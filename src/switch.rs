@@ -1,32 +1,82 @@
 //! Switch-to-task workflow: activate worktree branches and open Cursor.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{Context, eyre};
+use color_eyre::eyre::eyre;
 
-use crate::gitutil;
+use crate::gitutil::{self, BranchInUse};
 use crate::task::Worktree;
 use crate::treehouse;
+
+/// Branch is locked by another worktree whose directory still exists.
+#[derive(Debug, Clone)]
+pub struct BranchLockedError {
+    pub branch: String,
+    pub conflicting_path: PathBuf,
+    /// Repo directory where checkout was attempted (main or submodule).
+    pub checkout_repo: PathBuf,
+    /// Current task worktree being activated.
+    pub current_worktree: Worktree,
+    /// Main Treehouse worktree that owns `conflicting_path`, when derivable.
+    pub other_worktree: Option<Worktree>,
+}
+
+/// Failure from [`activate_worktree`].
+#[derive(Debug)]
+pub enum ActivateError {
+    /// Needs user choice: conflicting path exists on disk.
+    BranchLocked(BranchLockedError),
+    Other(color_eyre::Report),
+}
+
+impl std::fmt::Display for ActivateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActivateError::BranchLocked(e) => write!(
+                f,
+                "branch `{}` is already used by worktree at {}",
+                e.branch,
+                e.conflicting_path.display()
+            ),
+            ActivateError::Other(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ActivateError {}
+
+impl From<color_eyre::Report> for ActivateError {
+    fn from(value: color_eyre::Report) -> Self {
+        ActivateError::Other(value)
+    }
+}
 
 /// Check out the task branch (or `temp{N}`) in the worktree main repo and each submodule.
 ///
 /// `on_progress` is called with a human-readable step label before each checkout.
+/// Missing conflicting worktree registrations are forgotten automatically inside checkout.
+/// If a conflicting path **exists**, returns [`ActivateError::BranchLocked`].
 pub fn activate_worktree(
     worktree: &Worktree,
     task_modules: &[String],
     branch: &str,
     mut on_progress: impl FnMut(String) -> color_eyre::Result<()>,
-) -> color_eyre::Result<()> {
+) -> Result<(), ActivateError> {
     if branch.is_empty() {
-        return Err(eyre!("cannot activate worktree without a branch name"));
+        return Err(ActivateError::Other(eyre!(
+            "cannot activate worktree without a branch name"
+        )));
     }
 
     let root = &worktree.path;
     if !root.is_dir() {
-        return Err(eyre!("worktree path does not exist: {}", root.display()));
+        return Err(ActivateError::Other(eyre!(
+            "worktree path does not exist: {}",
+            root.display()
+        )));
     }
 
-    let main_name = gitutil::main_repo_name(root)?;
+    let main_name = gitutil::main_repo_name(root).map_err(ActivateError::Other)?;
     let temp_branch = format!("temp{}", worktree.number);
 
     let main_target = if task_modules.iter().any(|m| m == &main_name) {
@@ -36,17 +86,17 @@ pub fn activate_worktree(
     };
     on_progress(format!(
         "Activate worktree: main `{main_name}` → `{main_target}`"
-    ))?;
-    gitutil::checkout_or_create_branch(root, main_target)
-        .wrap_err_with(|| format!("activating main repo `{}` onto `{main_target}`", main_name))?;
+    ))
+    .map_err(ActivateError::Other)?;
+    checkout_for_activate(root, main_target, worktree)?;
 
-    for (name, rel) in gitutil::submodule_entries(root)? {
+    for (name, rel) in gitutil::submodule_entries(root).map_err(ActivateError::Other)? {
         let sub_path = root.join(&rel);
         if !sub_path.is_dir() {
-            return Err(eyre!(
+            return Err(ActivateError::Other(eyre!(
                 "submodule `{name}` path missing in worktree: {}",
                 sub_path.display()
-            ));
+            )));
         }
         let target = if task_modules.iter().any(|m| m == &name) {
             branch
@@ -55,12 +105,58 @@ pub fn activate_worktree(
         };
         on_progress(format!(
             "Activate worktree: submodule `{name}` → `{target}`"
-        ))?;
-        gitutil::checkout_or_create_branch(&sub_path, target)
-            .wrap_err_with(|| format!("activating submodule `{name}` onto `{target}`"))?;
+        ))
+        .map_err(ActivateError::Other)?;
+        checkout_for_activate(&sub_path, target, worktree)
+            .map_err(|err| annotate_submodule(err, &name))?;
     }
 
     Ok(())
+}
+
+fn annotate_submodule(err: ActivateError, name: &str) -> ActivateError {
+    match err {
+        locked @ ActivateError::BranchLocked(_) => locked,
+        ActivateError::Other(report) => {
+            ActivateError::Other(report.wrap_err(format!("activating submodule `{name}`")))
+        }
+    }
+}
+
+fn checkout_for_activate(
+    repo: &Path,
+    branch: &str,
+    current_worktree: &Worktree,
+) -> Result<(), ActivateError> {
+    match gitutil::checkout_or_create_branch(repo, branch) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if let Some(BranchInUse {
+                branch: locked_branch,
+                conflicting_path,
+            }) = gitutil::parse_branch_in_use_msg(&msg)
+            {
+                // Missing paths are already auto-forgotten + retried inside checkout.
+                // If we still see this, the conflicting path exists (or forget failed).
+                if conflicting_path.exists() {
+                    let other_worktree = treehouse::main_worktree_from_pool_path(&conflicting_path)
+                        .map(|(number, path)| Worktree { number, path });
+                    return Err(ActivateError::BranchLocked(BranchLockedError {
+                        branch: locked_branch,
+                        conflicting_path,
+                        checkout_repo: repo.to_path_buf(),
+                        current_worktree: current_worktree.clone(),
+                        other_worktree,
+                    }));
+                }
+            }
+            Err(ActivateError::Other(err.wrap_err(format!(
+                "checking out branch `{branch}` in {}",
+                repo.display()
+            ))))
+        }
+    }
 }
 
 /// Lease a new Treehouse worktree from `cwd` (main repo).

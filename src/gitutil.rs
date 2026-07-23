@@ -95,8 +95,35 @@ pub fn local_branch_exists(repo: impl AsRef<Path>, name: &str) -> color_eyre::Re
 }
 
 /// Create `branch` if missing, then check it out in `repo`.
+///
+/// If checkout fails because the branch is locked by another worktree whose path is
+/// **missing on disk**, forget that stale registration and retry once.
 pub fn checkout_or_create_branch(repo: impl AsRef<Path>, branch: &str) -> color_eyre::Result<()> {
-    let repo = repo.as_ref();
+    match checkout_or_create_branch_once(repo.as_ref(), branch) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let Some(lock) = parse_branch_in_use_msg(&format!("{err:#}")) else {
+                return Err(err);
+            };
+            if lock.conflicting_path.exists() {
+                return Err(err);
+            }
+            // Stale registration after a crash / path move: forget and retry.
+            forget_worktree_registration(repo.as_ref(), &lock.conflicting_path).wrap_err_with(
+                || {
+                    format!(
+                        "branch `{branch}` locked by missing worktree {}; \
+                         failed to forget registration",
+                        lock.conflicting_path.display()
+                    )
+                },
+            )?;
+            checkout_or_create_branch_once(repo.as_ref(), branch)
+        }
+    }
+}
+
+fn checkout_or_create_branch_once(repo: &Path, branch: &str) -> color_eyre::Result<()> {
     if branch.is_empty() {
         return Err(eyre!("branch name is empty"));
     }
@@ -113,6 +140,87 @@ pub fn checkout_or_create_branch(repo: impl AsRef<Path>, branch: &str) -> color_
         })?;
     }
     Ok(())
+}
+
+/// A branch cannot be checked out because another worktree already has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInUse {
+    pub branch: String,
+    pub conflicting_path: PathBuf,
+}
+
+/// Parse git's "`branch` is already used by worktree at `path`" from an error message.
+pub fn parse_branch_in_use_msg(msg: &str) -> Option<BranchInUse> {
+    let lower = msg.to_lowercase();
+    const MARKER: &str = "is already used by worktree at";
+    let marker_pos = lower.find(MARKER)?;
+    let before = &msg[..marker_pos];
+    let after = &msg[marker_pos + MARKER.len()..];
+
+    let branch = extract_quoted_segment(before.trim_end())?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        return None;
+    }
+
+    let path = extract_quoted_segment(after.trim_start())
+        .or_else(|| {
+            after.split_whitespace().next().map(|s| {
+                s.trim_matches(|c| c == '.' || c == ';' || c == ',')
+                    .to_string()
+            })
+        })?
+        .trim()
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(BranchInUse {
+        branch,
+        conflicting_path: PathBuf::from(path),
+    })
+}
+
+fn extract_quoted_segment(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    // Prefer the last quoted span in `s`.
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let quote = bytes[i];
+        if quote != b'\'' && quote != b'"' {
+            continue;
+        }
+        let closer = i;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if bytes[j] == quote {
+                return Some(s[j + 1..closer].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Unregister a worktree path (`remove --force`), falling back to `prune`.
+pub fn forget_worktree_registration(
+    repo: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let repo = repo.as_ref();
+    let path = worktree_path.as_ref();
+    match worktree_remove_force(repo, path) {
+        Ok(()) => Ok(()),
+        Err(remove_err) => worktree_prune(repo).wrap_err_with(|| {
+            format!(
+                "git worktree remove --force {} failed ({remove_err:#}); prune also failed",
+                path.display()
+            )
+        }),
+    }
 }
 
 /// Drop registrations for worktrees whose directories are gone (`git worktree prune`).
@@ -263,5 +371,18 @@ mod tests {
         assert_eq!(head.trim(), "feature/x");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_branch_in_use_error() {
+        let msg = "git checkout opt/inv-569 failed (in /wt/1/workspace/flagship): \
+             fatal: 'opt/inv-569-recalculate_open_kit_requests' is already used by worktree at \
+             '/home/vscode/.treehouse/workspace-df5f8e/3/workspace/flagship'";
+        let lock = parse_branch_in_use_msg(msg).unwrap();
+        assert_eq!(lock.branch, "opt/inv-569-recalculate_open_kit_requests");
+        assert_eq!(
+            lock.conflicting_path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/3/workspace/flagship")
+        );
     }
 }

@@ -5,7 +5,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use tui_textarea::{CursorRenderMode, TextArea};
 
-use crate::app::{App, CredentialPromptKind, EditFocus, StaleWorktreeAction, View};
+use crate::app::{
+    App, BranchLockedAction, CredentialPromptKind, EditFocus, StaleWorktreeAction, View,
+};
 use crate::credentials;
 use crate::dirty;
 use crate::treehouse::LeasePathConflictKind;
@@ -25,6 +27,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::SwitchBranch => draw_switch_branch(frame, body, app),
         View::DirtyWarning => draw_dirty_warning(frame, body, app),
         View::StaleWorktree => draw_stale_worktree(frame, body, app),
+        View::BranchLocked => draw_branch_locked(frame, body, app),
     }
     draw_footer(frame, footer, app);
 }
@@ -631,6 +634,138 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn draw_branch_locked(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(state) = app.branch_locked.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("No branch-lock recovery in progress")
+                .block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+
+    let actions = BranchLockedAction::available(state.other_worktree.is_some());
+    let selected = actions
+        .get(state.action_cursor)
+        .copied()
+        .unwrap_or(BranchLockedAction::Cancel);
+    let other_num = state.other_worktree.as_ref().map(|w| w.number);
+
+    let mut report_lines = vec![
+        Line::from(Span::styled(
+            "Branch locked by another worktree",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "Cannot check out `{}` because another worktree already has it:",
+            state.branch
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            state.conflicting_path.display().to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "Current task worktree: {} ({})",
+                state.current_worktree.number,
+                state.current_worktree.path.display()
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    if let Some(other) = state.other_worktree.as_ref() {
+        report_lines.push(Line::from(Span::styled(
+            format!(
+                "Other worktree: {} ({})",
+                other.number,
+                other.path.display()
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    report_lines.push(Line::from(""));
+    report_lines.push(Line::from(
+        "If that other path is a leftover from a crash, prefer using it. \
+         Removing it is destructive if it still has real work.",
+    ));
+
+    let action_items: Vec<ListItem> = actions
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let cursor = if i == state.action_cursor { "> " } else { "  " };
+            let shortcut = action.shortcut().to_ascii_uppercase();
+            let style = if i == state.action_cursor {
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{cursor}[{shortcut}] {}", action.label()),
+                style,
+            )))
+        })
+        .collect();
+
+    let desc_lines = vec![
+        Line::from(Span::styled(
+            selected.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(selected.description(other_num)),
+    ];
+
+    let actions_height = (actions.len() as u16 + 2).max(4).min(7);
+    let [report_area, actions_area, desc_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(actions_height),
+        Constraint::Length(6),
+    ])
+    .areas(area);
+
+    frame.render_widget(
+        Paragraph::new(report_lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Branch in use")
+                    .borders(Borders::ALL),
+            ),
+        report_area,
+    );
+    frame.render_widget(
+        List::new(action_items).block(
+            Block::default()
+                .title("Options")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        actions_area,
+    );
+    frame.render_widget(
+        Paragraph::new(desc_lines)
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .title("About this option")
+                    .borders(Borders::ALL),
+            ),
+        desc_area,
+    );
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(status) = &app.status {
@@ -722,6 +857,10 @@ fn footer_controls(app: &App) -> String {
             _ => "↑/↓ move  Enter choose  O override  P prune  R remove  X/Esc cancel  Q quit"
                 .to_string(),
         },
+        View::BranchLocked => {
+            "↑/↓ move  Enter choose  U use that worktree  R remove other  X/Esc cancel  Q quit"
+                .to_string()
+        }
     }
 }
 

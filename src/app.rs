@@ -50,6 +50,8 @@ pub enum View {
     DirtyWarning,
     /// Stale or leftover worktree path blocking a Treehouse lease.
     StaleWorktree,
+    /// Branch locked by another worktree during activate.
+    BranchLocked,
 }
 
 /// In-progress release (R alone, or as part of archive).
@@ -159,6 +161,79 @@ pub struct StaleWorktreeState {
     pub action_cursor: usize,
 }
 
+/// Prompt when activate cannot check out a branch locked by another worktree.
+#[derive(Debug)]
+pub struct BranchLockedState {
+    pub task_stem: String,
+    pub branch: String,
+    pub conflicting_path: PathBuf,
+    pub checkout_repo: PathBuf,
+    pub current_worktree: crate::task::Worktree,
+    pub other_worktree: Option<crate::task::Worktree>,
+    pub action_cursor: usize,
+}
+
+/// Recovery choice when a branch is locked by another existing worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchLockedAction {
+    /// Point the task at the other Treehouse worktree and continue.
+    AssociateOther,
+    /// Forget/remove the other worktree registration, then retry activate on the current one.
+    RemoveOther,
+    Cancel,
+}
+
+impl BranchLockedAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            BranchLockedAction::AssociateOther => "Use that worktree",
+            BranchLockedAction::RemoveOther => "Remove other worktree",
+            BranchLockedAction::Cancel => "Cancel",
+        }
+    }
+
+    pub fn description(self, other_num: Option<i32>) -> String {
+        match self {
+            BranchLockedAction::AssociateOther => {
+                let n = other_num
+                    .map(|n| format!("worktree {n}"))
+                    .unwrap_or_else(|| "that worktree".to_string());
+                format!(
+                    "Associate this task with {n} (where the branch is already checked out), \
+                     return the current Treehouse lease if it differs, then continue activate."
+                )
+            }
+            BranchLockedAction::RemoveOther => {
+                "Run `git worktree remove --force` on the conflicting path so this branch \
+                 can be checked out in the current worktree, then retry activate. \
+                 Destructive if that other tree has real work."
+                    .to_string()
+            }
+            BranchLockedAction::Cancel => {
+                "Abort the switch and leave worktree associations unchanged.".to_string()
+            }
+        }
+    }
+
+    pub fn shortcut(self) -> char {
+        match self {
+            BranchLockedAction::AssociateOther => 'u',
+            BranchLockedAction::RemoveOther => 'r',
+            BranchLockedAction::Cancel => 'x',
+        }
+    }
+
+    pub fn available(has_other_worktree: bool) -> Vec<BranchLockedAction> {
+        let mut actions = Vec::new();
+        if has_other_worktree {
+            actions.push(BranchLockedAction::AssociateOther);
+        }
+        actions.push(BranchLockedAction::RemoveOther);
+        actions.push(BranchLockedAction::Cancel);
+        actions
+    }
+}
+
 /// Which control is focused in the edit view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditFocus {
@@ -213,6 +288,7 @@ pub struct App {
     pub switch_prep: Option<SwitchPrepState>,
     pub release: Option<ReleaseState>,
     pub stale_worktree: Option<StaleWorktreeState>,
+    pub branch_locked: Option<BranchLockedState>,
     /// Create-prompt input buffer.
     pub create_input: TextArea<'static>,
     /// Credential-prompt input buffer (Linear API key).
@@ -248,6 +324,7 @@ impl App {
             switch_prep: None,
             release: None,
             stale_worktree: None,
+            branch_locked: None,
             create_input: text_input::single_line(""),
             credential_input: text_input::single_line_masked(""),
             credential_prompt_kind: CredentialPromptKind::Missing,
@@ -339,6 +416,7 @@ impl App {
             View::SwitchBranch => self.handle_switch_branch_key(key)?,
             View::DirtyWarning => self.handle_dirty_warning_key(key)?,
             View::StaleWorktree => self.handle_stale_worktree_key(key)?,
+            View::BranchLocked => self.handle_branch_locked_key(key)?,
         }
         Ok(())
     }
@@ -1172,13 +1250,15 @@ impl App {
                     return Ok(());
                 }
             },
-            ParsedCreateInput::IssueId(id) => match self.resolve_linear_issue(&id, input, api_key)? {
-                Some(issue) => (issue.title, None, Some(issue.identifier)),
-                None => {
-                    // Credential prompt opened, or lookup failed (status already set).
-                    return Ok(());
+            ParsedCreateInput::IssueId(id) => {
+                match self.resolve_linear_issue(&id, input, api_key)? {
+                    Some(issue) => (issue.title, None, Some(issue.identifier)),
+                    None => {
+                        // Credential prompt opened, or lookup failed (status already set).
+                        return Ok(());
+                    }
                 }
-            },
+            }
         };
 
         self.finish_create_task(title, branch, issue_id)
@@ -1588,10 +1668,18 @@ impl App {
         if let Err(err) = switch::activate_worktree(&worktree, &modules, &branch, |step| {
             self.report_progress(terminal, step)
         }) {
-            self.switch_prep = None;
-            self.view = View::TaskList;
-            self.set_error(format!("Activate worktree failed: {err:#}"));
-            return Ok(());
+            match err {
+                switch::ActivateError::BranchLocked(locked) => {
+                    self.open_branch_locked_recovery(&stem, locked);
+                    return Ok(());
+                }
+                switch::ActivateError::Other(err) => {
+                    self.switch_prep = None;
+                    self.view = View::TaskList;
+                    self.set_error(format!("Activate worktree failed: {err:#}"));
+                    return Ok(());
+                }
+            }
         }
 
         self.report_progress(terminal, "Opening Cursor…")?;
@@ -1798,6 +1886,159 @@ impl App {
         self.stale_worktree = None;
         self.view = View::TaskList;
         self.set_status("Switch cancelled (worktree path left unchanged)");
+    }
+
+    // --- Branch locked by another worktree ---------------------------------
+
+    fn open_branch_locked_recovery(&mut self, task_stem: &str, locked: switch::BranchLockedError) {
+        self.branch_locked = Some(BranchLockedState {
+            task_stem: task_stem.to_string(),
+            branch: locked.branch,
+            conflicting_path: locked.conflicting_path,
+            checkout_repo: locked.checkout_repo,
+            current_worktree: locked.current_worktree,
+            other_worktree: locked.other_worktree,
+            action_cursor: 0,
+        });
+        self.view = View::BranchLocked;
+        self.clear_status();
+    }
+
+    fn branch_locked_actions(&self) -> Vec<BranchLockedAction> {
+        self.branch_locked
+            .as_ref()
+            .map(|s| BranchLockedAction::available(s.other_worktree.is_some()))
+            .unwrap_or_default()
+    }
+
+    fn handle_branch_locked_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
+            KeyCode::Esc => self.cancel_branch_locked_recovery(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_branch_locked_action(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_branch_locked_action(-1),
+            KeyCode::Enter => self.confirm_branch_locked_action()?,
+            KeyCode::Char(c) => {
+                let lower = c.to_ascii_lowercase();
+                let actions = self.branch_locked_actions();
+                if let Some(idx) = actions.iter().position(|a| a.shortcut() == lower) {
+                    if let Some(state) = self.branch_locked.as_mut() {
+                        state.action_cursor = idx;
+                    }
+                    self.confirm_branch_locked_action()?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn move_branch_locked_action(&mut self, delta: i32) {
+        let len = self.branch_locked_actions().len() as i32;
+        if len == 0 {
+            return;
+        }
+        let Some(state) = self.branch_locked.as_mut() else {
+            return;
+        };
+        let cur = state.action_cursor as i32;
+        state.action_cursor = (cur + delta).rem_euclid(len) as usize;
+    }
+
+    fn confirm_branch_locked_action(&mut self) -> color_eyre::Result<()> {
+        let (action, task_stem, checkout_repo, conflicting_path, current, other) = {
+            let Some(state) = self.branch_locked.as_ref() else {
+                return Ok(());
+            };
+            let actions = BranchLockedAction::available(state.other_worktree.is_some());
+            let Some(action) = actions.get(state.action_cursor).copied() else {
+                return Ok(());
+            };
+            (
+                action,
+                state.task_stem.clone(),
+                state.checkout_repo.clone(),
+                state.conflicting_path.clone(),
+                state.current_worktree.clone(),
+                state.other_worktree.clone(),
+            )
+        };
+
+        match action {
+            BranchLockedAction::Cancel => self.cancel_branch_locked_recovery(),
+            BranchLockedAction::AssociateOther => {
+                let Some(other) = other else {
+                    self.set_error(
+                        "Could not derive the other Treehouse worktree from the conflicting path",
+                    );
+                    return Ok(());
+                };
+                if other.number != current.number {
+                    // Best-effort return of the unused / wrong lease.
+                    if let Err(err) = treehouse::return_worktree(&current.path) {
+                        self.set_status(format!(
+                            "Associated other worktree; return of previous lease failed: {err:#}"
+                        ));
+                    }
+                }
+                let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem)
+                else {
+                    self.branch_locked = None;
+                    self.view = View::TaskList;
+                    self.set_error("Task disappeared while recovering branch lock");
+                    return Ok(());
+                };
+                {
+                    let task = &mut self.tasks[task_idx];
+                    task.worktree = Some(other.clone());
+                    task.touch();
+                    persist::save_task(task)?;
+                }
+                self.sort_tasks();
+                let task_idx = self
+                    .tasks
+                    .iter()
+                    .position(|t| t.file_stem == task_stem)
+                    .ok_or_else(|| color_eyre::eyre::eyre!("task disappeared after associate"))?;
+                self.branch_locked = None;
+                self.set_busy(format!(
+                    "Associated worktree {}; continuing activate…",
+                    other.number
+                ));
+                self.view = View::TaskList;
+                self.pending_finish_switch = Some(task_idx);
+            }
+            BranchLockedAction::RemoveOther => {
+                match gitutil::forget_worktree_registration(&checkout_repo, &conflicting_path) {
+                    Ok(()) => {
+                        self.branch_locked = None;
+                        let Some(task_idx) =
+                            self.tasks.iter().position(|t| t.file_stem == task_stem)
+                        else {
+                            self.view = View::TaskList;
+                            self.set_error("Task disappeared while recovering branch lock");
+                            return Ok(());
+                        };
+                        self.set_busy("Removed other worktree registration; retrying activate…");
+                        self.view = View::TaskList;
+                        self.pending_finish_switch = Some(task_idx);
+                    }
+                    Err(err) => {
+                        self.set_error(format!(
+                            "Could not remove conflicting worktree {}: {err:#}",
+                            conflicting_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_branch_locked_recovery(&mut self) {
+        self.branch_locked = None;
+        self.view = View::TaskList;
+        self.set_status("Switch cancelled (branch still locked by other worktree)");
     }
 
     // --- Release / dirty warning -------------------------------------------

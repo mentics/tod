@@ -244,6 +244,18 @@ pub fn worktree_number_from_path(path: &Path) -> Option<i32> {
     num_str.parse::<i32>().ok().filter(|&n| n > 0)
 }
 
+/// Resolve a Treehouse main worktree from a main or submodule path under the pool.
+///
+/// Accepts `.../<N>/<reponame>` or `.../<N>/<reponame>/<module>`.
+pub fn main_worktree_from_pool_path(path: &Path) -> Option<(i32, PathBuf)> {
+    if let Some(n) = worktree_number_from_path(path) {
+        return Some((n, path.to_path_buf()));
+    }
+    let parent = path.parent()?;
+    let n = worktree_number_from_path(parent)?;
+    Some((n, parent.to_path_buf()))
+}
+
 fn status_number_for_path(path: &Path) -> color_eyre::Result<Option<i32>> {
     let output = Command::new("treehouse")
         .args(["status", "--json"])
@@ -414,6 +426,19 @@ mod tests {
             PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace")
         );
         assert_eq!(conflict.kind, LeasePathConflictKind::AlreadyExists);
+    }
+
+    #[test]
+    fn derives_main_worktree_from_submodule_pool_path() {
+        let (n, path) = main_worktree_from_pool_path(Path::new(
+            "/home/vscode/.treehouse/workspace-df5f8e/3/workspace/flagship",
+        ))
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(
+            path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/3/workspace")
+        );
     }
 
     #[test]
