@@ -1,9 +1,16 @@
 [package]
-name = "taskstui"
+name = "tod"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
+dirs = "6"
+keyring = "3"
+rand = "0.9"
 ratatui = "0.30.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }

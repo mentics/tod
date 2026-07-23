@@ -1,41 +1,61 @@
 # Features
 
+Spec for **taskstui**: a TUI to manage coding tasks, associate them with git worktrees (via Treehouse), and open Cursor on the right tree.
+
+## Contents
+
+- [Repository context](#repository-context)
+- [Data model](#data-model)
+- [Persistence](#persistence)
+- [Views](#views)
+- [Workflows](#workflows)
+- [Integrations & credentials](#integrations--credentials)
+
+---
+
+## Repository context
+
+taskstui always uses the **current working directory** as the main git repository. Available modules (main repo name + submodule names) and Treehouse operations are resolved relative to that repo. The user is expected to launch taskstui from the repo they intend to work in.
+
+---
+
 ## Data model
 
 ### Task
-
-A task is a simple object with:
 
 | Field | Type | Notes |
 | --- | --- | --- |
 | Title | string | Required |
 | Branch | string? | Optional branch name |
 | Issue ID | string? | Optional tracker issue ID (e.g. from Linear) |
-| Modules | list | Required; may be empty. See [Modules](#modules) |
-| Worktree | optional | See below |
-| Last used | timestamp | Last interacted with / last used; list views sort by this descending (most recent first) |
+| Modules | list of string | Required; may be empty. See [Modules](#modules) |
+| Worktree | Worktree? | Optional; tracked automatically (not set in the edit view). See [Worktree](#worktree) |
+| Last used | timestamp | **Cognitive recency**: updated on any interaction that involves this task (create, edit, switch, archive, unarchive, release worktree, etc.). List views sort by this **descending** (most recent first) so recently touched tasks stay near the top of the unarchived list |
+| Archived | bool | When true, the task appears only in the [Archive view](#2-archive-view), not the main list |
 
 ### Modules
 
-Each task has a **modules** list: which parts of the repo this task cares about when activating a worktree.
+Each task’s **modules** list is which parts of the repo matter when activating a worktree.
 
-The set of possible module names is **dynamic per repository**:
+Available module names are **dynamic per repository** (from cwd):
 
 - the name of the main repo itself
 - plus the name of each git submodule
 
-Stored values are those names. The list can be empty (none selected yet).
+Stored values are those names. An empty list means none selected yet.
 
 ### Worktree
 
-When a task has an associated worktree, store both:
+When a task has an associated worktree:
 
 | Field | Type | Notes |
 | --- | --- | --- |
 | Number | integer | Displayed as `1`, `2`, `3`, … |
 | Path | path | Filesystem path to the worktree |
 
-Worktree association is tracked automatically; the user does not set it by hand in the edit view.
+Association is tracked automatically; the user does not set it by hand in the edit view. It is cleared when the worktree is [released](#release-worktree).
+
+---
 
 ## Persistence
 
@@ -43,80 +63,96 @@ Tasks (and all associated fields) are persisted as **one JSON file per task**.
 
 | Setting | Behavior |
 | --- | --- |
-| Config directory | From an environment variable (e.g. `TASKSTUI_DATA_DIR`) if set; otherwise default to `$HOME/.config/taskstui/` (Linux XDG-style convention). This is the top-level config dir; task JSON files live under `{config}/tasks/` (i.e. `${TASKSTUI_DATA_DIR}/tasks/` when the env var is set). |
+| Config directory | From `TASKSTUI_DATA_DIR` if set; otherwise `$HOME/.config/taskstui/` (Linux XDG-style). Task files live under `{config}/tasks/`. |
 | Load | On startup, load all task JSON files from `{config}/tasks/` |
-| Save | **Immediately** write to disk whenever any task data changes, so nothing is lost |
+| Save | Write to disk **immediately** whenever any task data changes |
 | File names | Normalized, truncated title + random characters (avoids collisions) |
 
-## Integrations & credentials
-
-Integrations (Linear now; others later) store credentials in the OS keyring via the [`keyring`](https://crates.io/crates/keyring) crate.
-
-When code first needs to contact an integration:
-
-1. Try to load the required credential (e.g. Linear API key) from the OS keyring.
-2. If it is missing, prompt the user for it.
-3. Store the entered credential in the keyring for later use.
+---
 
 ## Views
 
-There are several primary views.
+Primary UI screens. Multi-step behavior lives under [Workflows](#workflows).
+
+Keybindings are fixed for now (not user-remappable).
 
 ### 1. Task list (main / initial view)
 
-Shows active tasks, sorted by **last used descending** (most recent at the top). At the top of the list is a **Create new task** option.
+Active (non-archived) tasks, sorted by **last used descending**. The first row is **Create new task**.
 
-Each list row displays:
+Each task row shows:
 
 - title
 - branch (if any)
 - worktree number (if any)
 
-**Controls**
+| Key | Action |
+| --- | --- |
+| ↑ / ↓ | Move selection |
+| Enter | On a task: [switch](#switch-to-a-task). On **Create new task**: [create new task](#create-new-task). |
+| E | Open [Edit view](#3-edit-view) for the selected task |
+| R | [Release worktree](#release-worktree) for the selected task (without archiving) |
+| A | [Archive](#archive-task) the selected task |
+| Shift+A | Open [Archive view](#2-archive-view) |
+| Q | Quit |
+
+### 2. Archive view
+
+Archived tasks, sorted by **last used descending**. Same row fields as the main list (title, branch, worktree number).
 
 | Key | Action |
 | --- | --- |
 | ↑ / ↓ | Move selection |
-| Enter | On a task: **switch** to it (see [Switching to a task](#switching-to-a-task)). On **Create new task**: open the new-task input (below). |
-| E | Open the edit view for the selected task |
-| A | Archive the selected task |
-| Shift+A | Open the archive view |
+| U | [Unarchive](#unarchive-task) the selected task |
+| Esc | Return to the task list |
 | Q | Quit |
-
-#### Create new task input
-
-Selecting **Create new task** and pressing Enter prompts for a single-line input. The user types a value and presses Enter. Parsing rules, in order of specificity:
-
-1. **Issue ID** — matches a few letters, a hyphen, and a few numbers (e.g. `ABC-123`). Look up that ID in Linear, pull the issue title, use it as the task title, and store the issue ID on the task. (May prompt for Linear credentials via the keyring flow above.)
-2. **Branch name** — matches alphabetic characters, then `/`, then non-whitespace characters (no spaces). Create a task with that value as both **branch** and **title** (title is required).
-3. **Title (default)** — otherwise treat the input as the new task’s title.
-
-The new task appears in the list as usual (sorted by last used).
-
-### 2. Archive view
-
-Lists archived tasks, sorted by **last used descending**. Same display fields as the main list (title, branch, worktree number). Exact controls TBD beyond returning to the main view.
 
 ### 3. Edit view
 
-Lets the user edit a task’s editable fields and shows read-only worktree info.
+Edit a task’s editable fields; show read-only worktree / issue info. Field changes update **last used** and persist immediately.
 
 **Editable**
 
 - title
 - branch
-- **modules** — multiselect list of the repo’s available modules (main repo name + each submodule name). The user can select or unselect any number of them.
+- **modules** — multiselect of available modules (main repo name + each submodule name)
 
-**Display only (not editable)**
+**Display only**
 
-- worktree number and/or path (tracked automatically)
-- issue ID (if any), as applicable
+- worktree number and/or path (if associated)
+- issue ID (if any)
 
-### 4. Switching to a task
+| Key | Action |
+| --- | --- |
+| Tab / ↑ / ↓ | Move between fields (and within the modules list) |
+| Space | Toggle the highlighted module on/off |
+| Enter | Confirm the current text field (title / branch) |
+| Esc | Return to the previous view |
+| Q | Quit |
 
-Pressing Enter on a task in the list runs the **switch** action. The goal is to put the user in that task’s environment and open Cursor on its worktree.
+---
 
-Worktrees are managed with **[Treehouse](https://github.com/mentics/treehouse)** ([mentics/treehouse](https://github.com/mentics/treehouse) — our fork with submodule support). Treehouse maintains a pool of reusable git worktrees; we use it rather than managing worktrees by hand.
+## Workflows
+
+### Create new task
+
+From the task list: select **Create new task**, press Enter, then enter a single line. Parse in order of specificity:
+
+1. **Issue ID** — matches `^[A-Za-z]{1,32}-[0-9]{1,32}$` (e.g. `ABC-123`). Look up in Linear, use the issue title as the task title, store the issue ID. May prompt for Linear credentials ([Integrations](#integrations--credentials)).
+2. **Branch name** — matches a prefix, a `/`, then a git-valid suffix:
+   - **Prefix:** `^[A-Za-z]{1,64}` (up to 64 alphabetic characters)
+   - **Then:** `/`
+   - **Suffix:** 1–128 characters that form a valid git branch name segment per [`git check-ref-format --branch`](https://git-scm.com/docs/git-check-ref-format) (applied to the full `prefix/suffix` string). In practice the suffix must not contain ASCII control characters, space, `~`, `^`, `:`, `?`, `*`, `[`, `\`; must not contain `..` or `@{`; must not be `@` alone; must not start with `-` or `.`; must not end with `.` or `.lock`; and slash-separated components follow the same rules.
+   - Use the full matched string as both **branch** and **title**.
+3. **Title (default)** — otherwise treat the input as the task title.
+
+The new task is non-archived, gets **last used** set to now, and appears in the main list.
+
+### Switch to a task
+
+Pressing Enter on a task in the main list runs **switch**: put the user in that task’s environment and open Cursor on its worktree. Updates **last used**.
+
+Worktrees are managed with **[Treehouse](https://github.com/mentics/treehouse)** (our fork with submodule support). Treehouse maintains a pool of reusable git worktrees; we do not manage worktrees by hand.
 
 #### High-level flow
 
@@ -128,31 +164,116 @@ run Activate worktree steps   # always, including after New worktree
 launch Cursor: cursor {worktree path}
 ```
 
-Whether a Cursor instance already exists for that path does not matter; we always run `cursor {worktree path}` as the **last** step.
+Always run `cursor {worktree path}` as the **last** step, whether or not a Cursor window already exists for that path.
 
-#### Prerequisites when there is no worktree yet
+#### Prerequisites (no worktree yet)
 
-Before **New worktree**, if the user is switching to a task that is not yet associated with a worktree:
+Before **New worktree**, if the task has no worktree yet:
 
-1. **Modules** — if the task has no modules associated (empty list), prompt with a multiselect of available modules (main repo + submodules). Persist the selection on the task.
-2. **Branch** — if the task has no branch, prompt for a branch name. Persist it on the task.
+1. **Modules** — if the modules list is empty, prompt with a multiselect of available modules. Persist the selection.
+2. **Branch** — if there is no branch, prompt for a branch name. Persist it.
 
-#### New worktree steps
+#### New worktree
 
-Used when the task is **not** yet associated with a worktree. After these succeed, continue with **Activate worktree**.
+When the task is **not** yet associated with a worktree. On success, continue with **Activate worktree**.
 
-1. Call Treehouse **lease** (`treehouse get --lease`), always with **submodules** enabled (we always need submodule support).
+1. Call Treehouse **lease** (`treehouse get --lease`), always with **submodules** enabled.
 2. Associate the leased worktree (number + path) with the task and persist.
 
-#### Activate worktree steps
+#### Activate worktree
 
-Used when the task **already** has a worktree, and also always after **New worktree**.
+When the task **already** has a worktree, and also always after **New worktree**.
 
 Check out a branch in the main repository and in every submodule. Worktrees cannot all share the same branch name, so:
 
 | Target | Branch to check out |
 | --- | --- |
-| Modules associated with the task | The task’s **branch** (create the branch if it does not exist, then check it out) |
+| Modules associated with the task | The task’s **branch** (create if missing, then check out) |
 | Main repo and submodules **not** in the task’s modules list | `temp{N}` where `N` is the worktree number (e.g. `temp1`, `temp3`). Create if missing, then check out |
 
-Then proceed to launch Cursor on the worktree path.
+Then launch Cursor on the worktree path.
+
+### Archive task
+
+From the task list, press **A** on a task:
+
+1. If the task has a worktree association, run [Release worktree](#release-worktree) first (including the dirty check). If release is cancelled or blocked, do **not** archive.
+2. Set `Archived = true`, update **last used**, persist.
+3. The task leaves the main list and appears in the archive view.
+
+### Unarchive task
+
+From the archive view, press **U** on a task:
+
+1. Set `Archived = false`, update **last used**, persist.
+2. The task returns to the main list (near the top, since last used was just updated).
+
+Unarchive does **not** re-lease a worktree; the user switches to the task later if they need one.
+
+### Release worktree
+
+Frees a Treehouse worktree without necessarily archiving the task. Invoked by:
+
+- **R** on a task that has a worktree (release only)
+- **A** archive, when the task still has a worktree (release, then archive)
+
+If the task has no worktree, **R** is a no-op (or a brief status message).
+
+#### Flow
+
+```
+run Dirty worktree check   # block until clean or user cancels
+treehouse return {worktree path}
+clear worktree association on the task and persist
+update last used
+```
+
+Use Treehouse **`treehouse return {path}`** to release the lease and return the worktree to the pool.
+
+### Dirty worktree check
+
+Run **before every release** (whether from **R** or as part of archive). The goal is to prevent forgotten work from being wiped when Treehouse resets the tree.
+
+#### What to inspect
+
+Inspect the worktree’s **main repo** and **each submodule** separately for leftovers:
+
+| Kind | Meaning |
+| --- | --- |
+| Staged | Index changes not committed |
+| Unstaged | Tracked file modifications not staged |
+| Untracked | Untracked files (including ignored? **no** — only non-ignored untracked) |
+| Remote divergence | Branch not in sync with its upstream (e.g. unpushed commits, or ahead/behind). Surface this so the user can push or otherwise reconcile before release |
+
+**Ignore submodule pointer / gitlink changes in the main repo.** Submodules often appear “modified” in the parent because they are on a different branch than the parent expects; that is expected and must **not** trigger the warning. Always look *inside* each submodule (and the main repo’s own non-gitlink changes) for real leftovers.
+
+#### Warning UI
+
+If anything is dirty or divergent, show a warning and **do not proceed** until the tree is clean (or the user cancels the whole release/archive).
+
+- Group findings by location (main repo vs each submodule) and by kind (**staged** / **unstaged** / **untracked** / **remote**), so the user can see what is going on.
+- If a group has **10 or fewer** paths, list them.
+- If a group has **more than 10** paths, show a **count** instead of listing every file (e.g. “23 untracked files”).
+- Remote divergence may be summarized in words (ahead/behind counts) rather than a file list.
+
+#### User options on the warning
+
+| Option | Behavior |
+| --- | --- |
+| **Check again** | Re-run the inspection. If clean, proceed with release. If still dirty, show the warning again with the current findings. |
+| **Stash changes** | Offered when stashing would clear the blocking local changes. Run a stash that includes **untracked** files. If there is staged content, **unstage then stash** (make that clear in the UI: staged files are listed as staged before stash). After a successful stash, re-check; if clean (including remote sync), proceed. If remote divergence remains, keep blocking until the user reconciles it (stash does not fix unpushed commits). |
+| **Cancel** | Abort release (and therefore abort archive if this check was part of archive). Leave the worktree association unchanged. |
+
+The user may leave the TUI, fix things manually in the worktree, return to the same prompt, and choose **Check again**. Repeat until clean or cancelled.
+
+---
+
+## Integrations & credentials
+
+Integrations (Linear now; others later) store credentials in the OS keyring via the [`keyring`](https://crates.io/crates/keyring) crate.
+
+When code first needs to contact an integration:
+
+1. Try to load the required credential (e.g. Linear API key) from the OS keyring.
+2. If it is missing, prompt the user for it.
+3. Store the entered credential in the keyring for later use.
