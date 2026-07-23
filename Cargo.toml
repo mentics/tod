@@ -8,7 +8,11 @@ chrono = { version = "0.4", features = ["serde"] }
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
 dirs = "6"
-keyring = "3"
+# Platform credential stores must be selected explicitly (keyring 3 has no defaults).
+# Without these, Linux falls back to an in-memory mock that does not persist across Entry handles.
+# Prefer linux-native (kernel keyutils) over Secret Service so store/load works even when
+# the desktop keyring collection is locked.
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 rand = "0.9"
 ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }

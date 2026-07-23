@@ -3,6 +3,7 @@
 use color_eyre::eyre::{Context, eyre};
 use serde::Deserialize;
 use serde_json::json;
+use std::fmt;
 
 const LINEAR_GRAPHQL_URL: &str = "https://api.linear.app/graphql";
 
@@ -11,6 +12,32 @@ const LINEAR_GRAPHQL_URL: &str = "https://api.linear.app/graphql";
 pub struct LinearIssue {
     pub identifier: String,
     pub title: String,
+}
+
+/// Failure looking up a Linear issue.
+#[derive(Debug)]
+pub enum IssueLookupError {
+    /// HTTP 401/403 — API key is missing, revoked, or wrong.
+    Unauthorized,
+    /// Any other lookup failure (not found, network, GraphQL, etc.).
+    Other(color_eyre::Report),
+}
+
+impl fmt::Display for IssueLookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthorized => write!(f, "Linear API key was rejected (HTTP 401/403)"),
+            Self::Other(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for IssueLookupError {}
+
+impl From<color_eyre::Report> for IssueLookupError {
+    fn from(err: color_eyre::Report) -> Self {
+        Self::Other(err)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,18 +75,20 @@ struct GraphqlError {
 pub fn fetch_issue_by_identifier(
     api_key: &str,
     identifier: &str,
-) -> color_eyre::Result<LinearIssue> {
-    let (team_key, number) = parse_identifier(identifier)?;
+) -> Result<LinearIssue, IssueLookupError> {
+    let (team_key, number) = parse_identifier(identifier).map_err(IssueLookupError::Other)?;
 
     match fetch_via_issue_id(api_key, identifier) {
         Ok(issue) => Ok(issue),
+        Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
         Err(err) => {
             // Fall through to filter; keep the first error if filter also fails.
             match fetch_via_filter(api_key, &team_key, number) {
                 Ok(issue) => Ok(issue),
-                Err(filter_err) => Err(eyre!(
-                    "Linear lookup for {identifier} failed ({err:#}); filter fallback also failed: {filter_err:#}"
-                )),
+                Err(IssueLookupError::Unauthorized) => Err(IssueLookupError::Unauthorized),
+                Err(filter_err) => Err(IssueLookupError::Other(eyre!(
+                    "Linear lookup for {identifier} failed ({err}); filter fallback also failed: {filter_err}"
+                ))),
             }
         }
     }
@@ -75,7 +104,7 @@ fn parse_identifier(identifier: &str) -> color_eyre::Result<(String, i64)> {
     Ok((team.to_string(), number))
 }
 
-fn fetch_via_issue_id(api_key: &str, identifier: &str) -> color_eyre::Result<LinearIssue> {
+fn fetch_via_issue_id(api_key: &str, identifier: &str) -> Result<LinearIssue, IssueLookupError> {
     let query = r#"
         query Issue($id: String!) {
             issue(id: $id) {
@@ -95,19 +124,26 @@ fn fetch_via_issue_id(api_key: &str, identifier: &str) -> color_eyre::Result<Lin
             .map(|e| e.message.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(eyre!("GraphQL errors: {msg}"));
+        if looks_like_auth_graphql(&msg) {
+            return Err(IssueLookupError::Unauthorized);
+        }
+        return Err(IssueLookupError::Other(eyre!("GraphQL errors: {msg}")));
     }
     let issue = response
         .data
         .and_then(|d| d.issue)
-        .ok_or_else(|| eyre!("issue not found"))?;
+        .ok_or_else(|| IssueLookupError::Other(eyre!("issue not found")))?;
     Ok(LinearIssue {
         identifier: issue.identifier,
         title: issue.title,
     })
 }
 
-fn fetch_via_filter(api_key: &str, team_key: &str, number: i64) -> color_eyre::Result<LinearIssue> {
+fn fetch_via_filter(
+    api_key: &str,
+    team_key: &str,
+    number: i64,
+) -> Result<LinearIssue, IssueLookupError> {
     let query = r#"
         query IssueByTeamNumber($teamKey: String!, $number: Float!) {
             issues(
@@ -138,41 +174,77 @@ fn fetch_via_filter(api_key: &str, team_key: &str, number: i64) -> color_eyre::R
             .map(|e| e.message.as_str())
             .collect::<Vec<_>>()
             .join("; ");
-        return Err(eyre!("GraphQL errors: {msg}"));
+        if looks_like_auth_graphql(&msg) {
+            return Err(IssueLookupError::Unauthorized);
+        }
+        return Err(IssueLookupError::Other(eyre!("GraphQL errors: {msg}")));
     }
     let nodes = response
         .data
         .and_then(|d| d.issues)
         .map(|c| c.nodes)
         .unwrap_or_default();
-    let issue = nodes
-        .into_iter()
-        .next()
-        .ok_or_else(|| eyre!("no issue matched team {team_key} number {number}"))?;
+    let issue = nodes.into_iter().next().ok_or_else(|| {
+        IssueLookupError::Other(eyre!("no issue matched team {team_key} number {number}"))
+    })?;
     Ok(LinearIssue {
         identifier: issue.identifier,
         title: issue.title,
     })
 }
 
-fn graphql_post(api_key: &str, body: &serde_json::Value) -> color_eyre::Result<GraphqlResponse> {
-    let response = ureq::post(LINEAR_GRAPHQL_URL)
+fn looks_like_auth_graphql(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("not authenticated")
+        || lower.contains("invalid api key")
+        || lower.contains("api key")
+}
+
+fn graphql_post(
+    api_key: &str,
+    body: &serde_json::Value,
+) -> Result<GraphqlResponse, IssueLookupError> {
+    let response = match ureq::post(LINEAR_GRAPHQL_URL)
         .header("Authorization", api_key)
         .header("Content-Type", "application/json")
         .send_json(body)
-        .wrap_err("calling Linear GraphQL API")?;
+    {
+        Ok(response) => response,
+        // ureq 3 treats non-2xx as Err(StatusCode) by default — that is how Linear 401 arrives.
+        Err(ureq::Error::StatusCode(401 | 403)) => {
+            return Err(IssueLookupError::Unauthorized);
+        }
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(IssueLookupError::Other(eyre!(
+                "calling Linear GraphQL API: http status: {code}"
+            )));
+        }
+        Err(err) => {
+            return Err(IssueLookupError::Other(eyre!(
+                "calling Linear GraphQL API: {err:#}"
+            )));
+        }
+    };
 
     let status = response.status();
+    let code = status.as_u16();
+    if code == 401 || code == 403 {
+        return Err(IssueLookupError::Unauthorized);
+    }
     if !status.is_success() {
         let text = response
             .into_body()
             .read_to_string()
             .unwrap_or_else(|_| String::new());
-        return Err(eyre!("Linear HTTP {status}: {text}"));
+        return Err(IssueLookupError::Other(eyre!(
+            "Linear HTTP {status}: {text}"
+        )));
     }
 
     response
         .into_body()
         .read_json::<GraphqlResponse>()
-        .wrap_err("decoding Linear GraphQL response")
+        .map_err(|err| IssueLookupError::Other(eyre!("decoding Linear GraphQL response: {err:#}")))
 }

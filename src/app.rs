@@ -15,6 +15,16 @@ use crate::task::{self, Task};
 use crate::treehouse;
 use crate::ui;
 
+/// Why the Linear credential prompt is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialPromptKind {
+    /// No key in the OS keyring yet.
+    #[default]
+    Missing,
+    /// Linear rejected the key (401/403 or auth GraphQL error).
+    Invalid,
+}
+
 /// Primary UI screen / mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -73,6 +83,13 @@ pub struct SwitchPrepState {
     pub branch_input: String,
 }
 
+/// Message shown in the footer status line.
+#[derive(Debug, Clone)]
+pub struct StatusMessage {
+    pub text: String,
+    pub is_error: bool,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub tasks: Vec<Task>,
@@ -86,9 +103,11 @@ pub struct App {
     pub create_input: String,
     /// Credential-prompt input buffer (Linear API key).
     pub credential_input: String,
+    /// Copy / reason for the credential prompt (missing vs invalid key).
+    pub credential_prompt_kind: CredentialPromptKind,
     /// Create input waiting while the user supplies Linear credentials.
     pending_create_input: Option<String>,
-    pub status: Option<String>,
+    pub status: Option<StatusMessage>,
     should_quit: bool,
 }
 
@@ -112,6 +131,7 @@ impl App {
             release: None,
             create_input: String::new(),
             credential_input: String::new(),
+            credential_prompt_kind: CredentialPromptKind::Missing,
             pending_create_input: None,
             status: None,
             should_quit: false,
@@ -233,7 +253,7 @@ impl App {
                 if let Some(task_idx) = self.tasks_index_for_list_row(row)
                     && let Err(err) = self.start_switch(task_idx)
                 {
-                    self.set_status(format!("Switch failed: {err:#}"));
+                    self.set_error(format!("Switch failed: {err:#}"));
                 }
             }
             None => {}
@@ -256,7 +276,7 @@ impl App {
             return Ok(());
         };
         if row == 0 {
-            self.set_status("Select a task to edit");
+            self.set_error("Select a task to edit");
             return Ok(());
         }
         let Some(task_idx) = self.tasks_index_for_list_row(row) else {
@@ -270,7 +290,7 @@ impl App {
             return Ok(());
         };
         if row == 0 {
-            self.set_status("Select a task to archive");
+            self.set_error("Select a task to archive");
             return Ok(());
         }
         let Some(task_idx) = self.tasks_index_for_list_row(row) else {
@@ -289,7 +309,7 @@ impl App {
             return Ok(());
         };
         if row == 0 {
-            self.set_status("Select a task to release its worktree");
+            self.set_error("Select a task to release its worktree");
             return Ok(());
         }
         let Some(task_idx) = self.tasks_index_for_list_row(row) else {
@@ -297,7 +317,7 @@ impl App {
         };
 
         if self.tasks[task_idx].worktree.is_none() {
-            self.set_status("No worktree associated with this task");
+            self.set_error("No worktree associated with this task");
             return Ok(());
         }
 
@@ -312,7 +332,7 @@ impl App {
             .and_then(|t| t.worktree.as_ref())
             .map(|w| w.path.clone())
         else {
-            self.set_status("No worktree to release");
+            self.set_error("No worktree to release");
             return Ok(());
         };
 
@@ -332,7 +352,7 @@ impl App {
                 Ok(())
             }
             Err(err) => {
-                self.set_status(format!("Dirty check failed: {err:#}"));
+                self.set_error(format!("Dirty check failed: {err:#}"));
                 Ok(())
             }
         }
@@ -360,7 +380,7 @@ impl App {
                 return Ok(());
             };
             let Some(wt) = task.worktree.as_ref() else {
-                self.set_status("No worktree to release");
+                self.set_error("No worktree to release");
                 return Ok(());
             };
             (task.file_stem.clone(), wt.path.clone(), wt.number)
@@ -369,7 +389,7 @@ impl App {
         if let Err(err) = treehouse::return_worktree(&path) {
             self.release = None;
             self.view = View::TaskList;
-            self.set_status(format!("Treehouse return failed: {err:#}"));
+            self.set_error(format!("Treehouse return failed: {err:#}"));
             return Ok(());
         }
 
@@ -470,7 +490,7 @@ impl App {
 
     fn unarchive_selected(&mut self) -> color_eyre::Result<()> {
         let Some(row) = self.archive_state.selected() else {
-            self.set_status("No archived task selected");
+            self.set_error("No archived task selected");
             return Ok(());
         };
         let Some(task_idx) = self.tasks_index_for_archive_row(row) else {
@@ -508,12 +528,12 @@ impl App {
             Ok(cwd) => match task::available_modules(&cwd) {
                 Ok(mods) => mods,
                 Err(err) => {
-                    self.set_status(format!("Module discovery failed: {err:#}"));
+                    self.set_error(format!("Module discovery failed: {err:#}"));
                     Vec::new()
                 }
             },
             Err(err) => {
-                self.set_status(format!("Could not read cwd: {err}"));
+                self.set_error(format!("Could not read cwd: {err}"));
                 Vec::new()
             }
         };
@@ -783,6 +803,7 @@ impl App {
             KeyCode::Esc => {
                 self.credential_input.clear();
                 self.pending_create_input = None;
+                self.credential_prompt_kind = CredentialPromptKind::Missing;
                 self.create_input.clear();
                 self.view = View::TaskList;
                 self.set_status("Create cancelled (no Linear API key)");
@@ -790,23 +811,38 @@ impl App {
             KeyCode::Enter => {
                 let key_text = self.credential_input.trim().to_string();
                 if key_text.is_empty() {
-                    self.set_status("Linear API key cannot be empty");
+                    self.set_error("Linear API key cannot be empty");
                     return Ok(());
                 }
-                if let Err(err) = credentials::store_linear_api_key(&key_text) {
-                    self.set_status(format!("Could not store API key: {err:#}"));
-                    return Ok(());
-                }
+                let store_err = match credentials::store_linear_api_key(&key_text) {
+                    Ok(()) => None,
+                    Err(err) => Some(err),
+                };
                 self.credential_input.clear();
                 let pending = self.pending_create_input.take();
                 match pending {
                     Some(input) => {
                         self.create_input.clear();
-                        self.submit_create(&input)?;
+                        // Use the key just entered; don't rely on an immediate keyring reload.
+                        self.submit_create_with_key(&input, Some(key_text.as_str()))?;
+                        if let Some(err) = store_err {
+                            // Create may have succeeded; still surface the persistence failure.
+                            let suffix = format!(" (keyring store failed: {err:#})");
+                            if let Some(status) = &mut self.status {
+                                status.text.push_str(&suffix);
+                                status.is_error = true;
+                            } else {
+                                self.set_error(format!("Linear API key not persisted{suffix}"));
+                            }
+                        }
                     }
                     None => {
                         self.view = View::TaskList;
-                        self.set_status("Linear API key saved");
+                        if let Some(err) = store_err {
+                            self.set_error(format!("Could not store API key: {err:#}"));
+                        } else {
+                            self.set_status("Linear API key saved");
+                        }
                     }
                 }
             }
@@ -823,10 +859,19 @@ impl App {
 
     /// Parse input, optionally fetch Linear issue, persist task, return to list.
     fn submit_create(&mut self, input: &str) -> color_eyre::Result<()> {
+        self.submit_create_with_key(input, None)
+    }
+
+    /// Like [`submit_create`], but may use a just-entered API key instead of the keyring.
+    fn submit_create_with_key(
+        &mut self,
+        input: &str,
+        api_key: Option<&str>,
+    ) -> color_eyre::Result<()> {
         let parsed = match create::parse_create_input(input) {
             Ok(p) => p,
             Err(err) => {
-                self.set_status(format!("Create failed: {err:#}"));
+                self.set_error(format!("Create failed: {err:#}"));
                 // Stay on create prompt so the user can fix input.
                 self.view = View::CreatePrompt;
                 return Ok(());
@@ -836,10 +881,10 @@ impl App {
         let (title, branch, issue_id) = match parsed {
             ParsedCreateInput::Title(title) => (title, None, None),
             ParsedCreateInput::Branch(name) => (name.clone(), Some(name), None),
-            ParsedCreateInput::IssueId(id) => match self.resolve_linear_issue(&id)? {
+            ParsedCreateInput::IssueId(id) => match self.resolve_linear_issue(&id, api_key)? {
                 Some(issue) => (issue.title, None, Some(issue.identifier)),
                 None => {
-                    // Switched to credential prompt; wait for key then retry.
+                    // Credential prompt opened, or lookup failed (status already set).
                     return Ok(());
                 }
             },
@@ -848,33 +893,54 @@ impl App {
         self.finish_create_task(title, branch, issue_id)
     }
 
-    /// Returns `None` when switching to the credential prompt (caller should return).
+    /// Returns `None` when switching to the credential prompt, or when lookup fails.
     fn resolve_linear_issue(
         &mut self,
         issue_id: &str,
+        api_key_override: Option<&str>,
     ) -> color_eyre::Result<Option<linear::LinearIssue>> {
-        let api_key = match credentials::load_linear_api_key() {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                self.pending_create_input = Some(issue_id.to_string());
-                self.credential_input.clear();
-                self.view = View::CredentialPrompt;
-                self.set_status("Enter your Linear API key (stored in OS keyring)");
-                return Ok(None);
-            }
-            Err(err) => {
-                self.set_status(format!("Keyring error: {err:#}"));
-                self.view = View::CreatePrompt;
-                return Ok(None);
+        let api_key = if let Some(key) = api_key_override {
+            key.to_string()
+        } else {
+            match credentials::load_linear_api_key() {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    self.open_credential_prompt(issue_id, CredentialPromptKind::Missing);
+                    return Ok(None);
+                }
+                Err(err) => {
+                    self.set_error(format!("Keyring error: {err:#}"));
+                    self.view = View::CreatePrompt;
+                    return Ok(None);
+                }
             }
         };
 
         match linear::fetch_issue_by_identifier(&api_key, issue_id) {
             Ok(issue) => Ok(Some(issue)),
-            Err(err) => {
-                self.set_status(format!("Linear lookup failed: {err:#}"));
+            Err(linear::IssueLookupError::Unauthorized) => {
+                self.open_credential_prompt(issue_id, CredentialPromptKind::Invalid);
+                Ok(None)
+            }
+            Err(linear::IssueLookupError::Other(err)) => {
+                self.set_error(format!("Linear lookup failed: {err:#}"));
                 self.view = View::CreatePrompt;
                 Ok(None)
+            }
+        }
+    }
+
+    fn open_credential_prompt(&mut self, issue_id: &str, kind: CredentialPromptKind) {
+        self.pending_create_input = Some(issue_id.to_string());
+        self.credential_input.clear();
+        self.credential_prompt_kind = kind;
+        self.view = View::CredentialPrompt;
+        match kind {
+            CredentialPromptKind::Missing => {
+                self.set_status("Enter your Linear API key (stored in OS keyring)");
+            }
+            CredentialPromptKind::Invalid => {
+                self.set_error("Previous Linear API key looks invalid — enter a new one");
             }
         }
     }
@@ -899,6 +965,7 @@ impl App {
 
         self.create_input.clear();
         self.pending_create_input = None;
+        self.credential_prompt_kind = CredentialPromptKind::Missing;
         self.view = View::TaskList;
         self.set_status(format!("Created task: {title}"));
         Ok(())
@@ -923,7 +990,7 @@ impl App {
         self.clear_status();
 
         if self.tasks.get(task_idx).is_none() {
-            self.set_status("Task missing");
+            self.set_error("Task missing");
             return Ok(());
         }
 
@@ -982,12 +1049,12 @@ impl App {
             Ok(cwd) => match task::available_modules(&cwd) {
                 Ok(mods) => mods,
                 Err(err) => {
-                    self.set_status(format!("Module discovery failed: {err:#}"));
+                    self.set_error(format!("Module discovery failed: {err:#}"));
                     Vec::new()
                 }
             },
             Err(err) => {
-                self.set_status(format!("Could not read cwd: {err}"));
+                self.set_error(format!("Could not read cwd: {err}"));
                 Vec::new()
             }
         }
@@ -1074,7 +1141,7 @@ impl App {
             return Ok(());
         };
         if self.tasks[task_idx].modules.is_empty() {
-            self.set_status("Select at least one module (Space), then Enter");
+            self.set_error("Select at least one module (Space), then Enter");
             return Ok(());
         }
         // Persist already happened on toggle; continue to branch or finish.
@@ -1096,7 +1163,7 @@ impl App {
         let task_idx = prep.task_idx;
         let branch = prep.branch_input.trim().to_string();
         if branch.is_empty() {
-            self.set_status("Branch name cannot be empty");
+            self.set_error("Branch name cannot be empty");
             return Ok(());
         }
         {
@@ -1155,7 +1222,7 @@ impl App {
                 Err(err) => {
                     self.switch_prep = None;
                     self.view = View::TaskList;
-                    self.set_status(format!("Treehouse lease failed: {err:#}"));
+                    self.set_error(format!("Treehouse lease failed: {err:#}"));
                     return Ok(());
                 }
             }
@@ -1185,14 +1252,14 @@ impl App {
         if let Err(err) = switch::activate_worktree(&worktree, &modules, &branch) {
             self.switch_prep = None;
             self.view = View::TaskList;
-            self.set_status(format!("Activate worktree failed: {err:#}"));
+            self.set_error(format!("Activate worktree failed: {err:#}"));
             return Ok(());
         }
 
         if let Err(err) = switch::launch_cursor(&worktree) {
             self.switch_prep = None;
             self.view = View::TaskList;
-            self.set_status(format!("Opened worktree but Cursor launch failed: {err:#}"));
+            self.set_error(format!("Opened worktree but Cursor launch failed: {err:#}"));
             // Still touch — switch mostly succeeded.
             self.tasks[task_idx].touch();
             persist::save_task(&self.tasks[task_idx])?;
@@ -1285,7 +1352,7 @@ impl App {
             DirtyAction::CheckAgain => {
                 let Some(path) = path else {
                     self.cancel_release();
-                    self.set_status("Worktree association missing; release cancelled");
+                    self.set_error("Worktree association missing; release cancelled");
                     return Ok(());
                 };
                 match dirty::inspect_worktree(&path) {
@@ -1299,21 +1366,21 @@ impl App {
                             rel.actions = actions;
                             rel.action_cursor = 0;
                         }
-                        self.set_status("Still dirty — fix leftovers or stash, then check again");
+                        self.set_error("Still dirty — fix leftovers or stash, then check again");
                     }
                     Err(err) => {
-                        self.set_status(format!("Dirty check failed: {err:#}"));
+                        self.set_error(format!("Dirty check failed: {err:#}"));
                     }
                 }
             }
             DirtyAction::StashChanges => {
                 let Some(path) = path else {
                     self.cancel_release();
-                    self.set_status("Worktree association missing; release cancelled");
+                    self.set_error("Worktree association missing; release cancelled");
                     return Ok(());
                 };
                 if let Err(err) = dirty::stash_local_changes(&path) {
-                    self.set_status(format!("Stash failed: {err:#}"));
+                    self.set_error(format!("Stash failed: {err:#}"));
                     return Ok(());
                 }
                 match dirty::inspect_worktree(&path) {
@@ -1333,10 +1400,10 @@ impl App {
                             rel.actions = actions;
                             rel.action_cursor = 0;
                         }
-                        self.set_status(msg);
+                        self.set_error(msg);
                     }
                     Err(err) => {
-                        self.set_status(format!("Re-check after stash failed: {err:#}"));
+                        self.set_error(format!("Re-check after stash failed: {err:#}"));
                     }
                 }
             }
@@ -1366,7 +1433,17 @@ impl App {
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
-        self.status = Some(msg.into());
+        self.status = Some(StatusMessage {
+            text: msg.into(),
+            is_error: false,
+        });
+    }
+
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.status = Some(StatusMessage {
+            text: msg.into(),
+            is_error: true,
+        });
     }
 
     fn clear_status(&mut self) {

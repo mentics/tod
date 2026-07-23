@@ -4,18 +4,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, EditFocus, View};
+use crate::app::{App, CredentialPromptKind, EditFocus, View};
 use crate::dirty;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Fill(1),
-        Constraint::Length(4),
-    ])
-    .areas(frame.area());
+    let [body, footer] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(frame.area());
 
-    draw_header(frame, header, app);
     match app.view {
         View::TaskList => draw_task_list(frame, body, app),
         View::Archive => draw_archive_list(frame, body, app),
@@ -27,25 +22,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::DirtyWarning => draw_dirty_warning(frame, body, app),
     }
     draw_footer(frame, footer, app);
-}
-
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let subtitle = match app.view {
-        View::TaskList => "task manager",
-        View::Archive => "archive",
-        View::Edit => "edit task",
-        View::CreatePrompt => "create task",
-        View::CredentialPrompt => "credentials",
-        View::SwitchModules => "switch — modules",
-        View::SwitchBranch => "switch — branch",
-        View::DirtyWarning => "dirty worktree",
-    };
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled("tod", Style::default().bold().fg(Color::Cyan)),
-        Span::raw(format!(" — {subtitle}")),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(title, area);
 }
 
 fn format_task_row(title: &str, branch: Option<&str>, wt_num: Option<i32>) -> Line<'static> {
@@ -270,9 +246,19 @@ fn draw_create_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let masked: String = "*".repeat(app.credential_input.chars().count());
+    let (line1, line2) = match app.credential_prompt_kind {
+        CredentialPromptKind::Missing => (
+            "Linear API key not found in the OS keyring.",
+            "Paste your key below; it will be stored as service `tod`, account `linear`.",
+        ),
+        CredentialPromptKind::Invalid => (
+            "It looks like the API key you entered previously is invalid.",
+            "Try entering a new one; it will replace the stored key (service `tod`, account `linear`).",
+        ),
+    };
     let body = Paragraph::new(vec![
-        Line::from("Linear API key not found in the OS keyring."),
-        Line::from("Paste your key below; it will be stored as service `tod`, account `linear`."),
+        Line::from(line1),
+        Line::from(line2),
         Line::from(""),
         Line::from(vec![
             Span::raw("> "),
@@ -509,13 +495,20 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
     };
 
-    let text = if let Some(status) = &app.status {
-        format!("{status}  ‖  {help}")
-    } else {
-        help
-    };
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(status) = &app.status {
+        let style = if status.is_error {
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(status.text.clone(), style)));
+    }
+    lines.push(Line::from(help));
 
-    let footer = Paragraph::new(text)
+    let footer = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(footer, area);
