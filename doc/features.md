@@ -1,6 +1,6 @@
 # Features
 
-Spec for **taskstui**: a TUI to manage coding tasks, associate them with git worktrees (via Treehouse), and open Cursor on the right tree.
+Spec for **tod**: a TUI to manage coding tasks, associate them with git worktrees (via Treehouse), and open Cursor on the right tree.
 
 ## Contents
 
@@ -15,7 +15,7 @@ Spec for **taskstui**: a TUI to manage coding tasks, associate them with git wor
 
 ## Repository context
 
-taskstui always uses the **current working directory** as the main git repository. Available modules (main repo name + submodule names) and Treehouse operations are resolved relative to that repo. The user is expected to launch taskstui from the repo they intend to work in.
+tod always uses the **current working directory** as the main git repository. Available modules (main repo name + submodule names) and Treehouse operations are resolved relative to that repo. The user is expected to launch tod from the repo they intend to work in.
 
 ---
 
@@ -63,7 +63,7 @@ Tasks (and all associated fields) are persisted as **one JSON file per task**.
 
 | Setting | Behavior |
 | --- | --- |
-| Config directory | From `TASKSTUI_DATA_DIR` if set; otherwise `$HOME/.config/taskstui/` (Linux XDG-style). Task files live under `{config}/tasks/`. |
+| Config directory | From `TOD_DATA_DIR` if set; otherwise `$HOME/.config/tod/` (Linux XDG-style). Task files live under `{config}/tasks/`. |
 | Load | On startup, load all task JSON files from `{config}/tasks/` |
 | Save | Write to disk **immediately** whenever any task data changes |
 | File names | Normalized, truncated title + random characters (avoids collisions) |
@@ -109,24 +109,24 @@ Archived tasks, sorted by **last used descending**. Same row fields as the main 
 
 ### 3. Edit view
 
-Edit a task’s editable fields; show read-only worktree / issue info. Field changes update **last used** and persist immediately.
+Edit a task’s editable fields; show read-only worktree info. Field changes update **last used** and persist immediately.
 
 **Editable**
 
 - title
 - branch
+- issue ID
 - **modules** — multiselect of available modules (main repo name + each submodule name)
 
 **Display only**
 
 - worktree number and/or path (if associated)
-- issue ID (if any)
 
 | Key | Action |
 | --- | --- |
 | Tab / ↑ / ↓ | Move between fields (and within the modules list) |
 | Space | Toggle the highlighted module on/off |
-| Enter | Confirm the current text field (title / branch) |
+| Enter | Confirm the current text field (title / branch / issue ID) |
 | Esc | Return to the previous view |
 | Q | Quit |
 

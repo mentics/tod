@@ -20,7 +20,7 @@ Progress and decisions while implementing `doc/features.md`.
 ### 2026-07-23 — kickoff
 
 - Starting from scaffold: placeholder `Task`/`TaskStatus`, single list UI, no persistence/integrations.
-- Package name in `Cargo.toml` is `tod`; binary/UI branding is `taskstui`. Leaving package name unless we need to rename.
+- Package name and UI branding are both `tod`.
 - Work order: data model → persistence → credentials → views → create → switch → archive/release/dirty.
 
 ### 2026-07-23 — data model + persistence
@@ -28,7 +28,7 @@ Progress and decisions while implementing `doc/features.md`.
 **Completed**
 - Replaced placeholder `Task`/`TaskStatus` with real `Task` + `Worktree` (serde + chrono `DateTime<Utc>`).
 - Added `task::available_modules(cwd)` via `git rev-parse --show-toplevel` + `.gitmodules` submodule names.
-- Added `persist` module: `TASKSTUI_DATA_DIR` or `$HOME/.config/taskstui/tasks/`, load-all on startup, immediate `save_task`, filename = normalized truncated title + 6-char random suffix.
+- Added `persist` module: `TOD_DATA_DIR` or `$HOME/.config/tod/tasks/`, load-all on startup, immediate `save_task`, filename = normalized truncated title + 6-char random suffix.
 - App loads from disk (no hardcoded examples); UI shows title / branch / worktree number; non-archived only in the list.
 
 **Decisions**
@@ -52,13 +52,13 @@ Progress and decisions while implementing `doc/features.md`.
 - `View` enum: `TaskList`, `Archive`, `Edit`, `CreatePrompt` (stub).
 - Task list: row 0 = Create new task; active tasks by `last_used` desc; keys ↑/↓, Enter (switch stub / create prompt), E edit, R stub, A archive (real if no worktree; stub if worktree), Shift+A archive view, Q quit.
 - Archive view: archived tasks same row fields; U unarchives (persist + touch + resort); Esc → task list; Q quit.
-- Edit view: title/branch editable (persist + touch on each keystroke); modules multiselect from `available_modules(cwd)` with Space toggle; worktree/issue read-only; Tab/↑/↓ focus; Enter advances from text fields; Esc returns to previous view.
+- Edit view: title/branch/issue ID editable (persist + touch on each keystroke); modules multiselect from `available_modules(cwd)` with Space toggle; worktree read-only; Tab/↑/↓ focus; Enter advances from text fields; Esc returns to previous view.
 - Status line for workflow stubs (switch / release / archive-with-worktree / create).
 
 **Decisions**
 - Keep drawing in `ui.rs` and event handling in `app.rs` (no `src/views/` split yet — still small).
 - Shift+A: `KeyModifiers::SHIFT` on `a`/`A`, plus bare `A` fallback for terminals that omit the shift flag.
-- While edit focus is title/branch, `q` types into the field; quit with Q from modules focus or after Esc.
+- While edit focus is title/branch/issue ID, `q` types into the field; quit with Q from modules focus or after Esc.
 - Simple archive (no worktree) implemented; archive with worktree stays stubbed until Release/dirty-check workflows.
 - Create prompt is UI-only: Enter shows stub status and returns to list.
 
@@ -72,14 +72,14 @@ Progress and decisions while implementing `doc/features.md`.
 ### 2026-07-23 — Integrations + Create workflow
 
 **Completed**
-- OS keyring via `keyring`: service `taskstui`, account `linear` for the Linear API key (`credentials` module).
+- OS keyring via `keyring`: service `tod`, account `linear` for the Linear API key (`credentials` module).
 - On first Linear need: load key from keyring; if missing, `CredentialPrompt` view (masked input) → store → resume create.
 - Create prompt parsing (`create` module): issue ID → branch (`git check-ref-format --branch`) → title; invalid branch shape that looks like `prefix/suffix` errors instead of silently becoming a title.
 - Linear GraphQL (`linear` module, `ureq`): `issue(id:)` with identifier, fallback filter by team key + number; errors surface as TUI status (no panic).
 - New task: allocate stem, persist immediately, non-archived, `last_used` now, select in main list.
 
 **Decisions**
-- Keyring naming: service=`taskstui`, user/account=`linear`.
+- Keyring naming: service=`tod`, user/account=`linear`.
 - HTTP: `ureq` 3 (blocking) over reqwest — lighter for a TUI.
 - `keyring` 3.x (stable `Entry` / `NoEntry` API).
 - Credential UI is a dedicated view (not an overlay modal).

@@ -1,10 +1,10 @@
 //! OS keyring helpers for integration credentials.
 
-use color_eyre::eyre::{eyre, Context};
+use color_eyre::eyre::{Context, eyre};
 use keyring::Entry;
 
 /// Keyring service name for this application.
-pub const SERVICE: &str = "taskstui";
+pub const SERVICE: &str = "tod";
 
 /// Account name for the Linear API key.
 pub const LINEAR_ACCOUNT: &str = "linear";

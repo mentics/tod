@@ -41,7 +41,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         View::DirtyWarning => "dirty worktree",
     };
     let title = Paragraph::new(Line::from(vec![
-        Span::styled("taskstui", Style::default().bold().fg(Color::Cyan)),
+        Span::styled("tod", Style::default().bold().fg(Color::Cyan)),
         Span::raw(format!(" — {subtitle}")),
     ]))
     .block(Block::default().borders(Borders::ALL));
@@ -138,9 +138,9 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let [fields, modules, readonly] = Layout::vertical([
-        Constraint::Length(5),
+        Constraint::Length(7),
         Constraint::Fill(1),
-        Constraint::Length(5),
+        Constraint::Length(4),
     ])
     .areas(area);
 
@@ -155,7 +155,7 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let title_line = Line::from(vec![
-        Span::styled("Title:  ", focus_style(edit.focus == EditFocus::Title)),
+        Span::styled("Title:    ", focus_style(edit.focus == EditFocus::Title)),
         Span::raw(task.title.clone()),
         if edit.focus == EditFocus::Title {
             Span::styled("▌", Style::default().fg(Color::Yellow))
@@ -165,7 +165,7 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
     ]);
     let branch_val = task.branch.as_deref().unwrap_or("");
     let branch_line = Line::from(vec![
-        Span::styled("Branch: ", focus_style(edit.focus == EditFocus::Branch)),
+        Span::styled("Branch:   ", focus_style(edit.focus == EditFocus::Branch)),
         Span::raw(branch_val.to_string()),
         if edit.focus == EditFocus::Branch {
             Span::styled("▌", Style::default().fg(Color::Yellow))
@@ -173,12 +173,25 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw("")
         },
     ]);
+    let issue_val = task.issue_id.as_deref().unwrap_or("");
+    let issue_line = Line::from(vec![
+        Span::styled("Issue ID: ", focus_style(edit.focus == EditFocus::IssueId)),
+        Span::raw(issue_val.to_string()),
+        if edit.focus == EditFocus::IssueId {
+            Span::styled("▌", Style::default().fg(Color::Yellow))
+        } else {
+            Span::raw("")
+        },
+    ]);
 
-    let fields_widget = Paragraph::new(vec![title_line, Line::from(""), branch_line]).block(
-        Block::default()
-            .title("Editable")
-            .borders(Borders::ALL),
-    );
+    let fields_widget = Paragraph::new(vec![
+        title_line,
+        Line::from(""),
+        branch_line,
+        Line::from(""),
+        issue_line,
+    ])
+    .block(Block::default().title("Editable").borders(Borders::ALL));
     frame.render_widget(fields_widget, fields);
 
     let module_items: Vec<ListItem> = edit
@@ -224,22 +237,11 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
         Some(wt) => format!("Worktree: {} ({})", wt.number, wt.path.display()),
         None => "Worktree: (none)".to_string(),
     };
-    let issue_text = match &task.issue_id {
-        Some(id) => format!("Issue ID: {id}"),
-        None => "Issue ID: (none)".to_string(),
-    };
-    let readonly_widget = Paragraph::new(vec![
-        Line::from(Span::styled(wt_text, Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(
-            issue_text,
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(
-        Block::default()
-            .title("Read-only")
-            .borders(Borders::ALL),
-    );
+    let readonly_widget = Paragraph::new(vec![Line::from(Span::styled(
+        wt_text,
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().title("Read-only").borders(Borders::ALL));
     frame.render_widget(readonly_widget, readonly);
 }
 
@@ -270,7 +272,7 @@ fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let masked: String = "*".repeat(app.credential_input.chars().count());
     let body = Paragraph::new(vec![
         Line::from("Linear API key not found in the OS keyring."),
-        Line::from("Paste your key below; it will be stored as service `taskstui`, account `linear`."),
+        Line::from("Paste your key below; it will be stored as service `tod`, account `linear`."),
         Line::from(""),
         Line::from(vec![
             Span::raw("> "),
@@ -307,7 +309,8 @@ fn draw_switch_modules(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let [intro, modules] = Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(area);
+    let [intro, modules] =
+        Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(area);
 
     let intro_widget = Paragraph::new(vec![
         Line::from(format!("Task: {}", task.title)),
@@ -412,10 +415,7 @@ fn draw_dirty_warning(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut report_lines: Vec<Line> = vec![
         Line::from(format!("Task: {task_title}")),
-        Line::from(Span::styled(
-            context,
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(context, Style::default().fg(Color::DarkGray))),
         Line::from(""),
     ];
     for line in dirty::format_report_lines(&rel.report) {

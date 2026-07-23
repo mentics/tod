@@ -6,13 +6,13 @@ use rand::Rng;
 
 use crate::task::Task;
 
-const ENV_DATA_DIR: &str = "TASKSTUI_DATA_DIR";
-const APP_DIR_NAME: &str = "taskstui";
+const ENV_DATA_DIR: &str = "TOD_DATA_DIR";
+const APP_DIR_NAME: &str = "tod";
 const TASKS_SUBDIR: &str = "tasks";
 const TITLE_STEM_MAX: usize = 40;
 const RANDOM_SUFFIX_LEN: usize = 6;
 
-/// Resolve the config/data directory: `TASKSTUI_DATA_DIR` or `$HOME/.config/taskstui/`.
+/// Resolve the config/data directory: `TOD_DATA_DIR` or `$HOME/.config/tod/`.
 pub fn config_dir() -> color_eyre::Result<PathBuf> {
     if let Ok(override_dir) = std::env::var(ENV_DATA_DIR) {
         let path = PathBuf::from(override_dir);
@@ -137,7 +137,7 @@ mod tests {
     use crate::task::Task;
     use std::sync::{Mutex, OnceLock};
 
-    /// Serialize env-var tests that mutate `TASKSTUI_DATA_DIR`.
+    /// Serialize env-var tests that mutate `TOD_DATA_DIR`.
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let _guard = env_lock().lock().unwrap();
-        let dir = std::env::temp_dir().join(format!("taskstui-test-{}", random_alnum(8)));
+        let dir = std::env::temp_dir().join(format!("tod-test-{}", random_alnum(8)));
         let _ = fs::remove_dir_all(&dir);
         // SAFETY: serialized by env_lock; restored below.
         unsafe {
@@ -167,7 +167,7 @@ mod tests {
 
         let mut task = Task::new("Hello World!", stem);
         task.branch = Some("feat/x".into());
-        task.modules = vec!["taskstui".into()];
+        task.modules = vec!["tod".into()];
         save_task(&task).expect("save");
 
         let loaded = load_all_tasks().expect("load");

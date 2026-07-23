@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use color_eyre::eyre::{eyre, Context};
+use color_eyre::eyre::{Context, eyre};
 
 use crate::gitutil;
 use crate::task::Worktree;
@@ -20,10 +20,7 @@ pub fn activate_worktree(
 
     let root = &worktree.path;
     if !root.is_dir() {
-        return Err(eyre!(
-            "worktree path does not exist: {}",
-            root.display()
-        ));
+        return Err(eyre!("worktree path does not exist: {}", root.display()));
     }
 
     let main_name = gitutil::main_repo_name(root)?;
@@ -34,12 +31,8 @@ pub fn activate_worktree(
     } else {
         temp_branch.as_str()
     };
-    gitutil::checkout_or_create_branch(root, main_target).wrap_err_with(|| {
-        format!(
-            "activating main repo `{}` onto `{main_target}`",
-            main_name
-        )
-    })?;
+    gitutil::checkout_or_create_branch(root, main_target)
+        .wrap_err_with(|| format!("activating main repo `{}` onto `{main_target}`", main_name))?;
 
     for (name, rel) in gitutil::submodule_entries(root)? {
         let sub_path = root.join(&rel);
@@ -54,9 +47,8 @@ pub fn activate_worktree(
         } else {
             temp_branch.as_str()
         };
-        gitutil::checkout_or_create_branch(&sub_path, target).wrap_err_with(|| {
-            format!("activating submodule `{name}` onto `{target}`")
-        })?;
+        gitutil::checkout_or_create_branch(&sub_path, target)
+            .wrap_err_with(|| format!("activating submodule `{name}` onto `{target}`"))?;
     }
 
     Ok(())
@@ -84,45 +76,52 @@ mod tests {
 
     fn init_repo(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
-        assert!(Command::new("git")
-            .args(["init"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["init"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(dir.join("README"), "hi").unwrap();
-        assert!(Command::new("git")
-            .args(["add", "README"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["add", "README"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-m", "init"])
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]
     fn activate_checks_out_task_or_temp_branch() {
-        let dir = std::env::temp_dir().join(format!(
-            "taskstui-switch-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("tod-switch-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         init_repo(&dir);
         let main = gitutil::main_repo_name(&dir).unwrap();

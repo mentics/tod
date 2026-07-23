@@ -49,6 +49,7 @@ pub struct ReleaseState {
 pub enum EditFocus {
     Title,
     Branch,
+    IssueId,
     Modules,
 }
 
@@ -548,10 +549,13 @@ impl App {
             (Some(EditFocus::Modules), KeyCode::Char('q') | KeyCode::Char('Q')) => {
                 self.should_quit = true;
             }
-            (Some(EditFocus::Title | EditFocus::Branch), KeyCode::Backspace) => {
+            (
+                Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId),
+                KeyCode::Backspace,
+            ) => {
                 self.edit_backspace()?;
             }
-            (Some(EditFocus::Title | EditFocus::Branch), KeyCode::Char(c)) => {
+            (Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId), KeyCode::Char(c)) => {
                 // Letters (including q) go into the text field while focused here.
                 self.edit_insert_char(c)?;
             }
@@ -578,7 +582,8 @@ impl App {
         };
         edit.focus = match edit.focus {
             EditFocus::Title => EditFocus::Branch,
-            EditFocus::Branch => EditFocus::Modules,
+            EditFocus::Branch => EditFocus::IssueId,
+            EditFocus::IssueId => EditFocus::Modules,
             EditFocus::Modules => EditFocus::Title,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
@@ -595,7 +600,8 @@ impl App {
         edit.focus = match edit.focus {
             EditFocus::Title => EditFocus::Modules,
             EditFocus::Branch => EditFocus::Title,
-            EditFocus::Modules => EditFocus::Branch,
+            EditFocus::IssueId => EditFocus::Branch,
+            EditFocus::Modules => EditFocus::IssueId,
         };
         if edit.focus == EditFocus::Modules && !edit.available_modules.is_empty() {
             edit.module_cursor = edit
@@ -622,7 +628,7 @@ impl App {
             return Ok(());
         };
         match edit.focus {
-            EditFocus::Title | EditFocus::Branch => {
+            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId => {
                 // Text already persisted on each keystroke; Enter advances focus.
                 self.edit_focus_next();
             }
@@ -649,6 +655,10 @@ impl App {
                 let branch = task.branch.get_or_insert_with(String::new);
                 branch.push(c);
             }
+            EditFocus::IssueId => {
+                let issue_id = task.issue_id.get_or_insert_with(String::new);
+                issue_id.push(c);
+            }
             EditFocus::Modules => return Ok(()),
         }
         task.touch();
@@ -664,7 +674,10 @@ impl App {
             };
             (edit.task_idx, edit.focus)
         };
-        if !matches!(focus, EditFocus::Title | EditFocus::Branch) {
+        if !matches!(
+            focus,
+            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId
+        ) {
             return Ok(());
         }
         let Some(task) = self.tasks.get_mut(task_idx) else {
@@ -679,6 +692,14 @@ impl App {
                     branch.pop();
                     if branch.is_empty() {
                         task.branch = None;
+                    }
+                }
+            }
+            EditFocus::IssueId => {
+                if let Some(issue_id) = task.issue_id.as_mut() {
+                    issue_id.pop();
+                    if issue_id.is_empty() {
+                        task.issue_id = None;
                     }
                 }
             }

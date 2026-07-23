@@ -281,7 +281,7 @@ fn stash_one(repo: &Path, label: &str, ignore_gitlinks: bool) -> color_eyre::Res
             "push",
             "-u",
             "-m",
-            "taskstui: stash before worktree release",
+            "tod: stash before worktree release",
         ],
     )
     .wrap_err_with(|| format!("stashing changes in {label} ({})", repo.display()))?;
@@ -432,7 +432,7 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("taskstui-dirty-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tod-dirty-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

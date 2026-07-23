@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn checkout_creates_and_switches() {
-        let dir = std::env::temp_dir().join(format!("taskstui-gitutil-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tod-gitutil-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         init_repo(&dir);
 
