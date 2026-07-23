@@ -32,21 +32,44 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_footer(frame, footer, app);
 }
 
-fn format_task_row(title: &str, branch: Option<&str>, wt_num: Option<i32>) -> Line<'static> {
-    let mut spans = vec![Span::raw(title.to_string())];
-    if let Some(branch) = branch {
-        spans.push(Span::styled(
+const TITLE_MAX_CHARS: usize = 80;
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+fn format_task_row(
+    title: &str,
+    issue_id: Option<&str>,
+    branch: Option<&str>,
+    wt_num: Option<i32>,
+) -> ListItem<'static> {
+    let title = truncate_chars(title, TITLE_MAX_CHARS);
+    let first = match issue_id {
+        Some(id) => format!("{id} {title}"),
+        None => title,
+    };
+
+    let mut lines = vec![Line::from(Span::raw(first))];
+
+    if let Some(number) = wt_num {
+        let second = match branch {
+            Some(branch) => format!("  {number}: {branch}"),
+            None => format!("  {number}"),
+        };
+        lines.push(Line::from(Span::styled(
+            second,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if let Some(branch) = branch {
+        // No worktree yet, but still show the branch on the secondary line.
+        lines.push(Line::from(Span::styled(
             format!("  {branch}"),
             Style::default().fg(Color::DarkGray),
-        ));
+        )));
     }
-    if let Some(number) = wt_num {
-        spans.push(Span::styled(
-            format!("  [{number}]"),
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-    Line::from(spans)
+
+    ListItem::new(lines)
 }
 
 fn draw_task_list(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -56,11 +79,12 @@ fn draw_task_list(frame: &mut Frame, area: Rect, app: &mut App) {
     )))];
 
     for (_, task) in app.active_tasks() {
-        items.push(ListItem::new(format_task_row(
+        items.push(format_task_row(
             &task.title,
+            task.issue_id.as_deref(),
             task.branch.as_deref(),
             task.worktree.as_ref().map(|wt| wt.number),
-        )));
+        ));
     }
 
     let list = List::new(items)
@@ -79,11 +103,12 @@ fn draw_archive_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .archived_tasks()
         .map(|(_, task)| {
-            ListItem::new(format_task_row(
+            format_task_row(
                 &task.title,
+                task.issue_id.as_deref(),
                 task.branch.as_deref(),
                 task.worktree.as_ref().map(|wt| wt.number),
-            ))
+            )
         })
         .collect();
 
@@ -755,13 +780,11 @@ fn draw_branch_locked(frame: &mut Frame, area: Rect, app: &App) {
         actions_area,
     );
     frame.render_widget(
-        Paragraph::new(desc_lines)
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .title("About this option")
-                    .borders(Borders::ALL),
-            ),
+        Paragraph::new(desc_lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title("About this option")
+                .borders(Borders::ALL),
+        ),
         desc_area,
     );
 }
