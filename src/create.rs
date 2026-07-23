@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-use color_eyre::eyre::{eyre, Context};
+use color_eyre::eyre::{Context, eyre};
 
 /// Parsed single-line create input, in order of specificity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,16 +52,10 @@ pub fn is_issue_id(s: &str) -> bool {
         return false;
     };
     // Exactly one `-` separating letters from digits (no extra dashes).
-    if team.is_empty()
-        || team.len() > 32
-        || !team.chars().all(|c| c.is_ascii_alphabetic())
-    {
+    if team.is_empty() || team.len() > 32 || !team.chars().all(|c| c.is_ascii_alphabetic()) {
         return false;
     }
-    if number.is_empty()
-        || number.len() > 32
-        || !number.chars().all(|c| c.is_ascii_digit())
-    {
+    if number.is_empty() || number.len() > 32 || !number.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
     true
@@ -72,10 +66,7 @@ fn looks_like_branch(s: &str) -> bool {
     let Some((prefix, suffix)) = s.split_once('/') else {
         return false;
     };
-    if prefix.is_empty()
-        || prefix.len() > 64
-        || !prefix.chars().all(|c| c.is_ascii_alphabetic())
-    {
+    if prefix.is_empty() || prefix.len() > 64 || !prefix.chars().all(|c| c.is_ascii_alphabetic()) {
         return false;
     }
     if suffix.is_empty() || suffix.chars().count() > 128 {
@@ -89,13 +80,11 @@ fn looks_like_branch(s: &str) -> bool {
 /// Pattern: 1–8 ASCII uppercase letters, `-`, 1–8 ASCII digits, not adjacent to a
 /// longer letter or digit run (so `ABCDEFGHI-1` and `ABC-123456789` do not match).
 pub fn extract_issue_id_from_branch(branch: &str) -> Option<String> {
-    let Some((_prefix, suffix)) = branch.split_once('/') else {
-        return None;
-    };
+    let (_prefix, suffix) = branch.split_once('/')?;
     extract_strict_issue_id(suffix)
 }
 
-/// Scan `s` for the first `^[A-Z]{1,8}-[0-9]{1,8}` delimited by non-letter / non-digit edges.
+/// Scan `s` for the first `[A-Z]{1,8}-[0-9]{1,8}` delimited by non-letter / non-digit edges.
 fn extract_strict_issue_id(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut i = 0;

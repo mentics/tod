@@ -144,7 +144,7 @@ From the task list: select **Create new task**, press Enter, then enter a single
    - **Then:** `/`
    - **Suffix:** 1–128 characters that form a valid git branch name segment per [`git check-ref-format --branch`](https://git-scm.com/docs/git-check-ref-format) (applied to the full `prefix/suffix` string). In practice the suffix must not contain ASCII control characters, space, `~`, `^`, `:`, `?`, `*`, `[`, `\`; must not contain `..` or `@{`; must not be `@` alone; must not start with `-` or `.`; must not end with `.` or `.lock`; and slash-separated components follow the same rules.
    - Store the full matched string as the **branch**.
-   - If the suffix contains a strict issue id (`^[A-Z]{1,8}-[0-9]{1,8}`, not part of a longer letter/digit run — e.g. `ENG-123` in `feat/fix-ENG-123-add-login`), look that id up in Linear: use the issue **title**, store the **issue ID**, and keep the **branch**. Otherwise use the full branch string as the **title** as well.
+   - If the suffix contains a strict issue id (`[A-Z]{1,8}-[0-9]{1,8}` anywhere in the suffix, not part of a longer letter/digit run — e.g. `ENG-123` in `feat/fix-ENG-123-add-login`), look that id up in Linear: use the issue **title**, store the **issue ID**, and keep the **branch**. Otherwise use the full branch string as the **title** as well.
 3. **Title (default)** — otherwise treat the input as the task title.
 
 The new task is non-archived, gets **last used** set to now, and appears in the main list.
