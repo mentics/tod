@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use tui_textarea::{CursorRenderMode, TextArea};
 
-use crate::app::{App, CredentialPromptKind, EditFocus, View};
+use crate::app::{App, CredentialPromptKind, EditFocus, StaleWorktreeAction, View};
 use crate::credentials;
 use crate::dirty;
 
@@ -23,6 +23,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         View::SwitchModules => draw_switch_modules(frame, body, app),
         View::SwitchBranch => draw_switch_branch(frame, body, app),
         View::DirtyWarning => draw_dirty_warning(frame, body, app),
+        View::StaleWorktree => draw_stale_worktree(frame, body, app),
     }
     draw_footer(frame, footer, app);
 }
@@ -509,9 +510,117 @@ fn draw_dirty_warning(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(actions_list, actions_area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let help = footer_help(app);
+fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(stale) = app.stale_worktree.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("No stale worktree recovery in progress")
+                .block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
 
+    let selected = StaleWorktreeAction::all()
+        .get(stale.action_cursor)
+        .copied()
+        .unwrap_or(StaleWorktreeAction::Cancel);
+
+    let report_lines = vec![
+        Line::from(Span::styled(
+            "Git worktree registration is stale",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(
+            "Treehouse could not create a worktree because this path is missing on disk \
+             but still registered with git:",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            stale.problem_path.display().to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Repo: {}", stale.repo_root.display()),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from("Choose how to clear it, then tod will retry the lease."),
+    ];
+
+    let action_items: Vec<ListItem> = StaleWorktreeAction::all()
+        .iter()
+        .enumerate()
+        .map(|(i, action)| {
+            let cursor = if i == stale.action_cursor { "> " } else { "  " };
+            let shortcut = action.shortcut().to_ascii_uppercase();
+            let style = if i == stale.action_cursor {
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{cursor}[{shortcut}] {}", action.label()),
+                style,
+            )))
+        })
+        .collect();
+
+    let desc_lines = vec![
+        Line::from(Span::styled(
+            selected.label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(selected.description()),
+    ];
+
+    let [report_area, actions_area, desc_area] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(6),
+        Constraint::Length(5),
+    ])
+    .areas(area);
+
+    frame.render_widget(
+        Paragraph::new(report_lines)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Stale worktree")
+                    .borders(Borders::ALL),
+            ),
+        report_area,
+    );
+    frame.render_widget(
+        List::new(action_items).block(
+            Block::default()
+                .title("Options")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        ),
+        actions_area,
+    );
+    frame.render_widget(
+        Paragraph::new(desc_lines).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title("About this option")
+                .borders(Borders::ALL),
+        ),
+        desc_area,
+    );
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(status) = &app.status {
         let style = if status.is_error {
@@ -537,7 +646,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             lines.push(Line::from(Span::styled(String::new(), style)));
         }
     }
-    lines.push(Line::from(help));
+    // Context (e.g. selection) never shares a line with controls.
+    if let Some(context) = footer_context(app) {
+        lines.push(Line::from(context));
+    }
+    // Controls are always the last footer line(s), alone.
+    lines.push(Line::from(footer_controls(app)));
 
     let footer = Paragraph::new(lines)
         .wrap(Wrap { trim: true })
@@ -548,28 +662,34 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 /// Max wrapped lines reserved for the status message inside the footer.
 const MAX_STATUS_LINES: u16 = 10;
 
-fn footer_help(app: &App) -> String {
+/// Non-control footer context (selection label, etc.). Always above controls.
+fn footer_context(app: &App) -> Option<String> {
+    match app.view {
+        View::TaskList => Some(match app.list_state.selected() {
+            Some(0) => "Create new task".to_string(),
+            Some(_) => app
+                .selected_list_task()
+                .map(|t| format!("Selected: {}", t.title))
+                .unwrap_or_default(),
+            None => "No selection".to_string(),
+        }),
+        View::Archive => Some(
+            app.selected_archive_task()
+                .map(|t| format!("Selected: {}", t.title))
+                .unwrap_or_else(|| "Archive empty".to_string()),
+        ),
+        _ => None,
+    }
+}
+
+/// Keybinding help only — never include status or selection text here.
+fn footer_controls(app: &App) -> String {
     match app.view {
         View::TaskList => {
-            let sel = match app.list_state.selected() {
-                Some(0) => "Create new task".to_string(),
-                Some(_) => app
-                    .selected_list_task()
-                    .map(|t| format!("Selected: {}", t.title))
-                    .unwrap_or_default(),
-                None => "No selection".to_string(),
-            };
-            format!(
-                "{sel}  |  ↑/↓ move  Enter open  E edit  R release  A archive  Shift+A archive view  Q quit"
-            )
+            "↑/↓ move  Enter open  E edit  R release  A archive  Shift+A archive view  Q quit"
+                .to_string()
         }
-        View::Archive => {
-            let sel = app
-                .selected_archive_task()
-                .map(|t| format!("Selected: {}", t.title))
-                .unwrap_or_else(|| "Archive empty".to_string());
-            format!("{sel}  |  ↑/↓ move  U unarchive  Esc back  Q quit")
-        }
+        View::Archive => "↑/↓ move  U unarchive  Esc back  Q quit".to_string(),
         View::Edit => {
             "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Enter confirm  Esc back  Q quit"
                 .to_string()
@@ -583,13 +703,21 @@ fn footer_help(app: &App) -> String {
         View::DirtyWarning => {
             "↑/↓ move  Enter choose  C check again  S stash  X/Esc cancel  Q quit".to_string()
         }
+        View::StaleWorktree => {
+            "↑/↓ move  Enter choose  O override  P prune  R remove  X/Esc cancel  Q quit"
+                .to_string()
+        }
     }
 }
 
-/// Footer height: borders + status (0..=10 wrapped lines) + help (wrapped).
+/// Footer height: borders + status + optional context + controls (each on own lines).
 fn footer_height(app: &App, term_width: u16) -> u16 {
     let inner_width = term_width.saturating_sub(2).max(1) as usize;
-    let help_lines = wrapped_line_count(&footer_help(app), inner_width) as u16;
+    let context_lines = match footer_context(app) {
+        Some(context) => wrapped_line_count(&context, inner_width) as u16,
+        None => 0,
+    };
+    let control_lines = wrapped_line_count(&footer_controls(app), inner_width) as u16;
     let status_lines = match &app.status {
         Some(status) => {
             let text = if status.busy {
@@ -601,10 +729,10 @@ fn footer_height(app: &App, term_width: u16) -> u16 {
         }
         None => 0,
     };
-    // 2 border rows + content; keep at least the old 4-row footprint when idle.
-    (2 + status_lines + help_lines)
+    // 2 border rows + content; keep at least the old 3-row footprint when idle.
+    (2 + status_lines + context_lines + control_lines)
         .max(3)
-        .min(2 + MAX_STATUS_LINES + help_lines.max(1))
+        .min(2 + MAX_STATUS_LINES + context_lines + control_lines.max(1))
 }
 
 fn wrapped_line_count(text: &str, width: usize) -> usize {

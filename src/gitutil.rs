@@ -115,6 +115,34 @@ pub fn checkout_or_create_branch(repo: impl AsRef<Path>, branch: &str) -> color_
     Ok(())
 }
 
+/// Drop registrations for worktrees whose directories are gone (`git worktree prune`).
+pub fn worktree_prune(repo: impl AsRef<Path>) -> color_eyre::Result<()> {
+    let repo = repo.as_ref();
+    git_stdout(repo, &["worktree", "prune"])
+        .wrap_err_with(|| format!("git worktree prune failed in {}", repo.display()))?;
+    Ok(())
+}
+
+/// Unregister a worktree path, even if the directory is missing (`git worktree remove --force`).
+pub fn worktree_remove_force(
+    repo: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let repo = repo.as_ref();
+    let path = worktree_path.as_ref();
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| eyre!("worktree path is not valid UTF-8: {}", path.display()))?;
+    git_stdout(repo, &["worktree", "remove", "--force", path_str]).wrap_err_with(|| {
+        format!(
+            "git worktree remove --force {} failed in {}",
+            path.display(),
+            repo.display()
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

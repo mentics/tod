@@ -86,6 +86,82 @@ fn is_unknown_flag_error(err: &color_eyre::Report) -> bool {
     msg.contains("unknown flag") || msg.contains("unknown shorthand")
 }
 
+/// A Treehouse/git worktree path that is gone on disk but still registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleRegisteredWorktree {
+    pub path: PathBuf,
+}
+
+/// Detect git's "missing but already registered worktree" failure inside a lease error.
+///
+/// Example fragment:
+/// `fatal: '/path/to/wt' is a missing but already registered worktree;`
+pub fn parse_stale_registered_worktree(
+    err: &color_eyre::Report,
+) -> Option<StaleRegisteredWorktree> {
+    parse_stale_registered_worktree_msg(&format!("{err:#}"))
+}
+
+fn parse_stale_registered_worktree_msg(msg: &str) -> Option<StaleRegisteredWorktree> {
+    let lower = msg.to_lowercase();
+    if !lower.contains("missing but already registered worktree") {
+        return None;
+    }
+
+    // Prefer a quoted path immediately before the diagnostic phrase.
+    const MARKER: &str = "is a missing but already registered worktree";
+    let marker_pos = lower.find(MARKER)?;
+    let before = &msg[..marker_pos];
+    let path = extract_quoted_path_before(before).or_else(|| extract_last_absolute_path(before))?;
+
+    Some(StaleRegisteredWorktree {
+        path: PathBuf::from(path),
+    })
+}
+
+fn extract_quoted_path_before(before: &str) -> Option<String> {
+    // Walk backward for the last '...' or "..." segment.
+    let bytes = before.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let quote = bytes[i];
+        if quote != b'\'' && quote != b'"' {
+            continue;
+        }
+        // Find matching opener before this closer.
+        let closer_idx = i;
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if bytes[j] == quote {
+                let candidate = &before[j + 1..closer_idx];
+                if looks_like_path(candidate) {
+                    return Some(candidate.to_string());
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn extract_last_absolute_path(before: &str) -> Option<String> {
+    // Fallback: last whitespace-separated token that looks absolute.
+    before
+        .split_whitespace()
+        .rev()
+        .find(|t| looks_like_path(t.trim_matches(|c| c == ':' || c == ',' || c == ';')))
+        .map(|t| {
+            t.trim_matches(|c| c == ':' || c == ',' || c == ';')
+                .to_string()
+        })
+}
+
+fn looks_like_path(s: &str) -> bool {
+    !s.is_empty() && (s.starts_with('/') || s.starts_with('\\') || s.contains("/.treehouse/"))
+}
+
 fn parse_lease_output(stdout: &str, expect_json: bool) -> color_eyre::Result<LeasedWorktree> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -274,5 +350,26 @@ mod tests {
         let out = "/home/u/.treehouse/repo-abc/1/repo\n";
         let leased = parse_lease_output(out, false).unwrap();
         assert_eq!(leased.number, 1);
+    }
+
+    #[test]
+    fn detects_stale_registered_worktree_error() {
+        let msg = "treehouse get --lease --submodules --json failed: \
+             🌳 Setting up worktree...\n\
+             failed to create worktree: git worktree add --detach \
+             /home/vscode/.treehouse/workspace-df5f8e/1/workspace refs/remotes/origin/main: \
+             Preparing worktree (detached HEAD 147730e)\n\
+             fatal: '/home/vscode/.treehouse/workspace-df5f8e/1/workspace' is a missing but already registered worktree;\n\
+             use 'add -f' to override, or 'prune' or 'remove' to clear";
+        let stale = parse_stale_registered_worktree_msg(msg).unwrap();
+        assert_eq!(
+            stale.path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace")
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_lease_errors() {
+        assert!(parse_stale_registered_worktree_msg("treehouse get failed: pool empty").is_none());
     }
 }
