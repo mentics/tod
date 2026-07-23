@@ -8,6 +8,7 @@ use tui_textarea::{CursorRenderMode, TextArea};
 use crate::app::{App, CredentialPromptKind, EditFocus, StaleWorktreeAction, View};
 use crate::credentials;
 use crate::dirty;
+use crate::treehouse::LeasePathConflictKind;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let footer_h = footer_height(app, frame.area().width);
@@ -513,30 +514,43 @@ fn draw_dirty_warning(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
     let Some(stale) = app.stale_worktree.as_ref() else {
         frame.render_widget(
-            Paragraph::new("No stale worktree recovery in progress")
+            Paragraph::new("No worktree path recovery in progress")
                 .block(Block::default().borders(Borders::ALL)),
             area,
         );
         return;
     };
 
-    let selected = StaleWorktreeAction::all()
+    let actions = StaleWorktreeAction::for_kind(stale.kind);
+    let selected = actions
         .get(stale.action_cursor)
         .copied()
         .unwrap_or(StaleWorktreeAction::Cancel);
 
+    let (title, headline, explanation) = match stale.kind {
+        LeasePathConflictKind::MissingButRegistered => (
+            "Stale worktree",
+            "Git worktree registration is stale",
+            "Treehouse could not create a worktree because this path is missing on disk \
+             but still registered with git:",
+        ),
+        LeasePathConflictKind::AlreadyExists => (
+            "Path already exists",
+            "Worktree path already exists on disk",
+            "Treehouse could not create a worktree because this path already exists \
+             (often a leftover from a failed earlier attempt):",
+        ),
+    };
+
     let report_lines = vec![
         Line::from(Span::styled(
-            "Git worktree registration is stale",
+            headline,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(
-            "Treehouse could not create a worktree because this path is missing on disk \
-             but still registered with git:",
-        ),
+        Line::from(explanation),
         Line::from(""),
         Line::from(Span::styled(
             stale.problem_path.display().to_string(),
@@ -553,7 +567,7 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
         Line::from("Choose how to clear it, then tod will retry the lease."),
     ];
 
-    let action_items: Vec<ListItem> = StaleWorktreeAction::all()
+    let action_items: Vec<ListItem> = actions
         .iter()
         .enumerate()
         .map(|(i, action)| {
@@ -584,9 +598,10 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(selected.description()),
     ];
 
+    let actions_height = (actions.len() as u16 + 2).max(4).min(8);
     let [report_area, actions_area, desc_area] = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(6),
+        Constraint::Length(actions_height),
         Constraint::Length(5),
     ])
     .areas(area);
@@ -594,11 +609,7 @@ fn draw_stale_worktree(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(report_lines)
             .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("Stale worktree")
-                    .borders(Borders::ALL),
-            ),
+            .block(Block::default().title(title).borders(Borders::ALL)),
         report_area,
     );
     frame.render_widget(
@@ -703,10 +714,14 @@ fn footer_controls(app: &App) -> String {
         View::DirtyWarning => {
             "↑/↓ move  Enter choose  C check again  S stash  X/Esc cancel  Q quit".to_string()
         }
-        View::StaleWorktree => {
-            "↑/↓ move  Enter choose  O override  P prune  R remove  X/Esc cancel  Q quit"
-                .to_string()
-        }
+        View::StaleWorktree => match app.stale_worktree.as_ref().map(|s| s.kind) {
+            Some(LeasePathConflictKind::AlreadyExists) => {
+                "↑/↓ move  Enter choose  C clear path  D delete dir  R remove  X/Esc cancel  Q quit"
+                    .to_string()
+            }
+            _ => "↑/↓ move  Enter choose  O override  P prune  R remove  X/Esc cancel  Q quit"
+                .to_string(),
+        },
     }
 }
 

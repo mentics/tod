@@ -143,6 +143,56 @@ pub fn worktree_remove_force(
     Ok(())
 }
 
+/// True if `path` looks like a Treehouse pool worktree (safe to delete as recovery).
+pub fn is_treehouse_pool_path(path: impl AsRef<Path>) -> bool {
+    path.as_ref()
+        .components()
+        .any(|c| c.as_os_str() == ".treehouse")
+}
+
+/// Delete a leftover Treehouse worktree directory after verifying it is under `.treehouse/`.
+pub fn remove_treehouse_pool_dir(path: impl AsRef<Path>) -> color_eyre::Result<()> {
+    let path = path.as_ref();
+    if !is_treehouse_pool_path(path) {
+        return Err(eyre!(
+            "refusing to delete {}: not under a `.treehouse` directory",
+            path.display()
+        ));
+    }
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(path)
+        .wrap_err_with(|| format!("failed to delete leftover path {}", path.display()))?;
+    Ok(())
+}
+
+/// Clear a blocking worktree path: try `git worktree remove --force`, then delete leftovers.
+pub fn clear_worktree_path(
+    repo: impl AsRef<Path>,
+    worktree_path: impl AsRef<Path>,
+) -> color_eyre::Result<()> {
+    let path = worktree_path.as_ref();
+    // Prefer the official git removal when the path is registered.
+    match worktree_remove_force(repo.as_ref(), path) {
+        Ok(()) => {}
+        Err(_) if path.exists() => {
+            // Not registered (or remove failed); fall through to directory delete.
+        }
+        Err(err) => {
+            // Path already gone and remove failed — treat as cleared.
+            if !path.exists() {
+                return Ok(());
+            }
+            return Err(err);
+        }
+    }
+    if path.exists() {
+        remove_treehouse_pool_dir(path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

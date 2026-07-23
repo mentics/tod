@@ -86,36 +86,67 @@ fn is_unknown_flag_error(err: &color_eyre::Report) -> bool {
     msg.contains("unknown flag") || msg.contains("unknown shorthand")
 }
 
-/// A Treehouse/git worktree path that is gone on disk but still registered.
+/// A Treehouse/git worktree path that blocked leasing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleRegisteredWorktree {
+pub struct LeasePathConflict {
     pub path: PathBuf,
+    pub kind: LeasePathConflictKind,
+}
+
+/// Why Treehouse could not create a worktree at `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasePathConflictKind {
+    /// Directory gone, but git still has the worktree registered.
+    MissingButRegistered,
+    /// Directory (or file) already present where git wants to add a worktree.
+    AlreadyExists,
+}
+
+/// Detect recoverable path conflicts inside a lease error.
+pub fn parse_lease_path_conflict(err: &color_eyre::Report) -> Option<LeasePathConflict> {
+    parse_lease_path_conflict_msg(&format!("{err:#}"))
+}
+
+fn parse_lease_path_conflict_msg(msg: &str) -> Option<LeasePathConflict> {
+    parse_stale_registered_worktree_msg(msg).or_else(|| parse_path_already_exists_msg(msg))
 }
 
 /// Detect git's "missing but already registered worktree" failure inside a lease error.
-///
-/// Example fragment:
-/// `fatal: '/path/to/wt' is a missing but already registered worktree;`
-pub fn parse_stale_registered_worktree(
-    err: &color_eyre::Report,
-) -> Option<StaleRegisteredWorktree> {
-    parse_stale_registered_worktree_msg(&format!("{err:#}"))
-}
-
-fn parse_stale_registered_worktree_msg(msg: &str) -> Option<StaleRegisteredWorktree> {
+fn parse_stale_registered_worktree_msg(msg: &str) -> Option<LeasePathConflict> {
     let lower = msg.to_lowercase();
     if !lower.contains("missing but already registered worktree") {
         return None;
     }
 
-    // Prefer a quoted path immediately before the diagnostic phrase.
     const MARKER: &str = "is a missing but already registered worktree";
     let marker_pos = lower.find(MARKER)?;
     let before = &msg[..marker_pos];
     let path = extract_quoted_path_before(before).or_else(|| extract_last_absolute_path(before))?;
 
-    Some(StaleRegisteredWorktree {
+    Some(LeasePathConflict {
         path: PathBuf::from(path),
+        kind: LeasePathConflictKind::MissingButRegistered,
+    })
+}
+
+/// Detect git's "`path` already exists" failure from `git worktree add`.
+fn parse_path_already_exists_msg(msg: &str) -> Option<LeasePathConflict> {
+    let lower = msg.to_lowercase();
+    if lower.contains("missing but already registered") {
+        return None;
+    }
+    if !lower.contains("already exists") {
+        return None;
+    }
+
+    const MARKER: &str = "already exists";
+    let marker_pos = lower.find(MARKER)?;
+    let before = &msg[..marker_pos];
+    let path = extract_quoted_path_before(before).or_else(|| extract_last_absolute_path(before))?;
+
+    Some(LeasePathConflict {
+        path: PathBuf::from(path),
+        kind: LeasePathConflictKind::AlreadyExists,
     })
 }
 
@@ -361,15 +392,32 @@ mod tests {
              Preparing worktree (detached HEAD 147730e)\n\
              fatal: '/home/vscode/.treehouse/workspace-df5f8e/1/workspace' is a missing but already registered worktree;\n\
              use 'add -f' to override, or 'prune' or 'remove' to clear";
-        let stale = parse_stale_registered_worktree_msg(msg).unwrap();
+        let conflict = parse_lease_path_conflict_msg(msg).unwrap();
         assert_eq!(
-            stale.path,
+            conflict.path,
             PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace")
         );
+        assert_eq!(conflict.kind, LeasePathConflictKind::MissingButRegistered);
+    }
+
+    #[test]
+    fn detects_path_already_exists_error() {
+        let msg = "treehouse get --lease --submodules --json failed: \
+             🌳 Setting up worktree...\n\
+             failed to create worktree: git worktree add --detach \
+             /home/vscode/.treehouse/workspace-df5f8e/1/workspace refs/remotes/origin/main: \
+             Preparing worktree (detached HEAD 147730e)\n\
+             fatal: '/home/vscode/.treehouse/workspace-df5f8e/1/workspace' already exists";
+        let conflict = parse_lease_path_conflict_msg(msg).unwrap();
+        assert_eq!(
+            conflict.path,
+            PathBuf::from("/home/vscode/.treehouse/workspace-df5f8e/1/workspace")
+        );
+        assert_eq!(conflict.kind, LeasePathConflictKind::AlreadyExists);
     }
 
     #[test]
     fn ignores_unrelated_lease_errors() {
-        assert!(parse_stale_registered_worktree_msg("treehouse get failed: pool empty").is_none());
+        assert!(parse_lease_path_conflict_msg("treehouse get failed: pool empty").is_none());
     }
 }

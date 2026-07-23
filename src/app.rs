@@ -48,7 +48,7 @@ pub enum View {
     SwitchBranch,
     /// Dirty worktree warning before release (and optionally archive).
     DirtyWarning,
-    /// Stale git worktree registration blocking a Treehouse lease.
+    /// Stale or leftover worktree path blocking a Treehouse lease.
     StaleWorktree,
 }
 
@@ -63,7 +63,7 @@ pub struct ReleaseState {
     pub action_cursor: usize,
 }
 
-/// Recovery choice when a lease hits a missing-but-registered worktree.
+/// Recovery choice when a lease hits a worktree path conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleWorktreeAction {
     /// Clear this path's registration, then retry (like allowing `git worktree add -f`).
@@ -72,6 +72,10 @@ pub enum StaleWorktreeAction {
     Prune,
     /// `git worktree remove --force` on this path, then retry.
     Remove,
+    /// Remove registration if any, delete leftover dir under `.treehouse`, then retry.
+    ClearPath,
+    /// Delete the leftover directory under `.treehouse`, then retry.
+    DeleteDirectory,
     Cancel,
 }
 
@@ -81,6 +85,8 @@ impl StaleWorktreeAction {
             StaleWorktreeAction::Override => "Override (force)",
             StaleWorktreeAction::Prune => "Prune",
             StaleWorktreeAction::Remove => "Remove",
+            StaleWorktreeAction::ClearPath => "Clear path",
+            StaleWorktreeAction::DeleteDirectory => "Delete directory",
             StaleWorktreeAction::Cancel => "Cancel",
         }
     }
@@ -99,8 +105,16 @@ impl StaleWorktreeAction {
                 "Run `git worktree remove --force` on this path only to clear \
                  its registration, then retry the lease."
             }
+            StaleWorktreeAction::ClearPath => {
+                "Try `git worktree remove --force`, then delete any leftover folder \
+                 under `.treehouse`, then retry the lease."
+            }
+            StaleWorktreeAction::DeleteDirectory => {
+                "Delete the leftover folder on disk (only if it is under `.treehouse`), \
+                 then retry the lease."
+            }
             StaleWorktreeAction::Cancel => {
-                "Abort the switch and leave git worktree registrations unchanged."
+                "Abort the switch and leave the path / registrations unchanged."
             }
         }
     }
@@ -110,27 +124,38 @@ impl StaleWorktreeAction {
             StaleWorktreeAction::Override => 'o',
             StaleWorktreeAction::Prune => 'p',
             StaleWorktreeAction::Remove => 'r',
+            StaleWorktreeAction::ClearPath => 'c',
+            StaleWorktreeAction::DeleteDirectory => 'd',
             StaleWorktreeAction::Cancel => 'x',
         }
     }
 
-    pub fn all() -> &'static [StaleWorktreeAction] {
-        &[
-            StaleWorktreeAction::Override,
-            StaleWorktreeAction::Prune,
-            StaleWorktreeAction::Remove,
-            StaleWorktreeAction::Cancel,
-        ]
+    pub fn for_kind(kind: treehouse::LeasePathConflictKind) -> &'static [StaleWorktreeAction] {
+        match kind {
+            treehouse::LeasePathConflictKind::MissingButRegistered => &[
+                StaleWorktreeAction::Override,
+                StaleWorktreeAction::Prune,
+                StaleWorktreeAction::Remove,
+                StaleWorktreeAction::Cancel,
+            ],
+            treehouse::LeasePathConflictKind::AlreadyExists => &[
+                StaleWorktreeAction::ClearPath,
+                StaleWorktreeAction::DeleteDirectory,
+                StaleWorktreeAction::Remove,
+                StaleWorktreeAction::Cancel,
+            ],
+        }
     }
 }
 
-/// Prompt shown when Treehouse lease fails on a stale registered worktree.
+/// Prompt shown when Treehouse lease fails on a conflicting worktree path.
 #[derive(Debug)]
 pub struct StaleWorktreeState {
     /// Task file stem so we can resume after indices shift.
     pub task_stem: String,
     pub problem_path: PathBuf,
     pub repo_root: PathBuf,
+    pub kind: treehouse::LeasePathConflictKind,
     pub action_cursor: usize,
 }
 
@@ -1133,8 +1158,21 @@ impl App {
 
         let (title, branch, issue_id) = match parsed {
             ParsedCreateInput::Title(title) => (title, None, None),
-            ParsedCreateInput::Branch(name) => (name.clone(), Some(name), None),
-            ParsedCreateInput::IssueId(id) => match self.resolve_linear_issue(&id, api_key)? {
+            ParsedCreateInput::Branch {
+                name,
+                issue_id: None,
+            } => (name.clone(), Some(name), None),
+            ParsedCreateInput::Branch {
+                name,
+                issue_id: Some(id),
+            } => match self.resolve_linear_issue(&id, input, api_key)? {
+                Some(issue) => (issue.title, Some(name), Some(issue.identifier)),
+                None => {
+                    // Credential prompt opened, or lookup failed (status already set).
+                    return Ok(());
+                }
+            },
+            ParsedCreateInput::IssueId(id) => match self.resolve_linear_issue(&id, input, api_key)? {
                 Some(issue) => (issue.title, None, Some(issue.identifier)),
                 None => {
                     // Credential prompt opened, or lookup failed (status already set).
@@ -1147,9 +1185,12 @@ impl App {
     }
 
     /// Returns `None` when switching to the credential prompt, or when lookup fails.
+    ///
+    /// `resume_input` is the original create-prompt text to re-submit after credentials.
     fn resolve_linear_issue(
         &mut self,
         issue_id: &str,
+        resume_input: &str,
         api_key_override: Option<&str>,
     ) -> color_eyre::Result<Option<linear::LinearIssue>> {
         let api_key = if let Some(key) = api_key_override {
@@ -1158,7 +1199,7 @@ impl App {
             match credentials::load_linear_api_key() {
                 Ok(Some(key)) => key,
                 Ok(None) => {
-                    self.open_credential_prompt(issue_id, CredentialPromptKind::Missing);
+                    self.open_credential_prompt(resume_input, CredentialPromptKind::Missing);
                     return Ok(None);
                 }
                 Err(err) => {
@@ -1172,7 +1213,7 @@ impl App {
         match linear::fetch_issue_by_identifier(&api_key, issue_id) {
             Ok(issue) => Ok(Some(issue)),
             Err(linear::IssueLookupError::Unauthorized) => {
-                self.open_credential_prompt(issue_id, CredentialPromptKind::Invalid);
+                self.open_credential_prompt(resume_input, CredentialPromptKind::Invalid);
                 Ok(None)
             }
             Err(linear::IssueLookupError::Other(err)) => {
@@ -1183,8 +1224,8 @@ impl App {
         }
     }
 
-    fn open_credential_prompt(&mut self, issue_id: &str, kind: CredentialPromptKind) {
-        self.pending_create_input = Some(issue_id.to_string());
+    fn open_credential_prompt(&mut self, resume_input: &str, kind: CredentialPromptKind) {
+        self.pending_create_input = Some(resume_input.to_string());
         self.credential_input = text_input::single_line_masked("");
         self.credential_prompt_kind = kind;
         self.view = View::CredentialPrompt;
@@ -1502,12 +1543,13 @@ impl App {
                     persist::save_task(task)?;
                 }
                 Err(err) => {
-                    if let Some(stale) = treehouse::parse_stale_registered_worktree(&err) {
-                        match self.open_stale_worktree_recovery(&stem, stale.path) {
+                    if let Some(conflict) = treehouse::parse_lease_path_conflict(&err) {
+                        match self.open_stale_worktree_recovery(&stem, conflict.path, conflict.kind)
+                        {
                             Ok(()) => return Ok(()),
                             Err(open_err) => {
                                 self.set_error(format!(
-                                    "Treehouse lease failed (stale worktree; could not open recovery): \
+                                    "Treehouse lease failed (path conflict; could not open recovery): \
                                      {err:#} — {open_err:#}"
                                 ));
                                 return Ok(());
@@ -1589,24 +1631,33 @@ impl App {
         Ok(())
     }
 
-    // --- Stale registered worktree recovery --------------------------------
+    // --- Worktree path-conflict recovery -----------------------------------
 
     fn open_stale_worktree_recovery(
         &mut self,
         task_stem: &str,
         problem_path: PathBuf,
+        kind: treehouse::LeasePathConflictKind,
     ) -> color_eyre::Result<()> {
-        let cwd = env::current_dir().wrap_err("reading cwd for stale worktree recovery")?;
+        let cwd = env::current_dir().wrap_err("reading cwd for worktree path recovery")?;
         let repo_root = gitutil::repo_toplevel(&cwd)?;
         self.stale_worktree = Some(StaleWorktreeState {
             task_stem: task_stem.to_string(),
             problem_path,
             repo_root,
+            kind,
             action_cursor: 0,
         });
         self.view = View::StaleWorktree;
         self.clear_status();
         Ok(())
+    }
+
+    fn stale_actions(&self) -> &'static [StaleWorktreeAction] {
+        self.stale_worktree
+            .as_ref()
+            .map(|s| StaleWorktreeAction::for_kind(s.kind))
+            .unwrap_or(&[])
     }
 
     fn handle_stale_worktree_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
@@ -1618,10 +1669,8 @@ impl App {
             KeyCode::Enter => self.confirm_stale_worktree_action()?,
             KeyCode::Char(c) => {
                 let lower = c.to_ascii_lowercase();
-                if let Some(idx) = StaleWorktreeAction::all()
-                    .iter()
-                    .position(|a| a.shortcut() == lower)
-                {
+                let actions = self.stale_actions();
+                if let Some(idx) = actions.iter().position(|a| a.shortcut() == lower) {
                     if let Some(stale) = self.stale_worktree.as_mut() {
                         stale.action_cursor = idx;
                     }
@@ -1634,10 +1683,13 @@ impl App {
     }
 
     fn move_stale_worktree_action(&mut self, delta: i32) {
+        let len = self.stale_actions().len() as i32;
+        if len == 0 {
+            return;
+        }
         let Some(stale) = self.stale_worktree.as_mut() else {
             return;
         };
-        let len = StaleWorktreeAction::all().len() as i32;
         let cur = stale.action_cursor as i32;
         stale.action_cursor = (cur + delta).rem_euclid(len) as usize;
     }
@@ -1647,7 +1699,8 @@ impl App {
             let Some(stale) = self.stale_worktree.as_ref() else {
                 return Ok(());
             };
-            let Some(action) = StaleWorktreeAction::all().get(stale.action_cursor).copied() else {
+            let actions = StaleWorktreeAction::for_kind(stale.kind);
+            let Some(action) = actions.get(stale.action_cursor).copied() else {
                 return Ok(());
             };
             (
@@ -1670,7 +1723,7 @@ impl App {
                     }
                     Err(err) => {
                         self.set_error(format!(
-                            "Could not clear stale worktree {}: {err:#}",
+                            "Could not clear worktree {}: {err:#}",
                             problem_path.display()
                         ));
                     }
@@ -1685,6 +1738,34 @@ impl App {
                     self.set_error(format!("git worktree prune failed: {err:#}"));
                 }
             },
+            StaleWorktreeAction::ClearPath => {
+                match gitutil::clear_worktree_path(&repo_root, &problem_path) {
+                    Ok(()) => {
+                        self.stale_worktree = None;
+                        self.resume_switch_after_stale_fix(&task_stem, action)?;
+                    }
+                    Err(err) => {
+                        self.set_error(format!(
+                            "Could not clear path {}: {err:#}",
+                            problem_path.display()
+                        ));
+                    }
+                }
+            }
+            StaleWorktreeAction::DeleteDirectory => {
+                match gitutil::remove_treehouse_pool_dir(&problem_path) {
+                    Ok(()) => {
+                        self.stale_worktree = None;
+                        self.resume_switch_after_stale_fix(&task_stem, action)?;
+                    }
+                    Err(err) => {
+                        self.set_error(format!(
+                            "Could not delete {}: {err:#}",
+                            problem_path.display()
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1696,13 +1777,15 @@ impl App {
     ) -> color_eyre::Result<()> {
         let Some(task_idx) = self.tasks.iter().position(|t| t.file_stem == task_stem) else {
             self.view = View::TaskList;
-            self.set_error("Task disappeared while recovering stale worktree");
+            self.set_error("Task disappeared while recovering worktree path conflict");
             return Ok(());
         };
         let label = match action {
             StaleWorktreeAction::Override => "Cleared stale registration (override)",
             StaleWorktreeAction::Prune => "Pruned missing worktree registrations",
-            StaleWorktreeAction::Remove => "Removed stale worktree registration",
+            StaleWorktreeAction::Remove => "Removed worktree registration",
+            StaleWorktreeAction::ClearPath => "Cleared blocking worktree path",
+            StaleWorktreeAction::DeleteDirectory => "Deleted leftover worktree directory",
             StaleWorktreeAction::Cancel => unreachable!(),
         };
         self.set_busy(format!("{label}; retrying lease…"));
@@ -1714,7 +1797,7 @@ impl App {
     fn cancel_stale_worktree_recovery(&mut self) {
         self.stale_worktree = None;
         self.view = View::TaskList;
-        self.set_status("Switch cancelled (stale worktree left unchanged)");
+        self.set_status("Switch cancelled (worktree path left unchanged)");
     }
 
     // --- Release / dirty warning -------------------------------------------

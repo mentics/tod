@@ -9,8 +9,12 @@ use color_eyre::eyre::{eyre, Context};
 pub enum ParsedCreateInput {
     /// Linear-style issue id (`ABC-123`); title comes from Linear.
     IssueId(String),
-    /// Full branch string used as both branch and title.
-    Branch(String),
+    /// Full branch string; optional issue id extracted from the suffix for Linear lookup.
+    Branch {
+        name: String,
+        /// Strict id from the suffix: up to 8 capitals, `-`, up to 8 digits (e.g. `ENG-123`).
+        issue_id: Option<String>,
+    },
     /// Plain title.
     Title(String),
 }
@@ -28,7 +32,11 @@ pub fn parse_create_input(input: &str) -> color_eyre::Result<ParsedCreateInput> 
 
     if looks_like_branch(trimmed) {
         if is_valid_git_branch(trimmed)? {
-            return Ok(ParsedCreateInput::Branch(trimmed.to_string()));
+            let issue_id = extract_issue_id_from_branch(trimmed);
+            return Ok(ParsedCreateInput::Branch {
+                name: trimmed.to_string(),
+                issue_id,
+            });
         }
         return Err(eyre!(
             "looks like a branch name but failed git check-ref-format: {trimmed}"
@@ -76,6 +84,55 @@ fn looks_like_branch(s: &str) -> bool {
     true
 }
 
+/// Find a strict Linear-style id in the branch suffix (after the first `/`).
+///
+/// Pattern: 1–8 ASCII uppercase letters, `-`, 1–8 ASCII digits, not adjacent to a
+/// longer letter or digit run (so `ABCDEFGHI-1` and `ABC-123456789` do not match).
+pub fn extract_issue_id_from_branch(branch: &str) -> Option<String> {
+    let Some((_prefix, suffix)) = branch.split_once('/') else {
+        return None;
+    };
+    extract_strict_issue_id(suffix)
+}
+
+/// Scan `s` for the first `^[A-Z]{1,8}-[0-9]{1,8}` delimited by non-letter / non-digit edges.
+fn extract_strict_issue_id(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        // Must not start mid-run of capitals.
+        if i > 0 && bytes[i - 1].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        let letter_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_uppercase() {
+            i += 1;
+        }
+        let letter_len = i - letter_start;
+        if letter_len == 0 || letter_len > 8 {
+            continue;
+        }
+        if i >= bytes.len() || bytes[i] != b'-' {
+            continue;
+        }
+        let digit_start = i + 1;
+        let mut j = digit_start;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        let digit_len = j - digit_start;
+        if (1..=8).contains(&digit_len) {
+            return Some(s[letter_start..j].to_string());
+        }
+    }
+    None
+}
+
 /// Validate with `git check-ref-format --branch <name>`.
 pub fn is_valid_git_branch(name: &str) -> color_eyre::Result<bool> {
     let output = Command::new("git")
@@ -107,7 +164,39 @@ mod tests {
     #[test]
     fn parses_branch() {
         let parsed = parse_create_input("feat/add-login").unwrap();
-        assert_eq!(parsed, ParsedCreateInput::Branch("feat/add-login".into()));
+        assert_eq!(
+            parsed,
+            ParsedCreateInput::Branch {
+                name: "feat/add-login".into(),
+                issue_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_branch_with_embedded_issue_id() {
+        assert_eq!(
+            parse_create_input("feat/ENG-123").unwrap(),
+            ParsedCreateInput::Branch {
+                name: "feat/ENG-123".into(),
+                issue_id: Some("ENG-123".into()),
+            }
+        );
+        assert_eq!(
+            parse_create_input("jshellman/fix-ABC-42-add-login").unwrap(),
+            ParsedCreateInput::Branch {
+                name: "jshellman/fix-ABC-42-add-login".into(),
+                issue_id: Some("ABC-42".into()),
+            }
+        );
+        // Strict: capitals only, ≤8 letters / ≤8 digits.
+        assert_eq!(extract_issue_id_from_branch("feat/abc-123"), None);
+        assert_eq!(extract_issue_id_from_branch("feat/ABCDEFGHI-1"), None);
+        assert_eq!(extract_issue_id_from_branch("feat/ABC-123456789"), None);
+        assert_eq!(
+            extract_issue_id_from_branch("feat/ABCDEFGH-12345678"),
+            Some("ABCDEFGH-12345678".into())
+        );
     }
 
     #[test]
