@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, CredentialPromptKind, EditFocus, View};
+use crate::credentials;
 use crate::dirty;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -246,19 +247,30 @@ fn draw_create_prompt(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let masked: String = "*".repeat(app.credential_input.chars().count());
-    let (line1, line2) = match app.credential_prompt_kind {
+    let fallback_path = credentials::linear_api_key_file_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/tod/credentials/linear_api_key".to_string());
+    let (line1, line2, line3) = match app.credential_prompt_kind {
         CredentialPromptKind::Missing => (
-            "Linear API key not found in the OS keyring.",
-            "Paste your key below; it will be stored as service `tod`, account `linear`.",
+            "Linear API key not found in the OS keyring (or encrypted config file).".to_string(),
+            "Paste your key below. Prefer OS keyring (service `tod`, account `linear`)."
+                .to_string(),
+            format!(
+                "If the keyring is unavailable, an encrypted copy is stored at {fallback_path}."
+            ),
         ),
         CredentialPromptKind::Invalid => (
-            "It looks like the API key you entered previously is invalid.",
-            "Try entering a new one; it will replace the stored key (service `tod`, account `linear`).",
+            "It looks like the API key you entered previously is invalid.".to_string(),
+            "Try entering a new one; it will replace the stored key.".to_string(),
+            format!(
+                "Storage: OS keyring when available, otherwise encrypted file at {fallback_path}."
+            ),
         ),
     };
     let body = Paragraph::new(vec![
         Line::from(line1),
         Line::from(line2),
+        Line::from(line3),
         Line::from(""),
         Line::from(vec![
             Span::raw("> "),

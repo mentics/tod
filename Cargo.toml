@@ -13,6 +13,8 @@ dirs = "6"
 # Prefer linux-native (kernel keyutils) over Secret Service so store/load works even when
 # the desktop keyring collection is locked.
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
 rand = "0.9"
 ratatui = "0.30.2"
 serde = { version = "1", features = ["derive"] }

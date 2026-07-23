@@ -814,34 +814,44 @@ impl App {
                     self.set_error("Linear API key cannot be empty");
                     return Ok(());
                 }
-                let store_err = match credentials::store_linear_api_key(&key_text) {
-                    Ok(()) => None,
-                    Err(err) => Some(err),
-                };
+                let store_result = credentials::store_linear_api_key(&key_text);
                 self.credential_input.clear();
                 let pending = self.pending_create_input.take();
                 match pending {
                     Some(input) => {
                         self.create_input.clear();
-                        // Use the key just entered; don't rely on an immediate keyring reload.
+                        // Use the key just entered; don't rely on an immediate reload.
                         self.submit_create_with_key(&input, Some(key_text.as_str()))?;
-                        if let Some(err) = store_err {
-                            // Create may have succeeded; still surface the persistence failure.
-                            let suffix = format!(" (keyring store failed: {err:#})");
-                            if let Some(status) = &mut self.status {
-                                status.text.push_str(&suffix);
-                                status.is_error = true;
-                            } else {
-                                self.set_error(format!("Linear API key not persisted{suffix}"));
+                        match store_result {
+                            Ok(store) => {
+                                // Prefer location message; keep create status if present by appending.
+                                let where_msg = store.status_message();
+                                if let Some(status) = &mut self.status {
+                                    if !status.is_error {
+                                        status.text = format!("{} — {}", status.text, where_msg);
+                                    } else {
+                                        status.text.push_str(&format!(" — {where_msg}"));
+                                    }
+                                } else {
+                                    self.set_status(where_msg);
+                                }
+                            }
+                            Err(err) => {
+                                let suffix = format!(" (credential store failed: {err:#})");
+                                if let Some(status) = &mut self.status {
+                                    status.text.push_str(&suffix);
+                                    status.is_error = true;
+                                } else {
+                                    self.set_error(format!("Linear API key not persisted{suffix}"));
+                                }
                             }
                         }
                     }
                     None => {
                         self.view = View::TaskList;
-                        if let Some(err) = store_err {
-                            self.set_error(format!("Could not store API key: {err:#}"));
-                        } else {
-                            self.set_status("Linear API key saved");
+                        match store_result {
+                            Ok(store) => self.set_status(store.status_message()),
+                            Err(err) => self.set_error(format!("Could not store API key: {err:#}")),
                         }
                     }
                 }
@@ -937,7 +947,9 @@ impl App {
         self.view = View::CredentialPrompt;
         match kind {
             CredentialPromptKind::Missing => {
-                self.set_status("Enter your Linear API key (stored in OS keyring)");
+                self.set_status(
+                    "Enter your Linear API key (OS keyring, or encrypted config file if unavailable)",
+                );
             }
             CredentialPromptKind::Invalid => {
                 self.set_error("Previous Linear API key looks invalid — enter a new one");

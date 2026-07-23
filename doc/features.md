@@ -270,10 +270,18 @@ The user may leave the TUI, fix things manually in the worktree, return to the s
 
 ## Integrations & credentials
 
-Integrations (Linear now; others later) store credentials in the OS keyring via the [`keyring`](https://crates.io/crates/keyring) crate.
+Integrations (Linear now; others later) resolve credentials in this order:
+
+1. **Env override** — `TOD_LINEAR_API_KEY` if set (non-persisted; useful for CI / one-off use)
+2. **OS keyring** — via the [`keyring`](https://crates.io/crates/keyring) crate (service `tod`, account `linear`)
+3. **Encrypted config file** — `{config}/credentials/linear_api_key` (same config dir as tasks: `TOD_DATA_DIR` or `$HOME/.config/tod/`)
 
 When code first needs to contact an integration:
 
-1. Try to load the required credential (e.g. Linear API key) from the OS keyring.
+1. Try to load the credential using the order above.
 2. If it is missing, prompt the user for it.
-3. Store the entered credential in the keyring for later use.
+3. Store the entered credential in the OS keyring when possible; if the keyring is unavailable (common in Linux containers), write an **encrypted** fallback file instead.
+
+**File encryption:** ChaCha20-Poly1305; key derived from machine-bound material (`/etc/machine-id`, else hostname + uid) plus an app salt. File mode `0600`. This reduces casual disclosure; it is **not** equivalent to a real OS keychain against an attacker who can already read your home directory and run code as you.
+
+**Messaging:** After storing, the UI status states where the secret was saved (OS keyring, or the full encrypted file path when falling back). The credential prompt also notes the fallback path.
