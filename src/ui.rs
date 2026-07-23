@@ -3,14 +3,16 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use tui_textarea::{CursorRenderMode, TextArea};
 
 use crate::app::{App, CredentialPromptKind, EditFocus, View};
 use crate::credentials;
 use crate::dirty;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let footer_h = footer_height(app, frame.area().width);
     let [body, footer] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(4)]).areas(frame.area());
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(footer_h)]).areas(frame.area());
 
     match app.view {
         View::TaskList => draw_task_list(frame, body, app),
@@ -98,29 +100,68 @@ fn draw_archive_list(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.archive_state);
 }
 
-fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(edit) = app.edit.as_ref() else {
+fn style_field(ta: &mut TextArea<'static>, title: impl Into<String>, focused: bool) {
+    let border = if focused {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    ta.set_block(
+        Block::default()
+            .title(title.into())
+            .borders(Borders::ALL)
+            .border_style(border),
+    );
+    if focused {
+        ta.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        ta.set_cursor_render_mode(CursorRenderMode::Cell);
+    } else {
+        ta.set_cursor_style(Style::default());
+        ta.set_cursor_render_mode(CursorRenderMode::Hidden);
+    }
+}
+
+fn draw_edit(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(edit) = app.edit.as_mut() else {
         frame.render_widget(
             Paragraph::new("No task selected").block(Block::default().borders(Borders::ALL)),
             area,
         );
         return;
     };
-    let Some(task) = app.tasks.get(edit.task_idx) else {
+    if app.tasks.get(edit.task_idx).is_none() {
         frame.render_widget(
             Paragraph::new("Task missing").block(Block::default().borders(Borders::ALL)),
             area,
         );
         return;
-    };
+    }
 
-    let [fields, modules, readonly] = Layout::vertical([
-        Constraint::Length(7),
+    let [title_area, branch_area, issue_area, modules, readonly] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
         Constraint::Fill(1),
         Constraint::Length(4),
     ])
     .areas(area);
 
+    let focus = edit.focus;
+    style_field(&mut edit.title_input, "Title", focus == EditFocus::Title);
+    style_field(&mut edit.branch_input, "Branch", focus == EditFocus::Branch);
+    style_field(
+        &mut edit.issue_input,
+        "Issue ID",
+        focus == EditFocus::IssueId,
+    );
+
+    frame.render_widget(&edit.title_input, title_area);
+    frame.render_widget(&edit.branch_input, branch_area);
+    frame.render_widget(&edit.issue_input, issue_area);
+
+    let task = &app.tasks[edit.task_idx];
     let focus_style = |focused: bool| {
         if focused {
             Style::default()
@@ -130,46 +171,6 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
         }
     };
-
-    let title_line = Line::from(vec![
-        Span::styled("Title:    ", focus_style(edit.focus == EditFocus::Title)),
-        Span::raw(task.title.clone()),
-        if edit.focus == EditFocus::Title {
-            Span::styled("▌", Style::default().fg(Color::Yellow))
-        } else {
-            Span::raw("")
-        },
-    ]);
-    let branch_val = task.branch.as_deref().unwrap_or("");
-    let branch_line = Line::from(vec![
-        Span::styled("Branch:   ", focus_style(edit.focus == EditFocus::Branch)),
-        Span::raw(branch_val.to_string()),
-        if edit.focus == EditFocus::Branch {
-            Span::styled("▌", Style::default().fg(Color::Yellow))
-        } else {
-            Span::raw("")
-        },
-    ]);
-    let issue_val = task.issue_id.as_deref().unwrap_or("");
-    let issue_line = Line::from(vec![
-        Span::styled("Issue ID: ", focus_style(edit.focus == EditFocus::IssueId)),
-        Span::raw(issue_val.to_string()),
-        if edit.focus == EditFocus::IssueId {
-            Span::styled("▌", Style::default().fg(Color::Yellow))
-        } else {
-            Span::raw("")
-        },
-    ]);
-
-    let fields_widget = Paragraph::new(vec![
-        title_line,
-        Line::from(""),
-        branch_line,
-        Line::from(""),
-        issue_line,
-    ])
-    .block(Block::default().title("Editable").borders(Borders::ALL));
-    frame.render_widget(fields_widget, fields);
 
     let module_items: Vec<ListItem> = edit
         .available_modules
@@ -222,31 +223,43 @@ fn draw_edit(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(readonly_widget, readonly);
 }
 
-fn draw_create_prompt(frame: &mut Frame, area: Rect, app: &App) {
-    let body = Paragraph::new(vec![
-        Line::from("Enter a title, branch (prefix/name), or issue ID (ABC-123):"),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("> "),
-            Span::raw(app.create_input.clone()),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Issue IDs look up Linear (may prompt for API key). Esc cancels.",
-            Style::default().fg(Color::DarkGray),
-        )),
+fn draw_create_prompt(frame: &mut Frame, area: Rect, app: &mut App) {
+    let [hint_top, input_area, hint_bottom] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Fill(1),
     ])
+    .areas(area);
+
+    let top = Paragraph::new(vec![Line::from(
+        "Enter a title, branch (prefix/name), or issue ID (ABC-123):",
+    )])
     .block(
         Block::default()
             .title("Create new task")
             .borders(Borders::ALL),
     );
-    frame.render_widget(body, area);
+    frame.render_widget(top, hint_top);
+
+    app.create_input.set_block(
+        Block::default()
+            .title("Input")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    app.create_input
+        .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(&app.create_input, input_area);
+
+    let bottom = Paragraph::new(vec![Line::from(Span::styled(
+        "←/→ Home/End word-jump edit  Enter create  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(bottom, hint_bottom);
 }
 
-fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &App) {
-    let masked: String = "*".repeat(app.credential_input.chars().count());
+fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &mut App) {
     let fallback_path = credentials::linear_api_key_file_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "~/.config/tod/credentials/linear_api_key".to_string());
@@ -267,28 +280,42 @@ fn draw_credential_prompt(frame: &mut Frame, area: Rect, app: &App) {
             ),
         ),
     };
-    let body = Paragraph::new(vec![
+
+    let [hint_top, input_area, hint_bottom] = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let top = Paragraph::new(vec![
         Line::from(line1),
         Line::from(line2),
         Line::from(line3),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("> "),
-            Span::raw(masked),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter saves and continues create. Esc cancels.",
-            Style::default().fg(Color::DarkGray),
-        )),
     ])
     .block(
         Block::default()
             .title("Linear credentials")
             .borders(Borders::ALL),
     );
-    frame.render_widget(body, area);
+    frame.render_widget(top, hint_top);
+
+    app.credential_input.set_block(
+        Block::default()
+            .title("API key")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    app.credential_input
+        .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(&app.credential_input, input_area);
+
+    let bottom = Paragraph::new(vec![Line::from(Span::styled(
+        "←/→ Home/End word-jump edit  Enter save  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(bottom, hint_bottom);
 }
 
 fn draw_switch_modules(frame: &mut Frame, area: Rect, app: &App) {
@@ -355,40 +382,51 @@ fn draw_switch_modules(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(modules_list, modules);
 }
 
-fn draw_switch_branch(frame: &mut Frame, area: Rect, app: &App) {
-    let (title, input) = match app.switch_prep.as_ref() {
-        Some(prep) => {
-            let title = app
-                .tasks
-                .get(prep.task_idx)
-                .map(|t| t.title.as_str())
-                .unwrap_or("(missing)");
-            (title.to_string(), prep.branch_input.clone())
-        }
-        None => ("(none)".to_string(), String::new()),
-    };
+fn draw_switch_branch(frame: &mut Frame, area: Rect, app: &mut App) {
+    let title = app
+        .switch_prep
+        .as_ref()
+        .and_then(|prep| app.tasks.get(prep.task_idx))
+        .map(|t| t.title.as_str())
+        .unwrap_or("(none)")
+        .to_string();
 
-    let body = Paragraph::new(vec![
+    let [hint_top, input_area, hint_bottom] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let top = Paragraph::new(vec![
         Line::from(format!("Task: {title}")),
         Line::from("Enter the git branch name for this task:"),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("> "),
-            Span::raw(input),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Enter continues switch (lease / activate / Cursor). Esc cancels.",
-            Style::default().fg(Color::DarkGray),
-        )),
     ])
     .block(
         Block::default()
             .title("Switch — branch")
             .borders(Borders::ALL),
     );
-    frame.render_widget(body, area);
+    frame.render_widget(top, hint_top);
+
+    if let Some(prep) = app.switch_prep.as_mut() {
+        prep.branch_input.set_block(
+            Block::default()
+                .title("Branch")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        prep.branch_input
+            .set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        frame.render_widget(&prep.branch_input, input_area);
+    }
+
+    let bottom = Paragraph::new(vec![Line::from(Span::styled(
+        "←/→ Home/End word-jump edit  Enter continue  Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ))])
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(bottom, hint_bottom);
 }
 
 fn draw_dirty_warning(frame: &mut Frame, area: Rect, app: &App) {
@@ -472,7 +510,46 @@ fn draw_dirty_warning(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let help = match app.view {
+    let help = footer_help(app);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(status) = &app.status {
+        let style = if status.is_error {
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD)
+        } else if status.busy {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let text = if status.busy {
+            format!("{} {}", app.spinner_char(), status.text)
+        } else {
+            status.text.clone()
+        };
+        for line in text.lines() {
+            lines.push(Line::from(Span::styled(line.to_string(), style)));
+        }
+        if text.is_empty() {
+            lines.push(Line::from(Span::styled(String::new(), style)));
+        }
+    }
+    lines.push(Line::from(help));
+
+    let footer = Paragraph::new(lines)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, area);
+}
+
+/// Max wrapped lines reserved for the status message inside the footer.
+const MAX_STATUS_LINES: u16 = 10;
+
+fn footer_help(app: &App) -> String {
+    match app.view {
         View::TaskList => {
             let sel = match app.list_state.selected() {
                 Some(0) => "Create new task".to_string(),
@@ -494,34 +571,54 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             format!("{sel}  |  ↑/↓ move  U unarchive  Esc back  Q quit")
         }
         View::Edit => {
-            "Tab/↑/↓ fields  Space toggle module  Enter confirm field  Esc back  Q quit".to_string()
+            "Tab/↑/↓ fields  ←/→ edit text  Space toggle module  Enter confirm  Esc back  Q quit"
+                .to_string()
         }
-        View::CreatePrompt => "Type input  Enter create  Esc cancel".to_string(),
-        View::CredentialPrompt => "Type API key  Enter save  Esc cancel".to_string(),
+        View::CreatePrompt => "Type / move cursor  Enter create  Esc cancel".to_string(),
+        View::CredentialPrompt => "Type / move cursor  Enter save  Esc cancel".to_string(),
         View::SwitchModules => {
             "↑/↓ move  Space toggle  Enter confirm  Esc cancel  Q quit".to_string()
         }
-        View::SwitchBranch => "Type branch  Enter continue  Esc cancel".to_string(),
+        View::SwitchBranch => "Type / move cursor  Enter continue  Esc cancel".to_string(),
         View::DirtyWarning => {
             "↑/↓ move  Enter choose  C check again  S stash  X/Esc cancel  Q quit".to_string()
         }
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(status) = &app.status {
-        let style = if status.is_error {
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(Span::styled(status.text.clone(), style)));
     }
-    lines.push(Line::from(help));
+}
 
-    let footer = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, area);
+/// Footer height: borders + status (0..=10 wrapped lines) + help (wrapped).
+fn footer_height(app: &App, term_width: u16) -> u16 {
+    let inner_width = term_width.saturating_sub(2).max(1) as usize;
+    let help_lines = wrapped_line_count(&footer_help(app), inner_width) as u16;
+    let status_lines = match &app.status {
+        Some(status) => {
+            let text = if status.busy {
+                format!("{} {}", app.spinner_char(), status.text)
+            } else {
+                status.text.clone()
+            };
+            (wrapped_line_count(&text, inner_width) as u16).clamp(1, MAX_STATUS_LINES)
+        }
+        None => 0,
+    };
+    // 2 border rows + content; keep at least the old 4-row footprint when idle.
+    (2 + status_lines + help_lines)
+        .max(3)
+        .min(2 + MAX_STATUS_LINES + help_lines.max(1))
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut total = 0;
+    for line in text.split('\n') {
+        if line.is_empty() {
+            total += 1;
+            continue;
+        }
+        let chars = line.chars().count();
+        total += chars.div_ceil(width).max(1);
+    }
+    total.max(1)
 }

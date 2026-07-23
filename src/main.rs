@@ -7,6 +7,7 @@ mod linear;
 mod persist;
 mod switch;
 mod task;
+mod text_input;
 mod treehouse;
 mod ui;
 

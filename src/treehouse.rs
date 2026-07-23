@@ -37,11 +37,7 @@ pub fn lease_worktree(cwd: impl AsRef<Path>) -> color_eyre::Result<LeasedWorktre
             // Retry without --json if that was the problem; still want --submodules.
         }
         Err(err) => {
-            // Could be missing --lease / --submodules on older binaries, or a real failure.
-            return Err(err).wrap_err(
-                "treehouse get --lease failed (need a Treehouse build with --lease; \
-                 local v1.7 lacks it — upgrade or install the mentics fork with submodule support)",
-            );
+            return Err(err).wrap_err("treehouse get --lease --submodules --json failed");
         }
     }
 
@@ -58,8 +54,8 @@ pub fn lease_worktree(cwd: impl AsRef<Path>) -> color_eyre::Result<LeasedWorktre
     let out = run_lease(cwd, &["get", "--lease", "--json"])
         .or_else(|_| run_lease(cwd, &["get", "--lease"]))
         .wrap_err(
-            "treehouse get --lease failed (CLI may be too old: v1.7 has no --lease; \
-             install a newer Treehouse or the mentics fork)",
+            "treehouse get --lease failed (CLI may lack --lease / --submodules — \
+             upgrade Treehouse or install a build with the lease API)",
         )?;
     parse_lease_output(&out, out.trim_start().starts_with('{'))
 }

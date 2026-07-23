@@ -1,9 +1,13 @@
 use std::env;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
-use color_eyre::eyre::WrapErr;
+use color_eyre::eyre::{WrapErr, eyre};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use ratatui::widgets::ListState;
+use tui_textarea::{Input, Key, TextArea};
 
 use crate::create::{self, ParsedCreateInput};
 use crate::credentials;
@@ -12,6 +16,7 @@ use crate::linear;
 use crate::persist;
 use crate::switch;
 use crate::task::{self, Task};
+use crate::text_input;
 use crate::treehouse;
 use crate::ui;
 
@@ -72,6 +77,9 @@ pub struct EditState {
     /// Highlighted row in the available-modules list.
     pub module_cursor: usize,
     pub available_modules: Vec<String>,
+    pub title_input: TextArea<'static>,
+    pub branch_input: TextArea<'static>,
+    pub issue_input: TextArea<'static>,
 }
 
 /// In-progress switch prerequisites (modules / branch) for a task without a worktree.
@@ -80,15 +88,20 @@ pub struct SwitchPrepState {
     pub task_idx: usize,
     pub module_cursor: usize,
     pub available_modules: Vec<String>,
-    pub branch_input: String,
+    pub branch_input: TextArea<'static>,
 }
 
-/// Message shown in the footer status line.
+/// Message shown in the footer status area.
 #[derive(Debug, Clone)]
 pub struct StatusMessage {
     pub text: String,
     pub is_error: bool,
+    /// When true, the footer prefixes the text with an animated spinner.
+    pub busy: bool,
 }
+
+/// Braille spinner frames for busy status.
+pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug)]
 pub struct App {
@@ -100,14 +113,18 @@ pub struct App {
     pub switch_prep: Option<SwitchPrepState>,
     pub release: Option<ReleaseState>,
     /// Create-prompt input buffer.
-    pub create_input: String,
+    pub create_input: TextArea<'static>,
     /// Credential-prompt input buffer (Linear API key).
-    pub credential_input: String,
+    pub credential_input: TextArea<'static>,
     /// Copy / reason for the credential prompt (missing vs invalid key).
     pub credential_prompt_kind: CredentialPromptKind,
     /// Create input waiting while the user supplies Linear credentials.
     pending_create_input: Option<String>,
+    /// After prompts, run lease/activate/cursor on the next loop tick (so the UI can redraw).
+    pending_finish_switch: Option<usize>,
     pub status: Option<StatusMessage>,
+    /// Index into [`SPINNER_FRAMES`] while a busy status is showing.
+    pub spinner_frame: usize,
     should_quit: bool,
 }
 
@@ -129,11 +146,13 @@ impl App {
             edit: None,
             switch_prep: None,
             release: None,
-            create_input: String::new(),
-            credential_input: String::new(),
+            create_input: text_input::single_line(""),
+            credential_input: text_input::single_line_masked(""),
             credential_prompt_kind: CredentialPromptKind::Missing,
             pending_create_input: None,
+            pending_finish_switch: None,
             status: None,
+            spinner_frame: 0,
             should_quit: false,
         })
     }
@@ -141,9 +160,62 @@ impl App {
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         while !self.should_quit {
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
+            if let Some(task_idx) = self.pending_finish_switch.take() {
+                self.finish_switch(terminal, task_idx)?;
+                continue;
+            }
             self.handle_events()?;
         }
         Ok(())
+    }
+
+    pub fn spinner_char(&self) -> &'static str {
+        SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    fn tick_spinner(&mut self) {
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    /// Set a busy status, advance the spinner, and redraw immediately.
+    fn report_progress(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        msg: impl Into<String>,
+    ) -> color_eyre::Result<()> {
+        self.set_busy(msg);
+        self.tick_spinner();
+        terminal.draw(|frame| ui::draw(frame, self))?;
+        Ok(())
+    }
+
+    /// Run `work` on a background thread while animating the busy spinner.
+    fn run_busy<T, F>(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        msg: impl Into<String>,
+        work: F,
+    ) -> color_eyre::Result<T>
+    where
+        F: FnOnce() -> color_eyre::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.set_busy(msg);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        loop {
+            self.tick_spinner();
+            terminal.draw(|frame| ui::draw(frame, self))?;
+            match rx.recv_timeout(Duration::from_millis(80)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(eyre!("background work thread disconnected"));
+                }
+            }
+        }
     }
 
     fn handle_events(&mut self) -> color_eyre::Result<()> {
@@ -245,7 +317,7 @@ impl App {
     fn activate_list_selection(&mut self) {
         match self.list_state.selected() {
             Some(0) => {
-                self.create_input.clear();
+                self.create_input = text_input::single_line("");
                 self.view = View::CreatePrompt;
                 self.clear_status();
             }
@@ -538,12 +610,24 @@ impl App {
             }
         };
 
+        let (title_input, branch_input, issue_input) = {
+            let task = &self.tasks[task_idx];
+            (
+                text_input::single_line(&task.title),
+                text_input::single_line(task.branch.as_deref().unwrap_or("")),
+                text_input::single_line(task.issue_id.as_deref().unwrap_or("")),
+            )
+        };
+
         self.edit = Some(EditState {
             task_idx,
             return_to,
             focus: EditFocus::Title,
             module_cursor: 0,
             available_modules,
+            title_input,
+            branch_input,
+            issue_input,
         });
         self.view = View::Edit;
         self.clear_status();
@@ -551,36 +635,140 @@ impl App {
     }
 
     fn handle_edit_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        // Crossterm BackTab is not mapped by tui-textarea's Key enum.
+        if matches!(key.code, KeyCode::BackTab) {
+            self.edit_focus_prev();
+            return Ok(());
+        }
+
         let focus = self.edit.as_ref().map(|e| e.focus);
-        match (focus, key.code) {
-            (_, KeyCode::Esc) => self.leave_edit(),
-            (_, KeyCode::Tab) => self.edit_focus_next(),
-            (_, KeyCode::BackTab) => self.edit_focus_prev(),
-            (Some(EditFocus::Modules), KeyCode::Down | KeyCode::Char('j')) => {
-                self.edit_module_move(1);
-            }
-            (Some(EditFocus::Modules), KeyCode::Up | KeyCode::Char('k')) => {
-                self.edit_module_move(-1);
-            }
-            (_, KeyCode::Down) => self.edit_focus_next(),
-            (_, KeyCode::Up) => self.edit_focus_prev(),
-            (_, KeyCode::Enter) => self.edit_confirm_field()?,
-            (Some(EditFocus::Modules), KeyCode::Char(' ')) => self.toggle_selected_module()?,
-            (Some(EditFocus::Modules), KeyCode::Char('q') | KeyCode::Char('Q')) => {
-                self.should_quit = true;
+        let input = Input::from(key);
+
+        // Keys that navigate the edit form (not passed into text fields).
+        match (focus, &input) {
+            (_, Input { key: Key::Esc, .. }) => {
+                self.leave_edit();
+                return Ok(());
             }
             (
-                Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId),
-                KeyCode::Backspace,
+                _,
+                Input {
+                    key: Key::Tab,
+                    shift: false,
+                    ..
+                },
             ) => {
-                self.edit_backspace()?;
+                self.edit_focus_next();
+                return Ok(());
             }
-            (Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId), KeyCode::Char(c)) => {
-                // Letters (including q) go into the text field while focused here.
-                self.edit_insert_char(c)?;
+            (
+                _,
+                Input {
+                    key: Key::Tab,
+                    shift: true,
+                    ..
+                },
+            ) => {
+                self.edit_focus_prev();
+                return Ok(());
             }
-            (_, KeyCode::Char('q') | KeyCode::Char('Q')) => self.should_quit = true,
-            _ => {}
+            (Some(EditFocus::Modules), Input { key: Key::Down, .. })
+            | (
+                Some(EditFocus::Modules),
+                Input {
+                    key: Key::Char('j'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.edit_module_move(1);
+                return Ok(());
+            }
+            (Some(EditFocus::Modules), Input { key: Key::Up, .. })
+            | (
+                Some(EditFocus::Modules),
+                Input {
+                    key: Key::Char('k'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.edit_module_move(-1);
+                return Ok(());
+            }
+            // Up/Down move between fields even while a text input is focused.
+            (_, Input { key: Key::Down, .. }) => {
+                self.edit_focus_next();
+                return Ok(());
+            }
+            (_, Input { key: Key::Up, .. }) => {
+                self.edit_focus_prev();
+                return Ok(());
+            }
+            (
+                _,
+                Input {
+                    key: Key::Enter, ..
+                },
+            ) => {
+                self.edit_confirm_field()?;
+                return Ok(());
+            }
+            (
+                Some(EditFocus::Modules),
+                Input {
+                    key: Key::Char(' '),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.toggle_selected_module()?;
+                return Ok(());
+            }
+            (
+                Some(EditFocus::Modules),
+                Input {
+                    key: Key::Char('q' | 'Q'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.should_quit = true;
+                return Ok(());
+            }
+            (Some(EditFocus::Title | EditFocus::Branch | EditFocus::IssueId), _) => {
+                // Fall through to textarea handling below.
+            }
+            (
+                _,
+                Input {
+                    key: Key::Char('q' | 'Q'),
+                    ctrl: false,
+                    alt: false,
+                    ..
+                },
+            ) => {
+                self.should_quit = true;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+
+        let Some(edit) = self.edit.as_mut() else {
+            return Ok(());
+        };
+        let modified = match edit.focus {
+            EditFocus::Title => edit.title_input.input(input),
+            EditFocus::Branch => edit.branch_input.input(input),
+            EditFocus::IssueId => edit.issue_input.input(input),
+            EditFocus::Modules => false,
+        };
+        if modified {
+            self.sync_edit_inputs_to_task()?;
         }
         Ok(())
     }
@@ -659,72 +847,39 @@ impl App {
         Ok(())
     }
 
-    fn edit_insert_char(&mut self, c: char) -> color_eyre::Result<()> {
-        let (task_idx, focus) = {
+    /// Copy focused edit textareas into the underlying task and persist.
+    fn sync_edit_inputs_to_task(&mut self) -> color_eyre::Result<()> {
+        let (task_idx, title, branch, issue_id) = {
             let Some(edit) = self.edit.as_ref() else {
                 return Ok(());
             };
-            (edit.task_idx, edit.focus)
+            (
+                edit.task_idx,
+                text_input::value(&edit.title_input),
+                text_input::value(&edit.branch_input),
+                text_input::value(&edit.issue_input),
+            )
         };
         let Some(task) = self.tasks.get_mut(task_idx) else {
             return Ok(());
         };
-        match focus {
-            EditFocus::Title => task.title.push(c),
-            EditFocus::Branch => {
-                let branch = task.branch.get_or_insert_with(String::new);
-                branch.push(c);
+        task.title = title;
+        task.branch = {
+            let trimmed = branch.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(branch)
             }
-            EditFocus::IssueId => {
-                let issue_id = task.issue_id.get_or_insert_with(String::new);
-                issue_id.push(c);
-            }
-            EditFocus::Modules => return Ok(()),
-        }
-        task.touch();
-        persist::save_task(task)?;
-        self.sort_tasks_preserving_edit(task_idx)?;
-        Ok(())
-    }
-
-    fn edit_backspace(&mut self) -> color_eyre::Result<()> {
-        let (task_idx, focus) = {
-            let Some(edit) = self.edit.as_ref() else {
-                return Ok(());
-            };
-            (edit.task_idx, edit.focus)
         };
-        if !matches!(
-            focus,
-            EditFocus::Title | EditFocus::Branch | EditFocus::IssueId
-        ) {
-            return Ok(());
-        }
-        let Some(task) = self.tasks.get_mut(task_idx) else {
-            return Ok(());
+        task.issue_id = {
+            let trimmed = issue_id.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(issue_id)
+            }
         };
-        match focus {
-            EditFocus::Title => {
-                task.title.pop();
-            }
-            EditFocus::Branch => {
-                if let Some(branch) = task.branch.as_mut() {
-                    branch.pop();
-                    if branch.is_empty() {
-                        task.branch = None;
-                    }
-                }
-            }
-            EditFocus::IssueId => {
-                if let Some(issue_id) = task.issue_id.as_mut() {
-                    issue_id.pop();
-                    if issue_id.is_empty() {
-                        task.issue_id = None;
-                    }
-                }
-            }
-            EditFocus::Modules => return Ok(()),
-        }
         task.touch();
         persist::save_task(task)?;
         self.sort_tasks_preserving_edit(task_idx)?;
@@ -776,50 +931,59 @@ impl App {
     // --- Create prompt -----------------------------------------------------
 
     fn handle_create_prompt_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
-        match key.code {
-            KeyCode::Esc => {
-                self.create_input.clear();
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
+                self.create_input = text_input::single_line("");
                 self.pending_create_input = None;
                 self.view = View::TaskList;
                 self.clear_status();
             }
-            KeyCode::Enter => {
-                let input = self.create_input.clone();
-                self.submit_create(&input)?;
+            Input {
+                key: Key::Enter, ..
+            } => {
+                let text = text_input::value(&self.create_input);
+                self.submit_create(&text)?;
             }
-            KeyCode::Backspace => {
-                self.create_input.pop();
+            // Keep single-line: ignore bare Ctrl+M (treated as Enter by some terminals).
+            Input {
+                key: Key::Char('m'),
+                ctrl: true,
+                ..
+            } => {}
+            input => {
+                self.create_input.input(input);
             }
-            KeyCode::Char(c) => {
-                self.create_input.push(c);
-            }
-            _ => {}
         }
         Ok(())
     }
 
     fn handle_credential_prompt_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
-        match key.code {
-            KeyCode::Esc => {
-                self.credential_input.clear();
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
+                self.credential_input = text_input::single_line_masked("");
                 self.pending_create_input = None;
                 self.credential_prompt_kind = CredentialPromptKind::Missing;
-                self.create_input.clear();
+                self.create_input = text_input::single_line("");
                 self.view = View::TaskList;
                 self.set_status("Create cancelled (no Linear API key)");
             }
-            KeyCode::Enter => {
-                let key_text = self.credential_input.trim().to_string();
+            Input {
+                key: Key::Enter, ..
+            } => {
+                let key_text = text_input::value(&self.credential_input);
+                let key_text = key_text.trim().to_string();
                 if key_text.is_empty() {
                     self.set_error("Linear API key cannot be empty");
                     return Ok(());
                 }
                 let store_result = credentials::store_linear_api_key(&key_text);
-                self.credential_input.clear();
+                self.credential_input = text_input::single_line_masked("");
                 let pending = self.pending_create_input.take();
                 match pending {
                     Some(input) => {
-                        self.create_input.clear();
+                        self.create_input = text_input::single_line("");
                         // Use the key just entered; don't rely on an immediate reload.
                         self.submit_create_with_key(&input, Some(key_text.as_str()))?;
                         match store_result {
@@ -856,13 +1020,14 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.credential_input.pop();
+            Input {
+                key: Key::Char('m'),
+                ctrl: true,
+                ..
+            } => {}
+            input => {
+                self.credential_input.input(input);
             }
-            KeyCode::Char(c) => {
-                self.credential_input.push(c);
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -942,7 +1107,7 @@ impl App {
 
     fn open_credential_prompt(&mut self, issue_id: &str, kind: CredentialPromptKind) {
         self.pending_create_input = Some(issue_id.to_string());
-        self.credential_input.clear();
+        self.credential_input = text_input::single_line_masked("");
         self.credential_prompt_kind = kind;
         self.view = View::CredentialPrompt;
         match kind {
@@ -975,7 +1140,7 @@ impl App {
         self.sort_tasks();
         self.select_active_task_by_stem(&stem);
 
-        self.create_input.clear();
+        self.create_input = text_input::single_line("");
         self.pending_create_input = None;
         self.credential_prompt_kind = CredentialPromptKind::Missing;
         self.view = View::TaskList;
@@ -1007,7 +1172,8 @@ impl App {
         }
 
         if self.tasks[task_idx].worktree.is_some() {
-            return self.finish_switch(task_idx);
+            self.queue_finish_switch(task_idx);
+            return Ok(());
         }
 
         // No worktree yet: ensure modules + branch, then lease.
@@ -1023,7 +1189,14 @@ impl App {
             return self.open_switch_branch_prompt(task_idx);
         }
 
-        self.finish_switch(task_idx)
+        self.queue_finish_switch(task_idx);
+        Ok(())
+    }
+
+    /// Schedule lease/activate/cursor after the next redraw (keeps the status bar live).
+    fn queue_finish_switch(&mut self, task_idx: usize) {
+        self.set_busy("Switching to task…");
+        self.pending_finish_switch = Some(task_idx);
     }
 
     fn open_switch_modules_prompt(&mut self, task_idx: usize) -> color_eyre::Result<()> {
@@ -1032,7 +1205,7 @@ impl App {
             task_idx,
             module_cursor: 0,
             available_modules,
-            branch_input: String::new(),
+            branch_input: text_input::single_line(""),
         });
         self.view = View::SwitchModules;
         self.set_status("Select modules for this task (Space toggle, Enter confirm)");
@@ -1049,7 +1222,9 @@ impl App {
             task_idx,
             module_cursor: 0,
             available_modules,
-            branch_input: self.tasks[task_idx].branch.clone().unwrap_or_default(),
+            branch_input: text_input::single_line(
+                self.tasks[task_idx].branch.as_deref().unwrap_or(""),
+            ),
         });
         self.view = View::SwitchBranch;
         self.set_status("Enter a branch name for this task");
@@ -1090,24 +1265,26 @@ impl App {
     }
 
     fn handle_switch_branch_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
-        match key.code {
-            KeyCode::Esc => {
+        let input = Input::from(key);
+        match input {
+            Input { key: Key::Esc, .. } => {
                 self.switch_prep = None;
                 self.view = View::TaskList;
                 self.set_status("Switch cancelled");
             }
-            KeyCode::Enter => self.confirm_switch_branch()?,
-            KeyCode::Backspace => {
+            Input {
+                key: Key::Enter, ..
+            } => self.confirm_switch_branch()?,
+            Input {
+                key: Key::Char('m'),
+                ctrl: true,
+                ..
+            } => {}
+            input => {
                 if let Some(prep) = self.switch_prep.as_mut() {
-                    prep.branch_input.pop();
+                    prep.branch_input.input(input);
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(prep) = self.switch_prep.as_mut() {
-                    prep.branch_input.push(c);
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -1165,7 +1342,8 @@ impl App {
         {
             return self.open_switch_branch_prompt(task_idx);
         }
-        self.finish_switch(task_idx)
+        self.queue_finish_switch(task_idx);
+        Ok(())
     }
 
     fn confirm_switch_branch(&mut self) -> color_eyre::Result<()> {
@@ -1173,7 +1351,8 @@ impl App {
             return Ok(());
         };
         let task_idx = prep.task_idx;
-        let branch = prep.branch_input.trim().to_string();
+        let branch = text_input::value(&prep.branch_input);
+        let branch = branch.trim().to_string();
         if branch.is_empty() {
             self.set_error("Branch name cannot be empty");
             return Ok(());
@@ -1192,7 +1371,8 @@ impl App {
             .as_ref()
             .map(|p| p.task_idx)
             .unwrap_or(task_idx);
-        self.finish_switch(task_idx)
+        self.queue_finish_switch(task_idx);
+        Ok(())
     }
 
     /// Re-sort and keep `switch_prep.task_idx` pointing at the same task.
@@ -1214,7 +1394,15 @@ impl App {
     }
 
     /// Lease if needed, activate branches, launch Cursor, touch + persist.
-    fn finish_switch(&mut self, task_idx: usize) -> color_eyre::Result<()> {
+    fn finish_switch(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        task_idx: usize,
+    ) -> color_eyre::Result<()> {
+        // Leave any switch prompts; progress lives in the status bar.
+        self.switch_prep = None;
+        self.view = View::TaskList;
+
         let stem = self
             .tasks
             .get(task_idx)
@@ -1224,7 +1412,11 @@ impl App {
         // Lease when no worktree yet.
         if self.tasks[task_idx].worktree.is_none() {
             let cwd = env::current_dir().wrap_err("reading cwd for treehouse lease")?;
-            match switch::lease_new_worktree(&cwd) {
+            match self.run_busy(
+                terminal,
+                "New worktree: leasing from Treehouse…",
+                move || switch::lease_new_worktree(&cwd),
+            ) {
                 Ok(wt) => {
                     let task = &mut self.tasks[task_idx];
                     task.worktree = Some(wt);
@@ -1261,13 +1453,16 @@ impl App {
             (worktree, task.modules.clone(), branch)
         };
 
-        if let Err(err) = switch::activate_worktree(&worktree, &modules, &branch) {
+        if let Err(err) = switch::activate_worktree(&worktree, &modules, &branch, |step| {
+            self.report_progress(terminal, step)
+        }) {
             self.switch_prep = None;
             self.view = View::TaskList;
             self.set_error(format!("Activate worktree failed: {err:#}"));
             return Ok(());
         }
 
+        self.report_progress(terminal, "Opening Cursor…")?;
         if let Err(err) = switch::launch_cursor(&worktree) {
             self.switch_prep = None;
             self.view = View::TaskList;
@@ -1448,6 +1643,15 @@ impl App {
         self.status = Some(StatusMessage {
             text: msg.into(),
             is_error: false,
+            busy: false,
+        });
+    }
+
+    fn set_busy(&mut self, msg: impl Into<String>) {
+        self.status = Some(StatusMessage {
+            text: msg.into(),
+            is_error: false,
+            busy: true,
         });
     }
 
@@ -1455,6 +1659,7 @@ impl App {
         self.status = Some(StatusMessage {
             text: msg.into(),
             is_error: true,
+            busy: false,
         });
     }
 

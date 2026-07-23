@@ -9,10 +9,13 @@ use crate::task::Worktree;
 use crate::treehouse;
 
 /// Check out the task branch (or `temp{N}`) in the worktree main repo and each submodule.
+///
+/// `on_progress` is called with a human-readable step label before each checkout.
 pub fn activate_worktree(
     worktree: &Worktree,
     task_modules: &[String],
     branch: &str,
+    mut on_progress: impl FnMut(String) -> color_eyre::Result<()>,
 ) -> color_eyre::Result<()> {
     if branch.is_empty() {
         return Err(eyre!("cannot activate worktree without a branch name"));
@@ -31,6 +34,9 @@ pub fn activate_worktree(
     } else {
         temp_branch.as_str()
     };
+    on_progress(format!(
+        "Activate worktree: main `{main_name}` → `{main_target}`"
+    ))?;
     gitutil::checkout_or_create_branch(root, main_target)
         .wrap_err_with(|| format!("activating main repo `{}` onto `{main_target}`", main_name))?;
 
@@ -47,6 +53,9 @@ pub fn activate_worktree(
         } else {
             temp_branch.as_str()
         };
+        on_progress(format!(
+            "Activate worktree: submodule `{name}` → `{target}`"
+        ))?;
         gitutil::checkout_or_create_branch(&sub_path, target)
             .wrap_err_with(|| format!("activating submodule `{name}` onto `{target}`"))?;
     }
@@ -132,12 +141,12 @@ mod tests {
         };
 
         // Main module selected → task branch.
-        activate_worktree(&wt, &[main.clone()], "feat/switch-test").unwrap();
+        activate_worktree(&wt, &[main.clone()], "feat/switch-test", |_| Ok(())).unwrap();
         let head = gitutil::git_stdout(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
         assert_eq!(head.trim(), "feat/switch-test");
 
         // Main not selected → temp7.
-        activate_worktree(&wt, &[], "feat/switch-test").unwrap();
+        activate_worktree(&wt, &[], "feat/switch-test", |_| Ok(())).unwrap();
         let head = gitutil::git_stdout(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
         assert_eq!(head.trim(), "temp7");
 
