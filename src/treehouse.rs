@@ -345,52 +345,133 @@ fn run_return(args: &[&str]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Open Cursor on `path` without waiting for it to exit.
+/// Open Cursor on `path` without waiting for the editor window to close.
 ///
 /// Inside a devcontainer, prefers
 /// `cursor --folder-uri vscode-remote://dev-container+<hex(hostPath)><containerPath>`
-/// so the local Cursor client targets the existing container config explicitly.
-/// That avoids relying on a live `VSCODE_IPC_HOOK_CLI` socket (which a long-lived
-/// `tod` process often holds stale) and the remote-CLI fallback that re-runs
-/// compose against a path's `.devcontainer/`.
+/// so the local client targets the existing container config explicitly (avoids
+/// rediscovering a nested `.devcontainer/` and re-running compose).
+///
+/// The remote CLI still needs a live `VSCODE_IPC_HOOK_CLI` socket to reach the
+/// host Cursor window. A long-lived `tod` often inherited a stale hook, so we
+/// refresh to the newest `vscode-ipc-*.sock` before invoking `cursor`.
 ///
 /// Outside a container (or when the host path cannot be resolved), falls back to
-/// `cursor {path}`.
+/// `cursor {path}` (still with a refreshed IPC hook when available).
 pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
     let path = path.as_ref();
     let abs = abs_path_string(path)?;
 
     if let Some(uri) = devcontainer_folder_uri(&abs) {
-        spawn_cursor(
-            &["--folder-uri", uri.as_str()],
-            /* clear_stale_ipc */ true,
-            &abs,
-        )
+        run_cursor(&["--folder-uri", uri.as_str()], &abs)
     } else {
-        spawn_cursor(&[abs.as_str()], /* clear_stale_ipc */ false, &abs)
+        run_cursor(&[abs.as_str()], &abs)
     }
 }
 
-fn spawn_cursor(
-    args: &[&str],
-    clear_stale_ipc: bool,
-    display_path: &str,
-) -> color_eyre::Result<()> {
+fn run_cursor(args: &[&str], display_path: &str) -> color_eyre::Result<()> {
     let mut cmd = Command::new("cursor");
     cmd.args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if clear_stale_ipc {
-        // A stale IPC hook from when `tod` was started makes the remote CLI try
-        // a dead window socket before honoring --folder-uri.
-        cmd.env_remove("VSCODE_IPC_HOOK_CLI");
-        cmd.env_remove("VSCODE_IPC_HOOK");
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(hook) = newest_vscode_ipc_hook() {
+        cmd.env("VSCODE_IPC_HOOK_CLI", &hook);
     }
-    cmd.spawn().wrap_err_with(|| {
+
+    // Remote CLI returns quickly after posting to the IPC socket; waiting lets
+    // us surface silent failures (it often exits 0 while printing an error).
+    let output = cmd.output().wrap_err_with(|| {
         format!("failed to launch `cursor` on {display_path} — is the Cursor CLI on PATH?")
     })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+    if !output.status.success()
+        || combined.contains("only available in WSL or inside a Visual Studio Code terminal")
+    {
+        let detail = combined.trim();
+        if detail.is_empty() {
+            return Err(eyre!(
+                "cursor launch failed for {display_path} (exit {})",
+                output.status
+            ));
+        }
+        return Err(eyre!("cursor launch failed for {display_path}: {detail}"));
+    }
     Ok(())
+}
+
+/// Prefer the newest live `vscode-ipc-*.sock` so a long-lived process does not
+/// keep using the hook it inherited at startup.
+fn newest_vscode_ipc_hook() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
+        let p = PathBuf::from(xdg);
+        if p.is_dir() {
+            dirs.push(p);
+        }
+    }
+    if let Some(uid) = current_uid() {
+        let p = PathBuf::from(format!("/run/user/{uid}"));
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    let tmp = PathBuf::from("/tmp");
+    if tmp.is_dir() && !dirs.contains(&tmp) {
+        dirs.push(tmp);
+    }
+    // Also scan the directory of the inherited hook, if any.
+    if let Ok(existing) = env::var("VSCODE_IPC_HOOK_CLI") {
+        if let Some(parent) = Path::new(&existing).parent() {
+            let p = parent.to_path_buf();
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("vscode-ipc-") && name.ends_with(".sock")) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(best_time, _)| modified > *best_time)
+            {
+                best = Some((modified, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn current_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            continue;
+        };
+        return rest.split_whitespace().next()?.parse().ok();
+    }
+    None
 }
 
 fn abs_path_string(path: &Path) -> color_eyre::Result<String> {
