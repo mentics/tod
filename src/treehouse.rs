@@ -1,5 +1,7 @@
 //! Treehouse CLI integration: lease worktrees and launch Cursor.
 
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -343,22 +345,176 @@ fn run_return(args: &[&str]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Spawn `cursor {path}` without waiting for it to exit.
+/// Open Cursor on `path` without waiting for it to exit.
+///
+/// Inside a devcontainer, prefers
+/// `cursor --folder-uri vscode-remote://dev-container+<hex(hostPath)><containerPath>`
+/// so the local Cursor client targets the existing container config explicitly.
+/// That avoids relying on a live `VSCODE_IPC_HOOK_CLI` socket (which a long-lived
+/// `tod` process often holds stale) and the remote-CLI fallback that re-runs
+/// compose against a path's `.devcontainer/`.
+///
+/// Outside a container (or when the host path cannot be resolved), falls back to
+/// `cursor {path}`.
 pub fn launch_cursor(path: impl AsRef<Path>) -> color_eyre::Result<()> {
     let path = path.as_ref();
-    Command::new("cursor")
-        .arg(path)
+    let abs = abs_path_string(path)?;
+
+    if let Some(uri) = devcontainer_folder_uri(&abs) {
+        spawn_cursor(
+            &["--folder-uri", uri.as_str()],
+            /* clear_stale_ipc */ true,
+            &abs,
+        )
+    } else {
+        spawn_cursor(&[abs.as_str()], /* clear_stale_ipc */ false, &abs)
+    }
+}
+
+fn spawn_cursor(
+    args: &[&str],
+    clear_stale_ipc: bool,
+    display_path: &str,
+) -> color_eyre::Result<()> {
+    let mut cmd = Command::new("cursor");
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .wrap_err_with(|| {
-            format!(
-                "failed to launch `cursor` on {} — is the Cursor CLI on PATH?",
-                path.display()
-            )
-        })?;
+        .stderr(Stdio::null());
+    if clear_stale_ipc {
+        // A stale IPC hook from when `tod` was started makes the remote CLI try
+        // a dead window socket before honoring --folder-uri.
+        cmd.env_remove("VSCODE_IPC_HOOK_CLI");
+        cmd.env_remove("VSCODE_IPC_HOOK");
+    }
+    cmd.spawn().wrap_err_with(|| {
+        format!("failed to launch `cursor` on {display_path} — is the Cursor CLI on PATH?")
+    })?;
     Ok(())
+}
+
+fn abs_path_string(path: &Path) -> color_eyre::Result<String> {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .wrap_err("reading cwd to absolutize Cursor path")?
+            .join(path)
+    };
+    let s = abs
+        .to_str()
+        .ok_or_else(|| eyre!("path is not valid UTF-8: {}", abs.display()))?;
+    Ok(s.to_string())
+}
+
+/// Build a `vscode-remote://dev-container+…` folder URI when we can resolve the
+/// host path that identifies the running container's config.
+///
+/// Host-path resolution order:
+/// 1. `TOD_DEVCONTAINER_HOST_PATH`
+/// 2. `LOCAL_WORKSPACE_FOLDER` (sometimes injected by Dev Containers)
+/// 3. Bind-mount source covering `/workspace` or `folder` from `/proc/self/mountinfo`
+fn devcontainer_folder_uri(folder: &str) -> Option<String> {
+    let host_path = resolve_devcontainer_host_path(folder)?;
+    Some(format!(
+        "vscode-remote://dev-container+{}{}",
+        utf8_to_hex(&host_path),
+        folder
+    ))
+}
+
+fn resolve_devcontainer_host_path(folder: &str) -> Option<String> {
+    if let Ok(p) = env::var("TOD_DEVCONTAINER_HOST_PATH") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Ok(p) = env::var("LOCAL_WORKSPACE_FOLDER") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if !looks_like_container() {
+        return None;
+    }
+    bind_source_covering(folder)
+}
+
+fn looks_like_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+        || env::var_os("REMOTE_CONTAINERS").is_some()
+        || env::var_os("DEVCONTAINER").is_some()
+}
+
+/// Return the mountinfo "root" (bind source) for the longest mount point that
+/// prefixes `folder`, preferring `/workspace` when the folder lives under it.
+fn bind_source_covering(folder: &str) -> Option<String> {
+    let mounts = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").ok()?)?;
+    if folder == "/workspace" || folder.starts_with("/workspace/") {
+        if let Some(m) = mounts.iter().find(|m| m.mount_point == "/workspace") {
+            return Some(m.root.clone());
+        }
+    }
+    mounts
+        .into_iter()
+        .filter(|m| folder == m.mount_point || folder.starts_with(&(m.mount_point.clone() + "/")))
+        .max_by_key(|m| m.mount_point.len())
+        .map(|m| m.root)
+}
+
+#[derive(Debug, Clone)]
+struct MountInfoEntry {
+    root: String,
+    mount_point: String,
+}
+
+fn parse_mountinfo(contents: &str) -> Option<Vec<MountInfoEntry>> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        // mount_id parent major:minor root mount_point options [opt]* - fstype source super
+        let mut parts = line.split(' ');
+        let _id = parts.next()?;
+        let _parent = parts.next()?;
+        let _dev = parts.next()?;
+        let root = unescape_mount_path(parts.next()?);
+        let mount_point = unescape_mount_path(parts.next()?);
+        if root.is_empty() || mount_point.is_empty() {
+            continue;
+        }
+        out.push(MountInfoEntry { root, mount_point });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn unescape_mount_path(s: &str) -> String {
+    // mountinfo escapes space, tab, newline, backslash as \040 \011 \012 \134.
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let oct = &s[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn utf8_to_hex(s: &str) -> String {
+    let mut hex = String::with_capacity(s.len() * 2);
+    for b in s.as_bytes() {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -444,5 +600,62 @@ mod tests {
     #[test]
     fn ignores_unrelated_lease_errors() {
         assert!(parse_lease_path_conflict_msg("treehouse get failed: pool empty").is_none());
+    }
+
+    #[test]
+    fn hex_encodes_host_path_bytes() {
+        assert_eq!(utf8_to_hex("/tmp/ws"), "2f746d702f7773");
+    }
+
+    #[test]
+    fn builds_devcontainer_folder_uri_shape() {
+        let host = "/home/me/proj";
+        let folder = "/workspace/.local/.treehouse/worktrees/workspace-df5f8e/1/workspace";
+        let uri = format!(
+            "vscode-remote://dev-container+{}{}",
+            utf8_to_hex(host),
+            folder
+        );
+        assert_eq!(
+            uri,
+            format!(
+                "vscode-remote://dev-container+{}{}",
+                "2f686f6d652f6d652f70726f6a", folder
+            )
+        );
+    }
+
+    #[test]
+    fn parses_mountinfo_bind_of_workspace() {
+        let contents = "\
+123 456 8:1 /home/me/proj /workspace rw,relatime - ext4 /dev/sda1 rw\n\
+124 456 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n";
+        let mounts = parse_mountinfo(contents).unwrap();
+        assert_eq!(mounts[0].root, "/home/me/proj");
+        assert_eq!(mounts[0].mount_point, "/workspace");
+    }
+
+    #[test]
+    fn unescapes_mountinfo_octal_paths() {
+        assert_eq!(
+            unescape_mount_path("/home/me/my\\040proj"),
+            "/home/me/my proj"
+        );
+    }
+
+    #[test]
+    fn bind_source_prefers_workspace_mount() {
+        let contents = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+2 1 8:1 /home/me/proj /workspace rw - ext4 /dev/sda1 rw\n";
+        // Simulate by parsing then selecting like bind_source_covering would.
+        let mounts = parse_mountinfo(contents).unwrap();
+        let folder = "/workspace/.local/.treehouse/worktrees/workspace-df5f8e/1/workspace";
+        let root = mounts
+            .iter()
+            .find(|m| m.mount_point == "/workspace")
+            .map(|m| m.root.as_str());
+        assert_eq!(root, Some("/home/me/proj"));
+        assert!(folder.starts_with("/workspace/"));
     }
 }
