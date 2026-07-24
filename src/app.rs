@@ -343,7 +343,7 @@ impl App {
                 self.finish_switch(terminal, task_idx)?;
                 continue;
             }
-            self.handle_events()?;
+            self.handle_events(terminal)?;
         }
         Ok(())
     }
@@ -397,24 +397,28 @@ impl App {
         }
     }
 
-    fn handle_events(&mut self) -> color_eyre::Result<()> {
+    fn handle_events(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key)?,
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(terminal, key)?,
             _ => {}
         }
         Ok(())
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+    fn handle_key(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        key: KeyEvent,
+    ) -> color_eyre::Result<()> {
         match self.view {
-            View::TaskList => self.handle_task_list_key(key)?,
+            View::TaskList => self.handle_task_list_key(terminal, key)?,
             View::Archive => self.handle_archive_key(key)?,
             View::Edit => self.handle_edit_key(key)?,
             View::CreatePrompt => self.handle_create_prompt_key(key)?,
             View::CredentialPrompt => self.handle_credential_prompt_key(key)?,
             View::SwitchModules => self.handle_switch_modules_key(key)?,
             View::SwitchBranch => self.handle_switch_branch_key(key)?,
-            View::DirtyWarning => self.handle_dirty_warning_key(key)?,
+            View::DirtyWarning => self.handle_dirty_warning_key(terminal, key)?,
             View::StaleWorktree => self.handle_stale_worktree_key(key)?,
             View::BranchLocked => self.handle_branch_locked_key(key)?,
         }
@@ -423,7 +427,11 @@ impl App {
 
     // --- Task list ---------------------------------------------------------
 
-    fn handle_task_list_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+    fn handle_task_list_key(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        key: KeyEvent,
+    ) -> color_eyre::Result<()> {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
@@ -432,9 +440,9 @@ impl App {
             // when the terminal omits KeyModifiers::SHIFT.
             KeyCode::Char('a') | KeyCode::Char('A') if shift => self.open_archive_view(),
             KeyCode::Char('A') => self.open_archive_view(),
-            KeyCode::Char('a') => self.archive_selected()?,
+            KeyCode::Char('a') => self.archive_selected(terminal)?,
             KeyCode::Char('e') | KeyCode::Char('E') => self.open_edit_for_list_selection()?,
-            KeyCode::Char('r') | KeyCode::Char('R') => self.release_selected()?,
+            KeyCode::Char('r') | KeyCode::Char('R') => self.release_selected(terminal)?,
             KeyCode::Down | KeyCode::Char('j') => self.select_next_list(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous_list(),
             KeyCode::Enter => self.activate_list_selection(),
@@ -538,7 +546,7 @@ impl App {
         self.open_edit(task_idx, View::TaskList)
     }
 
-    fn archive_selected(&mut self) -> color_eyre::Result<()> {
+    fn archive_selected(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let Some(row) = self.list_state.selected() else {
             return Ok(());
         };
@@ -551,13 +559,13 @@ impl App {
         };
 
         if self.tasks[task_idx].worktree.is_some() {
-            return self.begin_release(task_idx, true);
+            return self.begin_release(terminal, task_idx, true);
         }
 
         self.finish_archive(task_idx)
     }
 
-    fn release_selected(&mut self) -> color_eyre::Result<()> {
+    fn release_selected(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let Some(row) = self.list_state.selected() else {
             return Ok(());
         };
@@ -574,11 +582,16 @@ impl App {
             return Ok(());
         }
 
-        self.begin_release(task_idx, false)
+        self.begin_release(terminal, task_idx, false)
     }
 
     /// Start release: dirty-check first; show warning or proceed.
-    fn begin_release(&mut self, task_idx: usize, then_archive: bool) -> color_eyre::Result<()> {
+    fn begin_release(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        task_idx: usize,
+        then_archive: bool,
+    ) -> color_eyre::Result<()> {
         let Some(path) = self
             .tasks
             .get(task_idx)
@@ -589,25 +602,32 @@ impl App {
             return Ok(());
         };
 
-        match dirty::inspect_worktree(&path) {
-            Ok(report) if report.is_clean() => self.complete_release(task_idx, then_archive),
-            Ok(report) => {
-                let actions = dirty::menu_actions(&report);
-                self.release = Some(ReleaseState {
-                    task_idx,
-                    then_archive,
-                    report,
-                    actions,
-                    action_cursor: 0,
-                });
-                self.view = View::DirtyWarning;
-                self.clear_status();
-                Ok(())
-            }
-            Err(err) => {
-                self.set_error(format!("Dirty check failed: {err:#}"));
-                Ok(())
-            }
+        let path_for_check = path.clone();
+        let report =
+            match self.run_busy(terminal, "Checking worktree for leftovers…", move || {
+                dirty::inspect_worktree(&path_for_check)
+            }) {
+                Ok(report) => report,
+                Err(err) => {
+                    self.set_error(format!("Dirty check failed: {err:#}"));
+                    return Ok(());
+                }
+            };
+
+        if report.is_clean() {
+            self.complete_release(terminal, task_idx, then_archive)
+        } else {
+            let actions = dirty::menu_actions(&report);
+            self.release = Some(ReleaseState {
+                task_idx,
+                then_archive,
+                report,
+                actions,
+                action_cursor: 0,
+            });
+            self.view = View::DirtyWarning;
+            self.clear_status();
+            Ok(())
         }
     }
 
@@ -627,7 +647,12 @@ impl App {
     }
 
     /// Return worktree to Treehouse, clear association, optionally archive.
-    fn complete_release(&mut self, task_idx: usize, then_archive: bool) -> color_eyre::Result<()> {
+    fn complete_release(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        task_idx: usize,
+        then_archive: bool,
+    ) -> color_eyre::Result<()> {
         let (stem, path, wt_num) = {
             let Some(task) = self.tasks.get(task_idx) else {
                 return Ok(());
@@ -639,9 +664,15 @@ impl App {
             (task.file_stem.clone(), wt.path.clone(), wt.number)
         };
 
-        if let Err(err) = treehouse::return_worktree(&path) {
-            self.release = None;
-            self.view = View::TaskList;
+        // Leave any dirty-warning prompt; progress lives in the status bar.
+        self.release = None;
+        self.view = View::TaskList;
+
+        if let Err(err) = self.run_busy(
+            terminal,
+            format!("Releasing worktree {wt_num}…"),
+            move || treehouse::return_worktree(&path),
+        ) {
             self.set_error(format!("Treehouse return failed: {err:#}"));
             return Ok(());
         }
@@ -666,12 +697,10 @@ impl App {
             .position(|t| t.file_stem == stem)
             .ok_or_else(|| color_eyre::eyre::eyre!("task disappeared after release"))?;
 
-        self.release = None;
         if then_archive {
             self.finish_archive(task_idx)?;
             self.set_status(format!("Released worktree {wt_num} and archived task"));
         } else {
-            self.view = View::TaskList;
             self.select_active_task_by_stem(&stem);
             self.set_status(format!("Released worktree {wt_num}"));
         }
@@ -2043,13 +2072,17 @@ impl App {
 
     // --- Release / dirty warning -------------------------------------------
 
-    fn handle_dirty_warning_key(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+    fn handle_dirty_warning_key(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        key: KeyEvent,
+    ) -> color_eyre::Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.should_quit = true,
             KeyCode::Esc => self.cancel_release(),
             KeyCode::Down | KeyCode::Char('j') => self.move_dirty_action(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_dirty_action(-1),
-            KeyCode::Enter => self.confirm_dirty_action()?,
+            KeyCode::Enter => self.confirm_dirty_action(terminal)?,
             KeyCode::Char(c) => {
                 let lower = c.to_ascii_lowercase();
                 if let Some(rel) = self.release.as_ref()
@@ -2058,7 +2091,7 @@ impl App {
                     if let Some(rel) = self.release.as_mut() {
                         rel.action_cursor = idx;
                     }
-                    self.confirm_dirty_action()?;
+                    self.confirm_dirty_action(terminal)?;
                 }
             }
             _ => {}
@@ -2078,7 +2111,7 @@ impl App {
         rel.action_cursor = (cur + delta).rem_euclid(len as i32) as usize;
     }
 
-    fn confirm_dirty_action(&mut self) -> color_eyre::Result<()> {
+    fn confirm_dirty_action(&mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         let (action, task_idx, then_archive, path) = {
             let Some(rel) = self.release.as_ref() else {
                 return Ok(());
@@ -2104,22 +2137,27 @@ impl App {
                     self.set_error("Worktree association missing; release cancelled");
                     return Ok(());
                 };
-                match dirty::inspect_worktree(&path) {
-                    Ok(report) if report.is_clean() => {
-                        self.complete_release(task_idx, then_archive)?;
-                    }
-                    Ok(report) => {
-                        let actions = dirty::menu_actions(&report);
-                        if let Some(rel) = self.release.as_mut() {
-                            rel.report = report;
-                            rel.actions = actions;
-                            rel.action_cursor = 0;
+                let path_for_check = path.clone();
+                let report =
+                    match self.run_busy(terminal, "Checking worktree for leftovers…", move || {
+                        dirty::inspect_worktree(&path_for_check)
+                    }) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            self.set_error(format!("Dirty check failed: {err:#}"));
+                            return Ok(());
                         }
-                        self.set_error("Still dirty — fix leftovers or stash, then check again");
+                    };
+                if report.is_clean() {
+                    self.complete_release(terminal, task_idx, then_archive)?;
+                } else {
+                    let actions = dirty::menu_actions(&report);
+                    if let Some(rel) = self.release.as_mut() {
+                        rel.report = report;
+                        rel.actions = actions;
+                        rel.action_cursor = 0;
                     }
-                    Err(err) => {
-                        self.set_error(format!("Dirty check failed: {err:#}"));
-                    }
+                    self.set_error("Still dirty — fix leftovers or stash, then check again");
                 }
             }
             DirtyAction::StashChanges => {
@@ -2128,32 +2166,39 @@ impl App {
                     self.set_error("Worktree association missing; release cancelled");
                     return Ok(());
                 };
-                if let Err(err) = dirty::stash_local_changes(&path) {
+                let path_for_stash = path.clone();
+                if let Err(err) = self.run_busy(terminal, "Stashing local changes…", move || {
+                    dirty::stash_local_changes(&path_for_stash)
+                }) {
                     self.set_error(format!("Stash failed: {err:#}"));
                     return Ok(());
                 }
-                match dirty::inspect_worktree(&path) {
-                    Ok(report) if report.is_clean() => {
-                        self.complete_release(task_idx, then_archive)?;
-                    }
-                    Ok(report) => {
-                        let msg = if report.has_remote_divergence() && !report.has_local_changes() {
-                            "Stashed local changes; remote divergence still blocks release"
-                                .to_string()
-                        } else {
-                            "Stashed; still dirty — check again after fixing".to_string()
-                        };
-                        let actions = dirty::menu_actions(&report);
-                        if let Some(rel) = self.release.as_mut() {
-                            rel.report = report;
-                            rel.actions = actions;
-                            rel.action_cursor = 0;
+                let path_for_check = path.clone();
+                let report =
+                    match self.run_busy(terminal, "Checking worktree for leftovers…", move || {
+                        dirty::inspect_worktree(&path_for_check)
+                    }) {
+                        Ok(report) => report,
+                        Err(err) => {
+                            self.set_error(format!("Re-check after stash failed: {err:#}"));
+                            return Ok(());
                         }
-                        self.set_error(msg);
+                    };
+                if report.is_clean() {
+                    self.complete_release(terminal, task_idx, then_archive)?;
+                } else {
+                    let msg = if report.has_remote_divergence() && !report.has_local_changes() {
+                        "Stashed local changes; remote divergence still blocks release".to_string()
+                    } else {
+                        "Stashed; still dirty — check again after fixing".to_string()
+                    };
+                    let actions = dirty::menu_actions(&report);
+                    if let Some(rel) = self.release.as_mut() {
+                        rel.report = report;
+                        rel.actions = actions;
+                        rel.action_cursor = 0;
                     }
-                    Err(err) => {
-                        self.set_error(format!("Re-check after stash failed: {err:#}"));
-                    }
+                    self.set_error(msg);
                 }
             }
         }
