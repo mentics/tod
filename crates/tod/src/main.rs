@@ -1,6 +1,7 @@
 mod agent_socket;
 mod app;
 mod interview;
+mod logging;
 mod ui;
 mod views;
 
@@ -11,7 +12,8 @@ fn main() {
             eprintln!("tod: {err}");
             eprintln!(
                 "usage: tod [--width PX] [--height PX] [--agent-socket HOST:PORT] \
-                 [--data-root PATH] [--agent mock|cursor] [--no-focus]"
+                 [--data-root PATH] [--agent mock|cursor] [--log-level error|info|debug|trace] \
+                 [--no-focus]"
             );
             std::process::exit(2);
         }
@@ -29,5 +31,25 @@ fn main() {
         let _ = std::fs::create_dir_all(&marker);
         interview::set_data_root(root);
     }
+
+    if let Err(err) = init_logging(&opts) {
+        eprintln!("tod: {err:#}");
+        std::process::exit(1);
+    }
+
     app::App::run(opts);
+}
+
+fn init_logging(opts: &agent_socket::LaunchOptions) -> anyhow::Result<()> {
+    let paths = interview::TodPaths::discover()?;
+    paths.ensure_log_dir()?;
+    let settings = interview::TodSettings::load(&paths)?;
+    let level = logging::resolve_level(opts.log_level, settings.log_level);
+    logging::init(logging::InitConfig {
+        log_dir: paths.log_dir(),
+        level,
+        max_size_kb: settings.log_max_size_kb,
+        cli_override: opts.log_level.is_some(),
+    })?;
+    Ok(())
 }

@@ -1,4 +1,5 @@
 use crate::interview::agent::AgentBackend;
+use crate::logging::LogLevel;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -13,6 +14,8 @@ pub struct LaunchOptions {
     pub agent_backend: AgentBackend,
     /// When true, open the window without stealing OS keyboard focus.
     pub no_focus: bool,
+    /// CLI `--log-level` override for this process run.
+    pub log_level: Option<LogLevel>,
 }
 
 impl Default for LaunchOptions {
@@ -24,6 +27,7 @@ impl Default for LaunchOptions {
             data_root: None,
             agent_backend: AgentBackend::Cursor,
             no_focus: false,
+            log_level: None,
         }
     }
 }
@@ -83,6 +87,16 @@ impl LaunchOptions {
                         .ok_or_else(|| anyhow::anyhow!("--agent requires mock|cursor"))?;
                     opts.agent_backend = AgentBackend::parse(v)?;
                 }
+                "--log-level" => {
+                    i += 1;
+                    let v = rest.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--log-level requires error|info|debug|trace")
+                    })?;
+                    opts.log_level = Some(
+                        v.parse::<LogLevel>()
+                            .map_err(|e| anyhow::anyhow!("invalid --log-level: {e}"))?,
+                    );
+                }
                 "--no-focus" => {
                     opts.no_focus = true;
                 }
@@ -126,6 +140,8 @@ mod tests {
             r"c:\sandbox".into(),
             "--agent".into(),
             "mock".into(),
+            "--log-level".into(),
+            "debug".into(),
             "--no-focus".into(),
         ])
         .unwrap();
@@ -138,6 +154,7 @@ mod tests {
             Some(std::path::Path::new(r"c:\sandbox"))
         );
         assert_eq!(opts.agent_backend, AgentBackend::Mock);
+        assert_eq!(opts.log_level, Some(LogLevel::Debug));
     }
 
     #[test]
@@ -149,5 +166,14 @@ mod tests {
         assert!(opts.data_root.is_none());
         assert_eq!(opts.agent_backend, AgentBackend::Cursor);
         assert!(!opts.no_focus);
+        assert!(opts.log_level.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_log_level() {
+        let err =
+            LaunchOptions::from_args(["tod".into(), "--log-level".into(), "warn".into()])
+                .unwrap_err();
+        assert!(err.to_string().contains("log-level"));
     }
 }

@@ -61,10 +61,22 @@ impl TodPaths {
         self.config_dir.join("tod.yml")
     }
 
+    /// Diagnostic log directory: `{repo_root}/.local/logs/tod/`.
+    pub fn log_dir(&self) -> PathBuf {
+        self.repo_root.join(".local").join("logs").join("tod")
+    }
+
     /// Ensure `.local/.config/tod/` exists.
     pub fn ensure_config_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("failed to create config dir {}", self.config_dir.display()))
+    }
+
+    /// Ensure `.local/logs/tod/` exists.
+    pub fn ensure_log_dir(&self) -> Result<()> {
+        let dir = self.log_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create log dir {}", dir.display()))
     }
 }
 
@@ -96,6 +108,7 @@ mod tests {
             paths.settings_path(),
             Path::new("/repo/.local/.config/tod/tod.yml")
         );
+        assert_eq!(paths.log_dir(), Path::new("/repo/.local/logs/tod"));
     }
 
     #[test]

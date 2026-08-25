@@ -1,7 +1,9 @@
-use crate::interview::{TodPaths, TodSettings};
+use crate::interview::settings::{MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings};
+use crate::interview::TodPaths;
+use crate::logging;
 use gpui::{
-    App, AppContext, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, Styled, Window, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
@@ -9,6 +11,7 @@ use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 pub struct SettingsView {
     paths: TodPaths,
     settings: TodSettings,
+    log_dir_display: SharedString,
     focus_handle: FocusHandle,
 }
 
@@ -16,9 +19,15 @@ impl SettingsView {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
+        let log_dir_display = SharedString::from(
+            logging::absolute_log_dir(&paths.log_dir())
+                .display()
+                .to_string(),
+        );
         Self {
             paths,
             settings,
+            log_dir_display,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -34,6 +43,27 @@ impl SettingsView {
         self.settings.researcher.second_researcher_threshold =
             step_u32(self.settings.researcher.second_researcher_threshold, delta);
         let _ = self.settings.save(&self.paths);
+        cx.notify();
+    }
+
+    fn step_log_level(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.log_level = self.settings.log_level.step(delta);
+        let _ = self.settings.save(&self.paths);
+        let _ = logging::reload_level(self.settings.log_level);
+        cx.notify();
+    }
+
+    fn step_log_max_size(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let next = if delta >= 0 {
+            self.settings.log_max_size_kb.saturating_add(delta as u64)
+        } else {
+            self.settings
+                .log_max_size_kb
+                .saturating_sub((-delta) as u64)
+        };
+        self.settings.log_max_size_kb = TodSettings::clamp_log_max_size_kb(next);
+        let _ = self.settings.save(&self.paths);
+        let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
         cx.notify();
     }
 }
@@ -89,7 +119,7 @@ impl Render for SettingsView {
             .child(threshold_row(
                 cx,
                 "replenish",
-                self.settings.researcher.replenish_threshold,
+                self.settings.researcher.replenish_threshold.to_string(),
                 "Replenish when open count below",
                 "Start a researcher run when fewer than this many questions remain open.",
                 theme.foreground,
@@ -100,7 +130,10 @@ impl Render for SettingsView {
             .child(threshold_row(
                 cx,
                 "second",
-                self.settings.researcher.second_researcher_threshold,
+                self.settings
+                    .researcher
+                    .second_researcher_threshold
+                    .to_string(),
                 "Start second researcher when open count below",
                 "While a researcher is already running, start another if open count drops below this threshold (max 2 concurrent).",
                 theme.foreground,
@@ -108,13 +141,62 @@ impl Render for SettingsView {
                 |this, _, cx| this.step_second(-1, cx),
                 |this, _, cx| this.step_second(1, cx),
             ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Diagnostic logging"),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .text_color(theme.foreground)
+                            .child("Log directory"),
+                    )
+                    .child(
+                        div()
+                            .id("log-dir-path")
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .whitespace_normal()
+                            .child(self.log_dir_display.clone()),
+                    ),
+            )
+            .child(threshold_row(
+                cx,
+                "log-level",
+                self.settings.log_level.to_string(),
+                "Log verbosity",
+                "Minimum diagnostic log level (error, info, debug, trace). Default is info.",
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_log_level(-1, cx),
+                |this, _, cx| this.step_log_level(1, cx),
+            ))
+            .child(threshold_row(
+                cx,
+                "log-max-size",
+                format!("{} KB", self.settings.log_max_size_kb),
+                "Max log storage (KB)",
+                format!(
+                    "Maximum on-disk diagnostic log size in kilobytes ({MIN_LOG_MAX_SIZE_KB}–{MAX_LOG_MAX_SIZE_KB}). Default 51200 KB."
+                ),
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_log_max_size(-1024, cx),
+                |this, _, cx| this.step_log_max_size(1024, cx),
+            ))
     }
 }
 
 fn threshold_row(
     cx: &mut Context<SettingsView>,
     id_prefix: &'static str,
-    value: u32,
+    value: impl Into<SharedString>,
     label: impl Into<SharedString>,
     help: impl Into<SharedString>,
     foreground: gpui::Hsla,
@@ -124,6 +206,7 @@ fn threshold_row(
 ) -> impl IntoElement {
     let label = label.into();
     let help = help.into();
+    let value = value.into();
 
     h_flex()
         .gap_3()
@@ -143,13 +226,13 @@ fn threshold_row(
                 .child(
                     div()
                         .id(SharedString::from(format!("{id_prefix}-value")))
-                        .min_w(px(48.))
+                        .min_w(px(72.))
                         .px_2()
                         .py_2()
                         .text_sm()
                         .font_semibold()
                         .text_color(foreground)
-                        .child(value.to_string()),
+                        .child(value),
                 )
                 .child(
                     Button::new(SharedString::from(format!("{id_prefix}-inc")))

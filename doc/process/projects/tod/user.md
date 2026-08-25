@@ -187,3 +187,5 @@ Make it extremely efficient for a software engineer to work with many agents —
 3. Tod is for one user on their machine (no multi-user shared fleet).
 
 4. Tod’s durable state lives on the user’s machine under a known local location the user can copy or back up with ordinary filesystem tools (no required cloud store for core state).
+
+5. Logging practices — Follow [`doc/process/shared/constraints/logging-constraints.md`](../../shared/constraints/logging-constraints.md).
