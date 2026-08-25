@@ -1,30 +1,54 @@
-use crate::interview::InterviewSession;
+use crate::interview::config::agent_scratchpad_for_entity;
+use crate::interview::{InterviewSession, TodPaths};
 use std::path::Path;
 
 /// Build the researcher kickoff prompt for bootstrap + initial queue population.
 pub fn researcher_bootstrap_prompt(session: &InterviewSession) -> String {
+    let entity = session.entity_path.as_deref().unwrap_or("(unknown entity)");
+    let phase = session.phase.as_deref().unwrap_or("(unknown phase)");
+    let mut abs_hints = String::new();
+    if let Ok(paths) = TodPaths::discover() {
+        if let Ok(entity_path) = std::path::PathBuf::from(entity)
+            .canonicalize()
+            .or_else(|_| Ok::<_, std::io::Error>(std::path::PathBuf::from(entity)))
+        {
+            if let Ok(scratch_root) = agent_scratchpad_for_entity(paths.repo_root(), &entity_path) {
+                abs_hints = format!(
+                    "\n\
+         Absolute paths (required — do not invent roots):\n\
+         - Repo/data root: {}\n\
+         - Entity: {}\n\
+         - Transcript dir: {}\\history\\\n\
+         - Session scratchpad dir: {}\\{{session-id}}\\\n\
+         (Create queue/ and interview-config.md inside that session scratchpad dir.)\n",
+                    paths.repo_root().display(),
+                    entity_path.display(),
+                    entity_path.display(),
+                    scratch_root.display(),
+                );
+            }
+        }
+    }
+
     format!(
         "Interview UI kickoff — bootstrap this interview session.\n\
          \n\
          SQLite session id: {}\n\
          Display name: {}\n\
-         Entity path: {}\n\
-         Phase/purpose: {}\n\
-         \n\
+         Entity path: {entity}\n\
+         Phase/purpose: {phase}\n\
+         {abs_hints}\
          Follow refs/process/interview/SKILL.md bootstrap (researcher owns scaffolding):\n\
          1. Create transcript under {{entity}}/history/{{description}}-{{YYYY-MM-DD}}-{{HHMM}}.md (session header only).\n\
          2. Derive session_id from transcript filename stem.\n\
-         3. Create session scratchpad under .local/agent/process/{{mirrored entity}}/scratchpad/interviews/{{session-id}}/\n\
+         3. Create session scratchpad under the Absolute paths session scratchpad parent above.\n\
          4. Create empty queue/ and interview-config.md with absolute paths.\n\
          5. Populate queue/ with initial questions for this phase.\n\
          6. Update researcher-status.md.\n\
          \n\
-         Queue files use YAML front matter + markdown body; MC options as options: key/label list.\n\
+         Queue files use YAML front matter + markdown body; MC options as options: key/label list with digit keys \"1\", \"2\", \"3\", … only (never A/B/C).\n\
          Do not talk to the user. Return the queue directory path only when done.",
-        session.id,
-        session.display_name,
-        session.entity_path.as_deref().unwrap_or("(unknown entity)"),
-        session.phase.as_deref().unwrap_or("(unknown phase)"),
+        session.id, session.display_name,
     )
 }
 

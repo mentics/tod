@@ -17,26 +17,33 @@ Design how Interview UI mounts in the existing tod GPUI app, talks to agents thr
 | Interview transcripts (`history/*.md`) | Written **only by the UI** as markdown under entity `history/`. **Not** stored in SQLite. Agents (answer-processor / researcher) **stop writing** transcripts — process/agent changes for that are **in scope for this task**. |
 | SQLite session-list schema (v1 sketch) | One **`interview_sessions`** table: display name; status enum `active` \| `archived` \| `complete`; paths to scratchpad/transcript/config; created/updated timestamps. No transcript-body tables in SQLite. |
 | New session SQLite row timing | On interview kickoff, UI **inserts** the `interview_sessions` row immediately (status e.g. active/pending paths); **updates paths later** when scaffolding (config/transcript/scratchpad) appears on disk. |
-| Interview finished state | **No separate Complete screen.** When the question list is empty and replenishment is not waiting (researcher returned no further questions), the interview workspace shows an in-place **Complete** (or similar) message in that view. Session list still reflects complete status. Not a blocking modal; not a dedicated finished-panel screen. |
+| Interview finished state | **No separate Complete screen.** Show in-place **Complete** only when the bound queue has **no open questions** and replenishment is not waiting (researcher returned no further questions). SQLite `complete` must not short-circuit the UI into Complete while open questions are loaded; if questions reappear, show question body UI and allow answering (reopen Active as needed). Session list still reflects complete status when truly finished. Not a blocking modal; not a dedicated finished-panel screen. |
 | Researcher threshold settings | **Global Settings UI**; persist the two replenishment thresholds (defaults 8 and 2) in **`tod.yml`** (YAML, not JSON) under **`.local/.config/tod/`** (same tree as SQLite; not SQLite itself). |
 | Archive persistence | Archive = **SQLite status/metadata** (`archived`); session files stay in place; archive view filters on status; mutation (answer submit / replenish) blocked while archived. Prefer metadata in SQLite; transcripts remain UI-owned markdown in `history/`; on-disk queue/protocol files still required for agents. |
-| Answer-processor submission protocol | **Accepted.** One or more concatenated **answer records**. Each record is YAML front matter + optional free-text body, terminated by the next record’s `---` or end of payload. Front matter: `id` required (e.g. `q-016`); `option` **optional** (omit when no MC selection). Body after closing `---` is free text (may be empty). Multiple answers = multiple units in one submission; single-answer submit is one unit. Not required to be JSON. |
+| Answer-processor submission protocol | **Accepted.** One or more concatenated **answer records**. Each record is YAML front matter + optional free-text body, terminated by the next record’s `---` or end of payload. Front matter: `id` required (e.g. `q-016`); `option` **optional** (omit when no MC selection; when present, digit string `"1"` / `"2"` / …). Body after closing `---` is free text (may be empty). Multiple answers = multiple units in one submission; single-answer submit is one unit. Not required to be JSON. |
 | Researcher action submission protocol | Same multi-record YAML shape as answer-processor, but researcher actions use **`action`** (not `option`). Front matter: `action` required (`defer` \| `reconsider` \| `more-options`); `id` required; optional free-text body. Multiple actions = multiple units; single action is one unit. UI marks the question pending (like answer submit); researcher deletes or modifies the queue file. |
-| Open-question list layout | **Three-column interview workspace** — scrollable question list (id + short label) \| full question body \| compact response pane (MC → Notes → action dropdown + Submit). Visual: Accepted `artifacts/visual/interview-workspace/`. |
+| Open-question list layout | **Three-column interview workspace** — scrollable question list (**single-line** id + short label; ellipsis OK) \| full question body \| **flexing** response pane (MC → Notes → action dropdown + Submit). Visual: Accepted `artifacts/visual/interview-workspace/` (row shape and no MC truncation per project `user.md` 20/23). |
+| Selection visibility | Session-list and question-list selected rows, and keyboard focus chrome, must be clearly distinguishable from background (not weak accent-tint alone). Cite `refs/process/other/ux-design.md` Color and contrast / States and feedback / Actionable lists. Same visibility bar for focused MC / response controls. |
+| Workspace focus and input model | Focus regions: (A) question list, (B) response column controls in visual order: MC options (top→bottom) → Notes → action dropdown → Submit (and any other interactive response controls in that order). **Middle question-body column has nothing interactive and no keyboard focus stop** (Left ↔ Right only). Visible focus chrome on list row and focused response control (meets selection-visibility bar). **Right** from list → uppermost response control; **Left** from response → list; **Up/Down** among response controls when response-focused. |
+| Workspace Escape | Escape does **not** navigate to the session list. Escape exits Notes edit mode when editing; otherwise no-op (unless nested workspace chrome dismisses). Leave via explicit **Back to interviews** (or equivalent). |
+| MC option keys | Digits **only**. `options[].key` values are decimal digit strings `"1"`, `"2"`, `"3"`, … matching on-screen labels. **No** letter-key MC support (no dual-accept, no A→1 mapping). UI binds digit keys to **immediate submit** when not in Notes edit mode. Researcher / any agent-authored MC must emit digit keys via updated skills, prompts, and protocol examples. Space/Enter on focused MC submits; mouse click on MC submits immediately. |
+| Independent review F1–F6 | **In scope** for this same redesign→implement cycle. If not already fixed, fix in planning/active. Work items remain in `.local/.../journal/2026-08-25-review-independent.md` for planning/active disposition (not open design questions). |
+| Notes edit mode | Focus stop on Notes ≠ edit mode. Keyboard: Enter/Space enter edit; Escape exits edit (stays on Notes, not session list). While editing: arrows = text navigation; digit MC shortcuts inactive; **Ctrl+Enter** submits. Mouse click on Notes enters edit immediately. |
+| Response column sizing | Flexing response column that shares remaining width after list + body (exact flex recipe open to planning). **Supersedes** prior “compact fixed-width response” construction where that caused truncation. MC option rows: wrap text; no ellipsis truncation on option labels. Notes width tracks the response column. Horizontal fill required; vertical window fill not required. |
 | Question action: Reject | **Out.** Do not implement Reject. Replace with a **Consider / Reconsider**-style action (wording may settle as “Consider”). |
 | Question action: Consider / Reconsider | Submit consider/reconsider intent to the **researcher** (not the answer-processor) via researcher action protocol (`action: reconsider`). |
 | Question action: Defer | Submit defer intent to the **researcher** (not the answer-processor) via researcher action protocol (`action: defer`). |
 | Question action: More options | Submit request-more-options to the **researcher** via researcher action protocol (`action: more-options`). |
 | Other actions chrome | Deep-dive, defer, and reconsider/consider are the **other actions** set — not unique chrome placements. Prefer a dropdown / “Run other action” (or similar) for those actions, separate from multiple-choice option selection. |
-| Answer submit UX | User may submit free-text alone; select an MC option alone; combine MC selection + extra text in one submit; must be able to submit text without choosing an MC option. |
-| Ctrl+Enter submit | When focus is in the question free-form answer text area, **Ctrl+Enter** submits that text as the answer for that question (same submit path as the Submit control). |
+| Answer submit UX | User may submit free-text alone; submit an MC option alone (digit key, Space/Enter on focused option, or click); combine MC + extra text in one submit when applicable; must be able to submit text without choosing an MC option. Digit/click/Space/Enter MC paths submit immediately (not select-only). |
+| Ctrl+Enter submit | **While editing Notes**, **Ctrl+Enter** submits the current answer (same submit path as Submit). Single Ctrl+Enter rule for Notes (see Notes edit mode). |
 | Auto-select next question | Immediately after the user does something on a question that submits it (answer submit or other submit-like actions that put the question pending / remove it from active work), the UI selects the **next** question in the list. |
 | Deep-dive context | When starting a deep-dive, supply rich context: (1) current project and task, (2) current lifecycle state, (3) purpose of this interview, (4) interview phase (initial / design / planning). |
 | Deep-dive branch scaffolding | **No special on-disk scaffolding.** Deep-dive is an ordinary agent chat session: UI sends settled context, then ordinary chat — no dedicated transcript / config / scratchpad artifacts required specifically for the branch. |
 | Deep-dive closure UX | **No auto-detect** of agent “answer ready”; **no auto-submit** to the parent question. Choosing Deep dive does **not** change the main interview question UI (inputs stay); opens deep-dive **separately elsewhere**. In the deep-dive view: user can select text from the transcript (or similar) and use a **“Use this” / copy-into-answer** control that pastes into the **parent question’s answer text area**. User may **edit** that text, then submit the parent question normally via the answer-processor payload. Supersedes any auto-submit / machine-signal closure construction. |
 | Queue directory watcher | **`notify` only** (or equivalent) — OS filesystem events with short debounce; no polling primary path. Prefer notify-only unless Windows notify buffer overflow becomes a real problem (that is the usual argument for hybrid). |
 | Queue entry format | Queue files use **YAML front matter + free-text body** (not JSON). Metadata in front matter; prose unescaped in the body. Format may support multiple YAML documents in one file (`---` separators) as a capability; **queue still one file per open question** for concurrent answer processing. Config remains markdown for agents; transcripts are UI-owned `history/*.md` (see persistence). |
-| MC option binding for keyboard | MC options live in YAML front matter (e.g. `options:` list with `key` / `label`); body/prose is display-only. Agents author that list so the UI can bind keys. |
+| MC option binding for keyboard | MC options live in YAML front matter (`options:` list with digit `key` / `label` only); body/prose is display-only. Update researcher (and related) agent skills/prompts/examples so new queue files never emit letter keys. |
 | Interview launch UI | **No separate launch screen.** New interview is started from the **session list / menu** (entity picker + purpose live in that menu flow or lightweight in-menu controls — not a dedicated Launch page). UI builds a typed prompt/payload for the researcher; UI does not create session scaffolding itself (researcher does). UI still inserts the SQLite session row on kickoff (see New session SQLite row timing). |
 | Agent-run failure UI | **Errors → toast/banner** (tod `user.md` req 11 — more visible than the status area). Interview agent errors use the same toast/banner pattern as tod; **recovery controls remain available in context** (re-enable submit / researcher kickoff). Not a separate Errors panel; not toasts-only without recovery. |
 | Agent-run in-flight / success status | Use tod’s **persistent status location** (tod `user.md` req 10 — status area) for in-flight and **success** (and status-ish history later — not implementing full notification history yet). Quiet success via status is fine for now. Do not toast success. |
@@ -49,13 +56,13 @@ Payload = one or more concatenated answer records. Each record is YAML front mat
 ```
 ---
 id: q-016
-option: A
+option: "1"
 ---
 Optional free-text notes for this answer.
 
 ---
 id: q-017
-option: B
+option: "2"
 ---
 
 ---
@@ -64,7 +71,7 @@ id: q-018
 Text-only answer with no MC option.
 ```
 
-Rules: `id` required; `option` **optional** (omit when no MC selection); body after closing `---` is free text (may be empty); multiple answers = multiple units; single-answer submit is one unit; not required to be JSON.
+Rules: `id` required; `option` **optional** (omit when no MC selection; when present use digit strings `"1"` / `"2"` / …); body after closing `---` is free text (may be empty); multiple answers = multiple units; single-answer submit is one unit; not required to be JSON.
 
 ### Researcher action submission protocol (accepted — q-023)
 
@@ -108,7 +115,7 @@ Rules: `action` required (`defer` \| `reconsider` \| `more-options`); `id` requi
 
 | Need | Notes |
 |--|--|
-| — | None. Visual packages Accepted; ready for planning. |
+| — | None. Legacy MC = digits only (no letter support); F1–F6 in-scope for this cycle; middle column confirmed non-focusable. Planning handoff: revise `plan.md` for H4–H8 / digits / Complete-vs-queue / F1–F6 work items (not a design open need). |
 
 ## Links / external references
 
@@ -116,7 +123,8 @@ Rules: `action` required (`defer` \| `reconsider` \| `more-options`); `id` requi
 |--|--|--|
 | `doc/process/projects/interview-ui/doc/spikes/acp-auto-billing-test/` | User ACP spike (verified working with test script) | required |
 | `doc/process/projects/interview-ui/doc/spike-cursor-agent-launch.md` | Earlier Cursor launch spike (CLI vs SDK vs ACP); v1 launch path superseded by ACP | guideline |
-| `doc/process/projects/interview-ui/tasks/core-ui/artifacts/visual/interview-workspace/` | Accepted visual — question list + body + answer (`preview.png`) | required |
+| `refs/process/other/ux-design.md` | Color and contrast / States and feedback / Actionable lists — selection & focus visibility bar | guideline (obligations stated in project `user.md` §19) |
+| `doc/process/projects/interview-ui/tasks/core-ui/artifacts/visual/interview-workspace/` | Accepted visual — question list + body + answer (`preview.png`); single-line rows + no MC ellipsis per updated reqs | required |
 | `doc/process/projects/interview-ui/tasks/core-ui/artifacts/visual/sessions-menu/` | Accepted visual — interview sessions menu / list (`preview.png`, `source.canvas.tsx`) | required |
 | `doc/process/projects/interview-ui/tasks/core-ui/artifacts/visual/deep-dive/` | Accepted visual — deep-dive chat + Use this (`preview.png`, `source.canvas.tsx`) | required |
 | `doc/process/projects/interview-ui/tasks/core-ui/artifacts/visual/complete-inplace/` | Accepted visual — in-place Complete in interview workspace (`preview.png`, `source.canvas.tsx`) | required |

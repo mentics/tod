@@ -1,100 +1,61 @@
 use crate::interview::{TodPaths, TodSettings};
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, px,
+    App, AppContext, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::input::{
-    InputEvent, InputState, NumberInput, NumberInputEvent, StepAction,
-};
+use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 
 pub struct SettingsView {
     paths: TodPaths,
     settings: TodSettings,
-    replenish_input: Entity<InputState>,
-    second_input: Entity<InputState>,
     focus_handle: FocusHandle,
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
-
-        let replenish_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(settings.researcher.replenish_threshold.to_string())
-        });
-        let second_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(settings.researcher.second_researcher_threshold.to_string())
-        });
-
-        let focus_handle = cx.focus_handle();
-        let view = Self {
+        Self {
             paths,
-            settings: settings.clone(),
-            replenish_input: replenish_input.clone(),
-            second_input: second_input.clone(),
-            focus_handle,
-        };
+            settings,
+            focus_handle: cx.focus_handle(),
+        }
+    }
 
-        cx.subscribe(&replenish_input, |this, input, event, cx| {
-            if matches!(event, InputEvent::Change) {
-                let text = input.read(cx).value().to_string();
-                if let Ok(value) = text.parse::<u32>() {
-                    this.settings.researcher.replenish_threshold = value;
-                    let _ = this.settings.save(&this.paths);
-                }
-            }
-        })
-        .detach();
+    fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.researcher.replenish_threshold =
+            step_u32(self.settings.researcher.replenish_threshold, delta);
+        let _ = self.settings.save(&self.paths);
+        cx.notify();
+    }
 
-        cx.subscribe_in(&replenish_input, window, |this, input, event, window, cx| {
-            let NumberInputEvent::Step(action) = event;
-            if let Some(value) = stepped_value(&input.read(cx).value(), *action) {
-                input.update(cx, |input, cx| {
-                    input.set_value(value.to_string(), window, cx);
-                });
-                this.settings.researcher.replenish_threshold = value;
-                let _ = this.settings.save(&this.paths);
-            }
-        })
-        .detach();
-
-        cx.subscribe(&second_input, |this, input, event, cx| {
-            if matches!(event, InputEvent::Change) {
-                let text = input.read(cx).value().to_string();
-                if let Ok(value) = text.parse::<u32>() {
-                    this.settings.researcher.second_researcher_threshold = value;
-                    let _ = this.settings.save(&this.paths);
-                }
-            }
-        })
-        .detach();
-
-        cx.subscribe_in(&second_input, window, |this, input, event, window, cx| {
-            let NumberInputEvent::Step(action) = event;
-            if let Some(value) = stepped_value(&input.read(cx).value(), *action) {
-                input.update(cx, |input, cx| {
-                    input.set_value(value.to_string(), window, cx);
-                });
-                this.settings.researcher.second_researcher_threshold = value;
-                let _ = this.settings.save(&this.paths);
-            }
-        })
-        .detach();
-
-        view
+    fn step_second(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.researcher.second_researcher_threshold =
+            step_u32(self.settings.researcher.second_researcher_threshold, delta);
+        let _ = self.settings.save(&self.paths);
+        cx.notify();
     }
 }
 
-fn stepped_value(text: &str, action: StepAction) -> Option<u32> {
-    let value = text.parse::<u32>().ok()?;
-    Some(match action {
-        StepAction::Increment => value.saturating_add(1),
-        StepAction::Decrement => value.saturating_sub(1),
-    })
+fn step_u32(value: u32, delta: i32) -> u32 {
+    if delta >= 0 {
+        value.saturating_add(delta as u32)
+    } else {
+        value.saturating_sub((-delta) as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::step_u32;
+
+    #[test]
+    fn step_increments_and_decrements() {
+        assert_eq!(step_u32(8, 1), 9);
+        assert_eq!(step_u32(8, -1), 7);
+        assert_eq!(step_u32(0, -1), 0);
+    }
 }
 
 impl Focusable for SettingsView {
@@ -105,7 +66,7 @@ impl Focusable for SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
 
         v_flex()
             .size_full()
@@ -127,26 +88,40 @@ impl Render for SettingsView {
             )
             .child(threshold_row(
                 cx,
-                &self.replenish_input,
+                "replenish",
+                self.settings.researcher.replenish_threshold,
                 "Replenish when open count below",
                 "Start a researcher run when fewer than this many questions remain open.",
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_replenish(-1, cx),
+                |this, _, cx| this.step_replenish(1, cx),
             ))
             .child(threshold_row(
                 cx,
-                &self.second_input,
+                "second",
+                self.settings.researcher.second_researcher_threshold,
                 "Start second researcher when open count below",
                 "While a researcher is already running, start another if open count drops below this threshold (max 2 concurrent).",
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_second(-1, cx),
+                |this, _, cx| this.step_second(1, cx),
             ))
     }
 }
 
 fn threshold_row(
-    cx: &App,
-    input: &Entity<InputState>,
+    cx: &mut Context<SettingsView>,
+    id_prefix: &'static str,
+    value: u32,
     label: impl Into<SharedString>,
     help: impl Into<SharedString>,
+    foreground: gpui::Hsla,
+    muted: gpui::Hsla,
+    on_dec: impl Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
+    on_inc: impl Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
 ) -> impl IntoElement {
-    let theme = cx.theme();
     let label = label.into();
     let help = help.into();
 
@@ -154,10 +129,36 @@ fn threshold_row(
         .gap_3()
         .items_start()
         .child(
-            NumberInput::new(input)
-                .appearance(true)
-                .w(px(120.))
-                .into_any_element(),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new(SharedString::from(format!("{id_prefix}-dec")))
+                        .label("−")
+                        .w(px(48.))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            on_dec(this, window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("{id_prefix}-value")))
+                        .min_w(px(48.))
+                        .px_2()
+                        .py_2()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(foreground)
+                        .child(value.to_string()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("{id_prefix}-inc")))
+                        .label("+")
+                        .w(px(48.))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            on_inc(this, window, cx);
+                        })),
+                ),
         )
         .child(
             v_flex()
@@ -168,7 +169,7 @@ fn threshold_row(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(theme.foreground)
+                        .text_color(foreground)
                         .child(label),
                 )
                 .child(
@@ -176,7 +177,7 @@ fn threshold_row(
                         .w_full()
                         .min_w_0()
                         .text_sm()
-                        .text_color(theme.muted_foreground)
+                        .text_color(muted)
                         .whitespace_normal()
                         .child(help),
                 ),

@@ -1,11 +1,10 @@
-use crate::interview::agent::{AgentProvider, AgentRunState, CursorAcpProvider};
-use crate::interview::config::{find_bootstrap_config_for_session, parse_interview_config};
+use crate::interview::agent::{AgentRunState, SharedAgent};
+use crate::interview::config::sync_scaffolding_from_disk;
 use crate::interview::kickoff::researcher_bootstrap_prompt;
 use crate::interview::views::workspace::{WorkspaceEvent, WorkspaceView};
 use crate::interview::{
     InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore, TodPaths,
 };
-use anyhow::Result;
 use chrono::{DateTime, Local, Utc};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -18,7 +17,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SESSIONS_CONTEXT: &str = "InterviewSessions";
 
@@ -29,7 +28,10 @@ actions!(
         SessionMoveDown,
         SessionOpen,
         SessionToggleNew,
-        SessionLaunch
+        SessionLaunch,
+        SessionCancelCompose,
+        SessionFilterActive,
+        SessionFilterArchive
     ]
 );
 
@@ -40,7 +42,10 @@ pub fn register_sessions_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("down", SessionMoveDown, context),
         KeyBinding::new("enter", SessionOpen, context),
         KeyBinding::new("n", SessionToggleNew, context),
+        KeyBinding::new("escape", SessionCancelCompose, context),
         KeyBinding::new("shift-enter", SessionLaunch, context),
+        KeyBinding::new("ctrl-shift-1", SessionFilterActive, context),
+        KeyBinding::new("ctrl-shift-2", SessionFilterArchive, context),
     ]);
 }
 
@@ -83,7 +88,7 @@ pub struct SessionsView {
     selected_task: usize,
     selected_purpose: usize,
     purpose_note: Entity<InputState>,
-    agent: Arc<Mutex<CursorAcpProvider>>,
+    agent: SharedAgent,
     kickoff_status: SharedString,
     focus_handle: FocusHandle,
     list_scroll_handle: ScrollHandle,
@@ -92,7 +97,7 @@ pub struct SessionsView {
 }
 
 impl SessionsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, agent: SharedAgent) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let store = SessionStore::open(&paths).expect("failed to open session store");
         let sessions = store.list_sessions().unwrap_or_default();
@@ -113,7 +118,7 @@ impl SessionsView {
             selected_task: 1,
             selected_purpose: 0,
             purpose_note,
-            agent: Arc::new(Mutex::new(CursorAcpProvider::default())),
+            agent,
             kickoff_status: SharedString::default(),
             focus_handle: cx.focus_handle(),
             list_scroll_handle: ScrollHandle::new(),
@@ -200,6 +205,13 @@ impl SessionsView {
     fn toggle_compose(&mut self, cx: &mut Context<Self>) {
         self.composing = !self.composing;
         cx.notify();
+    }
+
+    fn cancel_compose_action(&mut self, cx: &mut Context<Self>) {
+        if self.composing {
+            self.composing = false;
+            cx.notify();
+        }
     }
 
     fn cycle_project(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -309,8 +321,20 @@ impl SessionsView {
                 let mut provider = agent.lock().expect("agent lock");
                 provider.start_researcher_replenishment(cwd, prompt)
             };
-            if let Ok(handle) = handle {
-                loop {
+            let Ok(handle) = handle else {
+                eprintln!("tod: researcher bootstrap failed to start for session {session_id}");
+                return;
+            };
+
+            // Poll disk for interview-config while ACP runs, and keep trying after ACP
+            // finishes until paths bind (or timeout). One-shot sync after ACP alone races
+            // when the agent returns slightly before files are visible, or SQLITE_BUSY
+            // swallows a single update attempt.
+            let deadline = Instant::now() + Duration::from_secs(360);
+            let mut agent_finished = false;
+            let mut synced = false;
+            while Instant::now() < deadline {
+                if !agent_finished {
                     let finished = {
                         let mut provider = agent.lock().expect("agent lock");
                         provider
@@ -318,13 +342,41 @@ impl SessionsView {
                             .is_some_and(|state| !matches!(state, AgentRunState::InFlight))
                     };
                     if finished {
-                        break;
+                        agent_finished = true;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
-                if let Ok(store) = SessionStore::open(&store_paths) {
-                    let _ = sync_scaffolding_from_disk(&store, &repo_root, session_id);
+
+                if !synced {
+                    match SessionStore::open(&store_paths) {
+                        Ok(store) => {
+                            match sync_scaffolding_from_disk(&store, &repo_root, session_id) {
+                                Ok(true) => synced = true,
+                                Ok(false) => {}
+                                Err(err) => {
+                                    eprintln!(
+                                        "tod: scaffolding sync error for session {session_id}: {err}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "tod: scaffolding store open failed for session {session_id}: {err}"
+                            );
+                        }
+                    }
                 }
+
+                if synced {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+
+            if !synced {
+                eprintln!(
+                    "tod: scaffolding sync timed out for session {session_id} (agent_finished={agent_finished})"
+                );
             }
         });
     }
@@ -468,7 +520,8 @@ impl Render for SessionsView {
             .child(scroll_content)
             .vertical_scrollbar(scroll_handle);
 
-        let mut root = v_flex()
+        let mut root = div()
+            .v_flex()
             .size_full()
             .bg(background)
             .key_context(SESSIONS_CONTEXT)
@@ -486,6 +539,18 @@ impl Render for SessionsView {
             }))
             .on_action(cx.listener(|this, _: &SessionToggleNew, _, cx| {
                 this.toggle_compose(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SessionCancelCompose, _, cx| {
+                this.cancel_compose_action(cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SessionFilterActive, _, cx| {
+                this.set_filter(SessionFilter::Active, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SessionFilterArchive, _, cx| {
+                this.set_filter(SessionFilter::Archive, cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &SessionLaunch, _, cx| {
                 if this.composing {
@@ -531,53 +596,52 @@ fn header_bar(
     composing: bool,
 ) -> impl IntoElement {
     let theme = cx.theme();
-    h_flex()
+    // Same layout pattern as shell tab_bar (div().h_flex() + styled_tab) — the
+    // gpui_component h_flex + min_w_0 + overflow_hidden combination painted an
+    // empty strip with no Active/Archive/New controls.
+    div()
+        .id("sessions-header")
+        .h_flex()
         .w_full()
-        .min_w_0()
-        .items_center()
-        .gap_3()
-        .px_4()
-        .py_3()
-        .overflow_hidden()
+        .flex_shrink_0()
+        .gap_2()
+        .px_3()
+        .py_2()
         .border_b_1()
         .border_color(theme.border)
+        .bg(theme.background)
         .child(
             div()
-                .flex_shrink_0()
+                .px_2()
+                .py_2()
                 .text_sm()
                 .font_semibold()
                 .text_color(theme.foreground)
                 .child("Interview sessions"),
         )
+        .child(filter_tab(
+            cx,
+            "Active",
+            filter == SessionFilter::Active,
+            |this, _, _, cx| this.set_filter(SessionFilter::Active, cx),
+        ))
+        .child(filter_tab(
+            cx,
+            "Archive",
+            filter == SessionFilter::Archive,
+            |this, _, _, cx| this.set_filter(SessionFilter::Archive, cx),
+        ))
         .child(
-            h_flex()
-                .flex_shrink_0()
-                .gap_2()
-                .child(filter_tab(
-                    cx,
-                    "Active",
-                    filter == SessionFilter::Active,
-                    |this, _, _, cx| this.set_filter(SessionFilter::Active, cx),
-                ))
-                .child(filter_tab(
-                    cx,
-                    "Archive",
-                    filter == SessionFilter::Archive,
-                    |this, _, _, cx| this.set_filter(SessionFilter::Archive, cx),
-                ))
-                .child(
-                    Button::new("new-interview")
-                        .label(if composing {
-                            "Cancel new"
-                        } else {
-                            "New interview (N)"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_compose(cx);
-                        })),
-                ),
+            Button::new("new-interview")
+                .label(if composing {
+                    "Cancel new"
+                } else {
+                    "New interview (N)"
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toggle_compose(cx);
+                })),
         )
-        .child(div().flex_1().min_w_0())
 }
 
 fn footer_bar(
@@ -785,7 +849,7 @@ fn session_row(
         } else {
             gpui::transparent_black()
         })
-        .when(selected, |el| el.bg(accent.opacity(0.24)))
+        .when(selected, |el| el.bg(accent).border_color(foreground))
         .on_click(cx.listener({
             let id = session.id;
             move |this, _, _, cx| this.select_session(id, cx)
@@ -798,7 +862,7 @@ fn session_row(
                         .text_sm()
                         .font_semibold()
                         .text_color(if selected {
-                            foreground
+                            cx.theme().background
                         } else {
                             foreground.opacity(0.92)
                         })
@@ -807,7 +871,11 @@ fn session_row(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(muted)
+                        .text_color(if selected {
+                            cx.theme().background.opacity(0.85)
+                        } else {
+                            muted
+                        })
                         .child(format!("{entity} · {status} · {updated}")),
                 ),
         )
@@ -944,25 +1012,4 @@ fn default_purposes() -> Vec<PurposeOption> {
             label: "Task requirements".into(),
         },
     ]
-}
-
-fn sync_scaffolding_from_disk(
-    store: &SessionStore,
-    repo_root: &std::path::Path,
-    sqlite_id: i64,
-) -> Result<()> {
-    let session = store
-        .get_session(sqlite_id)?
-        .ok_or_else(|| anyhow::anyhow!("session {sqlite_id} not found"))?;
-    if let Some(config_path) = find_bootstrap_config_for_session(repo_root, &session)? {
-        let config = parse_interview_config(&config_path)?;
-        store.update_session_scaffolding(
-            sqlite_id,
-            Some(&config.session_id),
-            Some(config.scratchpad.to_string_lossy().as_ref()),
-            Some(config.transcript.to_string_lossy().as_ref()),
-            Some(config.config_path.to_string_lossy().as_ref()),
-        )?;
-    }
-    Ok(())
 }

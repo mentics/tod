@@ -48,7 +48,7 @@ pub struct DeepDiveContext {
     pub question_body: String,
 }
 
-/// Swappable agent backend boundary. v1 uses Cursor ACP only.
+/// Swappable agent backend boundary (`--agent mock|cursor`).
 pub trait AgentProvider {
     fn start_researcher_replenishment(
         &mut self,

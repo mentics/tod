@@ -12,8 +12,6 @@ pub mod transcript;
 pub mod views;
 
 pub use bootstrap::bootstrap;
-pub use db::{
-    InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore,
-};
-pub use paths::TodPaths;
+pub use db::{InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore};
+pub use paths::{TodPaths, set_data_root};
 pub use settings::TodSettings;

@@ -16,6 +16,8 @@ pub struct QueueWatcher {
     watcher: RecommendedWatcher,
     receiver: Receiver<Result<Event, notify::Error>>,
     debounce_deadline: Option<Instant>,
+    /// Fingerprint of queue dir contents — catches Windows notify gaps.
+    last_fingerprint: Option<u64>,
 }
 
 impl QueueWatcher {
@@ -34,11 +36,13 @@ impl QueueWatcher {
             Config::default(),
         )?;
         watcher.watch(&queue_dir, RecursiveMode::NonRecursive)?;
+        let last_fingerprint = Some(dir_fingerprint(&queue_dir));
         Ok(Self {
             queue_dir,
             watcher,
             receiver: rx,
             debounce_deadline: None,
+            last_fingerprint,
         })
     }
 
@@ -47,7 +51,8 @@ impl QueueWatcher {
     }
 
     /// Poll filesystem events without blocking the UI thread.
-    /// Returns `Some(updated questions)` after debounce settles.
+    /// Returns `Some(updated questions)` after debounce settles, or when the
+    /// on-disk fingerprint changes (notify miss / delayed events).
     pub fn poll(&mut self) -> Result<Option<Vec<QueueQuestion>>> {
         while let Ok(result) = self.receiver.try_recv() {
             match result {
@@ -59,12 +64,20 @@ impl QueueWatcher {
             }
         }
 
-        if self
+        let fp = dir_fingerprint(&self.queue_dir);
+        let fingerprint_dirty = self.last_fingerprint.is_some_and(|prev| prev != fp);
+        let debounce_ready = self
             .debounce_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+            .is_some_and(|deadline| Instant::now() >= deadline);
+
+        if debounce_ready {
             self.debounce_deadline = None;
-            return Ok(Some(load_queue_dir(&self.queue_dir)?));
+        }
+
+        if debounce_ready || fingerprint_dirty {
+            let questions = load_queue_dir(&self.queue_dir)?;
+            self.last_fingerprint = Some(dir_fingerprint(&self.queue_dir));
+            return Ok(Some(questions));
         }
         Ok(None)
     }
@@ -74,6 +87,38 @@ impl QueueWatcher {
     }
 }
 
+/// Stable fingerprint of `*.md` queue files (name + len + mtime).
+fn dir_fingerprint(queue_dir: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut entries: Vec<(String, u64, u64)> = Vec::new();
+    if let Ok(read) = std::fs::read_dir(queue_dir) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let meta = entry.metadata().ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            entries.push((name, len, mtime));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn is_queue_relevant(event: &Event) -> bool {
     match &event.kind {
         EventKind::Create(_) | EventKind::Remove(_) => true,
@@ -81,6 +126,9 @@ fn is_queue_relevant(event: &Event) -> bool {
         EventKind::Modify(ModifyKind::Name(mode)) => {
             matches!(mode, RenameMode::Any | RenameMode::To | RenameMode::Both)
         }
+        // Windows often reports opaque Modify(Any) for new files.
+        EventKind::Modify(ModifyKind::Any) => true,
+        EventKind::Any => true,
         _ => false,
     }
 }

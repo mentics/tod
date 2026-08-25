@@ -1,5 +1,5 @@
 use crate::interview::agent::{
-    AgentProvider, AgentRunState, CursorAcpProvider, DeepDiveContext, RunId,
+    AgentRunState, DeepDiveContext, RunId, SharedAgent,
 };
 use crate::interview::config::InterviewConfig;
 use crate::interview::queue::QueueQuestion;
@@ -13,7 +13,6 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +40,7 @@ pub struct DeepDiveView {
     _session: InterviewSession,
     turns: Vec<ChatTurn>,
     draft_input: Entity<InputState>,
-    agent: Arc<Mutex<CursorAcpProvider>>,
+    agent: SharedAgent,
     active_run: Option<RunId>,
     selected_turn_id: Option<String>,
     pasted_preview: Option<SharedString>,
@@ -57,7 +56,7 @@ impl DeepDiveView {
         session: InterviewSession,
         window: &mut Window,
         cx: &mut Context<Self>,
-        agent: Arc<Mutex<CursorAcpProvider>>,
+        agent: SharedAgent,
     ) -> Self {
         let draft_input = cx.new(|cx| {
             InputState::new(window, cx)

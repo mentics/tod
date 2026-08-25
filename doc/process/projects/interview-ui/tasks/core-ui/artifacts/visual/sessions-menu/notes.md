@@ -9,5 +9,5 @@
 
 - App chrome: tod · Tasks / Interview · Settings
 - Session list is the menu; **New interview** expands in-menu entity/purpose controls (no separate launch screen)
-- Active / Archive tabs; selected row blue left accent + Open
+- Active / Archive tabs; selected row blue left accent + Open — selection must be **clearly distinguishable** from list background (project `user.md` §19)
 - Archived reopenable but mutation blocked for agent work

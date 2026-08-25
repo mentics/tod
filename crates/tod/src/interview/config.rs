@@ -1,7 +1,7 @@
-use crate::interview::db::InterviewSession;
-use anyhow::{Context, Result, bail};
+use crate::interview::db::{InterviewSession, SessionStore};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -78,9 +78,7 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         .get("queue")
         .map(|q| PathBuf::from(q.trim_end_matches('/')))
         .context("interview-config missing queue")?;
-    let queue_target = values
-        .get("queue_target")
-        .and_then(|v| v.parse().ok());
+    let queue_target = values.get("queue_target").and_then(|v| v.parse().ok());
 
     Ok(InterviewConfig {
         session_id,
@@ -93,30 +91,47 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         queue_target,
         to_process: values.get("to_process").map(PathBuf::from),
         researcher_status: values.get("researcher_status").map(PathBuf::from),
-        answer_processor_status: values
-            .get("answer_processor_status")
-            .map(PathBuf::from),
+        answer_processor_status: values.get("answer_processor_status").map(PathBuf::from),
         scope,
         state_agent: values.get("state_agent").map(PathBuf::from),
     })
 }
 
 pub fn agent_scratchpad_for_entity(repo_root: &Path, entity: &Path) -> Result<PathBuf> {
-    let entity = entity.canonicalize().unwrap_or_else(|_| entity.to_path_buf());
-    let repo_root = repo_root.canonicalize().unwrap_or_else(|_| repo_root.to_path_buf());
-    let entity_str = entity.to_string_lossy();
-    let repo_str = repo_root.to_string_lossy();
-    if !entity_str.starts_with(repo_str.as_ref()) {
-        bail!("entity path must be inside repo root for scratchpad mirroring");
-    }
-    let rel = entity.strip_prefix(&repo_root).unwrap_or(entity.as_path());
+    let entity = entity
+        .canonicalize()
+        .unwrap_or_else(|_| entity.to_path_buf());
+    let repo_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let rel = entity.strip_prefix(&repo_root).map_err(|_| {
+        anyhow::anyhow!("entity path must be inside repo root for scratchpad mirroring")
+    })?;
+    // Live entities live under doc/process/; ephemeral mirror drops that prefix:
+    // doc/process/projects/X → .local/agent/process/projects/X
+    let mirrored = strip_doc_process_prefix(rel);
     Ok(repo_root
         .join(".local")
         .join("agent")
         .join("process")
-        .join(rel)
+        .join(mirrored)
         .join("scratchpad")
         .join("interviews"))
+}
+
+/// Strip leading `doc/process` from a repo-relative entity path.
+pub fn strip_doc_process_prefix(rel: &Path) -> PathBuf {
+    let mut comps = rel.components();
+    let first = comps.next();
+    let second = comps.next();
+    match (first, second) {
+        (Some(std::path::Component::Normal(a)), Some(std::path::Component::Normal(b)))
+            if a == "doc" && b == "process" =>
+        {
+            comps.as_path().to_path_buf()
+        }
+        _ => rel.to_path_buf(),
+    }
 }
 
 /// Base phase token from SQLite metadata (strips optional parenthetical note).
@@ -125,12 +140,30 @@ pub fn base_interview_phase(phase: &str) -> &str {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Strip Windows verbatim (`\\?\`) prefix for durable path storage / UI.
+fn path_for_storage(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+    raw.into_owned()
 }
 
 fn paths_match(a: &Path, b: &Path) -> bool {
-    normalize_path(a) == normalize_path(b)
+    let na = normalize_path(a);
+    let nb = normalize_path(b);
+    if na == nb {
+        return true;
+    }
+    // Windows paths often differ only by drive-letter case when canonicalize fails.
+    na.to_string_lossy()
+        .eq_ignore_ascii_case(nb.to_string_lossy().as_ref())
 }
 
 fn system_time_to_utc(time: SystemTime) -> DateTime<Utc> {
@@ -187,12 +220,7 @@ pub fn find_bootstrap_config_for_session(
     if let Ok(scratchpad_root) = agent_scratchpad_for_entity(repo_root, &entity_path) {
         search_roots.push(scratchpad_root);
     }
-    search_roots.push(
-        repo_root
-            .join(".local")
-            .join("agent")
-            .join("process"),
-    );
+    search_roots.push(repo_root.join(".local").join("agent").join("process"));
 
     let mut best: Option<(i64, PathBuf)> = None;
     let mut seen = HashMap::new();
@@ -231,6 +259,63 @@ pub fn find_bootstrap_config_for_session(
     Ok(best.map(|(_, path)| path))
 }
 
+/// Bind SQLite session scaffolding paths from a matching on-disk `interview-config.md`.
+///
+/// Returns `Ok(true)` when paths are already set or were just updated; `Ok(false)` when
+/// no matching config is visible yet (caller should retry).
+pub fn sync_scaffolding_from_disk(
+    store: &SessionStore,
+    repo_root: &Path,
+    sqlite_id: i64,
+) -> Result<bool> {
+    let session = store
+        .get_session(sqlite_id)?
+        .ok_or_else(|| anyhow::anyhow!("session {sqlite_id} not found"))?;
+    if session
+        .config_path
+        .as_ref()
+        .is_some_and(|p| Path::new(p).exists())
+    {
+        return Ok(true);
+    }
+
+    let claimed: HashSet<String> = store
+        .list_sessions()?
+        .into_iter()
+        .filter(|s| s.id != sqlite_id)
+        .filter_map(|s| s.config_path)
+        .map(|p| {
+            let pb = PathBuf::from(&p);
+            pb.canonicalize()
+                .unwrap_or(pb)
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        })
+        .collect();
+
+    let Some(config_path) = find_bootstrap_config_for_session(repo_root, &session)? else {
+        return Ok(false);
+    };
+    let canon = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.clone())
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if claimed.contains(&canon) {
+        // Another session already owns this config — wait for a fresh bootstrap write.
+        return Ok(false);
+    }
+    let config = parse_interview_config(&config_path)?;
+    store.update_session_scaffolding(
+        sqlite_id,
+        Some(&config.session_id),
+        Some(&path_for_storage(&config.scratchpad)),
+        Some(&path_for_storage(&config.transcript)),
+        Some(&path_for_storage(&config.config_path)),
+    )?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +350,25 @@ queue_target: 8
     }
 
     #[test]
+    fn strip_doc_process_mirrors_under_local_agent_process() {
+        let repo = Path::new(r"c:\data\git\tod");
+        let entity = repo
+            .join("doc")
+            .join("process")
+            .join("projects")
+            .join("interview-ui")
+            .join("tasks")
+            .join("core-ui");
+        // Without canonicalize (paths may not exist on CI), exercise the strip helper directly.
+        let rel = Path::new("doc/process/projects/interview-ui/tasks/core-ui");
+        assert_eq!(
+            strip_doc_process_prefix(rel),
+            PathBuf::from("projects/interview-ui/tasks/core-ui")
+        );
+        let _ = (repo, entity);
+    }
+
+    #[test]
     fn find_bootstrap_config_matches_entity_and_phase_not_newest_global() {
         use crate::interview::db::{InterviewSession, InterviewSessionStatus};
         use chrono::TimeZone;
@@ -278,7 +382,9 @@ queue_target: 8
         std::fs::create_dir_all(&entity).unwrap();
         std::fs::create_dir_all(&entity_b).unwrap();
 
-        let old_config_dir = agent_scratchpad_for_entity(repo, &entity_b).unwrap().join("old-session");
+        let old_config_dir = agent_scratchpad_for_entity(repo, &entity_b)
+            .unwrap()
+            .join("old-session");
         std::fs::create_dir_all(&old_config_dir).unwrap();
         let old_config = old_config_dir.join("interview-config.md");
         std::fs::write(
@@ -295,8 +401,9 @@ queue_target: 8
         std::thread::sleep(std::time::Duration::from_millis(20));
 
         let kickoff = Utc.with_ymd_and_hms(2026, 8, 24, 12, 0, 0).unwrap();
-        let new_config_dir =
-            agent_scratchpad_for_entity(repo, &entity).unwrap().join("new-session");
+        let new_config_dir = agent_scratchpad_for_entity(repo, &entity)
+            .unwrap()
+            .join("new-session");
         std::fs::create_dir_all(&new_config_dir).unwrap();
         let new_config = new_config_dir.join("interview-config.md");
         std::fs::write(
@@ -329,5 +436,93 @@ queue_target: 8
             .unwrap()
             .expect("expected matching config");
         assert_eq!(found, new_config);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_scaffolding_writes_sqlite_paths_when_config_appears() {
+        use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
+        use crate::interview::paths::TodPaths;
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("tod-sync-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let repo = dir.as_path();
+        let entity = repo
+            .join("doc")
+            .join("process")
+            .join("projects")
+            .join("demo")
+            .join("tasks")
+            .join("t1");
+        fs::create_dir_all(&entity).unwrap();
+
+        let paths = TodPaths::from_repo_root(repo.to_path_buf());
+        let store = SessionStore::open(&paths).unwrap();
+        let session = store
+            .insert_session_with_metadata(
+                NewInterviewSession {
+                    display_name: "t1 — Initial".into(),
+                    entity_path: entity.to_string_lossy().into(),
+                    phase: "project-defining".into(),
+                },
+                InterviewSessionStatus::Active,
+            )
+            .unwrap();
+
+        assert!(
+            !sync_scaffolding_from_disk(&store, repo, session.id).unwrap(),
+            "no config yet"
+        );
+
+        let scratch = agent_scratchpad_for_entity(repo, &entity)
+            .unwrap()
+            .join("project-defining-interview-test");
+        fs::create_dir_all(scratch.join("queue")).unwrap();
+        let config_path = scratch.join("interview-config.md");
+        let transcript = entity
+            .join("history")
+            .join("project-defining-interview-test.md");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "# transcript\n").unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "session_id: project-defining-interview-test\nentity: {}\nphase: project-defining\ntranscript: {}\nscratchpad: {}\nqueue: {}/queue/\n",
+                entity.display(),
+                transcript.display(),
+                scratch.display(),
+                scratch.display(),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            sync_scaffolding_from_disk(&store, repo, session.id).unwrap(),
+            "config on disk should bind"
+        );
+        let mirrored = agent_scratchpad_for_entity(repo, &entity).unwrap();
+        let mirrored_s = mirrored.to_string_lossy().replace('\\', "/");
+        assert!(
+            mirrored_s.ends_with("projects/demo/tasks/t1/scratchpad/interviews"),
+            "mirrored path must drop doc/process, got {mirrored_s}"
+        );
+
+        let updated = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(
+            updated.session_id.as_deref(),
+            Some("project-defining-interview-test")
+        );
+        assert_eq!(
+            updated.config_path.as_deref(),
+            Some(path_for_storage(&config_path).as_str())
+        );
+        assert_eq!(
+            updated.scratchpad_path.as_deref(),
+            Some(path_for_storage(&scratch).as_str())
+        );
+        assert!(sync_scaffolding_from_disk(&store, repo, session.id).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,15 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+static DATA_ROOT_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Pin all durable tod paths under `root` (sandbox / test isolation).
+/// Call once at process start before any `TodPaths::discover()`.
+pub fn set_data_root(root: PathBuf) {
+    let mut guard = DATA_ROOT_OVERRIDE.write().expect("data root override lock");
+    *guard = Some(root);
+}
 
 /// Repo-local XDG-style paths for durable tod data.
 #[derive(Debug, Clone)]
@@ -9,9 +19,15 @@ pub struct TodPaths {
 }
 
 impl TodPaths {
-    /// Resolve repo root by walking up from the current directory.
-    /// A directory qualifies if it contains `.local` or `.git`.
+    /// Resolve repo root: `--data-root` override, else walk up from cwd for `.local`/`.git`.
     pub fn discover() -> Result<Self> {
+        if let Some(root) = DATA_ROOT_OVERRIDE
+            .read()
+            .expect("data root override lock")
+            .clone()
+        {
+            return Ok(Self::from_repo_root(root));
+        }
         let start = std::env::current_dir().context("failed to read current directory")?;
         let repo_root = find_repo_root(&start).unwrap_or(start);
         Ok(Self::from_repo_root(repo_root))
@@ -72,7 +88,23 @@ mod tests {
     fn config_paths_under_local_config_tod() {
         let paths = TodPaths::from_repo_root(PathBuf::from("/repo"));
         assert_eq!(paths.config_dir(), Path::new("/repo/.local/.config/tod"));
-        assert_eq!(paths.sqlite_path(), Path::new("/repo/.local/.config/tod/tod.db"));
-        assert_eq!(paths.settings_path(), Path::new("/repo/.local/.config/tod/tod.yml"));
+        assert_eq!(
+            paths.sqlite_path(),
+            Path::new("/repo/.local/.config/tod/tod.db")
+        );
+        assert_eq!(
+            paths.settings_path(),
+            Path::new("/repo/.local/.config/tod/tod.yml")
+        );
+    }
+
+    #[test]
+    fn discover_honors_data_root_override() {
+        let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
+        set_data_root(root.clone());
+        let paths = TodPaths::discover().unwrap();
+        assert_eq!(paths.repo_root(), root.as_path());
+        // Clear so other tests in this process are not pinned.
+        *DATA_ROOT_OVERRIDE.write().unwrap() = None;
     }
 }

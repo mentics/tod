@@ -1,7 +1,14 @@
-use image::{DynamicImage, RgbaImage};
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{DynamicImage, ExtendedColorType, ImageEncoder, RgbaImage};
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Capture the app window, scale to logical `width`×`height`, optional crop, write PNG.
+///
+/// Lean path: crop in physical pixels first when a crop is given, skip resize when sizes
+/// already match, and encode PNG with fast compression.
 pub fn capture_window_png(
     path: &Path,
     logical_width: u32,
@@ -27,32 +34,42 @@ fn capture_windows(
     crop: Option<(f32, f32, f32, f32)>,
 ) -> Result<(), String> {
     let rgba = capture_client_rgba()?;
-    let scaled = DynamicImage::ImageRgba8(rgba)
-        .resize_exact(
-            logical_width,
-            logical_height,
-            image::imageops::FilterType::Triangle,
-        )
-        .into_rgba8();
+    let (pw, ph) = (rgba.width(), rgba.height());
+    let lw = logical_width.max(1);
+    let lh = logical_height.max(1);
+    let scale_x = pw as f32 / lw as f32;
+    let scale_y = ph as f32 / lh as f32;
 
     let out = if let Some((x0, y0, x1, y1)) = crop {
-        let (x0, y0, x1, y1) = clamp_crop(x0, y0, x1, y1, logical_width, logical_height)?;
-        DynamicImage::ImageRgba8(scaled)
-            .crop_imm(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
-            .into_rgba8()
+        let (lx0, ly0, lx1, ly1) = clamp_crop(x0, y0, x1, y1, lw, lh)?;
+        let tw = lx1.saturating_sub(lx0).max(1);
+        let th = ly1.saturating_sub(ly0).max(1);
+
+        // Crop in physical space first (fewer pixels to resize/encode).
+        let px0 = ((lx0 as f32) * scale_x).floor().max(0.0) as u32;
+        let py0 = ((ly0 as f32) * scale_y).floor().max(0.0) as u32;
+        let px1 = ((lx1 as f32) * scale_x).ceil().min(pw as f32) as u32;
+        let py1 = ((ly1 as f32) * scale_y).ceil().min(ph as f32) as u32;
+        if px1 <= px0 || py1 <= py0 {
+            return Err("crop rectangle is empty after physical clamp".into());
+        }
+        let cropped = DynamicImage::ImageRgba8(rgba).crop_imm(px0, py0, px1 - px0, py1 - py0);
+        if cropped.width() == tw && cropped.height() == th {
+            cropped.into_rgba8()
+        } else {
+            cropped
+                .resize_exact(tw, th, image::imageops::FilterType::Triangle)
+                .into_rgba8()
+        }
+    } else if pw == lw && ph == lh {
+        rgba
     } else {
-        scaled
+        DynamicImage::ImageRgba8(rgba)
+            .resize_exact(lw, lh, image::imageops::FilterType::Triangle)
+            .into_rgba8()
     };
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create_dir {}: {e}", parent.display()))?;
-        }
-    }
-    out.save(path)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(())
+    write_png_fast(path, &out)
 }
 
 fn clamp_crop(
@@ -79,17 +96,48 @@ fn clamp_crop(
     Ok((x0, y0, x1, y1))
 }
 
+fn write_png_fast(path: &Path, img: &RgbaImage) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir {}: {e}", parent.display()))?;
+        }
+    }
+    let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    let encoder =
+        PngEncoder::new_with_quality(&mut writer, CompressionType::Fast, FilterType::Adaptive);
+    encoder
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn capture_client_rgba() -> Result<RgbaImage, String> {
-    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::Foundation::{BOOL, HWND, RECT};
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-        GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ, ReleaseDC, SelectObject,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-    let hwnd = find_main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn PrintWindow(hwnd: HWND, hdc_blt: HDC, flags: u32) -> BOOL;
+    }
+    use windows::Win32::Graphics::Gdi::HDC;
+
+    // Prefer PW_RENDERFULLCONTENT so GPU/DWM content is included even when covered.
+    const PW_RENDERFULLCONTENT: u32 = 0x00000002;
+    const PW_CLIENTONLY: u32 = 0x00000001;
+
+    let hwnd = main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
 
     unsafe {
         let mut client = RECT::default();
@@ -99,45 +147,33 @@ fn capture_client_rgba() -> Result<RgbaImage, String> {
         let cw = (client.right - client.left).max(1);
         let ch = (client.bottom - client.top).max(1);
 
-        let mut origin = POINT { x: 0, y: 0 };
-        if !ClientToScreen(hwnd, &mut origin).as_bool() {
-            return Err("ClientToScreen failed".into());
+        let hdc_window = GetDC(hwnd);
+        if hdc_window.is_invalid() {
+            return Err("GetDC(hwnd) failed".into());
         }
-
-        let hdc_screen = GetDC(HWND::default());
-        if hdc_screen.is_invalid() {
-            return Err("GetDC(screen) failed".into());
-        }
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        let hdc_mem = CreateCompatibleDC(hdc_window);
         if hdc_mem.is_invalid() {
-            ReleaseDC(HWND::default(), hdc_screen);
+            ReleaseDC(hwnd, hdc_window);
             return Err("CreateCompatibleDC failed".into());
         }
-        let hbmp = CreateCompatibleBitmap(hdc_screen, cw, ch);
+        let hbmp = CreateCompatibleBitmap(hdc_window, cw, ch);
         if hbmp.is_invalid() {
             let _ = DeleteDC(hdc_mem);
-            ReleaseDC(HWND::default(), hdc_screen);
+            ReleaseDC(hwnd, hdc_window);
             return Err("CreateCompatibleBitmap failed".into());
         }
         let old = SelectObject(hdc_mem, HGDIOBJ(hbmp.0));
-        if BitBlt(
-            hdc_mem,
-            0,
-            0,
-            cw,
-            ch,
-            hdc_screen,
-            origin.x,
-            origin.y,
-            SRCCOPY,
-        )
-        .is_err()
-        {
+
+        let printed = PrintWindow(hwnd, hdc_mem, PW_CLIENTONLY | PW_RENDERFULLCONTENT).as_bool()
+            || PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT).as_bool()
+            || PrintWindow(hwnd, hdc_mem, 0).as_bool();
+
+        if !printed {
             SelectObject(hdc_mem, old);
             let _ = DeleteObject(HGDIOBJ(hbmp.0));
             let _ = DeleteDC(hdc_mem);
-            ReleaseDC(HWND::default(), hdc_screen);
-            return Err("BitBlt failed".into());
+            ReleaseDC(hwnd, hdc_window);
+            return Err("PrintWindow failed".into());
         }
 
         let mut info = BITMAPINFO {
@@ -165,7 +201,7 @@ fn capture_client_rgba() -> Result<RgbaImage, String> {
         SelectObject(hdc_mem, old);
         let _ = DeleteObject(HGDIOBJ(hbmp.0));
         let _ = DeleteDC(hdc_mem);
-        ReleaseDC(HWND::default(), hdc_screen);
+        ReleaseDC(hwnd, hdc_window);
 
         if got == 0 {
             return Err("GetDIBits failed".into());
@@ -177,6 +213,29 @@ fn capture_client_rgba() -> Result<RgbaImage, String> {
         RgbaImage::from_raw(cw as u32, ch as u32, buf)
             .ok_or_else(|| "invalid bitmap buffer".to_string())
     }
+}
+
+#[cfg(windows)]
+static HWND_CACHE: Mutex<Option<isize>> = Mutex::new(None);
+
+#[cfg(windows)]
+fn main_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    if let Ok(guard) = HWND_CACHE.lock() {
+        if let Some(raw) = *guard {
+            let hwnd = HWND(raw);
+            if unsafe { IsWindow(hwnd).as_bool() } {
+                return Some(hwnd);
+            }
+        }
+    }
+    let found = find_main_hwnd()?;
+    if let Ok(mut guard) = HWND_CACHE.lock() {
+        *guard = Some(found.0);
+    }
+    Some(found)
 }
 
 #[cfg(windows)]
@@ -226,8 +285,8 @@ fn find_main_hwnd() -> Option<windows::Win32::Foundation::HWND> {
     state.best.map(|(h, _)| h)
 }
 
-/// Post a left-button click at logical client coords (no OS focus required).
-pub fn post_click(
+/// Left-button click at logical client coords via `SendMessage` (no OS focus, waits for handling).
+pub fn send_click(
     logical_x: f32,
     logical_y: f32,
     logical_width: u32,
@@ -235,7 +294,7 @@ pub fn post_click(
 ) -> Result<(), String> {
     #[cfg(windows)]
     {
-        post_click_windows(logical_x, logical_y, logical_width, logical_height)
+        send_click_windows(logical_x, logical_y, logical_width, logical_height)
     }
     #[cfg(not(windows))]
     {
@@ -245,7 +304,7 @@ pub fn post_click(
 }
 
 #[cfg(windows)]
-fn post_click_windows(
+fn send_click_windows(
     logical_x: f32,
     logical_y: f32,
     logical_width: u32,
@@ -253,10 +312,10 @@ fn post_click_windows(
 ) -> Result<(), String> {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     };
 
-    let hwnd = find_main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
+    let hwnd = main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
     let (cw, ch) = unsafe {
         let mut client = windows::Win32::Foundation::RECT::default();
         GetClientRect(hwnd, &mut client).map_err(|e| format!("GetClientRect: {e}"))?;
@@ -273,12 +332,10 @@ fn post_click_windows(
     const MK_LBUTTON: usize = 0x0001;
 
     unsafe {
-        PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lp)
-            .map_err(|e| format!("PostMessage MOVE: {e}"))?;
-        PostMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lp)
-            .map_err(|e| format!("PostMessage DOWN: {e}"))?;
-        PostMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lp)
-            .map_err(|e| format!("PostMessage UP: {e}"))?;
+        // SendMessage blocks until the window proc handles the message — no sleep needed.
+        SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lp);
+        SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lp);
+        SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lp);
     }
     Ok(())
 }

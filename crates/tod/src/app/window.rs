@@ -1,4 +1,6 @@
+use super::no_focus;
 use crate::agent_socket::{self, LaunchOptions};
+use crate::interview::agent::SharedAgent;
 use crate::interview::views::sessions::styled_tab;
 use crate::interview::views::{SessionsView, SettingsView};
 use crate::views::task_list::TaskListView;
@@ -60,7 +62,15 @@ impl Render for Shell {
             }))
             .child(TitleBar::new().child("tod"))
             .child(self.render_tab_bar(cx))
-            .child(div().flex_1().min_w_0().min_h_0().overflow_hidden().w_full().child(self.render_content(window, cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .w_full()
+                    .child(self.render_content(window, cx)),
+            )
     }
 }
 
@@ -119,6 +129,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let socket_addr = opts.agent_socket;
     let width = opts.width;
     let height = opts.height;
+    let no_focus = opts.no_focus;
+    let agent: SharedAgent = opts.agent_backend.create();
+
+    #[cfg(windows)]
+    let previous_foreground = if no_focus {
+        no_focus::foreground_hwnd()
+    } else {
+        None
+    };
 
     let handle = cx.open_window(
         WindowOptions {
@@ -128,11 +147,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 size: size(px(width), px(height)),
             })),
             is_resizable: socket_addr.is_none(),
+            focus: !no_focus,
             ..Default::default()
         },
         |window, cx| {
             let task_list = cx.new(|cx| TaskListView::new(window, cx));
-            let sessions = cx.new(|cx| SessionsView::new(window, cx));
+            let agent_for_sessions = agent.clone();
+            let sessions = cx.new(|cx| SessionsView::new(window, cx, agent_for_sessions));
             let settings = cx.new(|cx| SettingsView::new(window, cx));
             let view = cx.new(|_| Shell {
                 active_tab: ShellTab::Tasks,
@@ -143,6 +164,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             cx.new(|cx| Root::new(view, window, cx))
         },
     )?;
+
+    #[cfg(windows)]
+    if no_focus {
+        no_focus::after_window_open(previous_foreground);
+    }
 
     if let Some(addr) = socket_addr {
         agent_socket::start(cx, handle.into(), addr, width, height);

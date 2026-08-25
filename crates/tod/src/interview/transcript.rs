@@ -37,8 +37,8 @@ pub fn append_action(
     }
     if let Some(notes) = notes.filter(|s| !s.trim().is_empty()) {
         block.push_str(notes);
-        block.push('\n');
     }
+    block.push('\n');
     append_block(transcript_path, &block)
 }
 
@@ -92,7 +92,8 @@ pub struct AnswerRecord {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Free-text body lives after the closing `---`, never in front matter.
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub body: String,
 }
 
@@ -100,18 +101,37 @@ pub struct AnswerRecord {
 pub struct ActionRecord {
     pub action: String,
     pub id: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Free-text body lives after the closing `---`, never in front matter.
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub body: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AnswerFrontMatter<'a> {
+    id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    option: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActionFrontMatter<'a> {
+    action: &'a str,
+    id: &'a str,
+}
+
 /// Serialize one or more answer records into the YAML multi-record payload shape.
+/// Front matter is `id` + optional `option` only; free text follows the closing `---`.
 pub fn format_answer_payload(records: &[AnswerRecord]) -> Result<String> {
     if records.is_empty() {
         bail!("answer payload requires at least one record");
     }
     let mut out = String::new();
     for record in records {
-        let header = serde_yaml::to_string(record).context("failed to serialize answer record")?;
+        let header = serde_yaml::to_string(&AnswerFrontMatter {
+            id: &record.id,
+            option: record.option.as_deref(),
+        })
+        .context("failed to serialize answer front matter")?;
         out.push_str("---\n");
         out.push_str(header.trim_end());
         out.push('\n');
@@ -127,13 +147,18 @@ pub fn format_answer_payload(records: &[AnswerRecord]) -> Result<String> {
 }
 
 /// Serialize one or more researcher action records.
+/// Front matter is `action` + `id` only; free text follows the closing `---`.
 pub fn format_action_payload(records: &[ActionRecord]) -> Result<String> {
     if records.is_empty() {
         bail!("action payload requires at least one record");
     }
     let mut out = String::new();
     for record in records {
-        let header = serde_yaml::to_string(record).context("failed to serialize action record")?;
+        let header = serde_yaml::to_string(&ActionFrontMatter {
+            action: &record.action,
+            id: &record.id,
+        })
+        .context("failed to serialize action front matter")?;
         out.push_str("---\n");
         out.push_str(header.trim_end());
         out.push('\n');
@@ -163,26 +188,49 @@ mod tests {
             "q-001",
             "Where should settings live?",
             "Under .local/.config/tod/",
-            Some("A"),
+            Some("1"),
         )
         .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("## q-001"));
-        assert!(text.contains("**Selected:** A"));
+        assert!(text.contains("**Selected:** 1"));
         assert!(text.contains("**Answer:** Under .local/.config/tod/"));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn answer_payload_yaml_shape() {
+    fn answer_payload_yaml_shape_no_body_in_front_matter() {
         let payload = format_answer_payload(&[AnswerRecord {
             id: "q-016".into(),
-            option: Some("A".into()),
+            option: Some("1".into()),
             body: "Notes".into(),
         }])
         .unwrap();
         assert!(payload.contains("id: q-016"));
-        assert!(payload.contains("option: A"));
+        assert!(
+            payload.contains("option:") && (payload.contains('1')),
+            "expected digit option in payload: {payload}"
+        );
         assert!(payload.contains("Notes"));
+        let before_body = payload.split("---\nNotes").next().unwrap_or(&payload);
+        assert!(
+            !before_body.lines().any(|l| l.trim().starts_with("body:")),
+            "body must not appear in front matter: {payload}"
+        );
+    }
+
+    #[test]
+    fn action_payload_yaml_shape_no_body_in_front_matter() {
+        let payload = format_action_payload(&[ActionRecord {
+            action: "defer".into(),
+            id: "q-016".into(),
+            body: "Later".into(),
+        }])
+        .unwrap();
+        assert!(payload.contains("action: defer"));
+        assert!(payload.contains("id: q-016"));
+        assert!(payload.contains("Later"));
+        let before_body = payload.split("---\nLater").next().unwrap_or(&payload);
+        assert!(!before_body.lines().any(|l| l.trim().starts_with("body:")));
     }
 }

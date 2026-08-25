@@ -136,20 +136,20 @@ mod tests {
 id: q-001
 created: 2026-08-22T14:00:00-07:00
 options:
-  - key: A
+  - key: "1"
     label: First option
-  - key: B
+  - key: "2"
     label: Second option
 ---
 Where should durable interview transcripts live?
 
-**Recommend:** A
+**Recommend:** 1
 Which do you want?
 "#;
         let q = parse_queue_contents(Path::new("q-001.md"), contents).unwrap();
         assert_eq!(q.id, "q-001");
         assert_eq!(q.options.len(), 2);
-        assert_eq!(q.options[0].key, "A");
+        assert_eq!(q.options[0].key, "1");
         assert!(q.body.contains("Where should durable"));
     }
 }

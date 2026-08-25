@@ -1,11 +1,18 @@
+use crate::interview::agent::AgentBackend;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
-/// Launch options for window size and optional agent control socket.
+/// Launch options for window size, optional agent control socket, sandbox root, agent backend.
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
     pub width: f32,
     pub height: f32,
     pub agent_socket: Option<SocketAddr>,
+    /// When set, all `TodPaths` resolve under this root (isolated sandbox).
+    pub data_root: Option<PathBuf>,
+    pub agent_backend: AgentBackend,
+    /// When true, open the window without stealing OS keyboard focus.
+    pub no_focus: bool,
 }
 
 impl Default for LaunchOptions {
@@ -14,12 +21,15 @@ impl Default for LaunchOptions {
             width: 1280.0,
             height: 768.0,
             agent_socket: None,
+            data_root: None,
+            agent_backend: AgentBackend::Cursor,
+            no_focus: false,
         }
     }
 }
 
 impl LaunchOptions {
-    /// Parse `--width`, `--height`, and `--agent-socket` from argv (after binary name).
+    /// Parse CLI flags from argv (after binary name).
     pub fn from_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
         let mut opts = Self::default();
         let mut iter = args.into_iter();
@@ -59,6 +69,23 @@ impl LaunchOptions {
                             .map_err(|e| anyhow::anyhow!("invalid --agent-socket `{v}`: {e}"))?,
                     );
                 }
+                "--data-root" => {
+                    i += 1;
+                    let v = rest
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--data-root requires a path"))?;
+                    opts.data_root = Some(PathBuf::from(v));
+                }
+                "--agent" => {
+                    i += 1;
+                    let v = rest
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--agent requires mock|cursor"))?;
+                    opts.agent_backend = AgentBackend::parse(v)?;
+                }
+                "--no-focus" => {
+                    opts.no_focus = true;
+                }
                 other if other.starts_with('-') => {
                     anyhow::bail!("unknown flag: {other}");
                 }
@@ -95,14 +122,22 @@ mod tests {
             "600".into(),
             "--agent-socket".into(),
             "127.0.0.1:9876".into(),
+            "--data-root".into(),
+            r"c:\sandbox".into(),
+            "--agent".into(),
+            "mock".into(),
+            "--no-focus".into(),
         ])
         .unwrap();
         assert_eq!(opts.width, 1024.0);
         assert_eq!(opts.height, 600.0);
+        assert!(opts.no_focus);
+        assert_eq!(opts.agent_socket.unwrap().to_string(), "127.0.0.1:9876");
         assert_eq!(
-            opts.agent_socket.unwrap().to_string(),
-            "127.0.0.1:9876"
+            opts.data_root.as_deref(),
+            Some(std::path::Path::new(r"c:\sandbox"))
         );
+        assert_eq!(opts.agent_backend, AgentBackend::Mock);
     }
 
     #[test]
@@ -111,5 +146,8 @@ mod tests {
         assert_eq!(opts.width, 1280.0);
         assert_eq!(opts.height, 768.0);
         assert!(opts.agent_socket.is_none());
+        assert!(opts.data_root.is_none());
+        assert_eq!(opts.agent_backend, AgentBackend::Cursor);
+        assert!(!opts.no_focus);
     }
 }

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0"
+async-channel = "2.5"
 chrono = { version = "0.4", features = ["serde"] }
 gpui = "0.2.2"
 gpui-component = "0.5.1"

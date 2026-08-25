@@ -1,3 +1,4 @@
+mod no_focus;
 mod window;
 
 use crate::agent_socket::LaunchOptions;

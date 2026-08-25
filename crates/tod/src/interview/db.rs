@@ -71,6 +71,8 @@ impl SessionStore {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open SQLite database at {}", path.display()))?;
+        // Background kickoff sync opens a second connection while the UI holds one.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&conn)?;
         Ok(Self { conn })
     }

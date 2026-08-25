@@ -2,12 +2,23 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub enum Command {
-    Key { keystroke: String },
-    Click { x: f32, y: f32 },
+    Key {
+        keystroke: String,
+    },
+    /// Insert text into the focused GPUI input handler (after a prior focus click + sync).
+    Text {
+        text: String,
+    },
+    Click {
+        x: f32,
+        y: f32,
+    },
     Shot {
         path: PathBuf,
         crop: Option<(f32, f32, f32, f32)>,
     },
+    /// Wait one UI frame (layout/paint) before the next observation.
+    Sync,
 }
 
 /// Parse one protocol line into a command.
@@ -27,6 +38,15 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             }
             Ok(Command::Key {
                 keystroke: rest.to_string(),
+            })
+        }
+        "text" => {
+            let rest = line["text".len()..].trim();
+            if rest.is_empty() {
+                return Err("text requires a string".into());
+            }
+            Ok(Command::Text {
+                text: rest.to_string(),
             })
         }
         "click" => {
@@ -68,6 +88,12 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 crop,
             })
         }
+        "sync" => {
+            if parts.next().is_some() {
+                return Err("sync takes no arguments".into());
+            }
+            Ok(Command::Sync)
+        }
         other => Err(format!("unknown command `{other}`")),
     }
 }
@@ -91,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_click_and_shot_crop() {
+    fn parses_click_shot_and_sync() {
         let c = parse_line("click 10 20.5").unwrap();
         match c {
             Command::Click { x, y } => {
@@ -106,6 +132,16 @@ mod tests {
                 assert_eq!(path, PathBuf::from("out.png"));
                 assert_eq!(crop, Some((0.0, 80.0, 640.0, 400.0)));
             }
+            _ => panic!(),
+        }
+        assert!(matches!(parse_line("sync").unwrap(), Command::Sync));
+    }
+
+    #[test]
+    fn parses_text_command() {
+        let c = parse_line("text hello world").unwrap();
+        match c {
+            Command::Text { text } => assert_eq!(text, "hello world"),
             _ => panic!(),
         }
     }

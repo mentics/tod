@@ -6032,6 +6032,7 @@ name = "tod"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "chrono",
  "gpui",
  "gpui-component",

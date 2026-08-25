@@ -1,202 +1,123 @@
 # Core UI — plan
 
+> **Cycle:** redesign → implement (2026-08-25). Prior foundation/workspace already shipped; this plan is the **delta** for H1–H8 (project reqs 6, 18–23) + task req 5 (F1–F6). Do not re-land Steps 1–30 from the original build unless a fix step touches them.
+
 ## Goal (from user.md)
 
-Implement the full Interview UI product inside the tod GPUI desktop app: all project requirements 1–18, agent/protocol changes, interview process skill updates (not state agents), and end-to-end verification via one real process interview.
+Deliver full Interview UI (project reqs 1–23) inside tod GPUI, including selection/nav/MC/Complete UX and independent-review fixes F1–F6; re-verify (mock + ACP smoke + E2E as needed).
 
-## Steps
+## Baseline (already implemented)
 
-### Foundation
+Treat as done unless a redesign step below revises it:
 
-1. **Crate layout** — Add interview modules under `crates/tod/src/interview/` (or a workspace member crate if separation helps testing). Export from `crates/tod/src/lib.rs` or `main` wiring as needed. Confirm `cargo check` passes.
-2. **Local home paths** — Implement path helpers: repo `.local` as XDG-style home; durable config/data under `.local/.config/tod/` (SQLite DB, `tod.yml`). Create dirs on first use.
-3. **SQLite persistence** — Add `rusqlite` (or equivalent). Schema v1: `interview_sessions` table per design (display name, status `active`|`archived`|`complete`, paths to scratchpad/transcript/config, created/updated timestamps). Migrations on open. No transcript-body tables.
-4. **Settings file** — Load/save `tod.yml` under `.local/.config/tod/` with researcher thresholds (replenish default 8, second-researcher default 2). Wire Settings UI to this file.
+- Crate layout, `.local` paths, SQLite sessions, `tod.yml` settings
+- Agent provider + Cursor ACP + mock provider
+- Interview SKILL / researcher / answer-processor bootstrap & queue YAML formats (letter MC examples may still need digit-only scrub — see R2)
+- Queue watcher, shell tabs, session list/archive/kickoff
+- Three-column workspace, pending state, actions, deep-dive, replenishment, status/toasts
+- Prior verifying PASS (sandbox mock) — **not** a waiver of H1–H8 / F1–F6
 
-### Agent provider & ACP
+## Redesign steps (ordered)
 
-5. **Agent provider trait** — Define `AgentProvider` (or equivalent) with operations: start researcher replenishment, start answer-processor run, start deep-dive chat session; each returns a run handle with in-flight / success / failure lifecycle. Cursor is the only v1 backend behind this trait.
-6. **Cursor ACP adapter** — Implement v1 adapter using ACP over Cursor Agent CLI (`agent acp`), fresh session per run, model `auto`, subscription auth. Follow spike reference `doc/process/projects/interview-ui/doc/spikes/acp-auto-billing-test/`. Handle initialize → authenticate → session/new → session/prompt → session/update; auto-allow permissions for unattended runs. Map lifecycle to provider run handle.
-7. **ACP decision tree (deferred fallback)** — If ACP install/auth fails on target machine during implementation: log failure; consider SDK Node sidecar or CLI print-mode behind same trait — do **not** silently switch to pay-per-token or non-Auto model. Primary path remains ACP.
+### Protocol & agents (digits + payload shape)
 
-### Process & protocol changes
+1. **Digit-only MC in agent docs** — Scrub researcher (and related) skills/prompts/protocol examples so `options[].key` / labels are `"1"`, `"2"`, `"3"`, … only. No A/B/C examples. Task req 2; project req 6. Files under `skills/process/interview/`.
+2. **Answer/action YAML body placement (F3)** — `format_answer_payload` / `format_action_payload` (`transcript.rs`): front matter = `id` + optional `option` (answers) or `action` + `id` (actions) only; free text **after** closing `---` — do not serialize `body` into FM via `serde_yaml::to_string(record)`. Align with `design.md` protocol examples.
 
-8. **Interview SKILL bootstrap update** — Update `skills/process/interview/SKILL.md` bootstrap: UI inserts SQLite session row on kickoff; **researcher** creates transcript (under entity `history/`), session scratchpad, empty `queue/`, and `interview-config.md` on first launch (UI does not create scaffolding separately). Document UI-owned transcripts.
-9. **Researcher agent update** — Update `interview-researcher-agent.md`: bootstrap ownership shift; queue file format → YAML front matter + free-text body; MC `options:` list with `key`/`label` in front matter; handle researcher action protocol input when UI forwards action payloads; `researcher-status.md` for UI observation.
-10. **Answer-processor agent update** — Update `interview-answer-processor-agent.md`: stop writing transcripts (UI appends to entity `history/` before invoking processor); accept YAML multi-record answer payloads; queue delete/modify semantics unchanged; status file for UI.
-11. **UI transcript writer** — Before each answer-processor or researcher-action invoke, UI appends exact Q&A (or action) to entity `history/{description}-{YYYY-MM-DD}-{HHMM}.md` per interview SKILL transcript rules.
+### Agent / run correctness (F1–F6)
 
-### Queue & filesystem sync
+3. **Mock researcher actions (F1)** — Stop routing researcher-action submits through replenish-only paths. `submit_action` must start an action-shaped run; `MockAgentProvider` must handle action prompts with defer/reconsider/more-options semantics (mutate/delete queue per action), not `replenish_from_prompt`. Touch `workspace.rs` submit path + `agent/mock.rs`.
+4. **Pending clear on failure (F2)** — On answer-processor / researcher-action failure, clear pending for the **finished run’s `question_id`**, not `last_submitted_id`. Concurrent action + later answer must not clear the wrong id.
+5. **ACP cancel kills child (F4)** — `CursorAcpProvider::cancel_run` must retain a worker/process handle and terminate the ACP child; hung-replenish reconcile must cancel for real, not only drop UI bookkeeping.
+6. **Workspace queue bind (F5)** — `WorkspaceView::new`: bind only the session’s `config_path` / queue. **No** fallback to repo-root `interview-config.md` + `queue/`. If paths missing, show pending/scaffolding state until sync — never watch the wrong queue.
+7. **Hung replenish = failure (F6)** — `reconcile_hung_replenishment` must finish runs as **error/cancelled**, not `Ok(())` success (must not mark replenish succeeded / exhausted falsely).
 
-12. **Queue file parser** — Parse queue files: YAML front matter (`id`, `created`, optional `options:` with `key`/`label`) + markdown body. One question per file.
-13. **Queue watcher** — Watch session `queue/` with `notify` (debounced ~300ms). Reflect add/remove/modify within ~1s. Per-session watcher lifecycle tied to open interview.
+### Workspace UX (H1–H8 / project 19–23 + 6, 18)
 
-### App navigation (minimal)
+8. **Selection visibility (H1/H2 / req 19)** — Session-list and question-list selected rows + focus chrome on list/response controls: strong contrast (not weak accent tint alone). Cite `refs/process/other/ux-design.md` contrast / states / actionable lists.
+9. **Single-line question rows (H3 / req 20)** — Question list: one line `id` + short label; ellipsis OK; no stacked id-above-label.
+10. **Workspace focus model (H4 / req 21)** — Focus regions: (A) question list, (B) response column in visual order MC → Notes → actions → Submit. **Middle column never focuses.** Right from list → uppermost response control; Left from response → list; Up/Down among response controls.
+11. **Notes edit mode (H4 / req 21)** — Focus ≠ edit. Enter/Space enter edit; Escape exits edit (stay on Notes); while editing: text arrows; digit MC off; Ctrl+Enter submits. Click Notes → edit immediately.
+12. **MC submit paths (H4/H6 / reqs 6, 21)** — Digits only; digit key → **immediate submit** when not in Notes edit. Space/Enter on focused MC submits; click MC submits. Remove letter-key select-only behavior.
+13. **Escape stays in workspace (H5 / req 22)** — Escape never navigates to session list. Exit Notes edit when editing; otherwise no-op (unless nested chrome). Leave via **Back to interviews**.
+14. **Response column layout (H7 / req 23)** — Response column horizontal fill / flex with window; MC labels wrap, **no ellipsis truncate**; Notes width tracks column. Drop fixed max-width that clips.
+15. **Complete vs bound queue (H8 / req 18 + F5)** — Show in-place Complete **only** when bound queue has zero open questions and replenishment not waiting. SQLite `complete` must not stick Complete over a non-empty bound queue; if questions reappear, show body UI and allow answers. Pair with step 6 (correct queue bind).
 
-14. **Shell tabs** — Extend `Shell` with minimal top navigation: **Tasks** | **Interview** | **Settings** (per accepted visual). Swap main content area only; do not rework task-list implementation. Tasks tab keeps existing `TaskListView`.
+### Verification & close
 
-### Session management views
+16. **Targeted regression** — cargo test/check; mock batch covering F1–F3, F5–F6 paths; hung-cancel smoke for F4 if feasible; UI checks for reqs 6, 18–23.
+17. **Re-verify prior checklist** — Re-run sandbox mock batch + one ACP smoke (or full prior verifying harness) so redesign did not regress reqs 1–17 / deep-dive.
+18. **E2E** — If prior E2E is stale relative to this delta, re-run one real process interview via UI to interview-complete (task req 4).
 
-15. **Session list view** — Interview tab default: list from SQLite; Active / Archive tabs; row selection + Open; **New interview** in-menu entity/purpose controls (no separate launch screen). Visual: `artifacts/visual/sessions-menu/`.
-16. **New interview kickoff** — On launch: UI inserts SQLite row (status active, pending paths); builds typed prompt/payload for researcher; starts researcher via provider. Researcher creates scaffolding; UI updates SQLite paths when config/transcript/scratchpad appear (watch parent dirs or poll once after researcher success).
-17. **Archive** — Archive action sets SQLite status `archived`; files stay on disk; archive tab filters; block answer submit and replenishment while archived.
-
-### Interview workspace
-
-18. **Three-column workspace** — Selected session: scrollable question list (id + short label) | full question body | response pane (MC → Notes → action dropdown + Submit). Visual: `artifacts/visual/interview-workspace/`.
-19. **MC + keyboard** — Bind MC option keys from YAML front matter; selected option highlight; user may submit MC alone, text alone, or both.
-20. **Notes + submit** — Notes text area; Submit builds YAML answer record(s) per design; **Ctrl+Enter** in Notes submits; after submit-like action, auto-select next question in list.
-21. **Pending state** — After submit, mark question pending/deactivated until queue file removed or modified; re-enable and refresh content on modify.
-22. **Question actions dropdown** — Consider/reconsider, Defer, More options, Deep dive — separate from MC. Build researcher YAML action records (`action` + `id` + optional body); mark pending like answer submit.
-23. **In-place Complete** — When queue empty and researcher returned no further questions (not waiting on in-flight replenishment), show Complete message in workspace middle column; Back to interviews + optional doc links. Visual: `artifacts/visual/complete-inplace/`. Update SQLite status `complete`.
-
-### Deep-dive
-
-24. **Deep-dive view** — Separate chat UI (not three-column workspace). Start from question action with context: project, task, lifecycle state, interview purpose, phase. Ordinary agent chat via provider (non-interview session). Visual: `artifacts/visual/deep-dive/`.
-25. **Use this** — User selects transcript text → **Use this** pastes into parent question Notes; user edits and submits via normal answer-processor path. No auto-detect / auto-submit.
-
-### Agent orchestration
-
-26. **Replenishment logic** — When open count < replenish threshold (from `tod.yml`), start researcher run. If count < second threshold while one researcher in flight, start second (max 2 concurrent). Skip for archived/complete sessions.
-27. **Fresh sessions** — New ACP session per replenishment and per answer submission (v1).
-28. **Status area** — Use persistent status location for in-flight and success (quiet success OK). Integrate minimal status strip if not present (tod req 10 pattern).
-29. **Error toasts** — Failures → toast/banner (more visible than status). Answer-processor failure: re-enable submit on question + show error. Researcher failure: auto-retry up to 3 with exponential backoff; after 3, stop auto-retry and expose manual kickoff control.
-
-### Settings
-
-30. **Settings view** — Number inputs for both thresholds; labels/help per visual. Visual: `artifacts/visual/settings/`.
-
-### Verification
-
-31. **Manual integration pass** — Run full verification checklist (see [Verification](#verification)) on Windows.
-32. **End-to-end process interview** — Using only Interview UI, conduct one real process interview on a scratch entity until interview-complete state (task user.md req 4).
-
-## Constructions (must match design / user constraints)
+## Constructions (must match design / user)
 
 | Concern | Construction |
 |--|--|
-| App navigation / mounting | Replace main content area; tab/menu Tasks ↔ Interview ↔ Settings; same window |
-| Agent provider boundary | Interview code → trait → Cursor ACP adapter only in v1 |
-| Cursor usage | Subscription + Auto model via ACP |
-| Agent launch (v1) | ACP over Cursor agent; fresh session per run |
-| Local home | `.local` repo home; durable files under `.local/.config/tod/` |
-| Session persistence | SQLite metadata; on-disk queue/config/protocol for agents |
-| Transcripts | UI writes `history/*.md` only; not in SQLite |
-| SQLite schema | `interview_sessions`: name, status, paths, timestamps |
-| New session row | Insert on kickoff; update paths when scaffolding appears |
-| Interview finished | In-place Complete in workspace; SQLite `complete` |
-| Researcher thresholds | Global Settings → `tod.yml` (not SQLite) |
-| Archive | SQLite `archived`; files in place; mutation blocked |
-| Answer payload | YAML multi-record: `id`, optional `option`, body |
-| Researcher actions | YAML multi-record: `action`, `id`, optional body |
-| Workspace layout | Three columns per accepted visual |
-| Reject action | Not implemented; Consider/reconsider instead |
-| Queue watcher | `notify` + debounce; no polling primary path |
-| Queue format | YAML front matter + body; one file per question |
-| MC binding | `options:` with `key`/`label` in front matter |
-| Launch UI | From session list/menu; researcher creates scaffolding |
-| Agent errors | Toast/banner + in-context recovery |
-| Agent success/in-flight | Status area; no success toast |
-| Visual design | Match accepted packages under `artifacts/visual/` |
-| Scope constraint | Interview views only; do not rework task-list UI |
-| Process skill scope | May change interview SKILL + researcher/answer-processor agents; not state agents |
+| MC keys | Digits only; immediate submit; agents emit `"1"`/`"2"`/… |
+| Answer / action YAML | FM keys only (`id`/`option` or `action`/`id`); body after `---` |
+| Mock actions | Action semantics, not replenish |
+| Pending on failure | Clear by run `question_id` |
+| ACP cancel | Kill child process |
+| Queue bind | Session config only; no repo-root fallback |
+| Hung replenish | Failure/cancel, not success |
+| Selection chrome | High-contrast selected + focused |
+| Question list rows | Single-line id + label |
+| Focus model | List ↔ response; middle non-focusable |
+| Notes edit | Explicit edit mode; Ctrl+Enter; click-to-edit |
+| Escape | No leave workspace |
+| Response layout | Flex horizontal fill; wrap; no MC truncate |
+| Complete | Only empty bound queue; don’t stick over open Qs |
+| Scope | Interview views only; no state-agent edits |
 
 ## Requirement traceability
 
-### Project `user.md` (reqs 1–18)
+### Project `user.md` (1–23)
 
-| Req | Plan element | Implementation (to fill) | Check |
-|--|--|--|--|
-| 1. Replenishment threshold | Steps 4, 26, 30; Constructions: thresholds in `tod.yml` | `TodSettings` + `SettingsView` (wired); replenishment scheduler pending step 26 | Replenish runs below configured threshold; user can change in Settings |
-| 2. Queue folder sync | Steps 12–13 | `notify` watcher per session | Add/remove/change reflected within ~1s |
-| 3. Researcher concurrency | Steps 26–27 | Max 2 in-flight researcher runs | Second run when count < lower threshold while first in progress |
-| 4. Efficient question interaction | Steps 18–20 | Editable Notes; MC keyboard; in-place wording edit | From approval-style question, edit text in pane and submit without copy elsewhere |
-| 5. Answer submission payload | Steps 10–11, 20 | UI builds YAML record; invokes answer-processor with payload | Question id + answer content reach processor (YAML shape per design) |
-| 6. Keyboard MC selection | Step 19 | Key bindings from `options:` keys | User selects MC option via keyboard |
-| 7. Pending state | Step 21 | Pending UI until file gone/modified | Submit → pending; re-enable on modify |
-| 8. Question actions | Step 22 | Action dropdown → researcher protocol | Deep-dive, consider, more-options, defer available |
-| 9. Deep-dive start | Step 24 | Separate non-interview session + context | Branch starts from queued question |
-| 10. Deep-dive closure | Step 25 | Use this → parent Notes; manual submit | No auto-detect/submit; user submits parent normally |
-| 11. Fresh agent sessions | Steps 6–7, 27 | ACP session/new per run | New session per replenishment and per answer |
-| 12. Agent run feedback | Steps 28–29 | Status + toast patterns | Visible in-flight, success (status), failure (toast) |
-| 13. Error recovery | Step 29 | Re-enable submit; researcher retry + manual kickoff | AP failure re-enables question; researcher 3× backoff then manual |
-| 14. Multiple simultaneous interviews | Steps 15–16, 13 | Per-session SQLite + watchers + provider runs | Two+ sessions active concurrently |
-| 15. Session list and launch | Steps 15–16 | Session list view + in-menu new interview | List visible; launch from list |
-| 16. Archive | Step 17 | SQLite archived + UI filter + block mutations | Archived reopenable; submit/replenish blocked |
-| 17. New session creation | Steps 8–9, 16 | UI row + researcher bootstrap | User provides context; researcher creates scaffolding |
-| 18. Interview completion | Step 23 | In-place Complete + SQLite complete | Empty queue, no pending replenishment, clear finished state |
+| Req | Plan | Check |
+|--|--|--|
+| 1–5, 7–17 | Baseline + step 17 regression | Prior verifying checks still pass |
+| 6 MC digits + immediate submit | Steps 1, 12 | Digit keys submit; no letters; agents emit digits |
+| 18 Complete vs queue | Steps 6, 15 | Complete only empty bound queue; reopen body if Qs return |
+| 19 Selection visibility | Step 8 | Selected/focus clearly distinct |
+| 20 Single-line rows | Step 9 | One line id+label |
+| 21 Workspace nav | Steps 10–12 | Left/Right/Up/Down, Notes edit, MC Space/Enter/click, Ctrl+Enter |
+| 22 Escape | Step 13 | Escape does not → session list |
+| 23 Response layout | Step 14 | Fill width; wrap; no truncate |
 
 ### Task `user.md`
 
-| Req | Plan element | Implementation (to fill) | Check |
-|--|--|--|--|
-| 1. Full project scope | All steps + traceability above | Entire interview feature set | Each project req 1–18 passes |
-| 2. Agent/protocol changes | Steps 8–11 | SKILL + agent defs + on-disk formats | Researcher/AP agents and queue/config/transcript layouts updated |
-| 3. Process skills (not state agents) | Steps 8–10 | `interview/SKILL.md`, researcher, answer-processor only | No edits to `planning-agent.md` etc. |
-| 4. E2E verification | Step 32 | Real interview via UI only | Reaches interview-complete |
-
-### Inherited / constraints
-
-| Source | Plan element | Check |
+| Req | Plan | Check |
 |--|--|--|
-| Project constraint 1: embedded GPUI | Steps 14–30 in existing `crates/tod` | Not standalone/web |
-| Project constraint 4: self-enclosed | No task-list → interview integration | Session list is entry point |
-| Project constraint 5: session durability | Steps 3, 16; SQLite + on-disk files | Survives app restart |
-| Project constraint 6: agent compatibility | Steps 8–12 | Queue/config work with updated agents |
-| Task constraint 1: interview views only | Step 14 minimal tabs | Task list unchanged beyond tab shell |
-| Task constraint 2: ui-scaffolding | Step 14 extends `Shell` | Same GPUI app |
-| tod req 10 status area | Step 28 | In-flight/success in status location |
-| tod req 11 failure feedback | Step 29 | Errors in toast/banner |
+| 1 Full project 1–23 | All redesign + baseline | Each project req check |
+| 2 Agent/protocol + digits | Steps 1–2 | Skills/prompts digit-only; YAML shape |
+| 3 Interview skills only | Step 1 | No state-agent edits |
+| 4 E2E | Step 18 | Interview-complete via UI |
+| 5 F1–F6 | Steps 2–7 | Each finding fixed + pointer in review journal |
 
 ## Assumptions
 
-1. Developer has Cursor Agent CLI installed and authenticated (`agent login` or `CURSOR_API_KEY`) on the Windows dev machine; ACP path verified by user spike.
-2. ACP remains the v1 primary launch path; fallback adapters are contingency only (see Step 7 decision tree).
-3. GPUI + gpui-component versions from ui-scaffolding/task-list remain acceptable; interview views follow same stack.
-4. `rusqlite` bundled SQLite is acceptable for v1 session metadata.
-5. Minimal status area and toast/banner components may be net-new in tod shell (not present in task-list task) — scoped to interview + shared hook points only.
-6. End-to-end verification uses a throwaway process entity (task or project) created for the test interview.
-7. Cross-platform verification on Windows only for this task (consistent with prior tod tasks).
-8. Implementation interview waived — design interview, task requirements interview, accepted visuals, and ACP spike provide sufficient step-level and verification detail; waiver recorded in `history/` pending human confirmation at look-over.
+1. Prior verifying PASS remains valid evidence for untouched paths; redesign requires re-check of touched paths + smoke regression.
+2. Implementation interview waived for this redesign planning pass — locked design constructions + Accept H1–H8 + F1–F6 journal are sufficient; waiver in `history/`.
+3. Human authorized advance past interactive look-over to **active** once plan ready (2026-08-25).
+4. Flex recipe for response column may use GPUI `flex`/`flex_grow` sharing remainder after list+body; exact weights implementer choice if visual matches req 23.
+5. Windows-only verification continues.
 
 ## Verification
 
-Manual verification on **Windows**. Run from repo root after implementation steps complete.
-
-### Per-requirement checks (project 1–18)
-
 | # | Check | How |
 |--|--|--|
-| 1 | Replenishment at configured threshold; Settings changes threshold | Lower open count artificially; change Settings; observe runs |
-| 2 | Queue sync ~1s | Add/remove/modify queue file on disk; UI updates |
-| 3 | Max 2 researcher runs | Drop count below both thresholds during in-flight run |
-| 4 | Edit approval text in place | Open wording-approval question; edit Notes; submit |
-| 5 | Answer payload to processor | Submit answer; confirm processor receives id + content (YAML) |
-| 6 | Keyboard MC | Press option key; selection moves |
-| 7 | Pending until resolved | Submit; pending until file deleted/modified |
-| 8 | All four action types | Exercise consider, defer, more-options, deep-dive |
-| 9 | Deep-dive session starts | Deep-dive opens separate chat with context |
-| 10 | Use this → manual submit | Paste from deep-dive; edit; submit parent |
-| 11 | Fresh sessions | Observe new ACP session per run (logs/handles) |
-| 12 | Status + error visibility | In-flight in status; failure in toast |
-| 13 | Recovery paths | Force AP failure (re-enable); force researcher failure (retry then manual) |
-| 14 | Two sessions concurrent | Open two interviews; both functional |
-| 15 | List + launch | Session list; new interview from menu |
-| 16 | Archive | Archive session; reopen; mutations blocked |
-| 17 | Researcher scaffolds | New interview; researcher creates config/queue/transcript |
-| 18 | Complete state | Drain queue; in-place Complete shown |
+| F1 | Mock defer/reconsider/more-options | Mock provider; queue mutates per action, not blind replenish |
+| F2 | Failure clears correct pending | Concurrent action + answer; fail first; only its id re-enabled |
+| F3 | YAML FM has no `body` key | Inspect payload / unit test on formatters |
+| F4 | cancel_run kills ACP child | Start run; cancel; process gone (Task Manager / wait) |
+| F5 | No repo-root queue bind | Open session without config; must not watch repo `queue/` |
+| F6 | Hung replenish ≠ success | Force hung reconcile; status/error not exhausted-success |
+| 6 | Digit immediate submit | Press `1`; answer submits |
+| 18 | Complete gating | Non-empty queue never shows stuck Complete |
+| 19–20 | Selection + single-line | Visual/manual |
+| 21–22 | Nav + Escape | Keyboard/mouse matrix per req 21–22 |
+| 23 | Response flex/wrap | Widen window; long MC wraps |
+| R | Regression | Mock batch + ACP smoke |
+| E2E | Task req 4 | Full interview via UI if needed |
 
-### End-to-end (task req 4)
-
-| # | Check | How |
-|--|--|--|
-| E2E | Full process interview via UI only | New interview on scratch entity → answer questions through design/planning-like phase → interview-complete without chat fallback |
-
-### Regression
-
-| # | Check | How |
-|--|--|--|
-| R1 | Task list still works | Tasks tab: list renders and keyboard nav unchanged |
-| R2 | App restart durability | Restart tod mid-interview; session and queue restored |
-
-**Out of scope:** automated UI tests; macOS/Linux verification; task-list → interview integration.
+**Out of scope:** letter-key MC; Reject action; state-agent edits; macOS/Linux; task-list → interview integration.

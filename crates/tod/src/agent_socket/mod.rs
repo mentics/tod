@@ -2,12 +2,14 @@
 //!
 //! Line protocol (one command per line, one `ok` / `err …` reply):
 //! - `key <keystroke>`
+//! - `text <string>` — insert into focused input (after focus click + sync)
 //! - `click <x> <y>`
 //! - `shot <path> [x0 y0 x1 y1]`
+//! - `sync` — wait one UI frame (use before a shot after clicks if paint must settle)
 //!
 //! Keys use GPUI `dispatch_keystroke` (same path as typed input). Clicks use
-//! `PostMessage` to this process's HWND — GPUI's `dispatch_event` returns a
-//! crate-private type and cannot be called from outside `gpui`.
+//! `SendMessage` to this process's HWND — synchronous, no focus steal, no sleep.
+//! The UI drain loop wakes on each command (no polling).
 
 mod capture;
 mod commands;
@@ -15,15 +17,20 @@ mod options;
 
 pub use options::LaunchOptions;
 
-use commands::{parse_line, Command};
+use commands::{Command, parse_line};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
+use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, SyncSender};
 use std::time::Duration;
 
 enum UiRequest {
     Key(String),
+    /// Insert characters into the focused GPUI text input handler.
+    Text(String),
+    /// Yield one frame so layout/paint after input is visible to `shot`.
+    Sync,
 }
 
 struct Pending {
@@ -39,7 +46,7 @@ pub fn start(
     logical_width: f32,
     logical_height: f32,
 ) {
-    let (tx, rx) = mpsc::sync_channel::<Pending>(8);
+    let (tx, rx) = async_channel::bounded::<Pending>(32);
     let lw = logical_width.round().max(1.0) as u32;
     let lh = logical_height.round().max(1.0) as u32;
 
@@ -56,7 +63,7 @@ pub fn start(
 
 fn listen_loop(
     addr: SocketAddr,
-    tx: SyncSender<Pending>,
+    tx: async_channel::Sender<Pending>,
     logical_width: u32,
     logical_height: u32,
 ) {
@@ -84,7 +91,7 @@ fn listen_loop(
 
 fn handle_client(
     stream: TcpStream,
-    tx: SyncSender<Pending>,
+    tx: async_channel::Sender<Pending>,
     logical_width: u32,
     logical_height: u32,
 ) {
@@ -108,12 +115,10 @@ fn handle_client(
             Ok(Command::Shot { path, crop }) => {
                 capture::capture_window_png(&path, logical_width, logical_height, crop)
             }
-            Ok(Command::Key { keystroke }) => {
-                dispatch_ui(&tx, UiRequest::Key(keystroke))
-            }
-            Ok(Command::Click { x, y }) => {
-                capture::post_click(x, y, logical_width, logical_height)
-            }
+            Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
+            Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
+            Ok(Command::Click { x, y }) => capture::send_click(x, y, logical_width, logical_height),
+            Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
             Err(e) => Err(e),
         };
 
@@ -127,9 +132,9 @@ fn handle_client(
     }
 }
 
-fn dispatch_ui(tx: &SyncSender<Pending>, request: UiRequest) -> Result<(), String> {
+fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Result<(), String> {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(Pending {
+    tx.send_blocking(Pending {
         request,
         reply: reply_tx,
     })
@@ -139,25 +144,61 @@ fn dispatch_ui(tx: &SyncSender<Pending>, request: UiRequest) -> Result<(), Strin
         .map_err(|_| "agent UI command timed out".to_string())?
 }
 
-async fn drain_loop(cx: &mut AsyncApp, window: AnyWindowHandle, rx: Receiver<Pending>) {
-    loop {
+async fn drain_loop(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    rx: async_channel::Receiver<Pending>,
+) {
+    while let Ok(pending) = rx.recv().await {
+        let result = match pending.request {
+            UiRequest::Sync => {
+                Timer::after(Duration::from_millis(16)).await;
+                Ok(())
+            }
+            UiRequest::Key(keystroke) => apply_key(cx, window, keystroke),
+            UiRequest::Text(text) => apply_text(cx, window, text),
+        };
+        let _ = pending.reply.send(result);
+
         while let Ok(pending) = rx.try_recv() {
-            let result = apply_on_ui(cx, window, pending.request);
+            let result = match pending.request {
+                UiRequest::Sync => {
+                    Timer::after(Duration::from_millis(16)).await;
+                    Ok(())
+                }
+                UiRequest::Key(keystroke) => apply_key(cx, window, keystroke),
+                UiRequest::Text(text) => apply_text(cx, window, text),
+            };
             let _ = pending.reply.send(result);
         }
-        Timer::after(Duration::from_millis(16)).await;
     }
 }
 
-fn apply_on_ui(cx: &mut AsyncApp, window: AnyWindowHandle, request: UiRequest) -> Result<(), String> {
+fn apply_key(cx: &mut AsyncApp, window: AnyWindowHandle, keystroke: String) -> Result<(), String> {
     window
-        .update(cx, |_root, window, cx| match request {
-            UiRequest::Key(keystroke) => {
-                let ks = Keystroke::parse(&keystroke)
-                    .map_err(|e| format!("invalid keystroke `{keystroke}`: {e}"))?;
-                let _handled = window.dispatch_keystroke(ks, cx);
-                Ok(())
+        .update(cx, |_root, window, cx| {
+            let ks = Keystroke::parse(&keystroke)
+                .map_err(|e| format!("invalid keystroke `{keystroke}`: {e}"))?;
+            let _handled = window.dispatch_keystroke(ks, cx);
+            Ok(())
+        })
+        .map_err(|e| format!("window update failed: {e}"))?
+}
+
+fn apply_text(cx: &mut AsyncApp, window: AnyWindowHandle, text: String) -> Result<(), String> {
+    window
+        .update(cx, |_root, window, cx| {
+            // Prefer direct insert into gpui-component focused InputState when available.
+            if let Some(input) = window.focused_input(cx) {
+                input.update(cx, |state, cx| {
+                    state.insert(text.clone(), window, cx);
+                });
+                return Ok(());
             }
+            Err(
+                "no focused input — click the field (or key ctrl-shift-n for Notes) then sync"
+                    .into(),
+            )
         })
         .map_err(|e| format!("window update failed: {e}"))?
 }
