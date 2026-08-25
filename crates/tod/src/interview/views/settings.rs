@@ -3,7 +3,9 @@ use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
     SharedString, Styled, Window, div, px,
 };
-use gpui_component::input::{InputEvent, InputState, NumberInput};
+use gpui_component::input::{
+    InputEvent, InputState, NumberInput, NumberInputEvent, StepAction,
+};
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 
 pub struct SettingsView {
@@ -48,6 +50,18 @@ impl SettingsView {
         })
         .detach();
 
+        cx.subscribe_in(&replenish_input, window, |this, input, event, window, cx| {
+            let NumberInputEvent::Step(action) = event;
+            if let Some(value) = stepped_value(&input.read(cx).value(), *action) {
+                input.update(cx, |input, cx| {
+                    input.set_value(value.to_string(), window, cx);
+                });
+                this.settings.researcher.replenish_threshold = value;
+                let _ = this.settings.save(&this.paths);
+            }
+        })
+        .detach();
+
         cx.subscribe(&second_input, |this, input, event, cx| {
             if matches!(event, InputEvent::Change) {
                 let text = input.read(cx).value().to_string();
@@ -59,8 +73,28 @@ impl SettingsView {
         })
         .detach();
 
+        cx.subscribe_in(&second_input, window, |this, input, event, window, cx| {
+            let NumberInputEvent::Step(action) = event;
+            if let Some(value) = stepped_value(&input.read(cx).value(), *action) {
+                input.update(cx, |input, cx| {
+                    input.set_value(value.to_string(), window, cx);
+                });
+                this.settings.researcher.second_researcher_threshold = value;
+                let _ = this.settings.save(&this.paths);
+            }
+        })
+        .detach();
+
         view
     }
+}
+
+fn stepped_value(text: &str, action: StepAction) -> Option<u32> {
+    let value = text.parse::<u32>().ok()?;
+    Some(match action {
+        StepAction::Increment => value.saturating_add(1),
+        StepAction::Decrement => value.saturating_sub(1),
+    })
 }
 
 impl Focusable for SettingsView {
@@ -122,12 +156,13 @@ fn threshold_row(
         .child(
             NumberInput::new(input)
                 .appearance(true)
-                .w(px(56.))
+                .w(px(120.))
                 .into_any_element(),
         )
         .child(
             v_flex()
                 .flex_1()
+                .min_w_0()
                 .gap_1()
                 .child(
                     div()
@@ -138,8 +173,11 @@ fn threshold_row(
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .text_sm()
                         .text_color(theme.muted_foreground)
+                        .whitespace_normal()
                         .child(help),
                 ),
         )

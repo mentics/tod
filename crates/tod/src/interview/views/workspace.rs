@@ -18,7 +18,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyBinding, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div, px,
+    Styled, Subscription, Task, Timer, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants, DropdownButton};
 use gpui_component::input::{Input, InputState};
@@ -28,7 +28,9 @@ use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 actions!(
     interview_workspace,
@@ -40,11 +42,18 @@ actions!(
         McKeyD,
         QuestionMoveUp,
         QuestionMoveDown,
+        BackToSessions,
     ]
 );
 
 const WORKSPACE_CONTEXT: &str = "InterviewWorkspace";
 const MAX_RESEARCHER_RETRIES: u32 = 3;
+/// Fixed response pane width (logical px). Kept modest for 1024×768 under common DPI.
+const RESPONSE_COLUMN_WIDTH: f32 = 240.;
+const LIST_COLUMN_WIDTH: f32 = 160.;
+/// Middle reading pane. Explicit width avoids flex_1 eating the response column when
+/// the parent row's main size is content-determined.
+const BODY_COLUMN_WIDTH: f32 = 250.;
 
 #[derive(Debug, Clone)]
 enum RunKind {
@@ -90,6 +99,7 @@ pub struct WorkspaceView {
     pending_notes_paste: Option<String>,
     focus_handle: FocusHandle,
     question_list_scroll_handle: ScrollHandle,
+    _poll_task: Task<()>,
 }
 
 impl WorkspaceView {
@@ -143,11 +153,24 @@ impl WorkspaceView {
         let notes_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(5)
+                .rows(3)
                 .placeholder("Notes (Ctrl+Enter to submit)")
         });
         let mutations_blocked = session.status == InterviewSessionStatus::Archived
             || session.status == InterviewSessionStatus::Complete;
+
+        let poll_task = cx.spawn(async move |this, cx| {
+            loop {
+                Timer::after(QUEUE_POLL_INTERVAL).await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    if this.poll_runs_and_queue(cx) {
+                        cx.notify();
+                    }
+                }) else {
+                    break;
+                };
+            }
+        });
 
         Self {
             session,
@@ -173,6 +196,7 @@ impl WorkspaceView {
             pending_notes_paste: None,
             focus_handle: cx.focus_handle().tab_stop(true),
             question_list_scroll_handle: ScrollHandle::new(),
+            _poll_task: poll_task,
         }
     }
 
@@ -200,7 +224,8 @@ impl WorkspaceView {
             && !self.replenish_state.manual_required
     }
 
-    fn poll_runs_and_queue(&mut self, cx: &mut Context<Self>) {
+    fn poll_runs_and_queue(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
         let mut finished = Vec::new();
         if let Ok(mut agent) = self.agent.try_lock() {
             for (run_id, kind) in &self.runs {
@@ -220,13 +245,24 @@ impl WorkspaceView {
         for (run_id, kind, result) in finished {
             self.runs.remove(&run_id);
             self.handle_run_finished(kind, result, cx);
+            changed = true;
         }
 
         if let Ok(Some(questions)) = self.queue_watcher.poll() {
             self.apply_queue_update(questions);
+            changed = true;
         }
 
+        let runs_before = self.runs.len();
+        let status_before = self.status_line.clone();
+        let error_before = self.error_banner.clone();
         self.maybe_start_replenishment(cx);
+        if self.runs.len() != runs_before
+            || self.status_line != status_before
+            || self.error_banner != error_before
+        {
+            changed = true;
+        }
 
         if self.is_complete() && self.session.status == InterviewSessionStatus::Active {
             let _ = self
@@ -235,9 +271,10 @@ impl WorkspaceView {
             self.session.status = InterviewSessionStatus::Complete;
             self.mutations_blocked = true;
             cx.emit(WorkspaceEvent::SessionComplete);
+            changed = true;
         }
 
-        cx.notify();
+        changed
     }
 
     fn handle_run_finished(
@@ -676,6 +713,7 @@ fn register_workspace_keys(cx: &mut App) {
         KeyBinding::new("d", McKeyD, context),
         KeyBinding::new("up", QuestionMoveUp, context),
         KeyBinding::new("down", QuestionMoveDown, context),
+        KeyBinding::new("escape", BackToSessions, context),
     ]);
 }
 
@@ -710,10 +748,8 @@ impl Render for WorkspaceView {
             });
         }
 
-        self.poll_runs_and_queue(cx);
-
         if let Some(deep_dive) = &self.deep_dive {
-            return div().size_full().child(deep_dive.clone());
+            return div().size_full().min_w_0().overflow_hidden().child(deep_dive.clone());
         }
 
         let background = cx.theme().background;
@@ -727,6 +763,8 @@ impl Render for WorkspaceView {
             .key_context(WORKSPACE_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
+            .min_w_0()
+            .overflow_hidden()
             .bg(background)
             .v_flex()
             .on_action(cx.listener(|this, _: &SubmitAnswer, _, cx| {
@@ -752,14 +790,22 @@ impl Render for WorkspaceView {
                 this.move_question_selection(1, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &BackToSessions, _, cx| {
+                this.back_to_sessions(cx);
+            }))
             .child(workspace_header(cx, &self.session, border, muted))
             .when(archived, |el| el.child(archived_banner(border, muted)))
             .when_some(self.error_banner.clone(), |el, msg| {
                 el.child(error_banner(msg, border))
             })
             .child(
-                h_flex()
+                div()
+                    .id("workspace-columns")
+                    .flex()
+                    .flex_row()
                     .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
                     .child(question_list_column(
                         cx,
                         &self.questions,
@@ -818,29 +864,46 @@ fn workspace_header(
         .unwrap_or_else(|| "—".to_string())
         .into();
     h_flex()
+        .w_full()
+        .min_w_0()
+        .flex_shrink_0()
         .items_center()
-        .justify_between()
+        .gap_3()
         .px_4()
         .py_3()
+        .overflow_hidden()
         .border_b_1()
         .border_color(border)
         .child(
+            Button::new("back-to-sessions")
+                .label("Back to interviews")
+                .flex_shrink_0()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.back_to_sessions(cx);
+                })),
+        )
+        .child(
             v_flex()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
                 .gap_1()
                 .child(
                     div()
                         .text_sm()
                         .font_semibold()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .child(session.display_name.clone()),
                 )
-                .child(div().text_xs().text_color(muted).child(entity_label)),
-        )
-        .child(
-            Button::new("back-to-sessions")
-                .label("Back to interviews")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.back_to_sessions(cx);
-                })),
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(entity_label),
+                ),
         )
 }
 
@@ -920,6 +983,8 @@ fn question_list_column(
                             div()
                                 .text_sm()
                                 .text_color(if is_pending { muted } else { foreground })
+                                .overflow_hidden()
+                                .text_ellipsis()
                                 .child(question.short_label.clone()),
                         ),
                 ),
@@ -927,8 +992,12 @@ fn question_list_column(
     }
 
     v_flex()
-        .w(px(240.))
+        .w(px(LIST_COLUMN_WIDTH))
+        .min_w(px(LIST_COLUMN_WIDTH))
+        .max_w(px(LIST_COLUMN_WIDTH))
+        .flex_none()
         .h_full()
+        .overflow_hidden()
         .border_r_1()
         .border_color(border)
         .child(
@@ -962,6 +1031,8 @@ fn body_column(
         complete_body(cx, session, foreground, muted).into_any_element()
     } else if let Some(q) = question {
         div()
+            .w_full()
+            .min_w_0()
             .text_sm()
             .text_color(foreground)
             .child(q.body.clone())
@@ -974,13 +1045,24 @@ fn body_column(
             .into_any_element()
     };
     v_flex()
-        .flex_1()
+        .flex_none()
+        .w(px(BODY_COLUMN_WIDTH))
+        .min_w(px(BODY_COLUMN_WIDTH))
+        .max_w(px(BODY_COLUMN_WIDTH))
         .h_full()
+        .overflow_hidden()
         .border_r_1()
         .border_color(border)
         .p_4()
-        .overflow_y_scrollbar()
-        .child(body)
+        .child(
+            div()
+                .id("question-body-scroll")
+                .size_full()
+                .min_w_0()
+                .overflow_hidden()
+                .overflow_y_scroll()
+                .child(body),
+        )
 }
 
 fn complete_body(
@@ -1023,20 +1105,26 @@ fn response_column(
     accent: gpui::Hsla,
     foreground: gpui::Hsla,
     muted: gpui::Hsla,
-    _border: gpui::Hsla,
+    border: gpui::Hsla,
 ) -> impl IntoElement {
     let disabled = !can_mutate || pending || question.is_none();
-    let mut col =
-        v_flex()
-            .w(px(320.))
-            .h_full()
-            .p_4()
-            .gap_3()
-            .child(div().text_xs().text_color(muted).child(if pending {
-                "Pending — waiting for agent"
-            } else {
-                "Response"
-            }));
+    let mut col = v_flex()
+        .id("response-column")
+        .flex_none()
+        .w(px(RESPONSE_COLUMN_WIDTH))
+        .min_w(px(RESPONSE_COLUMN_WIDTH))
+        .max_w(px(RESPONSE_COLUMN_WIDTH))
+        .h_full()
+        .overflow_hidden()
+        .border_l_1()
+        .border_color(border)
+        .p_3()
+        .gap_2()
+        .child(div().text_xs().text_color(muted).child(if pending {
+            "Pending — waiting for agent"
+        } else {
+            "Response"
+        }));
     if let Some(q) = question {
         for (idx, opt) in q.options.iter().enumerate() {
             let key = opt.key.clone();
@@ -1054,22 +1142,50 @@ fn response_column(
             ));
         }
     }
-    col.child(Input::new(notes_input).disabled(disabled).w_full())
-        .child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .child(action_dropdown(cx, disabled))
-                .child(
-                    Button::new("submit-answer")
-                        .label("Submit")
-                        .primary()
-                        .disabled(disabled)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.submit_answer(cx);
-                        })),
-                ),
-        )
+    col.child(
+        v_flex()
+            .id("response-footer")
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                div()
+                    .id("notes-field")
+                    .w_full()
+                    .min_w_0()
+                    .h(px(80.))
+                    .overflow_hidden()
+                    .child(
+                        Input::new(notes_input)
+                            .disabled(disabled)
+                            .w_full()
+                            .h(px(80.)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .id("response-actions")
+                    .w_full()
+                    .min_w_0()
+                    .flex_none()
+                    .justify_between()
+                    .items_center()
+                    .gap_1()
+                    .child(action_dropdown(cx, disabled))
+                    .child(
+                        Button::new("submit-answer")
+                            .label("Submit")
+                            .primary()
+                            .compact()
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_answer(cx);
+                            })),
+                    ),
+            ),
+    )
 }
 
 fn mc_option_row(
@@ -1085,6 +1201,8 @@ fn mc_option_row(
     let key = opt.key.clone();
     div()
         .id(("mc-option", idx))
+        .w_full()
+        .overflow_hidden()
         .cursor_pointer()
         .when(selected, |el| el.bg(accent.opacity(0.12)))
         .when(disabled, |el| el.opacity(0.5))
@@ -1098,12 +1216,14 @@ fn mc_option_row(
         }))
         .child(
             h_flex()
+                .w_full()
                 .gap_2()
                 .px_2()
                 .py_1()
                 .rounded_sm()
                 .child(
                     div()
+                        .flex_shrink_0()
                         .text_sm()
                         .font_semibold()
                         .text_color(if selected { accent } else { muted })
@@ -1111,7 +1231,11 @@ fn mc_option_row(
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .flex_1()
                         .text_sm()
+                        .overflow_hidden()
+                        .text_ellipsis()
                         .text_color(if selected { foreground } else { muted })
                         .child(opt.label),
                 ),
@@ -1122,7 +1246,8 @@ fn action_dropdown(cx: &mut Context<WorkspaceView>, disabled: bool) -> impl Into
     let view = cx.entity().downgrade();
     DropdownButton::new("question-actions")
         .disabled(disabled)
-        .button(Button::new("actions-trigger").label("Other action"))
+        .compact()
+        .button(Button::new("actions-trigger").label("Other action").compact())
         .dropdown_menu(move |menu, _window, _cx| {
             let view = view.clone();
             menu.item(PopupMenuItem::new("Consider / Reconsider").on_click({
@@ -1176,14 +1301,22 @@ fn status_footer(
     show_manual_kickoff: bool,
 ) -> impl IntoElement {
     h_flex()
+        .w_full()
+        .min_w_0()
+        .flex_shrink_0()
         .px_4()
         .py_2()
         .border_t_1()
         .border_color(border)
         .justify_between()
         .items_center()
+        .gap_3()
         .child(
             div()
+                .min_w_0()
+                .flex_1()
+                .overflow_hidden()
+                .text_ellipsis()
                 .text_xs()
                 .text_color(muted)
                 .child(if status.is_empty() {

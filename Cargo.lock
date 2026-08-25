@@ -6036,6 +6036,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "image",
  "notify 8.2.0",
  "rusqlite",
  "serde",
@@ -6043,6 +6044,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.20",
  "uuid",
+ "windows 0.57.0",
 ]
 
 [[package]]

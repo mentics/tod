@@ -1,3 +1,4 @@
+use crate::agent_socket::{self, LaunchOptions};
 use crate::interview::views::sessions::styled_tab;
 use crate::interview::views::{SessionsView, SettingsView};
 use crate::views::task_list::TaskListView;
@@ -59,7 +60,7 @@ impl Render for Shell {
             }))
             .child(TitleBar::new().child("tod"))
             .child(self.render_tab_bar(cx))
-            .child(div().flex_1().child(self.render_content(window, cx)))
+            .child(div().flex_1().min_w_0().min_h_0().overflow_hidden().w_full().child(self.render_content(window, cx)))
     }
 }
 
@@ -111,17 +112,22 @@ fn tab_button(
     styled_tab(cx, label, active, on_click)
 }
 
-pub fn open(cx: &mut AsyncApp) -> Result<()> {
+pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     // Eager-init interview persistence so config dir and defaults exist on first launch.
     let _ = crate::interview::bootstrap();
 
-    cx.open_window(
+    let socket_addr = opts.agent_socket;
+    let width = opts.width;
+    let height = opts.height;
+
+    let handle = cx.open_window(
         WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: point(px(0.), px(0.)),
-                size: size(px(1024.), px(768.)),
+                size: size(px(width), px(height)),
             })),
+            is_resizable: socket_addr.is_none(),
             ..Default::default()
         },
         |window, cx| {
@@ -137,6 +143,10 @@ pub fn open(cx: &mut AsyncApp) -> Result<()> {
             cx.new(|cx| Root::new(view, window, cx))
         },
     )?;
+
+    if let Some(addr) = socket_addr {
+        agent_socket::start(cx, handle.into(), addr, width, height);
+    }
 
     Ok(())
 }

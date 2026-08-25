@@ -395,7 +395,29 @@ impl Focusable for SessionsView {
 impl Render for SessionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(workspace) = &self.workspace {
-            return div().size_full().child(workspace.clone());
+            // Absolute fill gives Workspace a definite width/height. Without this,
+            // percentage `w_full` on the three-column row stayed indefinite, the row
+            // sized to content, and the response column was clipped on the right.
+            return div()
+                .relative()
+                .size_full()
+                .w_full()
+                .h_full()
+                .min_w_0()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .w_full()
+                        .h_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(workspace.clone()),
+                );
         }
 
         self.ensure_selection();
@@ -510,14 +532,18 @@ fn header_bar(
 ) -> impl IntoElement {
     let theme = cx.theme();
     h_flex()
+        .w_full()
+        .min_w_0()
         .items_center()
-        .justify_between()
+        .gap_3()
         .px_4()
         .py_3()
+        .overflow_hidden()
         .border_b_1()
         .border_color(theme.border)
         .child(
             div()
+                .flex_shrink_0()
                 .text_sm()
                 .font_semibold()
                 .text_color(theme.foreground)
@@ -525,6 +551,7 @@ fn header_bar(
         )
         .child(
             h_flex()
+                .flex_shrink_0()
                 .gap_2()
                 .child(filter_tab(
                     cx,
@@ -550,6 +577,7 @@ fn header_bar(
                         })),
                 ),
         )
+        .child(div().flex_1().min_w_0())
 }
 
 fn footer_bar(
@@ -807,8 +835,10 @@ where
     let theme = cx.theme();
     div()
         .id(label)
-        .px_3()
-        .py_1()
+        .px_4()
+        .py_2()
+        .min_h(px(32.))
+        .items_center()
         .rounded_sm()
         .cursor_pointer()
         .font_medium()

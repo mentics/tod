@@ -1,6 +1,6 @@
 # State
 
-- State: approved
+- State: done
 - Mode: interactive
 - Paused/blocked: no
-- Note: External human approval 2026-08-24 (“mark it reviewed”). Verifying evidence in journal `2026-08-24-verifying-complete.md`.
+- Note: Closed 2026-08-24. Merged/released per human. Learn waived (`history/learn-waiver-2026-08-24.md`).
