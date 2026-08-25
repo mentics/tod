@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Complete in-place</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font: 13px/1.45 system-ui, sans-serif;
+      background: #1e1e1e;
+      color: #e8e8e8;
+      padding: 16px;
+    }
+
+    h1 {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .sub {
+      color: #9a9a9a;
+      font-size: 12px;
+      margin: 4px 0 12px;
+    }
+
+    .shell {
+      display: flex;
+      border: 1px solid #3a3a3a;
+      background: #2a2a2a;
+      max-width: 920px;
+      min-height: 280px;
+    }
+
+    .list {
+      width: 196px;
+      flex-shrink: 0;
+      border-right: 1px solid #333;
+    }
+
+    .body {
+      flex: 1.15;
+      min-width: 200px;
+      padding: 28px 20px;
+      border-right: 1px solid #333;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .body .title {
+      font-weight: 600;
+      font-size: 15px;
+    }
+
+    .body .msg {
+      color: #9a9a9a;
+      max-width: 360px;
+      line-height: 1.45;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 6px;
+      padding: 7px 12px;
+      font: inherit;
+      font-weight: 600;
+      background: #3b82f6;
+      color: #fff;
+    }
+
+    .link {
+      color: #777;
+      font-size: 12px;
+      text-decoration: none;
+    }
+
+    .idle {
+      flex: 0.85;
+      min-width: 200px;
+      max-width: 280px;
+      background: #252526;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Interview — question workspace</h1>
+  <p class="sub">Same shell · queue empty · replenishment idle (in-place Complete)</p>
+  <div class="shell">
+    <div class="list"></div>
+    <div class="body">
+      <div class="title">Complete</div>
+      <div class="msg">No open questions remain, and the researcher added none. This interview is finished.</div>
+      <div class="actions">
+        <button class="btn">Back to interviews</button>
+        <a class="link" href="#">Open related docs</a>
+      </div>
+    </div>
+    <div class="idle"></div>
+  </div>
+</body>
+
+</html>

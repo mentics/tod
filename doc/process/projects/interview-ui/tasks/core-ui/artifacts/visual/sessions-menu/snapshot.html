@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Sessions menu</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font: 13px/1.4 system-ui, sans-serif;
+      background: #1e1e1e;
+      color: #e8e8e8;
+      min-height: 100vh;
+    }
+
+    .chrome {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 14px;
+      background: #252526;
+      border-bottom: 1px solid #333;
+    }
+
+    .chrome .brand {
+      font-weight: 600;
+    }
+
+    .chrome .muted {
+      color: #888;
+    }
+
+    .chrome .tab {
+      padding: 4px 8px;
+      color: #888;
+      border-bottom: 2px solid transparent;
+    }
+
+    .chrome .tab.on {
+      color: #e8e8e8;
+      font-weight: 600;
+      border-bottom-color: #3b82f6;
+    }
+
+    .chrome .spacer {
+      flex: 1;
+    }
+
+    .chrome .ghost {
+      background: transparent;
+      border: none;
+      color: #aaa;
+      font: inherit;
+      cursor: default;
+    }
+
+    .wrap {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+
+    .head {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .head h1 {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .head p {
+      color: #9a9a9a;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 6px;
+      padding: 7px 12px;
+      font: inherit;
+      cursor: default;
+    }
+
+    .btn-primary {
+      background: #3b82f6;
+      color: #fff;
+      font-weight: 600;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: #aaa;
+    }
+
+    .filters {
+      display: flex;
+      border-bottom: 1px solid #333;
+      margin-bottom: 0;
+    }
+
+    .filters button {
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #888;
+      padding: 6px 12px 8px;
+      font: inherit;
+      margin-bottom: -1px;
+    }
+
+    .filters button.on {
+      color: #e8e8e8;
+      font-weight: 600;
+      border-bottom-color: #3b82f6;
+    }
+
+    .filters .n {
+      color: #666;
+      margin-left: 6px;
+      font-size: 12px;
+    }
+
+    .list {
+      border: 1px solid #3a3a3a;
+      background: #2a2a2a;
+      margin-top: 0;
+    }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      text-align: left;
+      border: none;
+      border-top: 1px solid #333;
+      border-left: 2px solid transparent;
+      background: transparent;
+      color: inherit;
+      padding: 10px 12px 10px 10px;
+      font: inherit;
+    }
+
+    .row:first-child {
+      border-top: none;
+    }
+
+    .row.sel {
+      border-left-color: #3b82f6;
+      background: #333;
+    }
+
+    .row .name {
+      font-weight: 400;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .row.sel .name {
+      font-weight: 600;
+    }
+
+    .row .meta {
+      color: #777;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    .row .open {
+      margin-left: auto;
+    }
+
+    .foot {
+      color: #666;
+      font-size: 12px;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="chrome">
+    <span class="brand">tod</span>
+    <span class="muted">·</span>
+    <span class="tab">Tasks</span>
+    <span class="tab on">Interview</span>
+    <span class="spacer"></span>
+    <button class="ghost">Settings</button>
+  </div>
+  <div class="wrap">
+    <div class="head">
+      <div style="flex:1">
+        <h1>Interviews</h1>
+        <p>Session list is the menu — start new interviews here; no separate launch screen.</p>
+      </div>
+      <button class="btn btn-primary">New interview</button>
+    </div>
+    <div class="filters">
+      <button class="on">Active<span class="n">3</span></button>
+      <button>Archive<span class="n">3</span></button>
+    </div>
+    <div class="list">
+      <button class="row sel">
+        <div style="flex:1;min-width:0">
+          <div class="name">Core UI — design interview</div>
+          <div class="meta">interview-ui / core-ui · Active · Updated 2h ago</div>
+        </div>
+        <button class="btn btn-primary open">Open</button>
+      </button>
+      <button class="row">
+        <div style="flex:1;min-width:0">
+          <div class="name">ACP billing spike follow-up</div>
+          <div class="meta">interview-ui / spikes · Active · Updated yesterday</div>
+        </div>
+      </button>
+      <button class="row">
+        <div style="flex:1;min-width:0">
+          <div class="name">UI scaffolding — requirements</div>
+          <div class="meta">tod / ui-scaffolding · Complete · Updated 3d ago</div>
+        </div>
+      </button>
+    </div>
+    <p class="foot">Active includes in-progress and complete sessions. Archive from an open session when finished.</p>
+  </div>
+</body>
+
+</html>

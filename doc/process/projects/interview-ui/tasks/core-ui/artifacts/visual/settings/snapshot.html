@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <title>Settings</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font: 13px/1.4 system-ui, sans-serif;
+      background: #1e1e1e;
+      color: #e8e8e8;
+      padding: 12px;
+      min-height: 100vh;
+    }
+
+    .chrome {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #333;
+      margin-bottom: 10px;
+    }
+
+    .chrome .brand {
+      font-weight: 600;
+      font-size: 12px;
+    }
+
+    .chrome .muted {
+      color: #888;
+      font-size: 12px;
+    }
+
+    .chrome .on {
+      color: #3b82f6;
+      font-weight: 600;
+      font-size: 12px;
+    }
+
+    .panel {
+      border: 1px solid #3a3a3a;
+      background: #2a2a2a;
+      padding: 10px 12px;
+      max-width: 440px;
+    }
+
+    .panel h2 {
+      font-size: 12px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .row input {
+      width: 56px;
+      flex-shrink: 0;
+      background: #1e1e1e;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      color: #e8e8e8;
+      padding: 6px 8px;
+      font: inherit;
+    }
+
+    .row .label {
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .row .help {
+      font-size: 12px;
+      color: #888;
+      line-height: 1.35;
+      margin-top: 2px;
+    }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #333;
+      margin: 4px 0 10px;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .actions .spacer {
+      flex: 1;
+    }
+
+    .btn {
+      border: none;
+      border-radius: 6px;
+      padding: 7px 12px;
+      font: inherit;
+      cursor: default;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: #aaa;
+    }
+
+    .btn-primary {
+      background: #3b82f6;
+      color: #fff;
+      font-weight: 600;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="chrome">
+    <span class="brand">tod</span>
+    <span class="muted">· Tasks / Interview ·</span>
+    <span class="on">Settings</span>
+  </div>
+  <div class="panel">
+    <h2>Researcher thresholds</h2>
+    <div class="row">
+      <input type="number" value="8" readonly />
+      <div>
+        <div class="label">Replenish below</div>
+        <div class="help">Start a researcher run when open questions fall under this count. Default 8.</div>
+      </div>
+    </div>
+    <div class="row">
+      <input type="number" value="2" readonly />
+      <div>
+        <div class="label">Second researcher below</div>
+        <div class="help">While one researcher is already running, start a second if open count drops under this lower
+          threshold. Max two runs. Default 2.</div>
+      </div>
+    </div>
+    <hr class="divider" />
+    <div class="actions">
+      <button class="btn btn-ghost">Cancel</button>
+      <span class="spacer"></span>
+      <button class="btn btn-primary">Save</button>
+    </div>
+  </div>
+</body>
+
+</html>

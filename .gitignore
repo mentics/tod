@@ -1,0 +1,24 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local reference material (not part of the repo)
+/refs/
+
+# Local runtime data (SQLite, config, agent scratchpads)
+/.local/
+
+# Environment and secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.idea/
+*.swp
+*~
