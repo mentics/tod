@@ -10,4 +10,5 @@
 - Number inputs on the **left** (fixed width)
 - Label + short help text stacked on the **right** of each input
 - Two thresholds: replenish below (default 8), second researcher below (default 2)
+- **Answer-processor session pool:** maximum session pool size (default 4), answers per session (default 4)
 - No `tod.yml` / path chrome on this view (persistence remains a design construction elsewhere)

@@ -1,24 +1,45 @@
+use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, DeepDiveContext, RunId,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, AnswerProcessorPoolStats,
+    DeepDiveContext, RunId,
 };
 use crate::interview::config::agent_scratchpad_for_entity;
+use crate::interview::settings::AnswerProcessorSettings;
 use crate::interview::transcript::new_transcript_filename;
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 /// Fast in-process agent backend for UI tests. Writes realistic on-disk scaffolding
 /// and queue/status files; never calls Cursor ACP or any external process.
 pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
+    answer_pool: AnswerProcessorPoolManager,
+    answer_run_cwd: HashMap<RunId, PathBuf>,
+    answer_completion_tx: mpsc::Sender<AnswerJobResult>,
+    answer_completion_rx: mpsc::Receiver<AnswerJobResult>,
+}
+
+struct AnswerJobResult {
+    cwd: PathBuf,
+    slot_id: u32,
+    run_id: RunId,
+    result: Result<String, String>,
 }
 
 impl MockAgentProvider {
     pub fn new() -> Self {
+        let (answer_completion_tx, answer_completion_rx) = mpsc::channel();
         Self {
             runs: HashMap::new(),
+            answer_pool: AnswerProcessorPoolManager::default(),
+            answer_run_cwd: HashMap::new(),
+            answer_completion_tx,
+            answer_completion_rx,
         }
     }
 
@@ -26,6 +47,38 @@ impl MockAgentProvider {
         let id = RunId::new();
         self.runs.insert(id, state.clone());
         AgentRunHandle { id, kind, state }
+    }
+
+    fn drain_answer_completions(&mut self) {
+        while let Ok(job) = self.answer_completion_rx.try_recv() {
+            self.apply_answer_completion(job);
+        }
+    }
+
+    fn apply_answer_completion(&mut self, job: AnswerJobResult) {
+        let outcome = self
+            .answer_pool
+            .complete_run(&job.cwd, job.slot_id, job.run_id, job.result);
+        if let Some(recycled) = outcome.recycled_slot_id {
+            let _ = recycled;
+        }
+        for (slot_id, run_id, prompt) in outcome.dispatched {
+            self.answer_run_cwd.insert(run_id, job.cwd.clone());
+            self.spawn_answer_job(job.cwd.clone(), slot_id, run_id, prompt);
+        }
+    }
+
+    fn spawn_answer_job(&self, cwd: PathBuf, slot_id: u32, run_id: RunId, prompt: String) {
+        let tx = self.answer_completion_tx.clone();
+        thread::spawn(move || {
+            let result = process_answer_from_prompt(&prompt).map_err(|err| err.to_string());
+            let _ = tx.send(AnswerJobResult {
+                cwd,
+                slot_id,
+                run_id,
+                result,
+            });
+        });
     }
 }
 
@@ -43,8 +96,7 @@ impl AgentProvider for MockAgentProvider {
     ) -> Result<AgentRunHandle> {
         let msg = if prompt.contains("Interview UI kickoff") {
             bootstrap_from_prompt(&prompt)?
-        } else if prompt.contains("Action payload")
-            || prompt.contains("Process researcher action")
+        } else if prompt.contains("Action payload") || prompt.contains("Process researcher action")
         {
             action_from_prompt(&prompt)?
         } else {
@@ -56,12 +108,36 @@ impl AgentProvider for MockAgentProvider {
         ))
     }
 
-    fn start_answer_processor(&mut self, _cwd: PathBuf, prompt: String) -> Result<AgentRunHandle> {
-        let msg = process_answer_from_prompt(&prompt)?;
-        Ok(self.finish(
-            AgentRunKind::AnswerProcessor,
-            AgentRunState::Success(Some(msg)),
-        ))
+    fn start_answer_processor(
+        &mut self,
+        cwd: PathBuf,
+        prompt: String,
+        pool: &AnswerProcessorSettings,
+    ) -> Result<AgentRunHandle> {
+        let (assignment, run_id) = self
+            .answer_pool
+            .submit(cwd.clone(), pool.clone(), prompt)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.answer_run_cwd.insert(run_id, cwd.clone());
+        match assignment {
+            AnswerSubmitAssignment::Dispatch { slot_id, prompt } => {
+                self.spawn_answer_job(cwd.clone(), slot_id, run_id, prompt);
+            }
+            AnswerSubmitAssignment::Queued { .. } => {}
+        }
+        Ok(AgentRunHandle {
+            id: run_id,
+            kind: AgentRunKind::AnswerProcessor,
+            state: AgentRunState::InFlight,
+        })
+    }
+
+    fn answer_processor_pool_stats(
+        &self,
+        cwd: &Path,
+        pool: &AnswerProcessorSettings,
+    ) -> AnswerProcessorPoolStats {
+        self.answer_pool.stats(cwd, pool)
     }
 
     fn start_deep_dive_chat(
@@ -83,10 +159,23 @@ impl AgentProvider for MockAgentProvider {
     }
 
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
+        self.drain_answer_completions();
+        if let Some(cwd) = self.answer_run_cwd.get(&id).cloned() {
+            if let Some(state) = self.answer_pool.poll_run(&cwd, id) {
+                if !matches!(state, AgentRunState::InFlight) {
+                    self.answer_run_cwd.remove(&id);
+                }
+                return Some(state);
+            }
+        }
         self.runs.get(&id).cloned()
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
+        if let Some(cwd) = self.answer_run_cwd.remove(&id) {
+            self.answer_pool.cancel_run(&cwd, id);
+            return Ok(());
+        }
         self.runs.remove(&id);
         Ok(())
     }
@@ -560,6 +649,20 @@ fn extract_actions(prompt: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interview::settings::AnswerProcessorSettings;
+    use std::time::Duration;
+
+    fn poll_answer_run(mock: &mut MockAgentProvider, id: RunId) -> AgentRunState {
+        for _ in 0..200 {
+            if let Some(state) = mock.poll_run(id) {
+                if !matches!(state, AgentRunState::InFlight) {
+                    return state;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for answer-processor run {id:?}");
+    }
 
     #[test]
     fn mock_bootstrap_writes_config_and_queue() {
@@ -629,7 +732,12 @@ mod tests {
             .unwrap();
 
         let scratch = agent_scratchpad_for_entity(&root, &entity).unwrap();
-        let session_dir = fs::read_dir(&scratch).unwrap().next().unwrap().unwrap().path();
+        let session_dir = fs::read_dir(&scratch)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
         let config_path = session_dir.join("interview-config.md");
         let queue = session_dir.join("queue");
         assert!(find_queue_question_path(&queue, "q-001").is_some());
@@ -645,5 +753,30 @@ mod tests {
             .unwrap();
         assert!(find_queue_question_path(&queue, "q-001").is_none());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mock_answer_pool_allows_parallel_submits() {
+        let mut mock = MockAgentProvider::new();
+        let cwd = PathBuf::from("/tmp/mock-pool");
+        let pool = AnswerProcessorSettings::default();
+        let prompt = "Config path: /x\nAnswer payload:\n---\nid: q-001\n---\n";
+
+        let h0 = mock
+            .start_answer_processor(cwd.clone(), prompt.into(), &pool)
+            .unwrap();
+        let h1 = mock
+            .start_answer_processor(cwd.clone(), prompt.into(), &pool)
+            .unwrap();
+        assert_eq!(mock.answer_processor_pool_stats(&cwd, &pool).in_pool, 2);
+        assert_eq!(mock.answer_processor_pool_stats(&cwd, &pool).active, 2);
+        assert!(matches!(
+            poll_answer_run(&mut mock, h0.id),
+            AgentRunState::Failure(_)
+        ));
+        assert!(matches!(
+            poll_answer_run(&mut mock, h1.id),
+            AgentRunState::Failure(_)
+        ));
     }
 }

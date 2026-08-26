@@ -1,10 +1,13 @@
-use crate::interview::agent::{AgentRunState, SharedAgent};
-use crate::interview::config::sync_scaffolding_from_disk;
+use crate::interview::agent::{AgentRunState, BootstrapGate, SharedAgent};
+use crate::interview::config::{
+    sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
+};
 use crate::interview::kickoff::researcher_bootstrap_prompt;
 use crate::interview::views::workspace::{WorkspaceEvent, WorkspaceView};
 use crate::interview::{
     InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore, TodPaths,
 };
+use crate::ui::toast::confirm_toast;
 use chrono::{DateTime, Local, Utc};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -14,9 +17,13 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
+use gpui_component::list::ListItem;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const SESSIONS_CONTEXT: &str = "InterviewSessions";
@@ -89,15 +96,25 @@ pub struct SessionsView {
     selected_purpose: usize,
     purpose_note: Entity<InputState>,
     agent: SharedAgent,
+    bootstrap_gate: BootstrapGate,
+    /// SQLite session ids with a bootstrap thread already running.
+    bootstrap_sessions: Arc<Mutex<HashSet<i64>>>,
     kickoff_status: SharedString,
     focus_handle: FocusHandle,
     list_scroll_handle: ScrollHandle,
     workspace: Option<Entity<WorkspaceView>>,
     _workspace_subscription: Option<Subscription>,
+    /// Deferred bootstrap prompt after workspace detects missing scaffolding.
+    pending_bootstrap_prompt: Option<InterviewSession>,
 }
 
 impl SessionsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, agent: SharedAgent) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        agent: SharedAgent,
+        bootstrap_gate: BootstrapGate,
+    ) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let store = SessionStore::open(&paths).expect("failed to open session store");
         let sessions = store.list_sessions().unwrap_or_default();
@@ -119,11 +136,14 @@ impl SessionsView {
             selected_purpose: 0,
             purpose_note,
             agent,
+            bootstrap_gate,
+            bootstrap_sessions: Arc::new(Mutex::new(HashSet::new())),
             kickoff_status: SharedString::default(),
             focus_handle: cx.focus_handle(),
             list_scroll_handle: ScrollHandle::new(),
             workspace: None,
             _workspace_subscription: None,
+            pending_bootstrap_prompt: None,
         }
     }
 
@@ -271,6 +291,9 @@ impl SessionsView {
 
     fn launch_interview(&mut self, cx: &mut Context<Self>) {
         let (entity_path, entity_label) = self.launch_target();
+        let entity_path = entity_path
+            .canonicalize()
+            .unwrap_or_else(|_| entity_path.clone());
         let purpose = self
             .purpose_options
             .get(self.selected_purpose)
@@ -290,7 +313,7 @@ impl SessionsView {
         match self.store.insert_session_with_metadata(
             NewInterviewSession {
                 display_name: display_name.clone(),
-                entity_path: entity_path.to_string_lossy().into(),
+                entity_path: crate::interview::config::path_for_storage(&entity_path),
                 phase,
             },
             InterviewSessionStatus::Active,
@@ -310,18 +333,185 @@ impl SessionsView {
         }
     }
 
+    fn session_needs_bootstrap(session: &InterviewSession) -> bool {
+        !session
+            .config_path
+            .as_ref()
+            .is_some_and(|p| Path::new(p).exists())
+    }
+
+    fn bootstrap_in_flight(&self, session_id: i64) -> bool {
+        self.bootstrap_sessions
+            .lock()
+            .expect("bootstrap sessions lock")
+            .contains(&session_id)
+    }
+
+    fn should_prompt_bootstrap(&self, session: &InterviewSession) -> bool {
+        Self::session_needs_bootstrap(session) && !self.bootstrap_in_flight(session.id)
+    }
+
+    fn entity_cwd(session: &InterviewSession) -> Option<PathBuf> {
+        session
+            .entity_path
+            .as_ref()
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                PathBuf::from(p.as_str())
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p.as_str()))
+            })
+    }
+
+    fn bootstrap_subject_label(session: &InterviewSession) -> SharedString {
+        if let Some(prefix) = session.display_name.split('—').next() {
+            let trimmed = prefix.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string().into();
+            }
+        }
+        session
+            .entity_path
+            .as_ref()
+            .and_then(|p| {
+                Path::new(p.as_str())
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .map(SharedString::from)
+            .unwrap_or_else(|| "This interview".into())
+    }
+
+    fn prompt_bootstrap_setup(
+        &mut self,
+        session: InterviewSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let subject = Self::bootstrap_subject_label(&session);
+        let message = format!("{subject} has not been set up yet. Do you want me to set it up?");
+        let view = cx.entity().downgrade();
+        let session_for_yes = session.clone();
+
+        confirm_toast(
+            window,
+            cx,
+            "Interview not set up",
+            message,
+            move |window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.accept_bootstrap_setup(session_for_yes.clone(), window, cx);
+                });
+            },
+            |_window, _cx| {
+                // Stay on the session list — nothing to show in the workspace yet.
+            },
+        );
+    }
+
+    fn accept_bootstrap_setup(
+        &mut self,
+        session: InterviewSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = Self::entity_cwd(&session) else {
+            tracing::warn!(
+                event = "interview",
+                action = "bootstrap_skipped_no_entity",
+                session_id = session.id,
+                "cannot bootstrap session without entity_path"
+            );
+            self.kickoff_status =
+                "Cannot set up interview: the session has no project or task path.".into();
+            cx.notify();
+            return;
+        };
+        if session.status == InterviewSessionStatus::Complete {
+            let _ = self
+                .store
+                .set_status(session.id, InterviewSessionStatus::Active);
+        }
+        tracing::info!(
+            event = "interview",
+            action = "bootstrap_accepted",
+            session_id = session.id,
+            entity = %cwd.display(),
+            "user accepted bootstrap for unbound session"
+        );
+        self.reload();
+        let session = self
+            .sessions
+            .iter()
+            .find(|s| s.id == session.id)
+            .cloned()
+            .unwrap_or(session);
+        self.start_researcher_bootstrap(session.clone(), cwd);
+        self.open_workspace(session, window, cx);
+    }
+
     fn start_researcher_bootstrap(&self, session: InterviewSession, cwd: PathBuf) {
         let prompt = researcher_bootstrap_prompt(&session);
         let agent = self.agent.clone();
+        let bootstrap_gate = self.bootstrap_gate.clone();
+        let bootstrap_sessions = self.bootstrap_sessions.clone();
         let store_paths = self.paths.clone();
         let session_id = session.id;
+        {
+            let mut in_flight = bootstrap_sessions.lock().expect("bootstrap sessions lock");
+            if !in_flight.insert(session_id) {
+                tracing::debug!(
+                    event = "interview",
+                    action = "bootstrap_already_running",
+                    session_id,
+                    "bootstrap already in flight for session"
+                );
+                return;
+            }
+        }
+        tracing::info!(
+            event = "interview",
+            action = "bootstrap_start",
+            session_id,
+            cwd = %cwd.display(),
+            phase = session.phase.as_deref().unwrap_or(""),
+            entity = session.entity_path.as_deref().unwrap_or(""),
+            prompt_chars = prompt.len(),
+            "researcher bootstrap thread starting"
+        );
+        bootstrap_gate.store(true, Ordering::SeqCst);
         std::thread::spawn(move || {
+            struct BootstrapGuard {
+                sessions: Arc<Mutex<HashSet<i64>>>,
+                session_id: i64,
+            }
+            impl Drop for BootstrapGuard {
+                fn drop(&mut self) {
+                    self.sessions
+                        .lock()
+                        .expect("bootstrap sessions lock")
+                        .remove(&self.session_id);
+                }
+            }
+            let _bootstrap_guard = BootstrapGuard {
+                sessions: bootstrap_sessions,
+                session_id,
+            };
+            let clear_gate = || bootstrap_gate.store(false, Ordering::SeqCst);
             let repo_root = store_paths.repo_root().to_path_buf();
             let handle = {
                 let mut provider = agent.lock().expect("agent lock");
                 provider.start_researcher_replenishment(cwd, prompt)
             };
             let Ok(handle) = handle else {
+                clear_gate();
+                tracing::error!(
+                    event = "interview",
+                    action = "bootstrap_start_failed",
+                    session_id,
+                    "researcher bootstrap failed to start"
+                );
                 eprintln!("tod: researcher bootstrap failed to start for session {session_id}");
                 return;
             };
@@ -333,6 +523,7 @@ impl SessionsView {
             let deadline = Instant::now() + Duration::from_secs(360);
             let mut agent_finished = false;
             let mut synced = false;
+            let mut last_sync_log = Instant::now() - Duration::from_secs(10);
             while Instant::now() < deadline {
                 if !agent_finished {
                     let finished = {
@@ -343,16 +534,63 @@ impl SessionsView {
                     };
                     if finished {
                         agent_finished = true;
+                        let state = {
+                            let mut provider = agent.lock().expect("agent lock");
+                            provider.poll_run(handle.id)
+                        };
+                        tracing::info!(
+                            event = "interview",
+                            action = "bootstrap_agent_finished",
+                            session_id,
+                            ?state,
+                            "bootstrap ACP run left InFlight"
+                        );
+                        // Allow workspace replenishment only after the bootstrap ACP exits.
+                        clear_gate();
                     }
                 }
 
                 if !synced {
                     match SessionStore::open(&store_paths) {
                         Ok(store) => {
-                            match sync_scaffolding_from_disk(&store, &repo_root, session_id) {
-                                Ok(true) => synced = true,
-                                Ok(false) => {}
+                            let sync_result = if agent_finished {
+                                sync_scaffolding_from_disk_after_bootstrap(
+                                    &store, &repo_root, session_id,
+                                )
+                            } else {
+                                sync_scaffolding_from_disk(&store, &repo_root, session_id)
+                            };
+                            match sync_result {
+                                Ok(true) => {
+                                    synced = true;
+                                    tracing::info!(
+                                        event = "interview",
+                                        action = "bootstrap_synced",
+                                        session_id,
+                                        agent_finished,
+                                        "scaffolding paths bound in SQLite"
+                                    );
+                                }
+                                Ok(false) => {
+                                    if last_sync_log.elapsed() >= Duration::from_secs(5) {
+                                        tracing::debug!(
+                                            event = "interview",
+                                            action = "bootstrap_sync_pending",
+                                            session_id,
+                                            agent_finished,
+                                            "no matching interview-config yet"
+                                        );
+                                        last_sync_log = Instant::now();
+                                    }
+                                }
                                 Err(err) => {
+                                    tracing::warn!(
+                                        event = "interview",
+                                        action = "bootstrap_sync_error",
+                                        session_id,
+                                        error = %err,
+                                        "scaffolding sync error"
+                                    );
                                     eprintln!(
                                         "tod: scaffolding sync error for session {session_id}: {err}"
                                     );
@@ -360,6 +598,13 @@ impl SessionsView {
                             }
                         }
                         Err(err) => {
+                            tracing::warn!(
+                                event = "interview",
+                                action = "bootstrap_store_open_failed",
+                                session_id,
+                                error = %err,
+                                "scaffolding store open failed"
+                            );
                             eprintln!(
                                 "tod: scaffolding store open failed for session {session_id}: {err}"
                             );
@@ -367,13 +612,27 @@ impl SessionsView {
                     }
                 }
 
-                if synced {
+                if synced && agent_finished {
                     break;
+                }
+                // Keep polling until agent finishes even after sync, so the gate stays
+                // held while bootstrap is still writing queue files.
+                if synced && !agent_finished {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
 
+            clear_gate();
             if !synced {
+                tracing::error!(
+                    event = "interview",
+                    action = "bootstrap_sync_timeout",
+                    session_id,
+                    agent_finished,
+                    "scaffolding sync timed out"
+                );
                 eprintln!(
                     "tod: scaffolding sync timed out for session {session_id} (agent_finished={agent_finished})"
                 );
@@ -396,7 +655,11 @@ impl SessionsView {
 
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.selected_session().cloned() {
-            self.open_workspace(session, window, cx);
+            if self.should_prompt_bootstrap(&session) {
+                self.prompt_bootstrap_setup(session, window, cx);
+            } else {
+                self.open_workspace(session, window, cx);
+            }
         }
     }
 
@@ -413,9 +676,14 @@ impl SessionsView {
             .find(|s| s.id == session.id)
             .cloned()
             .unwrap_or(session);
+        if self.should_prompt_bootstrap(&session) {
+            self.prompt_bootstrap_setup(session, window, cx);
+            return;
+        }
         let agent = self.agent.clone();
-        let workspace = cx.new(|cx| WorkspaceView::new(session, window, cx, agent));
-        let subscription = cx.subscribe(&workspace, |this, _, event, cx| match event {
+        let bootstrap_gate = self.bootstrap_gate.clone();
+        let workspace = cx.new(|cx| WorkspaceView::new(session, window, cx, agent, bootstrap_gate));
+        let subscription = cx.subscribe(&workspace, |this, workspace, event, cx| match event {
             WorkspaceEvent::BackToSessions => {
                 this.workspace = None;
                 this._workspace_subscription = None;
@@ -425,6 +693,14 @@ impl SessionsView {
             }
             WorkspaceEvent::SessionComplete => {
                 this.reload();
+                cx.notify();
+            }
+            WorkspaceEvent::NeedsBootstrap => {
+                let session = workspace.read(cx).interview_session().clone();
+                this.workspace = None;
+                this._workspace_subscription = None;
+                this.reload();
+                this.pending_bootstrap_prompt = Some(session);
                 cx.notify();
             }
         });
@@ -446,6 +722,12 @@ impl Focusable for SessionsView {
 
 impl Render for SessionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(session) = self.pending_bootstrap_prompt.take() {
+            if self.should_prompt_bootstrap(&session) {
+                self.prompt_bootstrap_setup(session, window, cx);
+            }
+        }
+
         if let Some(workspace) = &self.workspace {
             // Absolute fill gives Workspace a definite width/height. Without this,
             // percentage `w_full` on the three-column row stayed indefinite, the row
@@ -476,8 +758,6 @@ impl Render for SessionsView {
 
         let background = cx.theme().background;
         let border = cx.theme().border;
-        let accent = cx.theme().accent;
-        let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let visible: Vec<InterviewSession> = self
             .sessions
@@ -508,8 +788,6 @@ impl Render for SessionsView {
                 cx,
                 session,
                 selected.is_some_and(|s| s.id == session.id),
-                accent,
-                foreground,
                 muted,
             ));
         }
@@ -826,8 +1104,6 @@ fn session_row(
     cx: &mut Context<SessionsView>,
     session: &InterviewSession,
     selected: bool,
-    accent: gpui::Hsla,
-    foreground: gpui::Hsla,
     muted: gpui::Hsla,
 ) -> impl IntoElement {
     let status = match session.status {
@@ -835,49 +1111,24 @@ fn session_row(
         InterviewSessionStatus::Archived => "Archived",
         InterviewSessionStatus::Complete => "Complete",
     };
-    let entity = session.entity_path.as_deref().unwrap_or("—");
+    let entity_label = session.entity_path.as_deref().unwrap_or("—");
     let updated = format_updated(session.updated_at);
+    let meta = format!("{entity_label} · {status} · {updated}");
+    let view = cx.entity();
+    let session_id = session.id;
+    let display_name = session.display_name.clone();
 
-    div()
-        .id(("session-row", session.id as u64))
-        .px_4()
-        .py_3()
-        .cursor_pointer()
-        .border_l_4()
-        .border_color(if selected {
-            accent
-        } else {
-            gpui::transparent_black()
+    ListItem::new(("session-row", session.id as u64))
+        .selected(selected)
+        .on_click(move |_, _, app| {
+            view.update(app, |this, cx| this.select_session(session_id, cx));
         })
-        .when(selected, |el| el.bg(accent).border_color(foreground))
-        .on_click(cx.listener({
-            let id = session.id;
-            move |this, _, _, cx| this.select_session(id, cx)
-        }))
         .child(
             v_flex()
                 .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(if selected {
-                            cx.theme().background
-                        } else {
-                            foreground.opacity(0.92)
-                        })
-                        .child(session.display_name.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if selected {
-                            cx.theme().background.opacity(0.85)
-                        } else {
-                            muted
-                        })
-                        .child(format!("{entity} · {status} · {updated}")),
-                ),
+                .w_full()
+                .child(div().text_sm().font_semibold().child(display_name))
+                .child(div().text_xs().text_color(muted).child(meta)),
         )
 }
 

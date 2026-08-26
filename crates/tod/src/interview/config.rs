@@ -44,7 +44,9 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         }
         if in_scope {
             if trimmed.starts_with("- ") {
-                scope.push(PathBuf::from(trimmed.trim_start_matches("- ").trim()));
+                scope.push(PathBuf::from(normalize_config_path(
+                    trimmed.trim_start_matches("- ").trim(),
+                )));
                 continue;
             }
             in_scope = false;
@@ -60,7 +62,7 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         .context("interview-config missing session_id")?;
     let entity = values
         .get("entity")
-        .map(PathBuf::from)
+        .map(|v| PathBuf::from(normalize_config_path(v)))
         .context("interview-config missing entity")?;
     let phase = values
         .get("phase")
@@ -68,15 +70,15 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         .context("interview-config missing phase")?;
     let transcript = values
         .get("transcript")
-        .map(PathBuf::from)
+        .map(|v| PathBuf::from(normalize_config_path(v)))
         .context("interview-config missing transcript")?;
     let scratchpad = values
         .get("scratchpad")
-        .map(PathBuf::from)
+        .map(|v| PathBuf::from(normalize_config_path(v)))
         .context("interview-config missing scratchpad")?;
     let queue = values
         .get("queue")
-        .map(|q| PathBuf::from(q.trim_end_matches('/')))
+        .map(|q| PathBuf::from(normalize_config_path(q.trim_end_matches(['/', '\\']))))
         .context("interview-config missing queue")?;
     let queue_target = values.get("queue_target").and_then(|v| v.parse().ok());
 
@@ -89,12 +91,32 @@ pub fn parse_interview_config_contents(path: &Path, contents: &str) -> Result<In
         queue,
         config_path: path.to_path_buf(),
         queue_target,
-        to_process: values.get("to_process").map(PathBuf::from),
-        researcher_status: values.get("researcher_status").map(PathBuf::from),
-        answer_processor_status: values.get("answer_processor_status").map(PathBuf::from),
+        to_process: values
+            .get("to_process")
+            .map(|v| PathBuf::from(normalize_config_path(v))),
+        researcher_status: values
+            .get("researcher_status")
+            .map(|v| PathBuf::from(normalize_config_path(v))),
+        answer_processor_status: values
+            .get("answer_processor_status")
+            .map(|v| PathBuf::from(normalize_config_path(v))),
         scope,
-        state_agent: values.get("state_agent").map(PathBuf::from),
+        state_agent: values
+            .get("state_agent")
+            .map(|v| PathBuf::from(normalize_config_path(v))),
     })
+}
+
+/// Strip Windows verbatim (`\\?\`) prefixes so queue watchers / exists checks work.
+fn normalize_config_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    #[cfg(windows)]
+    {
+        if let Some(stripped) = trimmed.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 pub fn agent_scratchpad_for_entity(repo_root: &Path, entity: &Path) -> Result<PathBuf> {
@@ -144,7 +166,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 /// Strip Windows verbatim (`\\?\`) prefix for durable path storage / UI.
-fn path_for_storage(path: &Path) -> String {
+pub fn path_for_storage(path: &Path) -> String {
     let raw = path.to_string_lossy();
     #[cfg(windows)]
     {
@@ -294,6 +316,14 @@ pub fn sync_scaffolding_from_disk(
         .collect();
 
     let Some(config_path) = find_bootstrap_config_for_session(repo_root, &session)? else {
+        tracing::debug!(
+            event = "interview",
+            action = "sync_no_config",
+            sqlite_id,
+            entity = session.entity_path.as_deref().unwrap_or(""),
+            phase = session.phase.as_deref().unwrap_or(""),
+            "find_bootstrap_config_for_session returned None"
+        );
         return Ok(false);
     };
     let canon = config_path
@@ -303,9 +333,91 @@ pub fn sync_scaffolding_from_disk(
         .to_ascii_lowercase();
     if claimed.contains(&canon) {
         // Another session already owns this config — wait for a fresh bootstrap write.
+        tracing::warn!(
+            event = "interview",
+            action = "sync_config_claimed",
+            sqlite_id,
+            config = %config_path.display(),
+            "matching config already claimed by another session"
+        );
         return Ok(false);
     }
     let config = parse_interview_config(&config_path)?;
+    if !scaffolding_ready_to_bind(&config) {
+        tracing::debug!(
+            event = "interview",
+            action = "sync_wait_queue",
+            sqlite_id,
+            config = %config_path.display(),
+            "config present but queue not ready yet"
+        );
+        return Ok(false);
+    }
+    bind_session_scaffolding(store, sqlite_id, &config_path, &config)
+}
+
+/// Like [`sync_scaffolding_from_disk`], but binds even when the queue is still empty.
+/// Used after the bootstrap ACP run exits so a deliberate empty interview can open.
+pub fn sync_scaffolding_from_disk_after_bootstrap(
+    store: &SessionStore,
+    repo_root: &Path,
+    sqlite_id: i64,
+) -> Result<bool> {
+    let session = store
+        .get_session(sqlite_id)?
+        .ok_or_else(|| anyhow::anyhow!("session {sqlite_id} not found"))?;
+    if session
+        .config_path
+        .as_ref()
+        .is_some_and(|p| Path::new(p).exists())
+    {
+        return Ok(true);
+    }
+
+    let claimed: HashSet<String> = store
+        .list_sessions()?
+        .into_iter()
+        .filter(|s| s.id != sqlite_id)
+        .filter_map(|s| s.config_path)
+        .map(|p| {
+            let pb = PathBuf::from(&p);
+            pb.canonicalize()
+                .unwrap_or(pb)
+                .to_string_lossy()
+                .to_ascii_lowercase()
+        })
+        .collect();
+
+    let Some(config_path) = find_bootstrap_config_for_session(repo_root, &session)? else {
+        return Ok(false);
+    };
+    let canon = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.clone())
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if claimed.contains(&canon) {
+        return Ok(false);
+    }
+    let config = parse_interview_config(&config_path)?;
+    bind_session_scaffolding(store, sqlite_id, &config_path, &config)
+}
+
+fn bind_session_scaffolding(
+    store: &SessionStore,
+    sqlite_id: i64,
+    config_path: &Path,
+    config: &InterviewConfig,
+) -> Result<bool> {
+    tracing::info!(
+        event = "interview",
+        action = "sync_bind",
+        sqlite_id,
+        config = %config_path.display(),
+        session_stem = %config.session_id,
+        queue = %config.queue.display(),
+        "binding scaffolding paths from disk"
+    );
     store.update_session_scaffolding(
         sqlite_id,
         Some(&config.session_id),
@@ -314,6 +426,15 @@ pub fn sync_scaffolding_from_disk(
         Some(&path_for_storage(&config.config_path)),
     )?;
     Ok(true)
+}
+
+/// Bind only once open question files exist. Empty-queue bind is deferred until
+/// bootstrap ACP finishes ([`sync_scaffolding_from_disk_after_bootstrap`]).
+fn scaffolding_ready_to_bind(config: &InterviewConfig) -> bool {
+    matches!(
+        crate::interview::queue::load_queue_dir(&config.queue),
+        Ok(questions) if !questions.is_empty()
+    )
 }
 
 #[cfg(test)]
@@ -498,8 +619,19 @@ queue_target: 8
         .unwrap();
 
         assert!(
+            !sync_scaffolding_from_disk(&store, repo, session.id).unwrap(),
+            "config alone (empty queue) should not bind yet"
+        );
+
+        fs::write(
+            scratch.join("queue").join("q-001.md"),
+            "---\nid: q-001\ncreated: 2026-08-25T12:00:00Z\n---\nFirst question?\n",
+        )
+        .unwrap();
+
+        assert!(
             sync_scaffolding_from_disk(&store, repo, session.id).unwrap(),
-            "config on disk should bind"
+            "config with queue questions should bind"
         );
         let mirrored = agent_scratchpad_for_entity(repo, &entity).unwrap();
         let mirrored_s = mirrored.to_string_lossy().replace('\\', "/");
@@ -524,5 +656,80 @@ queue_target: 8
         assert!(sync_scaffolding_from_disk(&store, repo, session.id).unwrap());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_after_bootstrap_binds_empty_queue() {
+        use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
+        use crate::interview::paths::TodPaths;
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!("tod-sync-empty-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let repo = dir.as_path();
+        let entity = repo
+            .join("doc")
+            .join("process")
+            .join("projects")
+            .join("demo")
+            .join("tasks")
+            .join("t2");
+        fs::create_dir_all(&entity).unwrap();
+
+        let paths = TodPaths::from_repo_root(repo.to_path_buf());
+        let store = SessionStore::open(&paths).unwrap();
+        let session = store
+            .insert_session_with_metadata(
+                NewInterviewSession {
+                    display_name: "t2 — Initial".into(),
+                    entity_path: entity.to_string_lossy().into(),
+                    phase: "project-defining".into(),
+                },
+                InterviewSessionStatus::Active,
+            )
+            .unwrap();
+
+        let scratch = agent_scratchpad_for_entity(repo, &entity)
+            .unwrap()
+            .join("empty-bootstrap");
+        fs::create_dir_all(scratch.join("queue")).unwrap();
+        let config_path = scratch.join("interview-config.md");
+        let transcript = entity.join("history").join("empty-bootstrap.md");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "# transcript\n").unwrap();
+        fs::write(
+            &config_path,
+            format!(
+                "session_id: empty-bootstrap\nentity: {}\nphase: project-defining\ntranscript: {}\nscratchpad: {}\nqueue: {}/queue/\n",
+                entity.display(),
+                transcript.display(),
+                scratch.display(),
+                scratch.display(),
+            ),
+        )
+        .unwrap();
+
+        assert!(!sync_scaffolding_from_disk(&store, repo, session.id).unwrap());
+        assert!(
+            sync_scaffolding_from_disk_after_bootstrap(&store, repo, session.id).unwrap(),
+            "after bootstrap, empty queue may still bind"
+        );
+        let updated = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(updated.session_id.as_deref(), Some("empty-bootstrap"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_strips_windows_verbatim_prefix() {
+        let text = r#"session_id: s1
+entity: \\?\C:\repo\entity
+phase: design-interview
+transcript: \\?\C:\repo\entity\history\s1.md
+scratchpad: \\?\C:\repo\.local\scratch\s1
+queue: \\?\C:\repo\.local\scratch\s1\queue/
+"#;
+        let cfg = parse_interview_config_contents(Path::new("interview-config.md"), text).unwrap();
+        assert!(!cfg.queue.to_string_lossy().contains(r"\\?\"));
+        assert!(!cfg.entity.to_string_lossy().contains(r"\\?\"));
     }
 }

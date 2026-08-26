@@ -1,5 +1,8 @@
-use std::path::PathBuf;
+use crate::interview::settings::AnswerProcessorSettings;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+pub use super::answer_pool::AnswerProcessorPoolStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(Uuid);
@@ -60,7 +63,15 @@ pub trait AgentProvider {
         &mut self,
         cwd: PathBuf,
         prompt: String,
+        pool: &AnswerProcessorSettings,
     ) -> anyhow::Result<AgentRunHandle>;
+
+    /// Pool visibility for the interview workspace status footer.
+    fn answer_processor_pool_stats(
+        &self,
+        cwd: &Path,
+        pool: &AnswerProcessorSettings,
+    ) -> AnswerProcessorPoolStats;
 
     fn start_deep_dive_chat(
         &mut self,

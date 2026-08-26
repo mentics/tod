@@ -3,4 +3,4 @@
 - State: review
 - Mode: interactive
 - Paused/blocked: no
-- Note: N1–N3 fixed + verifying PASS (`2026-08-25-verifying-n1-n3.md`, batch 12/12, units 26). F4 closed via N1. Waiting external approval only. Do not self-approve. Journal: 2026-08-25-review-redesign.md.
+- Note: ListItem.selected reuse shipped (session/question/MC/response focus). Project constraint 8 + §19. Units 30 pass; mock batch interview checks PASS (settings-yml click target residual). Await external approval. Journal: 2026-08-25-active-listitem-selection.md

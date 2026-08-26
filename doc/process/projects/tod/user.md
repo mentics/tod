@@ -55,7 +55,7 @@ Make it extremely efficient for a software engineer to work with many agents —
 
 10. Status area — tod provides a status area that displays text about in-progress operations in response to user requests (such as a spinner while work is underway).
 
-11. Operation failure feedback — When a user-requested operation fails, tod presents the error in a toast or banner, clearly more visible than the status area.
+11. Operation failure feedback — When a user-requested operation fails, tod presents the error in a toast or banner, clearly more visible than the status area. **Confirmation toasts:** when an operation requires explicit consent before proceeding (e.g. setting up missing interview scaffolding), use a non-autohide notification with **No** and **Yes** actions; copy names what is missing. **No** dismisses and cancels; **Yes** proceeds. Shared helper: `crates/tod/src/ui/toast.rs` (`confirm_toast`).
 
 ### Agent operations and environments
 
@@ -189,3 +189,7 @@ Make it extremely efficient for a software engineer to work with many agents —
 4. Tod’s durable state lives on the user’s machine under a known local location the user can copy or back up with ordinary filesystem tools (no required cloud store for core state).
 
 5. Logging practices — Follow [`doc/process/shared/constraints/logging-constraints.md`](../../shared/constraints/logging-constraints.md).
+
+6. Selectable data — Follow [`doc/process/shared/constraints/selectable-data-constraints.md`](../../shared/constraints/selectable-data-constraints.md).
+
+7. Resizable dividers — Follow [`doc/process/shared/constraints/resizable-dividers-constraints.md`](../../shared/constraints/resizable-dividers-constraints.md).

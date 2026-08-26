@@ -1,15 +1,22 @@
+mod answer_pool;
 mod cursor_acp;
 mod mock;
 mod provider;
+
+pub use answer_pool::AnswerProcessorPoolStats;
 
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;
 pub use provider::{AgentProvider, AgentRunState, DeepDiveContext, RunId};
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Shared agent handle passed through interview views.
 pub type SharedAgent = Arc<Mutex<Box<dyn AgentProvider + Send>>>;
+
+/// True while the kickoff bootstrap ACP run is still owning the researcher slot.
+pub type BootstrapGate = Arc<AtomicBool>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentBackend {
@@ -29,11 +36,14 @@ impl AgentBackend {
         }
     }
 
-    pub fn create(self) -> SharedAgent {
+    pub fn create(self) -> (SharedAgent, BootstrapGate) {
         let boxed: Box<dyn AgentProvider + Send> = match self {
             Self::Mock => Box::new(MockAgentProvider::new()),
             Self::Cursor => Box::new(CursorAcpProvider::default()),
         };
-        Arc::new(Mutex::new(boxed))
+        (
+            Arc::new(Mutex::new(boxed)),
+            Arc::new(AtomicBool::new(false)),
+        )
     }
 }

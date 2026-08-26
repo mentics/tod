@@ -130,7 +130,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let width = opts.width;
     let height = opts.height;
     let no_focus = opts.no_focus;
-    let agent: SharedAgent = opts.agent_backend.create();
+    let agent: SharedAgent;
+    let bootstrap_gate: crate::interview::agent::BootstrapGate;
+    {
+        let (a, g) = opts.agent_backend.create();
+        agent = a;
+        bootstrap_gate = g;
+    }
 
     #[cfg(windows)]
     let previous_foreground = if no_focus {
@@ -153,7 +159,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         |window, cx| {
             let task_list = cx.new(|cx| TaskListView::new(window, cx));
             let agent_for_sessions = agent.clone();
-            let sessions = cx.new(|cx| SessionsView::new(window, cx, agent_for_sessions));
+            let gate_for_sessions = bootstrap_gate.clone();
+            let sessions =
+                cx.new(|cx| SessionsView::new(window, cx, agent_for_sessions, gate_for_sessions));
             let settings = cx.new(|cx| SettingsView::new(window, cx));
             let view = cx.new(|_| Shell {
                 active_tab: ShellTab::Tasks,

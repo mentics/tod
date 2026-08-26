@@ -6,6 +6,8 @@ use std::path::Path;
 
 const DEFAULT_REPLENISH_THRESHOLD: u32 = 8;
 const DEFAULT_SECOND_RESEARCHER_THRESHOLD: u32 = 2;
+const DEFAULT_SESSION_POOL_SIZE: u32 = 4;
+const DEFAULT_ANSWERS_PER_SESSION: u32 = 4;
 pub const DEFAULT_LOG_MAX_SIZE_KB: u64 = 51_200;
 pub const MIN_LOG_MAX_SIZE_KB: u64 = 1;
 pub const MAX_LOG_MAX_SIZE_KB: u64 = 104_857_600;
@@ -35,6 +37,31 @@ fn default_second_researcher_threshold() -> u32 {
     DEFAULT_SECOND_RESEARCHER_THRESHOLD
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerProcessorSettings {
+    #[serde(default = "default_session_pool_size")]
+    pub session_pool_size: u32,
+    #[serde(default = "default_answers_per_session")]
+    pub answers_per_session: u32,
+}
+
+impl Default for AnswerProcessorSettings {
+    fn default() -> Self {
+        Self {
+            session_pool_size: DEFAULT_SESSION_POOL_SIZE,
+            answers_per_session: DEFAULT_ANSWERS_PER_SESSION,
+        }
+    }
+}
+
+fn default_session_pool_size() -> u32 {
+    DEFAULT_SESSION_POOL_SIZE
+}
+
+fn default_answers_per_session() -> u32 {
+    DEFAULT_ANSWERS_PER_SESSION
+}
+
 fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
@@ -47,6 +74,8 @@ fn default_log_max_size_kb() -> u64 {
 pub struct TodSettings {
     #[serde(default)]
     pub researcher: ResearcherSettings,
+    #[serde(default)]
+    pub answer_processor: AnswerProcessorSettings,
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
     #[serde(default = "default_log_max_size_kb")]
@@ -57,6 +86,7 @@ impl Default for TodSettings {
     fn default() -> Self {
         Self {
             researcher: ResearcherSettings::default(),
+            answer_processor: AnswerProcessorSettings::default(),
             log_level: LogLevel::Info,
             log_max_size_kb: DEFAULT_LOG_MAX_SIZE_KB,
         }
@@ -124,6 +154,8 @@ mod tests {
         let settings = TodSettings::load_from_path(&path).unwrap();
         assert_eq!(settings.researcher.replenish_threshold, 8);
         assert_eq!(settings.researcher.second_researcher_threshold, 2);
+        assert_eq!(settings.answer_processor.session_pool_size, 4);
+        assert_eq!(settings.answer_processor.answers_per_session, 4);
         assert_eq!(settings.log_level, LogLevel::Info);
         assert_eq!(settings.log_max_size_kb, DEFAULT_LOG_MAX_SIZE_KB);
         let _ = fs::remove_dir_all(dir);
@@ -139,6 +171,7 @@ mod tests {
                 replenish_threshold: 10,
                 second_researcher_threshold: 3,
             },
+            answer_processor: AnswerProcessorSettings::default(),
             log_level: LogLevel::Debug,
             log_max_size_kb: 1024,
         };

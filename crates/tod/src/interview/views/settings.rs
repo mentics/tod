@@ -1,5 +1,5 @@
-use crate::interview::settings::{MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings};
 use crate::interview::TodPaths;
+use crate::interview::settings::{MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings};
 use crate::logging;
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
@@ -42,6 +42,20 @@ impl SettingsView {
     fn step_second(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.researcher.second_researcher_threshold =
             step_u32(self.settings.researcher.second_researcher_threshold, delta);
+        let _ = self.settings.save(&self.paths);
+        cx.notify();
+    }
+
+    fn step_pool_size(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.answer_processor.session_pool_size =
+            step_u32(self.settings.answer_processor.session_pool_size, delta);
+        let _ = self.settings.save(&self.paths);
+        cx.notify();
+    }
+
+    fn step_answers_per_session(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.answer_processor.answers_per_session =
+            step_u32(self.settings.answer_processor.answers_per_session, delta);
         let _ = self.settings.save(&self.paths);
         cx.notify();
     }
@@ -140,6 +154,40 @@ impl Render for SettingsView {
                 theme.muted_foreground,
                 |this, _, cx| this.step_second(-1, cx),
                 |this, _, cx| this.step_second(1, cx),
+            ))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("Answer-processor session pool"),
+            )
+            .child(threshold_row(
+                cx,
+                "pool-size",
+                self.settings
+                    .answer_processor
+                    .session_pool_size
+                    .to_string(),
+                "Maximum session pool size",
+                "Maximum number of answer-processor ACP sessions open at once. Default 4.",
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_pool_size(-1, cx),
+                |this, _, cx| this.step_pool_size(1, cx),
+            ))
+            .child(threshold_row(
+                cx,
+                "answers-per-session",
+                self.settings
+                    .answer_processor
+                    .answers_per_session
+                    .to_string(),
+                "Answers per session",
+                "Recycle an ACP session after this many responses are received. Default 4.",
+                theme.foreground,
+                theme.muted_foreground,
+                |this, _, cx| this.step_answers_per_session(-1, cx),
+                |this, _, cx| this.step_answers_per_session(1, cx),
             ))
             .child(
                 div()

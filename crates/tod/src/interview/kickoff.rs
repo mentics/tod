@@ -7,7 +7,29 @@ pub fn researcher_bootstrap_prompt(session: &InterviewSession) -> String {
     let entity = session.entity_path.as_deref().unwrap_or("(unknown entity)");
     let phase = session.phase.as_deref().unwrap_or("(unknown phase)");
     let mut abs_hints = String::new();
+    let mut skill_hint = String::new();
     if let Ok(paths) = TodPaths::discover() {
+        let skill = paths
+            .repo_root()
+            .join("refs")
+            .join("process")
+            .join("interview")
+            .join("SKILL.md");
+        let researcher = paths
+            .repo_root()
+            .join("refs")
+            .join("process")
+            .join("interview")
+            .join("agents")
+            .join("interview-researcher-agent.md");
+        skill_hint = format!(
+            "\n\
+         Read these files first (absolute paths):\n\
+         - {}\n\
+         - {}\n",
+            skill.display(),
+            researcher.display(),
+        );
         if let Ok(entity_path) = std::path::PathBuf::from(entity)
             .canonicalize()
             .or_else(|_| Ok::<_, std::io::Error>(std::path::PathBuf::from(entity)))
@@ -15,7 +37,7 @@ pub fn researcher_bootstrap_prompt(session: &InterviewSession) -> String {
             if let Ok(scratch_root) = agent_scratchpad_for_entity(paths.repo_root(), &entity_path) {
                 abs_hints = format!(
                     "\n\
-         Absolute paths (required — do not invent roots):\n\
+         Absolute paths (required — do not invent roots; do not use \\\\?\\ prefixes):\n\
          - Repo/data root: {}\n\
          - Entity: {}\n\
          - Transcript dir: {}\\history\\\n\
@@ -37,17 +59,18 @@ pub fn researcher_bootstrap_prompt(session: &InterviewSession) -> String {
          Display name: {}\n\
          Entity path: {entity}\n\
          Phase/purpose: {phase}\n\
+         {skill_hint}\
          {abs_hints}\
-         Follow refs/process/interview/SKILL.md bootstrap (researcher owns scaffolding):\n\
+         Follow the interview SKILL bootstrap (researcher owns scaffolding):\n\
          1. Create transcript under {{entity}}/history/{{description}}-{{YYYY-MM-DD}}-{{HHMM}}.md (session header only).\n\
          2. Derive session_id from transcript filename stem.\n\
          3. Create session scratchpad under the Absolute paths session scratchpad parent above.\n\
-         4. Create empty queue/ and interview-config.md with absolute paths.\n\
-         5. Populate queue/ with initial questions for this phase.\n\
-         6. Update researcher-status.md.\n\
+         4. Create empty queue/ and interview-config.md with absolute paths (no \\\\?\\ prefixes).\n\
+         5. Populate queue/ with initial questions for this phase (at least several open questions before you finish).\n\
+         6. Update researcher-status.md only after queue files exist.\n\
          \n\
          Queue files use YAML front matter + markdown body; MC options as options: key/label list with digit keys \"1\", \"2\", \"3\", … only (never A/B/C).\n\
-         Do not talk to the user. Return the queue directory path only when done.",
+         Do not talk to the user. Do not return until queue/ has question files. Return the queue directory path only when done.",
         session.id, session.display_name,
     )
 }
