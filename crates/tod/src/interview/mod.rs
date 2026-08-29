@@ -7,9 +7,12 @@ pub mod paths;
 pub mod queue;
 pub mod queue_watcher;
 pub mod replenishment;
+pub mod routing;
 pub mod settings;
 pub mod transcript;
 pub mod views;
+
+pub use routing::{TaskListProceedContext, interview_work_remains};
 
 pub use bootstrap::bootstrap;
 pub use db::{InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore};

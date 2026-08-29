@@ -1,6 +1,6 @@
 # tod
 
-Agent fleet management desktop application.
+Task and agent management desktop application.
 
 ## Prerequisites
 

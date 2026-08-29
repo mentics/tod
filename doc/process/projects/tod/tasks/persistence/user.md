@@ -8,163 +8,62 @@ Durable on-machine storage for tasks, agents, transcripts, open notifications, a
 
 ## Requirements
 
+### Scope
+
 1. Full parity — This task delivers all of project requirement 23 in one pass.
 
-2. Agent transcript history — After quit and relaunch, each managed agent still has full prompt/response history for every agent session available to the user.
-   - Success criteria:
-     - After relaunch, the user can view the complete prompt/response history for all prior sessions of each managed agent
+### Entity restore after relaunch
 
-3. Shell session relaunch — After quit and relaunch, each open shell session restores as its own reconnectable identity on the agent detail page; the user reconnects to the live process when it still exists. When an agent had more than one open shell session before quit, each session restores separately. Restored shell sessions preserve reconnectable identity only; terminal scrollback (output history from before quit) is not restored.
-   - Success criteria:
-     - After relaunch, previously open shell sessions remain visible on the agent detail page
-     - When an agent had multiple open shell sessions before quit, each restores as a separate reconnectable identity
-     - User can reconnect to a shell session whose underlying process is still running
-     - When a restored shell session's underlying process is no longer running after relaunch, the session remains listed with a clear not-running indicator
-     - When a restored shell session's underlying process is no longer running after relaunch, no reconnect action is offered
-     - After relaunch, restored shell sessions do not include pre-quit terminal scrollback
+2. Task records — After quit and relaunch, each task restores title, slug, lifecycle state, git repository, branch, tags, notes, and linked issues/PRs.
 
-4. Write timing — Ordinary mutations are persisted via a short debounced batch; a crash or force-quit may lose at most a few seconds of recent edits. When quit proceeds (including after the in-flight count reaches zero), tod flushes any pending debounced fleet-state writes before the process exits.
-   - Success criteria:
-     - No explicit save step is required for ordinary mutations
-     - Data loss window after crash is bounded to a few seconds of recent edits
-     - When quit proceeds, pending debounced fleet-state writes are flushed before exit completes
+3. Notifications — After quit and relaunch, each unresolved notification restores message text, links to related task and agents, and unresolved status. Resolving a notification before quit keeps it absent after relaunch.
 
-5. Agent metadata relaunch — After quit and relaunch, each agent that was in the managed fleet before quit restores associated task, environment type, mode (autonomous vs interactive), and last persisted runtime status.
-   - Success criteria:
-     - After relaunch, user can see each restored agent's associated task, environment type, mode, and last persisted runtime status
+4. Agent fleet — After quit and relaunch, each managed agent restores task association, environment type, mode, last persisted runtime status, full prompt/response transcript history, and (for local/devcontainer agents) worktree identity sufficient to dirty-check, reclaim, and manually relaunch. Tod attempts reattach to still-reachable agent processes for every environment type, verifying identity beyond recorded PID (PID-reuse guard). Successful reattach shows and persists live runtime status. Failed reattach persists **not-running**; the agent stays in the fleet until manual relaunch or shutdown. Manual relaunch reuses the same agent record and persisted environment type (fixed for the agent's lifetime); mode defaults to last persisted with optional change before start. Successful manual relaunch preserves transcript history and reconnectable shell sessions on that record.
 
-6. First launch bootstrap — On first launch when no fleet-state store exists at the configured storage root, tod creates an empty store; the fleet starts with zero tasks and agents.
-   - Success criteria:
-     - On first launch with no existing store, tod initializes storage without blocking the user
-     - Fleet begins with zero tasks and zero agents
+5. Shell sessions — After quit and relaunch, each open shell session restores as its own reconnectable identity on the agent detail page (per environment type); reconnect verifies identity beyond recorded PID. Multiple open sessions restore separately. Restored sessions do not include pre-quit terminal scrollback. Reconnect is independent of agent runtime status when the shell process is still running and passes verification. While an agent is not-running, the user cannot launch a new shell into that environment — only reconnect to existing still-running restored shells. When a restored shell's process is gone or verification fails, the session stays listed with a clear not-running indicator and no reconnect action; the user may dismiss/remove that entry without confirmation, and dismissed entries stay absent after relaunch.
 
-7. Delete and shutdown durability — Permanent task deletes and agent shutdowns before quit are persisted; those entities remain absent from the fleet after relaunch.
-   - Success criteria:
-     - After relaunch, permanently deleted tasks do not reappear
-     - After relaunch, shut-down agents do not reappear in the managed fleet
+6. Queued prompts — Undelivered queued prompts are not restored after relaunch.
 
-8. Quit with in-flight items — When the user attempts to quit while in-flight items exist, tod warns with the in-flight count and the queued-not-yet-sent count shown separately; the warning updates live as items complete; when the in-flight count reaches zero, the warning dismisses and quit proceeds. While the in-flight count is still above zero, the warning includes a "quit anyway" action that proceeds immediately, accepting possible loss of in-flight work. In-flight means prompts that have been sent to an agent and are awaiting a response; queued means prompts waiting to be sent; agents in Starting status do not block quit.
-   - Success criteria:
-     - Quit attempt while in-flight items exist shows a warning with the current in-flight count and the queued-not-yet-sent count displayed separately
-     - The displayed in-flight count updates as sent prompts receive responses
-     - When the in-flight count reaches zero, the warning dismisses and quit proceeds automatically
-     - While the in-flight count is above zero, the warning includes a "quit anyway" action that quits immediately
-     - Agents in Starting status do not increment the in-flight count or block quit
-     - After force quit while prompts are in-flight and relaunch, each in-flight sent prompt remains visible in the agent transcript as interrupted/incomplete
-     - After force quit while prompts are in-flight and relaunch, no response (partial or complete) is available for those in-flight prompts
+### Durability and writes
 
-9. Agent reconnect relaunch — After quit and relaunch, tod attempts to reattach to agent processes still running on the host for agents that were in the managed fleet before quit. When reattachment fails because the underlying process is no longer running, the agent record remains in the managed fleet with a clear not-running status; the user can relaunch manually.
-   - Success criteria:
-     - After relaunch, tod attempts to reattach to agent processes still running on the host
-     - When reattachment fails because the process is no longer running, the agent remains in the fleet with a clear not-running status
-     - User can manually relaunch an agent left in not-running status after failed reattachment
+7. Write timing — Ordinary mutations use a short debounced batch (~2s); crash or force-quit may lose at most ~5 seconds of recent edits. When quit proceeds (including after in-flight count reaches zero or on "quit anyway"), tod flushes pending debounced fleet-state writes before exit. If that flush fails, quit is blocked with a clear error and retry until flush succeeds or the user force-quits.
 
-10. Task record relaunch — After quit and relaunch, each task restores the full task record: title, slug, lifecycle state, git repository, branch, tags, notes, and linked issues/PRs.
-   - Success criteria:
-     - After relaunch, user can see each restored task's title, slug, lifecycle state, git repository, branch, tags, notes, and linked issues/PRs
+8. Immediate durability — Permanent task deletes, agent shutdowns, notification resolves, not-running shell dismissals, sent in-flight prompts, reattach outcomes, and other irreversible or relaunch-critical mutations flush immediately (not via the debounce).
 
-11. Notification relaunch — After quit and relaunch, each unresolved notification restores full queue entry: message text, links to related task and agents, and unresolved status.
-   - Success criteria:
-     - After relaunch, user can see message text for each unresolved notification
-     - After relaunch, user can see related task and agent links for each unresolved notification
-     - After relaunch, unresolved notifications remain in unresolved status
+9. Delete durability — Permanent task deletes and agent shutdowns before quit remain absent after relaunch.
 
-12. Storage root change — When the user changes the fleet-state storage root to a new location, tod asks whether to migrate existing fleet state and offers copy, move, or create new. Migration runs immediately after the user confirms the choice; tod blocks further fleet mutations until migration finishes or the user cancels. When in-flight or queued items exist at migration time, tod shows a modal dialog (same pattern as the quit warning) with the in-flight count and queued-not-yet-sent count shown separately; the dialog blocks the whole application and migration proceeds only when the in-flight count reaches zero. Post-migration behavior follows the user's choice: copy leaves fleet state at the previous root (a duplicate exists at the new root); move relocates fleet state to the new root (nothing remains at the previous root); create new starts with an empty store at the new root without migrating from the previous root and leaves fleet state at the previous root untouched (user cleans up manually if desired).
-   - Success criteria:
-     - Changing storage root prompts the user whether to migrate existing fleet state
-     - User can choose copy, move, or create new at the new root
-     - Storage root migration runs immediately after the user confirms the migration choice
-     - While migration is pending or in progress, further fleet mutations are blocked
-     - When in-flight or queued items exist at migration time, a modal dialog blocks the application
-     - Migration dialog shows in-flight count and queued-not-yet-sent count separately
-     - Migration proceeds only when the in-flight count reaches zero
-     - User can cancel a pending or in-progress storage root migration
-     - When the user cancels a pending or in-progress storage root migration, tod automatically rolls back to the pre-migration state
-     - After cancel mid-migration, the configured storage root remains the pre-migration root
-     - After cancel mid-migration, partial fleet state written to the new root during the interrupted migration is removed
-     - After a copy migration, fleet state remains at the previous root
-     - After a move migration, fleet state is no longer at the previous root
-     - After create new, the new root starts empty without data migrated from the previous root
-     - After create new, fleet state at the previous root remains untouched
-     - When a copy or move migration fails partway, tod blocks completion and leaves both roots as-is
-     - When a copy or move migration fails partway, the user sees a clear error and can retry or fix manually
-     - If the user force-quits while a storage root copy or move migration is in progress, the next launch automatically rolls back to the pre-migration root
-     - After force-quit mid-migration and rollback on next launch, partial fleet state written to the new root during the interrupted migration is removed
+10. Write path — UI- and agent-triggered fleet-state writes serialize through one queue; no concurrent writers. Write failures (disk full, unwritable root) block the mutation with a clear error; the last good on-disk store stays authoritative. External edits under the storage root while tod runs are picked up on the next read or write (stale in-memory state discarded).
 
-13. Format upgrade migration — When a new tod version ships with an incompatible on-disk fleet-state format, tod auto-migrates existing fleet state in place on first launch after update, creating a backup copy of the pre-migration store before modifying on-disk files.
-   - Success criteria:
-     - After upgrading tod when the on-disk format is incompatible, existing fleet state is preserved without manual export or import
-     - Migration runs automatically on first launch after update
-     - Before modifying on-disk files during automatic format upgrade migration, tod creates a backup copy of the pre-migration store
-     - When automatic migration fails, launch is blocked with a clear error
-     - When automatic migration fails, pre-migration fleet state at the storage root is left untouched
-     - When automatic migration fails, the pre-migration backup remains available for recovery
+### Quit and in-flight
 
-14. Invalid storage root — On launch, if the configured fleet-state storage root is missing, not a directory, or not writable, tod blocks launch with a clear error; the user fixes the path in settings before continuing.
-   - Success criteria:
-     - Launch is blocked when the storage root is missing, not a directory, or not writable
-     - User sees a clear error explaining the problem
-     - User can fix the path in settings before continuing
+11. Quit with in-flight items — When quit is attempted while in-flight items exist, tod warns with in-flight count and queued-not-yet-sent count shown separately; counts update live; when in-flight reaches zero, quit proceeds. While in-flight is above zero, "quit anyway" abandons in-flight work and proceeds (still subject to write flush). **In-flight** = prompts sent and awaiting response; **queued** = not yet sent. Agents in Starting do not block quit. After quit-anyway while Processing, if the agent process is still reachable after relaunch, tod reattaches with live status; when the process is gone, in-flight sent prompts remain in the transcript as interrupted/incomplete with no response.
 
-15. Notification resolution durability — Before quit, if the user resolves a notification, that notification remains absent from the open notification queue after relaunch.
-   - Success criteria:
-     - After relaunch, notifications resolved before quit do not reappear in the open notification queue
+### Storage root and lifecycle
 
-16. Queued prompt non-restore — After quit and relaunch, prompts that were queued but not yet delivered to an agent are not restored; relaunch clears undelivered queued prompts.
-   - Success criteria:
-     - After relaunch, undelivered queued prompts do not reappear on any agent's prompt queue
+12. First launch — When the configured storage root does not exist or has no fleet-state store, tod creates the directory (if needed) and an empty store; fleet starts empty. Unwritable or non-directory paths block launch per invalid storage root (below). First-launch store init failure blocks launch with clear error, leaves partial state as-is, and exposes minimal settings to fix the path. A later relaunch against an unchanged path with a partial store runs corrupted-store recovery.
 
-17. Corrupted store recovery — On launch, if the fleet-state store at the configured storage root appears corrupted or partially written (for example after a crash mid-write), tod attempts automatic repair or recovery before blocking launch.
-   - Success criteria:
-     - When the store appears corrupted or partially written on launch, tod attempts automatic repair or recovery
-     - Launch proceeds normally when automatic repair or recovery succeeds
-     - When automatic repair or recovery fails, launch is blocked with a clear error
-     - When automatic repair or recovery fails, fleet state at the storage root is left as-is (not replaced with an empty store)
+13. Invalid / newer format — Launch is blocked with clear error and minimal settings when the root exists but is not a writable directory, the store is corrupted and auto-recovery fails, or on-disk format is newer than this build (store left untouched). A path that does not exist yet is not invalid (bootstrap creates it). After correcting the storage root in settings, persist the path on confirm and require full app restart before launch proceeds.
 
-18. Concurrent write consistency — When the UI and background agent activity both mutate fleet state, all fleet-state writes are serialized through one queue; no concurrent writers touch the store.
-   - Success criteria:
-     - UI-triggered and agent-triggered fleet-state mutations share a single serialized write path
-     - No two fleet-state writes execute concurrently against the store
+14. Single instance — A second tod instance against an in-use storage root is blocked with clear error. Stale locks from crashed processes are treated as abandoned. Destination roots during copy/move migration and roots undergoing format upgrade are also treated as in-use. After successful copy migration, a second instance against the previous-root duplicate path is allowed (locking is per root).
 
-19. Write failure handling — When a fleet-state write fails because the disk is full or the storage root is no longer writable, tod blocks the mutation with a clear error; the prior on-disk store remains intact and authoritative.
-   - Success criteria:
-     - When a fleet-state write fails due to disk full or an unwritable storage root, the user sees a clear error
-     - The failed mutation does not persist; the last good on-disk fleet state remains intact
-     - tod does not silently accept in-memory mutations that cannot be written to disk
+15. Format upgrade — On first launch after an incompatible on-disk format, tod auto-migrates in place after creating a pre-migration backup sibling under the storage root. Backup creation failure blocks launch. Failed upgrade blocks launch with error naming the backup path; recovery is manual filesystem restore (no in-app restore action). Force-quit mid-backup retries on next launch; force-quit mid-upgrade auto-restores from backup on next launch and defers upgrade. Successful upgrade removes the backup.
 
-20. Single storage root instance — If the user launches a second tod instance while another is already running against the same fleet-state storage root, the second instance is blocked with a clear error.
-   - Success criteria:
-     - Launch of a second tod instance against an in-use storage root is blocked
-     - User sees a clear error explaining that another tod instance is already using the storage root
+16. Storage root change — When the fleet-state storage root changes (via parent application settings), tod offers copy, move, or create new at the new location. Tod creates the destination directory if needed; blocks the change if the destination already contains a store or is not creatable. Migration runs after user confirmation: flush pending writes first; block fleet mutations (and queue agent-triggered writes to a held sidecar during copy/move) until finish or cancel. In-flight/queued items at migration time use the same modal pattern as quit (proceed when in-flight is zero). Copy/move include open shell session records. **Copy** — new root becomes active; previous root keeps a point-in-time duplicate. **Move** — fleet relocates; previous root cleaned of tod-owned files. **Create new** — empty store at new root; previous root untouched; blocked while any prior-fleet agent is not **not-running**. Cancel mid copy/move rolls back without confirmation. Failed partway copy/move leaves both roots as-is with retry. Force-quit mid copy/move rolls back to pre-migration root on next launch. Create-new switch flushes previous root first; does not tear down still-alive shell processes from the previous fleet.
 
-21. Newer format downgrade — When the fleet-state store on disk was written by a newer tod version than the one launching (on-disk format version is newer than this build understands), tod blocks launch with a clear error and leaves the store untouched.
-   - Success criteria:
-     - Launch is blocked when the on-disk format version is newer than this build supports
-     - User sees a clear error explaining the store format is from a newer tod version
-     - Fleet state at the storage root is left untouched (not modified or overwritten)
-
-22. Fleet scale — Fleet-state storage and load explicitly support at least ~100 agents and ~500 tasks.
-   - Success criteria:
-     - Fleet-state store loads and persists mutations for a fleet with at least ~100 agents
-     - Fleet-state store loads and persists mutations for a fleet with at least ~500 tasks
-
-23. External storage edits — When the user manually modifies or deletes files under the fleet-state storage root while tod is running, tod reloads from disk on the next fleet-state read or write and discards stale in-memory state.
-   - Success criteria:
-     - After manual edits under the storage root while tod is running, the next fleet-state read or write reflects on-disk state
-     - Stale in-memory fleet state is discarded rather than persisted over external changes
-
-24. Agent transcript retention — Agent transcript history on disk is retained without limit; this task does not impose a retention cap or pruning policy.
-   - Success criteria:
-     - Agent transcript data on disk is not automatically pruned or evicted by size or age
+17. Scale and retention — Fleet-state storage supports at least ~100 agents and ~500 tasks. Agent transcript history on disk has no automatic pruning cap in this task.
 
 ## Constraints
 
-1. Fleet entities only — Application settings and preferences (project requirement 26) are out of scope; this task covers fleet state per project requirement 23.
+1. Fleet entities only — Application settings (project requirement 26) are out of scope except the fleet-state storage root path in minimal settings when launch is blocked for storage problems, and the normal storage-root control owned by parent settings. JSON import (requirement 24) and fleet export are separate tasks.
 
-2. JSON import out of scope — JSON data import (project requirement 24) is a separate task; this task does not include import capability.
+2. Configurable storage root — User-configurable path on the user's machine; copy/backup with ordinary filesystem tools (project constraint 4). Where the user views or changes the storage root, tod shows brief guidance that a consistent backup requires copying the root only while no tod instance is running against it. Default on first launch is the OS-specific application data directory. On-disk layout need not be portable across operating systems.
 
-3. Configurable storage root — Fleet-state storage root is user-configurable in application settings; the chosen path is on the user's machine and can be copied or backed up with ordinary filesystem tools (project constraint 4).
+3. Agent removal cascade — Removing an agent from the managed fleet (shutdown, auto-delete on missing worktree, or explicit remove) tears down still-alive restored shell processes, deletes that agent's shell and transcript rows, and hard-deletes open notifications linked to that agent — without confirmation. Auto-delete on missing worktree shows a clear notice (no confirmation on delete).
 
-4. Default storage root — On first launch before the user sets a custom root, the default fleet-state storage root is the OS-specific standard application data directory (AppData on Windows, Application Support on macOS, XDG data dir on Linux).
+4. Worktree missing — When manual relaunch of a not-running local/devcontainer agent finds the restored worktree path missing, tod deletes that agent from the fleet (cascade above applies).
 
-5. Cross-OS storage portability — On-disk fleet-state layout need not be portable between operating systems. When a user moves to a different operating system, they export fleet state and import it on the destination; copying the storage root across OS boundaries is not a supported migration path for this task.
+5. Not-running agent UX — Inherits project requirement 3 (**not-running** status) and requirement 31 exceptions: shutdown and dismiss of stale shells need no confirmation; dirty-worktree warning still applies on shutdown; no new prompt without manual relaunch; failed reattachment does not add a notification.
+
+6. Persistent notices — Follow [`doc/process/shared/constraints/persistent-notice-constraints.md`](../../../../shared/constraints/persistent-notice-constraints.md).
+
+7. Operation failure feedback — User-visible errors for blocked operations inherit project requirement 11 (toast/banner).

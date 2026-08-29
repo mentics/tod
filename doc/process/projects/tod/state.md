@@ -3,4 +3,4 @@
 - State: active
 - Mode: interactive
 - Paused/blocked: no
-- Note: ui-scaffolding done 2026-08-23; task-list `done` 2026-08-24 (learn waived).
+- Note: task-list reopened → proposed 2026-08-25 (full restart). Persistence / issue-list work continues under project constraints.

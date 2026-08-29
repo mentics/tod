@@ -456,11 +456,11 @@ fn write_one_question(queue: &Path, n: u32, tag: &str) -> Result<()> {
     let path = queue.join(format!("{id}-{tag}.md"));
     let body = if n % 2 == 1 {
         format!(
-            "---\nid: {id}\ncreated: 2026-08-24T12:00:00Z\noptions:\n  - key: \"1\"\n    label: Option One\n  - key: \"2\"\n    label: Option Two\n---\nMock MC question {n} ({tag})\n"
+            "---\nid: {id}\ncreated: 2026-08-24T12:00:00Z\nlayer: task\nkind: decision\ncontext: |\n  Mock context for question {n} ({tag}).\nquestion: Which mock option do you want?\nrecommend: 1 — default mock pick\noptions:\n  - key: \"1\"\n    label: Option One\n  - key: \"2\"\n    label: Option Two\n---\n"
         )
     } else {
         format!(
-            "---\nid: {id}\ncreated: 2026-08-24T12:00:00Z\n---\nApprove this mock statement for question {n}?\n"
+            "---\nid: {id}\ncreated: 2026-08-24T12:00:00Z\nlayer: task\nkind: wording\nquestion: Approve this mock statement for question {n}?\nproposed_text: |\n  Mock durable statement {n} ({tag}).\noptions:\n  - key: \"1\"\n    label: Accept\n  - key: \"2\"\n    label: Modify — describe changes\n  - key: \"3\"\n    label: Reject\n---\n"
         )
     };
     fs::write(path, body)?;

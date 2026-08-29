@@ -11,6 +11,11 @@ pub fn set_data_root(root: PathBuf) {
     *guard = Some(root);
 }
 
+#[cfg(test)]
+pub fn clear_data_root_override() {
+    *DATA_ROOT_OVERRIDE.write().expect("data root override lock") = None;
+}
+
 /// Repo-local XDG-style paths for durable tod data.
 #[derive(Debug, Clone)]
 pub struct TodPaths {
@@ -117,7 +122,6 @@ mod tests {
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
         assert_eq!(paths.repo_root(), root.as_path());
-        // Clear so other tests in this process are not pinned.
-        *DATA_ROOT_OVERRIDE.write().unwrap() = None;
+        clear_data_root_override();
     }
 }

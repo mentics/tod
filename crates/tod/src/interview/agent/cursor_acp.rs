@@ -1064,8 +1064,8 @@ mod tests {
     fn deep_dive_prompt_includes_context() {
         let prompt = build_deep_dive_prompt(
             &DeepDiveContext {
-                project: "interview-ui".into(),
-                task: "core-ui".into(),
+                project: "tod".into(),
+                task: "interview".into(),
                 lifecycle_state: "active".into(),
                 interview_purpose: "implementation".into(),
                 interview_phase: "design".into(),

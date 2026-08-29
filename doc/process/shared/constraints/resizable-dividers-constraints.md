@@ -28,4 +28,4 @@ When in doubt, if both sides show user content that could benefit from more or l
 - Provide a clear drag affordance on hover (for example a resize cursor) so dividers are discoverable without documentation.
 - Enforce sensible minimum sizes so panels do not collapse to unusable slivers during or after a drag.
 - Divider drag must not break keyboard navigation, text selection, or primary interactions in either adjacent panel.
-- Where layout proportions are persisted (application settings, session state, or similar), restored sizes should respect the same minimum-size rules.
+- Divider positions (layout proportions) must **persist across application restarts**: closing the app and opening it again restores the same divider configuration the user left. How and where that state is stored is out of scope for this document; restored sizes must still respect the same minimum-size rules.

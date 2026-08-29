@@ -1,18 +1,58 @@
 use crate::interview::TodPaths;
 use crate::interview::settings::{MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings};
 use crate::logging;
+use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, px,
+    Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, Styled, Timer, Window, div, px,
 };
-use gpui_component::button::Button;
-use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
+use std::time::Duration;
+
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+const PANEL_WIDTH: f32 = 560.0;
+const SIDEBAR_WIDTH: f32 = 168.0;
+
+const SECTIONS: [SettingsSection; 3] = [
+    SettingsSection::Researcher,
+    SettingsSection::AnswerProcessor,
+    SettingsSection::Logging,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSection {
+    Researcher,
+    AnswerProcessor,
+    Logging,
+}
+
+impl SettingsSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Researcher => "Researcher thresholds",
+            Self::AnswerProcessor => "Answer-processor pool",
+            Self::Logging => "Diagnostic logging",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Researcher => "researcher",
+            Self::AnswerProcessor => "answer-processor",
+            Self::Logging => "logging",
+        }
+    }
+}
 
 pub struct SettingsView {
     paths: TodPaths,
     settings: TodSettings,
     log_dir_display: SharedString,
     focus_handle: FocusHandle,
+    app_nav: AppNavMenu,
+    active_section: SettingsSection,
+    save_generation: u64,
 }
 
 impl SettingsView {
@@ -24,46 +64,82 @@ impl SettingsView {
                 .display()
                 .to_string(),
         );
+
         Self {
             paths,
             settings,
             log_dir_display,
             focus_handle: cx.focus_handle(),
+            app_nav: AppNavMenu::default(),
+            active_section: SettingsSection::Researcher,
+            save_generation: 0,
         }
+    }
+
+    fn activate_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        if self.active_section == section {
+            return;
+        }
+        self.active_section = section;
+        cx.notify();
+    }
+
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        let entity = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            Timer::after(SAVE_DEBOUNCE).await;
+            let _ = entity.update(cx, |this, cx| {
+                if this.save_generation == generation {
+                    this.flush_save(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn flush_save(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = self.settings.save(&self.paths) {
+            tracing::error!("failed to save settings: {err:#}");
+            return;
+        }
+        let _ = logging::reload_level(self.settings.log_level);
+        let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        cx.notify();
     }
 
     fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.researcher.replenish_threshold =
             step_u32(self.settings.researcher.replenish_threshold, delta);
-        let _ = self.settings.save(&self.paths);
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn step_second(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.researcher.second_researcher_threshold =
             step_u32(self.settings.researcher.second_researcher_threshold, delta);
-        let _ = self.settings.save(&self.paths);
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn step_pool_size(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.answer_processor.session_pool_size =
             step_u32(self.settings.answer_processor.session_pool_size, delta);
-        let _ = self.settings.save(&self.paths);
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn step_answers_per_session(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.answer_processor.answers_per_session =
             step_u32(self.settings.answer_processor.answers_per_session, delta);
-        let _ = self.settings.save(&self.paths);
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn step_log_level(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.log_level = self.settings.log_level.step(delta);
-        let _ = self.settings.save(&self.paths);
-        let _ = logging::reload_level(self.settings.log_level);
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -76,8 +152,7 @@ impl SettingsView {
                 .saturating_sub((-delta) as u64)
         };
         self.settings.log_max_size_kb = TodSettings::clamp_log_max_size_kb(next);
-        let _ = self.settings.save(&self.paths);
-        let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        self.schedule_save(cx);
         cx.notify();
     }
 }
@@ -102,142 +177,235 @@ mod tests {
     }
 }
 
+impl HasAppNav for SettingsView {
+    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
+        &mut self.app_nav
+    }
+
+    fn app_nav_current(&self) -> Option<AppDestination> {
+        Some(AppDestination::Settings)
+    }
+
+    fn app_nav_fallback_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Focusable for SettingsView {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let focus = self.focus_handle.clone();
 
-        v_flex()
+        let root = v_flex()
             .size_full()
             .bg(theme.background)
-            .p_4()
-            .gap_4()
             .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .text_color(theme.foreground)
-                    .child("Interview settings"),
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(self.render_app_nav(window, cx)),
             )
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Researcher queue thresholds"),
-            )
-            .child(threshold_row(
-                cx,
-                "replenish",
-                self.settings.researcher.replenish_threshold.to_string(),
-                "Replenish when open count below",
-                "Start a researcher run when fewer than this many questions remain open.",
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_replenish(-1, cx),
-                |this, _, cx| this.step_replenish(1, cx),
-            ))
-            .child(threshold_row(
-                cx,
-                "second",
-                self.settings
-                    .researcher
-                    .second_researcher_threshold
-                    .to_string(),
-                "Start second researcher when open count below",
-                "While a researcher is already running, start another if open count drops below this threshold (max 2 concurrent).",
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_second(-1, cx),
-                |this, _, cx| this.step_second(1, cx),
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Answer-processor session pool"),
-            )
-            .child(threshold_row(
-                cx,
-                "pool-size",
-                self.settings
-                    .answer_processor
-                    .session_pool_size
-                    .to_string(),
-                "Maximum session pool size",
-                "Maximum number of answer-processor ACP sessions open at once. Default 4.",
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_pool_size(-1, cx),
-                |this, _, cx| this.step_pool_size(1, cx),
-            ))
-            .child(threshold_row(
-                cx,
-                "answers-per-session",
-                self.settings
-                    .answer_processor
-                    .answers_per_session
-                    .to_string(),
-                "Answers per session",
-                "Recycle an ACP session after this many responses are received. Default 4.",
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_answers_per_session(-1, cx),
-                |this, _, cx| this.step_answers_per_session(1, cx),
-            ))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("Diagnostic logging"),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            .child("Log directory"),
-                    )
-                    .child(
-                        div()
-                            .id("log-dir-path")
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .whitespace_normal()
-                            .child(self.log_dir_display.clone()),
-                    ),
-            )
-            .child(threshold_row(
-                cx,
-                "log-level",
-                self.settings.log_level.to_string(),
-                "Log verbosity",
-                "Minimum diagnostic log level (error, info, debug, trace). Default is info.",
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_log_level(-1, cx),
-                |this, _, cx| this.step_log_level(1, cx),
-            ))
-            .child(threshold_row(
-                cx,
-                "log-max-size",
-                format!("{} KB", self.settings.log_max_size_kb),
-                "Max log storage (KB)",
-                format!(
-                    "Maximum on-disk diagnostic log size in kilobytes ({MIN_LOG_MAX_SIZE_KB}–{MAX_LOG_MAX_SIZE_KB}). Default 51200 KB."
+                v_flex().flex_1().min_h_0().overflow_hidden().p_4().child(
+                    h_flex()
+                        .w(px(PANEL_WIDTH))
+                        .items_start()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .child(self.render_section_sidebar(cx, &theme))
+                        .child(self.render_section_panel(cx, &theme)),
                 ),
-                theme.foreground,
-                theme.muted_foreground,
-                |this, _, cx| this.step_log_max_size(-1024, cx),
-                |this, _, cx| this.step_log_max_size(1024, cx),
-            ))
+            )
+            .track_focus(&focus);
+
+        self.bind_app_nav_toggle(root, cx)
+    }
+}
+
+impl SettingsView {
+    fn render_section_sidebar(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &gpui_component::Theme,
+    ) -> impl IntoElement {
+        v_flex()
+            .w(px(SIDEBAR_WIDTH))
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .children(SECTIONS.iter().map(|section| {
+                let selected = self.active_section == *section;
+                Button::new(SharedString::from(format!(
+                    "settings-section-{}",
+                    section.id()
+                )))
+                .label(section.label())
+                .ghost()
+                .w_full()
+                .selected(selected)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.activate_section(*section, cx);
+                }))
+            }))
+    }
+
+    fn render_section_panel(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &gpui_component::Theme,
+    ) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .min_w(px(PANEL_WIDTH - SIDEBAR_WIDTH))
+            .p_3()
+            .gap_3()
+            .child(self.render_active_section(cx, theme))
+    }
+
+    fn render_active_section(
+        &self,
+        cx: &mut Context<Self>,
+        theme: &gpui_component::Theme,
+    ) -> impl IntoElement {
+        match self.active_section {
+            SettingsSection::Researcher => v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Researcher thresholds"),
+                )
+                .child(threshold_row(
+                    cx,
+                    "replenish",
+                    self.settings.researcher.replenish_threshold.to_string(),
+                    "Replenish below",
+                    "Start a researcher run when open questions fall under this count. Default 8.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_replenish(-1, cx),
+                    |this, _, cx| this.step_replenish(1, cx),
+                ))
+                .child(threshold_row(
+                    cx,
+                    "second",
+                    self.settings
+                        .researcher
+                        .second_researcher_threshold
+                        .to_string(),
+                    "Second researcher below",
+                    "While one researcher is already running, start a second if open count drops under this lower threshold. Max two runs. Default 2.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_second(-1, cx),
+                    |this, _, cx| this.step_second(1, cx),
+                ))
+                .into_any_element(),
+            SettingsSection::AnswerProcessor => v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Answer-processor pool"),
+                )
+                .child(threshold_row(
+                    cx,
+                    "pool-size",
+                    self.settings
+                        .answer_processor
+                        .session_pool_size
+                        .to_string(),
+                    "Maximum session pool size",
+                    "Cap on concurrent open answer-processor sessions. Default 4.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_pool_size(-1, cx),
+                    |this, _, cx| this.step_pool_size(1, cx),
+                ))
+                .child(threshold_row(
+                    cx,
+                    "answers-per-session",
+                    self.settings
+                        .answer_processor
+                        .answers_per_session
+                        .to_string(),
+                    "Answers per session",
+                    "After the Nth response is processed on one session, close that session. Default 4.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_answers_per_session(-1, cx),
+                    |this, _, cx| this.step_answers_per_session(1, cx),
+                ))
+                .into_any_element(),
+            SettingsSection::Logging => v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Diagnostic logging"),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(theme.foreground)
+                                .child("Log directory"),
+                        )
+                        .child(
+                            div()
+                                .id("log-dir-path")
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .whitespace_normal()
+                                .child(self.log_dir_display.clone()),
+                        ),
+                )
+                .child(threshold_row(
+                    cx,
+                    "log-level",
+                    self.settings.log_level.to_string(),
+                    "Log verbosity",
+                    "Minimum diagnostic log level (error, info, debug, trace). Default is info.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_log_level(-1, cx),
+                    |this, _, cx| this.step_log_level(1, cx),
+                ))
+                .child(threshold_row(
+                    cx,
+                    "log-max-size",
+                    format!("{} KB", self.settings.log_max_size_kb),
+                    "Max log storage (KB)",
+                    format!(
+                        "Maximum on-disk diagnostic log size in kilobytes ({MIN_LOG_MAX_SIZE_KB}–{MAX_LOG_MAX_SIZE_KB}). Default 51200 KB."
+                    ),
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_log_max_size(-1024, cx),
+                    |this, _, cx| this.step_log_max_size(1024, cx),
+                ))
+                .into_any_element(),
+        }
     }
 }
 
@@ -257,12 +425,14 @@ fn threshold_row(
     let value = value.into();
 
     h_flex()
+        .w_full()
         .gap_3()
         .items_start()
         .child(
             h_flex()
                 .gap_2()
                 .items_center()
+                .flex_shrink_0()
                 .child(
                     Button::new(SharedString::from(format!("{id_prefix}-dec")))
                         .label("−")
@@ -274,7 +444,7 @@ fn threshold_row(
                 .child(
                     div()
                         .id(SharedString::from(format!("{id_prefix}-value")))
-                        .min_w(px(72.))
+                        .w(px(56.))
                         .px_2()
                         .py_2()
                         .text_sm()
@@ -294,7 +464,7 @@ fn threshold_row(
         .child(
             v_flex()
                 .flex_1()
-                .min_w_0()
+                .min_w(px(220.))
                 .gap_1()
                 .child(
                     div()
@@ -306,7 +476,6 @@ fn threshold_row(
                 .child(
                     div()
                         .w_full()
-                        .min_w_0()
                         .text_sm()
                         .text_color(muted)
                         .whitespace_normal()

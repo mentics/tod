@@ -1,7 +1,9 @@
 mod agent_socket;
 mod app;
+mod fleet;
 mod interview;
 mod logging;
+mod process;
 mod ui;
 mod views;
 

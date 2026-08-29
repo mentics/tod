@@ -38,7 +38,7 @@ pub fn after_window_open(previous_foreground: Option<HWND>) {
 }
 
 #[cfg(windows)]
-fn main_hwnd() -> Option<HWND> {
+pub(crate) fn main_hwnd() -> Option<HWND> {
     use windows::Win32::Foundation::{BOOL, LPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClientRect, GetWindowThreadProcessId, IsWindowVisible,

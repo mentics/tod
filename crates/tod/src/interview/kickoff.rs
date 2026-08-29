@@ -69,7 +69,7 @@ pub fn researcher_bootstrap_prompt(session: &InterviewSession) -> String {
          5. Populate queue/ with initial questions for this phase (at least several open questions before you finish).\n\
          6. Update researcher-status.md only after queue files exist.\n\
          \n\
-         Queue files use YAML front matter + markdown body; MC options as options: key/label list with digit keys \"1\", \"2\", \"3\", … only (never A/B/C).\n\
+         Queue files use YAML front matter only for UI fields (context, question, recommend, proposed_text, options with digit keys \"1\"/\"2\"/\"3\", layer, kind, covers); leave the markdown body empty. Never duplicate MC labels or Recommend lines in the body.\n\
          Do not talk to the user. Do not return until queue/ has question files. Return the queue directory path only when done.",
         session.id, session.display_name,
     )

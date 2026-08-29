@@ -29,14 +29,16 @@ Make it extremely efficient for a software engineer to work with many agents —
    - Processing — working on a prompt
    - Blocked — could not finish the prompt; needs human input to continue
    - Waiting — finished the prompt successfully; awaiting further instructions or shut down
+   - Not-running — relaunch could not reattach to a reachable same-agent process (or identity verification failed); the agent remains in the managed fleet until the user manually relaunches or shuts it down
 
    When the user shuts down an agent, tod tears down the agent and its environment and removes it from the managed fleet (no durable post-shutdown / retired state). Interrupting an agent halts its current activity and sets its runtime status to Blocked; the agent remains in the managed fleet. Shut down is the only operation that removes an agent from the fleet. When an agent is in Waiting or Blocked, the user can submit a new prompt without relaunching the agent. When an agent is in Processing, the user can submit a new prompt and choose whether it interrupts the current work or is added to the agent’s prompt queue.
 
-4. Manual task create, edit, and delete — Users can create, edit, and permanently delete tasks manually in tod, including fields such as freeform notes, git repository, and branch. Title and slug are required; when the user does not supply a slug, tod auto-generates it from the title and from the linked issue ticket id when available (same rules as prior Tod extension). Slugs are editable after creation; when the linked issue ticket id is added or changed, tod auto-updates the slug from the title and ticket id unless the user has manually changed the slug. Titles must be unique across all tasks (case-insensitive); slugs must be unique across all tasks; all other task fields are optional. tod blocks permanent delete of a task while it still has associated agents. When permanently deleting a task with no associated agents, tod reclaims any unreclaimed isolated worktrees for that task (subject to the dirty-worktree warning in item 14). The user can also explicitly reclaim an agent’s isolated git worktree.
+4. Manual task create, edit, and delete — Users can create, edit, and permanently delete tasks manually in tod, including fields such as freeform notes, git repository, and branch. Title and slug are required; when the user does not supply a slug, tod auto-generates it from the title and from the linked issue ticket id when available (same rules as prior Tod extension). Slugs are editable after creation; when the linked issue ticket id is added or changed, tod auto-updates the slug from the title and ticket id unless the user has manually changed the slug. Titles must be unique across all tasks (case-insensitive); slugs must be unique across all tasks; all other task fields are optional. tod blocks permanent delete of a task while it still has associated agents. The user can also explicitly reclaim an agent’s isolated git worktree.
 
-5. Tags — Users can assign tags to tasks.
+5. Tags — Users can assign tags to tasks. A task may have at most 10 tags.
    - Success criteria:
      - User can add, remove, and view tags on a task
+     - User cannot add an eleventh tag to a task
 
 ### UI: awareness, lists, and detail pages
 
@@ -119,7 +121,8 @@ Make it extremely efficient for a software engineer to work with many agents —
    From tod, the user can:
    1. Associate a tod task with one or more linked issues
    2. Create a tod task from an issue ticket ID (tod pulls the issue content and creates the task)
-   3. Open a browser to an associated issue
+   3. Browse a list of issues from the issue tracker, select an issue, and create a tod task from it (tod pulls the issue content and creates the task)
+   4. Open a browser to an associated issue
 
 20. Code repository integration — Code-repository integrations share a common capability set. GitHub is the required code repository.
 
@@ -127,10 +130,11 @@ Make it extremely efficient for a software engineer to work with many agents —
    1. Associate a tod task with one or more linked pull requests
    2. Open a browser to an associated pull request
 
-21. Credential management — The user can store, update, and replace credentials tod needs to access configured external services (Slack, Linear, and GitHub). Credentials live on the user’s machine. When credentials are missing or invalid for an action that needs them, tod prompts the user to supply them.
+21. Credential management — The user can store, update, and replace credentials tod needs to access configured external services (Slack, Linear, and GitHub). Credentials live on the user’s machine. When an action needs credentials that are missing or invalid, tod prompts the user to supply them and then continues that action.
    - Success criteria:
      - User can set and change credentials for Slack, Linear, and GitHub used by tod
      - An action that needs a missing/invalid credential prompts for credentials rather than failing silently
+     - After valid credentials are supplied during a prompted action, tod continues that action without requiring the user to retry from scratch
 
 22. Code editor integration — From tod, the user can open Zed to view the code a particular agent is working on (one supported editor in this phase; user configuration of editor choice is not required):
    1. Open that agent’s worktree, workspace, or branch
@@ -163,20 +167,28 @@ Make it extremely efficient for a software engineer to work with many agents —
      - User can open settings and change a preference
      - Preference changes remain after quit and relaunch
 
-27. Diagnostic logging — Users can view tod’s own diagnostic logs for troubleshooting.
+27. Issue and PR URL templates — Application settings include URL templates for resolving short issue-tracker ticket ids and pull-request ids to browser URLs. Defaults target Linear (issue tracker) and GitHub (pull requests); users may change templates to support other hosts without changing task edit UI.
+
+28. Diagnostic logging — Users can view tod’s own diagnostic logs for troubleshooting.
 
 ### Interaction and safety
 
-28. Keyboard efficiency — Every user action in tod is reachable via the keyboard; a user can operate tod fully without using the mouse.
+29. Keyboard efficiency — Every user action in tod is reachable via the keyboard; a user can operate tod fully without using the mouse.
 
-29. Customizable keyboard shortcuts — Users can customize keyboard shortcuts in tod’s application preferences.
+30. Customizable keyboard shortcuts — Users can customize keyboard shortcuts in tod’s application preferences.
 
-30. Destructive-action confirmation — tod requires user confirmation before destructive actions.
+31. Destructive-action confirmation — tod requires user confirmation before destructive actions.
    - Success criteria:
      - User must confirm before permanently deleting a task
      - User must confirm before shutting down an agent that is in Starting, Processing, or Blocked
      - Shutting down an agent in Waiting does not require confirmation
      - Before shutting down an agent, if the agent’s working set has changes, tod warns the user and offers recovery options similar to dirty worktree reclaim before proceeding
+
+32. Optional task projects — Tasks may belong to at most one optional project/namespace (or none). Project namespaces are user-defined names selected or created inline via a reusable project selector on create and move surfaces.
+
+33. Ticket-id pattern — The ticket-id pattern matches only when the entire trimmed compose title is `{ASCII letters}-{ASCII digits}` (for example `TOD-142`). Values with extra text (non-whitespace) do not match and create proceeds as a plain title.
+
+34. Ticket-id pattern team keys — The ticket-id pattern accepts any trimmed value matching `{ASCII letters}-{ASCII digits}`; it is not restricted to a single configured team key. Issue-tracker fetch determines whether the ticket exists.
 
 ## Constraints
 
@@ -193,3 +205,25 @@ Make it extremely efficient for a software engineer to work with many agents —
 6. Selectable data — Follow [`doc/process/shared/constraints/selectable-data-constraints.md`](../../shared/constraints/selectable-data-constraints.md).
 
 7. Resizable dividers — Follow [`doc/process/shared/constraints/resizable-dividers-constraints.md`](../../shared/constraints/resizable-dividers-constraints.md).
+
+8. Focus return after overlay — Follow [`doc/process/shared/constraints/focus-return-after-overlay-constraints.md`](../../shared/constraints/focus-return-after-overlay-constraints.md).
+
+9. Invalid field submit feedback — Follow [`doc/process/shared/constraints/invalid-submit-feedback-constraints.md`](../../shared/constraints/invalid-submit-feedback-constraints.md).
+
+10. List selection scroll-into-view — Follow [`doc/process/shared/constraints/list-selection-scroll-into-view-constraints.md`](../../shared/constraints/list-selection-scroll-into-view-constraints.md).
+
+11. Singleton entry surface — Follow [`doc/process/shared/constraints/singleton-entry-surface-constraints.md`](../../shared/constraints/singleton-entry-surface-constraints.md).
+
+12. Row control activation — Follow [`doc/process/shared/constraints/row-control-activation-constraints.md`](../../shared/constraints/row-control-activation-constraints.md).
+
+13. Actionable affordance — Follow [`doc/process/shared/constraints/actionable-affordance-constraints.md`](../../shared/constraints/actionable-affordance-constraints.md).
+
+14. Keyboard badges — Follow [`doc/process/shared/constraints/keyboard-badge-constraints.md`](../../shared/constraints/keyboard-badge-constraints.md).
+
+15. Text editing keystroke priority — Follow [`doc/process/shared/constraints/text-area-keystroke-priority-constraints.md`](../../shared/constraints/text-area-keystroke-priority-constraints.md).
+
+16. Dismissible toasts — Follow [`doc/process/shared/constraints/dismissible-toast-constraints.md`](../../shared/constraints/dismissible-toast-constraints.md).
+
+17. Modal dialogs — Follow [`doc/process/shared/constraints/modal-dialog-constraints.md`](../../shared/constraints/modal-dialog-constraints.md).
+
+18. App navigation menu — Follow [`doc/process/projects/tod/constraints/app-navigation-menu-constraints.md`](constraints/app-navigation-menu-constraints.md).

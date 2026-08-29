@@ -1,8 +1,8 @@
 use crate::interview::paths::TodPaths;
 use crate::logging::LogLevel;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const DEFAULT_REPLENISH_THRESHOLD: u32 = 8;
 const DEFAULT_SECOND_RESEARCHER_THRESHOLD: u32 = 2;
@@ -80,6 +80,12 @@ pub struct TodSettings {
     pub log_level: LogLevel,
     #[serde(default = "default_log_max_size_kb")]
     pub log_max_size_kb: u64,
+    /// Fleet persistence storage root. When unset, uses the OS default on first resolve.
+    #[serde(default)]
+    pub fleet_storage_root: Option<PathBuf>,
+    /// Keep the main window above other windows (Windows only).
+    #[serde(default)]
+    pub always_on_top: bool,
 }
 
 impl Default for TodSettings {
@@ -89,6 +95,8 @@ impl Default for TodSettings {
             answer_processor: AnswerProcessorSettings::default(),
             log_level: LogLevel::Info,
             log_max_size_kb: DEFAULT_LOG_MAX_SIZE_KB,
+            fleet_storage_root: None,
+            always_on_top: false,
         }
     }
 }
@@ -139,6 +147,21 @@ impl TodSettings {
     pub fn clamp_log_max_size_kb(value: u64) -> u64 {
         value.clamp(MIN_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB)
     }
+
+    /// Resolved fleet storage root: explicit setting or `dirs::data_dir()/tod/fleet`.
+    pub fn resolve_fleet_storage_root(&self) -> Result<PathBuf> {
+        let root = match &self.fleet_storage_root {
+            Some(path) => path.clone(),
+            None => default_fleet_storage_root()?,
+        };
+        crate::fleet::paths::normalize_absolute(&root)
+    }
+}
+
+fn default_fleet_storage_root() -> Result<PathBuf> {
+    let data_dir =
+        dirs::data_dir().context("failed to resolve OS data directory for fleet storage")?;
+    Ok(data_dir.join("tod").join("fleet"))
 }
 
 #[cfg(test)]
@@ -158,7 +181,28 @@ mod tests {
         assert_eq!(settings.answer_processor.answers_per_session, 4);
         assert_eq!(settings.log_level, LogLevel::Info);
         assert_eq!(settings.log_max_size_kb, DEFAULT_LOG_MAX_SIZE_KB);
+        assert_eq!(settings.fleet_storage_root, None);
+        assert!(!settings.always_on_top);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_fleet_storage_root_uses_default() {
+        let settings = TodSettings::default();
+        let root = settings.resolve_fleet_storage_root().unwrap();
+        assert!(root.is_absolute());
+        assert!(root.ends_with("fleet"));
+    }
+
+    #[test]
+    fn resolve_fleet_storage_root_uses_setting() {
+        let settings = TodSettings {
+            fleet_storage_root: Some(PathBuf::from("/tmp/custom-fleet-root")),
+            ..TodSettings::default()
+        };
+        let root = settings.resolve_fleet_storage_root().unwrap();
+        assert!(root.is_absolute());
+        assert!(root.ends_with("custom-fleet-root"));
     }
 
     #[test]
@@ -174,6 +218,8 @@ mod tests {
             answer_processor: AnswerProcessorSettings::default(),
             log_level: LogLevel::Debug,
             log_max_size_kb: 1024,
+            fleet_storage_root: None,
+            always_on_top: true,
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();

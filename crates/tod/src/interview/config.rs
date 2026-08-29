@@ -177,7 +177,7 @@ pub fn path_for_storage(path: &Path) -> String {
     raw.into_owned()
 }
 
-fn paths_match(a: &Path, b: &Path) -> bool {
+pub(crate) fn paths_match(a: &Path, b: &Path) -> bool {
     let na = normalize_path(a);
     let nb = normalize_path(b);
     if na == nb {
@@ -326,6 +326,22 @@ pub fn sync_scaffolding_from_disk(
         );
         return Ok(false);
     };
+    let config = parse_interview_config(&config_path)?;
+    // Hard guarantee: never bind another entity's queue to this session.
+    if let Some(entity) = session.entity_path.as_ref() {
+        if !paths_match(&config.entity, Path::new(entity)) {
+            tracing::warn!(
+                event = "interview",
+                action = "sync_entity_mismatch",
+                sqlite_id,
+                session_entity = %entity,
+                config_entity = %config.entity.display(),
+                config = %config_path.display(),
+                "refusing to bind interview-config for a different entity"
+            );
+            return Ok(false);
+        }
+    }
     let canon = config_path
         .canonicalize()
         .unwrap_or_else(|_| config_path.clone())
@@ -342,7 +358,6 @@ pub fn sync_scaffolding_from_disk(
         );
         return Ok(false);
     }
-    let config = parse_interview_config(&config_path)?;
     if !scaffolding_ready_to_bind(&config) {
         tracing::debug!(
             event = "interview",
@@ -391,6 +406,20 @@ pub fn sync_scaffolding_from_disk_after_bootstrap(
     let Some(config_path) = find_bootstrap_config_for_session(repo_root, &session)? else {
         return Ok(false);
     };
+    let config = parse_interview_config(&config_path)?;
+    if let Some(entity) = session.entity_path.as_ref() {
+        if !paths_match(&config.entity, Path::new(entity)) {
+            tracing::warn!(
+                event = "interview",
+                action = "sync_entity_mismatch",
+                sqlite_id,
+                session_entity = %entity,
+                config_entity = %config.entity.display(),
+                "refusing to bind interview-config for a different entity"
+            );
+            return Ok(false);
+        }
+    }
     let canon = config_path
         .canonicalize()
         .unwrap_or_else(|_| config_path.clone())
@@ -399,7 +428,6 @@ pub fn sync_scaffolding_from_disk_after_bootstrap(
     if claimed.contains(&canon) {
         return Ok(false);
     }
-    let config = parse_interview_config(&config_path)?;
     bind_session_scaffolding(store, sqlite_id, &config_path, &config)
 }
 
@@ -446,14 +474,14 @@ mod tests {
         let text = r#"# Interview config
 
 session_id: design-interview-2026-08-23-1330
-entity: c:\data\git\tod\doc\process\projects\interview-ui\tasks\core-ui
+entity: c:\data\git\tod\doc\process\projects\tod\tasks\interview
 phase: design-interview
-transcript: c:\data\git\tod\doc\process\projects\interview-ui\tasks\core-ui\history\design-interview-2026-08-23-1330.md
+transcript: c:\data\git\tod\doc\process\projects\tod\tasks\interview\history\design-interview-2026-08-23-1330.md
 scope:
-  - c:\data\git\tod\doc\process\projects\interview-ui\tasks\core-ui\user.md
+  - c:\data\git\tod\doc\process\projects\tod\tasks\interview\user.md
 state_agent: C:\Users\joel\.claude\skills\process\agents\design-agent.md
-scratchpad: c:\data\git\tod\.local\agent\process\projects\interview-ui\tasks\core-ui\scratchpad\interviews\design-interview-2026-08-23-1330
-queue: c:\data\git\tod\.local\agent\process\projects\interview-ui\tasks\core-ui\scratchpad\interviews\design-interview-2026-08-23-1330\queue/
+scratchpad: c:\data\git\tod\.local\agent\process\projects\tod\tasks\interview\scratchpad\interviews\design-interview-2026-08-23-1330
+queue: c:\data\git\tod\.local\agent\process\projects\tod\tasks\interview\scratchpad\interviews\design-interview-2026-08-23-1330\queue/
 queue_target: 8
 "#;
         let cfg = parse_interview_config_contents(Path::new("interview-config.md"), text).unwrap();
@@ -477,14 +505,14 @@ queue_target: 8
             .join("doc")
             .join("process")
             .join("projects")
-            .join("interview-ui")
+            .join("tod")
             .join("tasks")
-            .join("core-ui");
+            .join("interview");
         // Without canonicalize (paths may not exist on CI), exercise the strip helper directly.
-        let rel = Path::new("doc/process/projects/interview-ui/tasks/core-ui");
+        let rel = Path::new("doc/process/projects/tod/tasks/interview");
         assert_eq!(
             strip_doc_process_prefix(rel),
-            PathBuf::from("projects/interview-ui/tasks/core-ui")
+            PathBuf::from("projects/tod/tasks/interview")
         );
         let _ = (repo, entity);
     }

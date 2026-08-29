@@ -7,6 +7,11 @@ use std::rc::Rc;
 
 struct ConfirmToast;
 
+/// Brief error toast for invalid submit attempts.
+pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    window.push_notification(Notification::error(message).autohide(true), cx);
+}
+
 /// Standard yes/no confirmation toast (non-autohide, warning style).
 pub fn confirm_toast(
     window: &mut Window,
@@ -30,17 +35,15 @@ pub fn confirm_toast(
                 h_flex()
                     .gap_2()
                     .mt_2()
-                    .child(
-                        Button::new("toast-no")
-                            .label("No")
-                            .on_click(cx.listener(move |note, _, window, cx| {
-                                note.dismiss(window, cx);
-                                window.remove_notification::<ConfirmToast>(cx);
-                                if let Some(on_no) = on_no.borrow_mut().take() {
-                                    on_no(window, cx);
-                                }
-                            })),
-                    )
+                    .child(Button::new("toast-no").label("No").on_click(cx.listener(
+                        move |note, _, window, cx| {
+                            note.dismiss(window, cx);
+                            window.remove_notification::<ConfirmToast>(cx);
+                            if let Some(on_no) = on_no.borrow_mut().take() {
+                                on_no(window, cx);
+                            }
+                        },
+                    )))
                     .child(
                         Button::new("toast-yes")
                             .label("Yes")

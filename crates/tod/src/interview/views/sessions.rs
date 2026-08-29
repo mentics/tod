@@ -3,24 +3,28 @@ use crate::interview::config::{
     sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
 };
 use crate::interview::kickoff::researcher_bootstrap_prompt;
-use crate::interview::views::workspace::{WorkspaceEvent, WorkspaceView};
+use crate::interview::views::session_list::SessionListDelegate;
+use crate::interview::views::workspace::{WorkspaceEvent, WorkspaceInFlightState, WorkspaceView};
 use crate::interview::{
-    InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore, TodPaths,
+    InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore,
+    TaskListProceedContext, TodPaths,
 };
+use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
+use crate::ui::key_context::{self, INPUT};
+use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::toast::confirm_toast;
-use chrono::{DateTime, Local, Utc};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Window, actions, div, px,
 };
+use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::list::ListItem;
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::list::{List, ListEvent, ListState};
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -31,8 +35,6 @@ const SESSIONS_CONTEXT: &str = "InterviewSessions";
 actions!(
     interview_sessions,
     [
-        SessionMoveUp,
-        SessionMoveDown,
         SessionOpen,
         SessionToggleNew,
         SessionLaunch,
@@ -43,16 +45,19 @@ actions!(
 );
 
 pub fn register_sessions_keyboard_bindings(cx: &mut App) {
-    let context = Some(SESSIONS_CONTEXT);
+    let context = Some(key_context::excluding_input(SESSIONS_CONTEXT));
+    // ↑/↓ use ListArrow* (same as Tasks / question list) — bound here because
+    // SessionsView keeps InterviewSessions focus context for N/filter/Enter.
     cx.bind_keys([
-        KeyBinding::new("up", SessionMoveUp, context),
-        KeyBinding::new("down", SessionMoveDown, context),
+        KeyBinding::new("up", ListArrowUp, context),
+        KeyBinding::new("down", ListArrowDown, context),
         KeyBinding::new("enter", SessionOpen, context),
         KeyBinding::new("n", SessionToggleNew, context),
         KeyBinding::new("escape", SessionCancelCompose, context),
         KeyBinding::new("shift-enter", SessionLaunch, context),
         KeyBinding::new("ctrl-shift-1", SessionFilterActive, context),
         KeyBinding::new("ctrl-shift-2", SessionFilterArchive, context),
+        KeyBinding::new("escape", SessionCancelCompose, Some(INPUT)),
     ]);
 }
 
@@ -60,6 +65,18 @@ pub fn register_sessions_keyboard_bindings(cx: &mut App) {
 enum SessionFilter {
     Active,
     Archive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceReturnTarget {
+    TaskList,
+    SessionsList,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionsEvent {
+    ReturnToTaskList,
+    ProceedToLifecycle { task_id: String, lifecycle: String },
 }
 
 #[derive(Debug, Clone)]
@@ -101,11 +118,22 @@ pub struct SessionsView {
     bootstrap_sessions: Arc<Mutex<HashSet<i64>>>,
     kickoff_status: SharedString,
     focus_handle: FocusHandle,
-    list_scroll_handle: ScrollHandle,
+    session_list_state: Entity<ListState<SessionListDelegate>>,
+    _session_list_subscription: Subscription,
     workspace: Option<Entity<WorkspaceView>>,
+    /// When false, the session list is shown but an existing workspace entity is
+    /// kept alive so in-flight pending questions / agent runs survive Back → Open.
+    workspace_visible: bool,
+    workspace_return_target: WorkspaceReturnTarget,
+    /// When opened from the task list, holds ids for **Proceed** → lifecycle panel.
+    task_list_context: Option<TaskListProceedContext>,
+    /// Pending submit state for sessions whose workspace was replaced (e.g. user
+    /// opened a different interview). Restored on reopen.
+    in_flight_by_session: HashMap<i64, WorkspaceInFlightState>,
     _workspace_subscription: Option<Subscription>,
     /// Deferred bootstrap prompt after workspace detects missing scaffolding.
     pending_bootstrap_prompt: Option<InterviewSession>,
+    app_nav: AppNavMenu,
 }
 
 impl SessionsView {
@@ -122,12 +150,46 @@ impl SessionsView {
         let purpose_options = default_purposes();
         let purpose_note = cx.new(|cx| InputState::new(window, cx).placeholder("Optional note"));
 
+        let initial_selected = sessions.first().map(|s| s.id);
+        let visible = filter_sessions(&sessions, SessionFilter::Active);
+        let delegate = SessionListDelegate::new(visible);
+        let session_list_state =
+            cx.new(|cx| ListState::new(delegate, window, cx).searchable(false));
+        session_list_state.update(cx, |state, cx| {
+            let ix = initial_selected
+                .and_then(|id| state.delegate().index_of_id(id))
+                .map(IndexPath::new);
+            state.set_selected_index(ix, window, cx);
+            if ix.is_some() {
+                state.scroll_to_selected_item(window, cx);
+            }
+        });
+        let _session_list_subscription =
+            cx.subscribe(&session_list_state, |this, state, event, cx| {
+                match event {
+                    ListEvent::Select(ix) => {
+                        let id = state.read(cx).delegate().items().get(ix.row).map(|s| s.id);
+                        if let Some(id) = id {
+                            this.selected_id = Some(id);
+                            cx.notify();
+                        }
+                    }
+                    ListEvent::Confirm(_) => {
+                        // Window is not available in ListEvent; SessionOpen /
+                        // Open button paths call open_selected with a Window.
+                        // Mouse double-confirm on List still syncs selection above
+                        // via Select before Confirm — open via SessionOpen key.
+                    }
+                    ListEvent::Cancel => {}
+                }
+            });
+
         Self {
             paths,
             store,
             sessions: sessions.clone(),
             filter: SessionFilter::Active,
-            selected_id: sessions.first().map(|s| s.id),
+            selected_id: initial_selected,
             composing: false,
             projects,
             purpose_options,
@@ -140,15 +202,35 @@ impl SessionsView {
             bootstrap_sessions: Arc::new(Mutex::new(HashSet::new())),
             kickoff_status: SharedString::default(),
             focus_handle: cx.focus_handle(),
-            list_scroll_handle: ScrollHandle::new(),
+            session_list_state,
+            _session_list_subscription,
             workspace: None,
+            workspace_visible: false,
+            workspace_return_target: WorkspaceReturnTarget::SessionsList,
+            task_list_context: None,
+            in_flight_by_session: HashMap::new(),
             _workspace_subscription: None,
             pending_bootstrap_prompt: None,
+            app_nav: AppNavMenu::default(),
         }
     }
 
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
+    }
+
+    pub fn close_app_nav(&mut self, cx: &mut App) {
+        self.app_nav.close();
+        if let Some(workspace) = &self.workspace {
+            workspace.update(cx, |view, _| view.close_app_nav());
+        }
+    }
+
+    fn hide_workspace(&mut self, cx: &mut Context<Self>) {
+        self.workspace_visible = false;
+        self.reload();
+        self.kickoff_status = SharedString::default();
+        cx.notify();
     }
 
     fn reload(&mut self) {
@@ -189,37 +271,79 @@ impl SessionsView {
         }
     }
 
-    fn set_filter(&mut self, filter: SessionFilter, cx: &mut Context<Self>) {
+    fn sync_session_list_items(&mut self, cx: &mut Context<Self>) {
+        let visible = filter_sessions(&self.sessions, self.filter);
+        let selected = self.selected_id;
+        self.session_list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(visible);
+            if let Some(id) = selected {
+                let _ = state.delegate_mut().select_by_id(id);
+            } else {
+                state.delegate_mut().clear_selected_index();
+            }
+            cx.notify();
+        });
+    }
+
+    fn sync_session_list_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        scroll: bool,
+    ) {
+        let visible = filter_sessions(&self.sessions, self.filter);
+        let selected = self.selected_id;
+        self.session_list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(visible);
+            let ix = selected
+                .and_then(|id| state.delegate().index_of_id(id))
+                .map(IndexPath::new);
+            state.set_selected_index(ix, window, cx);
+            if scroll && ix.is_some() {
+                state.scroll_to_selected_item(window, cx);
+            }
+        });
+    }
+
+    fn set_filter(&mut self, filter: SessionFilter, window: &mut Window, cx: &mut Context<Self>) {
         self.filter = filter;
         self.ensure_selection();
+        self.sync_session_list_selection(window, cx, true);
         cx.notify();
     }
 
-    fn select_session(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.selected_id = Some(id);
-        cx.notify();
-    }
-
-    fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let ids = self.visible_session_ids();
-        if ids.is_empty() {
+    fn move_selection(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.session_list_state.read(cx).delegate().items().len();
+        if count == 0 {
             return;
         }
-        let current = ids
-            .iter()
-            .position(|id| Some(*id) == self.selected_id)
+        let current = self
+            .selected_id
+            .and_then(|id| self.session_list_state.read(cx).delegate().index_of_id(id))
             .unwrap_or(0);
         let new_idx = if delta < 0 {
             current.saturating_sub((-delta) as usize)
         } else {
-            (current + delta as usize).min(ids.len() - 1)
+            (current + delta as usize).min(count - 1)
         };
         if new_idx == current {
             return;
         }
-        self.selected_id = Some(ids[new_idx]);
-        self.list_scroll_handle.scroll_to_item(new_idx);
-        cx.notify();
+        let id = self
+            .session_list_state
+            .read(cx)
+            .delegate()
+            .items()
+            .get(new_idx)
+            .map(|s| s.id);
+        if let Some(id) = id {
+            self.selected_id = Some(id);
+            self.session_list_state.update(cx, |state, cx| {
+                state.set_selected_index(Some(IndexPath::new(new_idx)), window, cx);
+                state.scroll_to_selected_item(window, cx);
+            });
+            cx.notify();
+        }
     }
 
     fn toggle_compose(&mut self, cx: &mut Context<Self>) {
@@ -323,6 +447,7 @@ impl SessionsView {
                 self.composing = false;
                 self.reload();
                 self.selected_id = Some(session.id);
+                self.sync_session_list_items(cx);
                 self.start_researcher_bootstrap(session, entity_path);
                 cx.notify();
             }
@@ -333,11 +458,276 @@ impl SessionsView {
         }
     }
 
+    /// Open an active interview for `entity_path` + base `phase`, or insert a new
+    /// session, start researcher bootstrap, and open the workspace.
+    pub fn open_or_kickoff_for_entity(
+        &mut self,
+        entity_path: PathBuf,
+        phase: &str,
+        entity_label: &str,
+        phase_label: &str,
+        task_list_context: Option<TaskListProceedContext>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entity_path = entity_path
+            .canonicalize()
+            .unwrap_or_else(|_| entity_path.clone());
+        let storage_key = crate::interview::config::path_for_storage(&entity_path);
+        let wanted_base = crate::interview::config::base_interview_phase(phase);
+
+        self.reload();
+
+        // Never leave another task's interview on screen while we resolve this one.
+        self.hide_workspace_if_other_entity(&entity_path, cx);
+
+        self.workspace_return_target = WorkspaceReturnTarget::TaskList;
+        self.task_list_context = task_list_context;
+
+        let existing = self.find_best_session_for_entity(&storage_key, &entity_path, wanted_base);
+
+        if let Some(session) = existing {
+            // Discard mock-agent fixtures so task-list jump always talks to the real researcher.
+            if Self::session_is_mock_scaffold(&session) {
+                let _ = self
+                    .store
+                    .set_status(session.id, InterviewSessionStatus::Archived);
+                self.reload();
+                tracing::info!(
+                    event = "interview",
+                    action = "archive_mock_scaffold",
+                    session_id = session.id,
+                    "archived mock interview session; kicking off fresh"
+                );
+            } else {
+                let mut session = session;
+                if session.status != InterviewSessionStatus::Active {
+                    let _ = self
+                        .store
+                        .set_status(session.id, InterviewSessionStatus::Active);
+                    self.reload();
+                    session = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == session.id)
+                        .cloned()
+                        .unwrap_or(session);
+                }
+                self.selected_id = Some(session.id);
+                self.sync_session_list_items(cx);
+                self.kickoff_status = format!("Opened: {}", session.display_name).into();
+                // Task-list jump: auto-bootstrap unbound sessions (same as new kickoff).
+                // Do not leave the user on the session list behind a setup toast.
+                if Self::session_needs_bootstrap(&session) {
+                    let Some(cwd) = Self::entity_cwd(&session) else {
+                        self.kickoff_status =
+                            "Cannot set up interview: the session has no project or task path."
+                                .into();
+                        cx.notify();
+                        return;
+                    };
+                    self.start_researcher_bootstrap(session.clone(), cwd);
+                }
+                self.open_workspace(session, window, cx);
+                cx.notify();
+                return;
+            }
+        }
+
+        let display_name = format!("{entity_label} — {phase_label}");
+        match self.store.insert_session_with_metadata(
+            NewInterviewSession {
+                display_name: display_name.clone(),
+                entity_path: storage_key,
+                phase: phase.to_string(),
+            },
+            InterviewSessionStatus::Active,
+        ) {
+            Ok(session) => {
+                self.kickoff_status = format!("Kickoff started: {display_name}").into();
+                self.reload();
+                self.selected_id = Some(session.id);
+                self.sync_session_list_items(cx);
+                self.start_researcher_bootstrap(session.clone(), entity_path);
+                self.open_workspace(session, window, cx);
+                cx.notify();
+            }
+            Err(err) => {
+                self.kickoff_status = format!("Failed to create session: {err}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    fn entity_paths_equal(stored: &str, storage_key: &str, entity_path: &Path) -> bool {
+        let stored_path = PathBuf::from(stored);
+        stored.eq_ignore_ascii_case(storage_key)
+            || crate::interview::config::paths_match(&stored_path, entity_path)
+    }
+
+    fn session_matches_entity_phase(
+        session: &InterviewSession,
+        storage_key: &str,
+        entity_path: &Path,
+        wanted_base: &str,
+    ) -> bool {
+        let Some(stored) = session.entity_path.as_deref() else {
+            return false;
+        };
+        if !Self::entity_paths_equal(stored, storage_key, entity_path) {
+            return false;
+        }
+        let session_base = session
+            .phase
+            .as_deref()
+            .map(crate::interview::config::base_interview_phase)
+            .unwrap_or("");
+        wanted_base.is_empty() || session_base == wanted_base
+    }
+
+    /// Open question files still on disk for this session (0 if unbound / unreadable).
+    fn session_open_question_count(session: &InterviewSession) -> usize {
+        let Some(cfg_path) = session
+            .config_path
+            .as_ref()
+            .map(Path::new)
+            .filter(|p| p.exists())
+        else {
+            return 0;
+        };
+        let Ok(config) = crate::interview::config::parse_interview_config(cfg_path) else {
+            return 0;
+        };
+        crate::interview::queue::load_queue_dir(&config.queue)
+            .map(|q| q.len())
+            .unwrap_or(0)
+    }
+
+    /// Pick the interview to open for this task — never prefer an empty `complete`
+    /// session over one that still has open questions (or over starting fresh).
+    fn find_best_session_for_entity(
+        &self,
+        storage_key: &str,
+        entity_path: &Path,
+        wanted_base: &str,
+    ) -> Option<InterviewSession> {
+        let matches: Vec<&InterviewSession> = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                Self::session_matches_entity_phase(s, storage_key, entity_path, wanted_base)
+            })
+            .collect();
+        if matches.is_empty() {
+            return None;
+        }
+
+        // 1) Any session (incl. archived) that still has open questions — newest wins.
+        if let Some(session) = matches
+            .iter()
+            .filter(|s| Self::session_open_question_count(s) > 0)
+            .max_by_key(|s| {
+                (
+                    s.status == InterviewSessionStatus::Active,
+                    Self::session_open_question_count(s),
+                    s.id,
+                )
+            })
+        {
+            return Some((*session).clone());
+        }
+
+        // 2) Active unbound — bootstrap still needed / in progress.
+        if let Some(session) = matches
+            .iter()
+            .filter(|s| {
+                s.status == InterviewSessionStatus::Active && Self::session_needs_bootstrap(s)
+            })
+            .max_by_key(|s| s.id)
+        {
+            return Some((*session).clone());
+        }
+
+        // 3) Other Active (bound but empty) — allow replenish.
+        if let Some(session) = matches
+            .iter()
+            .filter(|s| s.status == InterviewSessionStatus::Active)
+            .max_by_key(|s| s.id)
+        {
+            return Some((*session).clone());
+        }
+
+        // 4) Complete with empty queue — reopen finished workspace (do not re-kickoff).
+        if let Some(session) = matches
+            .iter()
+            .filter(|s| {
+                s.status == InterviewSessionStatus::Complete
+                    && Self::session_open_question_count(s) == 0
+            })
+            .max_by_key(|s| s.id)
+        {
+            return Some((*session).clone());
+        }
+
+        // Archived / other terminal sessions with empty queues: start fresh kickoff.
+        None
+    }
+
+    fn hide_workspace_if_other_entity(&mut self, entity_path: &Path, cx: &App) {
+        let Some(workspace) = self.workspace.as_ref() else {
+            return;
+        };
+        let other = {
+            let session = workspace.read(cx).interview_session();
+            let Some(stored) = session.entity_path.as_deref() else {
+                return;
+            };
+            !crate::interview::config::paths_match(Path::new(stored), entity_path)
+        };
+        if other {
+            self.stash_workspace_in_flight(cx);
+            self.workspace = None;
+            self.workspace_visible = false;
+            self._workspace_subscription = None;
+        }
+    }
+
     fn session_needs_bootstrap(session: &InterviewSession) -> bool {
         !session
             .config_path
             .as_ref()
             .is_some_and(|p| Path::new(p).exists())
+    }
+
+    /// True when scaffolding was produced by `--agent mock` (fixtures), not a real researcher.
+    fn session_is_mock_scaffold(session: &InterviewSession) -> bool {
+        if session
+            .session_id
+            .as_deref()
+            .is_some_and(|s| s.contains("interview-interview"))
+        {
+            return true;
+        }
+        let Some(cfg_path) = session.config_path.as_ref().map(Path::new) else {
+            return false;
+        };
+        let Ok(config) = crate::interview::config::parse_interview_config(cfg_path) else {
+            return false;
+        };
+        if std::fs::read_to_string(&config.transcript)
+            .map(|t| t.contains("# Mock interview") || t.contains("mock-bootstrap"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let Ok(entries) = std::fs::read_dir(&config.queue) else {
+            return false;
+        };
+        entries.flatten().take(8).any(|entry| {
+            std::fs::read_to_string(entry.path())
+                .map(|c| c.contains("mock-bootstrap") || c.contains("Mock MC question"))
+                .unwrap_or(false)
+        })
     }
 
     fn bootstrap_in_flight(&self, session_id: i64) -> bool {
@@ -484,28 +874,30 @@ impl SessionsView {
         std::thread::spawn(move || {
             struct BootstrapGuard {
                 sessions: Arc<Mutex<HashSet<i64>>>,
+                gate: BootstrapGate,
                 session_id: i64,
             }
             impl Drop for BootstrapGuard {
                 fn drop(&mut self) {
-                    self.sessions
-                        .lock()
-                        .expect("bootstrap sessions lock")
-                        .remove(&self.session_id);
+                    let remaining = {
+                        let mut sessions = self.sessions.lock().expect("bootstrap sessions lock");
+                        sessions.remove(&self.session_id);
+                        sessions.len()
+                    };
+                    self.gate.store(remaining > 0, Ordering::SeqCst);
                 }
             }
             let _bootstrap_guard = BootstrapGuard {
                 sessions: bootstrap_sessions,
+                gate: bootstrap_gate,
                 session_id,
             };
-            let clear_gate = || bootstrap_gate.store(false, Ordering::SeqCst);
             let repo_root = store_paths.repo_root().to_path_buf();
             let handle = {
                 let mut provider = agent.lock().expect("agent lock");
                 provider.start_researcher_replenishment(cwd, prompt)
             };
             let Ok(handle) = handle else {
-                clear_gate();
                 tracing::error!(
                     event = "interview",
                     action = "bootstrap_start_failed",
@@ -545,8 +937,8 @@ impl SessionsView {
                             ?state,
                             "bootstrap ACP run left InFlight"
                         );
-                        // Allow workspace replenishment only after the bootstrap ACP exits.
-                        clear_gate();
+                        // Keep bootstrap_sessions membership until this thread exits so the
+                        // workspace does not emit NeedsBootstrap before disk sync binds.
                     }
                 }
 
@@ -624,7 +1016,6 @@ impl SessionsView {
                 std::thread::sleep(Duration::from_millis(500));
             }
 
-            clear_gate();
             if !synced {
                 tracing::error!(
                     event = "interview",
@@ -640,7 +1031,7 @@ impl SessionsView {
         });
     }
 
-    fn archive_selected(&mut self, cx: &mut Context<Self>) {
+    fn archive_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.selected_session() {
             if session.status != InterviewSessionStatus::Archived {
                 let _ = self
@@ -648,6 +1039,7 @@ impl SessionsView {
                     .set_status(session.id, InterviewSessionStatus::Archived);
                 self.reload();
                 self.ensure_selection();
+                self.sync_session_list_selection(window, cx, true);
                 cx.notify();
             }
         }
@@ -655,6 +1047,8 @@ impl SessionsView {
 
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.selected_session().cloned() {
+            self.workspace_return_target = WorkspaceReturnTarget::SessionsList;
+            self.task_list_context = None;
             if self.should_prompt_bootstrap(&session) {
                 self.prompt_bootstrap_setup(session, window, cx);
             } else {
@@ -677,19 +1071,69 @@ impl SessionsView {
             .cloned()
             .unwrap_or(session);
         if self.should_prompt_bootstrap(&session) {
+            // Do not leave a different task's workspace visible behind the toast.
+            if let Some(entity) = session.entity_path.as_deref() {
+                self.hide_workspace_if_other_entity(Path::new(entity), cx);
+            } else if self.workspace.is_some() {
+                self.stash_workspace_in_flight(cx);
+                self.workspace = None;
+                self.workspace_visible = false;
+                self._workspace_subscription = None;
+            }
             self.prompt_bootstrap_setup(session, window, cx);
             return;
         }
-        let agent = self.agent.clone();
-        let bootstrap_gate = self.bootstrap_gate.clone();
-        let workspace = cx.new(|cx| WorkspaceView::new(session, window, cx, agent, bootstrap_gate));
-        let subscription = cx.subscribe(&workspace, |this, workspace, event, cx| match event {
-            WorkspaceEvent::BackToSessions => {
-                this.workspace = None;
-                this._workspace_subscription = None;
-                this.reload();
-                this.kickoff_status = SharedString::default();
+
+        // Reuse the cached workspace for this session so submitted-in-flight
+        // questions stay pending across Back → Open (req 7).
+        if let Some(existing) = self.workspace.as_ref() {
+            if existing.read(cx).interview_session().id == session.id {
+                self.workspace_visible = true;
+                self.kickoff_status = SharedString::default();
+                existing.update(cx, |view, cx| {
+                    view.set_task_list_proceed(self.task_list_context.clone());
+                    cx.focus_self(window);
+                });
                 cx.notify();
+                return;
+            }
+        }
+
+        self.stash_workspace_in_flight(cx);
+
+        let restored = self.in_flight_by_session.remove(&session.id);
+        let agent = self.agent.clone();
+        let bootstrap_sessions = self.bootstrap_sessions.clone();
+        let task_list_proceed = self.task_list_context.clone();
+        let workspace = cx.new(|cx| {
+            WorkspaceView::new(
+                session,
+                window,
+                cx,
+                agent,
+                bootstrap_sessions,
+                restored,
+                task_list_proceed,
+            )
+        });
+        let subscription = cx.subscribe(&workspace, |this, workspace, event, cx| match event {
+            WorkspaceEvent::NavigateBack => match this.workspace_return_target {
+                WorkspaceReturnTarget::TaskList => {
+                    this.hide_workspace(cx);
+                    cx.emit(SessionsEvent::ReturnToTaskList);
+                }
+                WorkspaceReturnTarget::SessionsList => {
+                    this.hide_workspace(cx);
+                }
+            },
+            WorkspaceEvent::ProceedToLifecycle => {
+                if let Some(ctx) = this.task_list_context.clone() {
+                    this.hide_workspace(cx);
+                    cx.emit(SessionsEvent::ProceedToLifecycle {
+                        task_id: ctx.task_id,
+                        lifecycle: ctx.lifecycle,
+                    });
+                }
             }
             WorkspaceEvent::SessionComplete => {
                 this.reload();
@@ -697,7 +1141,9 @@ impl SessionsView {
             }
             WorkspaceEvent::NeedsBootstrap => {
                 let session = workspace.read(cx).interview_session().clone();
+                this.stash_workspace_in_flight(cx);
                 this.workspace = None;
+                this.workspace_visible = false;
                 this._workspace_subscription = None;
                 this.reload();
                 this.pending_bootstrap_prompt = Some(session);
@@ -705,12 +1151,45 @@ impl SessionsView {
             }
         });
         self.workspace = Some(workspace.clone());
+        self.workspace_visible = true;
         self._workspace_subscription = Some(subscription);
         self.kickoff_status = SharedString::default();
         workspace.update(cx, |_, cx| {
             cx.focus_self(window);
         });
         cx.notify();
+    }
+
+    fn stash_workspace_in_flight(&mut self, cx: &App) {
+        let Some(workspace) = self.workspace.take() else {
+            return;
+        };
+        let (session_id, state) = {
+            let view = workspace.read(cx);
+            (view.interview_session().id, view.export_in_flight_state())
+        };
+        self._workspace_subscription = None;
+        if !state.is_empty() {
+            self.in_flight_by_session.insert(session_id, state);
+        } else {
+            self.in_flight_by_session.remove(&session_id);
+        }
+    }
+}
+
+impl EventEmitter<SessionsEvent> for SessionsView {}
+
+impl HasAppNav for SessionsView {
+    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
+        &mut self.app_nav
+    }
+
+    fn app_nav_current(&self) -> Option<AppDestination> {
+        None
+    }
+
+    fn app_nav_fallback_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -728,75 +1207,51 @@ impl Render for SessionsView {
             }
         }
 
-        if let Some(workspace) = &self.workspace {
-            // Absolute fill gives Workspace a definite width/height. Without this,
-            // percentage `w_full` on the three-column row stayed indefinite, the row
-            // sized to content, and the response column was clipped on the right.
-            return div()
-                .relative()
-                .size_full()
-                .w_full()
-                .h_full()
-                .min_w_0()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .w_full()
-                        .h_full()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .child(workspace.clone()),
-                );
+        if self.workspace_visible {
+            if let Some(workspace) = &self.workspace {
+                // Absolute fill gives Workspace a definite width/height. Without this,
+                // percentage `w_full` on the three-column row stayed indefinite, the row
+                // sized to content, and the response column was clipped on the right.
+                return div()
+                    .relative()
+                    .size_full()
+                    .w_full()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .w_full()
+                            .h_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(workspace.clone()),
+                    );
+            }
         }
 
         self.ensure_selection();
+        self.sync_session_list_items(cx);
 
         let background = cx.theme().background;
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let visible: Vec<InterviewSession> = self
-            .sessions
-            .iter()
-            .filter(|session| match self.filter {
-                SessionFilter::Active => session.status != InterviewSessionStatus::Archived,
-                SessionFilter::Archive => session.status == InterviewSessionStatus::Archived,
-            })
-            .cloned()
-            .collect();
-        let selected = visible
-            .iter()
-            .find(|s| Some(s.id) == self.selected_id)
-            .or_else(|| visible.first());
-        let archived_selected =
-            selected.is_some_and(|s| s.status == InterviewSessionStatus::Archived);
+        let selected = self.selected_session().cloned();
+        let archived_selected = selected
+            .as_ref()
+            .is_some_and(|s| s.status == InterviewSessionStatus::Archived);
+        let none_selected = selected.is_none();
 
-        let scroll_handle = &self.list_scroll_handle;
-        let mut scroll_content = div()
-            .id("session-list-scroll")
-            .flex()
-            .flex_col()
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(scroll_handle);
-        for session in &visible {
-            scroll_content = scroll_content.child(session_row(
-                cx,
-                session,
-                selected.is_some_and(|s| s.id == session.id),
-                muted,
-            ));
-        }
         let list = div()
             .relative()
             .flex_1()
             .min_h_0()
-            .child(scroll_content)
-            .vertical_scrollbar(scroll_handle);
+            .child(List::new(&self.session_list_state).size_full());
 
         let mut root = div()
             .v_flex()
@@ -804,12 +1259,12 @@ impl Render for SessionsView {
             .bg(background)
             .key_context(SESSIONS_CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &SessionMoveUp, _, cx| {
-                this.move_selection(-1, cx);
+            .on_action(cx.listener(|this, _: &ListArrowUp, window, cx| {
+                this.move_selection(-1, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SessionMoveDown, _, cx| {
-                this.move_selection(1, cx);
+            .on_action(cx.listener(|this, _: &ListArrowDown, window, cx| {
+                this.move_selection(1, window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &SessionOpen, window, cx| {
@@ -822,12 +1277,12 @@ impl Render for SessionsView {
                 this.cancel_compose_action(cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SessionFilterActive, _, cx| {
-                this.set_filter(SessionFilter::Active, cx);
+            .on_action(cx.listener(|this, _: &SessionFilterActive, window, cx| {
+                this.set_filter(SessionFilter::Active, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SessionFilterArchive, _, cx| {
-                this.set_filter(SessionFilter::Archive, cx);
+            .on_action(cx.listener(|this, _: &SessionFilterArchive, window, cx| {
+                this.set_filter(SessionFilter::Archive, window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &SessionLaunch, _, cx| {
@@ -835,7 +1290,8 @@ impl Render for SessionsView {
                     this.launch_interview(cx);
                 }
             }))
-            .child(header_bar(cx, self.filter, self.composing))
+            .on_action(cx.listener(on_app_nav_toggle::<Self>))
+            .child(header_bar(self, window, cx, self.filter, self.composing))
             .child(list);
 
         if self.composing {
@@ -857,7 +1313,7 @@ impl Render for SessionsView {
             border,
             archived_selected,
             &self.kickoff_status,
-            selected.is_none(),
+            none_selected,
         ))
         .on_mouse_down(
             gpui::MouseButton::Left,
@@ -869,11 +1325,14 @@ impl Render for SessionsView {
 }
 
 fn header_bar(
+    view: &mut SessionsView,
+    window: &mut Window,
     cx: &mut Context<SessionsView>,
     filter: SessionFilter,
     composing: bool,
 ) -> impl IntoElement {
-    let theme = cx.theme();
+    let theme = cx.theme().clone();
+    let foreground = theme.foreground;
     // Same layout pattern as shell tab_bar (div().h_flex() + styled_tab) — the
     // gpui_component h_flex + min_w_0 + overflow_hidden combination painted an
     // empty strip with no Active/Archive/New controls.
@@ -888,26 +1347,27 @@ fn header_bar(
         .border_b_1()
         .border_color(theme.border)
         .bg(theme.background)
+        .child(view.render_app_nav(window, cx))
         .child(
             div()
                 .px_2()
                 .py_2()
                 .text_sm()
                 .font_semibold()
-                .text_color(theme.foreground)
+                .text_color(foreground)
                 .child("Interview sessions"),
         )
         .child(filter_tab(
             cx,
             "Active",
             filter == SessionFilter::Active,
-            |this, _, _, cx| this.set_filter(SessionFilter::Active, cx),
+            |this, _, window, cx| this.set_filter(SessionFilter::Active, window, cx),
         ))
         .child(filter_tab(
             cx,
             "Archive",
             filter == SessionFilter::Archive,
-            |this, _, _, cx| this.set_filter(SessionFilter::Archive, cx),
+            |this, _, window, cx| this.set_filter(SessionFilter::Archive, window, cx),
         ))
         .child(
             Button::new("new-interview")
@@ -958,8 +1418,8 @@ fn footer_bar(
                     Button::new("archive-session")
                         .label("Archive")
                         .disabled(none_selected || archived_selected)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.archive_selected(cx);
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.archive_selected(window, cx);
                         })),
                 )
                 .child(
@@ -1100,36 +1560,15 @@ fn picker_row(
         )
 }
 
-fn session_row(
-    cx: &mut Context<SessionsView>,
-    session: &InterviewSession,
-    selected: bool,
-    muted: gpui::Hsla,
-) -> impl IntoElement {
-    let status = match session.status {
-        InterviewSessionStatus::Active => "Active",
-        InterviewSessionStatus::Archived => "Archived",
-        InterviewSessionStatus::Complete => "Complete",
-    };
-    let entity_label = session.entity_path.as_deref().unwrap_or("—");
-    let updated = format_updated(session.updated_at);
-    let meta = format!("{entity_label} · {status} · {updated}");
-    let view = cx.entity();
-    let session_id = session.id;
-    let display_name = session.display_name.clone();
-
-    ListItem::new(("session-row", session.id as u64))
-        .selected(selected)
-        .on_click(move |_, _, app| {
-            view.update(app, |this, cx| this.select_session(session_id, cx));
+fn filter_sessions(sessions: &[InterviewSession], filter: SessionFilter) -> Vec<InterviewSession> {
+    sessions
+        .iter()
+        .filter(|session| match filter {
+            SessionFilter::Active => session.status != InterviewSessionStatus::Archived,
+            SessionFilter::Archive => session.status == InterviewSessionStatus::Archived,
         })
-        .child(
-            v_flex()
-                .gap_1()
-                .w_full()
-                .child(div().text_sm().font_semibold().child(display_name))
-                .child(div().text_xs().text_color(muted).child(meta)),
-        )
+        .cloned()
+        .collect()
 }
 
 fn filter_tab(
@@ -1169,11 +1608,6 @@ where
         })
         .on_click(cx.listener(on_click))
         .child(label)
-}
-
-fn format_updated(at: DateTime<Utc>) -> String {
-    let local: DateTime<Local> = at.into();
-    format!("Updated {}", local.format("%b %d %H:%M"))
 }
 
 fn task_choices(project: &ProjectTarget) -> Vec<TaskTarget> {

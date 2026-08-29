@@ -92,6 +92,9 @@ pub struct AnswerRecord {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option: Option<String>,
+    /// When the question had `proposed_text`: `false` = Accept as-is; `true` = body is edited text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_changed: Option<bool>,
     /// Free-text body lives after the closing `---`, never in front matter.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub body: String,
@@ -111,6 +114,8 @@ struct AnswerFrontMatter<'a> {
     id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     option: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text_changed: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,7 +125,7 @@ struct ActionFrontMatter<'a> {
 }
 
 /// Serialize one or more answer records into the YAML multi-record payload shape.
-/// Front matter is `id` + optional `option` only; free text follows the closing `---`.
+/// Front matter is `id` + optional `option` + optional `text_changed`; free text follows the closing `---`.
 pub fn format_answer_payload(records: &[AnswerRecord]) -> Result<String> {
     if records.is_empty() {
         bail!("answer payload requires at least one record");
@@ -130,6 +135,7 @@ pub fn format_answer_payload(records: &[AnswerRecord]) -> Result<String> {
         let header = serde_yaml::to_string(&AnswerFrontMatter {
             id: &record.id,
             option: record.option.as_deref(),
+            text_changed: record.text_changed,
         })
         .context("failed to serialize answer front matter")?;
         out.push_str("---\n");
@@ -203,6 +209,7 @@ mod tests {
         let payload = format_answer_payload(&[AnswerRecord {
             id: "q-016".into(),
             option: Some("1".into()),
+            text_changed: None,
             body: "Notes".into(),
         }])
         .unwrap();
@@ -217,6 +224,34 @@ mod tests {
             !before_body.lines().any(|l| l.trim().starts_with("body:")),
             "body must not appear in front matter: {payload}"
         );
+    }
+
+    #[test]
+    fn answer_payload_includes_text_changed_when_set() {
+        let unchanged = format_answer_payload(&[AnswerRecord {
+            id: "q-017".into(),
+            option: Some("1".into()),
+            text_changed: Some(false),
+            body: String::new(),
+        }])
+        .unwrap();
+        assert!(unchanged.contains("text_changed: false"));
+        assert!(!unchanged.contains("Fleet uses"));
+
+        let edited = format_answer_payload(&[AnswerRecord {
+            id: "q-017".into(),
+            option: Some("1".into()),
+            text_changed: Some(true),
+            body: "Fleet uses SQLite.\n".into(),
+        }])
+        .unwrap();
+        assert!(edited.contains("text_changed: true"));
+        assert!(edited.contains("Fleet uses SQLite."));
+        let before_body = edited
+            .split("---\nFleet uses SQLite.")
+            .next()
+            .unwrap_or(&edited);
+        assert!(!before_body.lines().any(|l| l.trim().starts_with("body:")));
     }
 
     #[test]

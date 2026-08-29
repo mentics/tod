@@ -1,6 +1,4 @@
-use crate::interview::agent::{
-    AgentRunState, AnswerProcessorPoolStats, BootstrapGate, RunId, SharedAgent,
-};
+use crate::interview::agent::{AgentRunState, AnswerProcessorPoolStats, RunId, SharedAgent};
 use crate::interview::config::{
     InterviewConfig, parse_interview_config, sync_scaffolding_from_disk,
 };
@@ -16,35 +14,46 @@ use crate::interview::transcript::{
     format_answer_payload,
 };
 use crate::interview::views::deep_dive::{DeepDiveEvent, DeepDiveView};
+use crate::interview::views::question_list::QuestionListDelegate;
 use crate::interview::{
-    InterviewSession, InterviewSessionStatus, SessionStore, TodPaths, TodSettings,
+    InterviewSession, InterviewSessionStatus, SessionStore, TaskListProceedContext, TodPaths,
+    TodSettings,
 };
+use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
+use crate::ui::list::{ListArrowDown, ListArrowUp};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Corner, DismissEvent, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollHandle,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Timer, WeakEntity,
     Window, actions, anchored, div, px,
 };
+use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::list::ListItem;
+use gpui_component::list::{List, ListEvent, ListItem, ListState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Brief red flash before a queue row disappears so removals feel intentional.
+const QUESTION_REMOVAL_FLASH: Duration = Duration::from_millis(500);
 
 struct SubmitAnswerWork {
     question_id: String,
     question_path: PathBuf,
     question_body: String,
-    notes: String,
+    /// Transcript answer text (notes and/or edited proposed text).
+    answer_text: String,
     mc: Option<String>,
+    text_changed: Option<bool>,
+    /// Answer-processor body (notes when unchanged; full edited proposed text when changed).
+    payload_body: String,
     transcript: PathBuf,
     config_path: PathBuf,
     cwd: PathBuf,
@@ -92,7 +101,7 @@ actions!(
         FocusLeft,
         ActivateFocused,
         WorkspaceEscape,
-        BackToSessions,
+        NavigateBack,
         FocusNotes,
     ]
 );
@@ -106,13 +115,16 @@ const OTHER_ACTION_ITEMS: [(&str, &str); 4] = [
     ("deep-dive", "Deep dive"),
 ];
 const LIST_COLUMN_WIDTH: f32 = 160.;
-/// Middle reading pane. Explicit width; response column flexes for remaining width.
+const LIST_COLUMN_MIN: f32 = 120.;
+/// Middle reading pane. Initial width; response column flexes for remaining width.
 const BODY_COLUMN_WIDTH: f32 = 250.;
+const BODY_COLUMN_MIN: f32 = 160.;
+const RESPONSE_COLUMN_MIN: f32 = 200.;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceFocus {
     QuestionList,
-    /// Index into response interactive controls (MC options, then Notes, actions, Submit).
+    /// Index into response interactive controls (MC options, optional proposed text, then Notes, actions, Submit).
     Response(usize),
 }
 
@@ -121,6 +133,47 @@ enum RunKind {
     AnswerProcessor { question_id: String },
     ResearcherReplenish,
     ResearcherAction { question_id: String },
+}
+
+/// Submitted / in-flight question state preserved when a workspace is torn down
+/// (e.g. switching interviews) so reopen still shows those questions as pending.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceInFlightState {
+    pending: HashSet<String>,
+    pending_snapshots: HashMap<String, String>,
+    runs: HashMap<RunId, RunKind>,
+}
+
+impl WorkspaceInFlightState {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.runs.is_empty()
+    }
+
+    /// Keep only ids still present in the queue; drop pending whose file content
+    /// already diverged from the submit-time snapshot (req 7 re-enable).
+    fn pruned_for_queue(mut self, questions: &[QueueQuestion]) -> Self {
+        let mut still_pending = HashSet::new();
+        for id in self.pending.iter() {
+            if let Some(q) = questions.iter().find(|q| &q.id == id) {
+                if let Some(snapshot) = self.pending_snapshots.get(id) {
+                    if file_contents(&q.path).as_deref() != Some(snapshot.as_str()) {
+                        continue;
+                    }
+                }
+                still_pending.insert(id.clone());
+            }
+        }
+        self.pending = still_pending;
+        self.pending_snapshots
+            .retain(|id, _| self.pending.contains(id));
+        // Drop answer/action runs whose question is no longer pending; keep replenish.
+        self.runs.retain(|_, kind| match kind {
+            RunKind::ResearcherReplenish => true,
+            RunKind::AnswerProcessor { question_id }
+            | RunKind::ResearcherAction { question_id } => self.pending.contains(question_id),
+        });
+        self
+    }
 }
 
 #[derive(Debug, Default)]
@@ -194,8 +247,10 @@ fn reopen_complete_with_bound_queue(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEvent {
-    BackToSessions,
+    NavigateBack,
     SessionComplete,
+    /// User chose **Proceed** on the in-place Complete state (task-list origin).
+    ProceedToLifecycle,
     /// Scaffolding never bound and no bootstrap is running — return to list for setup prompt.
     NeedsBootstrap,
 }
@@ -208,13 +263,19 @@ pub struct WorkspaceView {
     questions: Vec<QueueQuestion>,
     pending: HashSet<String>,
     pending_snapshots: HashMap<String, String>,
+    /// Queue ids flashing red before drop; values are snapshots kept in `questions` until finalize.
+    removing: HashSet<String>,
     selected_question_id: Option<String>,
     selected_mc: Option<String>,
     notes_input: Entity<InputState>,
+    proposed_input: Entity<InputState>,
+    /// Question id whose `proposed_text` is currently loaded into `proposed_input`.
+    proposed_loaded_for: Option<String>,
     /// None until session `config_path` / queue is bound — never falls back to repo-root queue.
     queue_watcher: Option<QueueWatcher>,
     agent: SharedAgent,
-    bootstrap_gate: BootstrapGate,
+    /// SQLite session ids with a kickoff bootstrap thread still running.
+    bootstrap_sessions: Arc<Mutex<HashSet<i64>>>,
     runs: HashMap<RunId, RunKind>,
     replenish_state: ReplenishState,
     status_line: SharedString,
@@ -224,9 +285,11 @@ pub struct WorkspaceView {
     _deep_dive_subscription: Option<Subscription>,
     pending_notes_paste: Option<String>,
     focus_handle: FocusHandle,
-    question_list_scroll_handle: ScrollHandle,
+    question_list_state: Entity<ListState<QuestionListDelegate>>,
+    _question_list_subscription: Subscription,
     workspace_focus: WorkspaceFocus,
     notes_editing: bool,
+    proposed_editing: bool,
     /// Open state for the native PopupMenu (not a deferred Popover — menu must
     /// stay in the focus/dispatch tree for SelectUp/SelectDown).
     actions_menu_open: bool,
@@ -236,11 +299,30 @@ pub struct WorkspaceView {
     scaffolding_pending: bool,
     needs_bootstrap_handoff: bool,
     _poll_task: Task<()>,
+    app_nav: AppNavMenu,
+    task_list_proceed: Option<TaskListProceedContext>,
 }
 
 impl WorkspaceView {
+    pub fn close_app_nav(&mut self) {
+        self.app_nav.close();
+    }
+
     pub fn interview_session(&self) -> &InterviewSession {
         &self.session
+    }
+
+    /// Snapshot in-flight submit state for restore after this view is dropped.
+    pub fn export_in_flight_state(&self) -> WorkspaceInFlightState {
+        WorkspaceInFlightState {
+            pending: self.pending.clone(),
+            pending_snapshots: self.pending_snapshots.clone(),
+            runs: self.runs.clone(),
+        }
+    }
+
+    pub fn set_task_list_proceed(&mut self, context: Option<TaskListProceedContext>) {
+        self.task_list_proceed = context;
     }
 
     pub fn new(
@@ -248,7 +330,9 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
         agent: SharedAgent,
-        bootstrap_gate: BootstrapGate,
+        bootstrap_sessions: Arc<Mutex<HashSet<i64>>>,
+        restored_in_flight: Option<WorkspaceInFlightState>,
+        task_list_proceed: Option<TaskListProceedContext>,
     ) -> Self {
         register_workspace_keys(cx);
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
@@ -275,13 +359,48 @@ impl WorkspaceView {
                 (unbound_config(&session, &paths), None, Vec::new(), true)
             };
 
-        let selected_question_id = questions.first().map(|q| q.id.clone());
+        let restored = restored_in_flight
+            .unwrap_or_default()
+            .pruned_for_queue(&questions);
+        let pending = restored.pending;
+        let pending_snapshots = restored.pending_snapshots;
+        let runs = restored.runs;
+
+        let selected_question_id = questions
+            .iter()
+            .find(|q| !pending.contains(&q.id))
+            .or_else(|| questions.first())
+            .map(|q| q.id.clone());
         let notes_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(3)
                 .placeholder("Notes (Enter to edit; Ctrl+Enter to submit)")
         });
+        let proposed_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(5)
+                .placeholder("Proposed durable text (Enter to edit)")
+        });
+        let proposed_loaded_for = selected_question_id.clone().filter(|_| {
+            questions
+                .iter()
+                .find(|q| selected_question_id.as_ref() == Some(&q.id))
+                .and_then(|q| q.proposed_text.as_ref())
+                .is_some()
+        });
+        if let Some(id) = proposed_loaded_for.as_ref() {
+            if let Some(text) = questions
+                .iter()
+                .find(|q| &q.id == id)
+                .and_then(|q| q.proposed_text.clone())
+            {
+                proposed_input.update(cx, |input, cx| {
+                    input.set_value(text, window, cx);
+                });
+            }
+        }
         // H8 / req 18: Complete must not stick over a non-empty bound queue.
         // Reopen Active on open so can_replenish works (same as apply_queue_update /
         // try_bind_bootstrap_scaffolding).
@@ -304,49 +423,109 @@ impl WorkspaceView {
             }
         });
 
-        let bootstrap_in_progress = bootstrap_gate.load(Ordering::SeqCst);
+        let bootstrap_in_progress = bootstrap_sessions
+            .lock()
+            .map(|s| s.contains(&session.id))
+            .unwrap_or(false);
 
-        Self {
+        let initial_selected = selected_question_id.clone();
+        let initial_pending = pending.clone();
+        let delegate = QuestionListDelegate::new(questions.clone());
+        let question_list_state =
+            cx.new(|cx| ListState::new(delegate, window, cx).searchable(false));
+        question_list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_pending(initial_pending);
+            let ix = initial_selected
+                .as_ref()
+                .and_then(|id| state.delegate().index_of_id(id))
+                .map(IndexPath::new);
+            state.set_selected_index(ix, window, cx);
+            if ix.is_some() {
+                state.scroll_to_selected_item(window, cx);
+            }
+        });
+        let _question_list_subscription =
+            cx.subscribe(&question_list_state, |this, state, event, cx| match event {
+                ListEvent::Select(ix) | ListEvent::Confirm(ix) => {
+                    let id = state
+                        .read(cx)
+                        .delegate()
+                        .items()
+                        .get(ix.row)
+                        .map(|q| q.id.clone());
+                    if let Some(id) = id {
+                        this.workspace_focus = WorkspaceFocus::QuestionList;
+                        this.notes_editing = false;
+                        this.proposed_editing = false;
+                        this.select_question_without_window(&id, cx);
+                    }
+                }
+                ListEvent::Cancel => {}
+            });
+
+        let status_line = if scaffolding_pending {
+            if bootstrap_in_progress {
+                "Researcher bootstrap in progress…".into()
+            } else {
+                "Waiting for researcher scaffolding…".into()
+            }
+        } else if !pending.is_empty() {
+            "Waiting for in-flight answers to finish…".into()
+        } else {
+            SharedString::default()
+        };
+
+        let view = Self {
             session,
             config,
             settings,
             store,
             questions,
-            pending: HashSet::new(),
-            pending_snapshots: HashMap::new(),
+            pending,
+            pending_snapshots,
+            removing: HashSet::new(),
             selected_question_id,
             selected_mc: None,
             notes_input,
+            proposed_input,
+            proposed_loaded_for,
             queue_watcher,
             agent,
-            bootstrap_gate,
-            runs: HashMap::new(),
+            bootstrap_sessions,
+            runs,
             replenish_state: ReplenishState::default(),
-            status_line: if scaffolding_pending {
-                if bootstrap_in_progress {
-                    "Researcher bootstrap in progress…".into()
-                } else {
-                    "Waiting for researcher scaffolding…".into()
-                }
-            } else {
-                SharedString::default()
-            },
+            status_line,
             error_banner: None,
             mutations_blocked,
             deep_dive: None,
             _deep_dive_subscription: None,
             pending_notes_paste: None,
             focus_handle: cx.focus_handle().tab_stop(true),
-            question_list_scroll_handle: ScrollHandle::new(),
+            question_list_state,
+            _question_list_subscription,
             workspace_focus: WorkspaceFocus::QuestionList,
             notes_editing: false,
+            proposed_editing: false,
             actions_menu_open: false,
             actions_menu: None,
             _actions_menu_subscription: None,
             scaffolding_pending,
             needs_bootstrap_handoff: false,
             _poll_task: poll_task,
-        }
+            app_nav: AppNavMenu::default(),
+            task_list_proceed,
+        };
+
+        // Prefer List key context so ↑/↓ resolve to ListArrow* while in the question list.
+        cx.defer_in(window, |this, window, cx| {
+            if this.workspace_focus == WorkspaceFocus::QuestionList {
+                this.question_list_state.update(cx, |state, cx| {
+                    state.focus(window, cx);
+                });
+            }
+        });
+
+        view
     }
 
     fn researcher_in_flight(&self) -> usize {
@@ -388,10 +567,17 @@ impl WorkspaceView {
         .into()
     }
 
+    fn session_bootstrap_in_flight(&self) -> bool {
+        self.bootstrap_sessions
+            .lock()
+            .map(|s| s.contains(&self.session.id))
+            .unwrap_or(false)
+    }
+
     fn can_replenish(&self) -> bool {
         self.session.status == InterviewSessionStatus::Active
             && !self.scaffolding_pending
-            && !self.bootstrap_gate.load(Ordering::SeqCst)
+            && !self.session_bootstrap_in_flight()
             && self.queue_watcher.is_some()
             && !self.is_complete()
             && !self.replenish_state.manual_required
@@ -405,6 +591,23 @@ impl WorkspaceView {
             .is_focused(window)
     }
 
+    fn proposed_focused(&self, window: &Window, cx: &App) -> bool {
+        self.proposed_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    fn response_text_editing(&self) -> bool {
+        self.notes_editing || self.proposed_editing
+    }
+
+    fn has_proposed_editor(&self) -> bool {
+        self.selected_question()
+            .and_then(|q| q.proposed_text.as_ref())
+            .is_some_and(|t| !t.trim().is_empty())
+    }
+
     fn clear_validation_banner(&mut self) {
         if self
             .error_banner
@@ -416,7 +619,7 @@ impl WorkspaceView {
     }
 
     /// If kickoff left paths NULL, pick up researcher scaffolding when it appears on disk.
-    fn try_bind_bootstrap_scaffolding(&mut self) -> bool {
+    fn try_bind_bootstrap_scaffolding(&mut self, cx: &mut Context<Self>) -> bool {
         if self
             .session
             .config_path
@@ -458,6 +661,9 @@ impl WorkspaceView {
         self.scaffolding_pending = false;
         self.workspace_focus = WorkspaceFocus::QuestionList;
         self.notes_editing = false;
+        self.proposed_editing = false;
+        self.proposed_loaded_for = None;
+        self.sync_question_list_items(cx);
         if self.session.status == InterviewSessionStatus::Complete && !self.questions.is_empty() {
             if reopen_complete_with_bound_queue(&mut self.session, &self.store, true) {
                 self.mutations_blocked = false;
@@ -479,7 +685,7 @@ impl WorkspaceView {
         if !self.scaffolding_pending {
             return;
         }
-        self.status_line = if self.bootstrap_gate.load(Ordering::SeqCst) {
+        self.status_line = if self.session_bootstrap_in_flight() {
             "Researcher bootstrap in progress…".into()
         } else {
             "Waiting for researcher scaffolding…".into()
@@ -489,14 +695,17 @@ impl WorkspaceView {
     fn poll_runs_and_queue(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
 
-        if self.try_bind_bootstrap_scaffolding() {
+        if self.try_bind_bootstrap_scaffolding(cx) {
             changed = true;
         }
 
         if self.scaffolding_pending {
             self.sync_scaffolding_status_line();
             changed = true;
-            if !self.bootstrap_gate.load(Ordering::SeqCst) && !self.needs_bootstrap_handoff {
+            // Only hand off after THIS session's bootstrap thread exits unbound.
+            // Do not use the shared gate — another session clearing it would close us
+            // mid-flight, and agent_finished clears the gate before disk sync binds.
+            if !self.session_bootstrap_in_flight() && !self.needs_bootstrap_handoff {
                 self.needs_bootstrap_handoff = true;
                 cx.emit(WorkspaceEvent::NeedsBootstrap);
                 changed = true;
@@ -649,9 +858,19 @@ impl WorkspaceView {
                         self.replenish_state.retry_count = 0;
                         self.replenish_state.next_retry_at = None;
                         self.replenish_state.status_idle_since = None;
-                        if self.questions.is_empty() {
-                            self.replenish_state.exhausted = true;
-                            self.status_line = "Researcher returned no further questions".into();
+                        if self.live_question_count() == 0 && self.removing.is_empty() {
+                            // AP may wipe the queue while the researcher is still mid-refill
+                            // (`status: working`). Do not treat that as interview exhausted.
+                            let status =
+                                researcher_status_kind(self.config.researcher_status.as_deref());
+                            if matches!(status, ResearcherStatusKind::Working) {
+                                self.replenish_state.exhausted = false;
+                                self.status_line = "Researcher still filling the queue…".into();
+                            } else {
+                                self.replenish_state.exhausted = true;
+                                self.status_line =
+                                    "Researcher returned no further questions".into();
+                            }
                         } else {
                             self.replenish_state.exhausted = false;
                             self.status_line = "Researcher replenishment succeeded".into();
@@ -704,7 +923,7 @@ impl WorkspaceView {
             }
             self.replenish_state.next_retry_at = None;
         }
-        let open_count = self.questions.len();
+        let open_count = self.live_question_count();
         let in_flight = self.researcher_in_flight();
         let needed = researcher_starts_needed(open_count, in_flight, &self.settings.researcher);
         for _ in 0..needed {
@@ -761,6 +980,18 @@ impl WorkspaceView {
     }
 
     fn apply_queue_update(&mut self, questions: Vec<QueueQuestion>, cx: &mut Context<Self>) {
+        let live_before = self.live_question_count();
+        let new_ids: HashSet<String> = questions.iter().map(|q| q.id.clone()).collect();
+        let disappearing: HashSet<String> = self
+            .questions
+            .iter()
+            .filter(|q| !new_ids.contains(&q.id))
+            .map(|q| q.id.clone())
+            .collect();
+
+        // Resurrect any flash-pending rows that reappeared on disk.
+        self.removing.retain(|id| !new_ids.contains(id));
+
         let mut still_pending = HashSet::new();
         for id in self.pending.iter() {
             if let Some(q) = questions.iter().find(|q| &q.id == id) {
@@ -771,17 +1002,71 @@ impl WorkspaceView {
                 }
                 still_pending.insert(id.clone());
             }
+            // Keep pending while the row is flashing after disk delete.
+            if self.removing.contains(id) || disappearing.contains(id) {
+                still_pending.insert(id.clone());
+            }
         }
         self.pending = still_pending;
         self.pending_snapshots
             .retain(|id, _| self.pending.contains(id));
-        if !questions.is_empty() {
+
+        let previous = std::mem::take(&mut self.questions);
+        let mut merged = Vec::with_capacity(previous.len().max(questions.len()));
+        let mut used_new = HashSet::new();
+        let mut newly_removing = Vec::new();
+
+        for old in previous {
+            if let Some(fresh) = questions.iter().find(|q| q.id == old.id) {
+                used_new.insert(old.id.clone());
+                merged.push(fresh.clone());
+            } else if self.removing.contains(&old.id) {
+                // Still flashing from an earlier update.
+                merged.push(old);
+            } else {
+                // Just disappeared from disk — flash, then drop.
+                newly_removing.push(old.id.clone());
+                self.removing.insert(old.id.clone());
+                merged.push(old);
+            }
+        }
+        for q in &questions {
+            if !used_new.contains(&q.id) {
+                merged.push(q.clone());
+            }
+        }
+        self.questions = merged;
+
+        let live_after = self.live_question_count();
+        if live_after > 0 {
             self.replenish_state.exhausted = false;
             if reopen_complete_with_bound_queue(&mut self.session, &self.store, true) {
                 self.mutations_blocked = false;
             }
+        } else if live_before > 0 && live_after == 0 {
+            // Queue drained under us (typically AP invalidated remaining questions).
+            // Clear exhausted/manual so maybe_start_replenishment can refill.
+            self.replenish_state.exhausted = false;
+            self.replenish_state.manual_required = false;
+            self.replenish_state.retry_count = 0;
+            self.replenish_state.next_retry_at = None;
+            self.status_line = "Queue cleared — requesting researcher refill…".into();
         }
-        self.questions = questions;
+
+        // Selected row departing: lock interaction immediately; keep selection for the flash.
+        if self
+            .selected_question_id
+            .as_ref()
+            .is_some_and(|id| newly_removing.iter().any(|rid| rid == id))
+        {
+            self.notes_editing = false;
+            self.proposed_editing = false;
+            self.actions_menu_open = false;
+            self.actions_menu = None;
+            self._actions_menu_subscription = None;
+        }
+
+        // Keep selection on a departing row so the user sees the red flash + disabled detail.
         if self
             .selected_question_id
             .as_ref()
@@ -790,13 +1075,119 @@ impl WorkspaceView {
             self.selected_question_id = self
                 .questions
                 .iter()
-                .find(|q| !self.pending.contains(&q.id))
+                .find(|q| !self.pending.contains(&q.id) && !self.removing.contains(&q.id))
                 .map(|q| q.id.clone());
             self.reset_response_fields(None, cx);
             if self.selected_question_id.is_none() {
                 self.clear_validation_banner();
             }
         }
+
+        self.sync_question_list_items(cx);
+
+        for id in newly_removing {
+            self.schedule_question_removal_finalize(id, cx);
+        }
+    }
+
+    fn live_question_count(&self) -> usize {
+        self.questions
+            .iter()
+            .filter(|q| !self.removing.contains(&q.id))
+            .count()
+    }
+
+    fn schedule_question_removal_finalize(&mut self, question_id: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            Timer::after(QUESTION_REMOVAL_FLASH).await;
+            let _ = this.update(cx, |this, cx| {
+                this.finalize_question_removal(&question_id, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finalize_question_removal(&mut self, question_id: &str, cx: &mut Context<Self>) {
+        if !self.removing.remove(question_id) {
+            return;
+        }
+        self.pending.remove(question_id);
+        self.pending_snapshots.remove(question_id);
+        self.questions.retain(|q| q.id != question_id);
+
+        if self
+            .selected_question_id
+            .as_ref()
+            .is_some_and(|id| id == question_id)
+        {
+            self.selected_question_id = self
+                .questions
+                .iter()
+                .find(|q| !self.pending.contains(&q.id) && !self.removing.contains(&q.id))
+                .map(|q| q.id.clone());
+            self.reset_response_fields(None, cx);
+            if self.selected_question_id.is_none() {
+                self.clear_validation_banner();
+            }
+        }
+
+        if self.live_question_count() == 0 && self.removing.is_empty() {
+            self.replenish_state.exhausted = false;
+            self.replenish_state.manual_required = false;
+            self.replenish_state.retry_count = 0;
+            self.replenish_state.next_retry_at = None;
+            if self.status_line.is_empty() {
+                self.status_line = "Queue cleared — requesting researcher refill…".into();
+            }
+        }
+
+        self.sync_question_list_items(cx);
+        self.maybe_start_replenishment(cx);
+        cx.notify();
+    }
+
+    fn sync_question_list_items(&mut self, cx: &mut Context<Self>) {
+        let questions = self.questions.clone();
+        let pending = self.pending.clone();
+        let removing = self.removing.clone();
+        let selected_id = self.selected_question_id.clone();
+        self.question_list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(questions);
+            state.delegate_mut().set_pending(pending);
+            state.delegate_mut().set_removing(removing);
+            if let Some(id) = selected_id.as_deref() {
+                let _ = state.delegate_mut().select_by_id(id);
+            } else {
+                state.delegate_mut().clear_selected_index();
+            }
+            cx.notify();
+        });
+    }
+
+    /// Keep ListState selection aligned with workspace selection (needs a Window).
+    fn sync_question_list_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        scroll: bool,
+    ) {
+        let questions = self.questions.clone();
+        let pending = self.pending.clone();
+        let removing = self.removing.clone();
+        let selected_id = self.selected_question_id.clone();
+        self.question_list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(questions);
+            state.delegate_mut().set_pending(pending);
+            state.delegate_mut().set_removing(removing);
+            let ix = selected_id
+                .as_deref()
+                .and_then(|id| state.delegate().index_of_id(id))
+                .map(IndexPath::new);
+            state.set_selected_index(ix, window, cx);
+            if scroll && ix.is_some() {
+                state.scroll_to_selected_item(window, cx);
+            }
+        });
     }
 
     fn is_complete(&self) -> bool {
@@ -837,20 +1228,39 @@ impl WorkspaceView {
         self.selected_question_id = Some(id.to_string());
         self.reset_response_fields(Some(window), cx);
         self.clear_validation_banner();
-        if let Some(idx) = self.questions.iter().position(|q| q.id == id) {
-            self.question_list_scroll_handle.scroll_to_item(idx);
-        }
+        self.sync_question_list_selection(window, cx, true);
         cx.notify();
     }
 
-    fn move_question_selection(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_question_without_window(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self
+            .selected_question_id
+            .as_ref()
+            .is_some_and(|current| current == id)
+        {
+            return;
+        }
+        self.selected_question_id = Some(id.to_string());
+        self.reset_response_fields(None, cx);
+        self.clear_validation_banner();
+        self.sync_question_list_items(cx);
+        cx.notify();
+    }
+
+    fn move_question_list_by(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
         if self.questions.is_empty() {
             return;
         }
         let current = self
-            .selected_question_id
-            .as_ref()
-            .and_then(|id| self.questions.iter().position(|q| &q.id == id))
+            .question_list_state
+            .read(cx)
+            .selected_index()
+            .map(|ix| ix.row)
+            .or_else(|| {
+                self.selected_question_id
+                    .as_ref()
+                    .and_then(|id| self.questions.iter().position(|q| &q.id == id))
+            })
             .unwrap_or(0);
         let new_idx = if delta < 0 {
             current.saturating_sub((-delta) as usize)
@@ -860,11 +1270,8 @@ impl WorkspaceView {
         if new_idx == current {
             return;
         }
-        self.selected_question_id = Some(self.questions[new_idx].id.clone());
-        self.reset_response_fields(Some(window), cx);
-        self.clear_validation_banner();
-        self.question_list_scroll_handle.scroll_to_item(new_idx);
-        cx.notify();
+        let id = self.questions[new_idx].id.clone();
+        self.select_question(&id, window, cx);
     }
 
     fn reset_response_fields(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -872,14 +1279,19 @@ impl WorkspaceView {
         self.actions_menu_open = false;
         self.actions_menu = None;
         self._actions_menu_subscription = None;
-        let should_unfocus = window
-            .as_ref()
-            .is_some_and(|window| self.notes_editing || self.notes_focused(window, cx));
+        let should_unfocus = window.as_ref().is_some_and(|window| {
+            self.response_text_editing()
+                || self.notes_focused(window, cx)
+                || self.proposed_focused(window, cx)
+        });
         self.notes_editing = false;
+        self.proposed_editing = false;
+        self.proposed_loaded_for = None;
         if let Some(window) = window {
             self.notes_input.update(cx, |input, cx| {
                 input.set_value("", window, cx);
             });
+            self.sync_proposed_input(window, cx);
             if should_unfocus {
                 self.focus_handle.focus(window);
             }
@@ -889,8 +1301,33 @@ impl WorkspaceView {
         }
     }
 
+    /// Load `proposed_text` for the selected question into the editor (or clear it).
+    fn sync_proposed_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.selected_question_id.clone();
+        if self.proposed_loaded_for == id {
+            return;
+        }
+        let text = self
+            .selected_question()
+            .and_then(|q| q.proposed_text.clone())
+            .unwrap_or_default();
+        self.proposed_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+        });
+        self.proposed_loaded_for = id;
+    }
+
     fn is_question_pending(&self, id: &str) -> bool {
         self.pending.contains(id)
+    }
+
+    fn is_question_removing(&self, id: &str) -> bool {
+        self.removing.contains(id)
+    }
+
+    /// Pending or departing — response controls must not accept input.
+    fn is_question_locked(&self, id: &str) -> bool {
+        self.is_question_pending(id) || self.is_question_removing(id)
     }
 
     fn can_mutate(&self) -> bool {
@@ -910,10 +1347,11 @@ impl WorkspaceView {
             cx.notify();
             return;
         };
-        if self.is_question_pending(&question.id) {
+        if self.is_question_locked(&question.id) {
             return;
         }
         let notes = self.notes_input.read(cx).value().to_string();
+        let proposed_edited = self.proposed_input.read(cx).value().to_string();
         let mc = self.selected_mc.clone();
         if notes.trim().is_empty() && mc.is_none() {
             self.error_banner = Some("Enter notes and/or select an MC option".into());
@@ -921,12 +1359,20 @@ impl WorkspaceView {
             return;
         }
 
+        let (text_changed, payload_body, answer_text) = build_proposed_answer_parts(
+            question.proposed_text.as_deref(),
+            &proposed_edited,
+            &notes,
+        );
+
         let work = SubmitAnswerWork {
             question_id: question.id.clone(),
             question_path: question.path.clone(),
-            question_body: question.body.clone(),
-            notes: notes.trim().to_string(),
+            question_body: question.display_body(),
+            answer_text,
             mc,
+            text_changed,
+            payload_body,
             transcript: self.config.transcript.clone(),
             config_path: self.config.config_path.clone(),
             cwd: self.config.entity.clone(),
@@ -992,7 +1438,7 @@ impl WorkspaceView {
         let Some(question) = self.selected_question().cloned() else {
             return;
         };
-        if self.is_question_pending(&question.id) {
+        if self.is_question_locked(&question.id) {
             return;
         }
         let notes = self.notes_input.read(cx).value().to_string();
@@ -1001,7 +1447,7 @@ impl WorkspaceView {
             question_path: question.path.clone(),
             action: action.to_string(),
             notes: notes.trim().to_string(),
-            question_body: question.body.clone(),
+            question_body: question.display_body(),
             transcript: self.config.transcript.clone(),
             config_path: self.config.config_path.clone(),
             cwd: self.config.entity.clone(),
@@ -1062,11 +1508,11 @@ impl WorkspaceView {
         for offset in 0..self.questions.len() {
             let idx = (start + offset) % self.questions.len();
             let q = &self.questions[idx];
-            if !self.pending.contains(&q.id) {
+            if !self.pending.contains(&q.id) && !self.removing.contains(&q.id) {
                 self.selected_question_id = Some(q.id.clone());
                 self.reset_response_fields(window, cx);
                 self.clear_validation_banner();
-                self.question_list_scroll_handle.scroll_to_item(idx);
+                self.sync_question_list_items(cx);
                 return;
             }
         }
@@ -1074,11 +1520,12 @@ impl WorkspaceView {
         self.selected_question_id = None;
         self.reset_response_fields(window, cx);
         self.clear_validation_banner();
+        self.sync_question_list_items(cx);
     }
 
     fn on_digit_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Only Notes *edit mode* suppresses digit MC submit (req 21.6) — not mere focus.
-        if self.notes_editing {
+        // Text edit mode suppresses digit MC submit (req 21.6 / 22.7a) — not mere focus.
+        if self.response_text_editing() {
             cx.propagate();
             return;
         }
@@ -1087,9 +1534,6 @@ impl WorkspaceView {
     }
 
     fn submit_mc_option(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.notes_editing {
-            return;
-        }
         if !self.can_mutate() {
             return;
         }
@@ -1109,13 +1553,27 @@ impl WorkspaceView {
             .selected_question()
             .map(|q| q.options.len())
             .unwrap_or(0);
-        mc + 3 // Notes, Other action, Submit
+        let proposed = if self.has_proposed_editor() { 1 } else { 0 };
+        mc + proposed + 3 // Notes, Other action, Submit
+    }
+
+    fn proposed_stop_index(&self) -> Option<usize> {
+        if !self.has_proposed_editor() {
+            return None;
+        }
+        Some(
+            self.selected_question()
+                .map(|q| q.options.len())
+                .unwrap_or(0),
+        )
     }
 
     fn notes_stop_index(&self) -> usize {
-        self.selected_question()
+        let mc = self
+            .selected_question()
             .map(|q| q.options.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        mc + if self.has_proposed_editor() { 1 } else { 0 }
     }
 
     fn actions_stop_index(&self) -> usize {
@@ -1131,7 +1589,7 @@ impl WorkspaceView {
             || self
                 .selected_question_id
                 .as_deref()
-                .is_some_and(|id| self.is_question_pending(id))
+                .is_some_and(|id| self.is_question_locked(id))
             || self.selected_question().is_none()
     }
 
@@ -1160,35 +1618,12 @@ impl WorkspaceView {
         self.actions_menu = Some(menu);
     }
 
-    /// While the menu is open, workspace ↑/↓/enter/escape still resolve here.
-    /// Drive the native PopupMenu via its focus-handle action dispatch (not nested
-    /// keystrokes — those re-enter InterviewWorkspace bindings).
-    fn dispatch_to_actions_menu(&self, keystroke: &str, window: &mut Window, cx: &mut App) -> bool {
-        let Some(menu) = self.actions_menu.clone() else {
-            tracing::warn!(keystroke, "actions menu: no PopupMenu entity");
-            return false;
-        };
-        let action_name = match keystroke {
-            "up" => "ui::SelectUp",
-            "down" => "ui::SelectDown",
-            "enter" => "ui::Confirm",
-            "escape" => "ui::Cancel",
-            _ => return false,
-        };
-        let action = match cx.build_action(action_name, None).or_else(|_| {
-            cx.build_action(action_name, Some(serde_json::json!({ "secondary": false })))
-        }) {
-            Ok(action) => action,
-            Err(err) => {
-                tracing::warn!(action_name, %err, "actions menu: build_action failed");
-                return false;
-            }
-        };
-
-        let focus = menu.read(cx).focus_handle(cx);
-        focus.focus(window);
-        focus.dispatch_action(action.as_ref(), window, cx);
-        true
+    /// While the menu is open and focused, let native PopupMenu SelectUp/SelectDown/
+    /// Confirm/Cancel run — do not stop_propagation.
+    fn actions_menu_focused(&self, window: &Window, cx: &App) -> bool {
+        self.actions_menu
+            .as_ref()
+            .is_some_and(|menu| menu.read(cx).focus_handle(cx).is_focused(window))
     }
 
     fn focus_actions_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1206,10 +1641,9 @@ impl WorkspaceView {
         self.ensure_actions_menu(window, cx);
         self.actions_menu_open = true;
         cx.notify();
-        // Focus + first SelectDown after the non-deferred menu is in the tree.
+        // Focus after the non-deferred menu is in the tree so PopupMenu key context wins.
         cx.on_next_frame(window, |this, window, cx| {
             this.focus_actions_menu(window, cx);
-            this.dispatch_to_actions_menu("down", window, cx);
             cx.notify();
         });
     }
@@ -1228,7 +1662,6 @@ impl WorkspaceView {
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
             this.focus_actions_menu(window, cx);
-            this.dispatch_to_actions_menu("down", window, cx);
             cx.notify();
         });
     }
@@ -1247,10 +1680,11 @@ impl WorkspaceView {
         if self
             .selected_question_id
             .as_ref()
-            .is_some_and(|id| self.is_question_pending(id))
+            .is_some_and(|id| self.is_question_locked(id))
         {
             return;
         }
+        self.proposed_editing = false;
         self.workspace_focus = WorkspaceFocus::Response(self.notes_stop_index());
         self.notes_editing = true;
         cx.notify();
@@ -1272,8 +1706,45 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn enter_proposed_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit_notes() || !self.has_proposed_editor() {
+            return;
+        }
+        if self
+            .selected_question_id
+            .as_ref()
+            .is_some_and(|id| self.is_question_locked(id))
+        {
+            return;
+        }
+        let Some(idx) = self.proposed_stop_index() else {
+            return;
+        };
+        self.notes_editing = false;
+        self.workspace_focus = WorkspaceFocus::Response(idx);
+        self.proposed_editing = true;
+        cx.notify();
+        cx.on_next_frame(window, |this, window, cx| {
+            this.proposed_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn exit_proposed_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.proposed_editing {
+            return;
+        }
+        self.proposed_editing = false;
+        if let Some(idx) = self.proposed_stop_index() {
+            self.workspace_focus = WorkspaceFocus::Response(idx);
+        }
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
     fn focus_response_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.notes_editing {
+        if self.response_text_editing() {
             return;
         }
         self.workspace_focus = WorkspaceFocus::Response(0);
@@ -1282,16 +1753,18 @@ impl WorkspaceView {
     }
 
     fn focus_list_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.notes_editing {
+        if self.response_text_editing() {
             return;
         }
         self.workspace_focus = WorkspaceFocus::QuestionList;
-        self.focus_handle.focus(window);
+        self.question_list_state.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
         cx.notify();
     }
 
     fn move_response_focus(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
-        if self.notes_editing || self.actions_menu_open {
+        if self.response_text_editing() || self.actions_menu_open {
             return;
         }
         let count = self.response_stop_count().max(1);
@@ -1310,7 +1783,7 @@ impl WorkspaceView {
     }
 
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.notes_editing {
+        if self.response_text_editing() {
             return;
         }
         let WorkspaceFocus::Response(idx) = self.workspace_focus else {
@@ -1329,7 +1802,11 @@ impl WorkspaceView {
             }
             return;
         }
-        let notes_idx = mc_count;
+        if self.proposed_stop_index() == Some(idx) {
+            self.enter_proposed_edit(window, cx);
+            return;
+        }
+        let notes_idx = self.notes_stop_index();
         let actions_idx = self.actions_stop_index();
         let submit_idx = self.submit_stop_index();
         if idx == notes_idx {
@@ -1346,6 +1823,10 @@ impl WorkspaceView {
     }
 
     fn handle_workspace_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.proposed_editing {
+            self.exit_proposed_edit(window, cx);
+            return;
+        }
         if self.notes_editing {
             self.exit_notes_edit(window, cx);
             return;
@@ -1354,14 +1835,18 @@ impl WorkspaceView {
             self.close_actions_menu(window, cx);
             return;
         }
-        // Otherwise no-op — never navigate to session list (H5 / req 22).
+        self.navigate_back(cx);
+    }
+
+    fn navigate_back(&mut self, cx: &mut Context<Self>) {
+        cx.emit(WorkspaceEvent::NavigateBack);
     }
 
     fn open_deep_dive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(question) = self.selected_question().cloned() else {
             return;
         };
-        if self.is_question_pending(&question.id) {
+        if self.is_question_locked(&question.id) {
             return;
         }
         let agent = self.agent.clone();
@@ -1385,8 +1870,59 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn back_to_sessions(&mut self, cx: &mut Context<Self>) {
-        cx.emit(WorkspaceEvent::BackToSessions);
+    fn render_workspace_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        border: gpui::Hsla,
+        muted: gpui::Hsla,
+    ) -> impl IntoElement {
+        let entity_label: SharedString = self
+            .session
+            .entity_path
+            .clone()
+            .unwrap_or_else(|| "—".to_string())
+            .into();
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .flex_shrink_0()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_3()
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(border)
+            .child(self.render_app_nav(window, cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(self.session.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_right()
+                            .child(entity_label),
+                    ),
+            )
     }
 }
 
@@ -1423,7 +1959,7 @@ fn register_workspace_keys(cx: &mut App) {
         KeyBinding::new("enter", ActivateFocused, context),
         KeyBinding::new("space", ActivateFocused, context),
         KeyBinding::new("escape", WorkspaceEscape, context),
-        KeyBinding::new("alt-left", BackToSessions, context),
+        KeyBinding::new("alt-left", NavigateBack, context),
     ]);
 }
 
@@ -1469,7 +2005,7 @@ fn run_submit_answer_work(work: SubmitAnswerWork, agent: SharedAgent) -> SubmitA
             &work.transcript,
             &work.question_id,
             &work.question_body,
-            &work.notes,
+            &work.answer_text,
             work.mc.as_deref(),
         )
         .map_err(|err| format!("Transcript write failed: {err}"))?;
@@ -1477,7 +2013,8 @@ fn run_submit_answer_work(work: SubmitAnswerWork, agent: SharedAgent) -> SubmitA
         let record = AnswerRecord {
             id: work.question_id.clone(),
             option: work.mc.clone(),
-            body: work.notes.clone(),
+            text_changed: work.text_changed,
+            body: work.payload_body.clone(),
         };
         let payload =
             format_answer_payload(&[record]).map_err(|err| format!("Payload error: {err}"))?;
@@ -1495,6 +2032,36 @@ fn run_submit_answer_work(work: SubmitAnswerWork, agent: SharedAgent) -> SubmitA
     SubmitAnswerOutcome {
         question_id,
         result,
+    }
+}
+
+/// Build answer-processor `text_changed` / body and transcript answer text (req 4 / 4a).
+fn build_proposed_answer_parts(
+    original_proposed: Option<&str>,
+    edited_proposed: &str,
+    notes: &str,
+) -> (Option<bool>, String, String) {
+    let notes = notes.trim().to_string();
+    let Some(original) = original_proposed.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, notes.clone(), notes);
+    };
+    let edited = edited_proposed.trim();
+    if edited == original {
+        // Unedited Accept — do not resend proposed_text as the body.
+        let answer = if notes.is_empty() {
+            "Accepted proposed text as written.".to_string()
+        } else {
+            notes.clone()
+        };
+        (Some(false), notes, answer)
+    } else {
+        let edited = edited.to_string();
+        let answer = if notes.is_empty() {
+            edited.clone()
+        } else {
+            format!("{edited}\n\nNotes: {notes}")
+        };
+        (Some(true), edited, answer)
     }
 }
 
@@ -1571,8 +2138,26 @@ impl Focusable for WorkspaceView {
     }
 }
 
+impl HasAppNav for WorkspaceView {
+    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
+        &mut self.app_nav
+    }
+
+    fn app_nav_current(&self) -> Option<AppDestination> {
+        None
+    }
+
+    fn app_nav_fallback_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Align ListState after queue polls that only had App context (no Window).
+        self.sync_question_list_selection(window, cx, false);
+        self.sync_proposed_input(window, cx);
+
         if let Some(text) = self.pending_notes_paste.take() {
             self.notes_input.update(cx, |input, cx| {
                 input.set_value(text, window, cx);
@@ -1637,18 +2222,17 @@ impl Render for WorkspaceView {
                 this.on_digit_key("9", window, cx);
             }))
             .on_action(cx.listener(|this, _: &QuestionMoveUp, window, cx| {
-                if this.actions_menu_open {
-                    this.dispatch_to_actions_menu("up", window, cx);
-                    cx.stop_propagation();
+                if this.actions_menu_focused(window, cx) {
+                    cx.propagate();
                     return;
                 }
-                if this.notes_editing {
+                if this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
                 match this.workspace_focus {
                     WorkspaceFocus::QuestionList => {
-                        this.move_question_selection(-1, window, cx);
+                        this.move_question_list_by(-1, window, cx);
                         cx.stop_propagation();
                     }
                     WorkspaceFocus::Response(_) => {
@@ -1658,18 +2242,17 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|this, _: &QuestionMoveDown, window, cx| {
-                if this.actions_menu_open {
-                    this.dispatch_to_actions_menu("down", window, cx);
-                    cx.stop_propagation();
+                if this.actions_menu_focused(window, cx) {
+                    cx.propagate();
                     return;
                 }
-                if this.notes_editing {
+                if this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
                 match this.workspace_focus {
                     WorkspaceFocus::QuestionList => {
-                        this.move_question_selection(1, window, cx);
+                        this.move_question_list_by(1, window, cx);
                         cx.stop_propagation();
                     }
                     WorkspaceFocus::Response(_) => {
@@ -1678,8 +2261,20 @@ impl Render for WorkspaceView {
                     }
                 }
             }))
+            .on_action(cx.listener(|this, _: &ListArrowUp, window, cx| {
+                if this.workspace_focus == WorkspaceFocus::QuestionList {
+                    this.move_question_list_by(-1, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ListArrowDown, window, cx| {
+                if this.workspace_focus == WorkspaceFocus::QuestionList {
+                    this.move_question_list_by(1, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
-                if this.notes_editing {
+                if this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
@@ -1689,7 +2284,7 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
-                if this.notes_editing {
+                if this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
@@ -1699,81 +2294,93 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateFocused, window, cx| {
-                if this.actions_menu_open {
-                    this.dispatch_to_actions_menu("enter", window, cx);
-                    cx.stop_propagation();
+                if this.actions_menu_focused(window, cx) {
+                    cx.propagate();
                     return;
                 }
-                if this.notes_editing {
+                if this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
                 this.activate_focused(window, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(on_app_nav_toggle::<Self>))
+            .on_action(cx.listener(|this, _: &NavigateBack, _, cx| {
+                this.navigate_back(cx);
+            }))
             .on_action(cx.listener(|this, _: &WorkspaceEscape, window, cx| {
-                if this.actions_menu_open {
-                    this.dispatch_to_actions_menu("escape", window, cx);
-                    cx.stop_propagation();
+                if this.actions_menu_focused(window, cx) {
+                    cx.propagate();
                     return;
                 }
                 this.handle_workspace_escape(window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &BackToSessions, _, cx| {
-                this.back_to_sessions(cx);
-            }))
-            .child(workspace_header(cx, &self.session, border, muted))
+            .child(self.render_workspace_header(window, cx, border, muted))
             .when(archived, |el| el.child(archived_banner(border, muted)))
             .when_some(self.error_banner.clone(), |el, msg| {
                 el.child(error_banner(msg, border))
             })
             .child(
                 div()
-                    .id("workspace-columns")
-                    .flex()
-                    .flex_row()
                     .flex_1()
                     .min_h_0()
+                    .min_w_0()
+                    .w_full()
                     .overflow_hidden()
-                    .child(question_list_column(
-                        cx,
-                        &self.questions,
-                        &self.selected_question_id,
-                        &self.pending,
-                        &self.question_list_scroll_handle,
-                        muted,
-                        border,
-                    ))
-                    .child(body_column(
-                        cx,
-                        self.is_complete(),
-                        self.researcher_in_flight() > 0 || self.scaffolding_pending,
-                        self.selected_question(),
-                        &self.session,
-                        foreground,
-                        muted,
-                        border,
-                    ))
-                    .child(response_column(
-                        cx,
-                        window,
-                        self.selected_question(),
-                        self.is_question_pending(
-                            self.selected_question_id.as_deref().unwrap_or(""),
-                        ),
-                        &self.selected_mc,
-                        &self.notes_input,
-                        self.can_mutate(),
-                        self.can_edit_notes(),
-                        self.workspace_focus,
-                        self.notes_editing,
-                        self.actions_menu_open,
-                        self.actions_menu.clone(),
-                        &self.focus_handle,
-                        muted,
-                        border,
-                    )),
+                    .child(
+                        h_resizable("workspace-columns")
+                            .child(
+                                resizable_panel()
+                                    .size(px(LIST_COLUMN_WIDTH))
+                                    .size_range(px(LIST_COLUMN_MIN)..Pixels::MAX)
+                                    .child(question_list_column(&self.question_list_state, muted)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(BODY_COLUMN_WIDTH))
+                                    .size_range(px(BODY_COLUMN_MIN)..Pixels::MAX)
+                                    .child(body_column(
+                                        cx,
+                                        self.is_complete(),
+                                        self.researcher_in_flight() > 0 || self.scaffolding_pending,
+                                        self.selected_question(),
+                                        &self.session,
+                                        self.task_list_proceed.is_some(),
+                                        foreground,
+                                        muted,
+                                    )),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(RESPONSE_COLUMN_MIN)..Pixels::MAX)
+                                    .child(response_column(
+                                        cx,
+                                        window,
+                                        self.selected_question(),
+                                        self.is_question_pending(
+                                            self.selected_question_id.as_deref().unwrap_or(""),
+                                        ),
+                                        self.is_question_removing(
+                                            self.selected_question_id.as_deref().unwrap_or(""),
+                                        ),
+                                        &self.selected_mc,
+                                        &self.proposed_input,
+                                        &self.notes_input,
+                                        self.can_mutate(),
+                                        self.can_edit_notes(),
+                                        self.has_proposed_editor(),
+                                        self.workspace_focus,
+                                        self.proposed_editing,
+                                        self.notes_editing,
+                                        self.actions_menu_open,
+                                        self.actions_menu.clone(),
+                                        &self.focus_handle,
+                                        muted,
+                                    )),
+                            ),
+                    ),
             )
             .child(status_footer(
                 cx,
@@ -1784,68 +2391,6 @@ impl Render for WorkspaceView {
                 self.replenish_state.manual_required,
             ))
     }
-}
-
-fn workspace_header(
-    cx: &mut Context<WorkspaceView>,
-    session: &InterviewSession,
-    border: gpui::Hsla,
-    muted: gpui::Hsla,
-) -> impl IntoElement {
-    let entity_label: SharedString = session
-        .entity_path
-        .clone()
-        .unwrap_or_else(|| "—".to_string())
-        .into();
-    h_flex()
-        .w_full()
-        .min_w_0()
-        .flex_shrink_0()
-        .items_center()
-        .gap_3()
-        .px_4()
-        .py_3()
-        .overflow_hidden()
-        .border_b_1()
-        .border_color(border)
-        .child(
-            Button::new("back-to-sessions")
-                .label("Back to interviews")
-                .flex_shrink_0()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.back_to_sessions(cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.back_to_sessions(cx);
-                        cx.stop_propagation();
-                    }),
-                ),
-        )
-        .child(
-            v_flex()
-                .min_w_0()
-                .flex_1()
-                .overflow_hidden()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(session.display_name.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(entity_label),
-                ),
-        )
 }
 
 fn archived_banner(border: gpui::Hsla, muted: gpui::Hsla) -> impl IntoElement {
@@ -1871,65 +2416,13 @@ fn error_banner(message: SharedString, border: gpui::Hsla) -> impl IntoElement {
 }
 
 fn question_list_column(
-    cx: &mut Context<WorkspaceView>,
-    questions: &[QueueQuestion],
-    selected_id: &Option<String>,
-    pending: &HashSet<String>,
-    scroll_handle: &ScrollHandle,
+    list_state: &Entity<ListState<QuestionListDelegate>>,
     muted: gpui::Hsla,
-    border: gpui::Hsla,
 ) -> impl IntoElement {
-    let mut scroll_content = div()
-        .id("question-list-scroll")
-        .flex()
-        .flex_col()
-        .size_full()
-        .overflow_y_scroll()
-        .track_scroll(scroll_handle);
-    for (idx, question) in questions.iter().enumerate() {
-        let id = question.id.clone();
-        let is_selected = selected_id.as_ref() == Some(&id);
-        let is_pending = pending.contains(&id);
-        let label: SharedString = format!("{} · {}", question.id, question.short_label).into();
-        let view = cx.entity();
-        let select_id = id.clone();
-        scroll_content = scroll_content.child(
-            ListItem::new(("question-row", idx))
-                .selected(is_selected)
-                .disabled(is_pending)
-                .on_click(move |_, window, app| {
-                    view.update(app, |this, cx| {
-                        this.workspace_focus = WorkspaceFocus::QuestionList;
-                        this.notes_editing = false;
-                        this.select_question(&select_id, window, cx);
-                        this.focus_handle.focus(window);
-                    });
-                })
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .text_color(if is_pending {
-                            muted
-                        } else {
-                            cx.theme().foreground
-                        })
-                        .child(label),
-                ),
-        );
-    }
-
     v_flex()
-        .w(px(LIST_COLUMN_WIDTH))
-        .min_w(px(LIST_COLUMN_WIDTH))
-        .max_w(px(LIST_COLUMN_WIDTH))
-        .flex_none()
-        .h_full()
+        .size_full()
+        .min_w_0()
         .overflow_hidden()
-        .border_r_1()
-        .border_color(border)
         .child(
             div()
                 .px_3()
@@ -1940,11 +2433,10 @@ fn question_list_column(
         )
         .child(
             div()
-                .relative()
                 .flex_1()
                 .min_h_0()
-                .child(scroll_content)
-                .vertical_scrollbar(scroll_handle),
+                .size_full()
+                .child(List::new(list_state).size_full()),
         )
 }
 
@@ -1954,20 +2446,14 @@ fn body_column(
     researcher_waiting: bool,
     question: Option<&QueueQuestion>,
     session: &InterviewSession,
+    show_proceed: bool,
     foreground: gpui::Hsla,
     muted: gpui::Hsla,
-    border: gpui::Hsla,
 ) -> impl IntoElement {
     let body = if complete {
-        complete_body(cx, session, foreground, muted).into_any_element()
+        complete_body(cx, session, show_proceed, foreground, muted).into_any_element()
     } else if let Some(q) = question {
-        div()
-            .w_full()
-            .min_w_0()
-            .text_sm()
-            .text_color(foreground)
-            .child(q.body.clone())
-            .into_any_element()
+        question_body_view(q, foreground, muted).into_any_element()
     } else if researcher_waiting {
         div()
             .text_sm()
@@ -1982,14 +2468,9 @@ fn body_column(
             .into_any_element()
     };
     v_flex()
-        .flex_none()
-        .w(px(BODY_COLUMN_WIDTH))
-        .min_w(px(BODY_COLUMN_WIDTH))
-        .max_w(px(BODY_COLUMN_WIDTH))
-        .h_full()
+        .size_full()
+        .min_w_0()
         .overflow_hidden()
-        .border_r_1()
-        .border_color(border)
         .p_4()
         .child(
             div()
@@ -2002,13 +2483,87 @@ fn body_column(
         )
 }
 
-fn complete_body(
-    cx: &mut Context<WorkspaceView>,
-    session: &InterviewSession,
+fn question_body_view(
+    q: &QueueQuestion,
     foreground: gpui::Hsla,
     muted: gpui::Hsla,
 ) -> impl IntoElement {
-    v_flex()
+    let has_structured = q.context.is_some() || q.question.is_some();
+    let mut col = v_flex().w_full().min_w_0().gap_3();
+
+    if let Some(context) = q
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        col = col.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .text_color(muted)
+                .child(context.to_string()),
+        );
+    }
+
+    if let Some(question) = q
+        .question
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        col = col.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .font_semibold()
+                .text_color(foreground)
+                .child(question.to_string()),
+        );
+    } else if !has_structured {
+        let legacy = crate::interview::queue::strip_mc_option_lines(&q.body, &q.options);
+        let (legacy, _) = crate::interview::queue::split_recommend_from_body(&legacy);
+        if !legacy.trim().is_empty() {
+            col = col.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(foreground)
+                    .child(legacy),
+            );
+        }
+    }
+
+    if let Some(recommend) = q
+        .recommend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        col = col.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_sm()
+                .text_color(muted)
+                .child(format!("Recommend: {recommend}")),
+        );
+    }
+
+    col
+}
+
+fn complete_body(
+    cx: &mut Context<WorkspaceView>,
+    session: &InterviewSession,
+    show_proceed: bool,
+    foreground: gpui::Hsla,
+    muted: gpui::Hsla,
+) -> impl IntoElement {
+    let mut col = v_flex()
         .gap_3()
         .child(
             div()
@@ -2018,21 +2573,22 @@ fn complete_body(
                 .child("Complete"),
         )
         .child(div().text_sm().text_color(muted).child(format!(
-            "Interview \"{}\" has no remaining open questions.",
+            "No open questions remain for \"{}\".",
             session.display_name
-        )))
-        .child(
-            Button::new("complete-back")
-                .label("Back to interviews")
+        )));
+
+    if show_proceed {
+        col = col.child(
+            Button::new("proceed-lifecycle")
                 .primary()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.back_to_sessions(cx);
-                        cx.stop_propagation();
-                    }),
-                ),
-        )
+                .label("Proceed")
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(WorkspaceEvent::ProceedToLifecycle);
+                })),
+        );
+    }
+
+    col
 }
 
 fn response_column(
@@ -2040,35 +2596,40 @@ fn response_column(
     _window: &mut Window,
     question: Option<&QueueQuestion>,
     pending: bool,
+    removing: bool,
     selected_mc: &Option<String>,
+    proposed_input: &Entity<InputState>,
     notes_input: &Entity<InputState>,
     can_mutate: bool,
     can_edit_notes: bool,
+    show_proposed: bool,
     workspace_focus: WorkspaceFocus,
+    proposed_editing: bool,
     notes_editing: bool,
     actions_menu_open: bool,
     actions_menu: Option<Entity<PopupMenu>>,
     _workspace_focus_handle: &FocusHandle,
     muted: gpui::Hsla,
-    border: gpui::Hsla,
 ) -> impl IntoElement {
-    let disabled = !can_mutate || pending || question.is_none();
-    let notes_input_disabled = !can_edit_notes || pending || question.is_none() || !notes_editing;
+    let locked = pending || removing;
+    let disabled = !can_mutate || locked || question.is_none();
+    let proposed_input_disabled =
+        !can_edit_notes || locked || question.is_none() || !proposed_editing;
+    let notes_input_disabled = !can_edit_notes || locked || question.is_none() || !notes_editing;
     let focused_idx = match workspace_focus {
         WorkspaceFocus::Response(i) => Some(i),
         WorkspaceFocus::QuestionList => None,
     };
     let mut col = v_flex()
         .id("response-column")
-        .flex_1()
+        .size_full()
         .min_w_0()
-        .h_full()
         .overflow_hidden()
-        .border_l_1()
-        .border_color(border)
         .p_3()
         .gap_2()
-        .child(div().text_xs().text_color(muted).child(if pending {
+        .child(div().text_xs().text_color(muted).child(if removing {
+            "Removing…"
+        } else if pending {
             "Pending — waiting for agent"
         } else {
             "Response"
@@ -2090,81 +2651,113 @@ fn response_column(
             stop_idx += 1;
         }
     }
+    let proposed_focused = show_proposed && focused_idx == Some(stop_idx);
+    if show_proposed {
+        stop_idx += 1;
+    }
     let notes_focused = focused_idx == Some(stop_idx);
     stop_idx += 1;
     let actions_focused = focused_idx == Some(stop_idx);
     stop_idx += 1;
     let submit_focused = focused_idx == Some(stop_idx);
     let notes_view = cx.entity();
+    let proposed_view = cx.entity();
 
-    col.child(
-        v_flex()
-            .id("response-footer")
-            .w_full()
-            .min_w_0()
-            .flex_none()
-            .flex_shrink_0()
-            .gap_2()
+    let mut footer = v_flex()
+        .id("response-footer")
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .flex_shrink_0()
+        .gap_2();
+
+    if show_proposed {
+        footer = footer
+            .child(div().text_xs().text_color(muted).child("Proposed text"))
             .child(
-                ListItem::new("notes-field")
-                    .selected(notes_focused)
+                ListItem::new("proposed-field")
+                    .selected(proposed_focused)
                     .w_full()
-                    .h(px(80.))
+                    .h(px(100.))
                     .overflow_hidden()
                     .on_click(move |_, window, app| {
-                        notes_view.update(app, |this, cx| {
+                        proposed_view.update(app, |this, cx| {
                             if this.can_edit_notes() {
-                                this.enter_notes_edit(window, cx);
+                                this.enter_proposed_edit(window, cx);
                             }
                         });
                     })
                     .child(
-                        Input::new(notes_input)
-                            .disabled(notes_input_disabled)
+                        Input::new(proposed_input)
+                            .disabled(proposed_input_disabled)
                             .w_full()
-                            .h(px(80.)),
+                            .h(px(100.)),
                     ),
-            )
-            .child(
-                h_flex()
-                    .id("response-actions")
-                    .w_full()
-                    .min_w_0()
-                    .flex_none()
-                    .justify_between()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        ListItem::new("other-actions-focus")
-                            .selected(actions_focused && !actions_menu_open)
-                            .child(action_dropdown(
-                                cx,
-                                disabled,
-                                actions_menu_open,
-                                actions_focused,
-                                actions_menu,
-                            )),
-                    )
-                    .child(
-                        ListItem::new("submit-focus")
-                            .selected(submit_focused)
-                            .child(
-                                Button::new("submit-answer")
-                                    .label("Submit")
-                                    .primary()
-                                    .compact()
-                                    .disabled(disabled)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.submit_answer(window, cx);
-                                            cx.stop_propagation();
-                                        }),
-                                    ),
-                            ),
-                    ),
-            ),
-    )
+            );
+    }
+
+    footer = footer
+        .child(
+            ListItem::new("notes-field")
+                .selected(notes_focused)
+                .w_full()
+                .h(px(80.))
+                .overflow_hidden()
+                .on_click(move |_, window, app| {
+                    notes_view.update(app, |this, cx| {
+                        if this.can_edit_notes() {
+                            this.enter_notes_edit(window, cx);
+                        }
+                    });
+                })
+                .child(
+                    Input::new(notes_input)
+                        .disabled(notes_input_disabled)
+                        .w_full()
+                        .h(px(80.)),
+                ),
+        )
+        .child(
+            h_flex()
+                .id("response-actions")
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .justify_between()
+                .items_center()
+                .gap_1()
+                .child(
+                    ListItem::new("other-actions-focus")
+                        .selected(actions_focused && !actions_menu_open)
+                        .child(action_dropdown(
+                            cx,
+                            disabled,
+                            actions_menu_open,
+                            actions_focused,
+                            actions_menu,
+                        )),
+                )
+                .child(
+                    ListItem::new("submit-focus")
+                        .selected(submit_focused)
+                        .child(
+                            Button::new("submit-answer")
+                                .label("Submit")
+                                .primary()
+                                .compact()
+                                .disabled(disabled)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.submit_answer(window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        ),
+                ),
+        );
+
+    col.child(footer)
 }
 
 fn populate_action_menu(menu: PopupMenu, view: WeakEntity<WorkspaceView>) -> PopupMenu {
@@ -2184,8 +2777,12 @@ fn populate_action_menu(menu: PopupMenu, view: WeakEntity<WorkspaceView>) -> Pop
         })
 }
 
-/// Native PopupMenu anchored under the trigger — not a deferred Popover, so the
-/// menu stays in the focus/dispatch tree for keyboard SelectUp/SelectDown.
+/// Native `PopupMenu` anchored under the trigger.
+///
+/// Stock `Button::dropdown_menu` wraps the menu in a deferred `Popover`, which
+/// drops the menu out of the focus/dispatch tree (keyboard SelectUp/Down no-op).
+/// Eager anchored `PopupMenu` keeps native menu keyboard + MenuItemElement
+/// `.selected` chrome (theme accent bumped toward `list_active_border` at init).
 fn action_dropdown(
     cx: &mut Context<WorkspaceView>,
     disabled: bool,
@@ -2229,52 +2826,28 @@ fn mc_option_row(
     disabled: bool,
 ) -> impl IntoElement {
     let key = opt.key.clone();
-    let view = cx.entity();
     let submit_key = key.clone();
-    let foreground = cx.theme().foreground;
+    let label: SharedString = format!("{}. {}", opt.key, opt.label).into();
+    let _ = muted;
 
     ListItem::new(("mc-option", idx))
         .selected(focused || selected)
         .disabled(disabled)
         .w_full()
         .min_w_0()
-        .on_click(move |_, window, app| {
-            if !disabled {
-                view.update(app, |this, cx| {
-                    this.submit_mc_option(&submit_key, window, cx)
-                });
-            }
-        })
         .child(
-            h_flex()
+            Button::new(("mc-option-btn", idx))
+                .label(label)
+                .ghost()
+                .compact()
                 .w_full()
-                .min_w_0()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(if focused || selected {
-                            foreground
-                        } else {
-                            muted
-                        })
-                        .child(format!("{}.", opt.key)),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .text_sm()
-                        .whitespace_normal()
-                        .text_color(if focused || selected {
-                            foreground
-                        } else {
-                            muted
-                        })
-                        .child(opt.label),
-                ),
+                .disabled(disabled)
+                .selected(focused || selected)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if !disabled {
+                        this.submit_mc_option(&submit_key, window, cx);
+                    }
+                })),
         )
 }
 
@@ -2334,10 +2907,13 @@ impl gpui::EventEmitter<WorkspaceEvent> for WorkspaceView {}
 #[cfg(test)]
 mod tests {
     use super::{
-        ResearcherStatusKind, reopen_complete_with_bound_queue, researcher_status_from_text,
-        update_replenish_idle_since,
+        ResearcherStatusKind, RunKind, WorkspaceInFlightState, build_proposed_answer_parts,
+        reopen_complete_with_bound_queue, researcher_status_from_text, update_replenish_idle_since,
     };
+    use crate::interview::agent::RunId;
+    use crate::interview::queue::QueueQuestion;
     use crate::interview::{InterviewSessionStatus, SessionStore, TodPaths};
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::time::Instant;
 
@@ -2434,5 +3010,130 @@ mod tests {
         assert_eq!(done.status, InterviewSessionStatus::Complete);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn in_flight_prune_drops_removed_and_modified_questions() {
+        let dir = std::env::temp_dir().join(format!("tod-inflight-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path_keep = dir.join("q-001.md");
+        let path_mod = dir.join("q-002.md");
+        fs::write(&path_keep, "same").unwrap();
+        fs::write(&path_mod, "changed").unwrap();
+
+        let questions = vec![
+            QueueQuestion {
+                id: "q-001".into(),
+                path: path_keep.clone(),
+                created: None,
+                layer: None,
+                kind: None,
+                covers: Vec::new(),
+                context: None,
+                question: None,
+                recommend: None,
+                proposed_text: None,
+                options: Vec::new(),
+                body: "keep".into(),
+                short_label: "keep".into(),
+            },
+            QueueQuestion {
+                id: "q-002".into(),
+                path: path_mod.clone(),
+                created: None,
+                layer: None,
+                kind: None,
+                covers: Vec::new(),
+                context: None,
+                question: None,
+                recommend: None,
+                proposed_text: None,
+                options: Vec::new(),
+                body: "mod".into(),
+                short_label: "mod".into(),
+            },
+        ];
+
+        let mut pending = HashSet::new();
+        pending.insert("q-001".into());
+        pending.insert("q-002".into());
+        pending.insert("q-gone".into());
+        let mut snapshots = HashMap::new();
+        snapshots.insert("q-001".into(), "same".into());
+        snapshots.insert("q-002".into(), "original".into());
+        let mut runs = HashMap::new();
+        runs.insert(
+            RunId::new(),
+            RunKind::AnswerProcessor {
+                question_id: "q-001".into(),
+            },
+        );
+        runs.insert(
+            RunId::new(),
+            RunKind::AnswerProcessor {
+                question_id: "q-002".into(),
+            },
+        );
+        runs.insert(
+            RunId::new(),
+            RunKind::AnswerProcessor {
+                question_id: "q-gone".into(),
+            },
+        );
+        runs.insert(RunId::new(), RunKind::ResearcherReplenish);
+
+        let pruned = WorkspaceInFlightState {
+            pending,
+            pending_snapshots: snapshots,
+            runs,
+        }
+        .pruned_for_queue(&questions);
+
+        assert!(pruned.pending.contains("q-001"));
+        assert!(!pruned.pending.contains("q-002"));
+        assert!(!pruned.pending.contains("q-gone"));
+        assert_eq!(pruned.runs.len(), 2); // q-001 answer + replenish
+        assert!(pruned.runs.values().any(|k| matches!(
+            k,
+            RunKind::AnswerProcessor { question_id } if question_id == "q-001"
+        )));
+        assert!(
+            pruned
+                .runs
+                .values()
+                .any(|k| matches!(k, RunKind::ResearcherReplenish))
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn proposed_answer_parts_unchanged_omits_text_from_body() {
+        let (changed, body, answer) =
+            build_proposed_answer_parts(Some("Fleet uses SQLite."), "Fleet uses SQLite.", "");
+        assert_eq!(changed, Some(false));
+        assert!(body.is_empty());
+        assert!(answer.contains("Accepted"));
+    }
+
+    #[test]
+    fn proposed_answer_parts_edited_sends_full_text() {
+        let (changed, body, answer) = build_proposed_answer_parts(
+            Some("Fleet uses SQLite."),
+            "Fleet uses SQLite under the storage root.",
+            "extra note",
+        );
+        assert_eq!(changed, Some(true));
+        assert_eq!(body, "Fleet uses SQLite under the storage root.");
+        assert!(answer.contains("extra note"));
+        assert!(answer.contains("storage root"));
+    }
+
+    #[test]
+    fn proposed_answer_parts_absent_proposed_keeps_notes_only() {
+        let (changed, body, answer) = build_proposed_answer_parts(None, "ignored", "just notes");
+        assert_eq!(changed, None);
+        assert_eq!(body, "just notes");
+        assert_eq!(answer, "just notes");
     }
 }

@@ -1,6 +1,4 @@
-use crate::interview::agent::{
-    AgentRunState, DeepDiveContext, RunId, SharedAgent,
-};
+use crate::interview::agent::{AgentRunState, DeepDiveContext, RunId, SharedAgent};
 use crate::interview::config::InterviewConfig;
 use crate::interview::queue::QueueQuestion;
 use crate::interview::{InterviewSession, TodPaths};
@@ -177,7 +175,7 @@ impl DeepDiveView {
             interview_purpose: self.config.phase.clone(),
             interview_phase: self.config.phase.clone(),
             question_id: self.parent.id.clone(),
-            question_body: self.parent.body.clone(),
+            question_body: self.parent.display_body(),
         }
     }
 
