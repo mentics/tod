@@ -10,17 +10,20 @@ use crate::ui::key_context;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, SharedString, Styled, Subscription, Timer,
-    Window, actions, div, px,
+    IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+    Timer, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::time::Duration;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SIDEBAR_WIDTH: f32 = 200.0;
+const SIDEBAR_MIN: f32 = 140.0;
+const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
 const SECTIONS: [SettingsSection; 5] = [
@@ -519,12 +522,18 @@ impl Render for SettingsView {
                     .child(self.render_app_nav(window, cx)),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(self.render_section_sidebar(cx, &theme))
-                    .child(self.render_section_panel(cx, &theme)),
+                h_resizable("settings-columns")
+                    .child(
+                        resizable_panel()
+                            .size(px(SIDEBAR_WIDTH))
+                            .size_range(px(SIDEBAR_MIN)..Pixels::MAX)
+                            .child(self.render_section_sidebar(cx, &theme)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(PANEL_MIN)..Pixels::MAX)
+                            .child(self.render_section_panel(cx, &theme)),
+                    ),
             )
             .child(
                 h_flex()
@@ -558,10 +567,8 @@ impl SettingsView {
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(theme.border)
+            .h_full()
+            .min_w_0()
             .bg(theme.sidebar)
             .py_2()
             .children(SECTIONS.iter().map(|section| {

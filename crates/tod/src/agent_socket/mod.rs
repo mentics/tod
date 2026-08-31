@@ -27,8 +27,19 @@ use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::Duration;
+
+static SHUTDOWN: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+
+/// Stop the accept loop so the process can exit after the last window closes.
+pub fn shutdown() {
+    if let Some(flag) = SHUTDOWN.get() {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Bind the control socket. Call before opening the main window so port conflicts fail fast.
 pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
@@ -64,6 +75,8 @@ pub fn start(
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
 ) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let _ = SHUTDOWN.set(shutdown.clone());
     eprintln!("agent-socket: listening on {addr}");
     let (tx, rx) = async_channel::bounded::<Pending>(32);
     let lw = logical_width.round().max(1.0) as u32;
@@ -71,7 +84,7 @@ pub fn start(
 
     std::thread::Builder::new()
         .name("tod-agent-socket".into())
-        .spawn(move || listen_loop(listener, tx, lw, lh))
+        .spawn(move || listen_loop(listener, tx, lw, lh, shutdown))
         .expect("spawn agent socket thread");
 
     cx.spawn(async move |cx| {
@@ -85,16 +98,24 @@ fn listen_loop(
     tx: async_channel::Sender<Pending>,
     logical_width: u32,
     logical_height: u32,
+    shutdown: Arc<AtomicBool>,
 ) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    let _ = listener.set_nonblocking(true);
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let tx = tx.clone();
                 let _ = std::thread::Builder::new()
                     .name("tod-agent-client".into())
                     .spawn(move || handle_client(stream, tx, logical_width, logical_height));
             }
-            Err(e) => eprintln!("agent-socket: accept error: {e}"),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("agent-socket: accept error: {e}");
+                break;
+            }
         }
     }
 }

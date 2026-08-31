@@ -31,6 +31,7 @@ use crate::outline::types::{FlatNodeRow, OutlineList};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
@@ -52,6 +53,18 @@ pub struct FleetStore {
     notices: FleetNoticeHooks,
     migration: Option<StorageMigration>,
     traffic_log: Option<SharedAgentTrafficLog>,
+    background_shutdown: Arc<AtomicBool>,
+}
+
+impl Drop for FleetStore {
+    fn drop(&mut self) {
+        self.background_shutdown.store(true, Ordering::Relaxed);
+        if let Err(err) = self.flush_on_quit() {
+            tracing::error!("fleet flush on quit failed: {err:#}");
+        }
+        self.writer.signal_shutdown();
+        self.writer.commit_notify().notify_waiters();
+    }
 }
 
 impl FleetStore {
@@ -78,7 +91,12 @@ impl FleetStore {
         let projection = Arc::new(Mutex::new(
             FleetProjection::open(paths.db()).map_err(FleetLaunchError::Other)?,
         ));
-        crate::fleet::projection::spawn_commit_reloader(projection.clone(), writer.commit_notify());
+        let background_shutdown = Arc::new(AtomicBool::new(false));
+        crate::fleet::projection::spawn_commit_reloader(
+            projection.clone(),
+            writer.commit_notify(),
+            background_shutdown.clone(),
+        );
 
         let store = Self {
             paths,
@@ -90,6 +108,7 @@ impl FleetStore {
             notices: FleetNoticeHooks::new(),
             migration: None,
             traffic_log: None,
+            background_shutdown,
         };
 
         store.run_launch_hooks(guest)?;

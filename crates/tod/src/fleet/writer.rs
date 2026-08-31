@@ -609,8 +609,13 @@ impl FleetWriter {
     }
 
     pub fn shutdown(self) -> Result<()> {
-        let _ = self.tx.send(WriterCommand::Shutdown);
+        self.signal_shutdown();
         Ok(())
+    }
+
+    /// Stop the writer thread without consuming this handle (for app shutdown).
+    pub fn signal_shutdown(&self) {
+        let _ = self.tx.send(WriterCommand::Shutdown);
     }
 
     /// Simulate abrupt process exit without flushing debounced mutations (verification only).

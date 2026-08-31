@@ -51,12 +51,30 @@ pub(crate) fn launch_main_application(
 
 pub struct App;
 
+/// Quit the GPUI event loop when the last window closes (required on Windows).
+fn register_app_lifecycle(cx: &mut gpui::App) {
+    cx.on_window_closed(|cx| {
+        if cx.windows().is_empty() {
+            tracing::info!(
+                event = "lifecycle",
+                action = "process_quit",
+                "all windows closed; quitting"
+            );
+            #[cfg(feature = "agent-socket")]
+            crate::agent_socket::shutdown();
+            cx.quit();
+        }
+    })
+    .detach();
+}
+
 impl App {
     pub fn run(opts: LaunchOptions, needs_data_root_setup: bool) {
         let app = Application::new().with_assets(gpui_component_assets::Assets);
 
         app.run(move |cx| {
             gpui_component::init(cx);
+            register_app_lifecycle(cx);
             // Dark default accent (#171717) is nearly invisible for PopupMenu /
             // ListItem hover-selected chrome on #0a0a0a. Align with list_active
             // border so menu ↑/↓ selection is clearly visible (req 20).

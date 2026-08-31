@@ -32,6 +32,7 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,6 +42,10 @@ actions!(
     shell,
     [ShellOpenAgentTranscripts, ShellOpenHistory, ShellUndo]
 );
+
+const TASKS_TREE_WIDTH: f32 = 420.0;
+const TASKS_TREE_MIN: f32 = 240.0;
+const TASKS_DRAWER_MIN: f32 = 280.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellView {
@@ -733,31 +738,32 @@ impl Shell {
                 .into_any_element()
         };
 
-        h_flex()
-            .size_full()
-            .min_w_0()
-            .min_h_0()
+        h_resizable("tasks-split")
             .child(
-                div()
-                    .id("tasks-tree-pane")
-                    .h_full()
-                    .w(px(420.))
-                    .flex_shrink_0()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .border_r_1()
-                    .border_color(border)
-                    .child(self.task_list.clone()),
+                resizable_panel()
+                    .size(px(TASKS_TREE_WIDTH))
+                    .size_range(px(TASKS_TREE_MIN)..Pixels::MAX)
+                    .child(
+                        div()
+                            .id("tasks-tree-pane")
+                            .h_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.task_list.clone()),
+                    ),
             )
             .child(
-                div()
-                    .id("tasks-right-drawer")
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(drawer),
+                resizable_panel()
+                    .size_range(px(TASKS_DRAWER_MIN)..Pixels::MAX)
+                    .child(
+                        div()
+                            .id("tasks-right-drawer")
+                            .h_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(drawer),
+                    ),
             )
     }
 

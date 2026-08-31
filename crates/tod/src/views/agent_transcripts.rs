@@ -10,16 +10,20 @@ use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
-    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
-    actions, div, px,
+    MouseButton, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const AGENT_TRANSCRIPTS_CONTEXT: &str = "AgentTranscripts";
+const AGENTS_LIST_WIDTH: f32 = 320.0;
+const AGENTS_LIST_MIN: f32 = 200.0;
+const TRANSCRIPT_PANEL_MIN: f32 = 280.0;
 
 actions!(
     agent_transcripts,
@@ -336,13 +340,17 @@ impl Render for AgentTranscriptsView {
                 this.pick_by_index(8, cx);
             }))
             .child(
-                v_flex()
-                    .w(px(320.))
-                    .h_full()
-                    .border_r_1()
-                    .border_color(border)
-                    .bg(muted_bg)
+                h_resizable("agent-transcripts-columns")
                     .child(
+                        resizable_panel()
+                            .size(px(AGENTS_LIST_WIDTH))
+                            .size_range(px(AGENTS_LIST_MIN)..Pixels::MAX)
+                            .child(
+                                v_flex()
+                                    .h_full()
+                                    .min_w_0()
+                                    .bg(muted_bg)
+                                    .child(
                         h_flex()
                             .px_3()
                             .py_2()

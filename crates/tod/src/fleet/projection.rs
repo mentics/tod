@@ -128,6 +128,7 @@ fn load_metadata(conn: &Connection) -> Result<FleetMetadata> {
 pub fn spawn_commit_reloader(
     projection: Arc<Mutex<FleetProjection>>,
     writer_notify: Arc<tokio::sync::Notify>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -136,11 +137,23 @@ pub fn spawn_commit_reloader(
             .expect("fleet commit reloader runtime");
         rt.block_on(async move {
             loop {
-                writer_notify.notified().await;
-                if let Ok(mut guard) = projection.lock() {
-                    if let Err(err) = guard.reload() {
-                        tracing::error!("fleet projection reload after commit failed: {err:#}");
+                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                tokio::select! {
+                    _ = writer_notify.notified() => {
+                        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Ok(mut guard) = projection.lock() {
+                            if let Err(err) = guard.reload() {
+                                tracing::error!(
+                                    "fleet projection reload after commit failed: {err:#}"
+                                );
+                            }
+                        }
                     }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
                 }
             }
         });
@@ -158,7 +171,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-fleet-proj-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(50), crate::fleet::command_log::CommandLog::shared()).unwrap();
+        let writer = FleetWriter::open_with_debounce(
+            &path,
+            Duration::from_millis(50),
+            crate::fleet::command_log::CommandLog::shared(),
+        )
+        .unwrap();
         let projection = FleetProjection::open(&path).unwrap();
         (dir, writer, projection)
     }
