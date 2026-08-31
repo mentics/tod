@@ -24,6 +24,7 @@ use crate::ui::app_nav::{
     HasAppNav, ShellGoDatabase, ShellGoSettings, ShellGoTasks, register_app_nav_keyboard_bindings,
 };
 use crate::ui::key_context::NOT_INPUT;
+use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::views::agent_config_panel::{AgentConfigPanelEvent, AgentConfigPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
@@ -32,7 +33,6 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,6 +104,7 @@ pub struct Shell {
     pending_close_agent_panel: bool,
     pending_retarget_agent: Option<(String, String)>,
     always_on_top: bool,
+    tasks_split_state: Entity<PanelSplitState>,
     _task_list_subscription: Subscription,
     _task_edit_subscription: Subscription,
     _obligations_subscription: Subscription,
@@ -737,33 +738,16 @@ impl Shell {
                 .into_any_element()
         };
 
-        h_resizable("tasks-split")
-            .child(
-                resizable_panel()
-                    .size(px(TASKS_TREE_WIDTH))
-                    .size_range(px(TASKS_TREE_MIN)..Pixels::MAX)
-                    .child(
-                        div()
-                            .id("tasks-tree-pane")
-                            .h_full()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(self.task_list.clone()),
-                    ),
+        h_panel_split("tasks-split", &self.tasks_split_state)
+            .min_left(px(TASKS_TREE_MIN))
+            .min_right(px(TASKS_DRAWER_MIN))
+            .left(
+                div()
+                    .id("tasks-tree-pane")
+                    .size_full()
+                    .child(self.task_list.clone()),
             )
-            .child(
-                resizable_panel()
-                    .size_range(px(TASKS_DRAWER_MIN)..Pixels::MAX)
-                    .child(
-                        div()
-                            .id("tasks-right-drawer")
-                            .h_full()
-                            .min_w_0()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(drawer),
-                    ),
-            )
+            .right(div().id("tasks-right-drawer").size_full().child(drawer))
     }
 
     fn drain_pending_task_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1234,6 +1218,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             );
                             let agent_status_text =
                                 format_status_bar(&AgentStatusGroups::default()).into();
+                            let tasks_split_state =
+                                cx.new(|_| PanelSplitState::new(px(TASKS_TREE_WIDTH)));
                             let shell = Shell {
                                 active_view: ShellView::Tasks,
                                 task_list,
@@ -1266,6 +1252,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_close_agent_panel: false,
                                 pending_retarget_agent: None,
                                 always_on_top: restore_always_on_top,
+                                tasks_split_state,
                                 _task_list_subscription,
                                 _task_edit_subscription,
                                 _obligations_subscription,

@@ -5,6 +5,14 @@ edition = "2024"
 publish = false
 build = "build.rs"
 
+[lib]
+name = "tod"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tod"
+path = "src/main.rs"
+
 [features]
 default = ["agent-socket"]
 agent-socket = []

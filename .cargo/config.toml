@@ -1,0 +1,12 @@
+# Dev-build settings for faster incremental compiles and links.
+# See workspace Cargo.toml [profile.dev] for compile-time tuning.
+
+[target.x86_64-pc-windows-msvc]
+# rust-lld links debug builds much faster than MSVC link.exe.
+linker = "rust-lld"
+
+[alias]
+# Fast type-check during editing; skips linking entirely.
+c = "check"
+# Check only library code (UI/domain); use when iterating on non-CLI code.
+cl = "check --lib -p tod"
