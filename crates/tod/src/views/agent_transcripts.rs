@@ -351,107 +351,117 @@ impl Render for AgentTranscriptsView {
                                     .min_w_0()
                                     .bg(muted_bg)
                                     .child(
-                        h_flex()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(border)
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
+                                        h_flex()
+                                            .px_3()
+                                            .py_2()
+                                            .border_b_1()
+                                            .border_color(border)
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_semibold()
+                                                            .text_color(foreground)
+                                                            .child("Agents"),
+                                                    )
+                                                    .when_some(
+                                                        render_shortcut_pill(
+                                                            window,
+                                                            &AgentTranscriptsSelectUp,
+                                                            AGENT_TRANSCRIPTS_CONTEXT,
+                                                            cx,
+                                                        ),
+                                                        |row, pill| row.child(pill),
+                                                    )
+                                                    .when_some(
+                                                        render_shortcut_pill(
+                                                            window,
+                                                            &AgentTranscriptsSelectDown,
+                                                            AGENT_TRANSCRIPTS_CONTEXT,
+                                                            cx,
+                                                        ),
+                                                        |row, pill| row.child(pill),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .gap_1()
+                                                    .child(chrome_control_with_shortcut(
+                                                        Button::new("refresh-transcripts")
+                                                            .label("Refresh")
+                                                            .outline()
+                                                            .compact()
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.refresh(cx);
+                                                                },
+                                                            )),
+                                                        window,
+                                                        &AgentTranscriptsRefresh,
+                                                        AGENT_TRANSCRIPTS_CONTEXT,
+                                                        cx,
+                                                    ))
+                                                    .child(chrome_control_with_shortcut(
+                                                        Button::new("close-transcripts")
+                                                            .label("Close")
+                                                            .outline()
+                                                            .compact()
+                                                            .on_click(cx.listener(
+                                                                |this, _, window, cx| {
+                                                                    this.close(window, cx);
+                                                                },
+                                                            )),
+                                                        window,
+                                                        &AgentTranscriptsClose,
+                                                        AGENT_TRANSCRIPTS_CONTEXT,
+                                                        cx,
+                                                    )),
+                                            ),
+                                    )
                                     .child(
                                         div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(foreground)
-                                            .child("Agents"),
-                                    )
-                                    .when_some(
-                                        render_shortcut_pill(
-                                            window,
-                                            &AgentTranscriptsSelectUp,
-                                            AGENT_TRANSCRIPTS_CONTEXT,
-                                            cx,
-                                        ),
-                                        |row, pill| row.child(pill),
-                                    )
-                                    .when_some(
-                                        render_shortcut_pill(
-                                            window,
-                                            &AgentTranscriptsSelectDown,
-                                            AGENT_TRANSCRIPTS_CONTEXT,
-                                            cx,
-                                        ),
-                                        |row, pill| row.child(pill),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(chrome_control_with_shortcut(
-                                        Button::new("refresh-transcripts")
-                                            .label("Refresh")
-                                            .outline()
-                                            .compact()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.refresh(cx);
-                                            })),
-                                        window,
-                                        &AgentTranscriptsRefresh,
-                                        AGENT_TRANSCRIPTS_CONTEXT,
-                                        cx,
-                                    ))
-                                    .child(chrome_control_with_shortcut(
-                                        Button::new("close-transcripts")
-                                            .label("Close")
-                                            .outline()
-                                            .compact()
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.close(window, cx);
-                                            })),
-                                        window,
-                                        &AgentTranscriptsClose,
-                                        AGENT_TRANSCRIPTS_CONTEXT,
-                                        cx,
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .p_2()
-                            .v_flex()
-                            .gap_2()
-                            .when(self.grouped_agents.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .px_2()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child("No agent traffic logged yet."),
-                                )
-                            })
-                            .children(self.grouped_agents.iter().map(|(category, agents)| {
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(muted)
-                                            .child(category.label()),
-                                    )
-                                    .children(agents.iter().enumerate().map(|(ix, agent)| {
-                                        let selected = self.selected_agent_id.as_deref()
-                                            == Some(agent.id.as_str());
-                                        let badge = pick_badges.get(&agent.id).cloned();
-                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scrollbar()
+                                            .p_2()
+                                            .v_flex()
+                                            .gap_2()
+                                            .when(self.grouped_agents.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .px_2()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child("No agent traffic logged yet."),
+                                                )
+                                            })
+                                            .children(self.grouped_agents.iter().map(
+                                                |(category, agents)| {
+                                                    v_flex()
+                                                        .gap_1()
+                                                        .child(
+                                                            div()
+                                                                .px_2()
+                                                                .text_xs()
+                                                                .font_semibold()
+                                                                .text_color(muted)
+                                                                .child(category.label()),
+                                                        )
+                                                        .children(agents.iter().enumerate().map(
+                                                            |(ix, agent)| {
+                                                                let selected = self
+                                                                    .selected_agent_id
+                                                                    .as_deref()
+                                                                    == Some(agent.id.as_str());
+                                                                let badge = pick_badges
+                                                                    .get(&agent.id)
+                                                                    .cloned();
+                                                                div()
                                             .id(("agent-pick", ix))
                                             .relative()
                                             .px_2()
@@ -504,81 +514,85 @@ impl Render for AgentTranscriptsView {
                                                         .child(render_label_badge(label, cx)),
                                                 )
                                             })
-                                    }))
-                            })),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(
-                        h_flex()
-                            .px_4()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(border)
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .text_color(foreground)
-                                    .child(self.header.clone()),
+                                                            },
+                                                        ))
+                                                },
+                                            )),
+                                    ),
                             ),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .p_4()
-                            .gap_3()
-                            .v_flex()
-                            .when(self.turns.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(muted)
-                                        .child("No transcript turns for this agent yet."),
-                                )
-                            })
-                            .children(self.turns.iter().map(|turn| {
-                                let turn_accent = match turn.direction {
-                                    TrafficDirection::Request => cx.theme().primary,
-                                    TrafficDirection::Response => cx.theme().accent,
-                                };
+                        resizable_panel()
+                            .size_range(px(TRANSCRIPT_PANEL_MIN)..Pixels::MAX)
+                            .child(
                                 v_flex()
-                                    .id(("turn", turn.sequence))
-                                    .gap_1()
-                                    .p_3()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(muted_bg)
+                                    .h_full()
+                                    .min_w_0()
                                     .child(
-                                        selectable_text(
-                                            ("turn-label", turn.sequence),
-                                            turn.label.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .text_xs()
-                                        .text_color(turn_accent),
+                                        h_flex()
+                                            .px_4()
+                                            .py_2()
+                                            .border_b_1()
+                                            .border_color(border)
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_semibold()
+                                                    .text_color(foreground)
+                                                    .child(self.header.clone()),
+                                            ),
                                     )
                                     .child(
-                                        selectable_text(
-                                            ("turn-content", turn.sequence),
-                                            turn.content.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .text_sm()
-                                        .text_color(foreground),
-                                    )
-                            })),
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .overflow_y_scrollbar()
+                                            .p_4()
+                                            .gap_3()
+                                            .v_flex()
+                                            .when(self.turns.is_empty(), |el| {
+                                                el.child(div().text_sm().text_color(muted).child(
+                                                    "No transcript turns for this agent yet.",
+                                                ))
+                                            })
+                                            .children(self.turns.iter().map(|turn| {
+                                                let turn_accent = match turn.direction {
+                                                    TrafficDirection::Request => cx.theme().primary,
+                                                    TrafficDirection::Response => cx.theme().accent,
+                                                };
+                                                v_flex()
+                                                    .id(("turn", turn.sequence))
+                                                    .gap_1()
+                                                    .p_3()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(border)
+                                                    .bg(muted_bg)
+                                                    .child(
+                                                        selectable_text(
+                                                            ("turn-label", turn.sequence),
+                                                            turn.label.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .text_xs()
+                                                        .text_color(turn_accent),
+                                                    )
+                                                    .child(
+                                                        selectable_text(
+                                                            ("turn-content", turn.sequence),
+                                                            turn.content.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .text_sm()
+                                                        .text_color(foreground),
+                                                    )
+                                            })),
+                                    ),
+                            ),
                     ),
             )
             .on_mouse_down(

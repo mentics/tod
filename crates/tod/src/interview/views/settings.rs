@@ -522,18 +522,20 @@ impl Render for SettingsView {
                     .child(self.render_app_nav(window, cx)),
             )
             .child(
-                h_resizable("settings-columns")
-                    .child(
-                        resizable_panel()
-                            .size(px(SIDEBAR_WIDTH))
-                            .size_range(px(SIDEBAR_MIN)..Pixels::MAX)
-                            .child(self.render_section_sidebar(cx, &theme)),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size_range(px(PANEL_MIN)..Pixels::MAX)
-                            .child(self.render_section_panel(cx, &theme)),
-                    ),
+                div().flex_1().min_h_0().min_w_0().overflow_hidden().child(
+                    h_resizable("settings-columns")
+                        .child(
+                            resizable_panel()
+                                .size(px(SIDEBAR_WIDTH))
+                                .size_range(px(SIDEBAR_MIN)..Pixels::MAX)
+                                .child(self.render_section_sidebar(cx, &theme)),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size_range(px(PANEL_MIN)..Pixels::MAX)
+                                .child(self.render_section_panel(cx, &theme)),
+                        ),
+                ),
             )
             .child(
                 h_flex()

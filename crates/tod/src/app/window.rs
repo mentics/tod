@@ -712,7 +712,6 @@ impl Shell {
     /// replace the (future) agent list in the same right drawer; the tree stays.
     fn render_tasks_split(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let border = theme.border;
         let muted = theme.muted_foreground;
         let drawer = if self.obligations.read(cx).is_open() {
             self.obligations.clone().into_any_element()
