@@ -1,7 +1,7 @@
 use gpui::{Context, Window};
 use gpui_component::input::InputState;
 
-use crate::outline::{CreatePosition, OutlineMutation};
+use tod_store::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
 use super::from_ticket::parse_ticket_reference;

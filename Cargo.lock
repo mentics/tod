@@ -6180,6 +6180,7 @@ dependencies = [
  "serde_yaml",
  "sysinfo 0.37.2",
  "thiserror 2.0.20",
+ "tod-store",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -6188,6 +6189,26 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows 0.57.0",
+]
+
+[[package]]
+name = "tod-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 6.0.0",
+ "fs2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sysinfo 0.37.2",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

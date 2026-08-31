@@ -1,9 +1,9 @@
 use gpui::{Context, Window};
 use uuid::Uuid;
 
-use crate::fleet::FleetMutation;
-use crate::outline::types::Capability;
-use crate::outline::{CreatePosition, OutlineMutation};
+use tod_store::fleet::FleetMutation;
+use tod_store::outline::types::Capability;
+use tod_store::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
 

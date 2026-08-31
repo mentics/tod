@@ -1,10 +1,10 @@
 //! Right-drawer agent config panel — persistent environment configuration for a task.
 
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
-use crate::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
-use crate::fleet::repos::shell::ShellSession;
-use crate::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
-use crate::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
+use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
+use tod_store::fleet::repos::shell::ShellSession;
+use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
+use tod_store::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::settings::TodSettings;
@@ -367,7 +367,7 @@ impl AgentConfigPanelView {
     }
 
     /// Agent row for launch (from saved config).
-    fn agent_row_for_launch(&self) -> Option<crate::fleet::AgentConfigRow> {
+    fn agent_row_for_launch(&self) -> Option<tod_store::fleet::AgentConfigRow> {
         let config_id = self.config_id.as_ref()?;
         self.fleet.get_agent(config_id).ok().flatten()
     }

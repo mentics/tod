@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
+use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
 use crate::ui::selectable_text::selectable_text;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,

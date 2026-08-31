@@ -15,9 +15,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
 use crate::interview::{TodPaths, interview_work_remains};
-use crate::outline::{CreatePosition, OutlineMutation, ReorderDirection};
+use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use crate::process::interview_phase_for_lifecycle;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -231,7 +231,7 @@ pub struct TaskListView {
     config_dir: PathBuf,
     fleet: Arc<FleetStore>,
     active_list_id: Option<uuid::Uuid>,
-    outline_lists: Vec<crate::outline::types::OutlineList>,
+    outline_lists: Vec<tod_store::outline::types::OutlineList>,
     app_nav: AppNavMenu,
     _list_subscription: Subscription,
     _compose_subscription: Subscription,
@@ -1626,7 +1626,7 @@ impl TaskListView {
             let projection = self.fleet.projection();
             let guard = projection.lock().unwrap();
             let conn = guard.connection();
-            let outline = crate::outline::repos::OutlineRepo::new(&conn);
+            let outline = tod_store::outline::repos::OutlineRepo::new(&conn);
             outline
                 .get_entry(node_id)
                 .ok()
@@ -1709,7 +1709,7 @@ impl TaskListView {
             let projection = self.fleet.projection();
             let guard = projection.lock().unwrap();
             let conn = guard.connection();
-            let outline = crate::outline::repos::OutlineRepo::new(&conn);
+            let outline = tod_store::outline::repos::OutlineRepo::new(&conn);
             if direction > 0 {
                 if ix == 0 {
                     return;

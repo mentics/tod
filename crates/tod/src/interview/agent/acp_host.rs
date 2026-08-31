@@ -1,35 +1,12 @@
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Interview agent platform — persisted in `tod.yml` and shown in Settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentPlatform {
-    Cursor,
-    #[serde(alias = "anthropic")]
-    Claude,
-}
+pub use tod_store::AgentPlatform;
 
-impl Default for AgentPlatform {
-    fn default() -> Self {
-        Self::Claude
-    }
-}
-
-impl AgentPlatform {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Cursor => "Cursor",
-            Self::Claude => "Claude",
-        }
-    }
-
-    pub fn acp_host(self) -> AcpHost {
-        match self {
-            Self::Cursor => AcpHost::Cursor,
-            Self::Claude => AcpHost::Claude,
-        }
+pub fn agent_platform_acp_host(platform: AgentPlatform) -> AcpHost {
+    match platform {
+        AgentPlatform::Cursor => AcpHost::Cursor,
+        AgentPlatform::Claude => AcpHost::Claude,
     }
 }
 
@@ -183,7 +160,7 @@ mod tests {
 
     #[test]
     fn platform_maps_to_acp_host() {
-        assert_eq!(AgentPlatform::Cursor.acp_host(), AcpHost::Cursor);
-        assert_eq!(AgentPlatform::Claude.acp_host(), AcpHost::Claude);
+        assert_eq!(agent_platform_acp_host(AgentPlatform::Cursor), AcpHost::Cursor);
+        assert_eq!(agent_platform_acp_host(AgentPlatform::Claude), AcpHost::Claude);
     }
 }

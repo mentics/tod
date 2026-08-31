@@ -5,7 +5,7 @@ use super::provider::{
     DeepDiveContext, RunId,
 };
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
-use crate::agent_traffic::{
+use tod_store::agent_traffic::{
     AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
 };
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};

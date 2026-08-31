@@ -1,8 +1,8 @@
 //! Materialize DB obligations and context to scratchpad files for agents.
 
-use crate::outline::resolve::{resolve_obligations, ResolvedObligation};
-use crate::outline::repos::NodeRepo;
-use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
+use tod_store::outline::resolve::{resolve_obligations, ResolvedObligation};
+use tod_store::outline::repos::NodeRepo;
+use tod_store::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::fs;
@@ -132,11 +132,11 @@ fn capitalize_kind(kind: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::schema;
-    use crate::outline::{CreatePosition, OutlineMutation};
-    use crate::outline::types::Capability;
-    use crate::outline::repos::obligations::NodeObligation;
-    use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
+    use tod_store::fleet::schema;
+    use tod_store::outline::{CreatePosition, OutlineMutation};
+    use tod_store::outline::types::Capability;
+    use tod_store::outline::repos::obligations::NodeObligation;
+    use tod_store::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
     use std::fs;
 
     #[test]
@@ -148,7 +148,7 @@ mod tests {
 
         let list_id = uuid::Uuid::new_v4();
         ListRepo::new(&conn)
-            .insert(&crate::outline::types::OutlineList {
+            .insert(&tod_store::outline::types::OutlineList {
                 id: list_id,
                 slug: "t".into(),
                 title: "T".into(),
@@ -172,7 +172,7 @@ mod tests {
             .unwrap();
         OutlineRepo::new(&conn)
             .insert(
-                &crate::outline::types::OutlineEntry {
+                &tod_store::outline::types::OutlineEntry {
                     node_id: node.id,
                     list_id,
                     parent_id: None,

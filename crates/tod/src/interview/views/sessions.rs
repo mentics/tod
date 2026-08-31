@@ -1,4 +1,4 @@
-use crate::fleet::{FleetStore, ensure_interview_agent_for_node};
+use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use crate::interview::agent::{AgentRunState, BootstrapGate, SharedAgent};
 use crate::interview::config::{
     sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
@@ -390,7 +390,7 @@ impl SessionsView {
     fn provision_interview_agent(
         &self,
         node_id: &str,
-    ) -> Result<crate::fleet::InterviewAgentContext, String> {
+    ) -> Result<tod_store::fleet::InterviewAgentContext, String> {
         let settings = TodSettings::load(&self.paths).map_err(|e| e.to_string())?;
         ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, node_id)
             .map_err(|e| e.to_string())

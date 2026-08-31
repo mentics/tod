@@ -1,4 +1,4 @@
-use crate::agent_traffic::InterviewAgentCounts;
+use tod_store::agent_traffic::InterviewAgentCounts;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::process_bundle::InterviewAgentPrompt;
 use std::path::{Path, PathBuf};

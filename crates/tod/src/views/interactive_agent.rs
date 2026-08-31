@@ -1,8 +1,8 @@
 //! Interactive fleet-agent chat window — prompt in, replies out.
 
 use crate::app::InteractiveAgentWindowControl;
-use crate::fleet::repos::transcript::TranscriptTurn;
-use crate::fleet::{FleetMutation, FleetStore};
+use tod_store::fleet::repos::transcript::TranscriptTurn;
+use tod_store::fleet::{FleetMutation, FleetStore};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;

@@ -1,9 +1,8 @@
 //! Diagnostic logging init and helpers (no call-site facade).
 
-mod level;
 mod prune;
 
-pub use level::LogLevel;
+pub use tod_store::LogLevel;
 pub use prune::prune_log_dir;
 
 use anyhow::{Context, Result};

@@ -2,8 +2,8 @@
 
 use crate::fleet::reconnect_identity::{self, ReconnectIdentity};
 use crate::fleet::{FleetMutation, FleetStore, resolve_agent_workspace};
-use crate::interview::TodPaths;
-use crate::interview::settings::{TerminalSettings, TodSettings};
+use crate::paths::TodPaths;
+use crate::settings::{TerminalSettings, TodSettings};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

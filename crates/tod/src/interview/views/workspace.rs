@@ -1,5 +1,5 @@
-use crate::fleet::FleetStore;
-use crate::fleet::{ensure_interview_agent_for_node, workspace_cwd_for_interview_agent};
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::{ensure_interview_agent_for_node, workspace_cwd_for_interview_agent};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::config::{
     InterviewConfig, parse_interview_config, sync_scaffolding_from_disk,
@@ -22,7 +22,7 @@ use crate::interview::{
     InterviewSession, InterviewSessionStatus, SessionStore, TaskListProceedContext, TodPaths,
     TodSettings,
 };
-use crate::outline::repos::NodeRepo;
+use tod_store::outline::repos::NodeRepo;
 use crate::process::lifecycle_for_interview_phase;
 use crate::process_bundle::{
     InterviewAgentPrompt, ProcessManifest, TodInstallPaths, session_scratchpad,
@@ -3706,9 +3706,9 @@ mod tests {
 
     #[test]
     fn reopen_complete_with_nonempty_queue_flips_active() {
-        use crate::fleet::FleetStore;
+        use tod_store::fleet::FleetStore;
         use crate::interview::db::{NewInterviewSession, SessionStore};
-        use crate::outline::OutlineMutation;
+        use tod_store::outline::OutlineMutation;
         use std::sync::Arc;
 
         let dir = std::env::temp_dir().join(format!("tod-reopen-{}", uuid::Uuid::new_v4()));
@@ -3728,7 +3728,7 @@ mod tests {
                 list_id,
                 parent_id: None,
                 anchor_id: None,
-                position: crate::outline::CreatePosition::Below,
+                position: tod_store::outline::CreatePosition::Below,
                 title: "Node".into(),
             })
             .unwrap();

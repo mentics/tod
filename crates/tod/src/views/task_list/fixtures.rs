@@ -2,8 +2,8 @@ use chrono::Utc;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::fleet::FleetStore;
-use crate::outline::types::Capability;
+use tod_store::fleet::FleetStore;
+use tod_store::outline::types::Capability;
 
 use super::model::{AgentInfo, TaskItem};
 
@@ -117,7 +117,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outline::{CreatePosition, OutlineMutation};
+    use tod_store::outline::{CreatePosition, OutlineMutation};
     use std::fs;
 
     #[test]
@@ -153,7 +153,7 @@ mod tests {
         let projection = store.projection();
         let proj = projection.lock().expect("projection");
         let conn = proj.connection();
-        let node = crate::outline::repos::NodeRepo::new(&conn)
+        let node = tod_store::outline::repos::NodeRepo::new(&conn)
             .get(uuid::Uuid::parse_str(&items[0].id).unwrap())
             .unwrap()
             .unwrap();

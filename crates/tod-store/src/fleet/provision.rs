@@ -4,8 +4,9 @@ use crate::fleet::FleetStore;
 use crate::fleet::repos::agent_config::{AgentConfigRepo, AgentConfigRow, NewAgentConfig};
 use crate::fleet::worktree::{self, WorktreeHandle, validate_git_repo};
 use crate::fleet::writer::FleetMutation;
-use crate::interview::settings::TodSettings;
-use crate::interview::{TodPaths, config::path_for_storage};
+use crate::settings::TodSettings;
+use crate::paths::TodPaths;
+use crate::path_util::path_for_storage;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -263,5 +264,5 @@ fn workspace_cwd_for_node_fallback(
     let projection = fleet.projection();
     let guard = projection.lock().expect("fleet projection mutex");
     let conn = guard.connection();
-    crate::process_bundle::workspace_cwd_for_node(&conn, node_id, paths)
+    crate::outline::workspace_cwd_for_node(&conn, node_id, paths)
 }

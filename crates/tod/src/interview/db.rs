@@ -1,12 +1,12 @@
 //! Interview session persistence (fleet DB).
 
-use crate::fleet::FleetStore;
-use crate::fleet::repos::interview_session::InterviewSessionRepo;
-use crate::fleet::writer::{FleetMutation, FleetWriterError};
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::repos::interview_session::InterviewSessionRepo;
+use tod_store::fleet::writer::{FleetMutation, FleetWriterError};
 use anyhow::Result;
 use uuid::Uuid;
 
-pub use crate::fleet::repos::interview_session::{
+pub use tod_store::fleet::repos::interview_session::{
     InterviewSession, InterviewSessionStatus, NewInterviewSession,
 };
 
@@ -96,7 +96,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outline::OutlineMutation;
+    use tod_store::outline::OutlineMutation;
     use std::fs;
 
     #[test]
@@ -119,7 +119,7 @@ mod tests {
                 list_id,
                 parent_id: None,
                 anchor_id: None,
-                position: crate::outline::CreatePosition::Below,
+                position: tod_store::outline::CreatePosition::Below,
                 title: "Node".into(),
             })
             .unwrap();

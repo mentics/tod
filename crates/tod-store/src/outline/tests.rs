@@ -1,7 +1,7 @@
 //! Outline integration tests.
 
 use crate::fleet::store::FleetStore;
-use crate::interview::paths::{clear_data_root_override, set_data_root};
+use crate::paths::{clear_data_root_override, set_data_root};
 use crate::outline::types::Capability;
 use crate::outline::{CreatePosition, OutlineMutation, resolve_obligations};
 use std::fs;
