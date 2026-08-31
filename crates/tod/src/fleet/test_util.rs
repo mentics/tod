@@ -1,6 +1,6 @@
 //! Shared helpers for fleet persistence verification tests.
 
-use crate::fleet::repos::agent::{AgentRepo, NewAgent};
+use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use rusqlite::Connection;
 use std::fs;
@@ -35,9 +35,16 @@ fn lifecycle_for(index: usize) -> String {
     .into()
 }
 
+fn deterministic_uuid(index: usize) -> String {
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&(index as u64).to_be_bytes());
+    Uuid::from_bytes(bytes).to_string()
+}
+
 fn deterministic_task(index: usize) -> FleetTask {
+    let id = deterministic_uuid(index);
     FleetTask {
-        id: format!("scale-task-{index:04}"),
+        id: id.clone(),
         title: format!("Scale Task {index}"),
         slug: format!("scale-task-{index}"),
         lifecycle: lifecycle_for(index),
@@ -69,13 +76,15 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
     for index in 0..AGENT_COUNT {
         let agent = NewAgent {
             id: format!("scale-agent-{index:03}"),
-            task_id: task_ids[index % TASK_COUNT].clone(),
+            node_id: task_ids[index % TASK_COUNT].clone(),
             env_type: if index % 2 == 0 {
                 "local".into()
             } else {
                 "devcontainer".into()
             },
             mode: "agent".into(),
+            work_directory: None,
+            use_worktree: false,
         };
         AgentRepo::new(conn)
             .insert(&agent)

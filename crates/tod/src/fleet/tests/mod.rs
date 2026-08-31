@@ -3,7 +3,7 @@
 use crate::fleet::launch::FleetLaunchError;
 use crate::fleet::lock::FleetLockError;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::fleet::repos::agent::{AgentRepo, NewAgent};
+use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
@@ -21,9 +21,12 @@ fn short_settle() {
 
 fn read_task_title(db_path: &std::path::Path, id: &str) -> Option<String> {
     let conn = schema::open_read_connection(db_path).unwrap();
+    let blob = uuid::Uuid::parse_str(id)
+        .ok()
+        .map(|u| u.as_bytes().to_vec())?;
     conn.query_row(
-        "SELECT title FROM tasks WHERE id = ?1",
-        [id],
+        "SELECT title FROM nodes WHERE id = ?1",
+        [blob],
         |row| row.get(0),
     )
     .optional()
@@ -64,14 +67,18 @@ fn external_edit_reloads_fleet_store_projection() {
     let db_path = store.paths().db().to_path_buf();
     {
         let conn = schema::open_writer_connection(&db_path).unwrap();
+        let node_id = uuid::Uuid::new_v4();
+        let blob = node_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                uuid::Uuid::new_v4().to_string(),
-                "External",
-                "external",
-                "proposed"
-            ],
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+            rusqlite::params![blob, "external", "External", now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'agent', ?2)",
+            rusqlite::params![blob, now],
         )
         .unwrap();
     }
@@ -99,7 +106,7 @@ fn debounced_mutations_lost_when_writer_abandoned() {
     schema::open_writer_connection(&db_path).unwrap();
 
     let writer =
-        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(3600)).unwrap();
+        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(3600), crate::fleet::command_log::CommandLog::shared()).unwrap();
     let task_id = uuid::Uuid::new_v4().to_string();
     writer
         .enqueue(FleetMutation::InsertTask {
@@ -155,14 +162,14 @@ fn scale_generator_inserts_tasks_and_agents() {
 
     let tasks = store.list_tasks().unwrap();
     assert_eq!(tasks.len(), snapshot.task_count);
-    assert!(tasks.iter().any(|t| t.id == "scale-task-0000"));
-    assert!(tasks.iter().any(|t| t.id == "scale-task-0499"));
+    assert!(tasks.iter().any(|t| t.slug == "scale-task-0"));
+    assert!(tasks.iter().any(|t| t.slug == "scale-task-499"));
 
     let projection = store.projection();
     let guard = projection.lock().unwrap();
     let agent_total: usize = guard
         .connection()
-        .query_row("SELECT COUNT(*) FROM agents", [], |row| {
+        .query_row("SELECT COUNT(*) FROM agent_configs", [], |row| {
             row.get::<_, i64>(0).map(|n| n as usize)
         })
         .unwrap();
@@ -203,7 +210,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     schema::open_writer_connection(&db_path).unwrap();
 
     let writer =
-        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(60)).unwrap();
+        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(60), crate::fleet::command_log::CommandLog::shared()).unwrap();
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let agent_id = uuid::Uuid::new_v4().to_string();
@@ -228,9 +235,11 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
         .enqueue(FleetMutation::InsertAgent {
             agent: NewAgent {
                 id: agent_id.clone(),
-                task_id: task_id.clone(),
+                node_id: task_id.clone(),
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             },
         })
         .unwrap();
@@ -493,9 +502,11 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
             .enqueue(FleetMutation::InsertAgent {
                 agent: NewAgent {
                     id: agent_id.clone(),
-                    task_id,
+                    node_id: task_id,
                     env_type: "local".into(),
                     mode: "agent".into(),
+                    work_directory: None,
+                    use_worktree: false,
                 },
             })
             .unwrap();

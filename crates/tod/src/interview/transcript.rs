@@ -21,7 +21,7 @@ pub fn append_answer(
     append_block(transcript_path, &block)
 }
 
-/// Append a researcher-action block before forwarding to the researcher.
+/// Append a question-maker-action block before forwarding to the question maker.
 pub fn append_action(
     transcript_path: &Path,
     question_id: &str,
@@ -152,7 +152,7 @@ pub fn format_answer_payload(records: &[AnswerRecord]) -> Result<String> {
     Ok(out)
 }
 
-/// Serialize one or more researcher action records.
+/// Serialize one or more question maker action records.
 /// Front matter is `action` + `id` only; free text follows the closing `---`.
 pub fn format_action_payload(records: &[ActionRecord]) -> Result<String> {
     if records.is_empty() {

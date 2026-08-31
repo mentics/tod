@@ -1,5 +1,6 @@
 use super::provider::{AgentRunState, RunId};
 use crate::interview::settings::AnswerProcessorSettings;
+use crate::process_bundle::InterviewAgentPrompt;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ pub struct AnswerProcessorPoolStats {
 #[derive(Debug, Clone)]
 struct QueuedJob {
     run_id: RunId,
-    prompt: String,
+    prompt: InterviewAgentPrompt,
 }
 
 #[derive(Debug)]
@@ -40,7 +41,7 @@ pub enum AnswerSubmitAssignment {
     /// Run immediately on the given slot.
     Dispatch { slot_id: u32, prompt: String },
     /// All pool sessions busy at capacity — queued until a slot frees.
-    Queued { prompt: String },
+    Queued { prompt: InterviewAgentPrompt },
 }
 
 /// Outcome after an answer-processor response is processed.
@@ -82,12 +83,16 @@ impl InterviewPool {
     }
 
     /// Register a new answer-processor run.
-    fn submit(&mut self, run_id: RunId, prompt: String) -> Result<AnswerSubmitAssignment, String> {
+    fn submit(&mut self, run_id: RunId, prompt: InterviewAgentPrompt) -> Result<AnswerSubmitAssignment, String> {
         if let Some(idx) = self.find_idle_slot() {
             self.runs.insert(run_id, AgentRunState::InFlight);
             self.slots[idx].busy = true;
             let slot_id = self.slots[idx].slot_id;
-            return Ok(AnswerSubmitAssignment::Dispatch { slot_id, prompt });
+            let responses_received = self.slots[idx].responses_received;
+            return Ok(AnswerSubmitAssignment::Dispatch {
+                slot_id,
+                prompt: prompt.for_slot(responses_received),
+            });
         }
 
         if self.slots.len() < self.settings.session_pool_size as usize {
@@ -95,7 +100,10 @@ impl InterviewPool {
             let idx = self.slots.len() - 1;
             self.runs.insert(run_id, AgentRunState::InFlight);
             self.slots[idx].busy = true;
-            return Ok(AnswerSubmitAssignment::Dispatch { slot_id, prompt });
+            return Ok(AnswerSubmitAssignment::Dispatch {
+                slot_id,
+                prompt: prompt.for_slot(0),
+            });
         }
 
         self.runs.insert(run_id, AgentRunState::InFlight);
@@ -162,8 +170,13 @@ impl InterviewPool {
             let job = self.queue.pop_front().expect("front exists");
             self.slots[slot_idx].busy = true;
             let slot_id = self.slots[slot_idx].slot_id;
+            let responses_received = self.slots[slot_idx].responses_received;
             self.runs.insert(job.run_id, AgentRunState::InFlight);
-            dispatched.push((slot_id, job.run_id, job.prompt));
+            dispatched.push((
+                slot_id,
+                job.run_id,
+                job.prompt.for_slot(responses_received),
+            ));
         }
         dispatched
     }
@@ -178,21 +191,20 @@ impl InterviewPool {
     }
 }
 
-/// Per-interview-entity session pool keyed by canonical cwd.
+/// Per-agent-config session pool (not keyed by cwd).
 #[derive(Debug, Default)]
 pub struct AnswerProcessorPoolManager {
-    pools: HashMap<PathBuf, InterviewPool>,
+    pools: HashMap<String, InterviewPool>,
 }
 
 impl AnswerProcessorPoolManager {
     pub fn stats(
         &self,
-        cwd: &Path,
+        agent_config_id: &str,
         settings: &AnswerProcessorSettings,
     ) -> AnswerProcessorPoolStats {
-        let key = normalize_cwd(cwd);
         self.pools
-            .get(&key)
+            .get(agent_config_id)
             .map(InterviewPool::stats)
             .unwrap_or(AnswerProcessorPoolStats {
                 active: 0,
@@ -201,14 +213,23 @@ impl AnswerProcessorPoolManager {
             })
     }
 
-    pub fn poll_run(&mut self, cwd: &Path, id: RunId) -> Option<AgentRunState> {
-        let key = normalize_cwd(cwd);
-        self.pools.get_mut(&key)?.poll_run(id)
+    pub fn global_stats(&self) -> AnswerProcessorPoolStats {
+        let mut stats = AnswerProcessorPoolStats::default();
+        for pool in self.pools.values() {
+            let pool_stats = pool.stats();
+            stats.active += pool_stats.active;
+            stats.in_pool += pool_stats.in_pool;
+            stats.max = stats.max.max(pool_stats.max);
+        }
+        stats
     }
 
-    pub fn cancel_run(&mut self, cwd: &Path, id: RunId) {
-        let key = normalize_cwd(cwd);
-        if let Some(pool) = self.pools.get_mut(&key) {
+    pub fn poll_run(&mut self, agent_config_id: &str, id: RunId) -> Option<AgentRunState> {
+        self.pools.get_mut(agent_config_id)?.poll_run(id)
+    }
+
+    pub fn cancel_run(&mut self, agent_config_id: &str, id: RunId) {
+        if let Some(pool) = self.pools.get_mut(agent_config_id) {
             pool.cancel_run(id);
         }
     }
@@ -216,12 +237,11 @@ impl AnswerProcessorPoolManager {
     /// Register a new answer-processor run.
     pub fn submit(
         &mut self,
-        cwd: PathBuf,
+        agent_config_id: String,
         settings: AnswerProcessorSettings,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
     ) -> Result<(AnswerSubmitAssignment, RunId), String> {
-        let key = normalize_cwd(&cwd);
-        let pool = self.pools.entry(key).or_insert_with(|| InterviewPool {
+        let pool = self.pools.entry(agent_config_id).or_insert_with(|| InterviewPool {
             settings: settings.clone(),
             slots: Vec::new(),
             queue: VecDeque::new(),
@@ -236,13 +256,12 @@ impl AnswerProcessorPoolManager {
 
     pub fn complete_run(
         &mut self,
-        cwd: &Path,
+        agent_config_id: &str,
         slot_id: u32,
         run_id: RunId,
         result: Result<String, String>,
     ) -> CompleteRunOutcome {
-        let key = normalize_cwd(cwd);
-        let Some(pool) = self.pools.get_mut(&key) else {
+        let Some(pool) = self.pools.get_mut(agent_config_id) else {
             return CompleteRunOutcome {
                 dispatched: Vec::new(),
                 recycled_slot_id: None,
@@ -252,54 +271,112 @@ impl AnswerProcessorPoolManager {
     }
 }
 
-fn normalize_cwd(cwd: &Path) -> PathBuf {
-    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn turn_prompt(text: &str) -> InterviewAgentPrompt {
+        InterviewAgentPrompt {
+            session_prefix: String::new(),
+            turn: text.into(),
+        }
+    }
+
+    #[test]
+    fn first_dispatch_includes_session_prefix() {
+        let mut mgr = AnswerProcessorPoolManager::default();
+        let agent = "test-agent".to_string();
+        let settings = AnswerProcessorSettings::default();
+        let prompt = InterviewAgentPrompt {
+            session_prefix: "PREFIX".into(),
+            turn: "TURN".into(),
+        };
+        let (assignment, _) = mgr.submit(agent, settings, prompt).unwrap();
+        match assignment {
+            AnswerSubmitAssignment::Dispatch { prompt, .. } => {
+                assert_eq!(prompt, "PREFIX\n\nTURN");
+            }
+            _ => panic!("expected dispatch"),
+        }
+    }
+
+    #[test]
+    fn followup_dispatch_omits_session_prefix() {
+        let mut mgr = AnswerProcessorPoolManager::default();
+        let agent = "test-agent-2".to_string();
+        let settings = AnswerProcessorSettings::default();
+        let prompt = InterviewAgentPrompt {
+            session_prefix: "PREFIX".into(),
+            turn: "TURN".into(),
+        };
+        let (a0, r0) = mgr.submit(agent.clone(), settings.clone(), prompt).unwrap();
+        let slot0 = match a0 {
+            AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,
+            _ => panic!("expected dispatch"),
+        };
+        mgr.complete_run(&agent, slot0, r0, Ok("ok".into()));
+
+        let (a1, _) = mgr
+            .submit(
+                agent,
+                settings,
+                InterviewAgentPrompt {
+                    session_prefix: "PREFIX2".into(),
+                    turn: "TURN2".into(),
+                },
+            )
+            .unwrap();
+        match a1 {
+            AnswerSubmitAssignment::Dispatch { prompt, .. } => {
+                assert_eq!(prompt, "TURN2");
+            }
+            _ => panic!("expected dispatch"),
+        }
+    }
+
     #[test]
     fn reuses_idle_slot_before_opening_new() {
         let mut mgr = AnswerProcessorPoolManager::default();
-        let cwd = PathBuf::from("/tmp/interview-a");
+        let agent = "test-agent-a".to_string();
         let settings = AnswerProcessorSettings {
             session_pool_size: 4,
             answers_per_session: 4,
         };
 
         let (a0, r0) = mgr
-            .submit(cwd.clone(), settings.clone(), "p0".into())
+            .submit(agent.clone(), settings.clone(), InterviewAgentPrompt {
+                session_prefix: "prefix".into(),
+                turn: "p0".into(),
+            })
             .unwrap();
         let slot0 = match a0 {
             AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,
             _ => panic!("expected dispatch"),
         };
 
-        mgr.complete_run(&cwd, slot0, r0, Ok("ok".into()));
+        mgr.complete_run(&agent, slot0, r0, Ok("ok".into()));
 
         let (a1, _r1) = mgr
-            .submit(cwd.clone(), settings.clone(), "p1".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p1"))
             .unwrap();
         assert!(matches!(
             a1,
             AnswerSubmitAssignment::Dispatch { slot_id, .. } if slot_id == slot0
         ));
-        assert_eq!(mgr.stats(&cwd, &settings).in_pool, 1);
+        assert_eq!(mgr.stats(&agent, &settings).in_pool, 1);
     }
 
     #[test]
     fn opens_second_slot_when_first_busy() {
         let mut mgr = AnswerProcessorPoolManager::default();
-        let cwd = PathBuf::from("/tmp/interview-b");
+        let agent = "test-agent-b".to_string();
         let settings = AnswerProcessorSettings {
             session_pool_size: 4,
             answers_per_session: 4,
         };
 
         let (a0, _r0) = mgr
-            .submit(cwd.clone(), settings.clone(), "p0".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p0"))
             .unwrap();
         let slot0 = match a0 {
             AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,
@@ -307,69 +384,72 @@ mod tests {
         };
 
         let (a1, _r1) = mgr
-            .submit(cwd.clone(), settings.clone(), "p1".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p1"))
             .unwrap();
         assert!(matches!(
             a1,
             AnswerSubmitAssignment::Dispatch { slot_id, .. } if slot_id != slot0
         ));
-        assert_eq!(mgr.stats(&cwd, &settings).active, 2);
-        assert_eq!(mgr.stats(&cwd, &settings).in_pool, 2);
+        assert_eq!(mgr.stats(&agent, &settings).active, 2);
+        assert_eq!(mgr.stats(&agent, &settings).in_pool, 2);
     }
 
     #[test]
     fn recycles_after_nth_response() {
         let mut mgr = AnswerProcessorPoolManager::default();
-        let cwd = PathBuf::from("/tmp/interview-c");
+        let agent = "test-agent-c".to_string();
         let settings = AnswerProcessorSettings {
             session_pool_size: 4,
             answers_per_session: 2,
         };
 
         let (a0, r0) = mgr
-            .submit(cwd.clone(), settings.clone(), "p0".into())
+            .submit(agent.clone(), settings.clone(), InterviewAgentPrompt {
+                session_prefix: "prefix".into(),
+                turn: "p0".into(),
+            })
             .unwrap();
         let slot0 = match a0 {
             AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,
             _ => panic!("expected dispatch"),
         };
-        mgr.complete_run(&cwd, slot0, r0, Ok("ok".into()));
+        mgr.complete_run(&agent, slot0, r0, Ok("ok".into()));
 
         let (_, r1) = mgr
-            .submit(cwd.clone(), settings.clone(), "p1".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p1"))
             .unwrap();
-        let outcome = mgr.complete_run(&cwd, slot0, r1, Ok("ok".into()));
+        let outcome = mgr.complete_run(&agent, slot0, r1, Ok("ok".into()));
         assert_eq!(outcome.recycled_slot_id, Some(slot0));
-        assert_eq!(mgr.stats(&cwd, &settings).in_pool, 0);
+        assert_eq!(mgr.stats(&agent, &settings).in_pool, 0);
 
         let (a2, _) = mgr
-            .submit(cwd.clone(), settings.clone(), "p2".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p2"))
             .unwrap();
         assert!(matches!(a2, AnswerSubmitAssignment::Dispatch { .. }));
-        assert_eq!(mgr.stats(&cwd, &settings).in_pool, 1);
+        assert_eq!(mgr.stats(&agent, &settings).in_pool, 1);
     }
 
     #[test]
     fn queues_when_pool_full_and_all_busy() {
         let mut mgr = AnswerProcessorPoolManager::default();
-        let cwd = PathBuf::from("/tmp/interview-d");
+        let agent = "test-agent-d".to_string();
         let settings = AnswerProcessorSettings {
             session_pool_size: 2,
             answers_per_session: 4,
         };
 
         let (_, _r0) = mgr
-            .submit(cwd.clone(), settings.clone(), "p0".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p0"))
             .unwrap();
         let (_, _r1) = mgr
-            .submit(cwd.clone(), settings.clone(), "p1".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p1"))
             .unwrap();
         let (a2, r2) = mgr
-            .submit(cwd.clone(), settings.clone(), "p2".into())
+            .submit(agent.clone(), settings.clone(), turn_prompt("p2"))
             .unwrap();
         assert!(matches!(a2, AnswerSubmitAssignment::Queued { .. }));
         assert!(matches!(
-            mgr.poll_run(&cwd, r2),
+            mgr.poll_run(&agent, r2),
             Some(AgentRunState::InFlight)
         ));
     }

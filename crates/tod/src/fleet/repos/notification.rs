@@ -1,13 +1,19 @@
 //! Notification repository — open rows and hard-delete resolve.
 
+use crate::fleet::repos::agent_config::AgentConfigRepo;
+use crate::outline::uuid_blob::{blob_to_uuid, uuid_to_blob};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetNotification {
     pub id: String,
     pub message: String,
+    /// Node UUID string when related to a task/node.
+    pub related_node_id: Option<String>,
+    /// Back-compat alias.
     pub related_task_id: Option<String>,
     pub related_agent_ids: Vec<String>,
 }
@@ -16,6 +22,8 @@ pub struct FleetNotification {
 pub enum NotificationRepoError {
     #[error("notification not found")]
     NotFound,
+    #[error(transparent)]
+    AgentConfig(#[from] crate::fleet::repos::agent_config::AgentConfigRepoError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -31,20 +39,32 @@ impl<'a> NotificationRepo<'a> {
         Self { conn }
     }
 
+    fn node_blob(node_id: Option<&str>) -> Result<Option<Vec<u8>>, NotificationRepoError> {
+        Ok(match node_id {
+            Some(id) => Some(uuid_to_blob(Uuid::parse_str(id).map_err(|_| {
+                NotificationRepoError::Other(anyhow::anyhow!(
+                    "invalid node id (expected UUID): {id}"
+                ))
+            })?)),
+            None => None,
+        })
+    }
+
     pub fn create(
         &self,
         id: &str,
         message: &str,
-        related_task_id: Option<&str>,
+        related_node_id: Option<&str>,
         related_agent_ids: &[String],
     ) -> Result<(), NotificationRepoError> {
+        let node_blob = Self::node_blob(related_node_id)?;
         self.conn.execute(
-            "INSERT INTO notifications (id, message, related_task_id) VALUES (?1, ?2, ?3)",
-            params![id, message, related_task_id],
+            "INSERT INTO notifications (id, message, related_node_id) VALUES (?1, ?2, ?3)",
+            params![id, message, node_blob],
         )?;
         for agent_id in related_agent_ids {
             self.conn.execute(
-                "INSERT INTO notification_agents (notification_id, agent_id) VALUES (?1, ?2)",
+                "INSERT INTO notification_agents (notification_id, agent_config_id) VALUES (?1, ?2)",
                 params![id, agent_id],
             )?;
         }
@@ -56,14 +76,11 @@ impl<'a> NotificationRepo<'a> {
         &self,
         id: &str,
         message: &str,
-        related_task_id: Option<&str>,
+        related_node_id: Option<&str>,
         agent_id: &str,
     ) -> Result<(), NotificationRepoError> {
-        self.create(id, message, related_task_id, &[agent_id.to_string()])?;
-        self.conn.execute(
-            "UPDATE agents SET runtime_status = 'blocked' WHERE id = ?1",
-            params![agent_id],
-        )?;
+        self.create(id, message, related_node_id, &[agent_id.to_string()])?;
+        AgentConfigRepo::new(self.conn).update_runtime_status(agent_id, "blocked")?;
         Ok(())
     }
 
@@ -71,30 +88,42 @@ impl<'a> NotificationRepo<'a> {
         let base = self
             .conn
             .query_row(
-                "SELECT id, message, related_task_id FROM notifications WHERE id = ?1",
+                "SELECT id, message, related_node_id FROM notifications WHERE id = ?1",
                 params![id],
                 |row| {
+                    let node_blob: Option<Vec<u8>> = row.get(2)?;
+                    let related_node_id = node_blob
+                        .as_deref()
+                        .map(blob_to_uuid)
+                        .transpose()
+                        .map_err(|e| {
+                            rusqlite::Error::InvalidParameterName(format!(
+                                "invalid related_node_id blob: {e}"
+                            ))
+                        })?
+                        .map(|u| u.to_string());
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
+                        related_node_id,
                     ))
                 },
             )
             .optional()?;
-        let Some((id, message, related_task_id)) = base else {
+        let Some((id, message, related_node_id)) = base else {
             return Ok(None);
         };
         let mut stmt = self.conn.prepare(
-            "SELECT agent_id FROM notification_agents WHERE notification_id = ?1 ORDER BY agent_id",
+            "SELECT agent_config_id FROM notification_agents WHERE notification_id = ?1 ORDER BY agent_config_id",
         )?;
         let agent_ids = stmt
             .query_map(params![id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(Some(FleetNotification {
+            related_task_id: related_node_id.clone(),
             id,
             message,
-            related_task_id,
+            related_node_id,
             related_agent_ids: agent_ids,
         }))
     }
@@ -136,7 +165,9 @@ impl<'a> NotificationRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent::{AgentRepo, NewAgent};
+    use crate::fleet::repos::agent_config::{
+        AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent,
+    };
     use crate::fleet::repos::task::{FleetTask, TaskRepo};
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
     use crate::fleet::schema;
@@ -150,9 +181,11 @@ mod tests {
         AgentRepo::new(conn)
             .insert(&NewAgent {
                 id: agent_id.clone(),
-                task_id,
+                node_id: task_id,
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             })
             .unwrap();
         agent_id
@@ -186,9 +219,11 @@ mod tests {
         AgentRepo::new(&conn)
             .insert(&NewAgent {
                 id: a2.clone(),
-                task_id,
+                node_id: task_id,
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             })
             .unwrap();
 

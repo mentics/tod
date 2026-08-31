@@ -2,25 +2,37 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    Context, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
+    App, Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
+use gpui_component::input::Input;
+use gpui_component::input::InputState;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
+use gpui_component::menu::PopupMenu;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
 
 use super::model::TaskItem;
-use crate::ui::list::TWO_LINE_ROW_HEIGHT;
+use super::row_menu::{RowMenuKind, row_menu_anchor};
+
+/// Checkvist-style uniform tree row height.
+pub const TREE_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
+/// Horizontal step per depth level — child chevron aligns with parent text start.
+const TREE_LEVEL_STEP: f32 = 18.0;
+const TREE_CHEVRON_WIDTH: f32 = 16.0;
 
 #[derive(Debug, Clone)]
 pub enum RowAction {
     OpenEdit { task_id: String },
+    InlineEdit { task_id: String },
     ToggleTagFilter { task_id: String, tag: String },
     AgentsControl { task_id: String },
     ShellsControl { task_id: String },
     LifecycleControl { task_id: String, lifecycle: String },
     RowChrome { task_id: String },
+    ToggleCollapsed { task_id: String },
+    OpenObligations { task_id: String },
 }
 
 pub struct TaskListDelegate {
@@ -28,6 +40,10 @@ pub struct TaskListDelegate {
     selected_index: Option<IndexPath>,
     tag_filter: Option<String>,
     action_sink: Rc<RefCell<Vec<RowAction>>>,
+    editing_id: Option<String>,
+    inline_edit_input: Option<Entity<InputState>>,
+    open_row_menu: Option<(RowMenuKind, String)>,
+    row_menu: Option<Entity<PopupMenu>>,
 }
 
 impl TaskListDelegate {
@@ -37,7 +53,29 @@ impl TaskListDelegate {
             selected_index: None,
             tag_filter: None,
             action_sink,
+            editing_id: None,
+            inline_edit_input: None,
+            open_row_menu: None,
+            row_menu: None,
         }
+    }
+
+    pub fn set_row_menu(
+        &mut self,
+        open: Option<(RowMenuKind, String)>,
+        menu: Option<Entity<PopupMenu>>,
+    ) {
+        self.open_row_menu = open;
+        self.row_menu = menu;
+    }
+
+    pub fn set_inline_edit(
+        &mut self,
+        editing_id: Option<String>,
+        inline_edit_input: Entity<InputState>,
+    ) {
+        self.editing_id = editing_id;
+        self.inline_edit_input = Some(inline_edit_input);
     }
 
     pub fn set_items(&mut self, items: Vec<TaskItem>) {
@@ -84,114 +122,134 @@ impl ListDelegate for TaskListDelegate {
     ) -> Option<Self::Item> {
         let item = self.items.get(ix.row)?.clone();
         let selected = self.selected_index.map(|s| s.eq_row(ix)).unwrap_or(false);
-        let theme = cx.theme();
         let tag_filter = self.tag_filter.clone();
         let sink = self.action_sink.clone();
-        let chip_border = theme.muted_foreground.opacity(0.5);
+        let chip_border = cx.theme().muted_foreground.opacity(0.5);
         let border = chip_border;
-        let primary = theme.primary;
-        let secondary = theme.secondary;
-        let background = theme.background;
-        let foreground = theme.foreground;
+        let primary = cx.theme().primary;
+        let secondary = cx.theme().secondary;
+        let background = cx.theme().background;
+        let foreground = cx.theme().foreground;
+        let muted_foreground = cx.theme().muted_foreground;
+        let link_color = cx.theme().link;
+        let muted_bg = cx.theme().muted;
 
-        let line1 = h_flex()
-            .gap_2()
-            .items_center()
-            .when_some(item.ticket_id.clone(), |row, ticket| {
-                row.child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(theme.link)
-                        .child(ticket),
+        let is_work = item.is_work_node;
+        let display_title = if item.title.is_empty() {
+            "(new item)".to_string()
+        } else {
+            item.title.clone()
+        };
+        let depth_indent = px(item.depth as f32 * TREE_LEVEL_STEP);
+        let task_id_toggle = item.id.clone();
+        let sink_toggle = sink.clone();
+        let collapsed = item.collapsed;
+        let chevron_cell = div()
+            .w(px(TREE_CHEVRON_WIDTH))
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(muted_foreground)
+            .when(item.has_children, |el| {
+                el.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, _, cx| {
+                        cx.stop_propagation();
+                        sink_toggle.borrow_mut().push(RowAction::ToggleCollapsed {
+                            task_id: task_id_toggle.clone(),
+                        });
+                    }),
                 )
             })
-            .child(title_edit_affordance(
-                theme.foreground,
-                item.title.clone(),
+            .child(if item.has_children {
+                if collapsed { "▸" } else { "▾" }
+            } else {
+                ""
+            });
+
+        let mut chips = h_flex().gap_1().items_center().ml_auto();
+        if item.has_spec {
+            let obl_label = format!(
+                "{} req · {} con",
+                item.requirement_count, item.constraint_count
+            );
+            let task_id_obl = item.id.clone();
+            chips = chips.child(action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                obl_label,
                 selected,
+                if selected { Some("O") } else { None },
                 {
                     let sink = sink.clone();
-                    let task_id = item.id.clone();
-                    move |_, _, _| {
-                        sink.borrow_mut().push(RowAction::OpenEdit {
-                            task_id: task_id.clone(),
+                    move || {
+                        sink.borrow_mut().push(RowAction::OpenObligations {
+                            task_id: task_id_obl.clone(),
                         });
                     }
                 },
             ));
-
-        let lifecycle = item.lifecycle.clone();
-        let task_id_lc = item.id.clone();
-        let lifecycle_chip = action_chip(
-            border,
-            primary,
-            secondary,
-            background,
-            foreground,
-            lifecycle.clone(),
-            selected,
-            None,
-            {
-                let sink = sink.clone();
-                move |_, _, _| {
-                    sink.borrow_mut().push(RowAction::LifecycleControl {
-                        task_id: task_id_lc.clone(),
-                        lifecycle: lifecycle.clone(),
-                    });
-                }
-            },
-        );
-
-        let agents_count = item.agent_count();
-        let agents_label = format!("agents {agents_count}");
-        let task_id_agents = item.id.clone();
-        let agents_chip = action_chip(
-            border,
-            primary,
-            secondary,
-            background,
-            foreground,
-            agents_label,
-            selected,
-            if selected { Some("A") } else { None },
-            {
-                let sink = sink.clone();
-                move |_, _, _| {
-                    sink.borrow_mut().push(RowAction::AgentsControl {
-                        task_id: task_id_agents.clone(),
-                    });
-                }
-            },
-        );
-
-        let shells_count = item.shell_count();
-        let shells_label = format!("shells {shells_count}");
-        let task_id_shells = item.id.clone();
-        let shells_chip = action_chip(
-            border,
-            primary,
-            secondary,
-            background,
-            foreground,
-            shells_label,
-            selected,
-            if selected { Some("T") } else { None },
-            {
-                let sink = sink.clone();
-                move |_, _, _| {
-                    sink.borrow_mut().push(RowAction::ShellsControl {
-                        task_id: task_id_shells.clone(),
-                    });
-                }
-            },
-        );
-
-        let sorted_tags = item.sorted_tags();
-        let tag_elements: Vec<_> = sorted_tags
-            .iter()
-            .enumerate()
-            .map(|(tag_ix, tag)| {
+        }
+        if is_work {
+            if !item.lifecycle.is_empty() {
+                let lifecycle = item.lifecycle.clone();
+                let task_id_lc = item.id.clone();
+                chips = chips.child(action_chip(
+                    cx,
+                    border,
+                    primary,
+                    secondary,
+                    background,
+                    foreground,
+                    lifecycle.clone(),
+                    selected,
+                    if selected { Some("L") } else { None },
+                    {
+                        let sink = sink.clone();
+                        move || {
+                            sink.borrow_mut().push(RowAction::LifecycleControl {
+                                task_id: task_id_lc.clone(),
+                                lifecycle: lifecycle.clone(),
+                            });
+                        }
+                    },
+                ));
+            }
+            let agents_count = item.agent_count();
+            let agents_label = format!("A {agents_count}");
+            let task_id_agents = item.id.clone();
+            let agents_chip = action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                agents_label,
+                selected,
+                if selected { Some("A") } else { None },
+                {
+                    let sink = sink.clone();
+                    move || {
+                        sink.borrow_mut().push(RowAction::AgentsControl {
+                            task_id: task_id_agents.clone(),
+                        });
+                    }
+                },
+            );
+            let agents_menu_open = selected
+                && self
+                    .open_row_menu
+                    .as_ref()
+                    .is_some_and(|(kind, id)| kind == &RowMenuKind::Agents && id == &item.id);
+            chips = chips.child(row_menu_anchor(
+                agents_chip,
+                agents_menu_open.then(|| self.row_menu.clone()).flatten(),
+            ));
+            for (tag_ix, tag) in item.sorted_tags().iter().enumerate() {
                 let tag = tag.clone();
                 let active = tag_filter
                     .as_ref()
@@ -209,56 +267,88 @@ impl ListDelegate for TaskListDelegate {
                 let sink = sink.clone();
                 let tag_for_filter = tag.clone();
                 let task_id_for_tag = item.id.clone();
-                tag_chip(tag, active, badge, move |_, _, _| {
+                chips = chips.child(tag_chip(cx, tag, active, badge, move || {
                     sink.borrow_mut().push(RowAction::ToggleTagFilter {
                         task_id: task_id_for_tag.clone(),
                         tag: tag_for_filter.clone(),
                     });
-                })
-            })
-            .collect();
+                }));
+            }
+        }
 
-        let row_task_id = item.id.clone();
-        let row_sink = sink.clone();
-        let row_content = v_flex()
-            .h(TWO_LINE_ROW_HEIGHT)
-            .justify_center()
-            .gap_0()
+        let mut title_row = h_flex()
+            .gap_1()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .pl(depth_indent)
+            .child(chevron_cell)
+            .when_some(item.ticket_id.clone(), |row, ticket| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(link_color)
+                        .flex_shrink_0()
+                        .child(format!("{ticket}: ")),
+                )
+            });
+        if self.editing_id.as_deref() == Some(item.id.as_str()) {
+            if let Some(input) = &self.inline_edit_input {
+                title_row =
+                    title_row.child(div().flex_1().min_w_0().child(Input::new(input).w_full()));
+            }
+        } else {
+            let title_color = if item.title.is_empty() {
+                muted_foreground
+            } else {
+                foreground
+            };
+            title_row = title_row.child(div().flex_1().min_w_0().overflow_hidden().child(
+                title_label(
+                    cx,
+                    title_color,
+                    display_title.clone(),
+                    selected,
+                    item.id.clone(),
+                    sink.clone(),
+                ),
+            ));
+        }
+        let chips_menu_open = selected
+            && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
+                matches!(kind, RowMenuKind::Shells | RowMenuKind::ShellAgentPick) && id == &item.id
+            });
+        let title_line = if chips_menu_open {
+            title_row.child(row_menu_anchor(chips, self.row_menu.clone()))
+        } else {
+            title_row.child(chips)
+        };
+
+        let row_content = h_flex()
+            .h(TREE_ROW_HEIGHT)
+            .items_center()
             .px_2()
             .border_b_1()
             .border_color(border)
+            .relative()
             .when(selected, |el| {
-                el.border_l(px(3.))
-                    .border_color(theme.primary)
-                    .bg(theme.muted)
-                    .border_1()
-                    .border_color(theme.primary)
+                el.bg(muted_bg).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(primary),
+                )
             })
-            .child(line1)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .flex_wrap()
-                    .child(lifecycle_chip)
-                    .child(agents_chip)
-                    .child(shells_chip)
-                    .children(tag_elements),
-            );
+            .child(title_line);
 
         Some(
             ListItem::new(("task-row", ix.row))
                 .selected(selected)
-                .h(TWO_LINE_ROW_HEIGHT)
-                .on_click({
-                    let sink = row_sink;
-                    let task_id = row_task_id;
-                    move |_, _, _| {
-                        sink.borrow_mut().push(RowAction::RowChrome {
-                            task_id: task_id.clone(),
-                        });
-                    }
-                })
+                .h(TREE_ROW_HEIGHT)
                 .child(row_content),
         )
     }
@@ -281,11 +371,13 @@ impl ListDelegate for TaskListDelegate {
     }
 }
 
-fn title_edit_affordance(
+fn title_label(
+    cx: &mut Context<ListState<TaskListDelegate>>,
     foreground: gpui::Hsla,
     title: String,
     selected: bool,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+    task_id: String,
+    sink: Rc<RefCell<Vec<RowAction>>>,
 ) -> impl gpui::IntoElement {
     div()
         .relative()
@@ -310,11 +402,29 @@ fn title_edit_affordance(
                     .opacity(0.5)
                     .child("E"),
             )
-            .on_mouse_down(MouseButton::Left, on_click)
+        })
+        .when(selected, |el| {
+            el.on_mouse_down(MouseButton::Left, {
+                let task_id = task_id.clone();
+                let sink = sink.clone();
+                cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if event.click_count >= 2 {
+                        sink.borrow_mut().push(RowAction::InlineEdit {
+                            task_id: task_id.clone(),
+                        });
+                    } else if event.click_count == 1 {
+                        sink.borrow_mut().push(RowAction::OpenEdit {
+                            task_id: task_id.clone(),
+                        });
+                    }
+                })
+            })
         })
 }
 
 fn action_chip(
+    cx: &mut Context<ListState<TaskListDelegate>>,
     border: gpui::Hsla,
     primary: gpui::Hsla,
     secondary: gpui::Hsla,
@@ -323,7 +433,7 @@ fn action_chip(
     label: impl Into<String>,
     selected: bool,
     badge: Option<&str>,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+    on_click: impl Fn() + 'static,
 ) -> impl gpui::IntoElement {
     let label = label.into();
     div()
@@ -350,19 +460,32 @@ fn action_chip(
             )
         })
         .child(label)
-        .on_mouse_down(MouseButton::Left, on_click)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                on_click();
+            }),
+        )
 }
 
 fn tag_chip(
+    cx: &mut Context<ListState<TaskListDelegate>>,
     tag: String,
     active: bool,
     badge: Option<String>,
-    on_click: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+    on_click: impl Fn() + 'static,
 ) -> impl gpui::IntoElement {
     div()
         .relative()
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, on_click)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                on_click();
+            }),
+        )
         .child(
             h_flex()
                 .gap_1()

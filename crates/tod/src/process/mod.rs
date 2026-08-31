@@ -59,6 +59,17 @@ pub fn interview_phase_for_lifecycle(lifecycle: &str) -> Option<&'static str> {
     }
 }
 
+/// Map interview phase → lifecycle state when the outline DB has no row yet.
+/// Unknown phases default to `proposed`.
+pub fn lifecycle_for_interview_phase(phase: &str) -> &'static str {
+    let base = phase.split('(').next().unwrap_or(phase).trim();
+    match base {
+        "design-interview" => "design",
+        "planning-interview" => "planning",
+        _ => "proposed",
+    }
+}
+
 /// Human label for the phase (for display_name).
 pub fn interview_phase_label(phase: &str) -> &'static str {
     match phase {
@@ -149,11 +160,8 @@ mod tests {
     use std::fs;
 
     fn temp_repo(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tod-process-{}-{}",
-            label,
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tod-process-{}-{}", label, uuid::Uuid::new_v4()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
@@ -175,7 +183,11 @@ mod tests {
             "# State\n\n- State: proposed\n- Mode: interactive\n",
         )
         .unwrap();
-        fs::write(task_dir.join("user.md"), "# Widget Persistence\n\nGoal text.\n").unwrap();
+        fs::write(
+            task_dir.join("user.md"),
+            "# Widget Persistence\n\nGoal text.\n",
+        )
+        .unwrap();
 
         // Dir without state.md must be skipped.
         let skip_dir = root
@@ -227,11 +239,29 @@ mod tests {
         assert_eq!(interview_phase_for_lifecycle("unknown"), None);
 
         assert_eq!(
+            lifecycle_for_interview_phase("task-requirements-interview"),
+            "proposed"
+        );
+        assert_eq!(lifecycle_for_interview_phase("design-interview"), "design");
+        assert_eq!(
+            lifecycle_for_interview_phase("planning-interview"),
+            "planning"
+        );
+        assert_eq!(
+            lifecycle_for_interview_phase("project-defining"),
+            "proposed"
+        );
+        assert_eq!(lifecycle_for_interview_phase("other"), "proposed");
+
+        assert_eq!(
             interview_phase_label("task-requirements-interview"),
             "Task requirements"
         );
         assert_eq!(interview_phase_label("design-interview"), "Design phase");
-        assert_eq!(interview_phase_label("planning-interview"), "Planning phase");
+        assert_eq!(
+            interview_phase_label("planning-interview"),
+            "Planning phase"
+        );
     }
 
     #[test]
@@ -245,7 +275,11 @@ mod tests {
             .join("tasks")
             .join("t");
         fs::create_dir_all(&task_dir).unwrap();
-        fs::write(task_dir.join("state.md"), "# State\n\n- Mode: interactive\n").unwrap();
+        fs::write(
+            task_dir.join("state.md"),
+            "# State\n\n- Mode: interactive\n",
+        )
+        .unwrap();
         // No user.md → title falls back to task_slug
         let found = scan_process_tasks(&root);
         assert_eq!(found.len(), 1);

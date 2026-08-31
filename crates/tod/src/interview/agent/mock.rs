@@ -3,9 +3,15 @@ use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, AnswerProcessorPoolStats,
     DeepDiveContext, RunId,
 };
-use crate::interview::config::agent_scratchpad_for_entity;
-use crate::interview::settings::AnswerProcessorSettings;
+use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
+use crate::agent_traffic::{
+    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+};
+use crate::interview::TodPaths;
+use crate::interview::config::{agent_scratchpad_for_node, path_for_storage};
+use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::interview::transcript::new_transcript_filename;
+use crate::process_bundle::InterviewAgentPrompt;
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use std::collections::HashMap;
@@ -19,12 +25,27 @@ use std::thread;
 pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
     answer_pool: AnswerProcessorPoolManager,
-    answer_run_cwd: HashMap<RunId, PathBuf>,
+    answer_run_agent: HashMap<RunId, String>,
     answer_completion_tx: mpsc::Sender<AnswerJobResult>,
     answer_completion_rx: mpsc::Receiver<AnswerJobResult>,
+    question_maker_pool: QuestionMakerPoolManager,
+    question_maker_run_agent: HashMap<RunId, String>,
+    question_maker_completion_tx: mpsc::Sender<QuestionMakerJobResult>,
+    question_maker_completion_rx: mpsc::Receiver<QuestionMakerJobResult>,
+    fleet_run_agent: HashMap<RunId, String>,
+    traffic_log: Option<SharedAgentTrafficLog>,
 }
 
 struct AnswerJobResult {
+    agent_config_id: String,
+    cwd: PathBuf,
+    slot_id: u32,
+    run_id: RunId,
+    result: Result<String, String>,
+}
+
+struct QuestionMakerJobResult {
+    agent_config_id: String,
     cwd: PathBuf,
     slot_id: u32,
     run_id: RunId,
@@ -34,17 +55,78 @@ struct AnswerJobResult {
 impl MockAgentProvider {
     pub fn new() -> Self {
         let (answer_completion_tx, answer_completion_rx) = mpsc::channel();
+        let (question_maker_completion_tx, question_maker_completion_rx) = mpsc::channel();
         Self {
             runs: HashMap::new(),
             answer_pool: AnswerProcessorPoolManager::default(),
-            answer_run_cwd: HashMap::new(),
+            answer_run_agent: HashMap::new(),
             answer_completion_tx,
             answer_completion_rx,
+            question_maker_pool: QuestionMakerPoolManager::default(),
+            question_maker_run_agent: HashMap::new(),
+            question_maker_completion_tx,
+            question_maker_completion_rx,
+            fleet_run_agent: HashMap::new(),
+            traffic_log: None,
         }
     }
 
-    fn finish(&mut self, kind: AgentRunKind, state: AgentRunState) -> AgentRunHandle {
+    pub fn with_traffic_log(mut self, traffic_log: SharedAgentTrafficLog) -> Self {
+        self.traffic_log = Some(traffic_log);
+        self
+    }
+
+    fn log_traffic(
+        &self,
+        kind: AgentRunKind,
+        run_id: RunId,
+        direction: TrafficDirection,
+        content: &str,
+    ) {
+        let Some(log) = &self.traffic_log else {
+            return;
+        };
+        let category = match kind {
+            AgentRunKind::QuestionMakerReplenishment => AgentCategory::QuestionMaker,
+            AgentRunKind::AnswerProcessor => AgentCategory::AnswerProcessor,
+            AgentRunKind::DeepDiveChat => AgentCategory::DeepDive,
+            AgentRunKind::FleetAgent => AgentCategory::Fleet,
+        };
+        let label = match kind {
+            AgentRunKind::QuestionMakerReplenishment => "question-maker",
+            AgentRunKind::AnswerProcessor => "answer-processor",
+            AgentRunKind::DeepDiveChat => "deep-dive",
+            AgentRunKind::FleetAgent => "fleet-agent",
+        };
+        let agent_id = self
+            .fleet_run_agent
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{run_id:?}"));
+        log.lock().expect("traffic log mutex").record(
+            category,
+            agent_id,
+            label,
+            direction,
+            content,
+        );
+    }
+
+    fn finish(
+        &mut self,
+        kind: AgentRunKind,
+        request: Option<&str>,
+        state: AgentRunState,
+    ) -> AgentRunHandle {
         let id = RunId::new();
+        if let Some(req) = request {
+            self.log_traffic(kind, id, TrafficDirection::Request, req);
+        }
+        if let AgentRunState::Success(Some(text)) = &state {
+            self.log_traffic(kind, id, TrafficDirection::Response, text);
+        } else if let AgentRunState::Failure(message) = &state {
+            self.log_traffic(kind, id, TrafficDirection::Response, message);
+        }
         self.runs.insert(id, state.clone());
         AgentRunHandle { id, kind, state }
     }
@@ -56,23 +138,105 @@ impl MockAgentProvider {
     }
 
     fn apply_answer_completion(&mut self, job: AnswerJobResult) {
-        let outcome = self
-            .answer_pool
-            .complete_run(&job.cwd, job.slot_id, job.run_id, job.result);
+        let response = match &job.result {
+            Ok(text) => text.clone(),
+            Err(err) => format!("ERROR: {err}"),
+        };
+        self.log_traffic(
+            AgentRunKind::AnswerProcessor,
+            job.run_id,
+            TrafficDirection::Response,
+            &response,
+        );
+        let outcome = self.answer_pool.complete_run(
+            &job.agent_config_id,
+            job.slot_id,
+            job.run_id,
+            job.result,
+        );
         if let Some(recycled) = outcome.recycled_slot_id {
             let _ = recycled;
         }
         for (slot_id, run_id, prompt) in outcome.dispatched {
-            self.answer_run_cwd.insert(run_id, job.cwd.clone());
-            self.spawn_answer_job(job.cwd.clone(), slot_id, run_id, prompt);
+            self.answer_run_agent
+                .insert(run_id, job.agent_config_id.clone());
+            self.spawn_answer_job(job.agent_config_id.clone(), job.cwd.clone(), slot_id, run_id, prompt);
         }
     }
 
-    fn spawn_answer_job(&self, cwd: PathBuf, slot_id: u32, run_id: RunId, prompt: String) {
+    fn spawn_answer_job(
+        &self,
+        agent_config_id: String,
+        cwd: PathBuf,
+        slot_id: u32,
+        run_id: RunId,
+        prompt: String,
+    ) {
         let tx = self.answer_completion_tx.clone();
         thread::spawn(move || {
             let result = process_answer_from_prompt(&prompt).map_err(|err| err.to_string());
             let _ = tx.send(AnswerJobResult {
+                agent_config_id,
+                cwd,
+                slot_id,
+                run_id,
+                result,
+            });
+        });
+    }
+
+    fn drain_question_maker_completions(&mut self) {
+        while let Ok(job) = self.question_maker_completion_rx.try_recv() {
+            self.apply_question_maker_completion(job);
+        }
+    }
+
+    fn apply_question_maker_completion(&mut self, job: QuestionMakerJobResult) {
+        let response = match &job.result {
+            Ok(text) => text.clone(),
+            Err(err) => format!("ERROR: {err}"),
+        };
+        self.log_traffic(
+            AgentRunKind::QuestionMakerReplenishment,
+            job.run_id,
+            TrafficDirection::Response,
+            &response,
+        );
+        let outcome = self.question_maker_pool.complete_run(
+            &job.agent_config_id,
+            job.slot_id,
+            job.run_id,
+            job.result,
+        );
+        if let Some(recycled) = outcome.recycled_slot_id {
+            let _ = recycled;
+        }
+        for (slot_id, run_id, prompt) in outcome.dispatched {
+            self.question_maker_run_agent
+                .insert(run_id, job.agent_config_id.clone());
+            self.spawn_question_maker_job(
+                job.agent_config_id.clone(),
+                job.cwd.clone(),
+                slot_id,
+                run_id,
+                prompt,
+            );
+        }
+    }
+
+    fn spawn_question_maker_job(
+        &self,
+        agent_config_id: String,
+        cwd: PathBuf,
+        slot_id: u32,
+        run_id: RunId,
+        prompt: String,
+    ) {
+        let tx = self.question_maker_completion_tx.clone();
+        thread::spawn(move || {
+            let result = process_question_maker_from_prompt(&prompt).map_err(|err| err.to_string());
+            let _ = tx.send(QuestionMakerJobResult {
+                agent_config_id,
                 cwd,
                 slot_id,
                 run_id,
@@ -89,39 +253,72 @@ impl Default for MockAgentProvider {
 }
 
 impl AgentProvider for MockAgentProvider {
-    fn start_researcher_replenishment(
+    fn start_question_maker_replenishment(
         &mut self,
-        _cwd: PathBuf,
-        prompt: String,
+        agent_config_id: &str,
+        cwd: PathBuf,
+        prompt: InterviewAgentPrompt,
+        pool: &QuestionMakerSettings,
     ) -> Result<AgentRunHandle> {
-        let msg = if prompt.contains("Interview UI kickoff") {
-            bootstrap_from_prompt(&prompt)?
-        } else if prompt.contains("Action payload") || prompt.contains("Process researcher action")
-        {
-            action_from_prompt(&prompt)?
-        } else {
-            replenish_from_prompt(&prompt)?
-        };
-        Ok(self.finish(
-            AgentRunKind::ResearcherReplenishment,
-            AgentRunState::Success(Some(msg)),
-        ))
+        let (assignment, run_id) = self
+            .question_maker_pool
+            .submit(agent_config_id.to_string(), pool.clone(), prompt.clone())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.log_traffic(
+            AgentRunKind::QuestionMakerReplenishment,
+            run_id,
+            TrafficDirection::Request,
+            &prompt.full(),
+        );
+        self.question_maker_run_agent
+            .insert(run_id, agent_config_id.to_string());
+        match assignment {
+            QuestionMakerSubmitAssignment::Dispatch { slot_id, prompt } => {
+                self.spawn_question_maker_job(
+                    agent_config_id.to_string(),
+                    cwd.clone(),
+                    slot_id,
+                    run_id,
+                    prompt,
+                );
+            }
+            QuestionMakerSubmitAssignment::Queued { .. } => {}
+        }
+        Ok(AgentRunHandle {
+            id: run_id,
+            kind: AgentRunKind::QuestionMakerReplenishment,
+            state: AgentRunState::InFlight,
+        })
     }
 
     fn start_answer_processor(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .answer_pool
-            .submit(cwd.clone(), pool.clone(), prompt)
+            .submit(agent_config_id.to_string(), pool.clone(), prompt.clone())
             .map_err(|e| anyhow::anyhow!(e))?;
-        self.answer_run_cwd.insert(run_id, cwd.clone());
+        self.log_traffic(
+            AgentRunKind::AnswerProcessor,
+            run_id,
+            TrafficDirection::Request,
+            &prompt.full(),
+        );
+        self.answer_run_agent
+            .insert(run_id, agent_config_id.to_string());
         match assignment {
             AnswerSubmitAssignment::Dispatch { slot_id, prompt } => {
-                self.spawn_answer_job(cwd.clone(), slot_id, run_id, prompt);
+                self.spawn_answer_job(
+                    agent_config_id.to_string(),
+                    cwd.clone(),
+                    slot_id,
+                    run_id,
+                    prompt,
+                );
             }
             AnswerSubmitAssignment::Queued { .. } => {}
         }
@@ -134,19 +331,26 @@ impl AgentProvider for MockAgentProvider {
 
     fn answer_processor_pool_stats(
         &self,
-        cwd: &Path,
+        agent_config_id: &str,
         pool: &AnswerProcessorSettings,
     ) -> AnswerProcessorPoolStats {
-        self.answer_pool.stats(cwd, pool)
+        self.answer_pool.stats(agent_config_id, pool)
     }
 
     fn start_deep_dive_chat(
         &mut self,
+        _agent_config_id: &str,
         _cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
     ) -> Result<AgentRunHandle> {
-        let body = initial_message.unwrap_or_else(|| context.question_body.clone());
+        let body = initial_message
+            .clone()
+            .unwrap_or_else(|| context.question_body.clone());
+        let request = initial_message
+            .as_deref()
+            .unwrap_or(context.question_body.as_str())
+            .to_string();
         let reply = format!(
             "Mock deep-dive reply for {}:\n\nConsider: {}\n\n(Use this text is available.)",
             context.question_id,
@@ -154,16 +358,50 @@ impl AgentProvider for MockAgentProvider {
         );
         Ok(self.finish(
             AgentRunKind::DeepDiveChat,
+            Some(&request),
             AgentRunState::Success(Some(reply)),
         ))
     }
 
+    fn start_fleet_agent(
+        &mut self,
+        agent_config_id: &str,
+        cwd: PathBuf,
+        prompt: String,
+    ) -> Result<AgentRunHandle> {
+        let preview: String = prompt.chars().take(200).collect();
+        let reply = format!(
+            "Fleet agent run complete (mock).\n\n\
+             Config: {agent_config_id}\n\
+             Cwd: {}\n\n\
+             Prompt preview:\n{preview}…",
+            cwd.display()
+        );
+        let handle = self.finish(
+            AgentRunKind::FleetAgent,
+            Some(&prompt),
+            AgentRunState::Success(Some(reply)),
+        );
+        self.fleet_run_agent
+            .insert(handle.id, agent_config_id.to_string());
+        Ok(handle)
+    }
+
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
+        self.drain_question_maker_completions();
         self.drain_answer_completions();
-        if let Some(cwd) = self.answer_run_cwd.get(&id).cloned() {
-            if let Some(state) = self.answer_pool.poll_run(&cwd, id) {
+        if let Some(agent_id) = self.question_maker_run_agent.get(&id).cloned() {
+            if let Some(state) = self.question_maker_pool.poll_run(&agent_id, id) {
                 if !matches!(state, AgentRunState::InFlight) {
-                    self.answer_run_cwd.remove(&id);
+                    self.question_maker_run_agent.remove(&id);
+                }
+                return Some(state);
+            }
+        }
+        if let Some(agent_id) = self.answer_run_agent.get(&id).cloned() {
+            if let Some(state) = self.answer_pool.poll_run(&agent_id, id) {
+                if !matches!(state, AgentRunState::InFlight) {
+                    self.answer_run_agent.remove(&id);
                 }
                 return Some(state);
             }
@@ -172,78 +410,103 @@ impl AgentProvider for MockAgentProvider {
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
-        if let Some(cwd) = self.answer_run_cwd.remove(&id) {
-            self.answer_pool.cancel_run(&cwd, id);
+        if let Some(agent_id) = self.question_maker_run_agent.remove(&id) {
+            self.question_maker_pool.cancel_run(&agent_id, id);
+            return Ok(());
+        }
+        if let Some(agent_id) = self.answer_run_agent.remove(&id) {
+            self.answer_pool.cancel_run(&agent_id, id);
             return Ok(());
         }
         self.runs.remove(&id);
+        self.fleet_run_agent.remove(&id);
         Ok(())
+    }
+
+    fn interview_status_counts(&self) -> InterviewAgentCounts {
+        let pool_stats = self.answer_pool.global_stats();
+        InterviewAgentCounts {
+            question_maker_in_flight: self.question_maker_pool.in_flight_count(),
+            answer_active: pool_stats.active,
+            answer_pool: pool_stats.in_pool,
+            answer_max: pool_stats.max,
+            ..Default::default()
+        }
+    }
+}
+
+fn process_question_maker_from_prompt(prompt: &str) -> Result<String> {
+    if prompt.contains("Interview UI kickoff") {
+        bootstrap_from_prompt(prompt)
+    } else if prompt.contains("Action payload") || prompt.contains("Process question maker action") {
+        action_from_prompt(prompt)
+    } else {
+        replenish_from_prompt(prompt)
     }
 }
 
 fn bootstrap_from_prompt(prompt: &str) -> Result<String> {
-    let entity =
-        prompt_field(prompt, "Entity path").context("mock bootstrap: missing Entity path")?;
-    let phase = prompt_field(prompt, "Phase/purpose").unwrap_or_else(|| "project-defining".into());
+    let node_id = prompt_field(prompt, "Node id").context("mock bootstrap: missing Node id")?;
+    let phase = prompt_field(prompt, "Phase").unwrap_or_else(|| "project-defining".into());
     let phase = phase.split('(').next().unwrap_or(&phase).trim().to_string();
-    let entity_path = PathBuf::from(&entity);
-    let repo_root = infer_repo_root(&entity_path)?;
-    let now = Local::now();
-    let session_stem =
-        new_transcript_filename(&format!("{}-interview", phase.replace(' ', "-")), now)
-            .trim_end_matches(".md")
-            .to_string();
+    let scratch = prompt_field(prompt, "Session scratchpad")
+        .or_else(|| {
+            prompt_field(prompt, "Create interview-config at").and_then(|p| {
+                std::path::PathBuf::from(&p)
+                    .parent()
+                    .map(|d| d.to_string_lossy().into_owned())
+            })
+        })
+        .context("mock bootstrap: missing Session scratchpad")?;
+    let config_path = prompt_field(prompt, "Create interview-config at")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&scratch).join("interview-config.md"));
+    let node_uuid = uuid::Uuid::parse_str(&node_id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+    let session_stem = prompt_field(prompt, "Session id").unwrap_or_else(|| {
+        new_transcript_filename(
+            &format!("{}-interview", phase.replace(' ', "-")),
+            Local::now(),
+        )
+        .trim_end_matches(".md")
+        .to_string()
+    });
 
-    let history_dir = entity_path.join("history");
-    fs::create_dir_all(&history_dir)
-        .with_context(|| format!("create history {}", history_dir.display()))?;
-    let transcript = history_dir.join(format!("{session_stem}.md"));
+    let session_dir = PathBuf::from(scratch.trim());
+    fs::create_dir_all(&session_dir)?;
+    let queue = session_dir.join("queue");
+    fs::create_dir_all(&queue)?;
+
+    let transcript = session_dir.join("transcript.md");
     fs::write(
         &transcript,
         format!(
-            "# Mock interview — {session_stem}\n\n## Session\n\n**Entity:** {}\n**Phase:** {phase}\n\n",
-            entity_path.display()
+            "# Mock interview — {session_stem}\n\n## Session\n\n**Node:** {node_id}\n**Phase:** {phase}\n\n",
         ),
     )?;
 
-    // agent_scratchpad_for_entity already ends at …/scratchpad/interviews
-    let scratch = agent_scratchpad_for_entity(&repo_root, &entity_path)?.join(&session_stem);
-    let queue = scratch.join("queue");
-    fs::create_dir_all(&queue)?;
-
-    let config_path = scratch.join("interview-config.md");
-    let researcher_status = scratch.join("researcher-status.md");
-    let answer_processor_status = scratch.join("answer-processor-status.md");
-    let to_process = agent_scratchpad_for_entity(&repo_root, &entity_path)?
-        .parent() // …/scratchpad
-        .unwrap_or(scratch.as_path())
-        .join("to-process.md");
+    let question_maker_status = session_dir.join("question-maker-status.md");
+    let answer_processor_status = session_dir.join("answer-processor-status.md");
+    let scope_dir = session_dir.join("scope");
+    fs::create_dir_all(&scope_dir)?;
+    let obligations = scope_dir.join("obligations.md");
+    fs::write(&obligations, "# Mock obligations\n")?;
 
     let config = format!(
         "# Interview config\n\n\
 session_id: {session_stem}\n\
-entity: {}\n\
+node_id: {node_uuid}\n\
 phase: {phase}\n\
-transcript: {}\n\
-scope:\n\
-  - {}\n\
 scratchpad: {}\n\
 queue: {}\n\
 queue_target: 8\n\
-to_process: {}\n\
-researcher_status: {}\n\
-answer_processor_status: {}\n",
-        entity_path.display(),
-        transcript.display(),
-        entity_path.join("user.md").display(),
-        scratch.display(),
-        queue.display(),
-        to_process.display(),
-        researcher_status.display(),
-        answer_processor_status.display(),
+scope:\n\
+  - {}\n",
+        path_for_storage(&session_dir),
+        path_for_storage(&queue),
+        path_for_storage(&obligations),
     );
     fs::write(&config_path, config)?;
-    write_status(&researcher_status, "idle", "mock bootstrap complete")?;
+    write_status(&question_maker_status, "idle", "mock bootstrap complete")?;
     write_status(&answer_processor_status, "idle", "")?;
     write_queue_questions(&queue, 8, "mock-bootstrap")?;
 
@@ -262,7 +525,7 @@ fn replenish_from_prompt(prompt: &str) -> Result<String> {
     let config_text =
         fs::read_to_string(&config_path).with_context(|| format!("read config {config_path}"))?;
     let queue = config_value(&config_text, "queue").context("config missing queue")?;
-    let status = config_value(&config_text, "researcher_status");
+    let status = config_value(&config_text, "question_maker_status");
     let queue_dir = PathBuf::from(queue.trim_end_matches(['/', '\\']));
 
     let existing = count_queue_files(&queue_dir);
@@ -318,7 +581,7 @@ fn action_from_prompt(prompt: &str) -> Result<String> {
     let config_text =
         fs::read_to_string(&config_path).with_context(|| format!("read config {config_path}"))?;
     let queue = config_value(&config_text, "queue").context("config missing queue")?;
-    let status = config_value(&config_text, "researcher_status");
+    let status = config_value(&config_text, "question_maker_status");
     let queue_dir = PathBuf::from(queue.trim_end_matches(['/', '\\']));
 
     let mut handled = Vec::new();
@@ -390,7 +653,7 @@ fn process_answer_from_prompt(prompt: &str) -> Result<String> {
 
     // Last question cleared → signal interview complete for UI (no further questions).
     if count_queue_files(&queue_dir) == 0 {
-        if let Some(rs) = config_value(&config_text, "researcher_status") {
+        if let Some(rs) = config_value(&config_text, "question_maker_status") {
             write_status(&PathBuf::from(rs), "complete", "no further questions")?;
         }
     }
@@ -649,10 +912,10 @@ fn extract_actions(prompt: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interview::settings::AnswerProcessorSettings;
+    use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
     use std::time::Duration;
 
-    fn poll_answer_run(mock: &mut MockAgentProvider, id: RunId) -> AgentRunState {
+    fn poll_run(mock: &mut MockAgentProvider, id: RunId) -> AgentRunState {
         for _ in 0..200 {
             if let Some(state) = mock.poll_run(id) {
                 if !matches!(state, AgentRunState::InFlight) {
@@ -661,46 +924,46 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        panic!("timed out waiting for answer-processor run {id:?}");
+        panic!("timed out waiting for run {id:?}");
+    }
+
+    fn question_maker_prompt(turn: &str) -> InterviewAgentPrompt {
+        InterviewAgentPrompt {
+            session_prefix: String::new(),
+            turn: turn.into(),
+        }
     }
 
     #[test]
     fn mock_bootstrap_writes_config_and_queue() {
         let root = std::env::temp_dir().join(format!("tod-mock-{}", uuid::Uuid::new_v4()));
-        let entity = root
-            .join("doc")
-            .join("process")
-            .join("projects")
-            .join("sandbox")
-            .join("tasks")
-            .join("smoke");
-        fs::create_dir_all(entity.join("history")).unwrap();
-        fs::write(entity.join("user.md"), "# Smoke\n").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let node_id = uuid::Uuid::new_v4();
+        let scratch_base = agent_scratchpad_for_node(&root, node_id);
+        fs::create_dir_all(&scratch_base).unwrap();
+        let session_dir = scratch_base.join("mock-session");
+        fs::create_dir_all(&session_dir).unwrap();
 
         let mut mock = MockAgentProvider::new();
-        let prompt = format!(
+        let pool = QuestionMakerSettings::default();
+        let prompt = question_maker_prompt(&format!(
             "Interview UI kickoff — bootstrap this interview session.\n\
-             SQLite session id: 1\n\
-             Display name: smoke — Initial\n\
-             Entity path: {}\n\
-             Phase/purpose: project-defining\n",
-            entity.display()
-        );
+             Session id: mock-session\n\
+             Node id: {node_id}\n\
+             Phase: project-defining\n\
+             Session scratchpad: {}\n\
+             Create interview-config at: {}\n",
+            session_dir.display(),
+            session_dir.join("interview-config.md").display(),
+        ));
         let handle = mock
-            .start_researcher_replenishment(entity.clone(), prompt)
+            .start_question_maker_replenishment("mock-agent", root.clone(), prompt, &pool)
             .unwrap();
         assert!(matches!(
-            mock.poll_run(handle.id),
-            Some(AgentRunState::Success(_))
+            poll_run(&mut mock, handle.id),
+            AgentRunState::Success(_)
         ));
 
-        let scratch = agent_scratchpad_for_entity(&root, &entity).unwrap();
-        let sessions: Vec<_> = fs::read_dir(&scratch)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(sessions.len(), 1);
-        let session_dir = sessions[0].path();
         assert!(session_dir.join("interview-config.md").is_file());
         assert_eq!(count_queue_files(&session_dir.join("queue")), 8);
         let _ = fs::remove_dir_all(&root);
@@ -709,48 +972,50 @@ mod tests {
     #[test]
     fn mock_action_defer_deletes_question() {
         let root = std::env::temp_dir().join(format!("tod-mock-act-{}", uuid::Uuid::new_v4()));
-        let entity = root
-            .join("doc")
-            .join("process")
-            .join("projects")
-            .join("sandbox")
-            .join("tasks")
-            .join("smoke");
-        fs::create_dir_all(entity.join("history")).unwrap();
-        fs::write(entity.join("user.md"), "# Smoke\n").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        let node_id = uuid::Uuid::new_v4();
+        let scratch_base = agent_scratchpad_for_node(&root, node_id);
+        let session_dir = scratch_base.join("mock-session");
+        fs::create_dir_all(&session_dir).unwrap();
 
         let mut mock = MockAgentProvider::new();
-        let prompt = format!(
+        let pool = QuestionMakerSettings::default();
+        let prompt = question_maker_prompt(&format!(
             "Interview UI kickoff — bootstrap this interview session.\n\
-             SQLite session id: 1\n\
-             Display name: smoke — Initial\n\
-             Entity path: {}\n\
-             Phase/purpose: project-defining\n",
-            entity.display()
-        );
-        mock.start_researcher_replenishment(entity.clone(), prompt)
+             Session id: mock-session\n\
+             Node id: {node_id}\n\
+             Phase: project-defining\n\
+             Session scratchpad: {}\n\
+             Create interview-config at: {}\n",
+            session_dir.display(),
+            session_dir.join("interview-config.md").display(),
+        ));
+        let bootstrap_handle = mock
+            .start_question_maker_replenishment("mock-agent", root.clone(), prompt, &pool)
             .unwrap();
+        assert!(matches!(
+            poll_run(&mut mock, bootstrap_handle.id),
+            AgentRunState::Success(_)
+        ));
 
-        let scratch = agent_scratchpad_for_entity(&root, &entity).unwrap();
-        let session_dir = fs::read_dir(&scratch)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
         let config_path = session_dir.join("interview-config.md");
         let queue = session_dir.join("queue");
         assert!(find_queue_question_path(&queue, "q-001").is_some());
 
-        let action_prompt = format!(
-            "Process researcher action submission.\n\
+        let action_prompt = question_maker_prompt(&format!(
+            "Process question maker action submission.\n\
              Config path: {}\n\
              Action payload (YAML multi-record):\n\
              ---\naction: defer\nid: q-001\n---\n",
             config_path.display()
-        );
-        mock.start_researcher_replenishment(entity, action_prompt)
+        ));
+        let handle = mock
+            .start_question_maker_replenishment("mock-agent", root.clone(), action_prompt, &pool)
             .unwrap();
+        assert!(matches!(
+            poll_run(&mut mock, handle.id),
+            AgentRunState::Success(_)
+        ));
         assert!(find_queue_question_path(&queue, "q-001").is_none());
         let _ = fs::remove_dir_all(&root);
     }
@@ -760,22 +1025,25 @@ mod tests {
         let mut mock = MockAgentProvider::new();
         let cwd = PathBuf::from("/tmp/mock-pool");
         let pool = AnswerProcessorSettings::default();
-        let prompt = "Config path: /x\nAnswer payload:\n---\nid: q-001\n---\n";
+        let prompt = InterviewAgentPrompt {
+            session_prefix: String::new(),
+            turn: "Config path: /x\nAnswer payload:\n---\nid: q-001\n---\n".into(),
+        };
 
         let h0 = mock
-            .start_answer_processor(cwd.clone(), prompt.into(), &pool)
+            .start_answer_processor("mock-agent", cwd.clone(), prompt.clone(), &pool)
             .unwrap();
         let h1 = mock
-            .start_answer_processor(cwd.clone(), prompt.into(), &pool)
+            .start_answer_processor("mock-agent", cwd.clone(), prompt, &pool)
             .unwrap();
-        assert_eq!(mock.answer_processor_pool_stats(&cwd, &pool).in_pool, 2);
-        assert_eq!(mock.answer_processor_pool_stats(&cwd, &pool).active, 2);
+        assert_eq!(mock.answer_processor_pool_stats("mock-agent", &pool).in_pool, 2);
+        assert_eq!(mock.answer_processor_pool_stats("mock-agent", &pool).active, 2);
         assert!(matches!(
-            poll_answer_run(&mut mock, h0.id),
+            poll_run(&mut mock, h0.id),
             AgentRunState::Failure(_)
         ));
         assert!(matches!(
-            poll_answer_run(&mut mock, h1.id),
+            poll_run(&mut mock, h1.id),
             AgentRunState::Failure(_)
         ));
     }

@@ -281,7 +281,8 @@ mod tests {
         let root = temp_root("upgrade");
         fs::create_dir_all(&root).unwrap();
         let db = root.join("tod.db");
-        let conn = schema::open_writer_connection(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        schema::install_v1_schema_for_test(&conn).unwrap();
         conn.execute(
             "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
             params!["t1", "Keep Me", "keep-me", "proposed"],
@@ -296,7 +297,7 @@ mod tests {
 
         let conn = schema::open_read_connection(paths.db()).unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM tasks WHERE id = 't1'", [], |row| {
+            .query_row("SELECT title FROM nodes WHERE slug = 'keep-me'", [], |row| {
                 row.get(0)
             })
             .unwrap();
@@ -311,7 +312,8 @@ mod tests {
         let root = temp_root("mid-upgrade");
         fs::create_dir_all(&root).unwrap();
         let paths = FleetPaths::new(&root).unwrap();
-        let conn = schema::open_writer_connection(paths.db()).unwrap();
+        let conn = Connection::open(paths.db()).unwrap();
+        schema::install_v1_schema_for_test(&conn).unwrap();
         conn.execute(
             "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
             params!["t1", "Survive", "survive", "proposed"],
@@ -328,7 +330,7 @@ mod tests {
         FleetLaunch::prepare(&paths).unwrap();
         let conn = schema::open_read_connection(paths.db()).unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM tasks WHERE id = 't1'", [], |row| {
+            .query_row("SELECT title FROM nodes WHERE slug = 'survive'", [], |row| {
                 row.get(0)
             })
             .unwrap();

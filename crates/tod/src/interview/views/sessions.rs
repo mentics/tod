@@ -1,16 +1,19 @@
+use crate::fleet::{ensure_interview_agent_for_node, FleetStore};
 use crate::interview::agent::{AgentRunState, BootstrapGate, SharedAgent};
 use crate::interview::config::{
     sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
 };
-use crate::interview::kickoff::researcher_bootstrap_prompt;
 use crate::interview::views::session_list::SessionListDelegate;
 use crate::interview::views::workspace::{WorkspaceEvent, WorkspaceInFlightState, WorkspaceView};
 use crate::interview::{
     InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore,
-    TaskListProceedContext, TodPaths,
+    TaskListProceedContext, TodPaths, TodSettings,
+};
+use crate::process_bundle::{
+    AgentLaunchContext, ProcessManifest, TodInstallPaths, session_scratchpad,
 };
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
-use crate::ui::key_context::{self, INPUT};
+use crate::ui::key_context;
 use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::toast::confirm_toast;
 use gpui::prelude::FluentBuilder;
@@ -29,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const SESSIONS_CONTEXT: &str = "InterviewSessions";
 
@@ -53,12 +57,11 @@ pub fn register_sessions_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("down", ListArrowDown, context),
         KeyBinding::new("enter", SessionOpen, context),
         KeyBinding::new("n", SessionToggleNew, context),
-        KeyBinding::new("escape", SessionCancelCompose, context),
         KeyBinding::new("shift-enter", SessionLaunch, context),
         KeyBinding::new("ctrl-shift-1", SessionFilterActive, context),
         KeyBinding::new("ctrl-shift-2", SessionFilterArchive, context),
-        KeyBinding::new("escape", SessionCancelCompose, Some(INPUT)),
     ]);
+    key_context::bind_panel_escape(cx, SessionCancelCompose, SESSIONS_CONTEXT);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,16 +83,9 @@ pub enum SessionsEvent {
 }
 
 #[derive(Debug, Clone)]
-struct TaskTarget {
-    path: PathBuf,
+struct NodeTarget {
+    node_id: Uuid,
     label: SharedString,
-}
-
-#[derive(Debug, Clone)]
-struct ProjectTarget {
-    path: PathBuf,
-    label: SharedString,
-    tasks: Vec<TaskTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -100,22 +96,21 @@ struct PurposeOption {
 
 pub struct SessionsView {
     paths: TodPaths,
+    fleet: Arc<FleetStore>,
     store: SessionStore,
     sessions: Vec<InterviewSession>,
     filter: SessionFilter,
-    selected_id: Option<i64>,
+    selected_id: Option<Uuid>,
     composing: bool,
-    projects: Vec<ProjectTarget>,
+    work_nodes: Vec<NodeTarget>,
     purpose_options: Vec<PurposeOption>,
-    selected_project: usize,
-    /// 0 = project-level interview; 1+ = task index + 1
-    selected_task: usize,
+    selected_node: usize,
     selected_purpose: usize,
     purpose_note: Entity<InputState>,
     agent: SharedAgent,
     bootstrap_gate: BootstrapGate,
     /// SQLite session ids with a bootstrap thread already running.
-    bootstrap_sessions: Arc<Mutex<HashSet<i64>>>,
+    bootstrap_sessions: Arc<Mutex<HashSet<Uuid>>>,
     kickoff_status: SharedString,
     focus_handle: FocusHandle,
     session_list_state: Entity<ListState<SessionListDelegate>>,
@@ -129,7 +124,7 @@ pub struct SessionsView {
     task_list_context: Option<TaskListProceedContext>,
     /// Pending submit state for sessions whose workspace was replaced (e.g. user
     /// opened a different interview). Restored on reopen.
-    in_flight_by_session: HashMap<i64, WorkspaceInFlightState>,
+    in_flight_by_session: HashMap<Uuid, WorkspaceInFlightState>,
     _workspace_subscription: Option<Subscription>,
     /// Deferred bootstrap prompt after workspace detects missing scaffolding.
     pending_bootstrap_prompt: Option<InterviewSession>,
@@ -142,11 +137,12 @@ impl SessionsView {
         cx: &mut Context<Self>,
         agent: SharedAgent,
         bootstrap_gate: BootstrapGate,
+        fleet: Arc<FleetStore>,
     ) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
-        let store = SessionStore::open(&paths).expect("failed to open session store");
+        let store = SessionStore::open(fleet.clone());
         let sessions = store.list_sessions().unwrap_or_default();
-        let projects = discover_projects(&paths);
+        let work_nodes = discover_work_nodes(&fleet);
         let purpose_options = default_purposes();
         let purpose_note = cx.new(|cx| InputState::new(window, cx).placeholder("Optional note"));
 
@@ -186,15 +182,15 @@ impl SessionsView {
 
         Self {
             paths,
+            fleet,
             store,
             sessions: sessions.clone(),
             filter: SessionFilter::Active,
             selected_id: initial_selected,
             composing: false,
-            projects,
+            work_nodes,
             purpose_options,
-            selected_project: 0,
-            selected_task: 1,
+            selected_node: 0,
             selected_purpose: 0,
             purpose_note,
             agent,
@@ -247,7 +243,7 @@ impl SessionsView {
             .collect()
     }
 
-    fn visible_session_ids(&self) -> Vec<i64> {
+    fn visible_session_ids(&self) -> Vec<Uuid> {
         self.visible_sessions().into_iter().map(|s| s.id).collect()
     }
 
@@ -358,34 +354,15 @@ impl SessionsView {
         }
     }
 
-    fn cycle_project(&mut self, delta: i32, cx: &mut Context<Self>) {
-        if self.projects.is_empty() {
+    fn cycle_node(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.work_nodes.is_empty() {
             return;
         }
-        let len = self.projects.len();
+        let len = self.work_nodes.len();
         if delta < 0 {
-            self.selected_project = (self.selected_project + len - 1) % len;
+            self.selected_node = (self.selected_node + len - 1) % len;
         } else {
-            self.selected_project = (self.selected_project + 1) % len;
-        }
-        self.selected_task = self.selected_task.min(
-            task_choices(&self.projects[self.selected_project])
-                .len()
-                .saturating_sub(1),
-        );
-        cx.notify();
-    }
-
-    fn cycle_task(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let choices = task_choices(self.projects.get(self.selected_project).expect("project"));
-        if choices.is_empty() {
-            return;
-        }
-        let len = choices.len();
-        if delta < 0 {
-            self.selected_task = (self.selected_task + len - 1) % len;
-        } else {
-            self.selected_task = (self.selected_task + 1) % len;
+            self.selected_node = (self.selected_node + 1) % len;
         }
         cx.notify();
     }
@@ -403,21 +380,26 @@ impl SessionsView {
         cx.notify();
     }
 
-    fn launch_target(&self) -> (PathBuf, SharedString) {
-        if let Some(project) = self.projects.get(self.selected_project) {
-            let choices = task_choices(project);
-            if let Some(choice) = choices.get(self.selected_task) {
-                return (choice.path.clone(), choice.label.clone());
-            }
+    fn launch_target(&self) -> (Uuid, SharedString) {
+        if let Some(node) = self.work_nodes.get(self.selected_node) {
+            return (node.node_id, node.label.clone());
         }
-        (self.paths.repo_root().to_path_buf(), "repo root".into())
+        (Uuid::nil(), "no node".into())
+    }
+
+    fn provision_interview_agent(&self, node_id: &str) -> Result<crate::fleet::InterviewAgentContext, String> {
+        let settings = TodSettings::load(&self.paths).map_err(|e| e.to_string())?;
+        ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, node_id)
+            .map_err(|e| e.to_string())
     }
 
     fn launch_interview(&mut self, cx: &mut Context<Self>) {
-        let (entity_path, entity_label) = self.launch_target();
-        let entity_path = entity_path
-            .canonicalize()
-            .unwrap_or_else(|_| entity_path.clone());
+        let (node_id, entity_label) = self.launch_target();
+        if node_id.is_nil() {
+            self.kickoff_status = "No work node selected.".into();
+            cx.notify();
+            return;
+        }
         let purpose = self
             .purpose_options
             .get(self.selected_purpose)
@@ -434,13 +416,27 @@ impl SessionsView {
             format!("{} ({})", purpose.phase, note.trim())
         };
 
+        let node_id_str = node_id.to_string();
+        self.kickoff_status = "Provisioning interview workspace…".into();
+        cx.notify();
+        let agent_ctx = match self.provision_interview_agent(&node_id_str) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                self.kickoff_status = format!("Interview workspace: {err}").into();
+                cx.notify();
+                return;
+            }
+        };
+
         match self.store.insert_session_with_metadata(
             NewInterviewSession {
+                node_id,
+                agent_config_id: Some(agent_ctx.agent.id.clone()),
                 display_name: display_name.clone(),
-                entity_path: crate::interview::config::path_for_storage(&entity_path),
                 phase,
             },
             InterviewSessionStatus::Active,
+            Some(agent_ctx.agent.id),
         ) {
             Ok(session) => {
                 self.kickoff_status = format!("Kickoff started: {display_name}").into();
@@ -448,7 +444,7 @@ impl SessionsView {
                 self.reload();
                 self.selected_id = Some(session.id);
                 self.sync_session_list_items(cx);
-                self.start_researcher_bootstrap(session, entity_path);
+                self.start_question_maker_bootstrap(session);
                 cx.notify();
             }
             Err(err) => {
@@ -458,11 +454,10 @@ impl SessionsView {
         }
     }
 
-    /// Open an active interview for `entity_path` + base `phase`, or insert a new
-    /// session, start researcher bootstrap, and open the workspace.
+    /// Open an active interview for `node_id` + base `phase`, or insert a new session.
     pub fn open_or_kickoff_for_entity(
         &mut self,
-        entity_path: PathBuf,
+        node_id: Uuid,
         phase: &str,
         entity_label: &str,
         phase_label: &str,
@@ -470,35 +465,22 @@ impl SessionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entity_path = entity_path
-            .canonicalize()
-            .unwrap_or_else(|_| entity_path.clone());
-        let storage_key = crate::interview::config::path_for_storage(&entity_path);
         let wanted_base = crate::interview::config::base_interview_phase(phase);
 
         self.reload();
-
-        // Never leave another task's interview on screen while we resolve this one.
-        self.hide_workspace_if_other_entity(&entity_path, cx);
+        self.hide_workspace_if_other_node(node_id, cx);
 
         self.workspace_return_target = WorkspaceReturnTarget::TaskList;
         self.task_list_context = task_list_context;
 
-        let existing = self.find_best_session_for_entity(&storage_key, &entity_path, wanted_base);
+        let existing = self.find_best_session_for_node(node_id, wanted_base);
 
         if let Some(session) = existing {
-            // Discard mock-agent fixtures so task-list jump always talks to the real researcher.
             if Self::session_is_mock_scaffold(&session) {
                 let _ = self
                     .store
                     .set_status(session.id, InterviewSessionStatus::Archived);
                 self.reload();
-                tracing::info!(
-                    event = "interview",
-                    action = "archive_mock_scaffold",
-                    session_id = session.id,
-                    "archived mock interview session; kicking off fresh"
-                );
             } else {
                 let mut session = session;
                 if session.status != InterviewSessionStatus::Active {
@@ -516,17 +498,8 @@ impl SessionsView {
                 self.selected_id = Some(session.id);
                 self.sync_session_list_items(cx);
                 self.kickoff_status = format!("Opened: {}", session.display_name).into();
-                // Task-list jump: auto-bootstrap unbound sessions (same as new kickoff).
-                // Do not leave the user on the session list behind a setup toast.
                 if Self::session_needs_bootstrap(&session) {
-                    let Some(cwd) = Self::entity_cwd(&session) else {
-                        self.kickoff_status =
-                            "Cannot set up interview: the session has no project or task path."
-                                .into();
-                        cx.notify();
-                        return;
-                    };
-                    self.start_researcher_bootstrap(session.clone(), cwd);
+                    self.start_question_maker_bootstrap(session.clone());
                 }
                 self.open_workspace(session, window, cx);
                 cx.notify();
@@ -534,21 +507,34 @@ impl SessionsView {
             }
         }
 
+        self.kickoff_status = "Provisioning interview workspace…".into();
+        cx.notify();
+        let agent_ctx = match self.provision_interview_agent(&node_id.to_string()) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                self.kickoff_status = format!("Interview workspace: {err}").into();
+                cx.notify();
+                return;
+            }
+        };
+
         let display_name = format!("{entity_label} — {phase_label}");
         match self.store.insert_session_with_metadata(
             NewInterviewSession {
+                node_id,
+                agent_config_id: Some(agent_ctx.agent.id.clone()),
                 display_name: display_name.clone(),
-                entity_path: storage_key,
                 phase: phase.to_string(),
             },
             InterviewSessionStatus::Active,
+            Some(agent_ctx.agent.id),
         ) {
             Ok(session) => {
                 self.kickoff_status = format!("Kickoff started: {display_name}").into();
                 self.reload();
                 self.selected_id = Some(session.id);
                 self.sync_session_list_items(cx);
-                self.start_researcher_bootstrap(session.clone(), entity_path);
+                self.start_question_maker_bootstrap(session.clone());
                 self.open_workspace(session, window, cx);
                 cx.notify();
             }
@@ -559,43 +545,28 @@ impl SessionsView {
         }
     }
 
-    fn entity_paths_equal(stored: &str, storage_key: &str, entity_path: &Path) -> bool {
-        let stored_path = PathBuf::from(stored);
-        stored.eq_ignore_ascii_case(storage_key)
-            || crate::interview::config::paths_match(&stored_path, entity_path)
-    }
-
-    fn session_matches_entity_phase(
+    fn session_matches_node_phase(
         session: &InterviewSession,
-        storage_key: &str,
-        entity_path: &Path,
+        node_id: Uuid,
         wanted_base: &str,
     ) -> bool {
-        let Some(stored) = session.entity_path.as_deref() else {
-            return false;
-        };
-        if !Self::entity_paths_equal(stored, storage_key, entity_path) {
+        if session.node_id != node_id {
             return false;
         }
-        let session_base = session
-            .phase
-            .as_deref()
-            .map(crate::interview::config::base_interview_phase)
-            .unwrap_or("");
+        let session_base = crate::interview::config::base_interview_phase(&session.phase);
         wanted_base.is_empty() || session_base == wanted_base
     }
 
     /// Open question files still on disk for this session (0 if unbound / unreadable).
     fn session_open_question_count(session: &InterviewSession) -> usize {
-        let Some(cfg_path) = session
-            .config_path
-            .as_ref()
-            .map(Path::new)
-            .filter(|p| p.exists())
-        else {
+        let Some(scratch) = session.scratchpad_path.as_ref() else {
             return 0;
         };
-        let Ok(config) = crate::interview::config::parse_interview_config(cfg_path) else {
+        let cfg_path = Path::new(scratch).join("interview-config.md");
+        if !cfg_path.exists() {
+            return 0;
+        }
+        let Ok(config) = crate::interview::config::parse_interview_config(&cfg_path) else {
             return 0;
         };
         crate::interview::queue::load_queue_dir(&config.queue)
@@ -603,26 +574,20 @@ impl SessionsView {
             .unwrap_or(0)
     }
 
-    /// Pick the interview to open for this task — never prefer an empty `complete`
-    /// session over one that still has open questions (or over starting fresh).
-    fn find_best_session_for_entity(
+    fn find_best_session_for_node(
         &self,
-        storage_key: &str,
-        entity_path: &Path,
+        node_id: Uuid,
         wanted_base: &str,
     ) -> Option<InterviewSession> {
         let matches: Vec<&InterviewSession> = self
             .sessions
             .iter()
-            .filter(|s| {
-                Self::session_matches_entity_phase(s, storage_key, entity_path, wanted_base)
-            })
+            .filter(|s| Self::session_matches_node_phase(s, node_id, wanted_base))
             .collect();
         if matches.is_empty() {
             return None;
         }
 
-        // 1) Any session (incl. archived) that still has open questions — newest wins.
         if let Some(session) = matches
             .iter()
             .filter(|s| Self::session_open_question_count(s) > 0)
@@ -637,7 +602,6 @@ impl SessionsView {
             return Some((*session).clone());
         }
 
-        // 2) Active unbound — bootstrap still needed / in progress.
         if let Some(session) = matches
             .iter()
             .filter(|s| {
@@ -648,7 +612,6 @@ impl SessionsView {
             return Some((*session).clone());
         }
 
-        // 3) Other Active (bound but empty) — allow replenish.
         if let Some(session) = matches
             .iter()
             .filter(|s| s.status == InterviewSessionStatus::Active)
@@ -657,32 +620,20 @@ impl SessionsView {
             return Some((*session).clone());
         }
 
-        // 4) Complete with empty queue — reopen finished workspace (do not re-kickoff).
-        if let Some(session) = matches
+        matches
             .iter()
-            .filter(|s| {
-                s.status == InterviewSessionStatus::Complete
-                    && Self::session_open_question_count(s) == 0
-            })
+            .filter(|s| s.status == InterviewSessionStatus::Complete)
             .max_by_key(|s| s.id)
-        {
-            return Some((*session).clone());
-        }
-
-        // Archived / other terminal sessions with empty queues: start fresh kickoff.
-        None
+            .map(|s| (*s).clone())
     }
 
-    fn hide_workspace_if_other_entity(&mut self, entity_path: &Path, cx: &App) {
+    fn hide_workspace_if_other_node(&mut self, node_id: Uuid, cx: &App) {
         let Some(workspace) = self.workspace.as_ref() else {
             return;
         };
         let other = {
             let session = workspace.read(cx).interview_session();
-            let Some(stored) = session.entity_path.as_deref() else {
-                return;
-            };
-            !crate::interview::config::paths_match(Path::new(stored), entity_path)
+            session.node_id != node_id
         };
         if other {
             self.stash_workspace_in_flight(cx);
@@ -694,12 +645,12 @@ impl SessionsView {
 
     fn session_needs_bootstrap(session: &InterviewSession) -> bool {
         !session
-            .config_path
+            .scratchpad_path
             .as_ref()
-            .is_some_and(|p| Path::new(p).exists())
+            .is_some_and(|p| Path::new(p).join("interview-config.md").exists())
     }
 
-    /// True when scaffolding was produced by `--agent mock` (fixtures), not a real researcher.
+    /// True when scaffolding was produced by `--agent mock` (fixtures), not a real question maker.
     fn session_is_mock_scaffold(session: &InterviewSession) -> bool {
         if session
             .session_id
@@ -708,18 +659,13 @@ impl SessionsView {
         {
             return true;
         }
-        let Some(cfg_path) = session.config_path.as_ref().map(Path::new) else {
+        let Some(scratch) = session.scratchpad_path.as_ref() else {
             return false;
         };
-        let Ok(config) = crate::interview::config::parse_interview_config(cfg_path) else {
+        let cfg_path = Path::new(scratch).join("interview-config.md");
+        let Ok(config) = crate::interview::config::parse_interview_config(&cfg_path) else {
             return false;
         };
-        if std::fs::read_to_string(&config.transcript)
-            .map(|t| t.contains("# Mock interview") || t.contains("mock-bootstrap"))
-            .unwrap_or(false)
-        {
-            return true;
-        }
         let Ok(entries) = std::fs::read_dir(&config.queue) else {
             return false;
         };
@@ -730,7 +676,7 @@ impl SessionsView {
         })
     }
 
-    fn bootstrap_in_flight(&self, session_id: i64) -> bool {
+    fn bootstrap_in_flight(&self, session_id: Uuid) -> bool {
         self.bootstrap_sessions
             .lock()
             .expect("bootstrap sessions lock")
@@ -741,18 +687,6 @@ impl SessionsView {
         Self::session_needs_bootstrap(session) && !self.bootstrap_in_flight(session.id)
     }
 
-    fn entity_cwd(session: &InterviewSession) -> Option<PathBuf> {
-        session
-            .entity_path
-            .as_ref()
-            .filter(|p| !p.is_empty())
-            .map(|p| {
-                PathBuf::from(p.as_str())
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(p.as_str()))
-            })
-    }
-
     fn bootstrap_subject_label(session: &InterviewSession) -> SharedString {
         if let Some(prefix) = session.display_name.split('—').next() {
             let trimmed = prefix.trim();
@@ -760,17 +694,7 @@ impl SessionsView {
                 return trimmed.to_string().into();
             }
         }
-        session
-            .entity_path
-            .as_ref()
-            .and_then(|p| {
-                Path::new(p.as_str())
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .map(SharedString::from)
-            .unwrap_or_else(|| "This interview".into())
+        session.node_id.to_string().into()
     }
 
     fn prompt_bootstrap_setup(
@@ -806,46 +730,82 @@ impl SessionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cwd) = Self::entity_cwd(&session) else {
-            tracing::warn!(
-                event = "interview",
-                action = "bootstrap_skipped_no_entity",
-                session_id = session.id,
-                "cannot bootstrap session without entity_path"
-            );
-            self.kickoff_status =
-                "Cannot set up interview: the session has no project or task path.".into();
-            cx.notify();
-            return;
-        };
-        if session.status == InterviewSessionStatus::Complete {
-            let _ = self
-                .store
-                .set_status(session.id, InterviewSessionStatus::Active);
-        }
-        tracing::info!(
-            event = "interview",
-            action = "bootstrap_accepted",
-            session_id = session.id,
-            entity = %cwd.display(),
-            "user accepted bootstrap for unbound session"
-        );
-        self.reload();
-        let session = self
-            .sessions
-            .iter()
-            .find(|s| s.id == session.id)
-            .cloned()
-            .unwrap_or(session);
-        self.start_researcher_bootstrap(session.clone(), cwd);
+        self.start_question_maker_bootstrap(session.clone());
         self.open_workspace(session, window, cx);
     }
 
-    fn start_researcher_bootstrap(&self, session: InterviewSession, cwd: PathBuf) {
-        let prompt = researcher_bootstrap_prompt(&session);
+    fn start_question_maker_bootstrap(&self, session: InterviewSession) {
+        let settings = TodSettings::load(&self.paths).unwrap_or_default();
+        let agent_ctx = match ensure_interview_agent_for_node(
+            &self.fleet,
+            &self.paths,
+            &settings,
+            &session.node_id.to_string(),
+        ) {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                tracing::error!("interview agent provision failed: {err:#}");
+                return;
+            }
+        };
+        let agent_config_id = session
+            .agent_config_id
+            .clone()
+            .unwrap_or_else(|| agent_ctx.agent.id.clone());
+        let workspace_cwd = agent_ctx.cwd;
+        let install = match TodInstallPaths::discover() {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::error!("process bundle not found: {err:#}");
+                return;
+            }
+        };
+        let manifest = match ProcessManifest::load(&install) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::error!("process manifest load failed: {err:#}");
+                return;
+            }
+        };
+        let scratchpad = session
+            .scratchpad_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                session_scratchpad(
+                    self.paths.repo_root(),
+                    session.node_id,
+                    &session.id.to_string(),
+                )
+            });
+        let ctx = {
+            let fleet_projection = self.fleet.projection();
+            let guard = fleet_projection.lock().expect("fleet projection mutex");
+            let conn = guard.connection();
+            match AgentLaunchContext::question_maker_bootstrap(
+                &conn,
+                &install,
+                &manifest,
+                &self.paths,
+                &session,
+                &scratchpad,
+            ) {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::error!("bootstrap launch context failed: {err:#}");
+                    return;
+                }
+            }
+        };
+        let prompt = ctx.prompt;
+        let cwd = workspace_cwd;
+        let question_maker_settings = TodSettings::load(&self.paths)
+            .unwrap_or_default()
+            .question_maker;
         let agent = self.agent.clone();
         let bootstrap_gate = self.bootstrap_gate.clone();
         let bootstrap_sessions = self.bootstrap_sessions.clone();
+        let fleet = self.fleet.clone();
         let store_paths = self.paths.clone();
         let session_id = session.id;
         {
@@ -854,7 +814,7 @@ impl SessionsView {
                 tracing::debug!(
                     event = "interview",
                     action = "bootstrap_already_running",
-                    session_id,
+                    session_id = %session_id.to_string(),
                     "bootstrap already in flight for session"
                 );
                 return;
@@ -863,19 +823,20 @@ impl SessionsView {
         tracing::info!(
             event = "interview",
             action = "bootstrap_start",
-            session_id,
+            session_id = %session_id.to_string(),
             cwd = %cwd.display(),
-            phase = session.phase.as_deref().unwrap_or(""),
-            entity = session.entity_path.as_deref().unwrap_or(""),
-            prompt_chars = prompt.len(),
-            "researcher bootstrap thread starting"
+            phase = %session.phase,
+            node_id = %session.node_id.to_string(),
+            prompt_chars = prompt.session_prefix.len() + prompt.turn.len(),
+            "question maker bootstrap thread starting"
         );
         bootstrap_gate.store(true, Ordering::SeqCst);
+        let agent_config_id_for_thread = agent_config_id.clone();
         std::thread::spawn(move || {
             struct BootstrapGuard {
-                sessions: Arc<Mutex<HashSet<i64>>>,
+                sessions: Arc<Mutex<HashSet<Uuid>>>,
                 gate: BootstrapGate,
-                session_id: i64,
+                session_id: Uuid,
             }
             impl Drop for BootstrapGuard {
                 fn drop(&mut self) {
@@ -895,16 +856,21 @@ impl SessionsView {
             let repo_root = store_paths.repo_root().to_path_buf();
             let handle = {
                 let mut provider = agent.lock().expect("agent lock");
-                provider.start_researcher_replenishment(cwd, prompt)
+                provider.start_question_maker_replenishment(
+                    &agent_config_id_for_thread,
+                    cwd,
+                    prompt,
+                    &question_maker_settings,
+                )
             };
             let Ok(handle) = handle else {
                 tracing::error!(
                     event = "interview",
                     action = "bootstrap_start_failed",
-                    session_id,
-                    "researcher bootstrap failed to start"
+                    session_id = %session_id.to_string(),
+                    "question maker bootstrap failed to start"
                 );
-                eprintln!("tod: researcher bootstrap failed to start for session {session_id}");
+                eprintln!("tod: question maker bootstrap failed to start for session {session_id}");
                 return;
             };
 
@@ -933,7 +899,7 @@ impl SessionsView {
                         tracing::info!(
                             event = "interview",
                             action = "bootstrap_agent_finished",
-                            session_id,
+                            session_id = %session_id.to_string(),
                             ?state,
                             "bootstrap ACP run left InFlight"
                         );
@@ -943,62 +909,45 @@ impl SessionsView {
                 }
 
                 if !synced {
-                    match SessionStore::open(&store_paths) {
-                        Ok(store) => {
-                            let sync_result = if agent_finished {
-                                sync_scaffolding_from_disk_after_bootstrap(
-                                    &store, &repo_root, session_id,
-                                )
-                            } else {
-                                sync_scaffolding_from_disk(&store, &repo_root, session_id)
-                            };
-                            match sync_result {
-                                Ok(true) => {
-                                    synced = true;
-                                    tracing::info!(
-                                        event = "interview",
-                                        action = "bootstrap_synced",
-                                        session_id,
-                                        agent_finished,
-                                        "scaffolding paths bound in SQLite"
-                                    );
-                                }
-                                Ok(false) => {
-                                    if last_sync_log.elapsed() >= Duration::from_secs(5) {
-                                        tracing::debug!(
-                                            event = "interview",
-                                            action = "bootstrap_sync_pending",
-                                            session_id,
-                                            agent_finished,
-                                            "no matching interview-config yet"
-                                        );
-                                        last_sync_log = Instant::now();
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        event = "interview",
-                                        action = "bootstrap_sync_error",
-                                        session_id,
-                                        error = %err,
-                                        "scaffolding sync error"
-                                    );
-                                    eprintln!(
-                                        "tod: scaffolding sync error for session {session_id}: {err}"
-                                    );
-                                }
+                    let store = SessionStore::open(fleet.clone());
+                    let sync_result = if agent_finished {
+                        sync_scaffolding_from_disk_after_bootstrap(&store, &repo_root, session_id)
+                    } else {
+                        sync_scaffolding_from_disk(&store, &repo_root, session_id)
+                    };
+                    match sync_result {
+                        Ok(true) => {
+                            synced = true;
+                            tracing::info!(
+                                event = "interview",
+                                action = "bootstrap_synced",
+                                session_id = %session_id.to_string(),
+                                agent_finished,
+                                "scaffolding paths bound in SQLite"
+                            );
+                        }
+                        Ok(false) => {
+                            if last_sync_log.elapsed() >= Duration::from_secs(5) {
+                                tracing::debug!(
+                                    event = "interview",
+                                    action = "bootstrap_sync_pending",
+                                    session_id = %session_id.to_string(),
+                                    agent_finished,
+                                    "no matching interview-config yet"
+                                );
+                                last_sync_log = Instant::now();
                             }
                         }
                         Err(err) => {
                             tracing::warn!(
                                 event = "interview",
-                                action = "bootstrap_store_open_failed",
-                                session_id,
+                                action = "bootstrap_sync_error",
+                                session_id = %session_id.to_string(),
                                 error = %err,
-                                "scaffolding store open failed"
+                                "scaffolding sync error"
                             );
                             eprintln!(
-                                "tod: scaffolding store open failed for session {session_id}: {err}"
+                                "tod: scaffolding sync error for session {session_id}: {err}"
                             );
                         }
                     }
@@ -1020,7 +969,7 @@ impl SessionsView {
                 tracing::error!(
                     event = "interview",
                     action = "bootstrap_sync_timeout",
-                    session_id,
+                    session_id = %session_id.to_string(),
                     agent_finished,
                     "scaffolding sync timed out"
                 );
@@ -1071,15 +1020,7 @@ impl SessionsView {
             .cloned()
             .unwrap_or(session);
         if self.should_prompt_bootstrap(&session) {
-            // Do not leave a different task's workspace visible behind the toast.
-            if let Some(entity) = session.entity_path.as_deref() {
-                self.hide_workspace_if_other_entity(Path::new(entity), cx);
-            } else if self.workspace.is_some() {
-                self.stash_workspace_in_flight(cx);
-                self.workspace = None;
-                self.workspace_visible = false;
-                self._workspace_subscription = None;
-            }
+            self.hide_workspace_if_other_node(session.node_id, cx);
             self.prompt_bootstrap_setup(session, window, cx);
             return;
         }
@@ -1105,12 +1046,14 @@ impl SessionsView {
         let agent = self.agent.clone();
         let bootstrap_sessions = self.bootstrap_sessions.clone();
         let task_list_proceed = self.task_list_context.clone();
+        let fleet = self.fleet.clone();
         let workspace = cx.new(|cx| {
             WorkspaceView::new(
                 session,
                 window,
                 cx,
                 agent,
+                fleet,
                 bootstrap_sessions,
                 restored,
                 task_list_proceed,
@@ -1299,10 +1242,9 @@ impl Render for SessionsView {
                 cx,
                 border,
                 muted,
-                &self.projects,
+                &self.work_nodes,
                 &self.purpose_options,
-                self.selected_project,
-                self.selected_task,
+                self.selected_node,
                 self.selected_purpose,
                 &self.purpose_note,
             ));
@@ -1437,20 +1379,15 @@ fn compose_panel(
     cx: &mut Context<SessionsView>,
     border: gpui::Hsla,
     muted: gpui::Hsla,
-    projects: &[ProjectTarget],
+    work_nodes: &[NodeTarget],
     purposes: &[PurposeOption],
-    selected_project: usize,
-    selected_task: usize,
+    selected_node: usize,
     selected_purpose: usize,
     purpose_note: &Entity<InputState>,
 ) -> impl IntoElement {
-    let project = projects.get(selected_project);
-    let project_label = project
-        .map(|p| p.label.clone())
-        .unwrap_or_else(|| "—".into());
-    let task_label = project
-        .map(|p| task_choices(p).get(selected_task).map(|t| t.label.clone()))
-        .flatten()
+    let node_label = work_nodes
+        .get(selected_node)
+        .map(|n| n.label.clone())
         .unwrap_or_else(|| "—".into());
     let purpose_label = purposes
         .get(selected_purpose)
@@ -1462,39 +1399,23 @@ fn compose_panel(
         .p_4()
         .border_t_1()
         .border_color(border)
-        .child(
-            div()
-                .text_sm()
-                .font_semibold()
-                .child("New interview"),
-        )
+        .child(div().text_sm().font_semibold().child("New interview"))
         .child(
             div()
                 .text_xs()
                 .text_color(muted)
-                .child("Choose a process project and optionally a task under it, then pick the interview phase."),
+                .child("Choose a work node from the outline, then pick the interview phase."),
         )
         .child(picker_row(
             cx,
-            "Project",
-            project_label,
-            "cycle-project-prev",
+            "Node",
+            node_label,
+            "cycle-node-prev",
             "◀",
-            |this, _, _, cx| this.cycle_project(-1, cx),
-            "cycle-project-next",
+            |this, _, _, cx| this.cycle_node(-1, cx),
+            "cycle-node-next",
             "▶",
-            |this, _, _, cx| this.cycle_project(1, cx),
-        ))
-        .child(picker_row(
-            cx,
-            "Task",
-            task_label,
-            "cycle-task-prev",
-            "◀",
-            |this, _, _, cx| this.cycle_task(-1, cx),
-            "cycle-task-next",
-            "▶",
-            |this, _, _, cx| this.cycle_task(1, cx),
+            |this, _, _, cx| this.cycle_node(1, cx),
         ))
         .child(picker_row(
             cx,
@@ -1610,72 +1531,21 @@ where
         .child(label)
 }
 
-fn task_choices(project: &ProjectTarget) -> Vec<TaskTarget> {
-    let mut choices = vec![TaskTarget {
-        path: project.path.clone(),
-        label: format!("{} (project-level)", project.label).into(),
-    }];
-    choices.extend(project.tasks.clone());
-    choices
-}
-
-fn discover_projects(paths: &TodPaths) -> Vec<ProjectTarget> {
-    let mut options = Vec::new();
-    let doc_process = paths
-        .repo_root()
-        .join("doc")
-        .join("process")
-        .join("projects");
-    if doc_process.is_dir() {
-        if let Ok(projects) = std::fs::read_dir(&doc_process) {
-            for project in projects.flatten() {
-                let project_path = project.path();
-                if !project_path.is_dir() {
-                    continue;
-                }
-                let project_name = project_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("project")
-                    .to_string();
-                let mut tasks = Vec::new();
-                let tasks_dir = project_path.join("tasks");
-                if tasks_dir.is_dir() {
-                    if let Ok(task_entries) = std::fs::read_dir(tasks_dir) {
-                        for task in task_entries.flatten() {
-                            let task_path = task.path();
-                            if task_path.is_dir() {
-                                let task_name = task_path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("task")
-                                    .to_string();
-                                tasks.push(TaskTarget {
-                                    path: task_path,
-                                    label: task_name.into(),
-                                });
-                            }
-                        }
-                    }
-                }
-                tasks.sort_by(|a, b| a.label.cmp(&b.label));
-                options.push(ProjectTarget {
-                    path: project_path,
-                    label: project_name.into(),
-                    tasks,
-                });
-            }
-        }
-    }
-    if options.is_empty() {
-        options.push(ProjectTarget {
-            path: paths.repo_root().to_path_buf(),
-            label: "repo root".into(),
-            tasks: Vec::new(),
-        });
-    }
-    options.sort_by(|a, b| a.label.cmp(&b.label));
-    options
+fn discover_work_nodes(fleet: &FleetStore) -> Vec<NodeTarget> {
+    let lists = fleet.list_outline_lists().unwrap_or_default();
+    let Some(list) = lists.first() else {
+        return Vec::new();
+    };
+    fleet
+        .flatten_outline(list.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| !row.capabilities.is_empty())
+        .map(|row| NodeTarget {
+            node_id: row.node.id,
+            label: row.node.title.into(),
+        })
+        .collect()
 }
 
 fn default_purposes() -> Vec<PurposeOption> {

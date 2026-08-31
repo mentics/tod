@@ -98,10 +98,14 @@ fn read_data_version(conn: &Connection) -> Result<i64> {
 }
 
 fn load_metadata(conn: &Connection) -> Result<FleetMetadata> {
-    let task_count: usize = conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| {
-        row.get::<_, i64>(0).map(|n| n as usize)
-    })?;
-    let agent_count: usize = conn.query_row("SELECT COUNT(*) FROM agents", [], |row| {
+    let task_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM node_capabilities WHERE capability = 'agent'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n as usize),
+        )
+        .unwrap_or(0);
+    let agent_count: usize = conn.query_row("SELECT COUNT(*) FROM agent_configs", [], |row| {
         row.get::<_, i64>(0).map(|n| n as usize)
     })?;
     let notification_count: usize =
@@ -154,7 +158,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-fleet-proj-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(50)).unwrap();
+        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(50), crate::fleet::command_log::CommandLog::shared()).unwrap();
         let projection = FleetProjection::open(&path).unwrap();
         (dir, writer, projection)
     }
@@ -164,14 +168,18 @@ mod tests {
         let (dir, writer, mut projection) = temp_projection();
         {
             let conn = schema::open_writer_connection(writer.db_path()).unwrap();
+            let node_id = uuid::Uuid::new_v4();
+            let blob = node_id.as_bytes().to_vec();
+            let now = chrono::Utc::now().timestamp_millis();
             conn.execute(
-                "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    "One",
-                    "one",
-                    "proposed"
-                ],
+                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+                rusqlite::params![blob, "one", "One", now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'agent', ?2)",
+                rusqlite::params![blob, now],
             )
             .unwrap();
         }
@@ -189,14 +197,18 @@ mod tests {
         writer.shutdown().unwrap();
         {
             let conn = schema::open_writer_connection(&db_path).unwrap();
+            let node_id = uuid::Uuid::new_v4();
+            let blob = node_id.as_bytes().to_vec();
+            let now = chrono::Utc::now().timestamp_millis();
             conn.execute(
-                "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    "External",
-                    "external",
-                    "proposed"
-                ],
+                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+                rusqlite::params![blob, "external", "External", now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'agent', ?2)",
+                rusqlite::params![blob, now],
             )
             .unwrap();
         }

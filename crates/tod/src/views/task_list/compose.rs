@@ -8,7 +8,7 @@ use super::from_ticket::is_ticket_id;
 impl TaskListView {
     pub(super) fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_chrome_overlays(cx);
-        if self.edit_open_for.take().is_some() {
+        if self.slide_edit_open {
             cx.emit(super::TaskListEvent::CloseTaskEdit);
         }
         if !self.compose_open {

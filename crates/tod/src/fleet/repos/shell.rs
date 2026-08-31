@@ -42,7 +42,7 @@ impl<'a> ShellRepo<'a> {
             None => (None, None),
         };
         self.conn.execute(
-            "INSERT INTO shell_sessions (id, agent_id, reconnect_pid, reconnect_birth_token)
+            "INSERT INTO shell_sessions (id, agent_config_id, reconnect_pid, reconnect_birth_token)
              VALUES (?1, ?2, ?3, ?4)",
             params![id, agent_id, pid, birth],
         )?;
@@ -51,7 +51,7 @@ impl<'a> ShellRepo<'a> {
 
     pub fn list_all(&self) -> Result<Vec<ShellSession>, ShellRepoError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent_id, reconnect_pid, reconnect_birth_token
+            "SELECT id, agent_config_id, reconnect_pid, reconnect_birth_token
              FROM shell_sessions ORDER BY id",
         )?;
         let rows = stmt
@@ -62,7 +62,7 @@ impl<'a> ShellRepo<'a> {
 
     pub fn list_with_reconnect(&self) -> Result<Vec<ShellSession>, ShellRepoError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent_id, reconnect_pid, reconnect_birth_token
+            "SELECT id, agent_config_id, reconnect_pid, reconnect_birth_token
              FROM shell_sessions
              WHERE reconnect_pid IS NOT NULL AND reconnect_birth_token IS NOT NULL
              ORDER BY id",
@@ -87,8 +87,8 @@ impl<'a> ShellRepo<'a> {
 
     pub fn list_for_agent(&self, agent_id: &str) -> Result<Vec<ShellSession>, ShellRepoError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent_id, reconnect_pid, reconnect_birth_token
-             FROM shell_sessions WHERE agent_id = ?1 ORDER BY id",
+            "SELECT id, agent_config_id, reconnect_pid, reconnect_birth_token
+             FROM shell_sessions WHERE agent_config_id = ?1 ORDER BY id",
         )?;
         let rows = stmt
             .query_map(params![agent_id], row_to_session)?
@@ -128,7 +128,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShellSession> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent::{AgentRepo, NewAgent};
+    use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
     use crate::fleet::repos::task::{FleetTask, TaskRepo};
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
 
@@ -138,12 +138,14 @@ mod tests {
         TaskRepo::new(conn)
             .insert(&FleetTask::new(&task_id, "T", "t"))
             .unwrap();
-        AgentRepo::new(conn)
-            .insert(&NewAgent {
+        AgentConfigRepo::new(conn)
+            .insert(&NewAgentConfig {
                 id: agent_id.clone(),
-                task_id,
+                node_id: task_id,
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             })
             .unwrap();
         agent_id

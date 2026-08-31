@@ -1,5 +1,6 @@
 use crate::fleet::{FleetStore, explore};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
+use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -231,8 +232,12 @@ impl Render for DatabaseView {
                                 }),
                             )),
                     )
-                    .child(div().text_sm().text_color(status_color).child(status))
-                    .child(self.render_results_table(border, foreground, muted, muted_bg)),
+                    .child(
+                        selectable_text("database-status", status, window, cx)
+                            .text_sm()
+                            .text_color(status_color),
+                    )
+                    .child(self.render_results_table(window, cx, border, foreground, muted, muted_bg)),
             )
             .track_focus(&self.focus_handle);
 
@@ -248,6 +253,8 @@ impl Render for DatabaseView {
 impl DatabaseView {
     fn render_results_table(
         &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
         border: gpui::Hsla,
         foreground: gpui::Hsla,
         muted: gpui::Hsla,
@@ -279,11 +286,13 @@ impl DatabaseView {
                             .max_w(px(360.))
                             .px_2()
                             .py_1()
-                            .text_xs()
-                            .font_semibold()
-                            .text_color(foreground)
                             .overflow_hidden()
-                            .child(name.clone())
+                            .child(
+                                selectable_text(("db-col-name", col_ix), name.clone(), window, cx)
+                                    .text_xs()
+                                    .font_semibold()
+                                    .text_color(foreground),
+                            )
                     }),
             );
 
@@ -299,10 +308,17 @@ impl DatabaseView {
                         .max_w(px(360.))
                         .px_2()
                         .py_1()
-                        .text_xs()
-                        .text_color(foreground)
                         .overflow_hidden()
-                        .child(cell.clone())
+                        .child(
+                            selectable_text(
+                                ("db-cell-text", row_ix * 1000 + col_ix),
+                                cell.clone(),
+                                window,
+                                cx,
+                            )
+                            .text_xs()
+                            .text_color(foreground),
+                        )
                 }))
         }));
 

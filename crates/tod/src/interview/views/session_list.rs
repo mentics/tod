@@ -4,6 +4,7 @@ use gpui::{Context, ParentElement, SharedString, Styled, Window, div};
 use gpui_component::IndexPath;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
+use uuid::Uuid;
 
 pub struct SessionListDelegate {
     items: Vec<InterviewSession>,
@@ -26,12 +27,12 @@ impl SessionListDelegate {
         &self.items
     }
 
-    pub fn selected_session_id(&self) -> Option<i64> {
+    pub fn selected_session_id(&self) -> Option<Uuid> {
         self.selected_index
             .and_then(|ix| self.items.get(ix.row).map(|s| s.id))
     }
 
-    pub fn select_by_id(&mut self, id: i64) -> Option<IndexPath> {
+    pub fn select_by_id(&mut self, id: Uuid) -> Option<IndexPath> {
         let ix = self
             .items
             .iter()
@@ -45,7 +46,7 @@ impl SessionListDelegate {
         self.selected_index = None;
     }
 
-    pub fn index_of_id(&self, id: i64) -> Option<usize> {
+    pub fn index_of_id(&self, id: Uuid) -> Option<usize> {
         self.items.iter().position(|s| s.id == id)
     }
 }
@@ -74,13 +75,13 @@ impl ListDelegate for SessionListDelegate {
             InterviewSessionStatus::Archived => "Archived",
             InterviewSessionStatus::Complete => "Complete",
         };
-        let entity_label = session.entity_path.as_deref().unwrap_or("—");
+        let entity_label = session.node_id.to_string();
         let updated = format_updated(session.updated_at);
         let meta: SharedString = format!("{entity_label} · {status} · {updated}").into();
         let display_name: SharedString = session.display_name.clone().into();
 
         Some(
-            ListItem::new(("session-row", session.id as u64))
+            ListItem::new(("session-row", ix.row))
                 .selected(selected)
                 .child(
                     v_flex()

@@ -1,5 +1,6 @@
 use gpui::{
-    Action, App, IntoElement, ParentElement, Styled, Window, div, prelude::FluentBuilder, px,
+    Action, App, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::StyledExt;
@@ -20,6 +21,21 @@ fn badge_style(cx: &App) -> ShortcutBadgeStyle {
     }
 }
 
+fn label_pill(label: SharedString, style: ShortcutBadgeStyle) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .px_1p5()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(style.border)
+        .bg(style.bg)
+        .text_color(style.fg)
+        .text_xs()
+        .font_medium()
+        .child(label)
+}
+
 fn shortcut_pill(kbd: Kbd, style: ShortcutBadgeStyle) -> impl IntoElement {
     div()
         .flex_shrink_0()
@@ -33,6 +49,11 @@ fn shortcut_pill(kbd: Kbd, style: ShortcutBadgeStyle) -> impl IntoElement {
         .text_xs()
         .font_medium()
         .child(kbd.appearance(false))
+}
+
+/// Keyboard-style badge showing arbitrary label text (e.g. row index shortcuts).
+pub fn render_label_badge(label: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+    label_pill(label.into(), badge_style(cx))
 }
 
 /// High-contrast shortcut pill for suffix slots (search field, etc.).

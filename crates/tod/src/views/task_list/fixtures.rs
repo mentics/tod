@@ -1,116 +1,115 @@
 use chrono::Utc;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use uuid::Uuid;
 
 use crate::fleet::FleetStore;
-use crate::fleet::repos::agent::FleetAgent;
-use crate::process::ProcessTask;
+use crate::outline::types::Capability;
 
-use super::model::{AgentInfo, ShellInfo, TaskItem};
+use super::model::{AgentInfo, TaskItem};
 
-/// Load tasks from `doc/process/…` scan, merged with fleet agent rows when matched.
-pub fn load_tasks_from_store(store: &FleetStore, repo_root: &Path) -> Vec<TaskItem> {
-    let fleet_tasks = store.list_tasks().unwrap_or_default();
-    let fleet_by_id: HashMap<String, &crate::fleet::repos::task::FleetTask> =
-        fleet_tasks.iter().map(|t| (t.id.clone(), t)).collect();
-    let fleet_by_slug: HashMap<String, &crate::fleet::repos::task::FleetTask> =
-        fleet_tasks.iter().map(|t| (t.slug.clone(), t)).collect();
-
-    scan_process_tasks(repo_root)
-        .into_iter()
-        .map(|mut item| {
-            if let Some(fleet) = fleet_for_item(&item, &fleet_by_id, &fleet_by_slug) {
-                if item.tags.is_empty() {
-                    item.tags = fleet.tags.clone();
-                }
-                if let Ok(agents) = store.list_agents_for_task(&fleet.id) {
-                    item.agents = agents.iter().map(agent_to_info).collect();
-                }
+/// Load tree rows from the outline store for `list_id` (or empty when none).
+pub fn load_tasks_from_store(
+    store: &FleetStore,
+    list_id: Option<Uuid>,
+) -> Vec<TaskItem> {
+    let Some(list_id) = list_id else {
+        return Vec::new();
+    };
+    let rows = store.flatten_outline(list_id).unwrap_or_default();
+    let counts = store.obligation_counts_for_list(list_id).unwrap_or_default();
+    rows.into_iter()
+        .map(|row| {
+            let is_work = !row.capabilities.is_empty();
+            let has_spec = row.capabilities.contains(&Capability::Spec);
+            let counts = counts.get(&row.node.id).copied().unwrap_or_default();
+            let lifecycle = if is_work {
+                row.lifecycle.unwrap_or_else(|| "proposed".into())
+            } else {
+                String::new()
+            };
+            let agents = if row.capabilities.contains(&Capability::Agent) {
+                store
+                    .list_agents_for_task(&row.node.id.to_string())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|a| AgentInfo {
+                        id: a.id,
+                        label: format!("{} {}", env_chip_label(&a.env_type), mode_chip_label(&a.mode)),
+                        status: a.runtime_status,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            TaskItem {
+                id: row.node.id.to_string(),
+                ticket_id: row.ticket_id,
+                title: row.node.title,
+                lifecycle,
+                entity_path: node_scratchpad_path(&row.node.id.to_string()),
+                tags: row.tags,
+                agents,
+                shells: Vec::new(),
+                interaction_timestamp: row.node.updated_at,
+                tree_ordinal: row.tree_ordinal,
+                depth: row.depth,
+                collapsed: row.collapsed,
+                is_work_node: is_work,
+                has_spec,
+                requirement_count: counts.requirements,
+                constraint_count: counts.constraints,
+                has_children: row.has_children,
             }
-            item
         })
         .collect()
 }
 
-fn fleet_for_item<'a>(
-    item: &TaskItem,
-    by_id: &HashMap<String, &'a crate::fleet::repos::task::FleetTask>,
-    by_slug: &HashMap<String, &'a crate::fleet::repos::task::FleetTask>,
-) -> Option<&'a crate::fleet::repos::task::FleetTask> {
-    by_id
-        .get(&item.id)
-        .copied()
-        .or_else(|| by_slug.get(&item.task_slug()).copied())
+fn node_scratchpad_path(node_id: &str) -> PathBuf {
+    PathBuf::from(".local")
+        .join("agent")
+        .join("nodes")
+        .join(node_id)
 }
 
-fn scan_process_tasks(repo_root: &Path) -> Vec<TaskItem> {
-    crate::process::scan_process_tasks(repo_root)
-        .into_iter()
-        .map(process_task_to_item)
-        .collect()
-}
-
-fn process_task_to_item(task: ProcessTask) -> TaskItem {
-    let id = if task.project_slug.is_empty() {
-        task.task_slug.clone()
-    } else {
-        format!("{}-{}", task.project_slug, task.task_slug)
-    };
-    TaskItem {
-        id,
-        ticket_id: None,
-        title: task.title,
-        lifecycle: task.lifecycle,
-        entity_path: task.entity_path,
-        tags: Vec::new(),
-        agents: Vec::new(),
-        shells: Vec::new(),
-        interaction_timestamp: Utc::now(),
-    }
-}
-
-fn agent_to_info(agent: &FleetAgent) -> AgentInfo {
-    AgentInfo {
-        id: agent.id.clone(),
-        label: format!("{} {}", agent.id, agent.env_type),
-        status: runtime_status_label(&agent.runtime_status),
-    }
-}
-
-fn runtime_status_label(status: &str) -> String {
-    match status {
-        "starting" => "Starting".into(),
-        "processing" => "Processing".into(),
-        "waiting" => "Waiting".into(),
-        "blocked" => "Blocked".into(),
-        "not_running" => "Not running".into(),
+fn env_chip_label(env_type: &str) -> String {
+    match env_type {
+        "local" => "host".into(),
+        "devcontainer" => "dc".into(),
+        "micro_vm" => "vm".into(),
         other => other.to_string(),
     }
 }
 
-impl TaskItem {
-    pub fn task_slug(&self) -> String {
-        self.entity_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&self.id)
-            .to_string()
+fn mode_chip_label(mode: &str) -> String {
+    match mode {
+        "agent" => "auto".into(),
+        "shell" => "interactive".into(),
+        "interview" => "interview".into(),
+        other => mode.to_string(),
     }
 }
 
-/// Synthetic rows for scale checks (not shown in the live app).
+/// Generate a large in-memory fixture set for list performance tests.
 pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
     (0..base_count)
         .map(|i| TaskItem {
             id: format!("scale-{i}"),
-            ticket_id: Some(format!("TOD-{}", 1000 + i)),
-            title: format!("Scale test task {i}"),
-            lifecycle: "ready".into(),
+            ticket_id: None,
+            title: format!("Scale task {i}"),
+            lifecycle: "active".into(),
             entity_path: PathBuf::from(format!("test/scale-{i}")),
-            tags: vec!["scale".into()],
-            agents: Vec::<AgentInfo>::new(),
-            shells: Vec::<ShellInfo>::new(),
+            tags: vec![],
+            agents: Vec::new(),
+            shells: Vec::new(),
             interaction_timestamp: Utc::now(),
+            tree_ordinal: i,
+            depth: 0,
+            collapsed: false,
+            is_work_node: true,
+            has_spec: false,
+            requirement_count: 0,
+            constraint_count: 0,
+            has_children: false,
         })
         .collect()
 }
@@ -118,39 +117,48 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::FleetStore;
+    use crate::outline::{CreatePosition, OutlineMutation};
     use std::fs;
 
-    fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-    }
-
     #[test]
-    fn load_tasks_from_workspace_process_tree() {
-        let root = repo_root();
-        let task_list_dir = root.join("doc/process/projects/tod/tasks/task-list");
-        if !task_list_dir.is_dir() {
-            return;
-        }
-        let store_root =
-            std::env::temp_dir().join(format!("tod-task-load-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&store_root).unwrap();
-        let store = FleetStore::open(&store_root).unwrap();
-        let tasks = load_tasks_from_store(&store, &root);
-        assert!(
-            tasks.iter().any(|t| t.task_slug() == "task-list"),
-            "expected workspace task-list row; got {:?}",
-            tasks.iter().map(|t| (&t.id, &t.title)).collect::<Vec<_>>()
-        );
-        assert!(
-            !tasks
-                .iter()
-                .any(|t| t.title == "Add fleet persistence layer"),
-            "hand-authored fixture titles must not appear"
-        );
+    fn loads_from_outline_tree() {
+        let root = std::env::temp_dir().join(format!("tod-fixtures-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: "test".into(),
+                title: "Test".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let lists = store.list_outline_lists().unwrap();
+        let list_id = lists[0].id;
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Root task".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+
+        let items = load_tasks_from_store(&store, Some(list_id));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Root task");
+        let projection = store.projection();
+        let proj = projection.lock().expect("projection");
+        let conn = proj.connection();
+        let node = crate::outline::repos::NodeRepo::new(&conn)
+            .get(uuid::Uuid::parse_str(&items[0].id).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.slug, "root-task");
         drop(store);
-        let _ = fs::remove_dir_all(store_root);
+        let _ = fs::remove_dir_all(root);
     }
 }

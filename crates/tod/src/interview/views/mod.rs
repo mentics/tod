@@ -6,4 +6,4 @@ pub mod settings;
 pub mod workspace;
 
 pub use sessions::{SessionsEvent, SessionsView, register_sessions_keyboard_bindings};
-pub use settings::SettingsView;
+pub use settings::{SettingsEvent, SettingsView};

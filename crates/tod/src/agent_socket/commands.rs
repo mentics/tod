@@ -1,5 +1,20 @@
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptsCommand {
+    Open,
+    Close,
+    Focus,
+    Status,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentPlatformSocketCommand {
+    Get,
+    Cycle,
+    Set(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum Command {
     Key {
@@ -19,6 +34,8 @@ pub enum Command {
     },
     /// Wait one UI frame (layout/paint) before the next observation.
     Sync,
+    Transcripts(TranscriptsCommand),
+    AgentPlatform(AgentPlatformSocketCommand),
 }
 
 /// Parse one protocol line into a command.
@@ -94,6 +111,54 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             }
             Ok(Command::Sync)
         }
+        "transcripts" => {
+            let action = parts
+                .next()
+                .ok_or_else(|| "transcripts requires open|close|focus|status".to_string())?;
+            if parts.next().is_some() {
+                return Err("transcripts takes exactly one argument".into());
+            }
+            Ok(Command::Transcripts(match action {
+                "open" => TranscriptsCommand::Open,
+                "close" => TranscriptsCommand::Close,
+                "focus" => TranscriptsCommand::Focus,
+                "status" => TranscriptsCommand::Status,
+                other => return Err(format!("unknown transcripts action `{other}`")),
+            }))
+        }
+        "agent-platform" => {
+            let action = parts
+                .next()
+                .ok_or_else(|| "agent-platform requires get|cycle|set".to_string())?;
+            match action {
+                "get" => {
+                    if parts.next().is_some() {
+                        return Err("agent-platform get takes no arguments".into());
+                    }
+                    Ok(Command::AgentPlatform(AgentPlatformSocketCommand::Get))
+                }
+                "cycle" => {
+                    if parts.next().is_some() {
+                        return Err("agent-platform cycle takes no arguments".into());
+                    }
+                    Ok(Command::AgentPlatform(AgentPlatformSocketCommand::Cycle))
+                }
+                "set" => {
+                    let value = parts
+                        .next()
+                        .ok_or_else(|| "agent-platform set requires cursor|claude".to_string())?;
+                    if parts.next().is_some() {
+                        return Err("agent-platform set takes exactly one value".into());
+                    }
+                    Ok(Command::AgentPlatform(AgentPlatformSocketCommand::Set(
+                        value.to_string(),
+                    )))
+                }
+                other => Err(format!(
+                    "unknown agent-platform action `{other}` (expected get|cycle|set)"
+                )),
+            }
+        }
         other => Err(format!("unknown command `{other}`")),
     }
 }
@@ -143,6 +208,41 @@ mod tests {
         match c {
             Command::Text { text } => assert_eq!(text, "hello world"),
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn parses_transcripts_commands() {
+        assert!(matches!(
+            parse_line("transcripts open").unwrap(),
+            Command::Transcripts(TranscriptsCommand::Open)
+        ));
+        assert!(matches!(
+            parse_line("transcripts close").unwrap(),
+            Command::Transcripts(TranscriptsCommand::Close)
+        ));
+        assert!(matches!(
+            parse_line("transcripts status").unwrap(),
+            Command::Transcripts(TranscriptsCommand::Status)
+        ));
+        assert!(parse_line("transcripts nope").is_err());
+    }
+
+    #[test]
+    fn parses_agent_platform_commands() {
+        assert!(matches!(
+            parse_line("agent-platform get").unwrap(),
+            Command::AgentPlatform(AgentPlatformSocketCommand::Get)
+        ));
+        assert!(matches!(
+            parse_line("agent-platform cycle").unwrap(),
+            Command::AgentPlatform(AgentPlatformSocketCommand::Cycle)
+        ));
+        match parse_line("agent-platform set claude").unwrap() {
+            Command::AgentPlatform(AgentPlatformSocketCommand::Set(value)) => {
+                assert_eq!(value, "claude");
+            }
+            _ => panic!("expected set"),
         }
     }
 }

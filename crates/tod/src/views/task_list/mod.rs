@@ -1,5 +1,6 @@
 mod compose;
 mod delegate;
+mod edit;
 pub(crate) mod fixtures;
 mod from_ticket;
 mod model;
@@ -14,16 +15,18 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::fleet::{FleetMutation, FleetStore};
+use crate::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
 use crate::interview::{TodPaths, interview_work_remains};
+use crate::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use crate::process::interview_phase_for_lifecycle;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
-use crate::ui::key_context::{self, INPUT};
+use crate::ui::key_context;
 use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, ListView,
     viewport_row_count,
 };
+use crate::ui::selectable_text::selectable_text;
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
@@ -35,7 +38,8 @@ use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::list::{ListEvent, ListState};
-use gpui_component::{ActiveTheme, Sizable, StyledExt};
+use gpui_component::menu::PopupMenu;
+use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
 use row_menu::RowMenuKind;
 use working_set::{load_working_set, save_working_set};
@@ -51,7 +55,10 @@ actions!(
         TaskListClearTagFilter,
         TaskListRowAgents,
         TaskListRowShells,
+        TaskListRowLifecycle,
         TaskListRowEdit,
+        TaskListOpenEditPanel,
+        TaskListOpenObligations,
         TaskListTag1,
         TaskListTag2,
         TaskListTag3,
@@ -63,6 +70,22 @@ actions!(
         TaskListTag9,
         TaskListTag0,
         TaskListDismissOverlay,
+        TaskListIndent,
+        TaskListOutdent,
+        TaskListSelectParent,
+        TaskListExpand,
+        TaskListCreateBelow,
+        TaskListCreateChild,
+        TaskListCreateAbove,
+        TaskListNewList,
+        TaskListNextList,
+        TaskListPrevList,
+        TaskListEnter,
+        TaskListMoveUp,
+        TaskListMoveDown,
+        TaskListEditNavUp,
+        TaskListEditNavDown,
+        TaskListDelete,
     ]
 );
 
@@ -77,15 +100,17 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("pagedown", ListPageDown, context),
         KeyBinding::new("home", ListHome, context),
         KeyBinding::new("end", ListEnd, context),
-        KeyBinding::new("enter", TaskListOpen, context),
-        KeyBinding::new("n", TaskListNewTask, context),
+        KeyBinding::new("enter", TaskListEnter, context),
+        KeyBinding::new("n", TaskListCreateBelow, context),
         KeyBinding::new("/", TaskListFocusSearch, context),
-        KeyBinding::new("escape", TaskListDismissOverlay, context),
         KeyBinding::new("s", TaskListSortToggle, context),
         KeyBinding::new("cmd-shift-t", TaskListClearTagFilter, context),
         KeyBinding::new("a", TaskListRowAgents, context),
+        KeyBinding::new("l", TaskListRowLifecycle, context),
         KeyBinding::new("t", TaskListRowShells, context),
-        KeyBinding::new("e", TaskListRowEdit, context),
+        KeyBinding::new("o", TaskListOpenObligations, context),
+        KeyBinding::new("e", TaskListOpenEditPanel, context),
+        KeyBinding::new("f2", TaskListRowEdit, context),
         KeyBinding::new("1", TaskListTag1, context),
         KeyBinding::new("2", TaskListTag2, context),
         KeyBinding::new("3", TaskListTag3, context),
@@ -96,16 +121,43 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("8", TaskListTag8, context),
         KeyBinding::new("9", TaskListTag9, context),
         KeyBinding::new("0", TaskListTag0, context),
-        // Edit-specific: Escape cancels compose/overlays while a text field is focused.
-        KeyBinding::new("escape", TaskListDismissOverlay, Some(INPUT)),
+        KeyBinding::new("tab", TaskListIndent, context),
+        KeyBinding::new("shift-tab", TaskListOutdent, context),
+        KeyBinding::new("left", TaskListSelectParent, context),
+        KeyBinding::new("right", TaskListExpand, context),
+        KeyBinding::new("shift-enter", TaskListCreateChild, context),
+        KeyBinding::new(
+            "shift-enter",
+            TaskListCreateChild,
+            Some(key_context::including_input(TASK_LIST_CONTEXT)),
+        ),
+        KeyBinding::new("alt-enter", TaskListCreateAbove, context),
+        KeyBinding::new("ctrl-shift-l", TaskListNewList, context),
+        KeyBinding::new("ctrl-tab", TaskListNextList, context),
+        KeyBinding::new("ctrl-shift-tab", TaskListPrevList, context),
+        KeyBinding::new("ctrl-up", TaskListMoveUp, context),
+        KeyBinding::new("ctrl-down", TaskListMoveDown, context),
+        KeyBinding::new("delete", TaskListDelete, context),
+        // Inline title edit: Escape cancels; arrows leave the field and move selection.
+        KeyBinding::new(
+            "up",
+            TaskListEditNavUp,
+            Some(key_context::including_input(TASK_LIST_CONTEXT)),
+        ),
+        KeyBinding::new(
+            "down",
+            TaskListEditNavDown,
+            Some(key_context::including_input(TASK_LIST_CONTEXT)),
+        ),
     ]);
+    key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
 }
 
 #[derive(Debug, Clone)]
 pub enum TaskListEvent {
     OpenInterview {
         task_id: String,
-        entity_path: PathBuf,
+        node_id: uuid::Uuid,
         lifecycle: String,
         title: String,
     },
@@ -113,8 +165,14 @@ pub enum TaskListEvent {
         task_id: String,
         title: String,
     },
+    OpenObligations {
+        task_id: String,
+        title: String,
+    },
     OpenNewTaskCompose,
     CloseTaskEdit,
+    CloseObligations,
+    CloseAgentPanel,
     OpenLifecycle {
         task_id: String,
         lifecycle: String,
@@ -149,40 +207,71 @@ pub struct TaskListView {
     compose_title_input: Entity<InputState>,
     selection_before_compose: Option<String>,
     open_row_menu: Option<(RowMenuKind, String)>,
+    row_menu: Option<Entity<PopupMenu>>,
+    _row_menu_subscription: Option<Subscription>,
     sort_menu_open: bool,
     edit_open_for: Option<String>,
+    slide_edit_open: bool,
+    obligations_open: bool,
+    agent_panel_open: bool,
+    /// Node created for inline edit that is not yet committed with Enter.
+    draft_node_id: Option<String>,
+    edit_original_title: Option<String>,
+    inline_edit_input: Entity<InputState>,
+    pending_inline_commit: bool,
+    /// Bumped when inline Enter is cancelled so deferred commit handlers no-op.
+    inline_enter_generation: u64,
+    pending_abandon_edit: bool,
     pending_compose_submit: bool,
-    pending_lifecycle_next: Option<String>,
     pending_live_refresh: bool,
     pending_delete_task_id: Option<String>,
+    pending_new_list: bool,
+    pending_create_below: bool,
     status_line: String,
     config_dir: PathBuf,
     fleet: Arc<FleetStore>,
+    active_list_id: Option<uuid::Uuid>,
+    outline_lists: Vec<crate::outline::types::OutlineList>,
     app_nav: AppNavMenu,
     _list_subscription: Subscription,
     _compose_subscription: Subscription,
+    _inline_edit_subscription: Subscription,
 }
 
 impl TaskListView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
-        let paths = TodPaths::discover().ok();
-        let config_dir = paths
-            .as_ref()
-            .map(|p| p.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".local/.config/tod"));
-        let repo_root = paths
-            .as_ref()
-            .map(|p| p.repo_root().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let paths = TodPaths::discover().expect("failed to resolve tod paths");
+        let config_dir = paths.config_dir().to_path_buf();
 
+        let outline_lists = fleet.list_outline_lists().unwrap_or_default();
         let mut working_set = load_working_set(&config_dir);
-        let all_tasks = load_tasks_from_store(&fleet, &repo_root);
+        let active_list_id = working_set
+            .active_list_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .or_else(|| outline_lists.first().map(|l| l.id));
+        if let Some(id) = active_list_id {
+            working_set.active_list_id = Some(id.to_string());
+        }
+        let all_tasks = load_tasks_from_store(&fleet, active_list_id);
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search tasks…"));
+
+        let inline_edit_input = cx.new(|cx| InputState::new(window, cx).placeholder("Item title…"));
+        let _inline_edit_subscription = cx.subscribe(&inline_edit_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.inline_enter_generation = this.inline_enter_generation.saturating_add(1);
+                this.pending_inline_commit = true;
+                cx.notify();
+            } else if matches!(event, InputEvent::Blur) {
+                this.pending_abandon_edit = true;
+                cx.notify();
+            }
+        });
 
         let compose_title_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Title or ticket id (e.g. TOD-142)"));
         let _compose_subscription = cx.subscribe(&compose_title_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.pending_compose_submit = true;
                 cx.notify();
             }
@@ -210,6 +299,7 @@ impl TaskListView {
         let focus_handle = cx.focus_handle();
 
         let _list_subscription = cx.subscribe(&list_state, |this, _state, event, cx| match event {
+            // Keyboard navigation emits Select; clicks and Enter emit Confirm.
             ListEvent::Select(ix) => {
                 this.close_sort_menu(cx);
                 this.clamp_selection(*ix, cx);
@@ -217,15 +307,11 @@ impl TaskListView {
                     this.sync_selected_id(cx);
                 }
             }
-            ListEvent::Confirm(_) => {
-                if let Some(id) = this
-                    .working_set
-                    .selected_id
-                    .clone()
-                    .or_else(|| this.selected_task(cx).map(|t| t.id))
-                {
-                    this.pending_lifecycle_next = Some(id);
-                    cx.notify();
+            ListEvent::Confirm(ix) => {
+                this.close_sort_menu(cx);
+                this.clamp_selection(*ix, cx);
+                if this.pending_revert.is_none() {
+                    this.sync_selected_id(cx);
                 }
             }
             ListEvent::Cancel => {}
@@ -246,18 +332,33 @@ impl TaskListView {
             compose_title_input,
             selection_before_compose: None,
             open_row_menu: None,
+            row_menu: None,
+            _row_menu_subscription: None,
             sort_menu_open: false,
             edit_open_for: None,
+            slide_edit_open: false,
+            obligations_open: false,
+            agent_panel_open: false,
+            draft_node_id: None,
+            edit_original_title: None,
+            inline_edit_input,
+            pending_inline_commit: false,
+            inline_enter_generation: 0,
+            pending_abandon_edit: false,
             pending_compose_submit: false,
-            pending_lifecycle_next: None,
             pending_live_refresh: false,
             pending_delete_task_id: None,
+            pending_new_list: false,
+            pending_create_below: false,
             status_line: String::new(),
             config_dir,
             fleet: fleet.clone(),
+            active_list_id,
+            outline_lists,
             app_nav: AppNavMenu::default(),
             _list_subscription,
             _compose_subscription,
+            _inline_edit_subscription,
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -347,6 +448,12 @@ impl TaskListView {
             state
                 .delegate_mut()
                 .set_tag_filter(self.working_set.tag_filter.clone());
+            state
+                .delegate_mut()
+                .set_inline_edit(self.edit_open_for.clone(), self.inline_edit_input.clone());
+            state
+                .delegate_mut()
+                .set_row_menu(self.open_row_menu.clone(), self.row_menu.clone());
             state.set_selected_index(selected_ix, window, cx);
             if selected_ix.is_some() {
                 state.scroll_to_selected_item(window, cx);
@@ -357,31 +464,7 @@ impl TaskListView {
         self.last_selected = selected_ix;
         self.pending_revert = None;
         self.persist_working_set();
-        self.sync_edit_follows_selection(previous_id, cx);
         cx.notify();
-    }
-
-    fn sync_edit_follows_selection(&mut self, previous_id: Option<String>, cx: &mut Context<Self>) {
-        if self.edit_open_for.is_none() {
-            return;
-        }
-        let new_id = self.working_set.selected_id.clone();
-        if new_id == previous_id {
-            return;
-        }
-        let Some(id) = new_id else {
-            self.edit_open_for = None;
-            cx.emit(TaskListEvent::CloseTaskEdit);
-            return;
-        };
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == id) else {
-            return;
-        };
-        self.edit_open_for = Some(id.clone());
-        cx.emit(TaskListEvent::OpenTaskEdit {
-            task_id: id,
-            title: task.title.clone(),
-        });
     }
 
     fn sync_selected_id(&mut self, cx: &mut Context<Self>) {
@@ -389,12 +472,20 @@ impl TaskListView {
         let Some(item) = self.list_state.read(cx).delegate().selected_item().cloned() else {
             return;
         };
-        self.working_set.selected_id = Some(item.id.clone());
+        let new_id = item.id.clone();
+        if self.edit_open_for.is_some() && previous.as_deref() != Some(new_id.as_str()) {
+            self.pending_abandon_edit = true;
+        }
+        if self.slide_edit_open && previous.as_deref() != Some(new_id.as_str()) {
+            self.emit_open_edit_for(&new_id, cx);
+        }
+        self.working_set.selected_id = Some(new_id);
         self.persist_working_set();
-        self.sync_edit_follows_selection(previous, cx);
+        cx.notify();
     }
 
-    fn persist_working_set(&self) {
+    fn persist_working_set(&mut self) {
+        self.working_set.active_list_id = self.active_list_id.map(|id| id.to_string());
         save_working_set(&self.config_dir, &self.working_set);
     }
 
@@ -404,10 +495,13 @@ impl TaskListView {
             .iter()
             .filter_map(|action| match action {
                 RowAction::OpenEdit { task_id }
+                | RowAction::InlineEdit { task_id }
                 | RowAction::AgentsControl { task_id }
                 | RowAction::ShellsControl { task_id }
                 | RowAction::LifecycleControl { task_id, .. }
-                | RowAction::ToggleTagFilter { task_id, .. } => Some(task_id.clone()),
+                | RowAction::ToggleTagFilter { task_id, .. }
+                | RowAction::OpenObligations { task_id }
+                | RowAction::ToggleCollapsed { task_id } => Some(task_id.clone()),
                 _ => None,
             })
             .collect();
@@ -431,13 +525,16 @@ impl TaskListView {
             RowAction::OpenEdit { task_id } => {
                 self.dismiss_compose_for_row_action(window, cx);
                 self.select_task_by_id(&task_id, window, cx);
-                self.bump_interaction(&task_id, window, cx);
-                self.emit_open_edit_for(&task_id, cx);
+                self.open_task_edit_panel(&task_id, window, cx);
+            }
+            RowAction::InlineEdit { task_id } => {
+                self.dismiss_compose_for_row_action(window, cx);
+                self.select_task_by_id(&task_id, window, cx);
+                self.start_inline_edit(&task_id, window, cx);
             }
             RowAction::RowChrome { task_id } => {
                 self.dismiss_compose_for_row_action(window, cx);
                 self.select_task_by_id(&task_id, window, cx);
-                self.run_lifecycle_next(&task_id, window, cx);
             }
             RowAction::ToggleTagFilter { task_id, tag } => {
                 self.select_task_by_id(&task_id, window, cx);
@@ -446,12 +543,12 @@ impl TaskListView {
             RowAction::AgentsControl { task_id } => {
                 self.select_task_by_id(&task_id, window, cx);
                 self.bump_interaction(&task_id, window, cx);
-                self.handle_agents_control(&task_id, cx);
+                self.handle_agents_control(&task_id, window, cx);
             }
             RowAction::ShellsControl { task_id } => {
                 self.select_task_by_id(&task_id, window, cx);
                 self.bump_interaction(&task_id, window, cx);
-                self.handle_shells_control(&task_id, cx);
+                self.handle_shells_control(&task_id, window, cx);
             }
             RowAction::LifecycleControl {
                 task_id,
@@ -460,7 +557,199 @@ impl TaskListView {
                 self.select_task_by_id(&task_id, window, cx);
                 self.run_lifecycle_next(&task_id, window, cx);
             }
+            RowAction::ToggleCollapsed { task_id } => {
+                self.toggle_collapsed(&task_id, window, cx);
+            }
+            RowAction::OpenObligations { task_id } => {
+                self.dismiss_compose_for_row_action(window, cx);
+                self.select_task_by_id(&task_id, window, cx);
+                self.open_obligations_panel(&task_id, window, cx);
+            }
         }
+    }
+
+    fn set_collapsed(
+        &mut self,
+        task_id: &str,
+        collapsed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if task.collapsed == collapsed {
+            return;
+        }
+        let _ = self
+            .fleet
+            .enqueue_outline(OutlineMutation::SetNodeCollapsed { node_id, collapsed });
+        let _ = self.fleet.writer().flush();
+        self.live_refresh(window, cx);
+    }
+
+    fn toggle_collapsed(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        self.set_collapsed(task_id, !task.collapsed, window, cx);
+    }
+
+    fn queue_create_below(&mut self, cx: &mut Context<Self>) {
+        if self.active_list_id.is_none() {
+            self.pending_new_list = true;
+        } else {
+            self.pending_create_below = true;
+        }
+        cx.notify();
+    }
+
+    fn create_tree_node(
+        &mut self,
+        position: CreatePosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let list_id = match self.active_list_id {
+            Some(id) => id,
+            None => {
+                self.status_line = "Create a list first (Enter or Ctrl+Shift+L)".into();
+                cx.notify();
+                return None;
+            }
+        };
+        let before_ids: std::collections::HashSet<_> =
+            self.all_tasks.iter().map(|t| t.id.clone()).collect();
+        let new_node_id = uuid::Uuid::new_v4();
+        let anchor = self
+            .working_set
+            .selected_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok());
+        let parent_id = if position == CreatePosition::Child {
+            anchor
+        } else {
+            None
+        };
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(new_node_id),
+            list_id,
+            parent_id,
+            anchor_id: anchor,
+            position,
+            title: String::new(),
+        }) {
+            self.status_line = format!("Failed to create item: {err}");
+            cx.notify();
+            return None;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.status_line = format!("Failed to create item: {err}");
+            cx.notify();
+            return None;
+        }
+        self.live_refresh(window, cx);
+        let new_id = if self
+            .all_tasks
+            .iter()
+            .any(|t| t.id == new_node_id.to_string())
+        {
+            Some(new_node_id.to_string())
+        } else {
+            self.all_tasks
+                .iter()
+                .find(|t| !before_ids.contains(&t.id))
+                .map(|t| t.id.clone())
+        };
+        if let Some(ref id) = new_id {
+            self.select_created_task(id, window, cx);
+        }
+        new_id
+    }
+
+    fn reload_outline_lists(&mut self) {
+        self.outline_lists = self.fleet.list_outline_lists().unwrap_or_default();
+    }
+
+    fn active_list_title(&self) -> String {
+        let Some(id) = self.active_list_id else {
+            return "No list".into();
+        };
+        self.outline_lists
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.title.clone())
+            .unwrap_or_else(|| "List".into())
+    }
+
+    fn create_new_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_outline_lists();
+        let n = self.outline_lists.len() + 1;
+        let slug = format!("list-{n}");
+        let title = format!("List {n}");
+        if self
+            .fleet
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: slug.clone(),
+                title: title.clone(),
+            })
+            .is_err()
+        {
+            self.status_line = "Failed to create list".into();
+            cx.notify();
+            return;
+        }
+        let _ = self.fleet.writer().flush();
+        let _ = self.fleet.reload_if_stale();
+        self.reload_outline_lists();
+        let Some(new_id) = self
+            .outline_lists
+            .iter()
+            .find(|l| l.slug == slug)
+            .map(|l| l.id)
+        else {
+            self.status_line = "List created but not found".into();
+            cx.notify();
+            return;
+        };
+        self.switch_active_list(new_id, window, cx);
+        self.status_line = format!("Created {title}");
+        cx.notify();
+    }
+
+    fn switch_active_list(
+        &mut self,
+        list_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_list_id = Some(list_id);
+        self.working_set.selected_id = None;
+        self.live_refresh(window, cx);
+        self.persist_working_set();
+        cx.notify();
+    }
+
+    fn cycle_list(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        self.reload_outline_lists();
+        if self.outline_lists.is_empty() {
+            self.status_line = "No lists yet — press Enter to create one".into();
+            cx.notify();
+            return;
+        }
+        let current_ix = self
+            .active_list_id
+            .and_then(|id| self.outline_lists.iter().position(|l| l.id == id))
+            .unwrap_or(0);
+        let len = self.outline_lists.len();
+        let next_ix = (current_ix as i32 + delta).rem_euclid(len as i32) as usize;
+        let next_id = self.outline_lists[next_ix].id;
+        let title = self.outline_lists[next_ix].title.clone();
+        self.switch_active_list(next_id, window, cx);
+        self.status_line = format!("Switched to {title}");
     }
 
     fn bump_interaction(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -483,28 +772,54 @@ impl TaskListView {
         self.rebuild_visible_list(window, cx);
     }
 
-    fn handle_agents_control(&mut self, task_id: &str, cx: &mut Context<Self>) {
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
-            return;
-        };
-        if task.agents.is_empty() {
+    fn handle_agents_control(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_count = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.agents.len())
+            .unwrap_or(0);
+        let task_title = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        if agent_count == 0 {
+            self.close_chrome_overlays(cx);
+            if self.slide_edit_open {
+                cx.emit(TaskListEvent::CloseTaskEdit);
+            }
+            if self.obligations_open {
+                cx.emit(TaskListEvent::CloseObligations);
+            }
             cx.emit(TaskListEvent::OpenAgentDetail {
                 task_id: task_id.to_string(),
                 agent_id: None,
             });
-            self.status_line = format!("Creating agent for {}", task.title);
+            self.status_line = format!("Launch agent config for {task_title}");
         } else {
-            self.toggle_agents_menu(task_id, cx);
+            self.toggle_agents_menu(task_id, window, cx);
         }
     }
 
-    fn handle_shells_control(&mut self, task_id: &str, cx: &mut Context<Self>) {
+    fn handle_shells_control(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
         if task.shells.is_empty() {
             if task.agents.len() > 1 {
-                self.toggle_shell_agent_picker(task_id, cx);
+                self.toggle_shell_agent_picker(task_id, window, cx);
                 return;
             }
             cx.emit(TaskListEvent::OpenShell {
@@ -513,7 +828,7 @@ impl TaskListView {
                 agent_id: None,
             });
         } else {
-            self.toggle_shells_menu(task_id, cx);
+            self.toggle_shells_menu(task_id, window, cx);
         }
     }
 
@@ -544,11 +859,30 @@ impl TaskListView {
     fn handle_lifecycle_control(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
         if interview_phase_for_lifecycle(lifecycle).is_some() {
             if let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) {
-                if Self::is_process_backed(&task.entity_path) {
-                    if interview_work_remains(&task.entity_path, lifecycle) {
+                if task.is_work_node {
+                    let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
+                        self.status_line = "Interview unavailable — invalid task id.".into();
+                        return;
+                    };
+                    if interview_work_remains(node_id, lifecycle) {
+                        if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
+                            if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
+                                self.status_line =
+                                    "Set repository on task before starting interview.".into();
+                                return;
+                            }
+                            let repo = task_row.repo.as_deref().unwrap_or("");
+                            let branch = task_row.branch.as_deref().unwrap_or("");
+                            if let Err(err) =
+                                validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
+                            {
+                                self.status_line = format!("Interview workspace: {err:#}").into();
+                                return;
+                            }
+                        }
                         cx.emit(TaskListEvent::OpenInterview {
                             task_id: task_id.to_string(),
-                            entity_path: task.entity_path.clone(),
+                            node_id,
                             lifecycle: lifecycle.to_string(),
                             title: task.title.clone(),
                         });
@@ -561,8 +895,7 @@ impl TaskListView {
                         self.status_line = format!("Lifecycle panel: {lifecycle}");
                     }
                 } else {
-                    self.status_line =
-                        "Interview unavailable — task has no linked process directory.".into();
+                    self.status_line = "Interview unavailable — task is not a work node.".into();
                 }
                 return;
             }
@@ -583,6 +916,17 @@ impl TaskListView {
         self.status_line = format!("Lifecycle panel: {lifecycle}");
     }
 
+    pub fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_list(window, cx);
+    }
+
+    pub(super) fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_state.update(cx, |state, cx| {
+            state.focus(window, cx);
+        });
+        self.focus_handle.focus(window);
+    }
+
     fn select_task_by_id(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         if let Some(row) = visible.iter().position(|t| t.id == task_id) {
@@ -601,12 +945,92 @@ impl TaskListView {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
-        self.edit_open_for = Some(task_id.to_string());
         cx.emit(TaskListEvent::OpenTaskEdit {
             task_id: task_id.to_string(),
             title: task.title.clone(),
         });
         self.status_line = format!("Edit: {}", task.title);
+    }
+
+    pub fn open_task_edit_panel(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chrome_overlays(cx);
+        if self.obligations_open {
+            cx.emit(TaskListEvent::CloseObligations);
+        }
+        self.emit_open_edit_for(task_id, cx);
+        self.bump_interaction(task_id, window, cx);
+        cx.notify();
+    }
+
+    fn emit_open_obligations_for(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if !task.has_spec {
+            return;
+        }
+        cx.emit(TaskListEvent::OpenObligations {
+            task_id: task_id.to_string(),
+            title: task.title.clone(),
+        });
+        self.status_line = format!("Obligations: {}", task.title);
+    }
+
+    pub fn open_obligations_panel(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if !task.has_spec {
+            self.status_line = "Obligations require the Spec capability.".into();
+            cx.notify();
+            return;
+        }
+        self.close_chrome_overlays(cx);
+        if self.slide_edit_open {
+            cx.emit(TaskListEvent::CloseTaskEdit);
+        }
+        self.emit_open_obligations_for(task_id, cx);
+        self.bump_interaction(task_id, window, cx);
+        cx.notify();
+    }
+
+    pub fn set_slide_edit_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.slide_edit_open = open;
+        if !open {
+            self.status_line.clear();
+        }
+        cx.notify();
+    }
+
+    pub fn set_obligations_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.obligations_open = open;
+        if !open {
+            self.status_line.clear();
+        }
+        cx.notify();
+    }
+
+    pub fn set_agent_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.agent_panel_open = open;
+        if !open {
+            self.status_line.clear();
+        }
+        cx.notify();
+    }
+
+    pub fn request_live_refresh(&mut self, cx: &mut Context<Self>) {
+        self.pending_live_refresh = true;
+        cx.notify();
     }
 
     fn selected_task(&self, cx: &Context<Self>) -> Option<TaskItem> {
@@ -633,7 +1057,28 @@ impl TaskListView {
         cx.notify();
     }
 
-    /// Remove a permanently deleted task and move selection to the nearest visible row.
+    /// Remove a node and its subtree from the outline tree.
+    pub(super) fn remove_outline_node(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::DeleteNode { node_id })
+        {
+            self.status_line = format!("Delete failed: {err}");
+            cx.notify();
+            return;
+        }
+        self.finish_node_removal(task_id, window, cx);
+    }
+
+    /// Remove a permanently deleted work node and move selection to the nearest visible row.
     pub fn remove_task(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteTask {
             id: task_id.to_string(),
@@ -642,6 +1087,10 @@ impl TaskListView {
             cx.notify();
             return;
         }
+        self.finish_node_removal(task_id, window, cx);
+    }
+
+    fn finish_node_removal(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(err) = self.fleet.writer().flush() {
             self.status_line = format!("Delete failed: {err}");
             cx.notify();
@@ -652,11 +1101,19 @@ impl TaskListView {
         let visible_before =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         let selected = self.working_set.selected_id.as_deref();
-        self.all_tasks.retain(|t| t.id != task_id);
-        if self.edit_open_for.as_deref() == Some(task_id) {
-            self.edit_open_for = None;
+        if self.slide_edit_open {
             cx.emit(TaskListEvent::CloseTaskEdit);
         }
+        if self.obligations_open {
+            cx.emit(TaskListEvent::CloseObligations);
+        }
+        if self.agent_panel_open {
+            cx.emit(TaskListEvent::CloseAgentPanel);
+        }
+        if self.edit_open_for.as_deref() == Some(task_id) {
+            self.edit_open_for = None;
+        }
+        self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
         let visible_after =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         self.working_set.selected_id =
@@ -664,27 +1121,22 @@ impl TaskListView {
         self.rebuild_visible_list(window, cx);
     }
 
-    fn is_process_backed(entity_path: &std::path::Path) -> bool {
-        entity_path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .windows(2)
-            .any(|w| w[0] == "doc" && w[1] == "process")
-    }
-
     fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible_before =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         let selected = self.working_set.selected_id.clone();
-        let paths = TodPaths::discover().ok();
-        let repo_root = paths
-            .as_ref()
-            .map(|p| p.repo_root())
-            .unwrap_or_else(|| std::path::Path::new("."));
         let _ = self.fleet.reload_if_stale();
-        let scanned = load_tasks_from_store(&self.fleet, repo_root);
-        self.merge_live_tasks(scanned);
+        self.reload_outline_lists();
+        if self.active_list_id.is_none() {
+            self.active_list_id = self
+                .working_set
+                .active_list_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .filter(|id| self.outline_lists.iter().any(|l| l.id == *id))
+                .or_else(|| self.outline_lists.first().map(|l| l.id));
+        }
+        self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
         if let Some(sel) = selected.clone() {
             if !self.all_tasks.iter().any(|t| t.id == sel) {
                 let visible_after =
@@ -706,18 +1158,18 @@ impl TaskListView {
         self.live_refresh(window, cx);
     }
 
+    pub fn set_status_message(&mut self, message: String, cx: &mut Context<Self>) {
+        self.status_line = message;
+        cx.notify();
+    }
+
     fn merge_live_tasks(&mut self, scanned: Vec<TaskItem>) {
-        let scanned_paths: std::collections::HashSet<_> =
-            scanned.iter().map(|t| t.entity_path.clone()).collect();
-        self.all_tasks.retain(|t| {
-            !Self::is_process_backed(&t.entity_path) || scanned_paths.contains(&t.entity_path)
-        });
+        let scanned_ids: std::collections::HashSet<_> =
+            scanned.iter().map(|t| t.id.clone()).collect();
+        self.all_tasks
+            .retain(|t| !t.is_work_node || scanned_ids.contains(&t.id));
         for fresh in scanned {
-            if let Some(existing) = self
-                .all_tasks
-                .iter_mut()
-                .find(|t| t.entity_path == fresh.entity_path)
-            {
+            if let Some(existing) = self.all_tasks.iter_mut().find(|t| t.id == fresh.id) {
                 existing.title = fresh.title;
                 existing.lifecycle = fresh.lifecycle;
                 existing.ticket_id = fresh.ticket_id.clone();
@@ -810,8 +1262,98 @@ impl TaskListView {
     }
 
     fn on_new_task(&mut self, _: &TaskListNewTask, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_compose(window, cx);
-        cx.emit(TaskListEvent::OpenNewTaskCompose);
+        self.on_create_below(&TaskListCreateBelow, window, cx);
+    }
+
+    fn on_create_below(
+        &mut self,
+        _: &TaskListCreateBelow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_list_id.is_none() {
+            self.pending_new_list = true;
+            cx.notify();
+            return;
+        }
+        self.create_tree_node_and_edit(CreatePosition::Below, window, cx);
+    }
+
+    fn on_enter(&mut self, _: &TaskListEnter, window: &mut Window, cx: &mut Context<Self>) {
+        self.on_smart_enter(window, cx);
+    }
+
+    fn on_move_up(&mut self, _: &TaskListMoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_sibling(ReorderDirection::Up, window, cx);
+    }
+
+    fn on_move_down(&mut self, _: &TaskListMoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selected_sibling(ReorderDirection::Down, window, cx);
+    }
+
+    fn move_selected_sibling(
+        &mut self,
+        direction: ReorderDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self.working_set.selected_id.clone() else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::ReorderSibling { node_id, direction })
+        {
+            self.status_line = format!("Failed to move item: {err}");
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.status_line = format!("Failed to move item: {err}");
+            cx.notify();
+            return;
+        }
+        self.live_refresh(window, cx);
+        self.select_task_by_id(&task_id, window, cx);
+    }
+
+    fn on_new_list(&mut self, _: &TaskListNewList, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_new_list(window, cx);
+    }
+
+    fn on_next_list(&mut self, _: &TaskListNextList, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_list(1, window, cx);
+    }
+
+    fn on_prev_list(&mut self, _: &TaskListPrevList, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_list(-1, window, cx);
+    }
+
+    fn on_edit_nav_up(
+        &mut self,
+        _: &TaskListEditNavUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editing() {
+            return;
+        }
+        self.leave_inline_edit_and_move(-1, window, cx);
+    }
+
+    fn on_edit_nav_down(
+        &mut self,
+        _: &TaskListEditNavDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editing() {
+            return;
+        }
+        self.leave_inline_edit_and_move(1, window, cx);
     }
 
     fn on_dismiss_overlay(
@@ -820,7 +1362,15 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.compose_open {
+        if self.slide_edit_open {
+            cx.emit(TaskListEvent::CloseTaskEdit);
+        } else if self.obligations_open {
+            cx.emit(TaskListEvent::CloseObligations);
+        } else if self.agent_panel_open {
+            cx.emit(TaskListEvent::CloseAgentPanel);
+        } else if self.is_editing() {
+            self.abandon_inline_edit(window, cx, true);
+        } else if self.compose_open {
             self.close_compose(window, cx);
         } else if self.sort_menu_open {
             self.close_sort_menu(cx);
@@ -861,6 +1411,36 @@ impl TaskListView {
             return;
         };
         self.handle_row_action(RowAction::ShellsControl { task_id }, window, cx);
+    }
+
+    fn on_row_lifecycle(
+        &mut self,
+        _: &TaskListRowLifecycle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        let Some(lifecycle) = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.lifecycle.clone())
+            .filter(|lc| !lc.is_empty())
+        else {
+            return;
+        };
+        self.handle_row_action(
+            RowAction::LifecycleControl { task_id, lifecycle },
+            window,
+            cx,
+        );
     }
 
     fn on_tag_digit(&mut self, digit: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1005,15 +1585,160 @@ impl TaskListView {
     }
 
     fn on_open(&mut self, _: &TaskListOpen, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self
-            .working_set
-            .selected_id
-            .clone()
-            .or_else(|| self.selected_task(cx).map(|t| t.id))
-        else {
+        self.on_smart_enter(window, cx);
+    }
+
+    fn on_indent(&mut self, _: &TaskListIndent, window: &mut Window, cx: &mut Context<Self>) {
+        self.reparent_selected(1, window, cx);
+    }
+
+    fn on_outdent(&mut self, _: &TaskListOutdent, window: &mut Window, cx: &mut Context<Self>) {
+        self.reparent_selected(-1, window, cx);
+    }
+
+    fn on_select_parent(
+        &mut self,
+        _: &TaskListSelectParent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self.working_set.selected_id.clone() else {
             return;
         };
-        self.run_lifecycle_next(&id, window, cx);
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if task.has_children && !task.collapsed {
+            self.set_collapsed(&task_id, true, window, cx);
+        } else {
+            self.select_parent(window, cx);
+        }
+    }
+
+    fn select_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self.working_set.selected_id.clone() else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        let parent_id = {
+            let projection = self.fleet.projection();
+            let guard = projection.lock().unwrap();
+            let conn = guard.connection();
+            let outline = crate::outline::repos::OutlineRepo::new(&conn);
+            outline
+                .get_entry(node_id)
+                .ok()
+                .flatten()
+                .and_then(|entry| entry.parent_id)
+        };
+        let Some(parent_id) = parent_id else {
+            return;
+        };
+        self.select_task_by_id(&parent_id.to_string(), window, cx);
+    }
+
+    fn on_expand(&mut self, _: &TaskListExpand, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self.working_set.selected_id.clone() else {
+            return;
+        };
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if task.has_children && task.collapsed {
+            self.set_collapsed(&task_id, false, window, cx);
+        }
+    }
+
+    fn on_create_child(
+        &mut self,
+        _: &TaskListCreateChild,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_editing() {
+            let title = self.inline_edit_title(cx);
+            if self.is_draft_edit() && title.is_empty() {
+                self.abandon_inline_edit(window, cx, true);
+            } else if !self.commit_inline_edit(window, cx) {
+                return;
+            }
+        }
+        self.create_tree_node_and_edit(CreatePosition::Child, window, cx);
+    }
+
+    fn on_create_above(
+        &mut self,
+        _: &TaskListCreateAbove,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_tree_node_and_edit(CreatePosition::Above, window, cx);
+    }
+
+    fn delete_selected_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.selected_task(cx) else {
+            return;
+        };
+        self.remove_outline_node(&task.id, window, cx);
+    }
+
+    fn on_delete(&mut self, _: &TaskListDelete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            return;
+        }
+        self.delete_selected_node(window, cx);
+    }
+
+    fn reparent_selected(&mut self, direction: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self.working_set.selected_id.clone() else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        let Some(list_id) = self.active_list_id else {
+            return;
+        };
+        let rows = self.fleet.flatten_outline(list_id).unwrap_or_default();
+        let Some(ix) = rows.iter().position(|r| r.node.id == node_id) else {
+            return;
+        };
+        let (new_parent, ordinal) = {
+            let projection = self.fleet.projection();
+            let guard = projection.lock().unwrap();
+            let conn = guard.connection();
+            let outline = crate::outline::repos::OutlineRepo::new(&conn);
+            if direction > 0 {
+                if ix == 0 {
+                    return;
+                }
+                let prev = &rows[ix - 1];
+                let ord = outline
+                    .next_ordinal(list_id, Some(prev.node.id))
+                    .unwrap_or(0);
+                (Some(prev.node.id), ord)
+            } else {
+                let Some(entry) = outline.get_entry(node_id).ok().flatten() else {
+                    return;
+                };
+                if entry.parent_id.is_none() {
+                    return;
+                };
+                let parent_entry = outline.get_entry(entry.parent_id.unwrap()).ok().flatten();
+                let grandparent = parent_entry.and_then(|p| p.parent_id);
+                let ord = entry.ordinal + 1;
+                (grandparent, ord)
+            }
+        };
+        let _ = self.fleet.enqueue_outline(OutlineMutation::ReparentNode {
+            node_id,
+            parent_id: new_parent,
+            ordinal,
+        });
+        let _ = self.fleet.writer().flush();
+        self.live_refresh(window, cx);
     }
 
     fn on_row_edit(&mut self, _: &TaskListRowEdit, window: &mut Window, cx: &mut Context<Self>) {
@@ -1025,7 +1750,41 @@ impl TaskListView {
         else {
             return;
         };
-        self.handle_row_action(RowAction::OpenEdit { task_id }, window, cx);
+        self.start_inline_edit(&task_id, window, cx);
+    }
+
+    fn on_open_edit_panel(
+        &mut self,
+        _: &TaskListOpenEditPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.open_task_edit_panel(&task_id, window, cx);
+    }
+
+    fn on_open_obligations(
+        &mut self,
+        _: &TaskListOpenObligations,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.open_obligations_panel(&task_id, window, cx);
     }
 
     fn render_header(
@@ -1049,6 +1808,9 @@ impl TaskListView {
             search = search.suffix(pill);
         }
 
+        let list_title = self.active_list_title();
+        let list_count = self.outline_lists.len();
+
         let mut row = div()
             .h_flex()
             .items_center()
@@ -1058,18 +1820,57 @@ impl TaskListView {
             .border_b_1()
             .border_color(border)
             .child(self.render_app_nav(window, cx))
+            .child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Button::new("prev-list")
+                            .label("◀")
+                            .small()
+                            .disabled(list_count <= 1)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_prev_list(&TaskListPrevList, window, cx);
+                            })),
+                    )
+                    .child(div().text_sm().min_w(px(80.)).child(list_title))
+                    .child(
+                        Button::new("next-list")
+                            .label("▶")
+                            .small()
+                            .disabled(list_count <= 1)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_next_list(&TaskListNextList, window, cx);
+                            })),
+                    )
+                    .child(chrome_control_with_shortcut(
+                        Button::new("new-list")
+                            .label("New list")
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_new_list(&TaskListNewList, window, cx);
+                            })),
+                        window,
+                        &TaskListNewList,
+                        TASK_LIST_CONTEXT,
+                        cx,
+                    )),
+            )
             .child(chrome_control_with_shortcut(
                 Button::new("new-task")
-                    .label("New task")
+                    .label("New item")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.on_new_task(&TaskListNewTask, window, cx);
+                        this.on_create_below(&TaskListCreateBelow, window, cx);
                     })),
                 window,
-                &TaskListNewTask,
+                &TaskListCreateBelow,
                 TASK_LIST_CONTEXT,
                 cx,
             ))
             .child(div().flex_1().min_w_0().child(search));
+
+        let mut row = row;
 
         if let Some(tag) = &self.working_set.tag_filter {
             row = row
@@ -1212,8 +2013,27 @@ impl Render for TaskListView {
             self.pending_compose_submit = false;
             self.submit_compose(window, cx);
         }
-        if let Some(task_id) = self.pending_lifecycle_next.take() {
-            self.run_lifecycle_next(&task_id, window, cx);
+        if self.pending_new_list {
+            self.pending_new_list = false;
+            self.create_new_list(window, cx);
+        }
+        if self.pending_create_below {
+            self.pending_create_below = false;
+            self.create_tree_node_and_edit(CreatePosition::Below, window, cx);
+        }
+        if self.pending_abandon_edit {
+            self.pending_abandon_edit = false;
+            self.abandon_inline_edit(window, cx, false);
+        }
+        if self.pending_inline_commit {
+            self.pending_inline_commit = false;
+            let generation = self.inline_enter_generation;
+            cx.defer_in(window, move |this, window, cx| {
+                if this.inline_enter_generation != generation {
+                    return;
+                }
+                this.on_smart_enter(window, cx);
+            });
         }
         self.drain_row_actions(window, cx);
 
@@ -1233,7 +2053,11 @@ impl Render for TaskListView {
                 .items_center()
                 .justify_center()
                 .text_color(muted)
-                .child("No tasks"),
+                .child(if self.active_list_id.is_some() {
+                    "Press Enter to add an item · F2 or double-click to edit"
+                } else {
+                    "Press Enter to create your first list"
+                }),
             BodyState::NoMatches => body
                 .v_flex()
                 .items_center()
@@ -1269,8 +2093,11 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_sort_toggle))
             .on_action(cx.listener(Self::on_clear_tag_filter))
             .on_action(cx.listener(Self::on_row_agents))
+            .on_action(cx.listener(Self::on_row_lifecycle))
             .on_action(cx.listener(Self::on_row_shells))
             .on_action(cx.listener(Self::on_row_edit))
+            .on_action(cx.listener(Self::on_open_edit_panel))
+            .on_action(cx.listener(Self::on_open_obligations))
             .on_action(cx.listener(Self::on_tag1))
             .on_action(cx.listener(Self::on_tag2))
             .on_action(cx.listener(Self::on_tag3))
@@ -1281,23 +2108,35 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_tag8))
             .on_action(cx.listener(Self::on_tag9))
             .on_action(cx.listener(Self::on_tag0))
+            .on_action(cx.listener(Self::on_enter))
+            .on_action(cx.listener(Self::on_create_below))
+            .on_action(cx.listener(Self::on_move_up))
+            .on_action(cx.listener(Self::on_move_down))
+            .on_action(cx.listener(Self::on_edit_nav_up))
+            .on_action(cx.listener(Self::on_edit_nav_down))
+            .on_action(cx.listener(Self::on_new_list))
+            .on_action(cx.listener(Self::on_next_list))
+            .on_action(cx.listener(Self::on_prev_list))
+            .on_action(cx.listener(Self::on_indent))
+            .on_action(cx.listener(Self::on_outdent))
+            .on_action(cx.listener(Self::on_select_parent))
+            .on_action(cx.listener(Self::on_expand))
+            .on_action(cx.listener(Self::on_create_child))
+            .on_action(cx.listener(Self::on_create_above))
+            .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
             .child(body)
             .when(!self.status_line.is_empty(), |el| {
                 el.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .border_t_1()
-                        .border_color(border)
-                        .text_xs()
-                        .text_color(muted)
-                        .child(self.status_line.clone()),
+                    div().px_3().py_1().border_t_1().border_color(border).child(
+                        selectable_text("task-list-status", self.status_line.clone(), window, cx)
+                            .text_xs()
+                            .text_color(muted),
+                    ),
                 )
             })
-            .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
-            .when_some(self.render_row_menu_overlay(cx), |el, menu| el.child(menu));
+            .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu));
 
         root
     }

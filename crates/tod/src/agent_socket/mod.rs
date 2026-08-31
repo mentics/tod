@@ -6,18 +6,23 @@
 //! - `click <x> <y>`
 //! - `shot <path> [x0 y0 x1 y1]`
 //! - `sync` — wait one UI frame (use before a shot after clicks if paint must settle)
+//! - `transcripts open` — open or focus the agent transcript window (single instance)
+//! - `transcripts close` — close the transcript window if open
+//! - `transcripts focus` — focus the transcript window if open
+//! - `transcripts status` — reply `ok open` or `ok closed`
+//! - `agent-platform get` — reply `ok claude` or `ok cursor`
+//! - `agent-platform cycle` — cycle platform and reply with new value
+//! - `agent-platform set cursor|claude` — set platform and reply with new value
 //!
 //! Keys use GPUI `dispatch_keystroke` (same path as typed input). Clicks use
 //! `SendMessage` to this process's HWND — synchronous, no focus steal, no sleep.
 //! The UI drain loop wakes on each command (no polling).
 
 mod capture;
-mod commands;
-mod options;
+pub mod commands;
 
-pub use options::LaunchOptions;
-
-use commands::{Command, parse_line};
+use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
+use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
@@ -25,57 +30,62 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, SyncSender};
 use std::time::Duration;
 
+/// Bind the control socket. Call before opening the main window so port conflicts fail fast.
+pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(addr).map_err(|err| {
+        anyhow::anyhow!("agent-socket: bind {addr} failed: {err} (choose another port)")
+    })
+}
+
 enum UiRequest {
     Key(String),
     /// Insert characters into the focused GPUI text input handler.
     Text(String),
     /// Yield one frame so layout/paint after input is visible to `shot`.
     Sync,
+    Transcripts(TranscriptsCommand),
+    AgentPlatform(AgentPlatformSocketCommand),
 }
 
 struct Pending {
     request: UiRequest,
-    reply: SyncSender<Result<(), String>>,
+    reply: SyncSender<Result<String, String>>,
 }
 
-/// Start TCP listener + UI drain loop after the main window is open.
+/// Start accept loop + UI drain loop after the main window is open.
+/// `listener` must come from [`bind`] on the requested address.
 pub fn start(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
+    listener: TcpListener,
     addr: SocketAddr,
     logical_width: f32,
     logical_height: f32,
+    transcript_window: TranscriptWindowControl,
+    shell: gpui::WeakEntity<crate::app::window::Shell>,
 ) {
+    eprintln!("agent-socket: listening on {addr}");
     let (tx, rx) = async_channel::bounded::<Pending>(32);
     let lw = logical_width.round().max(1.0) as u32;
     let lh = logical_height.round().max(1.0) as u32;
 
     std::thread::Builder::new()
         .name("tod-agent-socket".into())
-        .spawn(move || listen_loop(addr, tx, lw, lh))
+        .spawn(move || listen_loop(listener, tx, lw, lh))
         .expect("spawn agent socket thread");
 
     cx.spawn(async move |cx| {
-        drain_loop(cx, window, rx).await;
+        drain_loop(cx, window, transcript_window, shell, rx).await;
     })
     .detach();
 }
 
 fn listen_loop(
-    addr: SocketAddr,
+    listener: TcpListener,
     tx: async_channel::Sender<Pending>,
     logical_width: u32,
     logical_height: u32,
 ) {
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("agent-socket: bind {addr} failed: {e}");
-            return;
-        }
-    };
-    eprintln!("agent-socket: listening on {addr}");
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -114,16 +124,23 @@ fn handle_client(
         let reply = match parse_line(line.trim_end_matches(['\r', '\n'])) {
             Ok(Command::Shot { path, crop }) => {
                 capture::capture_window_png(&path, logical_width, logical_height, crop)
+                    .map(|()| "ok".to_string())
             }
             Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
             Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
-            Ok(Command::Click { x, y }) => capture::send_click(x, y, logical_width, logical_height),
+            Ok(Command::Click { x, y }) => {
+                capture::send_click(x, y, logical_width, logical_height).map(|()| "ok".to_string())
+            }
             Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
+            Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),
+            Ok(Command::AgentPlatform(action)) => {
+                dispatch_ui(&tx, UiRequest::AgentPlatform(action))
+            }
             Err(e) => Err(e),
         };
 
         let msg = match reply {
-            Ok(()) => "ok\n".to_string(),
+            Ok(line) => format!("{line}\n"),
             Err(e) => format!("err {e}\n"),
         };
         if writer.write_all(msg.as_bytes()).is_err() || writer.flush().is_err() {
@@ -132,7 +149,7 @@ fn handle_client(
     }
 }
 
-fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Result<(), String> {
+fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Result<String, String> {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send_blocking(Pending {
         request,
@@ -147,31 +164,74 @@ fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Resul
 async fn drain_loop(
     cx: &mut AsyncApp,
     window: AnyWindowHandle,
+    transcript_window: TranscriptWindowControl,
+    shell: gpui::WeakEntity<crate::app::window::Shell>,
     rx: async_channel::Receiver<Pending>,
 ) {
     while let Ok(pending) = rx.recv().await {
-        let result = match pending.request {
-            UiRequest::Sync => {
-                Timer::after(Duration::from_millis(16)).await;
-                Ok(())
-            }
-            UiRequest::Key(keystroke) => apply_key(cx, window, keystroke),
-            UiRequest::Text(text) => apply_text(cx, window, text),
+        let result = if matches!(pending.request, UiRequest::Sync) {
+            Timer::after(Duration::from_millis(16)).await;
+            Ok("ok".into())
+        } else {
+            handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
         };
         let _ = pending.reply.send(result);
 
         while let Ok(pending) = rx.try_recv() {
-            let result = match pending.request {
-                UiRequest::Sync => {
-                    Timer::after(Duration::from_millis(16)).await;
-                    Ok(())
-                }
-                UiRequest::Key(keystroke) => apply_key(cx, window, keystroke),
-                UiRequest::Text(text) => apply_text(cx, window, text),
+            let result = if matches!(pending.request, UiRequest::Sync) {
+                Timer::after(Duration::from_millis(16)).await;
+                Ok("ok".into())
+            } else {
+                handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
             };
             let _ = pending.reply.send(result);
         }
     }
+}
+
+fn handle_ui_request(
+    cx: &mut AsyncApp,
+    window: AnyWindowHandle,
+    transcript_window: &TranscriptWindowControl,
+    shell: &gpui::WeakEntity<crate::app::window::Shell>,
+    request: UiRequest,
+) -> Result<String, String> {
+    match request {
+        UiRequest::Sync => Ok("ok".into()),
+        UiRequest::Key(keystroke) => apply_key(cx, window, keystroke).map(|()| "ok".into()),
+        UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
+        UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),
+        UiRequest::AgentPlatform(action) => apply_agent_platform(cx, shell, action),
+    }
+}
+
+fn apply_agent_platform(
+    cx: &mut AsyncApp,
+    shell: &gpui::WeakEntity<crate::app::window::Shell>,
+    action: AgentPlatformSocketCommand,
+) -> Result<String, String> {
+    shell
+        .update(cx, |shell, cx| {
+            shell.handle_agent_platform_socket(action, cx)
+        })
+        .map_err(|err| format!("shell update failed: {err}"))?
+}
+
+fn apply_transcripts(
+    cx: &mut AsyncApp,
+    transcript_window: &TranscriptWindowControl,
+    action: TranscriptsCommand,
+) -> Result<String, String> {
+    cx.update(|app| match action {
+        TranscriptsCommand::Open => transcript_window.open_or_focus(app).map(|()| "ok".into()),
+        TranscriptsCommand::Close => transcript_window.close(app).map(|()| "ok".into()),
+        TranscriptsCommand::Focus => transcript_window.focus_if_open(app).map(|()| "ok".into()),
+        TranscriptsCommand::Status => Ok(match transcript_window.status(app) {
+            TranscriptWindowStatus::Open => "ok open".into(),
+            TranscriptWindowStatus::Closed => "ok closed".into(),
+        }),
+    })
+    .map_err(|err| format!("app update failed: {err}"))?
 }
 
 fn apply_key(cx: &mut AsyncApp, window: AnyWindowHandle, keystroke: String) -> Result<(), String> {
@@ -201,4 +261,19 @@ fn apply_text(cx: &mut AsyncApp, window: AnyWindowHandle, text: String) -> Resul
             )
         })
         .map_err(|e| format!("window update failed: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_fails_when_port_in_use() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let err = bind(addr).unwrap_err();
+        assert!(err.to_string().contains("bind"));
+        assert!(err.to_string().contains("choose another port"));
+    }
 }

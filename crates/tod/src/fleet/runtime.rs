@@ -1,6 +1,6 @@
 //! Callable trait surface for agent-runtime integration (guest liveness, shells, prompts).
 
-use crate::fleet::repos::agent::FleetAgent;
+use crate::fleet::repos::agent_config::AgentConfigRow as FleetAgent;
 use crate::fleet::repos::shell::ShellSession;
 
 /// After host PID+birth_token match, confirm the guest agent session is reachable.

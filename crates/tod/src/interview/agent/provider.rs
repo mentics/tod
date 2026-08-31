@@ -1,4 +1,6 @@
-use crate::interview::settings::AnswerProcessorSettings;
+use crate::agent_traffic::InterviewAgentCounts;
+use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
+use crate::process_bundle::InterviewAgentPrompt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -21,9 +23,10 @@ impl Default for RunId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRunKind {
-    ResearcherReplenishment,
+    QuestionMakerReplenishment,
     AnswerProcessor,
     DeepDiveChat,
+    FleetAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,34 +56,49 @@ pub struct DeepDiveContext {
 
 /// Swappable agent backend boundary (`--agent mock|cursor`).
 pub trait AgentProvider {
-    fn start_researcher_replenishment(
+    fn start_question_maker_replenishment(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
+        pool: &QuestionMakerSettings,
     ) -> anyhow::Result<AgentRunHandle>;
 
     fn start_answer_processor(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
     ) -> anyhow::Result<AgentRunHandle>;
 
     /// Pool visibility for the interview workspace status footer.
     fn answer_processor_pool_stats(
         &self,
-        cwd: &Path,
+        agent_config_id: &str,
         pool: &AnswerProcessorSettings,
     ) -> AnswerProcessorPoolStats;
 
     fn start_deep_dive_chat(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
     ) -> anyhow::Result<AgentRunHandle>;
 
+    /// Start an autonomous fleet agent run for a saved agent config.
+    fn start_fleet_agent(
+        &mut self,
+        agent_config_id: &str,
+        cwd: PathBuf,
+        prompt: String,
+    ) -> anyhow::Result<AgentRunHandle>;
+
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState>;
 
     fn cancel_run(&mut self, id: RunId) -> anyhow::Result<()>;
+
+    /// Live in-flight counts for the global agent status bar.
+    fn interview_status_counts(&self) -> InterviewAgentCounts;
 }

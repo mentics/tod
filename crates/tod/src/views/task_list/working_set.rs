@@ -11,6 +11,7 @@ struct PersistedWorkingSet {
     sort_direction: String,
     tag_filter: Option<String>,
     selected_id: Option<String>,
+    active_list_id: Option<String>,
 }
 
 pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
@@ -26,6 +27,7 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         sort_direction: parse_sort_direction(&persisted.sort_direction),
         tag_filter: persisted.tag_filter,
         selected_id: persisted.selected_id,
+        active_list_id: persisted.active_list_id,
     }
 }
 
@@ -39,6 +41,7 @@ pub fn save_working_set(config_dir: &Path, ws: &ListWorkingSet) {
         },
         tag_filter: ws.tag_filter.clone(),
         selected_id: ws.selected_id.clone(),
+        active_list_id: ws.active_list_id.clone(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&persisted) {
         let _ = fs::create_dir_all(config_dir);
@@ -49,6 +52,7 @@ pub fn save_working_set(config_dir: &Path, ws: &ListWorkingSet) {
 fn sort_key_name(key: SortKey) -> &'static str {
     match key {
         SortKey::InteractionTimestamp => "timestamp",
+        SortKey::TreeOrder => "tree",
         SortKey::Title => "title",
         SortKey::Lifecycle => "lifecycle",
         SortKey::TicketId => "ticket",
@@ -60,7 +64,8 @@ fn parse_sort_key(s: &str) -> SortKey {
         "title" => SortKey::Title,
         "lifecycle" => SortKey::Lifecycle,
         "ticket" => SortKey::TicketId,
-        _ => SortKey::InteractionTimestamp,
+        "tree" => SortKey::TreeOrder,
+        _ => SortKey::TreeOrder,
     }
 }
 

@@ -1,9 +1,16 @@
+use super::acp_host::{AcpHost, spawn_acp_process};
 use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, AnswerProcessorPoolStats,
     DeepDiveContext, RunId,
 };
-use crate::interview::settings::AnswerProcessorSettings;
+use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
+use crate::agent_traffic::{
+    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+};
+use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
+use crate::process_bundle::InterviewAgentPrompt;
+use crate::process_bundle::{TodInstallPaths, build_deep_dive_prompt, load_deep_dive_role_doc};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -45,10 +52,17 @@ enum SlotCommand {
 
 #[derive(Debug)]
 struct SlotCompletion {
+    agent_config_id: String,
     cwd: PathBuf,
     slot_id: u32,
     run_id: RunId,
     result: Result<String, String>,
+}
+
+#[derive(Clone)]
+struct PoolRunContext {
+    agent_config_id: String,
+    cwd: PathBuf,
 }
 
 struct AcpLiveSlot {
@@ -58,73 +72,222 @@ struct AcpLiveSlot {
     cancelled: Arc<AtomicBool>,
 }
 
-/// Cursor Agent CLI backend over ACP (Agent Client Protocol).
+/// ACP agent backend (Cursor, Claude, …).
 pub struct CursorAcpProvider {
+    host: AcpHost,
     agent_bin: PathBuf,
     model: String,
+    deep_dive_role: String,
     runs: HashMap<RunId, ActiveRun>,
     answer_pool: AnswerProcessorPoolManager,
-    answer_run_cwd: HashMap<RunId, PathBuf>,
-    slot_workers: HashMap<PathBuf, HashMap<u32, AcpLiveSlot>>,
-    slot_completions: Receiver<SlotCompletion>,
-    slot_completion_tx: Sender<SlotCompletion>,
+    answer_run_context: HashMap<RunId, PoolRunContext>,
+    answer_slot_workers: HashMap<String, HashMap<u32, AcpLiveSlot>>,
+    answer_slot_completions: Receiver<SlotCompletion>,
+    answer_slot_completion_tx: Sender<SlotCompletion>,
+    question_maker_pool: QuestionMakerPoolManager,
+    question_maker_run_context: HashMap<RunId, PoolRunContext>,
+    question_maker_slot_workers: HashMap<String, HashMap<u32, AcpLiveSlot>>,
+    question_maker_slot_completions: Receiver<SlotCompletion>,
+    question_maker_slot_completion_tx: Sender<SlotCompletion>,
+    fleet_run_context: HashMap<RunId, String>,
+    traffic_log: Option<SharedAgentTrafficLog>,
 }
 
 impl CursorAcpProvider {
-    pub fn new() -> Result<Self> {
-        let (slot_completion_tx, slot_completions) = mpsc::channel();
+    fn load_deep_dive_role() -> String {
+        TodInstallPaths::discover()
+            .ok()
+            .and_then(|install| load_deep_dive_role_doc(&install).ok())
+            .unwrap_or_else(|| "# Deep dive\n\nFree-form chat.".into())
+    }
+
+    pub fn for_host(host: AcpHost) -> Result<Self> {
+        let (answer_slot_completion_tx, answer_slot_completions) = mpsc::channel();
+        let (question_maker_slot_completion_tx, question_maker_slot_completions) = mpsc::channel();
         Ok(Self {
-            agent_bin: resolve_agent_bin()?,
+            host,
+            agent_bin: host.resolve_bin()?,
             model: DEFAULT_MODEL.to_string(),
+            deep_dive_role: Self::load_deep_dive_role(),
             runs: HashMap::new(),
             answer_pool: AnswerProcessorPoolManager::default(),
-            answer_run_cwd: HashMap::new(),
-            slot_workers: HashMap::new(),
-            slot_completions,
-            slot_completion_tx,
+            answer_run_context: HashMap::new(),
+            answer_slot_workers: HashMap::new(),
+            answer_slot_completions,
+            answer_slot_completion_tx,
+            question_maker_pool: QuestionMakerPoolManager::default(),
+            question_maker_run_context: HashMap::new(),
+            question_maker_slot_workers: HashMap::new(),
+            question_maker_slot_completions,
+            question_maker_slot_completion_tx,
+            fleet_run_context: HashMap::new(),
+            traffic_log: None,
         })
     }
 
-    pub fn with_agent_bin(agent_bin: PathBuf) -> Self {
-        let (slot_completion_tx, slot_completions) = mpsc::channel();
-        Self {
-            agent_bin,
-            model: DEFAULT_MODEL.to_string(),
-            runs: HashMap::new(),
-            answer_pool: AnswerProcessorPoolManager::default(),
-            answer_run_cwd: HashMap::new(),
-            slot_workers: HashMap::new(),
-            slot_completions,
-            slot_completion_tx,
+    pub fn new() -> Result<Self> {
+        Self::for_host(AcpHost::Cursor)
+    }
+
+    pub fn with_traffic_log(mut self, traffic_log: SharedAgentTrafficLog) -> Self {
+        self.traffic_log = Some(traffic_log);
+        self
+    }
+
+    fn run_id_string(id: RunId) -> String {
+        format!("{id:?}")
+    }
+
+    fn kind_category(kind: AgentRunKind) -> AgentCategory {
+        match kind {
+            AgentRunKind::QuestionMakerReplenishment => AgentCategory::QuestionMaker,
+            AgentRunKind::AnswerProcessor => AgentCategory::AnswerProcessor,
+            AgentRunKind::DeepDiveChat => AgentCategory::DeepDive,
+            AgentRunKind::FleetAgent => AgentCategory::Fleet,
         }
     }
 
-    fn pool_key(cwd: &Path) -> PathBuf {
-        cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+    fn kind_label(kind: AgentRunKind) -> &'static str {
+        match kind {
+            AgentRunKind::QuestionMakerReplenishment => "question-maker",
+            AgentRunKind::AnswerProcessor => "answer-processor",
+            AgentRunKind::DeepDiveChat => "deep-dive",
+            AgentRunKind::FleetAgent => "fleet-agent",
+        }
     }
 
-    fn process_slot_completions(&mut self) {
-        while let Ok(completion) = self.slot_completions.try_recv() {
+    fn log_traffic(
+        &self,
+        kind: AgentRunKind,
+        run_id: RunId,
+        direction: TrafficDirection,
+        content: &str,
+    ) {
+        let Some(log) = &self.traffic_log else {
+            return;
+        };
+        let agent_id = self
+            .fleet_run_context
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_else(|| Self::run_id_string(run_id));
+        log.lock().expect("traffic log mutex").record(
+            Self::kind_category(kind),
+            agent_id,
+            Self::kind_label(kind),
+            direction,
+            content,
+        );
+    }
+
+    pub fn with_agent_bin(host: AcpHost, agent_bin: PathBuf) -> Self {
+        let (answer_slot_completion_tx, answer_slot_completions) = mpsc::channel();
+        let (question_maker_slot_completion_tx, question_maker_slot_completions) = mpsc::channel();
+        Self {
+            host,
+            agent_bin,
+            model: DEFAULT_MODEL.to_string(),
+            deep_dive_role: Self::load_deep_dive_role(),
+            runs: HashMap::new(),
+            answer_pool: AnswerProcessorPoolManager::default(),
+            answer_run_context: HashMap::new(),
+            answer_slot_workers: HashMap::new(),
+            answer_slot_completions,
+            answer_slot_completion_tx,
+            question_maker_pool: QuestionMakerPoolManager::default(),
+            question_maker_run_context: HashMap::new(),
+            question_maker_slot_workers: HashMap::new(),
+            question_maker_slot_completions,
+            question_maker_slot_completion_tx,
+            fleet_run_context: HashMap::new(),
+            traffic_log: None,
+        }
+    }
+
+    fn process_answer_slot_completions(&mut self) {
+        while let Ok(completion) = self.answer_slot_completions.try_recv() {
             let SlotCompletion {
+                agent_config_id,
                 cwd,
                 slot_id,
                 run_id,
                 result,
             } = completion;
-            let outcome = self.answer_pool.complete_run(&cwd, slot_id, run_id, result);
+            let outcome = self
+                .answer_pool
+                .complete_run(&agent_config_id, slot_id, run_id, result);
             if let Some(recycled) = outcome.recycled_slot_id {
-                self.shutdown_slot(&cwd, recycled);
+                self.shutdown_answer_slot(&agent_config_id, recycled);
             }
             for (sid, rid, prompt) in outcome.dispatched {
-                self.answer_run_cwd.insert(rid, cwd.clone());
-                self.dispatch_answer_prompt(&cwd, sid, rid, prompt);
+                self.answer_run_context.insert(
+                    rid,
+                    PoolRunContext {
+                        agent_config_id: agent_config_id.clone(),
+                        cwd: cwd.clone(),
+                    },
+                );
+                self.dispatch_answer_prompt(&agent_config_id, &cwd, sid, rid, prompt);
             }
         }
     }
 
-    fn shutdown_slot(&mut self, cwd: &Path, slot_id: u32) {
-        let key = Self::pool_key(cwd);
-        let Some(slots) = self.slot_workers.get_mut(&key) else {
+    fn process_question_maker_slot_completions(&mut self) {
+        while let Ok(completion) = self.question_maker_slot_completions.try_recv() {
+            let SlotCompletion {
+                agent_config_id,
+                cwd,
+                slot_id,
+                run_id,
+                result,
+            } = completion;
+            let logged = match &result {
+                Ok(text) => text.clone(),
+                Err(err) => format!("ERROR: {err}"),
+            };
+            self.log_traffic(
+                AgentRunKind::QuestionMakerReplenishment,
+                run_id,
+                TrafficDirection::Response,
+                &logged,
+            );
+            let outcome =
+                self.question_maker_pool
+                    .complete_run(&agent_config_id, slot_id, run_id, result);
+            if let Some(recycled) = outcome.recycled_slot_id {
+                self.shutdown_question_maker_slot(&agent_config_id, recycled);
+            }
+            for (sid, rid, prompt) in outcome.dispatched {
+                self.question_maker_run_context.insert(
+                    rid,
+                    PoolRunContext {
+                        agent_config_id: agent_config_id.clone(),
+                        cwd: cwd.clone(),
+                    },
+                );
+                self.dispatch_question_maker_prompt(&agent_config_id, &cwd, sid, rid, prompt);
+            }
+        }
+    }
+
+    fn shutdown_answer_slot(&mut self, agent_config_id: &str, slot_id: u32) {
+        Self::shutdown_slot_in_map(&mut self.answer_slot_workers, agent_config_id, slot_id);
+    }
+
+    fn shutdown_question_maker_slot(&mut self, agent_config_id: &str, slot_id: u32) {
+        Self::shutdown_slot_in_map(
+            &mut self.question_maker_slot_workers,
+            agent_config_id,
+            slot_id,
+        );
+    }
+
+    fn shutdown_slot_in_map(
+        slot_workers: &mut HashMap<String, HashMap<u32, AcpLiveSlot>>,
+        agent_config_id: &str,
+        slot_id: u32,
+    ) {
+        let Some(slots) = slot_workers.get_mut(agent_config_id) else {
             return;
         };
         if let Some(slot) = slots.remove(&slot_id) {
@@ -138,25 +301,68 @@ impl CursorAcpProvider {
             let _ = slot.worker.join();
         }
         if slots.is_empty() {
-            self.slot_workers.remove(&key);
+            slot_workers.remove(agent_config_id);
         }
     }
 
-    fn ensure_slot_worker(&mut self, cwd: &Path, slot_id: u32) -> Result<()> {
-        let key = Self::pool_key(cwd);
-        if self
-            .slot_workers
-            .get(&key)
+    fn ensure_answer_slot_worker(
+        &mut self,
+        agent_config_id: &str,
+        cwd: &Path,
+        slot_id: u32,
+    ) -> Result<()> {
+        Self::ensure_slot_worker(
+            agent_config_id,
+            cwd,
+            slot_id,
+            self.host,
+            &self.agent_bin,
+            &self.model,
+            &mut self.answer_slot_workers,
+            self.answer_slot_completion_tx.clone(),
+        )
+    }
+
+    fn ensure_question_maker_slot_worker(
+        &mut self,
+        agent_config_id: &str,
+        cwd: &Path,
+        slot_id: u32,
+    ) -> Result<()> {
+        Self::ensure_slot_worker(
+            agent_config_id,
+            cwd,
+            slot_id,
+            self.host,
+            &self.agent_bin,
+            &self.model,
+            &mut self.question_maker_slot_workers,
+            self.question_maker_slot_completion_tx.clone(),
+        )
+    }
+
+    fn ensure_slot_worker(
+        agent_config_id: &str,
+        cwd: &Path,
+        slot_id: u32,
+        host: AcpHost,
+        agent_bin: &Path,
+        model: &str,
+        slot_workers: &mut HashMap<String, HashMap<u32, AcpLiveSlot>>,
+        done_tx: Sender<SlotCompletion>,
+    ) -> Result<()> {
+        if slot_workers
+            .get(agent_config_id)
             .is_some_and(|m| m.contains_key(&slot_id))
         {
             return Ok(());
         }
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
-        let agent_bin = self.agent_bin.clone();
-        let model = self.model.clone();
+        let agent_bin = agent_bin.to_path_buf();
+        let model = model.to_string();
         let cwd_buf = cwd.to_path_buf();
-        let done_tx = self.slot_completion_tx.clone();
+        let agent_id = agent_config_id.to_string();
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let child_for_worker = child_slot.clone();
@@ -164,7 +370,9 @@ impl CursorAcpProvider {
 
         let worker = thread::spawn(move || {
             run_acp_pool_slot(
+                host,
                 &agent_bin,
+                &agent_id,
                 &cwd_buf,
                 &model,
                 slot_id,
@@ -175,37 +383,107 @@ impl CursorAcpProvider {
             );
         });
 
-        self.slot_workers.entry(key).or_default().insert(
-            slot_id,
-            AcpLiveSlot {
-                cmd_tx,
-                worker,
-                child: child_slot,
-                cancelled,
-            },
-        );
+        slot_workers
+            .entry(agent_config_id.to_string())
+            .or_default()
+            .insert(
+                slot_id,
+                AcpLiveSlot {
+                    cmd_tx,
+                    worker,
+                    child: child_slot,
+                    cancelled,
+                },
+            );
         Ok(())
     }
 
-    fn dispatch_answer_prompt(&mut self, cwd: &Path, slot_id: u32, run_id: RunId, prompt: String) {
-        if self.ensure_slot_worker(cwd, slot_id).is_err() {
+    fn dispatch_answer_prompt(
+        &mut self,
+        agent_config_id: &str,
+        cwd: &Path,
+        slot_id: u32,
+        run_id: RunId,
+        prompt: String,
+    ) {
+        if self
+            .ensure_answer_slot_worker(agent_config_id, cwd, slot_id)
+            .is_err()
+        {
             let outcome = self.answer_pool.complete_run(
-                cwd,
+                agent_config_id,
                 slot_id,
                 run_id,
                 Err("failed to start ACP pool slot".into()),
             );
             if let Some(recycled) = outcome.recycled_slot_id {
-                self.shutdown_slot(cwd, recycled);
+                self.shutdown_answer_slot(agent_config_id, recycled);
             }
             for (sid, rid, p) in outcome.dispatched {
-                self.answer_run_cwd.insert(rid, cwd.to_path_buf());
-                self.dispatch_answer_prompt(cwd, sid, rid, p);
+                self.answer_run_context.insert(
+                    rid,
+                    PoolRunContext {
+                        agent_config_id: agent_config_id.to_string(),
+                        cwd: cwd.to_path_buf(),
+                    },
+                );
+                self.dispatch_answer_prompt(agent_config_id, cwd, sid, rid, p);
             }
             return;
         }
-        let key = Self::pool_key(cwd);
-        if let Some(slot) = self.slot_workers.get(&key).and_then(|m| m.get(&slot_id)) {
+        if let Some(slot) = self
+            .answer_slot_workers
+            .get(agent_config_id)
+            .and_then(|m| m.get(&slot_id))
+        {
+            let _ = slot.cmd_tx.send(SlotCommand::Prompt { run_id, prompt });
+        }
+    }
+
+    fn dispatch_question_maker_prompt(
+        &mut self,
+        agent_config_id: &str,
+        cwd: &Path,
+        slot_id: u32,
+        run_id: RunId,
+        prompt: String,
+    ) {
+        self.log_traffic(
+            AgentRunKind::QuestionMakerReplenishment,
+            run_id,
+            TrafficDirection::Request,
+            &prompt,
+        );
+        if self
+            .ensure_question_maker_slot_worker(agent_config_id, cwd, slot_id)
+            .is_err()
+        {
+            let outcome = self.question_maker_pool.complete_run(
+                agent_config_id,
+                slot_id,
+                run_id,
+                Err("failed to start ACP pool slot".into()),
+            );
+            if let Some(recycled) = outcome.recycled_slot_id {
+                self.shutdown_question_maker_slot(agent_config_id, recycled);
+            }
+            for (sid, rid, p) in outcome.dispatched {
+                self.question_maker_run_context.insert(
+                    rid,
+                    PoolRunContext {
+                        agent_config_id: agent_config_id.to_string(),
+                        cwd: cwd.to_path_buf(),
+                    },
+                );
+                self.dispatch_question_maker_prompt(agent_config_id, cwd, sid, rid, p);
+            }
+            return;
+        }
+        if let Some(slot) = self
+            .question_maker_slot_workers
+            .get(agent_config_id)
+            .and_then(|m| m.get(&slot_id))
+        {
             let _ = slot.cmd_tx.send(SlotCommand::Prompt { run_id, prompt });
         }
     }
@@ -219,6 +497,7 @@ impl CursorAcpProvider {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
         let agent_bin = self.agent_bin.clone();
+        let host = self.host;
         let model = self.model.clone();
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -230,34 +509,44 @@ impl CursorAcpProvider {
             action = "acp_spawn",
             run_id = ?id,
             ?kind,
+            host = host.label(),
             agent_bin = %agent_bin.display(),
             cwd = %cwd.display(),
             model = %model,
             prompt_chars = prompt.len(),
-            "starting Cursor ACP run"
+            "starting ACP run"
         );
 
+        self.log_traffic(kind, id, TrafficDirection::Request, &prompt);
+
+        let traffic_log = self.traffic_log.clone();
         let worker = thread::spawn(move || {
             let result = run_acp_session(
+                host,
                 &agent_bin,
                 &cwd,
                 &model,
                 &prompt,
                 child_for_worker,
                 cancelled_for_worker,
+                traffic_log,
+                id,
+                kind,
             );
             match &result {
                 Ok(text) => tracing::info!(
                     event = "agent",
                     action = "acp_completed",
+                    host = host.label(),
                     assistant_chars = text.len(),
-                    "Cursor ACP run completed successfully"
+                    "ACP run completed successfully"
                 ),
                 Err(err) => tracing::error!(
                     event = "agent",
                     action = "acp_failed",
+                    host = host.label(),
                     error = %err,
-                    "Cursor ACP run failed"
+                    "ACP run failed"
                 ),
             }
             let _ = tx.send(WorkerMessage::Completed(result));
@@ -285,36 +574,66 @@ impl CursorAcpProvider {
 
 impl Default for CursorAcpProvider {
     fn default() -> Self {
-        Self::new().unwrap_or_else(|err| {
+        Self::for_host(AcpHost::Cursor).unwrap_or_else(|err| {
             eprintln!("Cursor ACP provider init failed: {err}; using placeholder agent path");
-            Self::with_agent_bin(PathBuf::from("agent"))
+            Self::with_agent_bin(AcpHost::Cursor, PathBuf::from("agent"))
         })
     }
 }
 
 impl AgentProvider for CursorAcpProvider {
-    fn start_researcher_replenishment(
+    fn start_question_maker_replenishment(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
+        pool: &QuestionMakerSettings,
     ) -> Result<AgentRunHandle> {
-        self.spawn_run(AgentRunKind::ResearcherReplenishment, cwd, prompt)
+        let (assignment, run_id) = self
+            .question_maker_pool
+            .submit(agent_config_id.to_string(), pool.clone(), prompt)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        self.question_maker_run_context.insert(
+            run_id,
+            PoolRunContext {
+                agent_config_id: agent_config_id.to_string(),
+                cwd: cwd.clone(),
+            },
+        );
+        match assignment {
+            QuestionMakerSubmitAssignment::Dispatch { slot_id, prompt } => {
+                self.dispatch_question_maker_prompt(agent_config_id, &cwd, slot_id, run_id, prompt);
+            }
+            QuestionMakerSubmitAssignment::Queued { .. } => {}
+        }
+        Ok(AgentRunHandle {
+            id: run_id,
+            kind: AgentRunKind::QuestionMakerReplenishment,
+            state: AgentRunState::InFlight,
+        })
     }
 
     fn start_answer_processor(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
-        prompt: String,
+        prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .answer_pool
-            .submit(cwd.clone(), pool.clone(), prompt)
+            .submit(agent_config_id.to_string(), pool.clone(), prompt.clone())
             .map_err(|e| anyhow::anyhow!(e))?;
-        self.answer_run_cwd.insert(run_id, cwd.clone());
+        self.answer_run_context.insert(
+            run_id,
+            PoolRunContext {
+                agent_config_id: agent_config_id.to_string(),
+                cwd: cwd.clone(),
+            },
+        );
         match assignment {
             AnswerSubmitAssignment::Dispatch { slot_id, prompt } => {
-                self.dispatch_answer_prompt(&cwd, slot_id, run_id, prompt);
+                self.dispatch_answer_prompt(agent_config_id, &cwd, slot_id, run_id, prompt);
             }
             AnswerSubmitAssignment::Queued { .. } => {}
         }
@@ -327,49 +646,94 @@ impl AgentProvider for CursorAcpProvider {
 
     fn answer_processor_pool_stats(
         &self,
-        cwd: &Path,
+        agent_config_id: &str,
         pool: &AnswerProcessorSettings,
     ) -> AnswerProcessorPoolStats {
-        self.answer_pool.stats(cwd, pool)
+        self.answer_pool.stats(agent_config_id, pool)
     }
 
     fn start_deep_dive_chat(
         &mut self,
+        agent_config_id: &str,
         cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
     ) -> Result<AgentRunHandle> {
-        let prompt = build_deep_dive_prompt(&context, initial_message.as_deref());
+        let prompt =
+            build_deep_dive_prompt(&self.deep_dive_role, &context, initial_message.as_deref());
+        let _ = agent_config_id;
         self.spawn_run(AgentRunKind::DeepDiveChat, cwd, prompt)
     }
 
-    fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
-        self.process_slot_completions();
+    fn start_fleet_agent(
+        &mut self,
+        agent_config_id: &str,
+        cwd: PathBuf,
+        prompt: String,
+    ) -> Result<AgentRunHandle> {
+        let handle = self.spawn_run(AgentRunKind::FleetAgent, cwd, prompt)?;
+        self.fleet_run_context
+            .insert(handle.id, agent_config_id.to_string());
+        Ok(handle)
+    }
 
-        if let Some(cwd) = self.answer_run_cwd.get(&id).cloned() {
-            if let Some(state) = self.answer_pool.poll_run(&cwd, id) {
+    fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
+        self.process_answer_slot_completions();
+        self.process_question_maker_slot_completions();
+
+        if let Some(ctx) = self.question_maker_run_context.get(&id).cloned() {
+            if let Some(state) = self.question_maker_pool.poll_run(&ctx.agent_config_id, id) {
                 if !matches!(state, AgentRunState::InFlight) {
-                    self.answer_run_cwd.remove(&id);
+                    self.question_maker_run_context.remove(&id);
                 }
                 return Some(state);
             }
         }
 
-        let run = self.runs.get_mut(&id)?;
-        if matches!(run.state, AgentRunState::InFlight) {
-            if let Ok(WorkerMessage::Completed(result)) = run.receiver.try_recv() {
-                run.state = match result {
-                    Ok(text) => AgentRunState::Success(Some(text)),
-                    Err(err) => AgentRunState::Failure(err.to_string()),
-                };
+        if let Some(ctx) = self.answer_run_context.get(&id).cloned() {
+            if let Some(state) = self.answer_pool.poll_run(&ctx.agent_config_id, id) {
+                if !matches!(state, AgentRunState::InFlight) {
+                    self.answer_run_context.remove(&id);
+                }
+                return Some(state);
             }
         }
-        Some(run.state.clone())
+
+        let mut completed: Option<(AgentRunKind, String)> = None;
+        if let Some(run) = self.runs.get_mut(&id) {
+            if matches!(run.state, AgentRunState::InFlight) {
+                if let Ok(WorkerMessage::Completed(result)) = run.receiver.try_recv() {
+                    let logged = match &result {
+                        Ok(text) => text.clone(),
+                        Err(err) => format!("ERROR: {err}"),
+                    };
+                    completed = Some((run.kind, logged));
+                    run.state = match result {
+                        Ok(text) => AgentRunState::Success(Some(text)),
+                        Err(err) => AgentRunState::Failure(err.to_string()),
+                    };
+                }
+            }
+            let state = run.state.clone();
+            if let Some((kind, logged)) = completed {
+                self.log_traffic(kind, id, TrafficDirection::Response, &logged);
+                if !matches!(state, AgentRunState::InFlight) {
+                    self.fleet_run_context.remove(&id);
+                }
+            }
+            return Some(state);
+        }
+        None
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
-        if let Some(cwd) = self.answer_run_cwd.remove(&id) {
-            self.answer_pool.cancel_run(&cwd, id);
+        if let Some(ctx) = self.question_maker_run_context.remove(&id) {
+            self.question_maker_pool
+                .cancel_run(&ctx.agent_config_id, id);
+            return Ok(());
+        }
+        if let Some(ctx) = self.answer_run_context.remove(&id) {
+            self.answer_pool.cancel_run(&ctx.agent_config_id, id);
             return Ok(());
         }
         if let Some(mut run) = self.runs.remove(&id) {
@@ -382,92 +746,31 @@ impl AgentProvider for CursorAcpProvider {
             if let Some(worker) = run.worker.take() {
                 let _ = worker.join();
             }
+            self.fleet_run_context.remove(&id);
         }
         Ok(())
     }
-}
 
-fn build_deep_dive_prompt(context: &DeepDiveContext, initial_message: Option<&str>) -> String {
-    let mut prompt = format!(
-        "Deep-dive chat for interview question {}.\n\
-         Project: {}\n\
-         Task: {}\n\
-         Lifecycle state: {}\n\
-         Interview purpose: {}\n\
-         Interview phase: {}\n\
-         Question:\n{}\n",
-        context.question_id,
-        context.project,
-        context.task,
-        context.lifecycle_state,
-        context.interview_purpose,
-        context.interview_phase,
-        context.question_body,
-    );
-    if let Some(message) = initial_message {
-        prompt.push_str("\nUser message:\n");
-        prompt.push_str(message);
-    }
-    prompt
-}
-
-fn resolve_agent_bin() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("AGENT_BIN") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            candidates.push(
-                PathBuf::from(&local_app_data)
-                    .join("cursor-agent")
-                    .join("agent.cmd"),
-            );
-            candidates.push(
-                PathBuf::from(&local_app_data)
-                    .join("cursor-agent")
-                    .join("cursor-agent.cmd"),
-            );
+    fn interview_status_counts(&self) -> InterviewAgentCounts {
+        let mut counts = InterviewAgentCounts::default();
+        for run in self.runs.values() {
+            if !matches!(run.state, AgentRunState::InFlight) {
+                continue;
+            }
+            match run.kind {
+                AgentRunKind::QuestionMakerReplenishment => {}
+                AgentRunKind::AnswerProcessor => {}
+                AgentRunKind::DeepDiveChat => counts.deep_dive_in_flight += 1,
+                AgentRunKind::FleetAgent => {}
+            }
         }
-    } else if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local").join("bin").join("agent"));
+        counts.question_maker_in_flight = self.question_maker_pool.in_flight_count();
+        let pool_stats = self.answer_pool.global_stats();
+        counts.answer_active = pool_stats.active;
+        counts.answer_pool = pool_stats.in_pool;
+        counts.answer_max = pool_stats.max;
+        counts
     }
-    candidates.push(PathBuf::from("agent"));
-
-    for candidate in candidates {
-        if candidate == PathBuf::from("agent") || candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    bail!("Cursor agent CLI not found. Install from https://cursor.com/install or set AGENT_BIN.")
-}
-
-fn spawn_agent(agent_bin: &Path) -> Result<Child> {
-    let mut command = if agent_bin
-        .extension()
-        .is_some_and(|ext| ext == "cmd" || ext == "bat")
-    {
-        // Windows `.cmd`/`.bat` must go through `cmd /C`. Cancel must use
-        // `kill_child_tree` so the agent grandchild is terminated, not only cmd.
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", &agent_bin.to_string_lossy(), "acp"]);
-        cmd
-    } else {
-        let mut cmd = Command::new(agent_bin);
-        cmd.arg("acp");
-        cmd
-    };
-
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-
-    command
-        .spawn()
-        .with_context(|| format!("failed to spawn {}", agent_bin.display()))
 }
 
 /// Terminate `child` and, on Windows, its entire process tree.
@@ -497,14 +800,18 @@ fn kill_child_tree(child: &mut Child) {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn run_acp_session(
+    host: AcpHost,
     agent_bin: &Path,
     cwd: &Path,
     model: &str,
     prompt: &str,
     child_slot: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
+    traffic_log: Option<SharedAgentTrafficLog>,
+    run_id: RunId,
+    kind: AgentRunKind,
 ) -> Result<String> {
-    let mut child = spawn_agent(agent_bin)?;
+    let mut child = spawn_acp_process(host, agent_bin)?;
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
     {
@@ -521,13 +828,24 @@ fn run_acp_session(
         request_rx,
         assistant_text: String::new(),
         cancelled: cancelled.clone(),
+        traffic_log,
+        run_id,
+        kind,
     };
+
+    let auth_method = host.auth_method_id();
+    let client_name = host.client_name();
 
     let result = (|| -> Result<String> {
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        tracing::debug!(event = "agent", action = "acp_initialize", "ACP initialize");
+        tracing::debug!(
+            event = "agent",
+            action = "acp_initialize",
+            host = host.label(),
+            "ACP initialize"
+        );
         session.send_request(
             "initialize",
             json!({
@@ -536,7 +854,7 @@ fn run_acp_session(
                     "fs": { "readTextFile": false, "writeTextFile": false },
                     "terminal": false
                 },
-                "clientInfo": { "name": "tod-interview-ui", "version": "0.1.0" }
+                "clientInfo": { "name": client_name, "version": "0.1.0" }
             }),
         )?;
         session.await_response(AUTH_TIMEOUT)?;
@@ -547,9 +865,10 @@ fn run_acp_session(
         tracing::debug!(
             event = "agent",
             action = "acp_authenticate",
+            host = host.label(),
             "ACP authenticate"
         );
-        session.send_request("authenticate", json!({ "methodId": "cursor_login" }))?;
+        session.send_request("authenticate", json!({ "methodId": auth_method }))?;
         session.await_response(AUTH_TIMEOUT)?;
 
         if cancelled.load(Ordering::SeqCst) {
@@ -636,13 +955,33 @@ struct AcpClient {
     request_rx: Receiver<AcpRequest>,
     assistant_text: String,
     cancelled: Arc<AtomicBool>,
+    traffic_log: Option<SharedAgentTrafficLog>,
+    run_id: RunId,
+    kind: AgentRunKind,
 }
 
 impl AcpClient {
+    fn log_raw(&self, direction: TrafficDirection, content: &str) {
+        let Some(log) = &self.traffic_log else {
+            return;
+        };
+        log.lock().expect("traffic log mutex").record(
+            CursorAcpProvider::kind_category(self.kind),
+            CursorAcpProvider::run_id_string(self.run_id),
+            format!("{} · acp", CursorAcpProvider::kind_label(self.kind)),
+            direction,
+            content,
+        );
+    }
+
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id;
         self.next_id += 1;
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.log_raw(
+            TrafficDirection::Request,
+            &format!("ACP → {method}\n{message}"),
+        );
         writeln!(self.stdin, "{message}")?;
         self.stdin.flush()?;
         Ok(id)
@@ -662,7 +1001,17 @@ impl AcpClient {
                 .request_rx
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
             {
-                Ok(AcpRequest::Response { id: _, result }) => return Ok(result),
+                Ok(AcpRequest::Response { id: _, result }) => {
+                    self.log_raw(
+                        TrafficDirection::Response,
+                        &format!(
+                            "ACP ←\n{}",
+                            serde_json::to_string_pretty(&result)
+                                .unwrap_or_else(|_| result.to_string())
+                        ),
+                    );
+                    return Ok(result);
+                }
                 Ok(AcpRequest::ResponseError { message }) => bail!("ACP error: {message}"),
                 Ok(AcpRequest::Notification { method, params }) => {
                     self.handle_notification(&method, params)?;
@@ -894,13 +1243,14 @@ struct PersistentAcpSession {
 
 impl PersistentAcpSession {
     fn connect(
+        host: AcpHost,
         agent_bin: &Path,
         cwd: &Path,
         model: &str,
         child_slot: Arc<Mutex<Option<Child>>>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let mut child = spawn_agent(agent_bin)?;
+        let mut child = spawn_acp_process(host, agent_bin)?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
         {
@@ -917,7 +1267,13 @@ impl PersistentAcpSession {
             request_rx,
             assistant_text: String::new(),
             cancelled: cancelled.clone(),
+            traffic_log: None,
+            run_id: RunId::new(),
+            kind: AgentRunKind::AnswerProcessor,
         };
+
+        let auth_method = host.auth_method_id();
+        let client_name = host.client_name();
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -930,7 +1286,7 @@ impl PersistentAcpSession {
                     "fs": { "readTextFile": false, "writeTextFile": false },
                     "terminal": false
                 },
-                "clientInfo": { "name": "tod-interview-ui", "version": "0.1.0" }
+                "clientInfo": { "name": client_name, "version": "0.1.0" }
             }),
         )?;
         client.await_response(AUTH_TIMEOUT)?;
@@ -938,7 +1294,7 @@ impl PersistentAcpSession {
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        client.send_request("authenticate", json!({ "methodId": "cursor_login" }))?;
+        client.send_request("authenticate", json!({ "methodId": auth_method }))?;
         client.await_response(AUTH_TIMEOUT)?;
 
         if cancelled.load(Ordering::SeqCst) {
@@ -1005,7 +1361,9 @@ impl PersistentAcpSession {
 }
 
 fn run_acp_pool_slot(
+    host: AcpHost,
     agent_bin: &Path,
+    agent_config_id: &str,
     cwd: &Path,
     model: &str,
     slot_id: u32,
@@ -1015,7 +1373,9 @@ fn run_acp_pool_slot(
     cancelled: Arc<AtomicBool>,
 ) {
     let cwd_buf = cwd.to_path_buf();
+    let agent_config_id = agent_config_id.to_string();
     let mut session = match PersistentAcpSession::connect(
+        host,
         agent_bin,
         cwd,
         model,
@@ -1043,6 +1403,7 @@ fn run_acp_pool_slot(
             SlotCommand::Prompt { run_id, prompt } => {
                 let result = session.prompt(&prompt).map_err(|err| err.to_string());
                 let _ = done_tx.send(SlotCompletion {
+                    agent_config_id: agent_config_id.clone(),
                     cwd: cwd_buf.clone(),
                     slot_id,
                     run_id,
@@ -1063,6 +1424,7 @@ mod tests {
     #[test]
     fn deep_dive_prompt_includes_context() {
         let prompt = build_deep_dive_prompt(
+            "# Deep dive\n\nRole text.",
             &DeepDiveContext {
                 project: "tod".into(),
                 task: "interview".into(),
@@ -1072,8 +1434,9 @@ mod tests {
                 question_id: "q-001".into(),
                 question_body: "How should settings persist?".into(),
             },
-            Some("Let's explore trade-offs"),
+            Some("User: Let's explore trade-offs"),
         );
+        assert!(prompt.contains("Role text."));
         assert!(prompt.contains("q-001"));
         assert!(prompt.contains("Let's explore trade-offs"));
     }

@@ -399,13 +399,14 @@ mod tests {
         std::env::temp_dir().join(format!("tod-fleet-migration-{name}-{}", uuid::Uuid::new_v4()))
     }
 
-    fn seed_task(root: &Path, id: &str, title: &str) {
+    fn seed_task(root: &Path, slug: &str, title: &str) {
         let paths = FleetPaths::new(root).unwrap();
         FleetLaunch::prepare(&paths).unwrap();
         let writer = FleetWriter::open(paths.db()).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
         writer
             .enqueue(FleetMutation::InsertTask {
-                task: FleetTask::new(id, title, id),
+                task: FleetTask::new(id, title, slug),
             })
             .unwrap();
         writer.flush().unwrap();
@@ -414,8 +415,12 @@ mod tests {
 
     fn task_count(db: &Path) -> i64 {
         let conn = schema::open_read_connection(db).unwrap();
-        conn.query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(
+            "SELECT COUNT(*) FROM node_capabilities WHERE capability = 'agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -557,12 +562,14 @@ mod tests {
         let writer = FleetWriter::open(paths.db()).unwrap();
 
         let held = HeldWrites::new(paths.held_writes());
+        let id1 = uuid::Uuid::new_v4().to_string();
+        let id2 = uuid::Uuid::new_v4().to_string();
         held.append(&FleetMutation::InsertTask {
-            task: FleetTask::new("t1", "One", "one"),
+            task: FleetTask::new(&id1, "One", "one"),
         })
         .unwrap();
         held.append(&FleetMutation::InsertTask {
-            task: FleetTask::new("t2", "Two", "two"),
+            task: FleetTask::new(&id2, "Two", "two"),
         })
         .unwrap();
 

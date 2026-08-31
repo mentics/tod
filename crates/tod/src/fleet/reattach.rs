@@ -1,7 +1,7 @@
 //! Launch-time reattach orchestration for agents and shell sessions.
 
 use crate::fleet::reconnect_identity;
-use crate::fleet::repos::agent::AgentRepo;
+use crate::fleet::repos::agent_config::AgentConfigRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::runtime::GuestLivenessCheck;
 use crate::fleet::writer::{FleetMutation, FleetWriter};
@@ -26,7 +26,7 @@ pub fn reattach_on_launch(
     host_verify: HostVerifyFn,
 ) -> Result<ReattachReport> {
     let mut report = ReattachReport::default();
-    let agent_repo = AgentRepo::new(conn);
+    let agent_repo = AgentConfigRepo::new(conn);
     let shell_repo = ShellRepo::new(conn);
 
     let agents = agent_repo.list_with_reconnect()?;
@@ -86,7 +86,7 @@ pub fn remove_agents_with_missing_worktrees(
     writer: &FleetWriter,
     notices: &crate::fleet::notices::FleetNoticeHooks,
 ) -> Result<usize> {
-    let repo = AgentRepo::new(conn);
+    let repo = AgentConfigRepo::new(conn);
     let mut removed = 0usize;
     for agent in repo.list_all()? {
         let Some(path) = agent.worktree_path.as_deref() else {
@@ -114,7 +114,7 @@ pub fn remove_agents_with_missing_worktrees(
 mod tests {
     use super::*;
     use crate::fleet::reconnect_identity::ReconnectIdentity;
-    use crate::fleet::repos::agent::NewAgent;
+    use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
     use crate::fleet::repos::task::{FleetTask, TaskRepo};
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
     use crate::fleet::runtime::NoopGuestLiveness;
@@ -133,7 +133,7 @@ mod tests {
     fn failed_reattach_persists_not_running_without_notification() {
         let (dir, conn) = test_writer_conn();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10)).unwrap();
+        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10), crate::fleet::command_log::CommandLog::shared()).unwrap();
         let task_id = uuid::Uuid::new_v4().to_string();
         let agent_id = uuid::Uuid::new_v4().to_string();
         TaskRepo::new(&conn)
@@ -142,10 +142,15 @@ mod tests {
         AgentRepo::new(&conn)
             .insert(&NewAgent {
                 id: agent_id.clone(),
-                task_id,
+                node_id: task_id,
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             })
+            .unwrap();
+        AgentRepo::new(&conn)
+            .update_runtime_status(&agent_id, "processing")
             .unwrap();
         AgentRepo::new(&conn)
             .update_reconnect(
@@ -155,9 +160,6 @@ mod tests {
                     birth_token: 1,
                 },
             )
-            .unwrap();
-        AgentRepo::new(&conn)
-            .update_runtime_status(&agent_id, "processing")
             .unwrap();
 
         let report = reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_fail_verify)
@@ -181,7 +183,7 @@ mod tests {
     fn successful_reattach_persists_live_status() {
         let (dir, conn) = test_writer_conn();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10)).unwrap();
+        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10), crate::fleet::command_log::CommandLog::shared()).unwrap();
         let task_id = uuid::Uuid::new_v4().to_string();
         let agent_id = uuid::Uuid::new_v4().to_string();
         TaskRepo::new(&conn)
@@ -190,10 +192,15 @@ mod tests {
         AgentRepo::new(&conn)
             .insert(&NewAgent {
                 id: agent_id.clone(),
-                task_id,
+                node_id: task_id,
                 env_type: "local".into(),
                 mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
             })
+            .unwrap();
+        AgentRepo::new(&conn)
+            .update_runtime_status(&agent_id, "processing")
             .unwrap();
         let identity = reconnect_identity::record(std::process::id()).expect("current pid");
         AgentRepo::new(&conn)

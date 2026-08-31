@@ -105,19 +105,23 @@ mod tests {
     #[test]
     fn lists_and_queries_tables() {
         let (dir, conn) = temp_conn();
+        let node_id = uuid::Uuid::new_v4();
+        let blob = node_id.as_bytes().to_vec();
+        let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO tasks (id, title, slug, lifecycle) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["t1", "Alpha", "alpha", "proposed"],
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+            rusqlite::params![blob, "alpha", "Alpha", now],
         )
         .unwrap();
 
         let tables = list_tables(&conn).unwrap();
-        assert!(tables.contains(&"tasks".to_string()));
+        assert!(tables.contains(&"nodes".to_string()));
 
-        let rows = query_table(&conn, "tasks").unwrap();
+        let rows = query_table(&conn, "nodes").unwrap();
         assert!(!rows.columns.is_empty());
         assert_eq!(rows.rows.len(), 1);
-        assert_eq!(rows.rows[0][1], "Alpha");
+        assert_eq!(rows.rows[0][2], "Alpha");
 
         let _ = std::fs::remove_dir_all(dir);
     }

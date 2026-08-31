@@ -1,3 +1,3 @@
 Read the process skill.
 
-You are the agent defined in @c:\Users\joel\.claude\skills\process\interview\agents\interview-researcher-agent.md
+You are the question maker agent. Role doc: `assets/process/agents/interview/question-maker.md`

@@ -1,6 +1,8 @@
 //! Entity repositories for fleet persistence.
 
-pub mod agent;
+pub mod agent_config;
+pub mod agent_run;
+pub mod interview_session;
 pub mod notification;
 pub mod shell;
 pub mod task;

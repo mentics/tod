@@ -36,6 +36,8 @@ pub struct DeepDiveView {
     parent: QueueQuestion,
     config: InterviewConfig,
     _session: InterviewSession,
+    agent_config_id: String,
+    workspace_cwd: std::path::PathBuf,
     turns: Vec<ChatTurn>,
     draft_input: Entity<InputState>,
     agent: SharedAgent,
@@ -52,6 +54,8 @@ impl DeepDiveView {
         parent: QueueQuestion,
         config: InterviewConfig,
         session: InterviewSession,
+        agent_config_id: String,
+        workspace_cwd: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
         agent: SharedAgent,
@@ -66,6 +70,8 @@ impl DeepDiveView {
             parent,
             config,
             _session: session,
+            agent_config_id,
+            workspace_cwd,
             turns: Vec::new(),
             draft_input,
             agent,
@@ -132,11 +138,16 @@ impl DeepDiveView {
 
         let context = self.deep_dive_context();
         let conversation = conversation_transcript(&self.turns);
-        let cwd = self.config.entity.clone();
+        let cwd = self.workspace_cwd.clone();
         let agent = self.agent.clone();
         match agent.try_lock() {
             Ok(mut provider) => {
-                match provider.start_deep_dive_chat(cwd, context, Some(conversation)) {
+                match provider.start_deep_dive_chat(
+                    &self.agent_config_id,
+                    cwd,
+                    context,
+                    Some(conversation),
+                ) {
                     Ok(handle) => {
                         self.active_run = Some(handle.id);
                         self.status_line = "Agent thinking…".into();
@@ -164,13 +175,7 @@ impl DeepDiveView {
                 .file_name()
                 .map(|n| n.to_string_lossy().into())
                 .unwrap_or_else(|| "project".into()),
-            task: self
-                .config
-                .entity
-                .strip_prefix(&repo)
-                .unwrap_or(&self.config.entity)
-                .to_string_lossy()
-                .into(),
+            task: self.config.node_id.to_string().into(),
             lifecycle_state: "active".into(),
             interview_purpose: self.config.phase.clone(),
             interview_phase: self.config.phase.clone(),

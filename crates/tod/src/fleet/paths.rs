@@ -73,7 +73,15 @@ impl FleetPaths {
 
     pub fn ensure_root(&self) -> Result<()> {
         std::fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create fleet storage root {}", self.root.display()))
+            .with_context(|| format!("failed to create fleet storage root {}", self.root.display()))?;
+        std::fs::create_dir_all(self.media())
+            .with_context(|| format!("failed to create media dir {}", self.media().display()))?;
+        Ok(())
+    }
+
+    /// Immutable media artifacts directory (`{root}/media/`).
+    pub fn media(&self) -> PathBuf {
+        self.root.join("media")
     }
 }
 

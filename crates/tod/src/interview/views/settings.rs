@@ -1,10 +1,13 @@
 use crate::interview::TodPaths;
-use crate::interview::settings::{MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings};
+use crate::interview::agent::AgentPlatform;
+use crate::interview::settings::{
+    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WorktreeBackend,
+};
 use crate::logging;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use gpui::{
-    Context, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render,
-    SharedString, Styled, Timer, Window, div, px,
+    Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    Render, SharedString, Styled, Timer, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
@@ -14,32 +17,45 @@ const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const PANEL_WIDTH: f32 = 560.0;
 const SIDEBAR_WIDTH: f32 = 168.0;
 
-const SECTIONS: [SettingsSection; 3] = [
-    SettingsSection::Researcher,
+const SECTIONS: [SettingsSection; 5] = [
+    SettingsSection::Agents,
+    SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
+    SettingsSection::Workspaces,
     SettingsSection::Logging,
 ];
 
+#[derive(Debug, Clone)]
+pub enum SettingsEvent {
+    AgentPlatformChanged(AgentPlatform),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsSection {
-    Researcher,
+    Agents,
+    QuestionMaker,
     AnswerProcessor,
+    Workspaces,
     Logging,
 }
 
 impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
-            Self::Researcher => "Researcher thresholds",
+            Self::Agents => "Interview agents",
+            Self::QuestionMaker => "Question maker thresholds",
             Self::AnswerProcessor => "Answer-processor pool",
+            Self::Workspaces => "Workspaces",
             Self::Logging => "Diagnostic logging",
         }
     }
 
     fn id(self) -> &'static str {
         match self {
-            Self::Researcher => "researcher",
+            Self::Agents => "agents",
+            Self::QuestionMaker => "question-maker",
             Self::AnswerProcessor => "answer-processor",
+            Self::Workspaces => "workspaces",
             Self::Logging => "logging",
         }
     }
@@ -71,7 +87,7 @@ impl SettingsView {
             log_dir_display,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
-            active_section: SettingsSection::Researcher,
+            active_section: SettingsSection::Agents,
             save_generation: 0,
         }
     }
@@ -110,15 +126,24 @@ impl SettingsView {
     }
 
     fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.researcher.replenish_threshold =
-            step_u32(self.settings.researcher.replenish_threshold, delta);
+        self.settings.question_maker.replenish_threshold =
+            step_u32(self.settings.question_maker.replenish_threshold, delta);
         self.schedule_save(cx);
         cx.notify();
     }
 
     fn step_second(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.researcher.second_researcher_threshold =
-            step_u32(self.settings.researcher.second_researcher_threshold, delta);
+        self.settings.question_maker.second_question_maker_threshold = step_u32(
+            self.settings.question_maker.second_question_maker_threshold,
+            delta,
+        );
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn step_question_maker_runs_per_session(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.settings.question_maker.runs_per_session =
+            step_u32(self.settings.question_maker.runs_per_session, delta);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -155,6 +180,60 @@ impl SettingsView {
         self.schedule_save(cx);
         cx.notify();
     }
+
+    pub(crate) fn cycle_agent_platform(&mut self, delta: i32, cx: &mut Context<Self>) {
+        const ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+        let idx = ORDER
+            .iter()
+            .position(|p| *p == self.settings.agent_platform)
+            .unwrap_or(0);
+        let len = ORDER.len() as i32;
+        let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
+        self.set_agent_platform(ORDER[next], cx);
+    }
+
+    pub fn set_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
+        if self.settings.agent_platform == platform {
+            return;
+        }
+        self.settings.agent_platform = platform;
+        cx.emit(SettingsEvent::AgentPlatformChanged(platform));
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    pub fn agent_platform(&self) -> AgentPlatform {
+        self.settings.agent_platform
+    }
+
+    fn agent_platform_label(platform: AgentPlatform) -> &'static str {
+        platform.label()
+    }
+
+    fn cycle_worktree_backend(&mut self, delta: i32, cx: &mut Context<Self>) {
+        const ORDER: [WorktreeBackend; 3] = [
+            WorktreeBackend::TreehouseWithGitFallback,
+            WorktreeBackend::TreehouseRequired,
+            WorktreeBackend::GitOnly,
+        ];
+        let idx = ORDER
+            .iter()
+            .position(|b| *b == self.settings.worktree_backend)
+            .unwrap_or(0);
+        let len = ORDER.len() as i32;
+        let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
+        self.settings.worktree_backend = ORDER[next];
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn worktree_backend_label(backend: WorktreeBackend) -> &'static str {
+        match backend {
+            WorktreeBackend::TreehouseWithGitFallback => "Treehouse default, Git fallback",
+            WorktreeBackend::TreehouseRequired => "Treehouse required",
+            WorktreeBackend::GitOnly => "Git worktree only",
+        }
+    }
 }
 
 fn step_u32(value: u32, delta: i32) -> u32 {
@@ -176,6 +255,8 @@ mod tests {
         assert_eq!(step_u32(0, -1), 0);
     }
 }
+
+impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl HasAppNav for SettingsView {
     fn app_nav_mut(&mut self) -> &mut AppNavMenu {
@@ -279,21 +360,42 @@ impl SettingsView {
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
         match self.active_section {
-            SettingsSection::Researcher => v_flex()
+            SettingsSection::Agents => v_flex()
                 .gap_3()
                 .child(
                     div()
                         .text_sm()
                         .font_semibold()
                         .text_color(theme.foreground)
-                        .child("Researcher thresholds"),
+                        .child("Interview agents"),
+                )
+                .child(threshold_row(
+                    cx,
+                    "agent-platform",
+                    Self::agent_platform_label(self.settings.agent_platform),
+                    "Agent platform",
+                    "Which agent runtime runs interview question-maker and answer-processor work. Default is Claude.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.cycle_agent_platform(-1, cx),
+                    |this, _, cx| this.cycle_agent_platform(1, cx),
+                ))
+                .into_any_element(),
+            SettingsSection::QuestionMaker => v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Question maker thresholds"),
                 )
                 .child(threshold_row(
                     cx,
                     "replenish",
-                    self.settings.researcher.replenish_threshold.to_string(),
+                    self.settings.question_maker.replenish_threshold.to_string(),
                     "Replenish below",
-                    "Start a researcher run when open questions fall under this count. Default 8.",
+                    "Start a question maker run when open questions fall under this count. Default 8.",
                     theme.foreground,
                     theme.muted_foreground,
                     |this, _, cx| this.step_replenish(-1, cx),
@@ -303,15 +405,26 @@ impl SettingsView {
                     cx,
                     "second",
                     self.settings
-                        .researcher
-                        .second_researcher_threshold
+                        .question_maker
+                        .second_question_maker_threshold
                         .to_string(),
-                    "Second researcher below",
-                    "While one researcher is already running, start a second if open count drops under this lower threshold. Max two runs. Default 2.",
+                    "Second question maker below",
+                    "While one question maker is already running, start a second if open count drops under this lower threshold. Max two runs. Default 2.",
                     theme.foreground,
                     theme.muted_foreground,
                     |this, _, cx| this.step_second(-1, cx),
                     |this, _, cx| this.step_second(1, cx),
+                ))
+                .child(threshold_row(
+                    cx,
+                    "question-maker-runs-per-session",
+                    self.settings.question_maker.runs_per_session.to_string(),
+                    "Runs per session",
+                    "After the Nth question maker response on one session, close that session and open a fresh one. Default 8.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.step_question_maker_runs_per_session(-1, cx),
+                    |this, _, cx| this.step_question_maker_runs_per_session(1, cx),
                 ))
                 .into_any_element(),
             SettingsSection::AnswerProcessor => v_flex()
@@ -345,11 +458,32 @@ impl SettingsView {
                         .answers_per_session
                         .to_string(),
                     "Answers per session",
-                    "After the Nth response is processed on one session, close that session. Default 4.",
+                    "After the Nth answer-processor response on one session, close that session. Default 16.",
                     theme.foreground,
                     theme.muted_foreground,
                     |this, _, cx| this.step_answers_per_session(-1, cx),
                     |this, _, cx| this.step_answers_per_session(1, cx),
+                ))
+                .into_any_element(),
+            SettingsSection::Workspaces => v_flex()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Worktree management"),
+                )
+                .child(threshold_row(
+                    cx,
+                    "worktree-backend",
+                    Self::worktree_backend_label(self.settings.worktree_backend),
+                    "Worktree backend",
+                    "How interview agents provision git workspaces: Treehouse with optional Git fallback (default), Treehouse only, or Git worktree only.",
+                    theme.foreground,
+                    theme.muted_foreground,
+                    |this, _, cx| this.cycle_worktree_backend(-1, cx),
+                    |this, _, cx| this.cycle_worktree_backend(1, cx),
                 ))
                 .into_any_element(),
             SettingsSection::Logging => v_flex()

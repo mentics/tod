@@ -17,7 +17,7 @@ pub struct ShellInfo {
     pub label: String,
 }
 
-/// Task row for the task list pane.
+/// Task row for the task list / tree pane.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskItem {
     pub id: String,
@@ -29,6 +29,15 @@ pub struct TaskItem {
     pub agents: Vec<AgentInfo>,
     pub shells: Vec<ShellInfo>,
     pub interaction_timestamp: DateTime<Utc>,
+    /// Stable display order from outline flatten (preserved when sort = Tree).
+    pub tree_ordinal: usize,
+    pub depth: usize,
+    pub collapsed: bool,
+    pub is_work_node: bool,
+    pub has_spec: bool,
+    pub requirement_count: usize,
+    pub constraint_count: usize,
+    pub has_children: bool,
 }
 
 impl TaskItem {
@@ -50,6 +59,7 @@ impl TaskItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortKey {
     #[default]
+    TreeOrder,
     InteractionTimestamp,
     Title,
     Lifecycle,
@@ -59,6 +69,7 @@ pub enum SortKey {
 impl SortKey {
     pub fn label(self) -> &'static str {
         match self {
+            Self::TreeOrder => "Tree",
             Self::InteractionTimestamp => "Recent",
             Self::Title => "Title",
             Self::Lifecycle => "Lifecycle",
@@ -68,14 +79,16 @@ impl SortKey {
 
     pub fn cycle(self) -> Self {
         match self {
+            Self::TreeOrder => Self::Title,
             Self::InteractionTimestamp => Self::Title,
             Self::Title => Self::Lifecycle,
             Self::Lifecycle => Self::TicketId,
-            Self::TicketId => Self::InteractionTimestamp,
+            Self::TicketId => Self::TreeOrder,
         }
     }
 
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
+        Self::TreeOrder,
         Self::InteractionTimestamp,
         Self::Title,
         Self::Lifecycle,
@@ -117,22 +130,24 @@ pub struct ListWorkingSet {
     pub sort_direction: SortDirection,
     pub tag_filter: Option<String>,
     pub selected_id: Option<String>,
+    pub active_list_id: Option<String>,
 }
 
 impl ListWorkingSet {
     pub fn default_sort() -> Self {
         Self {
-            sort_key: SortKey::InteractionTimestamp,
-            sort_direction: SortDirection::Desc,
+            sort_key: SortKey::TreeOrder,
+            sort_direction: SortDirection::Asc,
             tag_filter: None,
             selected_id: None,
+            active_list_id: None,
         }
     }
 
     pub fn initial_direction_for_key(key: SortKey) -> SortDirection {
         match key {
+            SortKey::TreeOrder | SortKey::Title => SortDirection::Asc,
             SortKey::InteractionTimestamp => SortDirection::Desc,
-            SortKey::Title => SortDirection::Asc,
             SortKey::Lifecycle => SortDirection::Desc,
             SortKey::TicketId => SortDirection::Desc,
         }
@@ -226,6 +241,7 @@ pub fn task_matches_tag_filter(task: &TaskItem, tag_filter: Option<&str>) -> boo
 
 pub fn compare_tasks(a: &TaskItem, b: &TaskItem, key: SortKey, dir: SortDirection) -> Ordering {
     let ord = match key {
+        SortKey::TreeOrder => a.tree_ordinal.cmp(&b.tree_ordinal),
         SortKey::InteractionTimestamp => a.interaction_timestamp.cmp(&b.interaction_timestamp),
         SortKey::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
         SortKey::Lifecycle => lifecycle_rank(&a.lifecycle).cmp(&lifecycle_rank(&b.lifecycle)),
@@ -259,7 +275,11 @@ pub fn filter_and_sort_tasks(
         })
         .cloned()
         .collect();
-    visible.sort_by(|a, b| compare_tasks(a, b, working_set.sort_key, working_set.sort_direction));
+    if working_set.sort_key != SortKey::TreeOrder {
+        visible.sort_by(|a, b| {
+            compare_tasks(a, b, working_set.sort_key, working_set.sort_direction)
+        });
+    }
     visible
 }
 
@@ -305,6 +325,7 @@ pub fn nearest_visible_id(
             sort_key: working_set.sort_key,
             sort_direction: working_set.sort_direction,
             selected_id: None,
+            active_list_id: working_set.active_list_id.clone(),
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
@@ -337,6 +358,14 @@ mod tests {
             agents: Vec::new(),
             shells: Vec::new(),
             interaction_timestamp: Utc::now(),
+            tree_ordinal: 0,
+            depth: 0,
+            collapsed: false,
+            is_work_node: !lifecycle.is_empty(),
+            has_spec: false,
+            requirement_count: 0,
+            constraint_count: 0,
+            has_children: false,
         }
     }
 

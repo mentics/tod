@@ -1,5 +1,7 @@
 //! Public facade wiring writer, projection, lock, launch, migration, and runtime hooks.
 
+use crate::agent_traffic::SharedAgentTrafficLog;
+use crate::fleet::command_log::CommandLog;
 use crate::fleet::launch::{FleetLaunch, FleetLaunchError};
 use crate::fleet::lock::{FleetLock, FleetLockError};
 use crate::fleet::migration::{
@@ -11,11 +13,23 @@ use crate::fleet::paths::FleetPaths;
 use crate::fleet::projection::FleetProjection;
 use crate::fleet::prompt_queue::MemoryPromptQueue;
 use crate::fleet::reattach;
-use crate::fleet::repos::agent::{AgentRepo, FleetAgent};
+use crate::fleet::repos::agent_config::{
+    AgentConfig, AgentConfigRepo, AgentConfigRow, NewAgentConfig,
+};
+use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
+use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
+use crate::fleet::repos::transcript::{TranscriptRepo, TranscriptTurn};
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
+use crate::outline::OutlineMutation;
+use crate::outline::repos::node::NodeRepo;
+use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
+use crate::outline::repos::{ListRepo, tree::TreeLoader};
+use crate::outline::types::Capability;
+use crate::outline::types::{FlatNodeRow, OutlineList};
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -32,10 +46,12 @@ pub struct FleetStore {
     paths: FleetPaths,
     _lock: FleetLock,
     writer: FleetWriter,
+    command_log: Arc<Mutex<crate::fleet::command_log::CommandLog>>,
     projection: Arc<Mutex<FleetProjection>>,
     prompt_queue: Arc<MemoryPromptQueue>,
     notices: FleetNoticeHooks,
     migration: Option<StorageMigration>,
+    traffic_log: Option<SharedAgentTrafficLog>,
 }
 
 impl FleetStore {
@@ -52,7 +68,13 @@ impl FleetStore {
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
         let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
-        let writer = FleetWriter::open(paths.db()).map_err(FleetLaunchError::Other)?;
+        let command_log = CommandLog::shared();
+        let writer = FleetWriter::open_with_debounce(
+            paths.db(),
+            crate::fleet::writer::DEBOUNCE_INTERVAL,
+            command_log.clone(),
+        )
+        .map_err(FleetLaunchError::Other)?;
         let projection = Arc::new(Mutex::new(
             FleetProjection::open(paths.db()).map_err(FleetLaunchError::Other)?,
         ));
@@ -62,13 +84,21 @@ impl FleetStore {
             paths,
             _lock: lock,
             writer,
+            command_log,
             projection,
             prompt_queue: Arc::new(MemoryPromptQueue::new()),
             notices: FleetNoticeHooks::new(),
             migration: None,
+            traffic_log: None,
         };
 
         store.run_launch_hooks(guest)?;
+        if let Ok(paths) = crate::interview::TodPaths::discover() {
+            let projection = store.projection.lock().expect("fleet projection mutex");
+            let conn = projection.connection();
+            let _ =
+                crate::outline::migrate_interview::migrate_legacy_interview_sessions(&conn, &paths);
+        }
         Ok(store)
     }
 
@@ -97,6 +127,65 @@ impl FleetStore {
         &self.writer
     }
 
+    pub fn command_log(&self) -> Arc<Mutex<CommandLog>> {
+        self.command_log.clone()
+    }
+
+    /// Undo the most recent command-log entry.
+    pub fn undo_last(&self) -> Result<Option<String>, FleetWriterError> {
+        let entry = self
+            .command_log
+            .lock()
+            .expect("command log mutex")
+            .pop_last();
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        self.apply_undo_entry(&entry)?;
+        Ok(Some(entry.label))
+    }
+
+    /// Undo back through `entry_id` (inclusive), returning labels undone newest-first.
+    pub fn undo_through(&self, entry_id: uuid::Uuid) -> Result<Vec<String>, FleetWriterError> {
+        let entries = self
+            .command_log
+            .lock()
+            .expect("command log mutex")
+            .pop_through(entry_id);
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let labels: Vec<String> = entries.iter().map(|e| e.label.clone()).collect();
+        for entry in entries {
+            self.apply_undo_entry(&entry)?;
+        }
+        Ok(labels)
+    }
+
+    fn apply_undo_entry(
+        &self,
+        entry: &crate::fleet::command_log::CommandEntry,
+    ) -> Result<(), FleetWriterError> {
+        self.command_log
+            .lock()
+            .expect("command log mutex")
+            .set_suppressed(true);
+        for inverse in &entry.inverses {
+            self.writer.enqueue(inverse.clone())?;
+        }
+        self.writer.flush()?;
+        self.command_log
+            .lock()
+            .expect("command log mutex")
+            .set_suppressed(false);
+        self.projection
+            .lock()
+            .expect("fleet projection mutex")
+            .reload()
+            .map_err(|e| FleetWriterError::Write(e))?;
+        Ok(())
+    }
+
     pub fn projection(&self) -> Arc<Mutex<FleetProjection>> {
         self.projection.clone()
     }
@@ -107,6 +196,10 @@ impl FleetStore {
 
     pub fn notices(&self) -> &FleetNoticeHooks {
         &self.notices
+    }
+
+    pub fn set_traffic_log(&mut self, traffic_log: SharedAgentTrafficLog) {
+        self.traffic_log = Some(traffic_log);
     }
 
     /// Subscribe to coarse fleet-changed notifications (writer commit or external reload).
@@ -122,7 +215,31 @@ impl FleetStore {
         if self.migration.is_some() {
             return Err(FleetWriterError::MigrationBlocked);
         }
+        self.log_mutation(&mutation);
         self.writer.enqueue(mutation)
+    }
+
+    fn log_mutation(&self, mutation: &FleetMutation) {
+        let Some(log) = &self.traffic_log else {
+            return;
+        };
+        match mutation {
+            FleetMutation::SendPrompt {
+                agent_id, content, ..
+            } => {
+                log.lock()
+                    .expect("traffic log mutex")
+                    .record_fleet_request(agent_id, content);
+            }
+            FleetMutation::CompleteResponse {
+                agent_id, content, ..
+            } => {
+                log.lock()
+                    .expect("traffic log mutex")
+                    .record_fleet_response(agent_id, content);
+            }
+            _ => {}
+        }
     }
 
     /// List all tasks from the read-only projection.
@@ -132,13 +249,156 @@ impl FleetStore {
         TaskRepo::new(&conn).list().map_err(Into::into)
     }
 
-    /// List agents for a task from the projection.
-    pub fn list_agents_for_task(&self, task_id: &str) -> Result<Vec<FleetAgent>> {
+    /// Load one task by node id from the read-only projection.
+    pub fn get_task(&self, id: &str) -> Result<Option<FleetTask>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         let conn = guard.connection();
-        AgentRepo::new(&conn)
+        TaskRepo::new(&conn).get(id).map_err(Into::into)
+    }
+
+    /// List agent configs for a task/node from the projection.
+    pub fn list_agents_for_task(&self, task_id: &str) -> Result<Vec<AgentConfigRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        AgentConfigRepo::new(&conn)
             .list_for_task(task_id)
             .map_err(Into::into)
+    }
+
+    pub fn list_agent_configs_for_task(&self, task_id: &str) -> Result<Vec<AgentConfigRow>> {
+        self.list_agents_for_task(task_id)
+    }
+
+    /// Load one agent config row (with latest run status) by id.
+    pub fn get_agent(&self, id: &str) -> Result<Option<AgentConfigRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentConfigRepo::new(&guard.connection())
+            .get(id)
+            .map_err(Into::into)
+    }
+
+    pub fn get_agent_config(&self, id: &str) -> Result<Option<AgentConfig>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentConfigRepo::new(&guard.connection())
+            .get_config(id)
+            .map_err(Into::into)
+    }
+
+    /// Shell sessions attached to an agent config's environment.
+    pub fn list_shells_for_config(&self, config_id: &str) -> Result<Vec<ShellSession>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ShellRepo::new(&guard.connection())
+            .list_for_agent(config_id)
+            .map_err(Into::into)
+    }
+
+    /// Agent runs for a config, newest first.
+    pub fn list_runs_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .list_for_config(config_id)
+            .map_err(Into::into)
+    }
+
+    /// List all fleet agent configs from the projection.
+    pub fn list_all_agents(&self) -> Result<Vec<AgentConfigRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentConfigRepo::new(&guard.connection())
+            .list_all()
+            .map_err(Into::into)
+    }
+
+    /// Read transcript turns for an agent run.
+    pub fn list_transcript_for_agent(&self, agent_run_id: &str) -> Result<Vec<TranscriptTurn>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        TranscriptRepo::new(&guard.connection())
+            .list_for_agent_run(agent_run_id)
+            .map_err(Into::into)
+    }
+
+    pub fn list_transcript_for_config(&self, agent_config_id: &str) -> Result<Vec<TranscriptTurn>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        TranscriptRepo::new(&guard.connection())
+            .list_for_config(agent_config_id)
+            .map_err(Into::into)
+    }
+
+    /// List all outline lists.
+    pub fn list_outline_lists(&self) -> Result<Vec<OutlineList>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ListRepo::new(&guard.connection())
+            .list_all()
+            .map_err(Into::into)
+    }
+
+    /// Flatten visible tree rows for a list.
+    pub fn flatten_outline(&self, list_id: uuid::Uuid) -> Result<Vec<FlatNodeRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        TreeLoader::new(&guard.connection())
+            .flatten_visible(list_id)
+            .map_err(Into::into)
+    }
+
+    /// Direct (non-inherited) obligation rows for a node.
+    pub fn list_obligations_for_node(&self, node_id: uuid::Uuid) -> Result<Vec<NodeObligation>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ObligationRepo::new(&guard.connection())
+            .list_for_node(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Direct requirement/constraint counts keyed by node for one outline list.
+    pub fn obligation_counts_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<HashMap<uuid::Uuid, ObligationCounts>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ObligationRepo::new(&guard.connection())
+            .counts_for_list(list_id)
+            .map_err(Into::into)
+    }
+
+    /// Enabled capabilities for a node.
+    pub fn list_node_capabilities(&self, node_id: uuid::Uuid) -> Result<Vec<Capability>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        NodeRepo::new(&guard.connection())
+            .list_capabilities(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Build JSON archive payload before disabling a capability.
+    pub fn build_capability_disable_payload(
+        &self,
+        node_id: uuid::Uuid,
+        cap: Capability,
+    ) -> Result<String> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        crate::outline::archive::build_capability_disable_payload(&guard.connection(), node_id, cap)
+            .map_err(Into::into)
+    }
+
+    /// Whether a list has an open reference-loop health issue.
+    pub fn list_has_reference_loop(&self, list_id: uuid::Uuid) -> Result<bool> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        TreeLoader::new(&guard.connection())
+            .list_has_open_loop(list_id)
+            .map_err(Into::into)
+    }
+
+    /// Enqueue an outline mutation.
+    pub fn enqueue_outline(&self, mutation: OutlineMutation) -> Result<(), FleetWriterError> {
+        self.enqueue(FleetMutation::Outline(mutation))
+    }
+
+    /// Bootstrap-import `doc/process` from `repo_root`.
+    pub fn import_doc_process(
+        &self,
+        repo_root: impl AsRef<std::path::Path>,
+    ) -> Result<(), FleetWriterError> {
+        self.enqueue_outline(OutlineMutation::ImportDocProcess {
+            repo_root: repo_root.as_ref().to_string_lossy().into_owned(),
+        })?;
+        self.writer.flush()
     }
 
     /// Reload projection if the on-disk store changed externally.
@@ -243,7 +503,7 @@ impl FleetStore {
         Ok(held.apply(&self.writer, fail_on_first)?)
     }
 
-    /// Seed fixture tasks when the store is empty (dev UX on first launch).
+    /// Seed fixture tasks when the store has no agent-capable nodes (dev UX).
     pub fn seed_tasks_if_empty(&self, tasks: &[FleetTask]) -> Result<()> {
         if self
             .projection

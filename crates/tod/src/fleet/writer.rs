@@ -1,10 +1,16 @@
+use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::fleet::repos::agent::{AgentRepo, NewAgent};
+use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
+use crate::fleet::repos::agent_run::AgentRunRepo;
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::repos::transcript::TranscriptRepo;
 use crate::fleet::schema;
+use crate::fleet::undo::{
+    capture_inverse_after_delete, capture_inverse_after_restore, capture_inverse_before,
+};
+use crate::outline::OutlineMutation;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -12,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 /// Default debounce interval for ordinary fleet mutations.
 pub const DEBOUNCE_INTERVAL: Duration = Duration::from_secs(2);
@@ -23,6 +30,10 @@ pub enum FleetMutation {
     UpdateTaskTitle {
         id: String,
         title: String,
+    },
+    UpdateTaskSlug {
+        id: String,
+        slug: String,
     },
     UpdateTaskNotes {
         id: String,
@@ -64,9 +75,22 @@ pub enum FleetMutation {
         id: String,
         worktree_path: Option<String>,
     },
+    UpdateAgentWorktreeDetails {
+        id: String,
+        worktree_path: Option<String>,
+        worktree_lease_id: Option<String>,
+        worktree_lease_holder: Option<String>,
+    },
     // --- Agent (immediate) ---
     InsertAgent {
-        agent: NewAgent,
+        agent: NewAgentConfig,
+    },
+    UpdateAgentConfig {
+        id: String,
+        env_type: String,
+        mode: String,
+        work_directory: Option<String>,
+        use_worktree: bool,
     },
     DeleteAgent {
         id: String,
@@ -81,6 +105,15 @@ pub enum FleetMutation {
     },
     ClearAgentReconnect {
         id: String,
+    },
+    CreateAgentRun {
+        config_id: String,
+    },
+    EndAgentRun {
+        run_id: String,
+    },
+    DeleteAgentRun {
+        run_id: String,
     },
     // --- Transcript (immediate) ---
     /// Paired: sent prompt + **processing**.
@@ -134,18 +167,55 @@ pub enum FleetMutation {
     ClearShellReconnect {
         id: String,
     },
+    // --- Outline (tree / lists) ---
+    Outline(OutlineMutation),
+    // --- Interview sessions (immediate) ---
+    InsertInterviewSession {
+        id: uuid::Uuid,
+        new_session: crate::fleet::repos::interview_session::NewInterviewSession,
+        status: String,
+        agent_config_id: Option<String>,
+    },
+    UpdateInterviewSessionScaffolding {
+        id: uuid::Uuid,
+        session_id: Option<String>,
+        scratchpad_path: Option<String>,
+    },
+    SetInterviewSessionStatus {
+        id: uuid::Uuid,
+        status: String,
+    },
+}
+
+fn resolve_or_create_run(conn: &Connection, config_id: &str) -> Result<String> {
+    let run_repo = AgentRunRepo::new(conn);
+    if let Some(run) = run_repo.latest_run(config_id)? {
+        if run.runtime_status != "not_running" {
+            return Ok(run.id);
+        }
+    }
+    run_repo
+        .create_run(config_id, "starting")
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 impl FleetMutation {
     pub fn is_immediate(&self) -> bool {
+        if let FleetMutation::Outline(m) = self {
+            return m.is_immediate();
+        }
         matches!(
             self,
             FleetMutation::DeleteTask { .. }
                 | FleetMutation::DeleteAgent { .. }
                 | FleetMutation::InsertAgent { .. }
+                | FleetMutation::UpdateAgentConfig { .. }
                 | FleetMutation::UpdateAgentRuntimeStatus { .. }
                 | FleetMutation::UpdateAgentReconnect { .. }
                 | FleetMutation::ClearAgentReconnect { .. }
+                | FleetMutation::CreateAgentRun { .. }
+                | FleetMutation::EndAgentRun { .. }
+                | FleetMutation::DeleteAgentRun { .. }
                 | FleetMutation::SendPrompt { .. }
                 | FleetMutation::CompleteResponse { .. }
                 | FleetMutation::InsertPromptTurn { .. }
@@ -156,13 +226,31 @@ impl FleetMutation {
                 | FleetMutation::CreateShellSession { .. }
                 | FleetMutation::DismissShellSession { .. }
                 | FleetMutation::ClearShellReconnect { .. }
+                | FleetMutation::InsertInterviewSession { .. }
+                | FleetMutation::UpdateInterviewSessionScaffolding { .. }
+                | FleetMutation::SetInterviewSessionStatus { .. }
         )
     }
 
-    fn execute(&self, conn: &Connection) -> Result<()> {
+    fn execute(&self, conn: &Connection, media_root: &Path) -> Result<()> {
+        self.execute_with_outcome(conn, media_root).map(|_| ())
+    }
+
+    fn execute_with_outcome(&self, conn: &Connection, media_root: &Path) -> Result<Option<Uuid>> {
+        if let FleetMutation::Outline(mutation) = self {
+            return mutation.execute(conn, media_root);
+        }
+        self.execute_inner(conn, media_root)?;
+        Ok(None)
+    }
+
+    fn execute_inner(&self, conn: &Connection, _media_root: &Path) -> Result<()> {
         match self {
             FleetMutation::UpdateTaskTitle { id, title } => {
                 TaskRepo::new(conn).update_title(id, title)?;
+            }
+            FleetMutation::UpdateTaskSlug { id, slug } => {
+                TaskRepo::new(conn).update_slug(id, slug)?;
             }
             FleetMutation::UpdateTaskNotes { id, notes } => {
                 TaskRepo::new(conn).update_notes(id, notes.as_deref())?;
@@ -192,29 +280,67 @@ impl FleetMutation {
                 TaskRepo::new(conn).delete(id)?;
             }
             FleetMutation::UpdateAgentWorktree { id, worktree_path } => {
-                AgentRepo::new(conn).update_worktree(id, worktree_path.as_deref())?;
+                AgentConfigRepo::new(conn).update_worktree(id, worktree_path.as_deref())?;
+            }
+            FleetMutation::UpdateAgentWorktreeDetails {
+                id,
+                worktree_path,
+                worktree_lease_id,
+                worktree_lease_holder,
+            } => {
+                AgentConfigRepo::new(conn).update_worktree_details(
+                    id,
+                    worktree_path.as_deref(),
+                    worktree_lease_id.as_deref(),
+                    worktree_lease_holder.as_deref(),
+                )?;
             }
             FleetMutation::InsertAgent { agent } => {
-                AgentRepo::new(conn).insert(agent)?;
+                AgentConfigRepo::new(conn).insert(agent)?;
+            }
+            FleetMutation::UpdateAgentConfig {
+                id,
+                env_type,
+                mode,
+                work_directory,
+                use_worktree,
+            } => {
+                AgentConfigRepo::new(conn).update_fields(
+                    id,
+                    env_type,
+                    mode,
+                    work_directory.as_deref(),
+                    *use_worktree,
+                )?;
             }
             FleetMutation::DeleteAgent { id } => {
-                AgentRepo::new(conn).delete_cascade(id)?;
+                AgentConfigRepo::new(conn).delete_cascade(id)?;
             }
             FleetMutation::UpdateAgentRuntimeStatus { id, runtime_status } => {
-                AgentRepo::new(conn).update_runtime_status(id, runtime_status)?;
+                AgentConfigRepo::new(conn).update_runtime_status(id, runtime_status)?;
             }
             FleetMutation::UpdateAgentReconnect { id, identity } => {
-                AgentRepo::new(conn).update_reconnect(id, *identity)?;
+                AgentConfigRepo::new(conn).update_reconnect(id, *identity)?;
             }
             FleetMutation::ClearAgentReconnect { id } => {
-                AgentRepo::new(conn).clear_reconnect(id)?;
+                AgentConfigRepo::new(conn).clear_reconnect(id)?;
+            }
+            FleetMutation::CreateAgentRun { config_id } => {
+                AgentRunRepo::new(conn).create_run(config_id, "starting")?;
+            }
+            FleetMutation::EndAgentRun { run_id } => {
+                AgentRunRepo::new(conn).end_run(run_id)?;
+            }
+            FleetMutation::DeleteAgentRun { run_id } => {
+                AgentRunRepo::new(conn).delete_run(run_id)?;
             }
             FleetMutation::SendPrompt {
                 id,
                 agent_id,
                 content,
             } => {
-                TranscriptRepo::new(conn).send_prompt(id, agent_id, content)?;
+                let run_id = resolve_or_create_run(conn, agent_id)?;
+                TranscriptRepo::new(conn).send_prompt(id, &run_id, content)?;
             }
             FleetMutation::CompleteResponse {
                 response_id,
@@ -222,9 +348,10 @@ impl FleetMutation {
                 content,
                 prompt_id,
             } => {
+                let run_id = resolve_or_create_run(conn, agent_id)?;
                 TranscriptRepo::new(conn).complete_response(
                     response_id,
-                    agent_id,
+                    &run_id,
                     content,
                     prompt_id,
                 )?;
@@ -234,10 +361,13 @@ impl FleetMutation {
                 agent_id,
                 content,
             } => {
-                TranscriptRepo::new(conn).insert_prompt(id, agent_id, content)?;
+                let run_id = resolve_or_create_run(conn, agent_id)?;
+                TranscriptRepo::new(conn).insert_prompt(id, &run_id, content)?;
             }
             FleetMutation::MarkAgentPromptsInterrupted { agent_id } => {
-                TranscriptRepo::new(conn).mark_incomplete_prompts_interrupted(agent_id)?;
+                if let Some(run) = AgentRunRepo::new(conn).latest_run(agent_id)? {
+                    TranscriptRepo::new(conn).mark_incomplete_prompts_interrupted(&run.id)?;
+                }
             }
             FleetMutation::CreateNotification {
                 id,
@@ -281,6 +411,44 @@ impl FleetMutation {
             FleetMutation::ClearShellReconnect { id } => {
                 ShellRepo::new(conn).clear_reconnect(id)?;
             }
+            FleetMutation::InsertInterviewSession {
+                id,
+                new_session,
+                status,
+                agent_config_id,
+            } => {
+                use crate::fleet::repos::interview_session::{
+                    InterviewSessionRepo, InterviewSessionStatus, NewInterviewSession,
+                };
+                let status = InterviewSessionStatus::from_str(status)?;
+                let session = NewInterviewSession {
+                    agent_config_id: agent_config_id
+                        .clone()
+                        .or(new_session.agent_config_id.clone()),
+                    ..new_session.clone()
+                };
+                InterviewSessionRepo::new(conn).insert_with_id(*id, session, status)?;
+            }
+            FleetMutation::UpdateInterviewSessionScaffolding {
+                id,
+                session_id,
+                scratchpad_path,
+            } => {
+                use crate::fleet::repos::interview_session::InterviewSessionRepo;
+                InterviewSessionRepo::new(conn).update_scaffolding(
+                    *id,
+                    session_id.as_deref(),
+                    scratchpad_path.as_deref(),
+                )?;
+            }
+            FleetMutation::SetInterviewSessionStatus { id, status } => {
+                use crate::fleet::repos::interview_session::{
+                    InterviewSessionRepo, InterviewSessionStatus,
+                };
+                let status = InterviewSessionStatus::from_str(status)?;
+                InterviewSessionRepo::new(conn).set_status(*id, status)?;
+            }
+            FleetMutation::Outline(_) => {}
         }
         Ok(())
     }
@@ -309,19 +477,30 @@ enum WriterCommand {
 /// Single in-process async writer with debounced and immediate flush paths.
 pub struct FleetWriter {
     db_path: PathBuf,
+    media_root: PathBuf,
     debounce: Duration,
     tx: mpsc::UnboundedSender<WriterCommand>,
     runtime: Arc<tokio::runtime::Runtime>,
     commit_notify: Arc<tokio::sync::Notify>,
+    command_log: Arc<Mutex<CommandLog>>,
 }
 
 impl FleetWriter {
     pub fn open(db_path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_debounce(db_path, DEBOUNCE_INTERVAL)
+        Self::open_with_debounce(db_path, DEBOUNCE_INTERVAL, CommandLog::shared())
     }
 
-    pub fn open_with_debounce(db_path: impl AsRef<Path>, debounce: Duration) -> Result<Self> {
+    pub fn open_with_debounce(
+        db_path: impl AsRef<Path>,
+        debounce: Duration,
+        command_log: Arc<Mutex<CommandLog>>,
+    ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
+        let media_root = db_path
+            .parent()
+            .map(|p| p.join("media"))
+            .unwrap_or_else(|| PathBuf::from("media"));
+        let _ = std::fs::create_dir_all(&media_root);
         let conn = Arc::new(Mutex::new(schema::open_writer_connection(&db_path)?));
         let (tx, rx) = mpsc::unbounded_channel();
         let commit_notify = Arc::new(tokio::sync::Notify::new());
@@ -335,9 +514,18 @@ impl FleetWriter {
         );
         let driver = runtime.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let media_for_loop = media_root.clone();
+        let log_for_loop = command_log.clone();
         std::thread::spawn(move || {
             let _ = ready_tx.send(());
-            driver.block_on(writer_loop(conn, rx, debounce, notify));
+            driver.block_on(writer_loop(
+                conn,
+                media_for_loop,
+                rx,
+                debounce,
+                notify,
+                log_for_loop,
+            ));
         });
         ready_rx
             .recv()
@@ -345,11 +533,17 @@ impl FleetWriter {
 
         Ok(Self {
             db_path,
+            media_root,
             debounce,
             tx,
             runtime,
             commit_notify,
+            command_log,
         })
+    }
+
+    pub fn command_log(&self) -> Arc<Mutex<CommandLog>> {
+        self.command_log.clone()
     }
 
     pub fn db_path(&self) -> &Path {
@@ -415,9 +609,11 @@ impl FleetWriter {
 
 async fn writer_loop(
     conn: Arc<Mutex<Connection>>,
+    media_root: PathBuf,
     mut rx: mpsc::UnboundedReceiver<WriterCommand>,
     debounce: Duration,
     commit_notify: Arc<tokio::sync::Notify>,
+    command_log: Arc<Mutex<CommandLog>>,
 ) {
     let mut pending: Vec<FleetMutation> = Vec::new();
     let mut debounce_deadline: Option<tokio::time::Instant> = None;
@@ -429,7 +625,12 @@ async fn writer_loop(
                 match cmd {
                     Some(WriterCommand::Mutation(mutation)) => {
                         if mutation.is_immediate() {
-                            if let Err(err) = flush_batch(&conn, std::slice::from_ref(&mutation)) {
+                            if let Err(err) = flush_batch(
+                                &conn,
+                                &media_root,
+                                std::slice::from_ref(&mutation),
+                                &command_log,
+                            ) {
                                 tracing::error!("fleet immediate write failed: {err:#}");
                             } else {
                                 commit_notify.notify_waiters();
@@ -444,7 +645,7 @@ async fn writer_loop(
                         let result = if had_pending {
                             let batch = std::mem::take(&mut pending);
                             debounce_deadline = None;
-                            flush_batch(&conn, &batch).map_err(Into::into)
+                            flush_batch(&conn, &media_root, &batch, &command_log).map_err(Into::into)
                         } else {
                             Ok(())
                         };
@@ -458,7 +659,7 @@ async fn writer_loop(
                         if !pending.is_empty() {
                             let batch = std::mem::take(&mut pending);
                             debounce_deadline = None;
-                            if let Err(err) = flush_batch(&conn, &batch) {
+                            if let Err(err) = flush_batch(&conn, &media_root, &batch, &command_log) {
                                 let _ = respond.send(Err(err));
                                 continue;
                             }
@@ -477,7 +678,7 @@ async fn writer_loop(
                     }
                     Some(WriterCommand::Shutdown) | None => {
                         if !pending.is_empty() {
-                            let _ = flush_batch(&conn, &pending);
+                            let _ = flush_batch(&conn, &media_root, &pending, &command_log);
                         }
                         break;
                     }
@@ -493,7 +694,7 @@ async fn writer_loop(
                 if !pending.is_empty() {
                     let batch = std::mem::take(&mut pending);
                     debounce_deadline = None;
-                    if let Err(err) = flush_batch(&conn, &batch) {
+                    if let Err(err) = flush_batch(&conn, &media_root, &batch, &command_log) {
                         tracing::error!("fleet debounced write failed: {err:#}");
                     } else {
                         commit_notify.notify_waiters();
@@ -504,12 +705,62 @@ async fn writer_loop(
     }
 }
 
-fn flush_batch(conn: &Arc<Mutex<Connection>>, batch: &[FleetMutation]) -> Result<()> {
+fn flush_batch(
+    conn: &Arc<Mutex<Connection>>,
+    media_root: &Path,
+    batch: &[FleetMutation],
+    command_log: &Arc<Mutex<CommandLog>>,
+) -> Result<()> {
     let guard = conn.lock().expect("fleet writer connection mutex");
     for mutation in batch {
+        let suppressed = command_log
+            .lock()
+            .expect("command log mutex")
+            .is_suppressed();
+        let pre_undo = if suppressed {
+            None
+        } else {
+            capture_inverse_before(&guard, mutation)?
+        };
+        let delete_root = match mutation {
+            FleetMutation::Outline(crate::outline::OutlineMutation::DeleteNode { node_id }) => {
+                Some(*node_id)
+            }
+            _ => None,
+        };
+        let restore_root = match mutation {
+            FleetMutation::Outline(crate::outline::OutlineMutation::RestoreNodeSubtree {
+                root_node_id,
+                ..
+            }) => Some(*root_node_id),
+            _ => None,
+        };
         let tx = guard.unchecked_transaction()?;
-        mutation.execute(&guard)?;
+        let archive_id = mutation.execute_with_outcome(&guard, media_root)?;
         tx.commit()?;
+        if suppressed {
+            continue;
+        }
+        if let Some(entry) = pre_undo {
+            command_log
+                .lock()
+                .expect("command log mutex")
+                .push(entry.label, entry.inverses);
+        } else if let (Some(archive_id), Some(root_id)) = (archive_id, delete_root) {
+            if let Some(entry) = capture_inverse_after_delete(&guard, archive_id, root_id)? {
+                command_log
+                    .lock()
+                    .expect("command log mutex")
+                    .push(entry.label, entry.inverses);
+            }
+        } else if let Some(root_id) = restore_root {
+            if let Some(entry) = capture_inverse_after_restore(&guard, root_id)? {
+                command_log
+                    .lock()
+                    .expect("command log mutex")
+                    .push(entry.label, entry.inverses);
+            }
+        }
     }
     Ok(())
 }
@@ -517,6 +768,7 @@ fn flush_batch(conn: &Arc<Mutex<Connection>>, batch: &[FleetMutation]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::command_log::CommandLog;
     use crate::fleet::repos::task::FleetTask;
     use rusqlite::OptionalExtension;
     use std::fs;
@@ -527,17 +779,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-fleet-writer-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
-        let writer =
-            FleetWriter::open_with_debounce(&path, Duration::from_millis(debounce_ms)).unwrap();
+        let writer = FleetWriter::open_with_debounce(
+            &path,
+            Duration::from_millis(debounce_ms),
+            CommandLog::shared(),
+        )
+        .unwrap();
         (dir, writer)
     }
 
     fn task_title(conn: &Connection, id: &str) -> Option<String> {
-        conn.query_row("SELECT title FROM tasks WHERE id = ?1", [id], |row| {
-            row.get(0)
-        })
+        conn.query_row(
+            "SELECT title FROM nodes WHERE id = ?1",
+            [uuid_to_blob_for_id(id)],
+            |row| row.get(0),
+        )
         .optional()
         .unwrap()
+    }
+
+    fn uuid_to_blob_for_id(id: &str) -> Vec<u8> {
+        uuid::Uuid::parse_str(id)
+            .map(|u| u.as_bytes().to_vec())
+            .unwrap_or_default()
     }
 
     #[test]

@@ -26,7 +26,7 @@ impl TaskListView {
             return false;
         }
 
-        let title = format!("Linear issue {ticket}");
+        let title = ticket.to_string();
         let id = format!("linear-{}", ticket.to_lowercase().replace('-', "_"));
         let task = super::TaskItem {
             id: id.clone(),
@@ -38,6 +38,14 @@ impl TaskListView {
             agents: vec![],
             shells: vec![],
             interaction_timestamp: chrono::Utc::now(),
+            tree_ordinal: 0,
+            depth: 0,
+            collapsed: false,
+            is_work_node: true,
+            has_spec: false,
+            requirement_count: 0,
+            constraint_count: 0,
+            has_children: false,
         };
         self.all_tasks.push(task);
         self.select_created_task(&id, window, cx);
@@ -73,6 +81,14 @@ impl TaskListView {
             agents: vec![],
             shells: vec![],
             interaction_timestamp: chrono::Utc::now(),
+            tree_ordinal: 0,
+            depth: 0,
+            collapsed: false,
+            is_work_node: true,
+            has_spec: false,
+            requirement_count: 0,
+            constraint_count: 0,
+            has_children: false,
         };
         self.all_tasks.push(task);
         self.select_created_task(&id, window, cx);

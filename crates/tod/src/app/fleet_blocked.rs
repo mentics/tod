@@ -3,12 +3,13 @@
 use crate::fleet::FleetLaunchError;
 use crate::interview::TodPaths;
 use crate::interview::settings::TodSettings;
+use crate::ui::selectable_text::selectable_text;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
     SharedString, Styled, Window, div, prelude::FluentBuilder,
 };
 use gpui_component::button::Button;
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
 use std::path::PathBuf;
 
@@ -41,7 +42,7 @@ impl FleetBlockedView {
                 .placeholder("Fleet storage root path")
         });
         let _input_subscription = cx.subscribe(&root_input, |this, input, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.save_root(input.read(cx).value().to_string(), cx);
             }
         });
@@ -100,7 +101,7 @@ impl Focusable for FleetBlockedView {
 }
 
 impl Render for FleetBlockedView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let border = theme.border;
         let muted = theme.muted_foreground;
@@ -131,10 +132,10 @@ impl Render for FleetBlockedView {
                         .border_b_1()
                         .border_color(border)
                         .child(
-                            div()
+                            selectable_text("fleet-blocked-error", self.error_message.clone(), window, cx)
                                 .text_sm()
-                                .whitespace_normal()
-                                .child(self.error_message.clone()),
+                                .text_color(gpui::white())
+                                .whitespace_normal(),
                         )
                         .child(
                             Button::new("fleet-blocked-dismiss")
@@ -168,15 +169,17 @@ impl Render for FleetBlockedView {
                             ),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!(
-                                "Current resolved path: {}",
-                                self.resolved_root.display()
-                            )),
+                        selectable_text(
+                            "fleet-blocked-resolved-path",
+                            format!("Current resolved path: {}", self.resolved_root.display()),
+                            window,
+                            cx,
+                        )
+                        .text_xs()
+                        .text_color(muted)
+                        .whitespace_normal(),
                     )
-                    .child(self.root_input.clone())
+                    .child(Input::new(&self.root_input).w_full())
                     .child(
                         Button::new("fleet-blocked-save")
                             .label("Save storage root")
@@ -187,11 +190,10 @@ impl Render for FleetBlockedView {
                     )
                     .when(!self.status_line.is_empty(), |el| {
                         el.child(
-                            div()
+                            selectable_text("fleet-blocked-status", self.status_line.clone(), window, cx)
                                 .text_sm()
                                 .text_color(foreground)
-                                .whitespace_normal()
-                                .child(self.status_line.clone()),
+                                .whitespace_normal(),
                         )
                     })
                     .child(

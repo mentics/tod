@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use crate::interview::{
-    InterviewSession, InterviewSessionStatus, SessionStore, TodPaths,
-    config::{base_interview_phase, parse_interview_config, path_for_storage, paths_match},
+    InterviewSession, InterviewSessionStatus, SessionStore,
+    config::{base_interview_phase, parse_interview_config},
     queue::load_queue_dir,
 };
 use crate::process::interview_phase_for_lifecycle;
@@ -17,29 +17,40 @@ pub struct TaskListProceedContext {
 
 /// True when lifecycle next for **proposed / design / planning** should open the
 /// interview rather than the lifecycle transition panel.
-pub fn interview_work_remains(entity_path: &Path, lifecycle: &str) -> bool {
+pub fn interview_work_remains(node_id: Uuid, lifecycle: &str) -> bool {
     let Some(phase) = interview_phase_for_lifecycle(lifecycle) else {
         return false;
     };
-    let Ok(paths) = TodPaths::discover() else {
+    let Ok(paths) = crate::interview::TodPaths::discover() else {
         return true;
     };
-    let Ok(store) = SessionStore::open(&paths) else {
+    let Ok(settings) = crate::interview::TodSettings::load(&paths) else {
         return true;
     };
-    let Ok(sessions) = store.list_sessions() else {
+    let Ok(root) = settings.resolve_fleet_storage_root(&paths) else {
         return true;
     };
+    let Ok(fleet) = crate::fleet::FleetStore::open(root) else {
+        return true;
+    };
+    let fleet = std::sync::Arc::new(fleet);
+    let store = SessionStore::open(fleet);
+    interview_work_remains_with_store(&store, node_id, phase)
+}
 
-    let entity_path = entity_path
-        .canonicalize()
-        .unwrap_or_else(|_| entity_path.to_path_buf());
-    let storage_key = path_for_storage(&entity_path);
+pub fn interview_work_remains_with_store(
+    store: &SessionStore,
+    node_id: Uuid,
+    phase: &str,
+) -> bool {
     let wanted_base = base_interview_phase(phase);
+    let Ok(sessions) = store.list_for_node(node_id) else {
+        return true;
+    };
 
     let matches: Vec<&InterviewSession> = sessions
         .iter()
-        .filter(|s| session_matches_entity_phase(s, &storage_key, &entity_path, wanted_base))
+        .filter(|s| base_interview_phase(&s.phase) == wanted_base)
         .collect();
 
     if matches.is_empty() {
@@ -63,48 +74,22 @@ pub fn interview_work_remains(entity_path: &Path, lifecycle: &str) -> bool {
     false
 }
 
-fn entity_paths_equal(stored: &str, storage_key: &str, entity_path: &Path) -> bool {
-    let stored_path = PathBuf::from(stored);
-    stored.eq_ignore_ascii_case(storage_key) || paths_match(&stored_path, entity_path)
-}
-
-fn session_matches_entity_phase(
-    session: &InterviewSession,
-    storage_key: &str,
-    entity_path: &Path,
-    wanted_base: &str,
-) -> bool {
-    let Some(stored) = session.entity_path.as_deref() else {
-        return false;
-    };
-    if !entity_paths_equal(stored, storage_key, entity_path) {
-        return false;
-    }
-    let session_base = session
-        .phase
-        .as_deref()
-        .map(base_interview_phase)
-        .unwrap_or("");
-    wanted_base.is_empty() || session_base == wanted_base
-}
-
 fn session_needs_bootstrap(session: &InterviewSession) -> bool {
     !session
-        .config_path
+        .scratchpad_path
         .as_ref()
-        .is_some_and(|p| Path::new(p).exists())
+        .is_some_and(|p| std::path::Path::new(p).join("interview-config.md").exists())
 }
 
 fn session_open_question_count(session: &InterviewSession) -> usize {
-    let Some(cfg_path) = session
-        .config_path
-        .as_ref()
-        .map(Path::new)
-        .filter(|p| p.exists())
-    else {
+    let Some(scratch) = session.scratchpad_path.as_ref() else {
         return 0;
     };
-    let Ok(config) = parse_interview_config(cfg_path) else {
+    let config_path = std::path::Path::new(scratch).join("interview-config.md");
+    if !config_path.exists() {
+        return 0;
+    }
+    let Ok(config) = parse_interview_config(&config_path) else {
         return 0;
     };
     load_queue_dir(&config.queue).map(|q| q.len()).unwrap_or(0)
@@ -113,66 +98,72 @@ fn session_open_question_count(session: &InterviewSession) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interview::{
-        NewInterviewSession, config::path_for_storage, paths::clear_data_root_override,
-        set_data_root,
-    };
+    use crate::fleet::FleetStore;
+    use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
+    use crate::outline::OutlineMutation;
     use std::fs;
 
-    fn temp_repo(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "tod-interview-routing-{}-{}",
-            label,
-            uuid::Uuid::new_v4()
-        ));
-        let _ = fs::remove_dir_all(&root);
+    fn test_node() -> (PathBuf, std::sync::Arc<FleetStore>, Uuid) {
+        let root = std::env::temp_dir().join(format!("tod-route-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        set_data_root(root.clone());
-        root
+        let fleet = std::sync::Arc::new(FleetStore::open(&root).unwrap());
+        fleet
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: "t".into(),
+                title: "T".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: crate::outline::CreatePosition::Below,
+                title: "N".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet.reload_if_stale().unwrap();
+        let node_id = fleet.flatten_outline(list_id).unwrap()[0].node.id;
+        (root, fleet, node_id)
     }
+
+    use std::path::PathBuf;
 
     #[test]
     fn no_session_means_work_remains() {
-        let root = temp_repo("no-session");
-        let entity = root
-            .join("doc")
-            .join("process")
-            .join("projects")
-            .join("p")
-            .join("tasks")
-            .join("t");
-        fs::create_dir_all(&entity).unwrap();
-        assert!(interview_work_remains(&entity, "proposed"));
-        let _ = fs::remove_dir_all(&root);
-        clear_data_root_override();
+        let (_root, fleet, node_id) = test_node();
+        let store = SessionStore::open(fleet);
+        assert!(interview_work_remains_with_store(
+            &store,
+            node_id,
+            "task-requirements-interview"
+        ));
     }
 
     #[test]
     fn complete_session_means_no_work_remains() {
-        let root = temp_repo("complete");
-        let entity = root
-            .join("doc")
-            .join("process")
-            .join("projects")
-            .join("p")
-            .join("tasks")
-            .join("t");
-        fs::create_dir_all(&entity).unwrap();
-        let paths = TodPaths::from_repo_root(root.clone());
-        let store = SessionStore::open(&paths).unwrap();
-        let session = store
+        let (_root, fleet, node_id) = test_node();
+        let store = SessionStore::open(fleet.clone());
+        store
             .insert_session_with_metadata(
                 NewInterviewSession {
-                    display_name: "T — Task requirements".into(),
-                    entity_path: path_for_storage(&entity),
+                    node_id,
+                    agent_config_id: None,
+                    display_name: "T".into(),
                     phase: "task-requirements-interview".into(),
                 },
                 InterviewSessionStatus::Complete,
+                None,
             )
             .unwrap();
-        assert_eq!(session.status, InterviewSessionStatus::Complete);
-        assert!(!interview_work_remains(&entity, "proposed"));
-        let _ = fs::remove_dir_all(&root);
-        clear_data_root_override();
+        assert!(!interview_work_remains_with_store(
+            &store,
+            node_id,
+            "task-requirements-interview"
+        ));
     }
 }
