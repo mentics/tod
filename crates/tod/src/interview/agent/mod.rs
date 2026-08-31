@@ -13,7 +13,7 @@ pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;
 pub use provider::{AgentProvider, AgentRunState, DeepDiveContext, RunId};
 
-use crate::agent_traffic::SharedAgentTrafficLog;
+use tod_store::agent_traffic::SharedAgentTrafficLog;
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;

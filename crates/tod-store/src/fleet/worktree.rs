@@ -1,7 +1,7 @@
 //! Git worktree and Treehouse provisioning for agent workspaces.
 
-use crate::interview::config::path_for_storage;
-use crate::interview::settings::WorktreeBackend;
+use crate::path_util::path_for_storage;
+use crate::settings::WorktreeBackend;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -440,7 +440,7 @@ mod tests {
         use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
         use crate::fleet::repos::task::{FleetTask, TaskRepo};
         use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
-        use crate::interview::settings::WorktreeBackend;
+        use crate::settings::WorktreeBackend;
         use uuid::Uuid;
 
         let git_repo = init_temp_repo();

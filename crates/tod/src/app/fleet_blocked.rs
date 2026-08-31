@@ -1,6 +1,6 @@
 //! Minimal UI when fleet storage blocks launch (user.md reqs 12–14).
 
-use crate::fleet::FleetLaunchError;
+use tod_store::fleet::FleetLaunchError;
 use crate::interview::TodPaths;
 use crate::interview::settings::TodSettings;
 use crate::ui::selectable_text::selectable_text;
@@ -68,7 +68,7 @@ impl FleetBlockedView {
             return;
         }
         let path = PathBuf::from(trimmed);
-        match crate::fleet::paths::normalize_absolute(&path) {
+        match tod_store::fleet::paths::normalize_absolute(&path) {
             Ok(normalized) => {
                 self.settings.fleet_storage_root = Some(normalized);
             }

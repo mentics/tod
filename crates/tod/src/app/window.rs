@@ -5,19 +5,20 @@ use super::no_focus;
 #[cfg(feature = "agent-socket")]
 use crate::agent_socket;
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
-use crate::agent_traffic::{
+use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
 use crate::app::history_window::HistoryWindowControl;
 use crate::app::interactive_agent_window::InteractiveAgentWindowControl;
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
-use crate::fleet::{
+use tod_store::fleet::{
     FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
 };
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
+use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
 use crate::process::{interview_phase_for_lifecycle, interview_phase_label};
 use crate::ui::actionable::chrome_control_with_shortcut_in_context;
 use crate::ui::app_nav::{
@@ -908,7 +909,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
 
     let fleet_open = open_fleet_store(traffic_log.clone());
     let restore_always_on_top = app_settings.always_on_top;
-    let window_bounds = app_settings.resolve_open_window_bounds(
+    let window_bounds = resolve_open_window_bounds(
+        &app_settings,
         width,
         height,
         opts.width_from_cli,
@@ -968,7 +970,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 let history_for_close = history_window.clone();
                 let interactive_for_close = interactive_agent_window.clone();
                 window.on_window_should_close(cx, move |window, cx| {
-                    TodSettings::persist_window_geometry(window, &paths_for_geometry);
+                    persist_window_geometry(window, &paths_for_geometry);
                     transcript_for_close.close(cx);
                     history_for_close.close(cx);
                     interactive_for_close.close_all(cx);

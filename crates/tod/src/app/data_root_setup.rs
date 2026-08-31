@@ -77,7 +77,7 @@ impl DataRootSetupView {
             return;
         }
         let path = PathBuf::from(trimmed);
-        let normalized = match crate::fleet::paths::normalize_absolute(&path) {
+        let normalized = match tod_store::fleet::paths::normalize_absolute(&path) {
             Ok(path) => path,
             Err(err) => {
                 self.status_line = SharedString::from(format!("Invalid path: {err:#}"));

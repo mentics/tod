@@ -2,8 +2,8 @@
 
 mod delegate;
 
-use crate::fleet::FleetStore;
-use crate::outline::{
+use tod_store::fleet::FleetStore;
+use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
 };
 use crate::ui::actionable::chrome_control_with_shortcut;

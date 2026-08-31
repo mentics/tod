@@ -1,7 +1,7 @@
 //! Single-instance agent transcript window — open, focus, close.
 
-use crate::agent_traffic::SharedAgentTrafficLog;
-use crate::fleet::FleetStore;
+use tod_store::agent_traffic::SharedAgentTrafficLog;
+use tod_store::fleet::FleetStore;
 use crate::views::agent_transcripts::AgentTranscriptsView;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, WindowBounds, WindowOptions, point, px, size,

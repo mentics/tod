@@ -1,6 +1,6 @@
 //! Migrate legacy interview SQLite sessions into fleet `interview_sessions`.
 
-use crate::interview::paths::TodPaths;
+use crate::paths::TodPaths;
 use crate::outline::repos::NodeRepo;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 use anyhow::{Context, Result};

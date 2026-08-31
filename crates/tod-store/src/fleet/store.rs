@@ -112,7 +112,7 @@ impl FleetStore {
         };
 
         store.run_launch_hooks(guest)?;
-        if let Ok(paths) = crate::interview::TodPaths::discover() {
+        if let Ok(paths) = crate::paths::TodPaths::discover() {
             let projection = store.projection.lock().expect("fleet projection mutex");
             let conn = projection.connection();
             let _ =

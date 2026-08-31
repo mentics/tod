@@ -2,12 +2,12 @@
 
 use super::install::TodInstallPaths;
 use super::manifest::ProcessManifest;
-use crate::fleet::repos::agent_config::AgentConfigRepo;
-use crate::fleet::workspace_cwd_for_agent;
+use tod_store::fleet::repos::agent_config::AgentConfigRepo;
+use tod_store::fleet::workspace_cwd_for_agent;
 use crate::interview::agent::DeepDiveContext;
 use crate::interview::config::{base_interview_phase, path_for_storage};
 use crate::interview::db::InterviewSession;
-use crate::outline::repos::NodeRepo;
+use tod_store::outline::repos::NodeRepo;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -434,7 +434,7 @@ pub fn build_deep_dive_prompt(
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
 pub fn build_fleet_agent_prompt(
     manifest: &ProcessManifest,
-    task: &crate::fleet::repos::task::FleetTask,
+    task: &tod_store::fleet::repos::task::FleetTask,
     config_id: &str,
     cwd: &Path,
 ) -> Result<String> {

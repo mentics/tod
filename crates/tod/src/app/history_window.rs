@@ -1,6 +1,6 @@
 //! Single-instance command history window — open, focus, close.
 
-use crate::fleet::FleetStore;
+use tod_store::fleet::FleetStore;
 use crate::views::command_history::CommandHistoryView;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, WindowBounds, WindowOptions, point, px, size,

@@ -112,16 +112,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub fn path_for_storage(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    #[cfg(windows)]
-    {
-        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-            return stripped.to_string();
-        }
-    }
-    raw.into_owned()
-}
+pub use tod_store::path_for_storage;
 
 pub fn agent_scratchpad_for_node(data_root: &Path, node_id: Uuid) -> PathBuf {
     node_scratchpad_root(data_root, node_id)
@@ -294,10 +285,10 @@ fn system_time_to_utc(time: SystemTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::FleetStore;
+    use tod_store::fleet::FleetStore;
     use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
     use crate::interview::paths::TodPaths;
-    use crate::outline::OutlineMutation;
+    use tod_store::outline::OutlineMutation;
     use std::fs;
 
     fn test_fleet() -> (PathBuf, std::sync::Arc<FleetStore>, Uuid) {
@@ -318,7 +309,7 @@ mod tests {
                 list_id,
                 parent_id: None,
                 anchor_id: None,
-                position: crate::outline::CreatePosition::Below,
+                position: tod_store::outline::CreatePosition::Below,
                 title: "Node".into(),
             })
             .unwrap();

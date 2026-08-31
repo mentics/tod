@@ -1,5 +1,5 @@
-use crate::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
-use crate::outline::{Capability, OutlineMutation};
+use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::outline::{Capability, OutlineMutation};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::toast::{confirm_toast, error_toast};
@@ -357,11 +357,11 @@ impl TaskEditView {
         };
         self.obligation_requirements = obligations
             .iter()
-            .filter(|o| o.kind == crate::outline::repos::obligations::KIND_REQUIREMENT)
+            .filter(|o| o.kind == tod_store::outline::repos::obligations::KIND_REQUIREMENT)
             .count();
         self.obligation_constraints = obligations
             .iter()
-            .filter(|o| o.kind == crate::outline::repos::obligations::KIND_CONSTRAINT)
+            .filter(|o| o.kind == tod_store::outline::repos::obligations::KIND_CONSTRAINT)
             .count();
     }
 

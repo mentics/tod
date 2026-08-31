@@ -1,4 +1,4 @@
-use crate::fleet::default_terminal_hint;
+use tod_store::fleet::default_terminal_hint;
 use crate::interview::TodPaths;
 use crate::interview::agent::AgentPlatform;
 use crate::interview::settings::{

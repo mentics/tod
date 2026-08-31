@@ -1,4 +1,4 @@
-use crate::fleet::{FleetStore, explore};
+use tod_store::fleet::{FleetStore, explore};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;

@@ -1,8 +1,8 @@
 //! Command history window — view and undo recent mutations.
 
 use crate::app::HistoryWindowControl;
-use crate::fleet::FleetStore;
-use crate::fleet::command_log::CommandEntry;
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::command_log::CommandEntry;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::selectable_text::selectable_text;

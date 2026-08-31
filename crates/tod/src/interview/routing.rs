@@ -30,7 +30,7 @@ pub fn interview_work_remains(node_id: Uuid, lifecycle: &str) -> bool {
     let Ok(root) = settings.resolve_fleet_storage_root(&paths) else {
         return true;
     };
-    let Ok(fleet) = crate::fleet::FleetStore::open(root) else {
+    let Ok(fleet) = tod_store::fleet::FleetStore::open(root) else {
         return true;
     };
     let fleet = std::sync::Arc::new(fleet);
@@ -98,9 +98,9 @@ fn session_open_question_count(session: &InterviewSession) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::FleetStore;
+    use tod_store::fleet::FleetStore;
     use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
-    use crate::outline::OutlineMutation;
+    use tod_store::outline::OutlineMutation;
     use std::fs;
 
     fn test_node() -> (PathBuf, std::sync::Arc<FleetStore>, Uuid) {
@@ -121,7 +121,7 @@ mod tests {
                 list_id,
                 parent_id: None,
                 anchor_id: None,
-                position: crate::outline::CreatePosition::Below,
+                position: tod_store::outline::CreatePosition::Below,
                 title: "N".into(),
             })
             .unwrap();
