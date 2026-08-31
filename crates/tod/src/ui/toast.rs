@@ -29,7 +29,7 @@ pub fn confirm_toast(
             .title(title)
             .autohide(false)
             .id::<ConfirmToast>()
-            .content(move |note, window, cx| {
+            .content(move |_note, _window, cx| {
                 let on_yes = on_yes.clone();
                 let on_no = on_no.clone();
                 h_flex()

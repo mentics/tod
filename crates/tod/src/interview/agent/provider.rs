@@ -1,7 +1,7 @@
 use tod_store::agent_traffic::InterviewAgentCounts;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::process_bundle::InterviewAgentPrompt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub use super::answer_pool::AnswerProcessorPoolStats;
@@ -39,8 +39,6 @@ pub enum AgentRunState {
 #[derive(Debug, Clone)]
 pub struct AgentRunHandle {
     pub id: RunId,
-    pub kind: AgentRunKind,
-    pub state: AgentRunState,
 }
 
 #[derive(Debug, Clone)]
@@ -71,13 +69,6 @@ pub trait AgentProvider {
         prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
     ) -> anyhow::Result<AgentRunHandle>;
-
-    /// Pool visibility for the interview workspace status footer.
-    fn answer_processor_pool_stats(
-        &self,
-        agent_config_id: &str,
-        pool: &AnswerProcessorSettings,
-    ) -> AnswerProcessorPoolStats;
 
     fn start_deep_dive_chat(
         &mut self,

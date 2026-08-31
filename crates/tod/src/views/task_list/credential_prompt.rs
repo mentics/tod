@@ -1,6 +1,6 @@
 use gpui::{Context, ParentElement, Styled, Window, div, px};
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::Input;
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
 use tod_store::CredentialKind;
 
@@ -173,7 +173,7 @@ impl TaskListView {
         api_key: &str,
         ticket: &str,
         draft_node_id: Option<&str>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let draft_node_id = draft_node_id.map(str::to_string);

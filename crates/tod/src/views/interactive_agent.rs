@@ -89,7 +89,7 @@ impl InteractiveAgentView {
             }
         });
 
-        let mut view = Self {
+        let view = Self {
             task_id,
             config_id,
             session_run_id,

@@ -10,7 +10,7 @@ mod row_menu;
 mod working_set;
 
 pub use model::TaskItem;
-pub use model::{ListWorkingSet, SortKey};
+pub use model::SortKey;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ use crate::ui::selectable_text::selectable_text;
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     KeyBinding, ParentElement, Render, Styled, Subscription, Timer, Window, actions, div,
     prelude::FluentBuilder, px,
 };
@@ -1836,7 +1836,7 @@ impl TaskListView {
         let list_title = self.active_list_title();
         let list_count = self.outline_lists.len();
 
-        let mut row = div()
+        let row = div()
             .h_flex()
             .items_center()
             .gap_2()
@@ -2106,7 +2106,7 @@ impl Render for TaskListView {
             BodyState::List => body.child(self.list_view.render(window, cx)),
         };
 
-        let mut root = div()
+        let root = div()
             .key_context(TASK_LIST_CONTEXT)
             .track_focus(&self.focus_handle)
             .v_flex()

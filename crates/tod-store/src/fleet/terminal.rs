@@ -1,6 +1,6 @@
 //! OS terminal launcher for agent shell sessions.
 
-use crate::fleet::reconnect_identity::{self, ReconnectIdentity};
+use crate::fleet::reconnect_identity::{self};
 use crate::fleet::{FleetMutation, FleetStore, resolve_agent_workspace};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
@@ -190,6 +190,7 @@ fn command_available(name: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }

@@ -7,8 +7,7 @@ use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAs
 use tod_store::agent_traffic::{
     AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
 };
-use crate::interview::TodPaths;
-use crate::interview::config::{agent_scratchpad_for_node, path_for_storage};
+use crate::interview::config::path_for_storage;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::interview::transcript::new_transcript_filename;
 use crate::process_bundle::InterviewAgentPrompt;

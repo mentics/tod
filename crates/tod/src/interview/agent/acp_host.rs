@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 pub use tod_store::AgentPlatform;
 
+#[cfg(test)]
 pub fn agent_platform_acp_host(platform: AgentPlatform) -> AcpHost {
     match platform {
         AgentPlatform::Cursor => AcpHost::Cursor,
@@ -137,7 +138,7 @@ fn resolve_claude_bin() -> Result<PathBuf> {
         }
     } else if let Ok(home) = std::env::var("HOME") {
         candidates.push(
-            PathBuf::from(home)
+            PathBuf::from(&home)
                 .join(".local")
                 .join("bin")
                 .join("claude"),
@@ -147,7 +148,7 @@ fn resolve_claude_bin() -> Result<PathBuf> {
             candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
             candidates.push(PathBuf::from("/usr/local/bin/claude"));
             candidates.push(
-                PathBuf::from(home)
+                PathBuf::from(&home)
                     .join(".claude")
                     .join("local")
                     .join("bin")
@@ -172,9 +173,6 @@ fn resolve_claude_bin() -> Result<PathBuf> {
 /// Spawn `host acp` (or `cmd /C host.cmd acp` on Windows).
 pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
-
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
 
     let subcommand = host.spawn_subcommand();
     let mut command = if agent_bin

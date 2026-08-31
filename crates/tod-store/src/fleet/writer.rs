@@ -235,10 +235,6 @@ impl FleetMutation {
         )
     }
 
-    fn execute(&self, conn: &Connection, media_root: &Path) -> Result<()> {
-        self.execute_with_outcome(conn, media_root).map(|_| ())
-    }
-
     fn execute_with_outcome(&self, conn: &Connection, media_root: &Path) -> Result<Option<Uuid>> {
         if let FleetMutation::Outline(mutation) = self {
             return mutation.execute(conn, media_root);
@@ -492,8 +488,6 @@ enum WriterCommand {
 /// Single in-process async writer with debounced and immediate flush paths.
 pub struct FleetWriter {
     db_path: PathBuf,
-    media_root: PathBuf,
-    debounce: Duration,
     tx: mpsc::UnboundedSender<WriterCommand>,
     runtime: Arc<tokio::runtime::Runtime>,
     commit_notify: Arc<tokio::sync::Notify>,
@@ -548,8 +542,6 @@ impl FleetWriter {
 
         Ok(Self {
             db_path,
-            media_root,
-            debounce,
             tx,
             runtime,
             commit_notify,

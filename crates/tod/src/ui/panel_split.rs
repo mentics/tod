@@ -7,8 +7,7 @@
 use gpui::{
     App, AppContext, Bounds, Context, Element, ElementId, Empty, Entity, GlobalElementId,
     InteractiveElement, IntoElement, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
-    RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div,
-    prelude::FluentBuilder, px,
+    RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, px,
 };
 use gpui_component::{ActiveTheme, h_flex};
 
@@ -93,7 +92,7 @@ impl HPanelSplit {
 }
 
 impl RenderOnce for HPanelSplit {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = self.state.clone();
         let min_left = self.min_left;
         let min_right = self.min_right;

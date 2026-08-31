@@ -8,7 +8,7 @@ use crate::settings::TodSettings;
 use crate::paths::TodPaths;
 use crate::path_util::path_for_storage;
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]

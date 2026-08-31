@@ -3,7 +3,7 @@
 use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::types::{Capability, NodeKind};
-use crate::outline::uuid_blob::{blob_to_uuid, uuid_to_blob};
+use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::HashSet;

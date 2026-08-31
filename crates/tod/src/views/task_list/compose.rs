@@ -1,6 +1,6 @@
 use gpui::{Context, ParentElement, Styled, Window, div};
 use gpui_component::ActiveTheme;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::Input;
 
 use super::TaskListView;
 use super::from_ticket::{TicketImportResult, parse_ticket_reference};

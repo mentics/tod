@@ -310,7 +310,7 @@ fn send_click_windows(
     logical_width: u32,
     logical_height: u32,
 ) -> Result<(), String> {
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::Foundation::WPARAM;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     };

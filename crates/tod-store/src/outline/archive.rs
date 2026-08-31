@@ -1,8 +1,8 @@
 //! Archive snapshots for subtree delete / restore.
 
 use crate::outline::repos::{NodeRepo, OutlineRepo};
-use crate::outline::types::{Capability, NodeKind, OutlineEntry};
-use crate::outline::uuid_blob::{blob_to_uuid_sql, ms_to_datetime, now_ms, uuid_to_blob};
+use crate::outline::types::Capability;
+use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};

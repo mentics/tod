@@ -23,7 +23,6 @@ use gpui::*;
 
 pub use history_window::HistoryWindowControl;
 pub use interactive_agent_window::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
-pub use transcript_window::TranscriptWindowControl;
 pub use window::{open, open_data_root_setup};
 
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
@@ -45,7 +44,7 @@ pub(crate) fn launch_main_application(
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
     crate::init_logging(&opts)?;
-    cx.update(|app| register_main_keyboard_bindings(app));
+    let _ = cx.update(|app| register_main_keyboard_bindings(app));
     open(cx, opts)
 }
 

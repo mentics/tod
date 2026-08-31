@@ -1,6 +1,5 @@
 //! Git worktree and Treehouse provisioning for agent workspaces.
 
-use crate::path_util::path_for_storage;
 use crate::settings::WorktreeBackend;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -21,6 +20,7 @@ fn path_for_git(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(test)]
 fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
+    Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -11,7 +11,7 @@ use gpui_component::input::InputState;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
 use gpui_component::menu::PopupMenu;
 use gpui_component::tag::Tag;
-use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
 use super::model::TaskItem;
 use super::row_menu::{RowMenuKind, row_menu_anchor};
@@ -472,7 +472,7 @@ fn action_chip(
 fn tag_chip(
     cx: &mut Context<ListState<TaskListDelegate>>,
     tag: String,
-    active: bool,
+    _active: bool,
     badge: Option<String>,
     on_click: impl Fn() + 'static,
 ) -> impl gpui::IntoElement {

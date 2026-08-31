@@ -2,7 +2,7 @@
 
 use tod_store::outline::resolve::{resolve_obligations, ResolvedObligation};
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
+use tod_store::outline::uuid_blob::uuid_to_blob;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::fs;

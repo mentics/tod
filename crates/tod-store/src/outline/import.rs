@@ -5,10 +5,10 @@ use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 use crate::fleet::repos::agent_config::AgentConfigRepo;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rusqlite::Connection;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 pub struct ImportReport {

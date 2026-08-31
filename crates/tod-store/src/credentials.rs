@@ -394,14 +394,14 @@ fn machine_derived_key() -> Result<[u8; 32], String> {
 fn machine_id() -> Option<String> {
     #[cfg(windows)]
     {
-        return std::env::var("COMPUTERNAME").ok();
+        std::env::var("COMPUTERNAME").ok()
     }
     #[cfg(target_os = "linux")]
     {
-        return fs::read_to_string("/etc/machine-id")
+        fs::read_to_string("/etc/machine-id")
             .ok()
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
     }
     #[cfg(target_os = "macos")]
     {
@@ -417,8 +417,12 @@ fn machine_id() -> Option<String> {
                 }
             }
         }
+        None
     }
-    None
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {

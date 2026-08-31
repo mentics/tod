@@ -2,7 +2,6 @@ use super::provider::{AgentRunState, RunId};
 use crate::interview::settings::QuestionMakerSettings;
 use crate::process_bundle::InterviewAgentPrompt;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
 
 /// Max concurrent question maker ACP sessions per interview workspace.
 pub const RESEARCHER_SESSION_POOL_SIZE: u32 = 2;
@@ -33,7 +32,7 @@ struct QuestionMakerPool {
 #[derive(Debug, Clone)]
 pub enum QuestionMakerSubmitAssignment {
     Dispatch { slot_id: u32, prompt: String },
-    Queued { prompt: InterviewAgentPrompt },
+    Queued { _prompt: InterviewAgentPrompt },
 }
 
 /// Outcome after a question maker response is processed.

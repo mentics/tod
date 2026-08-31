@@ -7,7 +7,6 @@ mod question_maker_pool;
 
 pub use acp_host::{AcpHost, AgentPlatform};
 
-pub use answer_pool::AnswerProcessorPoolStats;
 
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;

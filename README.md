@@ -18,6 +18,12 @@ cargo run
 
 This builds the `tod` binary (`crates/tod`) with the **agent-socket** feature enabled (default) and opens a desktop application window.
 
+### Cross-platform compilation
+
+CI runs `cargo check --workspace --all-targets` on **Ubuntu, Windows, and macOS** for every push and pull request (see `.github/workflows/ci.yml`). Platform-specific code behind `#[cfg(target_os = "...")]` is only type-checked on the matching OS, so a change that compiles on one machine can still fail on another until CI (or a local build on that OS) runs.
+
+When editing `cfg`-gated paths, prefer borrowing shared values (e.g. `PathBuf::from(&home)`) instead of moving them into the first use if a later branch may need the same value.
+
 ### Release build (no agent control socket)
 
 Release binaries exclude the TCP control socket used for UI automation — that code is not compiled in at all:

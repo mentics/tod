@@ -3162,7 +3162,7 @@ fn response_column(
         WorkspaceFocus::Response(i) => Some(i),
         WorkspaceFocus::QuestionList => None,
     };
-    let mut col = v_flex()
+    let col = v_flex()
         .id("response-column")
         .size_full()
         .min_w_0()

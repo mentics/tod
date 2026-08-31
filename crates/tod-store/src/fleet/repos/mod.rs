@@ -8,7 +8,6 @@ pub mod shell;
 pub mod task;
 pub mod transcript;
 
-use rusqlite::Connection;
 
 /// Open a writer connection against a temp database (integration tests).
 #[cfg(test)]

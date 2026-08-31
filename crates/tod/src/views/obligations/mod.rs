@@ -311,7 +311,7 @@ impl ObligationsView {
         sections
     }
 
-    fn rebuild_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn rebuild_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.flat_rows();
         let selected = self.selected_key.clone();
         let selected_ix = selected

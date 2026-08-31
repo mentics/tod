@@ -8,12 +8,6 @@ use gpui::{
 use gpui_component::{Root, TitleBar};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryWindowStatus {
-    Closed,
-    Open,
-}
-
 /// Shared handle for the optional command-history window.
 #[derive(Clone)]
 pub struct HistoryWindowControl {
@@ -31,14 +25,6 @@ impl HistoryWindowControl {
 
     pub fn bind(&self, fleet: Arc<FleetStore>) {
         *self.fleet.lock().expect("history window fleet mutex") = Some(fleet);
-    }
-
-    pub fn status(&self, cx: &mut App) -> HistoryWindowStatus {
-        if self.live_handle(cx).is_some() {
-            HistoryWindowStatus::Open
-        } else {
-            HistoryWindowStatus::Closed
-        }
     }
 
     pub fn clear(&self) {

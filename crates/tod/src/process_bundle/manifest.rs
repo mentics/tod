@@ -1,7 +1,7 @@
 //! Bundled interview agent doc paths (formerly manifest.yaml).
 
 use super::install::TodInstallPaths;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]

@@ -30,7 +30,7 @@ impl<D: ListDelegate + 'static> ListView<D> {
         &self.state
     }
 
-    pub fn render(&self, window: &mut Window, cx: &mut App) -> List<D> {
+    pub fn render(&self, _window: &mut Window, _cx: &mut App) -> List<D> {
         List::new(&self.state).size_full()
     }
 }

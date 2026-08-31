@@ -137,7 +137,7 @@ impl TranscriptWindowControl {
         let Some(handle) = self.live_handle(cx) else {
             return Ok(());
         };
-        handle
+        let _ = handle
             .update(cx, |_, window, _| {
                 window.remove_window();
                 Ok::<(), String>(())

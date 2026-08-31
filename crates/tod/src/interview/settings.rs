@@ -1,11 +1,10 @@
 //! gpui-specific helpers for persisted settings (core types live in `tod-store`).
 
 pub use tod_store::settings::{
-    AgentPlatform, AnswerProcessorSettings, QuestionMakerSettings, TerminalSettings, TodSettings,
-    WorktreeBackend, WindowGeometry, DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB,
+    AnswerProcessorSettings, QuestionMakerSettings, TodSettings,
+    WorktreeBackend, WindowGeometry, MAX_LOG_MAX_SIZE_KB,
     MIN_LOG_MAX_SIZE_KB,
 };
-pub use tod_store::LogLevel;
 
 use crate::interview::paths::TodPaths;
 use gpui::{Bounds, Pixels, Window, WindowBounds, point, px, size};

@@ -2,7 +2,6 @@ use super::provider::{AgentRunState, RunId};
 use crate::interview::settings::AnswerProcessorSettings;
 use crate::process_bundle::InterviewAgentPrompt;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
 
 /// Live pool counts for the workspace status footer (req 11a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,7 +40,7 @@ pub enum AnswerSubmitAssignment {
     /// Run immediately on the given slot.
     Dispatch { slot_id: u32, prompt: String },
     /// All pool sessions busy at capacity — queued until a slot frees.
-    Queued { prompt: InterviewAgentPrompt },
+    Queued { _prompt: InterviewAgentPrompt },
 }
 
 /// Outcome after an answer-processor response is processed.
@@ -198,21 +197,6 @@ pub struct AnswerProcessorPoolManager {
 }
 
 impl AnswerProcessorPoolManager {
-    pub fn stats(
-        &self,
-        agent_config_id: &str,
-        settings: &AnswerProcessorSettings,
-    ) -> AnswerProcessorPoolStats {
-        self.pools
-            .get(agent_config_id)
-            .map(InterviewPool::stats)
-            .unwrap_or(AnswerProcessorPoolStats {
-                active: 0,
-                in_pool: 0,
-                max: settings.session_pool_size,
-            })
-    }
-
     pub fn global_stats(&self) -> AnswerProcessorPoolStats {
         let mut stats = AnswerProcessorPoolStats::default();
         for pool in self.pools.values() {

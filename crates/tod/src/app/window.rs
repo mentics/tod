@@ -86,7 +86,7 @@ pub struct Shell {
     agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
-    interactive_agent_window: InteractiveAgentWindowControl,
+    _interactive_agent_window: InteractiveAgentWindowControl,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
     paths: TodPaths,
@@ -294,7 +294,7 @@ impl Shell {
         action: AgentPlatformSocketCommand,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        use crate::interview::agent::AgentPlatform;
+        
         match action {
             AgentPlatformSocketCommand::Get => {
                 let platform = self.settings.read(cx).agent_platform();
@@ -978,7 +978,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 let interactive_for_close = interactive_agent_window.clone();
                 window.on_window_should_close(cx, move |window, cx| {
                     persist_window_geometry(window, &paths_for_geometry);
-                    transcript_for_close.close(cx);
+                    let _ = transcript_for_close.close(cx);
                     history_for_close.close(cx);
                     interactive_for_close.close_all(cx);
                     true
@@ -1242,7 +1242,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
-                                interactive_agent_window: interactive_agent_window.clone(),
+                                _interactive_agent_window: interactive_agent_window.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
                                 paths,

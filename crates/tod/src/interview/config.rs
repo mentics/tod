@@ -3,7 +3,7 @@ use crate::interview::paths::TodPaths;
 use crate::process_bundle::node_scratchpad_root;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use uuid::Uuid;
@@ -106,10 +106,6 @@ fn normalize_config_path(raw: &str) -> String {
 
 pub fn base_interview_phase(phase: &str) -> &str {
     phase.split('(').next().unwrap_or(phase).trim()
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub use tod_store::path_for_storage;

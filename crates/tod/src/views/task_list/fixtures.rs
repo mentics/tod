@@ -85,7 +85,7 @@ fn mode_chip_label(mode: &str) -> String {
         "agent" => "auto".into(),
         "shell" => "interactive".into(),
         "interview" => "interview".into(),
-        other => mode.to_string(),
+        _other => mode.to_string(),
     }
 }
 

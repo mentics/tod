@@ -1,6 +1,5 @@
 //! Launch-time reattach orchestration for agents and shell sessions.
 
-use crate::fleet::reconnect_identity;
 use crate::fleet::repos::agent_config::AgentConfigRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::runtime::GuestLivenessCheck;

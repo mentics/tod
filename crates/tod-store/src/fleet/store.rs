@@ -14,7 +14,7 @@ use crate::fleet::projection::FleetProjection;
 use crate::fleet::prompt_queue::MemoryPromptQueue;
 use crate::fleet::reattach;
 use crate::fleet::repos::agent_config::{
-    AgentConfig, AgentConfigRepo, AgentConfigRow, NewAgentConfig,
+    AgentConfig, AgentConfigRepo, AgentConfigRow,
 };
 use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};

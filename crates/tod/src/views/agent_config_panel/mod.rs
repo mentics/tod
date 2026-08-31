@@ -15,8 +15,8 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Window, actions, div, px,
+    App, AppContext, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
@@ -70,7 +70,7 @@ pub struct AgentConfigPanelView {
 
 impl AgentConfigPanelView {
     pub fn new(
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
@@ -1386,8 +1386,6 @@ pub fn register_agent_config_keyboard_bindings(cx: &mut App) {
 }
 
 // Back-compat re-exports for shell wiring during rename.
-pub use AgentConfigPanelEvent as AgentPanelEvent;
-pub use AgentConfigPanelView as AgentPanelView;
 pub fn register_agent_panel_keyboard_bindings(cx: &mut App) {
     register_agent_config_keyboard_bindings(cx);
 }

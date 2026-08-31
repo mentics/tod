@@ -7,7 +7,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored,
     deferred, div, px, rems,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, StyledExt, v_flex};
 
 actions!(
@@ -115,7 +115,7 @@ impl Focusable for AppNavPopup {
 }
 
 impl Render for AppNavPopup {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let radius = cx.theme().radius.min(px(8.));
         v_flex()
             .id("app-nav-popup")

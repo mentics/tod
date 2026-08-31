@@ -720,7 +720,7 @@ impl TaskEditView {
             .enqueue(FleetMutation::UpdateTaskNotes { id, notes });
     }
 
-    fn persist_tags(&mut self, cx: &mut Context<Self>) {
+    fn persist_tags(&mut self, _cx: &mut Context<Self>) {
         let Some(id) = self.task_id() else {
             return;
         };
@@ -801,7 +801,7 @@ impl TaskEditView {
         label: &str,
         width: f32,
         input: &Entity<InputState>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let has_value = !input_text(input, cx).trim().is_empty();

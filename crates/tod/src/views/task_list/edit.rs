@@ -1,5 +1,4 @@
 use gpui::{Context, Window};
-use gpui_component::input::InputState;
 
 use tod_store::outline::{CreatePosition, OutlineMutation};
 

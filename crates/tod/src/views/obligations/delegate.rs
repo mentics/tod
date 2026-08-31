@@ -8,7 +8,7 @@ use gpui::{
     SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputState};
-use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, StyledExt, h_flex};
 
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
 pub const NO_SECTION: &str = "<no section>";
