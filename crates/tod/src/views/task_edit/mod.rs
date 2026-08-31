@@ -1,5 +1,3 @@
-use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
-use tod_store::outline::{Capability, OutlineMutation};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::toast::{confirm_toast, error_toast};
@@ -14,6 +12,8 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::outline::{Capability, OutlineMutation};
 
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
@@ -178,19 +178,28 @@ impl TaskEditView {
 
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.task_id = Some(task_id.to_string());
-        self.load_task(window, cx);
-        self.title_input.update(cx, |input, cx| {
-            input.focus(window, cx);
-        });
+        if !self.load_task(window, cx) {
+            self.task_id = None;
+            return;
+        }
         cx.notify();
+        // Focus after the panel re-renders with its inputs mounted.
+        cx.on_next_frame(window, |this, window, cx| {
+            this.title_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
     }
 
     pub fn retarget(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.task_id.as_deref() == Some(task_id) {
             return;
         }
+        let previous = self.task_id.clone();
         self.task_id = Some(task_id.to_string());
-        self.load_task(window, cx);
+        if !self.load_task(window, cx) {
+            self.task_id = previous;
+        }
         cx.notify();
     }
 
@@ -252,17 +261,14 @@ impl TaskEditView {
         }
     }
 
-    fn load_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_task(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(task_id) = self.task_id.clone() else {
-            return;
+            return false;
         };
         let _ = self.fleet.reload_if_stale();
-        let mut task = match self.fleet.get_task(&task_id) {
+        let mut task = match self.fleet.get_node(&task_id) {
             Ok(Some(task)) => task,
-            _ => {
-                self.close(cx);
-                return;
-            }
+            _ => return false,
         };
 
         if task.slug.starts_with("node-") {
@@ -273,7 +279,7 @@ impl TaskEditView {
                 .enqueue(FleetMutation::UpdateTaskTitle { id, title });
             let _ = self.fleet.writer().flush();
             let _ = self.fleet.reload_if_stale();
-            if let Ok(Some(updated)) = self.fleet.get_task(&task_id) {
+            if let Ok(Some(updated)) = self.fleet.get_node(&task_id) {
                 task = updated;
             }
         }
@@ -316,6 +322,7 @@ impl TaskEditView {
         self.tag_draft_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
+        true
     }
 
     fn task_id(&self) -> Option<String> {
@@ -396,7 +403,7 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.capabilities.insert(cap);
         if let Some(task_id) = self.task_id() {
-            if let Ok(Some(task)) = self.fleet.get_task(&task_id) {
+            if let Ok(Some(task)) = self.fleet.get_node(&task_id) {
                 self.loaded_lifecycle = task.lifecycle.clone();
             }
             self.load_obligation_counts(&task_id);
@@ -462,7 +469,7 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.capabilities.remove(&cap);
         if let Some(task_id) = self.task_id() {
-            if let Ok(Some(task)) = self.fleet.get_task(&task_id) {
+            if let Ok(Some(task)) = self.fleet.get_node(&task_id) {
                 self.loaded_lifecycle = task.lifecycle.clone();
                 if cap == Capability::Agent {
                     self.loaded_repo.clear();
@@ -546,7 +553,7 @@ impl TaskEditView {
             return;
         }
         let _ = self.fleet.reload_if_stale();
-        let Ok(Some(task)) = self.fleet.get_task(&id) else {
+        let Ok(Some(task)) = self.fleet.get_node(&id) else {
             return;
         };
         if task.slug == self.loaded_slug {

@@ -5,20 +5,14 @@ use super::no_focus;
 #[cfg(feature = "agent-socket")]
 use crate::agent_socket;
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
-use tod_store::agent_traffic::{
-    AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
-};
 use crate::app::history_window::HistoryWindowControl;
 use crate::app::interactive_agent_window::InteractiveAgentWindowControl;
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
-use tod_store::fleet::{
-    FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
-};
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
+use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
-use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
 use crate::process::{interview_phase_for_lifecycle, interview_phase_label};
 use crate::ui::actionable::chrome_control_with_shortcut_in_context;
 use crate::ui::app_nav::{
@@ -37,6 +31,12 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_store::agent_traffic::{
+    AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
+};
+use tod_store::fleet::{
+    FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
+};
 use uuid::Uuid;
 
 actions!(
@@ -324,6 +324,13 @@ impl Shell {
         self.task_edit.update(cx, |edit, cx| {
             edit.open(task_id, window, cx);
         });
+        if !self.task_edit.read(cx).is_open() {
+            self.task_list.update(cx, |list, cx| {
+                list.set_status_message("Could not open node for editing".into(), cx);
+            });
+            cx.notify();
+            return;
+        }
         self.task_list.update(cx, |list, cx| {
             list.set_slide_edit_open(true, cx);
         });

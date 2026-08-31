@@ -213,6 +213,25 @@ impl<'a> TaskRepo<'a> {
             .map_err(Into::into)
     }
 
+    /// Load any outline node by id (including plain text nodes without Agent capability).
+    pub fn get_node(&self, id: &str) -> Result<Option<FleetTask>, TaskRepoError> {
+        let node_id = Self::parse_node_id(id)?;
+        self.conn
+            .query_row(
+                "SELECT n.id, n.title, n.slug,
+                        COALESCE(l.state, 'proposed'),
+                        f.repo, f.branch, f.notes, f.tags, f.linked_issues, f.linked_prs
+                 FROM nodes n
+                 LEFT JOIN node_lifecycle l ON l.node_id = n.id
+                 LEFT JOIN node_fields f ON f.node_id = n.id
+                 WHERE n.id = ?1",
+                params![uuid_to_blob(node_id)],
+                row_to_task,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list(&self) -> Result<Vec<FleetTask>, TaskRepoError> {
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.title, n.slug,
@@ -293,7 +312,9 @@ fn parse_json_array(raw: Option<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
+    use crate::fleet::repos::agent_config::{
+        AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent,
+    };
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
 
     #[test]
@@ -355,6 +376,23 @@ mod tests {
         repo.insert(&FleetTask::new(&id, "Gone", "gone")).unwrap();
         repo.delete(&id).unwrap();
         assert!(repo.get(&id).unwrap().is_none());
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn get_node_loads_outline_node_without_agent_capability() {
+        use crate::outline::repos::node::NodeRepo;
+
+        let (dir, conn) = test_writer_conn();
+        let node = NodeRepo::new(&conn)
+            .create_normal("plain-node", "Plain")
+            .unwrap();
+        let repo = TaskRepo::new(&conn);
+        let id = node.id.to_string();
+        assert!(repo.get(&id).unwrap().is_none());
+        let loaded = repo.get_node(&id).unwrap().expect("node exists");
+        assert_eq!(loaded.title, "Plain");
+        assert_eq!(loaded.slug, "plain-node");
         cleanup_test_dir(&dir);
     }
 }

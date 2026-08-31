@@ -275,6 +275,13 @@ impl FleetStore {
         TaskRepo::new(&conn).get(id).map_err(Into::into)
     }
 
+    /// Load any outline node by id (including plain text nodes without Agent capability).
+    pub fn get_node(&self, id: &str) -> Result<Option<FleetTask>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        TaskRepo::new(&conn).get_node(id).map_err(Into::into)
+    }
+
     /// List agent configs for a task/node from the projection.
     pub fn list_agents_for_task(&self, task_id: &str) -> Result<Vec<AgentConfigRow>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
