@@ -6,30 +6,6 @@ use super::TaskListView;
 use super::from_ticket::{TicketImportResult, parse_ticket_reference};
 
 impl TaskListView {
-    pub(super) fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_chrome_overlays(cx);
-        if self.slide_edit_open {
-            cx.emit(super::TaskListEvent::CloseTaskEdit);
-        }
-        if !self.compose_open {
-            self.selection_before_compose = self.working_set.selected_id.clone();
-            self.compose_open = true;
-            self.compose_title_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.list_state.update(cx, |state, cx| {
-                state.set_selected_index(None, window, cx);
-            });
-            self.working_set.selected_id = None;
-            self.last_selected = None;
-        }
-        self.compose_title_input.update(cx, |input, cx| {
-            input.focus(window, cx);
-        });
-        self.status_line = "New task".into();
-        cx.notify();
-    }
-
     pub(super) fn close_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.compose_open {
             return;

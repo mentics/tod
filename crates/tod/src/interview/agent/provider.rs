@@ -4,8 +4,6 @@ use crate::process_bundle::InterviewAgentPrompt;
 use std::path::PathBuf;
 use uuid::Uuid;
 
-pub use super::answer_pool::AnswerProcessorPoolStats;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(Uuid);
 

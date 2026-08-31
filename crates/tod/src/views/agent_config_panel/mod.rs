@@ -15,7 +15,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, ParentElement, Render, Styled, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -30,8 +30,8 @@ actions!(agent_config, [AgentConfigClose, AgentConfigSave]);
 #[derive(Debug, Clone)]
 pub enum AgentConfigPanelEvent {
     Close,
-    Saved { task_id: String, config_id: String },
-    Deleted { task_id: String },
+    Saved { _task_id: String, _config_id: String },
+    Deleted { _task_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -330,8 +330,8 @@ impl AgentConfigPanelView {
             self.refresh_workspace_label();
             self.status_message = format!("Saved agent config {id}");
             cx.emit(AgentConfigPanelEvent::Saved {
-                task_id,
-                config_id: id,
+                _task_id: task_id,
+                _config_id: id,
             });
         }
         cx.notify();
@@ -830,7 +830,7 @@ impl AgentConfigPanelView {
         }
         let _ = self.fleet.reload_if_stale();
         cx.emit(AgentConfigPanelEvent::Deleted {
-            task_id: task_id.clone(),
+            _task_id: task_id.clone(),
         });
         self.close(cx);
     }
@@ -1383,9 +1383,4 @@ pub fn register_agent_config_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(AGENT_CONFIG_CONTEXT));
     cx.bind_keys([gpui::KeyBinding::new("enter", AgentConfigSave, context)]);
     cx.bind_keys([gpui::KeyBinding::new("enter", AgentConfigSave, Some(INPUT))]);
-}
-
-// Back-compat re-exports for shell wiring during rename.
-pub fn register_agent_panel_keyboard_bindings(cx: &mut App) {
-    register_agent_config_keyboard_bindings(cx);
 }

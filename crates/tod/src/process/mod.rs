@@ -1,5 +1,7 @@
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessTask {
     pub title: String,
@@ -10,8 +12,7 @@ pub struct ProcessTask {
     pub task_slug: String,
 }
 
-/// Scan `repo_root/doc/process/projects/*/tasks/*`.
-/// Skip dirs missing state.md. Sort by project_slug then task_slug.
+#[cfg(test)]
 pub fn scan_process_tasks(repo_root: &Path) -> Vec<ProcessTask> {
     let mut tasks = Vec::new();
 
@@ -81,6 +82,7 @@ pub fn interview_phase_label(phase: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn collect_tasks_from_dir(tasks_dir: &Path, project_slug: &str, out: &mut Vec<ProcessTask>) {
     if !tasks_dir.is_dir() {
         return;
@@ -125,6 +127,7 @@ fn collect_tasks_from_dir(tasks_dir: &Path, project_slug: &str, out: &mut Vec<Pr
     }
 }
 
+#[cfg(test)]
 fn parse_lifecycle(body: &str) -> Option<String> {
     for line in body.lines() {
         let trimmed = line.trim();
@@ -140,6 +143,7 @@ fn parse_lifecycle(body: &str) -> Option<String> {
     None
 }
 
+#[cfg(test)]
 fn read_title(user_md: &Path) -> Option<String> {
     let body = std::fs::read_to_string(user_md).ok()?;
     for line in body.lines() {

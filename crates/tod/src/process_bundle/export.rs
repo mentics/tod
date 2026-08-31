@@ -12,8 +12,6 @@ use uuid::Uuid;
 /// Exported scope files written under `{scratchpad}/scope/`.
 #[derive(Debug, Clone)]
 pub struct ScopeExport {
-    pub obligations: PathBuf,
-    pub context: PathBuf,
     pub paths: Vec<PathBuf>,
 }
 
@@ -46,11 +44,7 @@ pub fn resolve_and_export_scope(
     )?;
 
     let paths = vec![obligations_path.clone(), context_path.clone()];
-    Ok(ScopeExport {
-        obligations: obligations_path,
-        context: context_path,
-        paths,
-    })
+    Ok(ScopeExport { paths })
 }
 
 fn load_extra_content(conn: &Connection, node_id: Uuid) -> Result<Vec<(String, String)>> {
@@ -184,8 +178,8 @@ mod tests {
 
         let scratch = dir.join("scratch");
         let export = resolve_and_export_scope(&conn, node.id, &scratch).unwrap();
-        assert!(export.obligations.is_file());
-        let text = fs::read_to_string(export.obligations).unwrap();
+        assert!(export.paths[0].is_file());
+        let text = fs::read_to_string(&export.paths[0]).unwrap();
         assert!(text.contains("Do the thing"));
         let _ = fs::remove_dir_all(dir);
     }

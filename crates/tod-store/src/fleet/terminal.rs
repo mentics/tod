@@ -271,6 +271,7 @@ pub fn focus_shell_session(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn escape_applescript_quotes() {
         assert_eq!(escape_applescript("C:\\dev\"test"), "C:\\dev\\\"test");

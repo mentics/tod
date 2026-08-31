@@ -45,10 +45,6 @@ impl TaskItem {
         self.agents.len()
     }
 
-    pub fn shell_count(&self) -> usize {
-        self.shells.len()
-    }
-
     pub fn sorted_tags(&self) -> Vec<String> {
         let mut tags = self.tags.clone();
         tags.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
@@ -153,10 +149,6 @@ impl ListWorkingSet {
         }
     }
 
-    pub fn toggle_sort_direction(&mut self) {
-        self.sort_direction = self.sort_direction.toggle();
-    }
-
     pub fn set_sort_key(&mut self, key: SortKey) {
         if self.sort_key != key {
             self.sort_key = key;
@@ -164,14 +156,6 @@ impl ListWorkingSet {
         } else {
             self.sort_direction = self.sort_direction.toggle();
         }
-    }
-
-    pub fn reset_sort(&mut self) {
-        let selected_id = self.selected_id.clone();
-        *self = Self {
-            selected_id,
-            ..Self::default_sort()
-        };
     }
 }
 

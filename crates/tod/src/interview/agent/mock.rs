@@ -1,6 +1,6 @@
-use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
+use super::answer_pool::{AnswerProcessorPoolManager, AnswerProcessorPoolStats, AnswerSubmitAssignment};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, AnswerProcessorPoolStats,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState,
     DeepDiveContext, RunId,
 };
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
@@ -127,7 +127,7 @@ impl MockAgentProvider {
             self.log_traffic(kind, id, TrafficDirection::Response, message);
         }
         self.runs.insert(id, state.clone());
-        AgentRunHandle { id, kind, state }
+        AgentRunHandle { id }
     }
 
     fn drain_answer_completions(&mut self) {
@@ -283,11 +283,7 @@ impl AgentProvider for MockAgentProvider {
             }
             QuestionMakerSubmitAssignment::Queued { .. } => {}
         }
-        Ok(AgentRunHandle {
-            id: run_id,
-            kind: AgentRunKind::QuestionMakerReplenishment,
-            state: AgentRunState::InFlight,
-        })
+        Ok(AgentRunHandle { id: run_id })
     }
 
     fn start_answer_processor(
@@ -321,19 +317,7 @@ impl AgentProvider for MockAgentProvider {
             }
             AnswerSubmitAssignment::Queued { .. } => {}
         }
-        Ok(AgentRunHandle {
-            id: run_id,
-            kind: AgentRunKind::AnswerProcessor,
-            state: AgentRunState::InFlight,
-        })
-    }
-
-    fn answer_processor_pool_stats(
-        &self,
-        agent_config_id: &str,
-        pool: &AnswerProcessorSettings,
-    ) -> AnswerProcessorPoolStats {
-        self.answer_pool.stats(agent_config_id, pool)
+        Ok(AgentRunHandle { id: run_id })
     }
 
     fn start_deep_dive_chat(
@@ -821,32 +805,6 @@ fn delete_queue_question(queue: &Path, id: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Infer the sandbox/repo root from an entity under `doc/process/...`.
-fn infer_repo_root(entity: &Path) -> Result<PathBuf> {
-    let raw = entity.to_string_lossy();
-    for marker in ["doc\\process", "doc/process"] {
-        if let Some(idx) = raw.find(marker) {
-            let root = raw[..idx].trim_end_matches(['/', '\\']);
-            if !root.is_empty() {
-                return Ok(PathBuf::from(root));
-            }
-        }
-    }
-    // Fallback: walk parents for `.local` / `.git`.
-    let mut dir = entity.to_path_buf();
-    loop {
-        if dir.join(".local").is_dir() || dir.join(".git").is_dir() {
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            bail!(
-                "mock bootstrap: cannot infer repo root from entity {}",
-                entity.display()
-            );
-        }
-    }
-}
-
 fn extract_answer_ids(prompt: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut in_payload = false;
@@ -911,6 +869,8 @@ fn extract_actions(prompt: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interview::agent::answer_pool::AnswerProcessorPoolStats;
+    use crate::interview::config::agent_scratchpad_for_node;
     use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
     use std::time::Duration;
 
@@ -1035,8 +995,8 @@ mod tests {
         let h1 = mock
             .start_answer_processor("mock-agent", cwd.clone(), prompt, &pool)
             .unwrap();
-        assert_eq!(mock.answer_processor_pool_stats("mock-agent", &pool).in_pool, 2);
-        assert_eq!(mock.answer_processor_pool_stats("mock-agent", &pool).active, 2);
+        assert_eq!(mock.pool_stats("mock-agent", &pool).in_pool, 2);
+        assert_eq!(mock.pool_stats("mock-agent", &pool).active, 2);
         assert!(matches!(
             poll_run(&mut mock, h0.id),
             AgentRunState::Failure(_)
@@ -1045,5 +1005,16 @@ mod tests {
             poll_run(&mut mock, h1.id),
             AgentRunState::Failure(_)
         ));
+    }
+}
+
+#[cfg(test)]
+impl MockAgentProvider {
+    fn pool_stats(
+        &self,
+        agent_config_id: &str,
+        pool: &AnswerProcessorSettings,
+    ) -> AnswerProcessorPoolStats {
+        self.answer_pool.stats(agent_config_id, pool)
     }
 }

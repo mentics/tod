@@ -29,8 +29,7 @@ pub enum RowAction {
     ToggleTagFilter { task_id: String, tag: String },
     AgentsControl { task_id: String },
     ShellsControl { task_id: String },
-    LifecycleControl { task_id: String, lifecycle: String },
-    RowChrome { task_id: String },
+    LifecycleControl { task_id: String, _lifecycle: String },
     ToggleCollapsed { task_id: String },
     OpenObligations { task_id: String },
 }
@@ -96,14 +95,6 @@ impl TaskListDelegate {
 
     pub fn set_tag_filter(&mut self, tag_filter: Option<String>) {
         self.tag_filter = tag_filter;
-    }
-
-    pub fn index_of_id(&self, id: &str) -> Option<usize> {
-        self.items.iter().position(|t| t.id == id)
-    }
-
-    fn push_action(&self, action: RowAction) {
-        self.action_sink.borrow_mut().push(action);
     }
 }
 
@@ -212,7 +203,7 @@ impl ListDelegate for TaskListDelegate {
                         move || {
                             sink.borrow_mut().push(RowAction::LifecycleControl {
                                 task_id: task_id_lc.clone(),
-                                lifecycle: lifecycle.clone(),
+                                _lifecycle: lifecycle.clone(),
                             });
                         }
                     },

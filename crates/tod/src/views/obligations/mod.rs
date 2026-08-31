@@ -18,7 +18,7 @@ use delegate::{
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div, prelude::FluentBuilder,
+    Styled, Subscription, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{InputEvent, InputState};

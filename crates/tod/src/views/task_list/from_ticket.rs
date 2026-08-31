@@ -25,11 +25,6 @@ pub(super) struct PendingTicketImport {
     pub auth_failure: bool,
 }
 
-/// Returns true when `text` is a ticket id or Linear issue URL.
-pub fn is_ticket_id(text: &str) -> bool {
-    parse_ticket_reference(text).is_some()
-}
-
 /// Extract a ticket id (e.g. `TOD-142`) from a bare id or Linear issue URL.
 pub fn parse_ticket_reference(text: &str) -> Option<String> {
     let text = text.trim();

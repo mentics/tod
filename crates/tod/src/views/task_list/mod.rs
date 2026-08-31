@@ -9,8 +9,8 @@ mod model;
 mod row_menu;
 mod working_set;
 
-pub use model::TaskItem;
 pub use model::SortKey;
+pub use model::TaskItem;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -30,8 +30,8 @@ use crate::ui::selectable_text::selectable_text;
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    KeyBinding, ParentElement, Render, Styled, Subscription, Timer, Window, actions, div,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, KeyBinding,
+    ParentElement, Render, Styled, Subscription, Timer, Window, actions, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -42,7 +42,7 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
 use row_menu::RowMenuKind;
-use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::fleet::{FleetStore, validate_interview_workspace};
 use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
 
@@ -52,7 +52,6 @@ actions!(
         TaskListOpen,
         TaskListNewTask,
         TaskListFocusSearch,
-        TaskListClearFilters,
         TaskListSortToggle,
         TaskListClearTagFilter,
         TaskListRowAgents,
@@ -165,18 +164,17 @@ pub enum TaskListEvent {
     },
     OpenTaskEdit {
         task_id: String,
-        title: String,
+        _title: String,
     },
     OpenObligations {
         task_id: String,
         title: String,
     },
-    OpenNewTaskCompose,
     CloseTaskEdit,
     CloseObligations,
     CloseAgentPanel,
     OpenLifecycle {
-        task_id: String,
+        _task_id: String,
         lifecycle: String,
     },
     OpenAgentDetail {
@@ -188,10 +186,6 @@ pub enum TaskListEvent {
         shell_id: Option<String>,
         agent_id: Option<String>,
     },
-    DeleteTask {
-        task_id: String,
-    },
-    StatusMessage(String),
 }
 
 pub struct TaskListView {
@@ -230,7 +224,6 @@ pub struct TaskListView {
     pending_abandon_edit: bool,
     pending_compose_submit: bool,
     pending_live_refresh: bool,
-    pending_delete_task_id: Option<String>,
     pending_new_list: bool,
     pending_create_below: bool,
     ticket_import_generation: u64,
@@ -367,7 +360,6 @@ impl TaskListView {
             pending_abandon_edit: false,
             pending_compose_submit: false,
             pending_live_refresh: false,
-            pending_delete_task_id: None,
             pending_new_list: false,
             pending_create_below: false,
             ticket_import_generation: 0,
@@ -514,26 +506,7 @@ impl TaskListView {
 
     fn drain_row_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let actions: Vec<RowAction> = self.action_sink.borrow_mut().drain(..).collect();
-        let suppress_row_chrome: std::collections::HashSet<String> = actions
-            .iter()
-            .filter_map(|action| match action {
-                RowAction::OpenEdit { task_id }
-                | RowAction::InlineEdit { task_id }
-                | RowAction::AgentsControl { task_id }
-                | RowAction::ShellsControl { task_id }
-                | RowAction::LifecycleControl { task_id, .. }
-                | RowAction::ToggleTagFilter { task_id, .. }
-                | RowAction::OpenObligations { task_id }
-                | RowAction::ToggleCollapsed { task_id } => Some(task_id.clone()),
-                _ => None,
-            })
-            .collect();
         for action in actions {
-            if let RowAction::RowChrome { task_id } = &action {
-                if suppress_row_chrome.contains(task_id) {
-                    continue;
-                }
-            }
             self.handle_row_action(action, window, cx);
         }
     }
@@ -555,10 +528,6 @@ impl TaskListView {
                 self.select_task_by_id(&task_id, window, cx);
                 self.start_inline_edit(&task_id, window, cx);
             }
-            RowAction::RowChrome { task_id } => {
-                self.dismiss_compose_for_row_action(window, cx);
-                self.select_task_by_id(&task_id, window, cx);
-            }
             RowAction::ToggleTagFilter { task_id, tag } => {
                 self.select_task_by_id(&task_id, window, cx);
                 self.toggle_tag_filter(&tag, window, cx);
@@ -575,7 +544,7 @@ impl TaskListView {
             }
             RowAction::LifecycleControl {
                 task_id,
-                lifecycle: _,
+                _lifecycle: _,
             } => {
                 self.select_task_by_id(&task_id, window, cx);
                 self.run_lifecycle_next(&task_id, window, cx);
@@ -619,15 +588,6 @@ impl TaskListView {
             return;
         };
         self.set_collapsed(task_id, !task.collapsed, window, cx);
-    }
-
-    fn queue_create_below(&mut self, cx: &mut Context<Self>) {
-        if self.active_list_id.is_none() {
-            self.pending_new_list = true;
-        } else {
-            self.pending_create_below = true;
-        }
-        cx.notify();
     }
 
     fn create_tree_node(
@@ -912,7 +872,7 @@ impl TaskListView {
                         self.status_line = format!("Opening interview for {}", task.title);
                     } else {
                         cx.emit(TaskListEvent::OpenLifecycle {
-                            task_id: task_id.to_string(),
+                            _task_id: task_id.to_string(),
                             lifecycle: lifecycle.to_string(),
                         });
                         self.status_line = format!("Lifecycle panel: {lifecycle}");
@@ -924,7 +884,7 @@ impl TaskListView {
             }
         }
         cx.emit(TaskListEvent::OpenLifecycle {
-            task_id: task_id.to_string(),
+            _task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
         self.status_line = format!("Lifecycle panel: {lifecycle}");
@@ -933,7 +893,7 @@ impl TaskListView {
     /// Open the lifecycle transition panel for a task (bypasses interview routing).
     pub fn open_lifecycle_panel(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
         cx.emit(TaskListEvent::OpenLifecycle {
-            task_id: task_id.to_string(),
+            _task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
         self.status_line = format!("Lifecycle panel: {lifecycle}");
@@ -970,7 +930,7 @@ impl TaskListView {
         };
         cx.emit(TaskListEvent::OpenTaskEdit {
             task_id: task_id.to_string(),
-            title: task.title.clone(),
+            _title: task.title.clone(),
         });
         self.status_line = format!("Edit: {}", task.title);
     }
@@ -1074,12 +1034,6 @@ impl TaskListView {
             })
     }
 
-    /// Queue permanent delete (task-crud integration); runs on next render when window is available.
-    pub fn schedule_remove_task(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.pending_delete_task_id = Some(task_id);
-        cx.notify();
-    }
-
     /// Remove a node and its subtree from the outline tree.
     pub(super) fn remove_outline_node(
         &mut self,
@@ -1094,18 +1048,6 @@ impl TaskListView {
             .fleet
             .enqueue_outline(OutlineMutation::DeleteNode { node_id })
         {
-            self.status_line = format!("Delete failed: {err}");
-            cx.notify();
-            return;
-        }
-        self.finish_node_removal(task_id, window, cx);
-    }
-
-    /// Remove a permanently deleted work node and move selection to the nearest visible row.
-    pub fn remove_task(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteTask {
-            id: task_id.to_string(),
-        }) {
             self.status_line = format!("Delete failed: {err}");
             cx.notify();
             return;
@@ -1184,29 +1126,6 @@ impl TaskListView {
     pub fn set_status_message(&mut self, message: String, cx: &mut Context<Self>) {
         self.status_line = message;
         cx.notify();
-    }
-
-    fn merge_live_tasks(&mut self, scanned: Vec<TaskItem>) {
-        let scanned_ids: std::collections::HashSet<_> =
-            scanned.iter().map(|t| t.id.clone()).collect();
-        self.all_tasks
-            .retain(|t| !t.is_work_node || scanned_ids.contains(&t.id));
-        for fresh in scanned {
-            if let Some(existing) = self.all_tasks.iter_mut().find(|t| t.id == fresh.id) {
-                existing.title = fresh.title;
-                existing.lifecycle = fresh.lifecycle;
-                existing.ticket_id = fresh.ticket_id.clone();
-                existing.tags = fresh.tags.clone();
-                if !fresh.agents.is_empty() {
-                    existing.agents = fresh.agents.clone();
-                }
-                if !fresh.shells.is_empty() {
-                    existing.shells = fresh.shells.clone();
-                }
-            } else if !self.all_tasks.iter().any(|t| t.id == fresh.id) {
-                self.all_tasks.push(fresh);
-            }
-        }
     }
 
     fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1462,7 +1381,10 @@ impl TaskListView {
             return;
         };
         self.handle_row_action(
-            RowAction::LifecycleControl { task_id, lifecycle },
+            RowAction::LifecycleControl {
+                task_id,
+                _lifecycle: lifecycle,
+            },
             window,
             cx,
         );
@@ -1550,16 +1472,6 @@ impl TaskListView {
         self.search_input.update(cx, |input, cx| {
             input.focus(window, cx);
         });
-    }
-
-    fn on_clear_filters(
-        &mut self,
-        _: &TaskListClearFilters,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.close_sort_menu(cx);
-        self.clear_filters(window, cx);
     }
 
     fn on_sort_toggle(
@@ -2029,9 +1941,6 @@ impl Render for TaskListView {
         if self.pending_live_refresh {
             self.pending_live_refresh = false;
             self.live_refresh(window, cx);
-        }
-        if let Some(task_id) = self.pending_delete_task_id.take() {
-            self.remove_task(&task_id, window, cx);
         }
         self.apply_pending_revert(window, cx);
         if self.pending_compose_submit {

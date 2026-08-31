@@ -5,16 +5,8 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-pub struct PhaseAgents {
-    pub base: String,
-    pub question_maker: String,
-    pub answer_processor: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ProcessManifest {
     process_root: PathBuf,
-    agents: PhaseAgents,
 }
 
 impl ProcessManifest {
@@ -51,17 +43,12 @@ impl ProcessManifest {
         }
         Ok(Self {
             process_root: root.to_path_buf(),
-            agents: PhaseAgents {
-                base: Self::BASE.to_string(),
-                question_maker: Self::QUESTION_MAKER.to_string(),
-                answer_processor: Self::ANSWER_PROCESSOR.to_string(),
-            },
         })
     }
 
-    pub fn phase(&self, base_phase: &str) -> Result<&PhaseAgents> {
+    pub fn phase(&self, base_phase: &str) -> Result<()> {
         if Self::KNOWN_PHASES.contains(&base_phase) {
-            Ok(&self.agents)
+            Ok(())
         } else {
             anyhow::bail!("unknown interview phase: {base_phase}")
         }
@@ -102,10 +89,6 @@ impl ProcessManifest {
 
     pub fn phase_count(&self) -> usize {
         Self::KNOWN_PHASES.len()
-    }
-
-    pub fn known_phases(&self) -> impl Iterator<Item = &'static str> {
-        Self::KNOWN_PHASES.iter().copied()
     }
 
     /// Lifecycle state agent doc when present (`agents/state/{lifecycle}.md`).

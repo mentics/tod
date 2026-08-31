@@ -58,12 +58,8 @@ struct SubmitAnswerWork {
     question_id: String,
     question_path: PathBuf,
     question_body: String,
-    /// Transcript answer text (notes and/or edited proposed text).
     answer_text: String,
     mc: Option<String>,
-    text_changed: Option<bool>,
-    /// Answer-processor body (notes when unchanged; full edited proposed text when changed).
-    payload_body: String,
     transcript: PathBuf,
     prompt: InterviewAgentPrompt,
     agent_config_id: String,
@@ -91,7 +87,6 @@ struct SubmitActionWork {
 
 struct SubmitActionOutcome {
     question_id: String,
-    action: String,
     result: Result<(RunId, Option<String>), String>,
 }
 
@@ -1710,8 +1705,6 @@ impl WorkspaceView {
             question_body: question.display_body(),
             answer_text,
             mc,
-            text_changed,
-            payload_body,
             transcript,
             prompt,
             agent_config_id: self.agent_config_id.clone(),
@@ -2548,7 +2541,7 @@ fn build_proposed_answer_parts(
 
 fn run_submit_action_work(work: SubmitActionWork, agent: SharedAgent) -> SubmitActionOutcome {
     let question_id = work.question_id.clone();
-    let action = work.action.clone();
+    let _action = work.action.clone();
     let result = (|| -> Result<(RunId, Option<String>), String> {
         append_action(
             &work.transcript,
@@ -2577,7 +2570,6 @@ fn run_submit_action_work(work: SubmitActionWork, agent: SharedAgent) -> SubmitA
     })();
     SubmitActionOutcome {
         question_id,
-        action,
         result,
     }
 }

@@ -55,6 +55,7 @@ impl TodInstallPaths {
         &self.process_root
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve(&self, rel: &str) -> PathBuf {
         self.process_root.join(rel)
     }

@@ -71,10 +71,6 @@ impl TaskListView {
         cx.notify();
     }
 
-    pub(super) fn cancel_inline_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.abandon_inline_edit(window, cx, true);
-    }
-
     /// Leave inline edit without Enter. Draft nodes are removed when `force_delete_draft`
     /// or when the title is still empty; otherwise typed text is saved.
     pub(super) fn abandon_inline_edit(

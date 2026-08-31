@@ -1,4 +1,3 @@
-use chrono::Utc;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -90,7 +89,9 @@ fn mode_chip_label(mode: &str) -> String {
 }
 
 /// Generate a large in-memory fixture set for list performance tests.
+#[cfg(test)]
 pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
+    use chrono::Utc;
     (0..base_count)
         .map(|i| TaskItem {
             id: format!("scale-{i}"),

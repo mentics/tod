@@ -84,10 +84,6 @@ impl ObligationListDelegate {
         &self.rows
     }
 
-    pub fn selected_index(&self) -> Option<usize> {
-        self.selected_index
-    }
-
     pub fn set_selected_index(&mut self, ix: Option<usize>) {
         self.selected_index = ix;
     }

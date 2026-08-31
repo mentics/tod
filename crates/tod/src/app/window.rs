@@ -1088,9 +1088,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 );
                                             }
                                         }
-                                        TaskListEvent::OpenNewTaskCompose => {
-                                            eprintln!("tod: new task compose stub");
-                                        }
                                         TaskListEvent::CloseTaskEdit => {
                                             this.queue_close_task_edit(cx);
                                         }
@@ -1137,14 +1134,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 agent_id.clone(),
                                                 cx,
                                             );
-                                        }
-                                        TaskListEvent::DeleteTask { task_id } => {
-                                            this.task_list.update(cx, |list, cx| {
-                                                list.schedule_remove_task(task_id.clone(), cx);
-                                            });
-                                        }
-                                        TaskListEvent::StatusMessage(msg) => {
-                                            eprintln!("tod: {msg}");
                                         }
                                     }
                                 });

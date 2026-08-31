@@ -112,6 +112,7 @@ pub fn remove_agents_with_missing_worktrees(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fleet::reconnect_identity;
     use crate::fleet::reconnect_identity::ReconnectIdentity;
     use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
     use crate::fleet::repos::task::{FleetTask, TaskRepo};

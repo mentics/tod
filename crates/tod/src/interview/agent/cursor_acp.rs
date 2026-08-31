@@ -1,7 +1,7 @@
 use super::acp_host::{AcpHost, spawn_acp_process};
 use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, AnswerProcessorPoolStats,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState,
     DeepDiveContext, RunId,
 };
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
@@ -62,7 +62,7 @@ struct SlotCompletion {
 #[derive(Clone)]
 struct PoolRunContext {
     agent_config_id: String,
-    cwd: PathBuf,
+    _cwd: PathBuf,
 }
 
 struct AcpLiveSlot {
@@ -123,10 +123,6 @@ impl CursorAcpProvider {
             fleet_run_context: HashMap::new(),
             traffic_log: None,
         })
-    }
-
-    pub fn new() -> Result<Self> {
-        Self::for_host(AcpHost::Cursor)
     }
 
     pub fn with_traffic_log(mut self, traffic_log: SharedAgentTrafficLog) -> Self {
@@ -224,7 +220,7 @@ impl CursorAcpProvider {
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.clone(),
-                        cwd: cwd.clone(),
+                        _cwd: cwd.clone(),
                     },
                 );
                 self.dispatch_answer_prompt(&agent_config_id, &cwd, sid, rid, prompt);
@@ -262,7 +258,7 @@ impl CursorAcpProvider {
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.clone(),
-                        cwd: cwd.clone(),
+                        _cwd: cwd.clone(),
                     },
                 );
                 self.dispatch_question_maker_prompt(&agent_config_id, &cwd, sid, rid, prompt);
@@ -424,7 +420,7 @@ impl CursorAcpProvider {
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.to_string(),
-                        cwd: cwd.to_path_buf(),
+                        _cwd: cwd.to_path_buf(),
                     },
                 );
                 self.dispatch_answer_prompt(agent_config_id, cwd, sid, rid, p);
@@ -472,7 +468,7 @@ impl CursorAcpProvider {
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.to_string(),
-                        cwd: cwd.to_path_buf(),
+                        _cwd: cwd.to_path_buf(),
                     },
                 );
                 self.dispatch_question_maker_prompt(agent_config_id, cwd, sid, rid, p);
@@ -564,11 +560,7 @@ impl CursorAcpProvider {
             },
         );
 
-        Ok(AgentRunHandle {
-            id,
-            kind,
-            state: AgentRunState::InFlight,
-        })
+        Ok(AgentRunHandle { id })
     }
 }
 
@@ -597,7 +589,7 @@ impl AgentProvider for CursorAcpProvider {
             run_id,
             PoolRunContext {
                 agent_config_id: agent_config_id.to_string(),
-                cwd: cwd.clone(),
+                _cwd: cwd.clone(),
             },
         );
         match assignment {
@@ -606,11 +598,7 @@ impl AgentProvider for CursorAcpProvider {
             }
             QuestionMakerSubmitAssignment::Queued { .. } => {}
         }
-        Ok(AgentRunHandle {
-            id: run_id,
-            kind: AgentRunKind::QuestionMakerReplenishment,
-            state: AgentRunState::InFlight,
-        })
+        Ok(AgentRunHandle { id: run_id })
     }
 
     fn start_answer_processor(
@@ -628,7 +616,7 @@ impl AgentProvider for CursorAcpProvider {
             run_id,
             PoolRunContext {
                 agent_config_id: agent_config_id.to_string(),
-                cwd: cwd.clone(),
+                _cwd: cwd.clone(),
             },
         );
         match assignment {
@@ -637,19 +625,7 @@ impl AgentProvider for CursorAcpProvider {
             }
             AnswerSubmitAssignment::Queued { .. } => {}
         }
-        Ok(AgentRunHandle {
-            id: run_id,
-            kind: AgentRunKind::AnswerProcessor,
-            state: AgentRunState::InFlight,
-        })
-    }
-
-    fn answer_processor_pool_stats(
-        &self,
-        agent_config_id: &str,
-        pool: &AnswerProcessorSettings,
-    ) -> AnswerProcessorPoolStats {
-        self.answer_pool.stats(agent_config_id, pool)
+        Ok(AgentRunHandle { id: run_id })
     }
 
     fn start_deep_dive_chat(
@@ -1001,7 +977,7 @@ impl AcpClient {
                 .request_rx
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
             {
-                Ok(AcpRequest::Response { id: _, result }) => {
+                Ok(AcpRequest::Response { _id: _, result }) => {
                     self.log_raw(
                         TrafficDirection::Response,
                         &format!(
@@ -1130,7 +1106,7 @@ impl AcpClient {
 
 #[derive(Debug)]
 enum AcpRequest {
-    Response { id: i64, result: Value },
+    Response { _id: i64, result: Value },
     ResponseError { message: String },
     Notification { method: String, params: Value },
 }
@@ -1144,7 +1120,7 @@ fn read_stdout_lines(stdout: std::process::ChildStdout, tx: Sender<AcpRequest>) 
 
         if let (Some(id), Some(result)) = (value.get("id"), value.get("result")) {
             let _ = tx.send(AcpRequest::Response {
-                id: id.as_i64().unwrap_or_default(),
+                _id: id.as_i64().unwrap_or_default(),
                 result: result.clone(),
             });
             continue;
@@ -1161,7 +1137,7 @@ fn read_stdout_lines(stdout: std::process::ChildStdout, tx: Sender<AcpRequest>) 
             });
             // Also satisfy await_response for request/response pairs.
             let _ = tx.send(AcpRequest::Response {
-                id: id.as_i64().unwrap_or_default(),
+                _id: id.as_i64().unwrap_or_default(),
                 result: json!({}),
             });
             continue;

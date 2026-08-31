@@ -80,10 +80,6 @@ impl SessionStore {
         self.with_read_repo(|repo| repo.list_all())
     }
 
-    pub fn list_by_status(&self, status: InterviewSessionStatus) -> Result<Vec<InterviewSession>> {
-        self.with_read_repo(|repo| repo.list_by_status(status))
-    }
-
     pub fn get_session(&self, id: Uuid) -> Result<Option<InterviewSession>> {
         self.with_read_repo(|repo| repo.get(id))
     }

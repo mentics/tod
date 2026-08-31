@@ -312,14 +312,6 @@ pub trait HasAppNav {
         element.on_action(cx.listener(on_app_nav_toggle::<Self>))
     }
 
-    /// Focus tracking plus app-nav toggle — for views that do not already call `track_focus`.
-    fn wrap_app_nav_view_root(&self, element: gpui::Div, cx: &mut Context<Self>) -> gpui::Div
-    where
-        Self: Render + Sized + 'static,
-    {
-        self.bind_app_nav_toggle(element.track_focus(&self.app_nav_fallback_focus()), cx)
-    }
-
     fn render_app_nav(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement
     where
         Self: Render + HasAppNav + Sized + 'static,

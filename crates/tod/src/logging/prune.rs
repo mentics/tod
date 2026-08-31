@@ -11,6 +11,7 @@ struct LogFile {
 }
 
 /// Sum byte size of `tod.log` and `tod.log.N` files in `dir`.
+#[cfg(test)]
 pub fn total_log_bytes(dir: &Path) -> Result<u64> {
     Ok(list_log_files(dir)?.into_iter().map(|f| f.size).sum())
 }

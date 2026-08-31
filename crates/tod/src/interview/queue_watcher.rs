@@ -4,7 +4,6 @@ use notify::{
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
     event::{ModifyKind, RenameMode},
 };
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -13,7 +12,7 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct QueueWatcher {
     queue_dir: PathBuf,
-    watcher: RecommendedWatcher,
+    _watcher: RecommendedWatcher,
     receiver: Receiver<Result<Event, notify::Error>>,
     debounce_deadline: Option<Instant>,
     /// Fingerprint of queue dir contents — catches Windows notify gaps.
@@ -39,15 +38,11 @@ impl QueueWatcher {
         let last_fingerprint = Some(dir_fingerprint(&queue_dir));
         Ok(Self {
             queue_dir,
-            watcher,
+            _watcher: watcher,
             receiver: rx,
             debounce_deadline: None,
             last_fingerprint,
         })
-    }
-
-    pub fn queue_dir(&self) -> &Path {
-        &self.queue_dir
     }
 
     /// Poll filesystem events without blocking the UI thread.
@@ -80,10 +75,6 @@ impl QueueWatcher {
             return Ok(Some(questions));
         }
         Ok(None)
-    }
-
-    pub fn snapshot(&self) -> Result<Vec<QueueQuestion>> {
-        load_queue_dir(&self.queue_dir)
     }
 }
 
@@ -130,49 +121,5 @@ fn is_queue_relevant(event: &Event) -> bool {
         EventKind::Modify(ModifyKind::Any) => true,
         EventKind::Any => true,
         _ => false,
-    }
-}
-
-/// Per-session watcher registry keyed by scratchpad queue path.
-pub struct QueueWatcherRegistry {
-    watchers: HashMap<PathBuf, QueueWatcher>,
-}
-
-impl QueueWatcherRegistry {
-    pub fn new() -> Self {
-        Self {
-            watchers: HashMap::new(),
-        }
-    }
-
-    pub fn ensure(&mut self, queue_dir: PathBuf) -> Result<()> {
-        if !self.watchers.contains_key(&queue_dir) {
-            let watcher = QueueWatcher::new(queue_dir.clone())?;
-            self.watchers.insert(queue_dir, watcher);
-        }
-        Ok(())
-    }
-
-    pub fn poll_all(&mut self) -> Result<HashMap<PathBuf, Vec<QueueQuestion>>> {
-        let keys: Vec<PathBuf> = self.watchers.keys().cloned().collect();
-        let mut updates = HashMap::new();
-        for key in keys {
-            if let Some(watcher) = self.watchers.get_mut(&key) {
-                if let Some(questions) = watcher.poll()? {
-                    updates.insert(key.clone(), questions);
-                }
-            }
-        }
-        Ok(updates)
-    }
-
-    pub fn remove(&mut self, queue_dir: &Path) {
-        self.watchers.remove(queue_dir);
-    }
-}
-
-impl Default for QueueWatcherRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }

@@ -1,29 +1,10 @@
 use tod_store::fleet::FleetStore;
 use crate::interview::TodPaths;
-use crate::interview::db::InterviewSession;
 use crate::process_bundle::{
     AgentLaunchContext, InterviewAgentPrompt, ProcessManifest, TodInstallPaths,
 };
 use std::path::Path;
 use std::sync::Arc;
-
-/// Build question maker bootstrap prompt via bundled process docs + DB scope export.
-pub fn question_maker_bootstrap_prompt(
-    fleet: &Arc<FleetStore>,
-    install: &TodInstallPaths,
-    manifest: &ProcessManifest,
-    paths: &TodPaths,
-    session: &InterviewSession,
-    scratchpad: &Path,
-) -> anyhow::Result<InterviewAgentPrompt> {
-    let fleet_projection = fleet.projection();
-    let guard = fleet_projection.lock().expect("fleet projection mutex");
-    let conn = guard.connection();
-    let ctx = AgentLaunchContext::question_maker_bootstrap(
-        &conn, install, manifest, paths, session, scratchpad,
-    )?;
-    Ok(ctx.prompt)
-}
 
 pub fn question_maker_replenish_prompt(
     fleet: &Arc<FleetStore>,

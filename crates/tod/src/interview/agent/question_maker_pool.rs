@@ -94,7 +94,7 @@ impl QuestionMakerPool {
             run_id,
             prompt: prompt.clone(),
         });
-        Ok(QuestionMakerSubmitAssignment::Queued { prompt })
+        Ok(QuestionMakerSubmitAssignment::Queued { _prompt: prompt })
     }
 
     fn on_slot_response(

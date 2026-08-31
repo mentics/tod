@@ -110,7 +110,7 @@ impl InterviewPool {
             run_id,
             prompt: prompt.clone(),
         });
-        Ok(AnswerSubmitAssignment::Queued { prompt })
+        Ok(AnswerSubmitAssignment::Queued { _prompt: prompt })
     }
 
     /// After a response completes: mark slot idle, recycle if at limit, drain queue.
@@ -436,5 +436,23 @@ mod tests {
             mgr.poll_run(&agent, r2),
             Some(AgentRunState::InFlight)
         ));
+    }
+}
+
+#[cfg(test)]
+impl AnswerProcessorPoolManager {
+    pub(crate) fn stats(
+        &self,
+        agent_config_id: &str,
+        settings: &AnswerProcessorSettings,
+    ) -> AnswerProcessorPoolStats {
+        self.pools
+            .get(agent_config_id)
+            .map(InterviewPool::stats)
+            .unwrap_or(AnswerProcessorPoolStats {
+                active: 0,
+                in_pool: 0,
+                max: settings.session_pool_size,
+            })
     }
 }

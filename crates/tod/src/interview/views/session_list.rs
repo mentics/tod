@@ -27,11 +27,6 @@ impl SessionListDelegate {
         &self.items
     }
 
-    pub fn selected_session_id(&self) -> Option<Uuid> {
-        self.selected_index
-            .and_then(|ix| self.items.get(ix.row).map(|s| s.id))
-    }
-
     pub fn select_by_id(&mut self, id: Uuid) -> Option<IndexPath> {
         let ix = self
             .items

@@ -39,11 +39,6 @@ impl QuestionListDelegate {
         &self.items
     }
 
-    pub fn selected_question_id(&self) -> Option<&str> {
-        self.selected_index
-            .and_then(|ix| self.items.get(ix.row).map(|q| q.id.as_str()))
-    }
-
     pub fn select_by_id(&mut self, id: &str) -> Option<IndexPath> {
         let ix = self
             .items

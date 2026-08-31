@@ -5,7 +5,7 @@ use super::manifest::ProcessManifest;
 use tod_store::fleet::repos::agent_config::AgentConfigRepo;
 use tod_store::fleet::workspace_cwd_for_agent;
 use crate::interview::agent::DeepDiveContext;
-use crate::interview::config::{base_interview_phase, path_for_storage};
+use crate::interview::config::base_interview_phase;
 use crate::interview::db::InterviewSession;
 use tod_store::outline::repos::NodeRepo;
 use anyhow::{Context, Result};
@@ -42,15 +42,15 @@ impl InterviewAgentPrompt {
 /// Everything needed to spawn an ACP agent run for an interview role.
 #[derive(Debug, Clone)]
 pub struct AgentLaunchContext {
-    pub cwd: PathBuf,
-    pub node_id: Uuid,
-    pub phase: String,
-    pub role_doc: PathBuf,
-    pub phase_doc: PathBuf,
-    pub base_doc: PathBuf,
-    pub scope_paths: Vec<PathBuf>,
-    pub session_config: PathBuf,
-    pub scratchpad: PathBuf,
+    _cwd: PathBuf,
+    _node_id: Uuid,
+    _phase: String,
+    _role_doc: PathBuf,
+    _phase_doc: PathBuf,
+    _base_doc: PathBuf,
+    _scope_paths: Vec<PathBuf>,
+    _session_config: PathBuf,
+    _scratchpad: PathBuf,
     pub prompt: InterviewAgentPrompt,
 }
 
@@ -85,15 +85,15 @@ impl AgentLaunchContext {
         )?;
         let turn = build_bootstrap_turn(session, &cwd, scratchpad, &session_config);
         Ok(Self {
-            cwd,
-            node_id,
-            phase,
-            role_doc,
-            phase_doc,
-            base_doc,
-            scope_paths,
-            session_config,
-            scratchpad: scratchpad.to_path_buf(),
+            _cwd: cwd,
+            _node_id: node_id,
+            _phase: phase,
+            _role_doc: role_doc,
+            _phase_doc: phase_doc,
+            _base_doc: base_doc,
+            _scope_paths: scope_paths,
+            _session_config: session_config,
+            _scratchpad: scratchpad.to_path_buf(),
             prompt: InterviewAgentPrompt {
                 session_prefix,
                 turn,
@@ -131,15 +131,15 @@ impl AgentLaunchContext {
         )?;
         let turn = build_turn_instruction(scratchpad, config_path, instruction);
         Ok(Self {
-            cwd,
-            node_id,
-            phase: phase.to_string(),
-            role_doc,
-            phase_doc,
-            base_doc,
-            scope_paths,
-            session_config: config_path.to_path_buf(),
-            scratchpad: scratchpad.to_path_buf(),
+            _cwd: cwd,
+            _node_id: node_id,
+            _phase: phase.to_string(),
+            _role_doc: role_doc,
+            _phase_doc: phase_doc,
+            _base_doc: base_doc,
+            _scope_paths: scope_paths,
+            _session_config: config_path.to_path_buf(),
+            _scratchpad: scratchpad.to_path_buf(),
             prompt: InterviewAgentPrompt {
                 session_prefix,
                 turn,
@@ -177,15 +177,15 @@ impl AgentLaunchContext {
         )?;
         let turn = build_turn_instruction(scratchpad, config_path, instruction);
         Ok(Self {
-            cwd,
-            node_id,
-            phase: phase.to_string(),
-            role_doc,
-            phase_doc,
-            base_doc,
-            scope_paths,
-            session_config: config_path.to_path_buf(),
-            scratchpad: scratchpad.to_path_buf(),
+            _cwd: cwd,
+            _node_id: node_id,
+            _phase: phase.to_string(),
+            _role_doc: role_doc,
+            _phase_doc: phase_doc,
+            _base_doc: base_doc,
+            _scope_paths: scope_paths,
+            _session_config: config_path.to_path_buf(),
+            _scratchpad: scratchpad.to_path_buf(),
             prompt: InterviewAgentPrompt {
                 session_prefix,
                 turn,
@@ -352,44 +352,6 @@ pub fn node_scratchpad_root(data_root: &Path, node_id: Uuid) -> PathBuf {
 
 pub fn session_scratchpad(data_root: &Path, node_id: Uuid, session_key: &str) -> PathBuf {
     node_scratchpad_root(data_root, node_id).join(session_key)
-}
-
-/// Write a starter interview-config.md for a new session.
-pub fn write_interview_config(
-    path: &Path,
-    node_id: Uuid,
-    phase: &str,
-    session_id: &str,
-    scratchpad: &Path,
-    role_doc: &Path,
-    scope_paths: &[PathBuf],
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let queue = scratchpad.join("queue");
-    let mut scope_lines = String::new();
-    for p in scope_paths {
-        scope_lines.push_str(&format!("  - {}\n", path_for_storage(p)));
-    }
-    let body = format!(
-        "# Interview config\n\
-         \n\
-         session_id: {session_id}\n\
-         node_id: {node_id}\n\
-         phase: {phase}\n\
-         scratchpad: {}\n\
-         queue: {}\n\
-         role_doc: {}\n\
-         scope:\n{scope_lines}\
-         queue_target: 8\n",
-        path_for_storage(scratchpad),
-        path_for_storage(&queue),
-        path_for_storage(role_doc),
-    );
-    std::fs::write(path, body)
-        .with_context(|| format!("write interview config {}", path.display()))?;
-    Ok(())
 }
 
 /// Read the bundled deep-dive role doc.
