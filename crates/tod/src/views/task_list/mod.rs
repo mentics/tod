@@ -3,6 +3,7 @@ mod delegate;
 mod edit;
 pub(crate) mod fixtures;
 mod from_ticket;
+use from_ticket::PendingTicketImport;
 mod model;
 mod row_menu;
 mod working_set;
@@ -15,9 +16,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
 use crate::interview::{TodPaths, interview_work_remains};
-use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use crate::process::interview_phase_for_lifecycle;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -42,6 +41,8 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt};
 use model::{ListWorkingSet as WorkingSet, filter_and_sort_tasks, nearest_visible_id};
 use row_menu::RowMenuKind;
+use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::outline::{CreatePosition, OutlineMutation, ReorderDirection};
 use working_set::{load_working_set, save_working_set};
 
 actions!(
@@ -227,6 +228,8 @@ pub struct TaskListView {
     pending_delete_task_id: Option<String>,
     pending_new_list: bool,
     pending_create_below: bool,
+    ticket_import_generation: u64,
+    pending_ticket_import: Option<PendingTicketImport>,
     status_line: String,
     config_dir: PathBuf,
     fleet: Arc<FleetStore>,
@@ -350,6 +353,8 @@ impl TaskListView {
             pending_delete_task_id: None,
             pending_new_list: false,
             pending_create_below: false,
+            ticket_import_generation: 0,
+            pending_ticket_import: None,
             status_line: String::new(),
             config_dir,
             fleet: fleet.clone(),
@@ -2020,6 +2025,9 @@ impl Render for TaskListView {
         if self.pending_create_below {
             self.pending_create_below = false;
             self.create_tree_node_and_edit(CreatePosition::Below, window, cx);
+        }
+        if let Some(pending) = self.pending_ticket_import.take() {
+            self.apply_pending_ticket_import(pending, window, cx);
         }
         if self.pending_abandon_edit {
             self.pending_abandon_edit = false;

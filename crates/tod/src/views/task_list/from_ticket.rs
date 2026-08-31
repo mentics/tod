@@ -1,4 +1,6 @@
 use gpui::{Context, Window};
+use tod_store::linear::{fetch_issue, resolve_api_key};
+use tod_store::settings::TodSettings;
 use uuid::Uuid;
 
 use tod_store::fleet::FleetMutation;
@@ -6,6 +8,21 @@ use tod_store::outline::types::Capability;
 use tod_store::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
+
+/// Outcome of starting a ticket import — may complete synchronously or fetch from Linear async.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketImportResult {
+    Pending,
+    Completed(bool),
+}
+
+pub(super) struct PendingTicketImport {
+    pub generation: u64,
+    pub ticket: String,
+    pub title: Option<String>,
+    pub error: Option<String>,
+    pub draft_node_id: Option<String>,
+}
 
 /// Returns true when `text` is a ticket id or Linear issue URL.
 pub fn is_ticket_id(text: &str) -> bool {
@@ -61,16 +78,16 @@ impl TaskListView {
     /// Link `ticket` to a new or draft node, or jump to an existing node with the same ticket.
     ///
     /// When `draft_node_id` is set (inline create), the empty draft row is updated or removed.
-    /// When `None` (compose), a new sibling node is created first.
+    /// When `None` (compose), a new sibling node is created after Linear fetch succeeds.
     pub(super) fn import_from_ticket(
         &mut self,
         ticket: &str,
         draft_node_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> TicketImportResult {
         let Some(ticket) = parse_ticket_reference(ticket) else {
-            return false;
+            return TicketImportResult::Completed(false);
         };
         let ticket = ticket.as_str();
 
@@ -84,40 +101,73 @@ impl TaskListView {
             self.finish_ticket_import(window, cx);
             self.select_created_task(&id, window, cx);
             self.status_line = format!("Selected existing task for {ticket}");
-            return true;
+            return TicketImportResult::Completed(true);
         }
 
-        if ticket.eq_ignore_ascii_case("ERR-500") {
-            crate::ui::toast::error_toast(window, cx, "Issue tracker fetch failed (stub)");
-            return false;
-        }
-
-        let node_id = match draft_node_id {
-            Some(id) => match Uuid::parse_str(id) {
-                Ok(uuid) => uuid,
-                Err(_) => return false,
-            },
-            None => match self.create_tree_node(CreatePosition::Below, window, cx) {
-                Some(id) => match Uuid::parse_str(&id) {
-                    Ok(uuid) => uuid,
-                    Err(_) => return false,
-                },
-                None => return false,
-            },
+        let settings = match TodSettings::load_from_path(&self.config_dir.join("tod.yml")) {
+            Ok(settings) => settings,
+            Err(err) => {
+                self.status_line = format!("Failed to load settings: {err}");
+                cx.notify();
+                return TicketImportResult::Completed(false);
+            }
+        };
+        let Some(api_key) = resolve_api_key(&settings) else {
+            crate::ui::toast::error_toast(
+                window,
+                cx,
+                "Linear API key not configured (set LINEAR_API_KEY or linear.api_key in tod.yml)",
+            );
+            return TicketImportResult::Completed(false);
         };
 
-        if let Err(err) = self.apply_ticket_to_node(node_id, ticket) {
-            self.status_line = format!("Failed to import {ticket}: {err}");
-            cx.notify();
-            return false;
-        }
+        let draft_node_id = draft_node_id.map(str::to_string);
+        let ticket_owned = ticket.to_string();
+        let ticket_for_fetch = ticket_owned.clone();
+        let api_key = api_key.clone();
 
-        self.finish_ticket_import(window, cx);
-        let id = node_id.to_string();
-        self.live_refresh(window, cx);
-        self.select_created_task(&id, window, cx);
-        self.status_line = format!("Created task from {ticket}");
-        true
+        self.ticket_import_generation = self.ticket_import_generation.wrapping_add(1);
+        let generation = self.ticket_import_generation;
+        self.status_line = format!("Fetching {ticket} from Linear…");
+        cx.notify();
+
+        let entity = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let fetch = std::thread::spawn(move || fetch_issue(&api_key, &ticket_for_fetch)).join();
+            let pending = match fetch {
+                Ok(Ok(issue)) => PendingTicketImport {
+                    generation,
+                    ticket: issue.identifier,
+                    title: Some(issue.title),
+                    error: None,
+                    draft_node_id: draft_node_id.clone(),
+                },
+                Ok(Err(err)) => PendingTicketImport {
+                    generation,
+                    ticket: ticket_owned.clone(),
+                    title: None,
+                    error: Some(err.to_string()),
+                    draft_node_id: draft_node_id.clone(),
+                },
+                Err(_) => PendingTicketImport {
+                    generation,
+                    ticket: ticket_owned.clone(),
+                    title: None,
+                    error: Some("Linear fetch thread panicked".into()),
+                    draft_node_id: draft_node_id.clone(),
+                },
+            };
+            let _ = entity.update(cx, |this, cx| {
+                if this.ticket_import_generation != generation {
+                    return;
+                }
+                this.pending_ticket_import = Some(pending);
+                cx.notify();
+            });
+        })
+        .detach();
+
+        TicketImportResult::Pending
     }
 
     pub(super) fn create_task_with_title(
@@ -164,11 +214,110 @@ impl TaskListView {
         self.status_line = format!("Created task: {title}");
     }
 
-    fn apply_ticket_to_node(&self, node_id: Uuid, ticket: &str) -> Result<(), String> {
+    pub(super) fn apply_pending_ticket_import(
+        &mut self,
+        pending: PendingTicketImport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ticket_import_generation != pending.generation {
+            return;
+        }
+        if let Some(message) = pending.error {
+            self.fail_ticket_import(&pending.ticket, message, window, cx);
+            return;
+        }
+        let Some(title) = pending.title else {
+            self.fail_ticket_import(
+                &pending.ticket,
+                "Linear returned no issue title".into(),
+                window,
+                cx,
+            );
+            return;
+        };
+        self.complete_ticket_import(
+            &pending.ticket,
+            &title,
+            pending.draft_node_id.as_deref(),
+            window,
+            cx,
+        );
+    }
+
+    fn complete_ticket_import(
+        &mut self,
+        ticket: &str,
+        title: &str,
+        draft_node_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let node_id = match draft_node_id {
+            Some(id) => match Uuid::parse_str(id) {
+                Ok(uuid) => uuid,
+                Err(_) => {
+                    self.fail_ticket_import(ticket, "Invalid draft node id".into(), window, cx);
+                    return;
+                }
+            },
+            None => match self.create_tree_node(CreatePosition::Below, window, cx) {
+                Some(id) => match Uuid::parse_str(&id) {
+                    Ok(uuid) => uuid,
+                    Err(_) => {
+                        self.fail_ticket_import(ticket, "Failed to create node".into(), window, cx);
+                        return;
+                    }
+                },
+                None => {
+                    self.fail_ticket_import(ticket, "Failed to create node".into(), window, cx);
+                    return;
+                }
+            },
+        };
+
+        if let Err(err) = self.apply_ticket_to_node(node_id, ticket, title) {
+            self.fail_ticket_import(ticket, err, window, cx);
+            return;
+        }
+
+        self.finish_ticket_import(window, cx);
+        if self.compose_open {
+            self.compose_open = false;
+            self.selection_before_compose = None;
+            self.compose_title_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+        }
+        let id = node_id.to_string();
+        self.live_refresh(window, cx);
+        self.select_created_task(&id, window, cx);
+        self.status_line = format!("Created task from {ticket}: {title}");
+        cx.notify();
+    }
+
+    fn fail_ticket_import(
+        &mut self,
+        ticket: &str,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::ui::toast::error_toast(window, cx, &message);
+        self.status_line = format!("Failed to import {ticket}: {message}");
+        cx.notify();
+    }
+
+    fn apply_ticket_to_node(
+        &self,
+        node_id: Uuid,
+        ticket: &str,
+        title: &str,
+    ) -> Result<(), String> {
         self.fleet
             .enqueue_outline(OutlineMutation::UpdateNodeTitle {
                 node_id,
-                title: ticket.to_string(),
+                title: title.to_string(),
             })
             .map_err(|err| err.to_string())?;
         self.fleet

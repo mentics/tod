@@ -1,18 +1,19 @@
 //! Per-session interactive agent chat windows.
 
-use tod_store::fleet::FleetStore;
-use tod_store::fleet::provision::resolve_agent_workspace;
-use tod_store::fleet::writer::FleetMutation;
 use crate::interview::TodPaths;
 use crate::interview::agent::SharedAgent;
 use crate::interview::settings::TodSettings;
 use crate::views::interactive_agent::InteractiveAgentView;
 use gpui::{
-    AnyWindowHandle, App, AppContext, Bounds, WindowBounds, WindowOptions, point, px, size,
+    AnyWindowHandle, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point,
+    px, size,
 };
-use gpui_component::{Root, TitleBar};
+use gpui_component::Root;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::provision::resolve_agent_workspace;
+use tod_store::fleet::writer::FleetMutation;
 
 #[derive(Debug, Clone)]
 pub struct InteractiveAgentOpenParams {
@@ -191,14 +192,20 @@ impl InteractiveAgentWindowControl {
             .get_agent(&params.config_id)
             .map_err(|err| format!("load agent config: {err}"))?
             .ok_or_else(|| format!("agent config {} not found", params.config_id))?;
-        let workspace_cwd = resolve_agent_workspace(
-            &fleet,
-            &paths,
-            &settings,
-            &agent_row,
-            &params.task_id,
-        )
-        .map_err(|err| format!("workspace: {err:#}"))?;
+        let workspace_cwd =
+            resolve_agent_workspace(&fleet, &paths, &settings, &agent_row, &params.task_id)
+                .map_err(|err| format!("workspace: {err:#}"))?;
+
+        let session_number = fleet
+            .list_runs_for_config(&params.config_id)
+            .ok()
+            .and_then(|runs| {
+                runs.iter()
+                    .find(|run| run.id == params.session_run_id)
+                    .map(|run| run.run_number)
+            })
+            .unwrap_or(0);
+        let window_title = format!("Session {} · {}", session_number, params.config_id);
 
         let session_run_id = params.session_run_id.clone();
         let task_id = params.task_id.clone();
@@ -208,7 +215,10 @@ impl InteractiveAgentWindowControl {
         let opened = cx
             .open_window(
                 WindowOptions {
-                    titlebar: Some(TitleBar::title_bar_options()),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(window_title.into()),
+                        ..Default::default()
+                    }),
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: point(px(120.), px(120.)),
                         size: size(px(720.), px(640.)),

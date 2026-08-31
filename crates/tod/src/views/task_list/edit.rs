@@ -4,7 +4,7 @@ use gpui_component::input::InputState;
 use tod_store::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
-use super::from_ticket::parse_ticket_reference;
+use super::from_ticket::{TicketImportResult, parse_ticket_reference};
 
 impl TaskListView {
     pub(super) fn is_editing(&self) -> bool {
@@ -158,7 +158,10 @@ impl TaskListView {
         let title = self.inline_edit_title(cx);
         if self.is_draft_edit() {
             if let Some(ticket) = parse_ticket_reference(&title) {
-                return self.import_from_ticket(&ticket, Some(&task_id), window, cx);
+                return match self.import_from_ticket(&ticket, Some(&task_id), window, cx) {
+                    TicketImportResult::Pending => false,
+                    TicketImportResult::Completed(ok) => ok,
+                };
             }
         }
         if title.is_empty() {

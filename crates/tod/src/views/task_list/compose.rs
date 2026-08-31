@@ -3,7 +3,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputState};
 
 use super::TaskListView;
-use super::from_ticket::parse_ticket_reference;
+use super::from_ticket::{TicketImportResult, parse_ticket_reference};
 
 impl TaskListView {
     pub(super) fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -65,25 +65,29 @@ impl TaskListView {
             return;
         }
 
-        let success = if let Some(ticket) = parse_ticket_reference(&value) {
+        let import_result = if let Some(ticket) = parse_ticket_reference(&value) {
             self.import_from_ticket(&ticket, None, window, cx)
         } else {
             self.create_task_with_title(&value, window, cx);
-            true
+            TicketImportResult::Completed(true)
         };
 
-        if success {
-            self.compose_open = false;
-            self.selection_before_compose = None;
-            self.compose_title_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.focus_handle.focus(window);
-            cx.notify();
-        } else {
-            self.compose_title_input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+        match import_result {
+            TicketImportResult::Pending => {}
+            TicketImportResult::Completed(true) => {
+                self.compose_open = false;
+                self.selection_before_compose = None;
+                self.compose_title_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                self.focus_handle.focus(window);
+                cx.notify();
+            }
+            TicketImportResult::Completed(false) => {
+                self.compose_title_input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                });
+            }
         }
     }
 

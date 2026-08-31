@@ -1,16 +1,13 @@
 //! Interactive fleet-agent chat window — prompt in, replies out.
 
 use crate::app::InteractiveAgentWindowControl;
-use tod_store::fleet::repos::transcript::TranscriptTurn;
-use tod_store::fleet::{FleetMutation, FleetStore};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
-use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Timer, Window, actions, div, px,
+    ParentElement, Render, Styled, Timer, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
@@ -19,6 +16,8 @@ use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tod_store::fleet::repos::transcript::TranscriptTurn;
+use tod_store::fleet::{FleetMutation, FleetStore};
 
 const INTERACTIVE_AGENT_CONTEXT: &str = "InteractiveAgent";
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -39,7 +38,6 @@ pub struct InteractiveAgentView {
     task_id: String,
     config_id: String,
     session_run_id: String,
-    session_number: i64,
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     workspace_cwd: PathBuf,
@@ -49,6 +47,7 @@ pub struct InteractiveAgentView {
     pending: Option<PendingRun>,
     status_line: String,
     error_banner: Option<String>,
+    poll_lock_misses: u32,
     focus_handle: FocusHandle,
     _poll_task: gpui::Task<()>,
 }
@@ -65,15 +64,6 @@ impl InteractiveAgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session_number = fleet
-            .list_runs_for_config(&config_id)
-            .ok()
-            .and_then(|runs| {
-                runs.iter()
-                    .find(|run| run.id == session_run_id)
-                    .map(|run| run.run_number)
-            })
-            .unwrap_or(0);
         let conversation = fleet
             .list_transcript_for_agent(&session_run_id)
             .ok()
@@ -84,7 +74,7 @@ impl InteractiveAgentView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(4)
-                .placeholder("Enter a prompt… (Ctrl+Enter to submit)")
+                .placeholder("Enter a prompt… (⌘/Ctrl+Enter to submit)")
         });
 
         let poll_entity = cx.weak_entity();
@@ -103,7 +93,6 @@ impl InteractiveAgentView {
             task_id,
             config_id,
             session_run_id,
-            session_number,
             fleet,
             agent,
             workspace_cwd,
@@ -113,6 +102,7 @@ impl InteractiveAgentView {
             pending: None,
             status_line: "Ready".into(),
             error_banner: None,
+            poll_lock_misses: 0,
             focus_handle: cx.focus_handle(),
             _poll_task,
         };
@@ -214,12 +204,16 @@ impl InteractiveAgentView {
         let Some(run_id) = self.pending.as_ref().and_then(|p| p.run_id) else {
             return;
         };
-        let Some(state) = self
-            .agent
-            .try_lock()
-            .ok()
-            .and_then(|mut agent| agent.poll_run(run_id))
-        else {
+        let Ok(mut agent) = self.agent.try_lock() else {
+            self.poll_lock_misses = self.poll_lock_misses.saturating_add(1);
+            if self.poll_lock_misses == 20 {
+                self.status_line = "Waiting for agent lock (another view may be using it)…".into();
+                cx.notify();
+            }
+            return;
+        };
+        self.poll_lock_misses = 0;
+        let Some(state) = agent.poll_run(run_id) else {
             return;
         };
 
@@ -413,11 +407,12 @@ impl Render for InteractiveAgentView {
         let user_label = theme.primary;
         let agent_label = theme.accent;
         let in_flight = self.in_flight();
-        let title = format!("Session {} · {}", self.session_number, self.config_id);
         let conversation = self.conversation.clone();
         let pending_user = self.pending.as_ref().map(|p| p.user_text.clone());
         let show_empty = conversation.is_empty() && pending_user.is_none();
         let pending_turn_ix = conversation.len();
+        const PROMPT_ROWS: f32 = 4.;
+        let prompt_height = window.line_height() * PROMPT_ROWS;
 
         div()
             .key_context(INTERACTIVE_AGENT_CONTEXT)
@@ -434,42 +429,24 @@ impl Render for InteractiveAgentView {
                 this.close(window, cx);
             }))
             .child(
-                h_flex()
+                div()
                     .flex_shrink_0()
-                    .items_center()
-                    .gap_2()
                     .px_4()
-                    .py_3()
+                    .py_2()
                     .border_b_1()
                     .border_color(border)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(div().text_sm().font_semibold().child(title))
-                            .child(div().text_xs().text_color(muted).child(format!(
-                                "Task {} · {}",
-                                self.task_id,
-                                self.workspace_cwd.display()
-                            ))),
-                    )
-                    .child(chrome_control_with_shortcut(
-                        Button::new("interactive-agent-close")
-                            .label("Close")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close(window, cx);
-                            })),
-                        window,
-                        &InteractiveAgentClose,
-                        INTERACTIVE_AGENT_CONTEXT,
-                        cx,
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!(
+                        "Task {} · {}",
+                        self.task_id,
+                        self.workspace_cwd.display()
                     )),
             )
             .when_some(self.error_banner.clone(), |el, msg| {
                 el.child(
                     div()
+                        .flex_shrink_0()
                         .px_4()
                         .py_2()
                         .bg(gpui::red())
@@ -482,122 +459,122 @@ impl Render for InteractiveAgentView {
             .child(
                 v_flex()
                     .flex_1()
-                    .gap_3()
+                    .min_h_0()
+                    .gap_1()
                     .p_4()
+                    .pb_0()
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(muted)
-                                    .child("Replies"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h(px(160.))
-                                    .overflow_y_scrollbar()
-                                    .v_flex()
-                                    .gap_3()
-                                    .when(show_empty, |el| {
-                                        el.child(
-                                            div()
-                                                .text_sm()
-                                                .text_color(muted)
-                                                .child("Agent replies will appear here…"),
-                                        )
-                                    })
-                                    .children(conversation.iter().enumerate().map(
-                                        |(turn_ix, (user, assistant))| {
-                                            v_flex()
-                                                .id(("interactive-agent-turn", turn_ix))
-                                                .gap_2()
-                                                .child(render_user_panel(
-                                                    turn_ix,
-                                                    user.clone(),
-                                                    border,
-                                                    panel_bg,
-                                                    user_label,
-                                                    foreground,
-                                                    window,
-                                                    cx,
-                                                ))
-                                                .child(render_agent_panel(
-                                                    turn_ix,
-                                                    assistant.clone(),
-                                                    border,
-                                                    panel_bg,
-                                                    agent_label,
-                                                    foreground,
-                                                    window,
-                                                    cx,
-                                                ))
-                                        },
-                                    ))
-                                    .when_some(pending_user, |el, user_text| {
-                                        el.child(
-                                            v_flex()
-                                                .id(("interactive-agent-turn", pending_turn_ix))
-                                                .gap_2()
-                                                .child(render_user_panel(
-                                                    pending_turn_ix,
-                                                    user_text,
-                                                    border,
-                                                    panel_bg,
-                                                    user_label,
-                                                    foreground,
-                                                    window,
-                                                    cx,
-                                                ))
-                                                .child(render_agent_thinking_panel(
-                                                    pending_turn_ix,
-                                                    border,
-                                                    panel_bg,
-                                                    agent_label,
-                                                    muted,
-                                                )),
-                                        )
-                                    }),
-                            ),
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("Replies"),
                     )
                     .child(
-                        v_flex()
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .v_flex()
+                            .gap_3()
+                            .when(show_empty, |el| {
+                                el.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child("Agent replies will appear here…"),
+                                )
+                            })
+                            .children(conversation.iter().enumerate().map(
+                                |(turn_ix, (user, assistant))| {
+                                    v_flex()
+                                        .id(("interactive-agent-turn", turn_ix))
+                                        .gap_2()
+                                        .child(render_user_panel(
+                                            turn_ix,
+                                            user.clone(),
+                                            border,
+                                            panel_bg,
+                                            user_label,
+                                            foreground,
+                                            window,
+                                            cx,
+                                        ))
+                                        .child(render_agent_panel(
+                                            turn_ix,
+                                            assistant.clone(),
+                                            border,
+                                            panel_bg,
+                                            agent_label,
+                                            foreground,
+                                            window,
+                                            cx,
+                                        ))
+                                },
+                            ))
+                            .when_some(pending_user, |el, user_text| {
+                                el.child(
+                                    v_flex()
+                                        .id(("interactive-agent-turn", pending_turn_ix))
+                                        .gap_2()
+                                        .child(render_user_panel(
+                                            pending_turn_ix,
+                                            user_text,
+                                            border,
+                                            panel_bg,
+                                            user_label,
+                                            foreground,
+                                            window,
+                                            cx,
+                                        ))
+                                        .child(render_agent_thinking_panel(
+                                            pending_turn_ix,
+                                            border,
+                                            panel_bg,
+                                            agent_label,
+                                            muted,
+                                        )),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .p_4()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("Prompt"),
+                    )
+                    .child(
+                        Input::new(&self.prompt_input)
+                            .disabled(in_flight)
+                            .w_full()
+                            .h(prompt_height),
+                    )
+                    .child(
+                        h_flex()
                             .gap_2()
+                            .items_center()
+                            .child(
+                                Button::new("interactive-agent-submit")
+                                    .label("Submit prompt")
+                                    .primary()
+                                    .compact()
+                                    .disabled(in_flight)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_prompt(window, cx);
+                                    })),
+                            )
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_semibold()
                                     .text_color(muted)
-                                    .child("Prompt"),
-                            )
-                            .child(
-                                div().min_h(px(96.)).child(
-                                    Input::new(&self.prompt_input).disabled(in_flight).w_full(),
-                                ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        Button::new("interactive-agent-submit")
-                                            .label("Submit prompt")
-                                            .primary()
-                                            .compact()
-                                            .disabled(in_flight)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_prompt(window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(muted)
-                                            .child("Ctrl+Enter to submit · Enter for newline"),
-                                    ),
+                                    .child("Ctrl+Enter to submit · Enter for newline"),
                             ),
                     ),
             )
@@ -620,16 +597,23 @@ impl Render for InteractiveAgentView {
 
 pub fn register_interactive_agent_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, InteractiveAgentClose, INTERACTIVE_AGENT_CONTEXT);
-    cx.bind_keys([
-        gpui::KeyBinding::new(
-            "ctrl-enter",
-            SubmitInteractivePrompt,
-            Some(key_context::including_input(INTERACTIVE_AGENT_CONTEXT)),
-        ),
-        gpui::KeyBinding::new(
-            "ctrl-enter",
-            SubmitInteractivePrompt,
-            Some(INTERACTIVE_AGENT_CONTEXT),
-        ),
-    ]);
+    let submit_bindings = [
+        "ctrl-enter",
+        #[cfg(target_os = "macos")]
+        "cmd-enter",
+    ];
+    for keystroke in submit_bindings {
+        cx.bind_keys([
+            gpui::KeyBinding::new(
+                keystroke,
+                SubmitInteractivePrompt,
+                Some(key_context::including_input(INTERACTIVE_AGENT_CONTEXT)),
+            ),
+            gpui::KeyBinding::new(
+                keystroke,
+                SubmitInteractivePrompt,
+                Some(INTERACTIVE_AGENT_CONTEXT),
+            ),
+        ]);
+    }
 }
