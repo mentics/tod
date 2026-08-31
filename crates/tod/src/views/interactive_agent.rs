@@ -6,7 +6,7 @@ use crate::fleet::{FleetMutation, FleetStore};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -45,7 +45,6 @@ pub struct InteractiveAgentView {
     workspace_cwd: PathBuf,
     window_control: InteractiveAgentWindowControl,
     prompt_input: Entity<InputState>,
-    reply_display: String,
     conversation: Vec<(String, String)>,
     pending: Option<PendingRun>,
     status_line: String,
@@ -110,7 +109,6 @@ impl InteractiveAgentView {
             workspace_cwd,
             window_control,
             prompt_input,
-            reply_display: String::new(),
             conversation,
             pending: None,
             status_line: "Ready".into(),
@@ -118,38 +116,11 @@ impl InteractiveAgentView {
             focus_handle: cx.focus_handle(),
             _poll_task,
         };
-        view.refresh_reply_display();
         view
     }
 
     fn in_flight(&self) -> bool {
         self.pending.is_some()
-    }
-
-    fn format_replies(&self) -> String {
-        let mut out = String::new();
-        for (user, assistant) in &self.conversation {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str("You:\n");
-            out.push_str(user);
-            out.push_str("\n\nAgent:\n");
-            out.push_str(assistant);
-        }
-        if let Some(pending) = &self.pending {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str("You:\n");
-            out.push_str(&pending.user_text);
-            out.push_str("\n\nAgent:\n(thinking…)");
-        }
-        out
-    }
-
-    fn refresh_reply_display(&mut self) {
-        self.reply_display = self.format_replies();
     }
 
     fn build_prompt(&self, new_user_text: &str) -> String {
@@ -168,7 +139,6 @@ impl InteractiveAgentView {
         self.pending = None;
         self.error_banner = Some(message);
         self.status_line = "Submit failed".into();
-        self.refresh_reply_display();
         cx.notify();
     }
 
@@ -204,7 +174,6 @@ impl InteractiveAgentView {
             response_id: response_id.clone(),
             user_text: text.clone(),
         });
-        self.refresh_reply_display();
 
         if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
             id: prompt_id.clone(),
@@ -290,12 +259,10 @@ impl InteractiveAgentView {
                 }
                 self.status_line = "Agent replied".into();
                 self.error_banner = None;
-                self.refresh_reply_display();
             }
             AgentRunState::Failure(message) => {
                 self.error_banner = Some(message);
                 self.status_line = "Agent run failed".into();
-                self.refresh_reply_display();
             }
         }
         cx.notify();
@@ -305,6 +272,103 @@ impl InteractiveAgentView {
         self.window_control.remove_handle(&self.session_run_id);
         window.remove_window();
     }
+}
+
+fn render_user_panel(
+    turn_ix: usize,
+    text: impl Into<gpui::SharedString>,
+    border: gpui::Hsla,
+    panel_bg: gpui::Hsla,
+    label_color: gpui::Hsla,
+    foreground: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let text = text.into();
+    v_flex()
+        .id(("interactive-agent-user", turn_ix))
+        .gap_1()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(panel_bg)
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(label_color)
+                .child("You"),
+        )
+        .child(
+            selectable_text(("interactive-agent-user-text", turn_ix), text, window, cx)
+                .text_sm()
+                .text_color(foreground),
+        )
+}
+
+fn render_agent_panel(
+    turn_ix: usize,
+    text: impl Into<gpui::SharedString>,
+    border: gpui::Hsla,
+    panel_bg: gpui::Hsla,
+    label_color: gpui::Hsla,
+    foreground: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let text = text.into();
+    v_flex()
+        .id(("interactive-agent-agent", turn_ix))
+        .gap_1()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(panel_bg)
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(label_color)
+                .child("Agent"),
+        )
+        .child(
+            selectable_markdown(("interactive-agent-agent-text", turn_ix), text, window, cx)
+                .text_sm()
+                .text_color(foreground),
+        )
+}
+
+fn render_agent_thinking_panel(
+    turn_ix: usize,
+    border: gpui::Hsla,
+    panel_bg: gpui::Hsla,
+    label_color: gpui::Hsla,
+    muted: gpui::Hsla,
+) -> impl IntoElement {
+    v_flex()
+        .id(("interactive-agent-agent", turn_ix))
+        .gap_1()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(panel_bg)
+        .child(
+            div()
+                .text_xs()
+                .font_semibold()
+                .text_color(label_color)
+                .child("Agent"),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(muted)
+                .italic()
+                .child("Thinking…"),
+        )
 }
 
 fn conversation_from_transcript(turns: &[TranscriptTurn]) -> Vec<(String, String)> {
@@ -344,9 +408,16 @@ impl Render for InteractiveAgentView {
         let theme = cx.theme();
         let border = theme.border;
         let muted = theme.muted_foreground;
+        let foreground = theme.foreground;
+        let panel_bg = theme.muted;
+        let user_label = theme.primary;
+        let agent_label = theme.accent;
         let in_flight = self.in_flight();
         let title = format!("Session {} · {}", self.session_number, self.config_id);
-        let reply_display = self.reply_display.clone();
+        let conversation = self.conversation.clone();
+        let pending_user = self.pending.as_ref().map(|p| p.user_text.clone());
+        let show_empty = conversation.is_empty() && pending_user.is_none();
+        let pending_turn_ix = conversation.len();
 
         div()
             .key_context(INTERACTIVE_AGENT_CONTEXT)
@@ -428,12 +499,10 @@ impl Render for InteractiveAgentView {
                                 div()
                                     .flex_1()
                                     .min_h(px(160.))
-                                    .p_2()
-                                    .border_1()
-                                    .border_color(border)
-                                    .rounded_md()
                                     .overflow_y_scrollbar()
-                                    .when(reply_display.is_empty(), |el| {
+                                    .v_flex()
+                                    .gap_3()
+                                    .when(show_empty, |el| {
                                         el.child(
                                             div()
                                                 .text_sm()
@@ -441,13 +510,56 @@ impl Render for InteractiveAgentView {
                                                 .child("Agent replies will appear here…"),
                                         )
                                     })
-                                    .when(!reply_display.is_empty(), |el| {
-                                        el.child(selectable_text(
-                                            "interactive-agent-replies",
-                                            reply_display,
-                                            window,
-                                            cx,
-                                        ))
+                                    .children(conversation.iter().enumerate().map(
+                                        |(turn_ix, (user, assistant))| {
+                                            v_flex()
+                                                .id(("interactive-agent-turn", turn_ix))
+                                                .gap_2()
+                                                .child(render_user_panel(
+                                                    turn_ix,
+                                                    user.clone(),
+                                                    border,
+                                                    panel_bg,
+                                                    user_label,
+                                                    foreground,
+                                                    window,
+                                                    cx,
+                                                ))
+                                                .child(render_agent_panel(
+                                                    turn_ix,
+                                                    assistant.clone(),
+                                                    border,
+                                                    panel_bg,
+                                                    agent_label,
+                                                    foreground,
+                                                    window,
+                                                    cx,
+                                                ))
+                                        },
+                                    ))
+                                    .when_some(pending_user, |el, user_text| {
+                                        el.child(
+                                            v_flex()
+                                                .id(("interactive-agent-turn", pending_turn_ix))
+                                                .gap_2()
+                                                .child(render_user_panel(
+                                                    pending_turn_ix,
+                                                    user_text,
+                                                    border,
+                                                    panel_bg,
+                                                    user_label,
+                                                    foreground,
+                                                    window,
+                                                    cx,
+                                                ))
+                                                .child(render_agent_thinking_panel(
+                                                    pending_turn_ix,
+                                                    border,
+                                                    panel_bg,
+                                                    agent_label,
+                                                    muted,
+                                                )),
+                                        )
                                     }),
                             ),
                     )

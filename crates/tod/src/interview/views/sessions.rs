@@ -776,7 +776,7 @@ impl SessionsView {
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 session_scratchpad(
-                    self.paths.repo_root(),
+                    self.paths.data_root(),
                     session.node_id,
                     &session.id.to_string(),
                 )
@@ -856,7 +856,7 @@ impl SessionsView {
                 gate: bootstrap_gate,
                 session_id,
             };
-            let repo_root = store_paths.repo_root().to_path_buf();
+            let data_root = store_paths.data_root().to_path_buf();
             let handle = {
                 let mut provider = agent.lock().expect("agent lock");
                 provider.start_question_maker_replenishment(
@@ -920,9 +920,9 @@ impl SessionsView {
                 if !synced {
                     let store = SessionStore::open(fleet.clone());
                     let sync_result = if agent_finished {
-                        sync_scaffolding_from_disk_after_bootstrap(&store, &repo_root, session_id)
+                        sync_scaffolding_from_disk_after_bootstrap(&store, &data_root, session_id)
                     } else {
-                        sync_scaffolding_from_disk(&store, &repo_root, session_id)
+                        sync_scaffolding_from_disk(&store, &data_root, session_id)
                     };
                     match sync_result {
                         Ok(true) => {

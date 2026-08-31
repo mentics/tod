@@ -632,7 +632,7 @@ impl WorkspaceView {
             return PathBuf::from(p);
         }
         let root = TodPaths::discover()
-            .map(|p| p.repo_root().to_path_buf())
+            .map(|p| p.data_root().to_path_buf())
             .unwrap_or_else(|_| PathBuf::from("."));
         session_scratchpad(&root, self.session.node_id, &self.session.id.to_string())
     }
@@ -906,7 +906,7 @@ impl WorkspaceView {
         let Ok(paths) = TodPaths::discover() else {
             return false;
         };
-        match sync_scaffolding_from_disk(&self.store, paths.repo_root(), self.session.id) {
+        match sync_scaffolding_from_disk(&self.store, paths.data_root(), self.session.id) {
             Ok(true) => {}
             Ok(false) | Err(_) => return false,
         }

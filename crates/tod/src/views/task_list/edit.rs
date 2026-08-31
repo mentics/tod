@@ -4,6 +4,7 @@ use gpui_component::input::InputState;
 use crate::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
+use super::from_ticket::parse_ticket_reference;
 
 impl TaskListView {
     pub(super) fn is_editing(&self) -> bool {
@@ -107,7 +108,10 @@ impl TaskListView {
             return;
         }
 
-        if !is_draft && !title.is_empty() && title != self.edit_original_title.as_deref().unwrap_or("") {
+        if !is_draft
+            && !title.is_empty()
+            && title != self.edit_original_title.as_deref().unwrap_or("")
+        {
             let _ = self.commit_inline_edit(window, cx);
             self.focus_list(window, cx);
             cx.notify();
@@ -152,6 +156,11 @@ impl TaskListView {
             return false;
         };
         let title = self.inline_edit_title(cx);
+        if self.is_draft_edit() {
+            if let Some(ticket) = parse_ticket_reference(&title) {
+                return self.import_from_ticket(&ticket, Some(&task_id), window, cx);
+            }
+        }
         if title.is_empty() {
             if self.is_draft_edit() {
                 self.draft_node_id = None;

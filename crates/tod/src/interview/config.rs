@@ -1,4 +1,5 @@
 use crate::interview::db::{InterviewSession, SessionStore};
+use crate::interview::paths::TodPaths;
 use crate::process_bundle::node_scratchpad_root;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -160,6 +161,19 @@ pub fn find_bootstrap_config_for_session(
             .join("nodes")
             .join(session.node_id.to_string()),
     );
+    // Pre-fix bootstrap wrote under git checkout root instead of data root.
+    if let Ok(paths) = TodPaths::discover() {
+        let repo = paths.repo_root();
+        if repo != data_root {
+            search_roots.push(
+                repo.join("agent")
+                    .join("nodes")
+                    .join(session.node_id.to_string())
+                    .join("scratchpad")
+                    .join("interviews"),
+            );
+        }
+    }
 
     let mut best: Option<(i64, PathBuf)> = None;
     let mut seen = HashMap::new();

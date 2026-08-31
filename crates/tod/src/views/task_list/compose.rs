@@ -3,7 +3,7 @@ use gpui_component::ActiveTheme;
 use gpui_component::input::{Input, InputState};
 
 use super::TaskListView;
-use super::from_ticket::is_ticket_id;
+use super::from_ticket::parse_ticket_reference;
 
 impl TaskListView {
     pub(super) fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -65,8 +65,8 @@ impl TaskListView {
             return;
         }
 
-        let success = if is_ticket_id(&value) {
-            self.import_from_ticket(&value, window, cx)
+        let success = if let Some(ticket) = parse_ticket_reference(&value) {
+            self.import_from_ticket(&ticket, None, window, cx)
         } else {
             self.create_task_with_title(&value, window, cx);
             true
@@ -100,7 +100,7 @@ impl TaskListView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .mb_1()
-                    .child("New task — enter a title or ticket id"),
+                    .child("New task — enter a title, ticket id, or Linear URL"),
             )
             .child(Input::new(&self.compose_title_input).w_full())
     }

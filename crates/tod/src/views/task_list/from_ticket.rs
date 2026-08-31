@@ -1,21 +1,87 @@
 use gpui::{Context, Window};
+use uuid::Uuid;
+
+use crate::fleet::FleetMutation;
+use crate::outline::types::Capability;
+use crate::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
 
-/// Returns true when `text` looks like an issue-tracker ticket id (e.g. TOD-142).
+/// Returns true when `text` is a ticket id or Linear issue URL.
 pub fn is_ticket_id(text: &str) -> bool {
-    text.len() >= 3 && text.contains('-') && text.chars().all(|c| c != ' ')
+    parse_ticket_reference(text).is_some()
+}
+
+/// Extract a ticket id (e.g. `TOD-142`) from a bare id or Linear issue URL.
+pub fn parse_ticket_reference(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if is_bare_ticket_id(text) {
+        return Some(text.to_string());
+    }
+    if text.contains("linear.app") || text.starts_with("http://") || text.starts_with("https://") {
+        return ticket_from_url(text);
+    }
+    None
+}
+
+fn is_bare_ticket_id(text: &str) -> bool {
+    is_ticket_id_segment(text) && !text.contains('/') && !text.contains(':')
+}
+
+fn is_ticket_id_segment(segment: &str) -> bool {
+    let Some((prefix, suffix)) = segment.rsplit_once('-') else {
+        return false;
+    };
+    segment.len() >= 3
+        && !prefix.is_empty()
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_')
+        && !suffix.is_empty()
+        && suffix.chars().all(|c| c.is_ascii_digit())
+}
+
+fn ticket_from_url(text: &str) -> Option<String> {
+    let path = text.split(['?', '#']).next()?;
+    for segment in path.split('/').rev() {
+        if segment.is_empty() {
+            continue;
+        }
+        if is_ticket_id_segment(segment) {
+            return Some(segment.to_string());
+        }
+    }
+    None
 }
 
 impl TaskListView {
+    /// Link `ticket` to a new or draft node, or jump to an existing node with the same ticket.
+    ///
+    /// When `draft_node_id` is set (inline create), the empty draft row is updated or removed.
+    /// When `None` (compose), a new sibling node is created first.
     pub(super) fn import_from_ticket(
         &mut self,
         ticket: &str,
+        draft_node_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let Some(ticket) = parse_ticket_reference(ticket) else {
+            return false;
+        };
+        let ticket = ticket.as_str();
+
         if let Some(existing) = self.find_by_ticket_id(ticket) {
             let id = existing.id.clone();
+            if let Some(draft_id) = draft_node_id {
+                if draft_id != id {
+                    self.remove_outline_node(draft_id, window, cx);
+                }
+            }
+            self.finish_ticket_import(window, cx);
             self.select_created_task(&id, window, cx);
             self.status_line = format!("Selected existing task for {ticket}");
             return true;
@@ -26,28 +92,29 @@ impl TaskListView {
             return false;
         }
 
-        let title = ticket.to_string();
-        let id = format!("linear-{}", ticket.to_lowercase().replace('-', "_"));
-        let task = super::TaskItem {
-            id: id.clone(),
-            ticket_id: Some(ticket.to_string()),
-            title,
-            lifecycle: "proposed".into(),
-            entity_path: std::path::PathBuf::from(format!("linear/{ticket}")),
-            tags: vec!["linear".into()],
-            agents: vec![],
-            shells: vec![],
-            interaction_timestamp: chrono::Utc::now(),
-            tree_ordinal: 0,
-            depth: 0,
-            collapsed: false,
-            is_work_node: true,
-            has_spec: false,
-            requirement_count: 0,
-            constraint_count: 0,
-            has_children: false,
+        let node_id = match draft_node_id {
+            Some(id) => match Uuid::parse_str(id) {
+                Ok(uuid) => uuid,
+                Err(_) => return false,
+            },
+            None => match self.create_tree_node(CreatePosition::Below, window, cx) {
+                Some(id) => match Uuid::parse_str(&id) {
+                    Ok(uuid) => uuid,
+                    Err(_) => return false,
+                },
+                None => return false,
+            },
         };
-        self.all_tasks.push(task);
+
+        if let Err(err) = self.apply_ticket_to_node(node_id, ticket) {
+            self.status_line = format!("Failed to import {ticket}: {err}");
+            cx.notify();
+            return false;
+        }
+
+        self.finish_ticket_import(window, cx);
+        let id = node_id.to_string();
+        self.live_refresh(window, cx);
         self.select_created_task(&id, window, cx);
         self.status_line = format!("Created task from {ticket}");
         true
@@ -59,40 +126,82 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let slug = title
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string();
-        let id = if slug.is_empty() {
-            format!("task-{}", chrono::Utc::now().timestamp_millis())
-        } else {
-            format!("task-{slug}")
+        let Some(id) = self.create_tree_node(CreatePosition::Below, window, cx) else {
+            return;
         };
-        let task = super::TaskItem {
-            id: id.clone(),
-            ticket_id: None,
-            title: title.to_string(),
-            lifecycle: "proposed".into(),
-            entity_path: std::path::PathBuf::from(format!("tasks/{id}")),
-            tags: vec![],
-            agents: vec![],
-            shells: vec![],
-            interaction_timestamp: chrono::Utc::now(),
-            tree_ordinal: 0,
-            depth: 0,
-            collapsed: false,
-            is_work_node: true,
-            has_spec: false,
-            requirement_count: 0,
-            constraint_count: 0,
-            has_children: false,
+        let Ok(node_id) = Uuid::parse_str(&id) else {
+            return;
         };
-        self.all_tasks.push(task);
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+                node_id,
+                title: title.to_string(),
+            })
+        {
+            self.status_line = format!("Failed to create task: {err}");
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id,
+                capabilities: vec![Capability::Spec, Capability::Lifecycle],
+            })
+        {
+            self.status_line = format!("Failed to create task: {err}");
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.status_line = format!("Failed to create task: {err}");
+            cx.notify();
+            return;
+        }
+        self.live_refresh(window, cx);
         self.select_created_task(&id, window, cx);
         self.status_line = format!("Created task: {title}");
+    }
+
+    fn apply_ticket_to_node(&self, node_id: Uuid, ticket: &str) -> Result<(), String> {
+        self.fleet
+            .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+                node_id,
+                title: ticket.to_string(),
+            })
+            .map_err(|err| err.to_string())?;
+        self.fleet
+            .enqueue(FleetMutation::UpdateTaskLinkedIssues {
+                id: node_id.to_string(),
+                linked_issues: vec![ticket.to_string()],
+            })
+            .map_err(|err| err.to_string())?;
+        self.fleet
+            .enqueue(FleetMutation::UpdateTaskTags {
+                id: node_id.to_string(),
+                tags: vec!["linear".into()],
+            })
+            .map_err(|err| err.to_string())?;
+        self.fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id,
+                capabilities: vec![Capability::Spec, Capability::Lifecycle],
+            })
+            .map_err(|err| err.to_string())?;
+        self.fleet.writer().flush().map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn finish_ticket_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.draft_node_id = None;
+        self.edit_open_for = None;
+        self.edit_original_title = None;
+        self.inline_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.sync_delegate_editing(cx);
+        self.focus_handle.focus(window);
     }
 
     fn find_by_ticket_id(&self, ticket: &str) -> Option<&super::TaskItem> {
@@ -114,5 +223,38 @@ impl TaskListView {
             self.select_task_by_id(task_id, window, cx);
         }
         self.rebuild_visible_list(window, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_ticket_ids() {
+        assert_eq!(parse_ticket_reference("TOD-142"), Some("TOD-142".into()));
+        assert_eq!(parse_ticket_reference("  tod-99  "), Some("tod-99".into()));
+        assert!(parse_ticket_reference("fix-login-bug").is_none());
+        assert!(parse_ticket_reference("ab").is_none());
+    }
+
+    #[test]
+    fn linear_urls() {
+        assert_eq!(
+            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142/fix-login"),
+            Some("TOD-142".into())
+        );
+        assert_eq!(
+            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142"),
+            Some("TOD-142".into())
+        );
+        assert_eq!(
+            parse_ticket_reference("linear.app/team/issue/ERR-500"),
+            Some("ERR-500".into())
+        );
+        assert_eq!(
+            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142/slug?foo=bar#frag"),
+            Some("TOD-142".into())
+        );
     }
 }
