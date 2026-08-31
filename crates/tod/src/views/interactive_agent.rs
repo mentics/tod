@@ -84,7 +84,7 @@ impl InteractiveAgentView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(4)
-                .placeholder("Enter a prompt… (Enter to submit, Shift+Enter for newline)")
+                .placeholder("Enter a prompt… (Ctrl+Enter to submit)")
         });
 
         let poll_entity = cx.weak_entity();
@@ -596,7 +596,7 @@ impl Render for InteractiveAgentView {
                                         div()
                                             .text_xs()
                                             .text_color(muted)
-                                            .child("Enter · Shift+Enter for newline"),
+                                            .child("Ctrl+Enter to submit · Enter for newline"),
                                     ),
                             ),
                     ),
@@ -622,19 +622,9 @@ pub fn register_interactive_agent_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, InteractiveAgentClose, INTERACTIVE_AGENT_CONTEXT);
     cx.bind_keys([
         gpui::KeyBinding::new(
-            "enter",
-            SubmitInteractivePrompt,
-            Some(key_context::including_input(INTERACTIVE_AGENT_CONTEXT)),
-        ),
-        gpui::KeyBinding::new(
             "ctrl-enter",
             SubmitInteractivePrompt,
             Some(key_context::including_input(INTERACTIVE_AGENT_CONTEXT)),
-        ),
-        gpui::KeyBinding::new(
-            "enter",
-            SubmitInteractivePrompt,
-            Some(INTERACTIVE_AGENT_CONTEXT),
         ),
         gpui::KeyBinding::new(
             "ctrl-enter",
