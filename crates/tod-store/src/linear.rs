@@ -1,6 +1,5 @@
 //! Linear GraphQL client for issue lookup by identifier (e.g. `TOD-142`).
 
-use crate::settings::TodSettings;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -15,7 +14,7 @@ pub struct LinearIssue {
 
 #[derive(Debug, Error)]
 pub enum LinearError {
-    #[error("Linear API key not configured (set LINEAR_API_KEY or linear.api_key in tod.yml)")]
+    #[error("Linear API key not configured")]
     MissingApiKey,
     #[error("HTTP request failed: {0}")]
     Http(String),
@@ -23,19 +22,6 @@ pub enum LinearError {
     NotFound(String),
     #[error("Linear API error: {0}")]
     Api(String),
-}
-
-pub fn resolve_api_key(settings: &TodSettings) -> Option<String> {
-    resolve_api_key_from(
-        std::env::var("LINEAR_API_KEY").ok(),
-        &settings.linear.api_key,
-    )
-}
-
-fn resolve_api_key_from(env: Option<String>, file: &Option<String>) -> Option<String> {
-    env.or_else(|| file.clone())
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
 }
 
 pub fn fetch_issue(api_key: &str, identifier: &str) -> Result<LinearIssue, LinearError> {
@@ -68,9 +54,7 @@ pub fn fetch_issue(api_key: &str, identifier: &str) -> Result<LinearIssue, Linea
             .collect::<Vec<_>>()
             .join("; ");
         if status == 401 || message.to_ascii_lowercase().contains("authentication") {
-            return Err(LinearError::Api(
-                "Invalid Linear API key (check LINEAR_API_KEY)".into(),
-            ));
+            return Err(LinearError::Api("Invalid Linear API key".into()));
         }
         return Err(LinearError::Api(message));
     }
@@ -105,26 +89,4 @@ struct LinearIssueRaw {
 #[derive(Debug, Deserialize)]
 struct GraphQlError {
     message: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_api_key_prefers_env() {
-        assert_eq!(
-            resolve_api_key_from(Some("env-key".into()), &Some("file-key".into()),).as_deref(),
-            Some("env-key")
-        );
-    }
-
-    #[test]
-    fn resolve_api_key_from_settings() {
-        assert_eq!(
-            resolve_api_key_from(None, &Some("file-key".into())).as_deref(),
-            Some("file-key")
-        );
-        assert!(resolve_api_key_from(None, &Some("  ".into())).is_none());
-    }
 }

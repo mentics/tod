@@ -137,13 +137,6 @@ impl Default for WorktreeBackend {
     }
 }
 
-/// Linear integration — API key can also be supplied via `LINEAR_API_KEY`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct LinearSettings {
-    #[serde(default)]
-    pub api_key: Option<String>,
-}
-
 /// Saved main-window placement restored on the next launch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowGeometry {
@@ -208,8 +201,6 @@ pub struct TodSettings {
     /// Last known main-window placement.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
-    #[serde(default)]
-    pub linear: LinearSettings,
 }
 
 impl Default for TodSettings {
@@ -225,7 +216,6 @@ impl Default for TodSettings {
             agent_platform: AgentPlatform::default(),
             terminal: TerminalSettings::default(),
             window_geometry: None,
-            linear: LinearSettings::default(),
         }
     }
 }
@@ -377,7 +367,6 @@ mod tests {
                 height: 900.0,
                 maximized: false,
             }),
-            linear: LinearSettings::default(),
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();

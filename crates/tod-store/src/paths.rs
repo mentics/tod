@@ -118,6 +118,11 @@ impl TodPaths {
         self.config_dir.join("tod.yml")
     }
 
+    /// Segregated secret storage (`linear_api_key.enc`, …).
+    pub fn credentials_dir(&self) -> PathBuf {
+        self.data_root.join("credentials")
+    }
+
     pub fn log_dir(&self) -> PathBuf {
         self.data_root.join("log")
     }

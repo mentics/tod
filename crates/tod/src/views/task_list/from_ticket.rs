@@ -1,6 +1,5 @@
 use gpui::{Context, Window};
-use tod_store::linear::{fetch_issue, resolve_api_key};
-use tod_store::settings::TodSettings;
+use tod_store::{CredentialStore, resolve_linear_api_key};
 use uuid::Uuid;
 
 use tod_store::fleet::FleetMutation;
@@ -8,6 +7,7 @@ use tod_store::outline::types::Capability;
 use tod_store::outline::{CreatePosition, OutlineMutation};
 
 use super::TaskListView;
+use super::credential_prompt::PendingCredentialRequest;
 
 /// Outcome of starting a ticket import — may complete synchronously or fetch from Linear async.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,7 @@ pub(super) struct PendingTicketImport {
     pub title: Option<String>,
     pub error: Option<String>,
     pub draft_node_id: Option<String>,
+    pub auth_failure: bool,
 }
 
 /// Returns true when `text` is a ticket id or Linear issue URL.
@@ -104,69 +105,20 @@ impl TaskListView {
             return TicketImportResult::Completed(true);
         }
 
-        let settings = match TodSettings::load_from_path(&self.config_dir.join("tod.yml")) {
-            Ok(settings) => settings,
-            Err(err) => {
-                self.status_line = format!("Failed to load settings: {err}");
-                cx.notify();
-                return TicketImportResult::Completed(false);
-            }
-        };
-        let Some(api_key) = resolve_api_key(&settings) else {
-            crate::ui::toast::error_toast(
+        let store = CredentialStore::from_data_root(&self.config_dir);
+        let Some(api_key) = resolve_linear_api_key(&store) else {
+            self.open_linear_credential_prompt(
+                PendingCredentialRequest {
+                    ticket: ticket.to_string(),
+                    draft_node_id: draft_node_id.map(str::to_string),
+                },
                 window,
                 cx,
-                "Linear API key not configured (set LINEAR_API_KEY or linear.api_key in tod.yml)",
             );
-            return TicketImportResult::Completed(false);
+            return TicketImportResult::Pending;
         };
 
-        let draft_node_id = draft_node_id.map(str::to_string);
-        let ticket_owned = ticket.to_string();
-        let ticket_for_fetch = ticket_owned.clone();
-        let api_key = api_key.clone();
-
-        self.ticket_import_generation = self.ticket_import_generation.wrapping_add(1);
-        let generation = self.ticket_import_generation;
-        self.status_line = format!("Fetching {ticket} from Linear…");
-        cx.notify();
-
-        let entity = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            let fetch = std::thread::spawn(move || fetch_issue(&api_key, &ticket_for_fetch)).join();
-            let pending = match fetch {
-                Ok(Ok(issue)) => PendingTicketImport {
-                    generation,
-                    ticket: issue.identifier,
-                    title: Some(issue.title),
-                    error: None,
-                    draft_node_id: draft_node_id.clone(),
-                },
-                Ok(Err(err)) => PendingTicketImport {
-                    generation,
-                    ticket: ticket_owned.clone(),
-                    title: None,
-                    error: Some(err.to_string()),
-                    draft_node_id: draft_node_id.clone(),
-                },
-                Err(_) => PendingTicketImport {
-                    generation,
-                    ticket: ticket_owned.clone(),
-                    title: None,
-                    error: Some("Linear fetch thread panicked".into()),
-                    draft_node_id: draft_node_id.clone(),
-                },
-            };
-            let _ = entity.update(cx, |this, cx| {
-                if this.ticket_import_generation != generation {
-                    return;
-                }
-                this.pending_ticket_import = Some(pending);
-                cx.notify();
-            });
-        })
-        .detach();
-
+        self.start_linear_ticket_fetch(&api_key, ticket, draft_node_id, window, cx);
         TicketImportResult::Pending
     }
 
@@ -221,6 +173,19 @@ impl TaskListView {
         cx: &mut Context<Self>,
     ) {
         if self.ticket_import_generation != pending.generation {
+            return;
+        }
+        if pending.auth_failure {
+            let store = CredentialStore::from_data_root(&self.config_dir);
+            let _ = store.delete(tod_store::CredentialKind::LinearApiKey);
+            self.open_linear_credential_prompt(
+                PendingCredentialRequest {
+                    ticket: pending.ticket.clone(),
+                    draft_node_id: pending.draft_node_id.clone(),
+                },
+                window,
+                cx,
+            );
             return;
         }
         if let Some(message) = pending.error {

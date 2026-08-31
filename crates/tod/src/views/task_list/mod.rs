@@ -1,4 +1,5 @@
 mod compose;
+mod credential_prompt;
 mod delegate;
 mod edit;
 pub(crate) mod fixtures;
@@ -206,6 +207,10 @@ pub struct TaskListView {
     action_sink: Rc<RefCell<Vec<RowAction>>>,
     compose_open: bool,
     compose_title_input: Entity<InputState>,
+    credential_prompt_open: bool,
+    credential_input: Entity<InputState>,
+    pending_credential_request: Option<credential_prompt::PendingCredentialRequest>,
+    pending_credential_submit: bool,
     selection_before_compose: Option<String>,
     open_row_menu: Option<(RowMenuKind, String)>,
     row_menu: Option<Entity<PopupMenu>>,
@@ -238,6 +243,7 @@ pub struct TaskListView {
     app_nav: AppNavMenu,
     _list_subscription: Subscription,
     _compose_subscription: Subscription,
+    _credential_subscription: Subscription,
     _inline_edit_subscription: Subscription,
 }
 
@@ -273,9 +279,16 @@ impl TaskListView {
 
         let compose_title_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("Title or ticket id (e.g. TOD-142)"));
+        let credential_input = cx.new(|cx| InputState::new(window, cx).placeholder("lin_api_…"));
         let _compose_subscription = cx.subscribe(&compose_title_input, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                 this.pending_compose_submit = true;
+                cx.notify();
+            }
+        });
+        let _credential_subscription = cx.subscribe(&credential_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.pending_credential_submit = true;
                 cx.notify();
             }
         });
@@ -333,6 +346,10 @@ impl TaskListView {
             action_sink,
             compose_open: false,
             compose_title_input,
+            credential_prompt_open: false,
+            credential_input,
+            pending_credential_request: None,
+            pending_credential_submit: false,
             selection_before_compose: None,
             open_row_menu: None,
             row_menu: None,
@@ -363,6 +380,7 @@ impl TaskListView {
             app_nav: AppNavMenu::default(),
             _list_subscription,
             _compose_subscription,
+            _credential_subscription,
             _inline_edit_subscription,
         };
 
@@ -1377,6 +1395,8 @@ impl TaskListView {
             self.abandon_inline_edit(window, cx, true);
         } else if self.compose_open {
             self.close_compose(window, cx);
+        } else if self.credential_prompt_open {
+            self.cancel_credential_prompt(window, cx);
         } else if self.sort_menu_open {
             self.close_sort_menu(cx);
         } else if self.open_row_menu.is_some() {
@@ -2018,6 +2038,10 @@ impl Render for TaskListView {
             self.pending_compose_submit = false;
             self.submit_compose(window, cx);
         }
+        if self.pending_credential_submit {
+            self.pending_credential_submit = false;
+            self.submit_credential_prompt(window, cx);
+        }
         if self.pending_new_list {
             self.pending_new_list = false;
             self.create_new_list(window, cx);
@@ -2144,7 +2168,10 @@ impl Render for TaskListView {
                     ),
                 )
             })
-            .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu));
+            .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
+            .when(self.credential_prompt_open, |el| {
+                el.child(self.render_credential_prompt_overlay(cx))
+            });
 
         root
     }
