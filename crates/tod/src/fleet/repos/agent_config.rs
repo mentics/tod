@@ -290,7 +290,7 @@ impl<'a> AgentConfigRepo<'a> {
             run_repo.update_runtime_status(&run.id, runtime_status)?;
             return Ok(());
         }
-        run_repo.create_run(config_id, runtime_status)?;
+        run_repo.create_run(config_id, runtime_status, "auto")?;
         Ok(())
     }
 
@@ -462,7 +462,7 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let (_, config_id) = seed_node_config(&conn);
         let run = crate::fleet::repos::agent_run::AgentRunRepo::new(&conn)
-            .create_run(&config_id, "waiting")
+            .create_run(&config_id, "waiting", "auto")
             .unwrap();
         let shell_id = uuid::Uuid::new_v4().to_string();
         ShellRepo::new(&conn)

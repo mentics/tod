@@ -85,6 +85,15 @@ impl<'a> ShellRepo<'a> {
         Ok(())
     }
 
+    pub fn find(&self, id: &str) -> Result<Option<ShellSession>, ShellRepoError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent_config_id, reconnect_pid, reconnect_birth_token
+             FROM shell_sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_session)?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn list_for_agent(&self, agent_id: &str) -> Result<Vec<ShellSession>, ShellRepoError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent_config_id, reconnect_pid, reconnect_birth_token

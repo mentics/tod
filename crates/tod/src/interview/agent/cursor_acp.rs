@@ -18,7 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -1360,6 +1360,31 @@ impl PersistentAcpSession {
     }
 }
 
+fn drain_slot_prompts_on_connect_failure(
+    cmd_rx: &Receiver<SlotCommand>,
+    done_tx: &Sender<SlotCompletion>,
+    agent_config_id: &str,
+    cwd: &Path,
+    slot_id: u32,
+    err_msg: &str,
+) {
+    loop {
+        match cmd_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(SlotCommand::Prompt { run_id, .. }) => {
+                let _ = done_tx.send(SlotCompletion {
+                    agent_config_id: agent_config_id.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    slot_id,
+                    run_id,
+                    result: Err(err_msg.to_string()),
+                });
+            }
+            Ok(SlotCommand::Shutdown) | Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 fn run_acp_pool_slot(
     host: AcpHost,
     agent_bin: &Path,
@@ -1384,12 +1409,23 @@ fn run_acp_pool_slot(
     ) {
         Ok(session) => session,
         Err(err) => {
+            let err_msg = err.to_string();
             tracing::error!(
                 event = "agent",
                 action = "acp_pool_connect_failed",
                 slot_id,
-                error = %err,
+                error = %err_msg,
                 "failed to open ACP pool slot"
+            );
+            // Prompts may have been sent while connect was in flight; fail them so runs
+            // do not stay InFlight forever.
+            drain_slot_prompts_on_connect_failure(
+                &cmd_rx,
+                &done_tx,
+                &agent_config_id,
+                &cwd_buf,
+                slot_id,
+                &err_msg,
             );
             return;
         }

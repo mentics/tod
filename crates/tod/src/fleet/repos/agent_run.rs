@@ -13,7 +13,11 @@ pub struct AgentRun {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub reconnect: Option<ReconnectIdentity>,
+    pub run_kind: String,
 }
+
+const RUN_SELECT: &str = "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+                    reconnect_pid, reconnect_birth_token, run_kind";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -46,6 +50,7 @@ impl<'a> AgentRunRepo<'a> {
         &self,
         config_id: &str,
         runtime_status: &str,
+        run_kind: &str,
     ) -> Result<String, AgentRunRepoError> {
         let run_number = self.next_run_number(config_id)?;
         let run_id = format!("{config_id}-run-{run_number}");
@@ -54,52 +59,76 @@ impl<'a> AgentRunRepo<'a> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id, config_id, run_number, runtime_status, now_ms],
+            "INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at, run_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run_id, config_id, run_number, runtime_status, now_ms, run_kind],
         )?;
         Ok(run_id)
     }
 
     pub fn list_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
-                    reconnect_pid, reconnect_birth_token
+        let sql = format!(
+            "{RUN_SELECT}
              FROM agent_runs
              WHERE agent_config_id = ?1
-             ORDER BY run_number DESC",
-        )?;
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![config_id], row_to_run)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn latest_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+    pub fn list_interactive_for_config(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1 AND run_kind = 'interactive'
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![config_id], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn latest_auto_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1 AND run_kind = 'auto'
+             ORDER BY run_number DESC
+             LIMIT 1"
+        );
         self.conn
-            .query_row(
-                "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
-                        reconnect_pid, reconnect_birth_token
-                 FROM agent_runs
-                 WHERE agent_config_id = ?1
-                 ORDER BY run_number DESC
-                 LIMIT 1",
-                params![config_id],
-                row_to_run,
-            )
+            .query_row(&sql, params![config_id], row_to_run)
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn latest_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1
+             ORDER BY run_number DESC
+             LIMIT 1"
+        );
+        self.conn
+            .query_row(&sql, params![config_id], row_to_run)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        let sql = format!("{RUN_SELECT} FROM agent_runs WHERE id = ?1");
         self.conn
-            .query_row(
-                "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
-                        reconnect_pid, reconnect_birth_token
-                 FROM agent_runs WHERE id = ?1",
-                params![id],
-                row_to_run,
-            )
+            .query_row(&sql, params![id], row_to_run)
             .optional()
             .map_err(Into::into)
     }
@@ -194,5 +223,6 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         started_at: row.get(4)?,
         ended_at: row.get(5)?,
         reconnect,
+        run_kind: row.get(8)?,
     })
 }

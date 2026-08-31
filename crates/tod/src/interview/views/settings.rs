@@ -1,3 +1,4 @@
+use crate::fleet::default_terminal_hint;
 use crate::interview::TodPaths;
 use crate::interview::agent::AgentPlatform;
 use crate::interview::settings::{
@@ -6,10 +7,11 @@ use crate::interview::settings::{
 use crate::logging;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use gpui::{
-    Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Timer, Window, div, px,
+    AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Timer, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::time::Duration;
 
@@ -65,14 +67,16 @@ pub struct SettingsView {
     paths: TodPaths,
     settings: TodSettings,
     log_dir_display: SharedString,
+    terminal_program_input: Entity<InputState>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     active_section: SettingsSection,
     save_generation: u64,
+    _terminal_subscription: Subscription,
 }
 
 impl SettingsView {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let settings = TodSettings::load(&paths).expect("failed to load tod settings");
         let log_dir_display = SharedString::from(
@@ -80,15 +84,37 @@ impl SettingsView {
                 .display()
                 .to_string(),
         );
+        let terminal_program_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Auto (OS default)")
+                .default_value(settings.terminal.program.clone().unwrap_or_default())
+        });
+        let _terminal_subscription = cx.subscribe(&terminal_program_input, |this, input, event, cx| {
+            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                let text = input.read(cx).text().to_string();
+                let trimmed = text.trim();
+                let next = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                if this.settings.terminal.program != next {
+                    this.settings.terminal.program = next;
+                    this.schedule_save(cx);
+                }
+            }
+        });
 
         Self {
             paths,
             settings,
             log_dir_display,
+            terminal_program_input,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             active_section: SettingsSection::Agents,
             save_generation: 0,
+            _terminal_subscription,
         }
     }
 
@@ -485,6 +511,31 @@ impl SettingsView {
                     |this, _, cx| this.cycle_worktree_backend(-1, cx),
                     |this, _, cx| this.cycle_worktree_backend(1, cx),
                 ))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child("Agent shell terminal"),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(theme.foreground)
+                                .child("Terminal program"),
+                        )
+                        .child(Input::new(&self.terminal_program_input).w_full())
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(default_terminal_hint()),
+                        ),
+                )
                 .into_any_element(),
             SettingsSection::Logging => v_flex()
                 .gap_3()

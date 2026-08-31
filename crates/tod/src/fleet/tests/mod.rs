@@ -292,6 +292,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
             id: prompt_id.clone(),
             agent_id: agent_id.clone(),
             content: "hello".into(),
+            run_id: None,
         })
         .unwrap();
     short_settle();
@@ -306,6 +307,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
             agent_id: agent_id.clone(),
             content: "world".into(),
             prompt_id: prompt_id.clone(),
+            run_id: None,
         })
         .unwrap();
     short_settle();

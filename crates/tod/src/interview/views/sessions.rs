@@ -1,4 +1,4 @@
-use crate::fleet::{ensure_interview_agent_for_node, FleetStore};
+use crate::fleet::{FleetStore, ensure_interview_agent_for_node};
 use crate::interview::agent::{AgentRunState, BootstrapGate, SharedAgent};
 use crate::interview::config::{
     sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
@@ -387,7 +387,10 @@ impl SessionsView {
         (Uuid::nil(), "no node".into())
     }
 
-    fn provision_interview_agent(&self, node_id: &str) -> Result<crate::fleet::InterviewAgentContext, String> {
+    fn provision_interview_agent(
+        &self,
+        node_id: &str,
+    ) -> Result<crate::fleet::InterviewAgentContext, String> {
         let settings = TodSettings::load(&self.paths).map_err(|e| e.to_string())?;
         ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, node_id)
             .map_err(|e| e.to_string())
@@ -880,6 +883,7 @@ impl SessionsView {
             // swallows a single update attempt.
             let deadline = Instant::now() + Duration::from_secs(360);
             let mut agent_finished = false;
+            let mut agent_failed = false;
             let mut synced = false;
             let mut last_sync_log = Instant::now() - Duration::from_secs(10);
             while Instant::now() < deadline {
@@ -896,6 +900,7 @@ impl SessionsView {
                             let mut provider = agent.lock().expect("agent lock");
                             provider.poll_run(handle.id)
                         };
+                        agent_failed = matches!(state, Some(AgentRunState::Failure(_)));
                         tracing::info!(
                             event = "interview",
                             action = "bootstrap_agent_finished",
@@ -906,6 +911,10 @@ impl SessionsView {
                         // Keep bootstrap_sessions membership until this thread exits so the
                         // workspace does not emit NeedsBootstrap before disk sync binds.
                     }
+                }
+
+                if agent_failed && !synced {
+                    break;
                 }
 
                 if !synced {

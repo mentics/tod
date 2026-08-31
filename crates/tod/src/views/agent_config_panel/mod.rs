@@ -1,9 +1,13 @@
 //! Right-drawer agent config panel — persistent environment configuration for a task.
 
-use crate::fleet::provision::workspace_cwd_for_agent;
+use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
+use crate::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
 use crate::fleet::repos::shell::ShellSession;
+use crate::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
 use crate::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
+use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
+use crate::interview::settings::TodSettings;
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, build_fleet_agent_prompt};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context::{self, INPUT};
@@ -12,16 +16,14 @@ use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Subscription, Window, actions, div, px,
+    IntoElement, ParentElement, Render, Styled, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
 
 const AGENT_CONFIG_CONTEXT: &str = "AgentConfig";
-const WORK_DIR_INPUT_WIDTH: f32 = 420.;
 
 actions!(agent_config, [AgentConfigClose, AgentConfigSave]);
 
@@ -29,6 +31,7 @@ actions!(agent_config, [AgentConfigClose, AgentConfigSave]);
 pub enum AgentConfigPanelEvent {
     Close,
     Saved { task_id: String, config_id: String },
+    Deleted { task_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -43,24 +46,26 @@ struct InFlightFleetRun {
 pub struct AgentConfigPanelView {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
+    interactive_window: InteractiveAgentWindowControl,
+    paths: TodPaths,
+    settings: TodSettings,
     install: TodInstallPaths,
     task_id: Option<String>,
     config_id: Option<String>,
     task_slug: String,
     focus_handle: FocusHandle,
-    work_dir_input: Entity<InputState>,
     env_type: String,
     mode: String,
     use_worktree: bool,
     runtime_status: String,
     active_run_id: Option<String>,
     worktree_path: Option<String>,
+    workspace_label: String,
     runs: Vec<AgentRun>,
     in_flight: Vec<InFlightFleetRun>,
     shells: Vec<ShellSession>,
+    chat_sessions: Vec<AgentRun>,
     status_message: String,
-    pending_save: bool,
-    _work_dir_subscription: Subscription,
 }
 
 impl AgentConfigPanelView {
@@ -69,7 +74,10 @@ impl AgentConfigPanelView {
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
+        interactive_window: InteractiveAgentWindowControl,
     ) -> Self {
+        let paths = TodPaths::discover().expect("data root must be configured");
+        let settings = TodSettings::load(&paths).unwrap_or_default();
         let install = TodInstallPaths::discover().unwrap_or_else(|err| {
             eprintln!("tod: process bundle discovery failed: {err:#}");
             TodInstallPaths::from_process_root(
@@ -77,36 +85,30 @@ impl AgentConfigPanelView {
             )
             .expect("dev process bundle fallback")
         });
-        let work_dir_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Work directory path…"));
-        let _work_dir_subscription = cx.subscribe(&work_dir_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                this.pending_save = true;
-                cx.notify();
-            }
-        });
 
         Self {
             fleet,
             agent,
+            interactive_window,
+            paths,
+            settings,
             install,
             task_id: None,
             config_id: None,
             task_slug: String::new(),
             focus_handle: cx.focus_handle(),
-            work_dir_input,
             env_type: "local".into(),
             mode: "agent".into(),
             use_worktree: false,
             runtime_status: "not_running".into(),
             active_run_id: None,
             worktree_path: None,
+            workspace_label: String::new(),
             runs: Vec::new(),
             in_flight: Vec::new(),
             shells: Vec::new(),
+            chat_sessions: Vec::new(),
             status_message: String::new(),
-            pending_save: false,
-            _work_dir_subscription,
         }
     }
 
@@ -166,6 +168,7 @@ impl AgentConfigPanelView {
         self.runs.clear();
         self.in_flight.clear();
         self.shells.clear();
+        self.chat_sessions.clear();
         self.status_message.clear();
 
         if let Some(ref id) = self.config_id {
@@ -176,21 +179,28 @@ impl AgentConfigPanelView {
                 self.worktree_path = row.worktree_path;
                 self.runtime_status = row.runtime_status;
                 self.active_run_id = row.active_run_id;
-                let work_dir = row.work_directory.unwrap_or_default();
-                self.work_dir_input.update(cx, |input, cx| {
-                    input.set_value(work_dir, window, cx);
-                });
             }
             self.reload_runs();
             self.reload_shells();
-        } else {
-            self.work_dir_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
+            self.reload_chat_sessions();
         }
-
+        self.refresh_workspace_label();
         self.focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn refresh_workspace_label(&mut self) {
+        self.workspace_label = match (self.task_id.as_deref(), self.config_id.as_deref()) {
+            (Some(task_id), Some(config_id)) => self
+                .fleet
+                .get_agent(config_id)
+                .ok()
+                .flatten()
+                .map(|row| describe_agent_workspace(&self.fleet, &row, task_id))
+                .unwrap_or_else(|| "Workspace unavailable".into()),
+            (Some(_), None) => "Save config to see workspace".into(),
+            _ => String::new(),
+        };
     }
 
     fn reload_runs(&mut self) {
@@ -209,6 +219,29 @@ impl AgentConfigPanelView {
             .unwrap_or_default();
     }
 
+    fn reload_chat_sessions(&mut self) {
+        self.chat_sessions = self
+            .config_id
+            .as_ref()
+            .and_then(|id| self.fleet.list_interactive_sessions_for_config(id).ok())
+            .unwrap_or_default();
+    }
+
+    fn session_label(&self, session: &AgentRun) -> String {
+        if let Ok(turns) = self.fleet.list_transcript_for_agent(&session.id) {
+            if let Some(first) = turns.iter().find(|t| t.kind == "prompt") {
+                let preview: String = first.content.chars().take(48).collect();
+                let suffix = if first.content.chars().count() > 48 {
+                    "…"
+                } else {
+                    ""
+                };
+                return format!("Session {} · {preview}{suffix}", session.run_number);
+            }
+        }
+        format!("Session {}", session.run_number)
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.task_id.is_none() {
             return;
@@ -218,6 +251,7 @@ impl AgentConfigPanelView {
         self.runs.clear();
         self.in_flight.clear();
         self.shells.clear();
+        self.chat_sessions.clear();
         self.status_message.clear();
         cx.emit(AgentConfigPanelEvent::Close);
         cx.notify();
@@ -245,18 +279,7 @@ impl AgentConfigPanelView {
             );
             return;
         }
-        let work_directory = self
-            .work_dir_input
-            .read(cx)
-            .text()
-            .to_string()
-            .trim()
-            .to_string();
-        let work_directory = if work_directory.is_empty() {
-            None
-        } else {
-            Some(work_directory)
-        };
+        let work_directory = None;
 
         if let Some(config_id) = self.config_id.clone() {
             if let Err(err) = self.fleet.enqueue(FleetMutation::UpdateAgentConfig {
@@ -303,6 +326,8 @@ impl AgentConfigPanelView {
             }
             self.reload_runs();
             self.reload_shells();
+            self.reload_chat_sessions();
+            self.refresh_workspace_label();
             self.status_message = format!("Saved agent config {id}");
             cx.emit(AgentConfigPanelEvent::Saved {
                 task_id,
@@ -323,6 +348,28 @@ impl AgentConfigPanelView {
 
     fn flush_fleet(&self) -> Result<(), String> {
         self.fleet.writer().flush().map_err(|err| err.to_string())
+    }
+
+    fn set_status(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.status_message = message.into();
+        cx.notify();
+    }
+
+    fn show_error(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        self.set_status(message.clone(), cx);
+        error_toast(window, cx, message);
+    }
+
+    /// Agent row for launch (from saved config).
+    fn agent_row_for_launch(&self) -> Option<crate::fleet::AgentConfigRow> {
+        let config_id = self.config_id.as_ref()?;
+        self.fleet.get_agent(config_id).ok().flatten()
     }
 
     fn poll_in_flight_runs(&mut self, cx: &mut Context<Self>) {
@@ -358,6 +405,7 @@ impl AgentConfigPanelView {
                         agent_id: flight.config_id.clone(),
                         content: content.clone(),
                         prompt_id: flight.prompt_id.clone(),
+                        run_id: Some(flight.fleet_run_id.clone()),
                     });
                 }
                 Err(_) => {
@@ -399,66 +447,80 @@ impl AgentConfigPanelView {
 
     fn launch_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
+            self.set_status("Save the agent config before launching.", cx);
             return;
         };
         let Some(task_id) = self.task_id.clone() else {
+            self.set_status("No task selected for this agent config.", cx);
             return;
         };
         if self.mode == "interview" {
-            error_toast(
+            self.show_error(
                 window,
                 cx,
                 "Interview agents are launched from the Interview view.",
             );
             return;
         }
+        if self.mode == "shell" {
+            self.show_error(
+                window,
+                cx,
+                "Interactive mode uses Launch shell. Switch to Auto to run a background agent.",
+            );
+            return;
+        }
         let task = match self.fleet.get_task(&task_id) {
             Ok(Some(task)) => task,
             _ => {
-                error_toast(window, cx, "Task not found.");
+                self.show_error(window, cx, "Task not found.");
                 return;
             }
         };
-        let agent_row = match self.fleet.get_agent(&config_id) {
-            Ok(Some(row)) => row,
-            _ => {
-                error_toast(window, cx, "Agent config not found.");
+        let agent_row = match self.agent_row_for_launch() {
+            Some(row) => row,
+            None => {
+                self.show_error(window, cx, "Agent config not found.");
                 return;
             }
         };
-        let cwd = match workspace_cwd_for_agent(&agent_row) {
+        let cwd = match resolve_agent_workspace(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &agent_row,
+            &task_id,
+        ) {
             Ok(path) => path,
             Err(err) => {
-                error_toast(
-                    window,
-                    cx,
-                    format!("Set work directory or worktree first: {err:#}"),
-                );
+                self.show_error(window, cx, format!("Workspace: {err:#}"));
                 return;
             }
         };
+        self.set_status(format!("{config_id} · starting agent run…"), cx);
         let manifest = match ProcessManifest::load(&self.install) {
             Ok(manifest) => manifest,
             Err(err) => {
-                error_toast(window, cx, format!("Process bundle: {err:#}"));
+                self.show_error(window, cx, format!("Process bundle: {err:#}"));
                 return;
             }
         };
         let prompt = match build_fleet_agent_prompt(&manifest, &task, &config_id, &cwd) {
             Ok(prompt) => prompt,
             Err(err) => {
-                error_toast(window, cx, format!("Prompt assembly failed: {err:#}"));
+                self.show_error(window, cx, format!("Prompt assembly failed: {err:#}"));
                 return;
             }
         };
         if let Err(err) = self.fleet.enqueue(FleetMutation::CreateAgentRun {
             config_id: config_id.clone(),
+            run_kind: Some("auto".into()),
         }) {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
+            self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
         }
         if let Err(err) = self.flush_fleet() {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
+            self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
         }
         let _ = self.fleet.reload_if_stale();
@@ -468,7 +530,7 @@ impl AgentConfigPanelView {
             .ok()
             .and_then(|runs| runs.first().map(|run| run.id.clone()))
         else {
-            error_toast(window, cx, "Launch agent failed: run not created.");
+            self.show_error(window, cx, "Launch agent failed: run not created.");
             return;
         };
         let prompt_id = uuid::Uuid::new_v4().to_string();
@@ -477,17 +539,18 @@ impl AgentConfigPanelView {
             id: prompt_id.clone(),
             agent_id: config_id.clone(),
             content: prompt.clone(),
+            run_id: Some(fleet_run_id.clone()),
         }) {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
+            self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
         }
         if let Err(err) = self.flush_fleet() {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
+            self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
         }
         let provider_run = {
             let mut agent = self.agent.lock().expect("agent mutex");
-            agent.start_fleet_agent(&config_id, cwd, prompt)
+            agent.start_fleet_agent(&config_id, cwd.clone(), prompt)
         };
         match provider_run {
             Ok(handle) => {
@@ -501,15 +564,22 @@ impl AgentConfigPanelView {
                 let _ = self.fleet.reload_if_stale();
                 self.reload_runs();
                 self.reload_agent_status();
-                self.status_message = format!("{config_id} · launched {fleet_run_id}");
-                cx.notify();
+                self.set_status(
+                    format!("{config_id} · launched {fleet_run_id} in {}", cwd.display()),
+                    cx,
+                );
             }
             Err(err) => {
                 let _ = self.fleet.enqueue(FleetMutation::EndAgentRun {
-                    run_id: fleet_run_id,
+                    run_id: fleet_run_id.clone(),
                 });
                 let _ = self.flush_fleet();
-                error_toast(window, cx, format!("Launch agent failed: {err:#}"));
+                self.reload_runs();
+                self.show_error(
+                    window,
+                    cx,
+                    format!("Launch agent failed (check Claude/Cursor CLI): {err:#}"),
+                );
             }
         }
     }
@@ -578,27 +648,134 @@ impl AgentConfigPanelView {
         cx.notify();
     }
 
+    fn new_interactive_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            self.set_status("Save the agent config before starting a session.", cx);
+            return;
+        };
+        let Some(task_id) = self.task_id.clone() else {
+            self.set_status("No task selected for this agent config.", cx);
+            return;
+        };
+        if self.mode != "shell" {
+            self.show_error(
+                window,
+                cx,
+                "Chat sessions are for Interactive mode configs.",
+            );
+            return;
+        }
+        match self
+            .interactive_window
+            .create_and_open_session(&task_id, &config_id, cx)
+        {
+            Ok(session_id) => {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_chat_sessions();
+                self.set_status(format!("{config_id} · opened {session_id}"), cx);
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("New session failed: {err}"));
+            }
+        }
+    }
+
+    fn open_interactive_session(
+        &mut self,
+        session_run_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        match self.interactive_window.open_session(
+            InteractiveAgentOpenParams {
+                task_id,
+                config_id: config_id.clone(),
+                session_run_id: session_run_id.to_string(),
+            },
+            cx,
+        ) {
+            Ok(()) => {
+                self.set_status(format!("{config_id} · opened {session_run_id}"), cx);
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("Open session failed: {err}"));
+            }
+        }
+    }
+
     fn launch_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
             return;
         };
-        let shell_id = uuid::Uuid::new_v4().to_string();
-        if let Err(err) = self.fleet.enqueue(FleetMutation::CreateShellSession {
-            id: shell_id.clone(),
-            agent_id: config_id.clone(),
-            reconnect: None,
-        }) {
-            error_toast(window, cx, format!("Launch shell failed: {err}"));
+        let Some(task_id) = self.task_id.clone() else {
             return;
+        };
+        match open_shell_for_agent_config(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &config_id,
+            &task_id,
+        ) {
+            Ok((shell_id, cwd)) => {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_shells();
+                self.refresh_workspace_label();
+                if let Ok(Some(row)) = self.fleet.get_agent(&config_id) {
+                    self.worktree_path = row.worktree_path;
+                }
+                self.set_status(
+                    format!("{config_id} · opened terminal in {}", cwd.display()),
+                    cx,
+                );
+                let _ = shell_id;
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("Launch shell failed: {err:#}"));
+            }
         }
-        if let Err(err) = self.fleet.writer().flush() {
-            error_toast(window, cx, format!("Launch shell failed: {err}"));
+    }
+
+    fn focus_shell(&mut self, shell_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
             return;
+        };
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        let shell = match self.shells.iter().find(|s| s.id == shell_id) {
+            Some(shell) => shell.clone(),
+            None => {
+                self.show_error(window, cx, "Shell session not found.");
+                return;
+            }
+        };
+        match focus_shell_session(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &config_id,
+            &task_id,
+            &shell,
+        ) {
+            Ok(cwd) => {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_shells();
+                self.set_status(
+                    format!("{config_id} · opened terminal in {}", cwd.display()),
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("Focus shell failed: {err:#}"));
+            }
         }
-        let _ = self.fleet.reload_if_stale();
-        self.reload_shells();
-        self.status_message = format!("{config_id} · launched shell");
-        cx.notify();
     }
 
     fn delete_shell(&mut self, shell_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -627,6 +804,35 @@ impl AgentConfigPanelView {
 
     fn on_save(&mut self, _: &AgentConfigSave, window: &mut Window, cx: &mut Context<Self>) {
         self.save(window, cx);
+    }
+
+    fn delete_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        for flight in self.in_flight.drain(..) {
+            if let Ok(mut agent) = self.agent.lock() {
+                let _ = agent.cancel_run(flight.provider_run_id);
+            }
+        }
+        if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteAgent {
+            id: config_id.clone(),
+        }) {
+            self.show_error(window, cx, format!("Delete failed: {err}"));
+            return;
+        }
+        if let Err(err) = self.flush_fleet() {
+            self.show_error(window, cx, format!("Delete failed: {err}"));
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        cx.emit(AgentConfigPanelEvent::Deleted {
+            task_id: task_id.clone(),
+        });
+        self.close(cx);
     }
 
     fn render_field_label(label: &str, cx: &Context<Self>) -> impl IntoElement {
@@ -724,7 +930,7 @@ impl AgentConfigPanelView {
     }
 
     fn render_runs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let can_launch = self.mode != "interview";
+        let can_launch = self.mode == "agent";
         v_flex()
             .gap_2()
             .child(Self::render_field_label("Agent runs", cx))
@@ -780,15 +986,37 @@ impl AgentConfigPanelView {
             }))
             .when(can_launch, |col| {
                 col.child(
-                    Button::new("launch-agent")
-                        .label("Launch agent")
-                        .compact()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.launch_agent(window, cx);
-                        })),
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Starts an autonomous background agent in the task workspace using \
+                             bundled lifecycle state docs.",
+                        ),
+                )
+                .child(
+                    h_flex().w_auto().flex_shrink_0().child(
+                        Button::new("launch-agent")
+                            .label("Launch agent")
+                            .small()
+                            .compact()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launch_agent(window, cx);
+                            })),
+                    ),
                 )
             })
-            .when(!can_launch, |col| {
+            .when(self.mode == "shell", |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Switch to Auto for background agent runs without a chat window.",
+                        ),
+                )
+            })
+            .when(self.mode == "interview", |col| {
                 col.child(
                     div()
                         .text_xs()
@@ -796,6 +1024,53 @@ impl AgentConfigPanelView {
                         .child("Interview configs are managed in the Interview view."),
                 )
             })
+    }
+
+    fn render_interactive_agent(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(Self::render_field_label("Chat sessions", cx))
+            .when(self.chat_sessions.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No sessions yet."),
+                )
+            })
+            .children(self.chat_sessions.iter().enumerate().map(|(idx, session)| {
+                let label = self.session_label(session);
+                let session_id = session.id.clone();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new(("chat-session-open", idx))
+                            .label(label)
+                            .small()
+                            .compact()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_interactive_session(&session_id, window, cx);
+                            })),
+                    )
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Open a session to continue the conversation, or start a new one."),
+            )
+            .child(
+                h_flex().w_auto().flex_shrink_0().child(
+                    Button::new("new-interactive-session")
+                        .label("New session")
+                        .small()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_interactive_session(window, cx);
+                        })),
+                ),
+            )
     }
 
     fn render_shells(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -815,7 +1090,6 @@ impl AgentConfigPanelView {
                 let label = format!("shell {}", idx + 1);
                 let focus_shell_id = shell.id.clone();
                 let delete_shell_id = shell.id.clone();
-                let config_id = self.config_id.clone().unwrap_or_default();
                 h_flex()
                     .gap_2()
                     .items_center()
@@ -824,10 +1098,8 @@ impl AgentConfigPanelView {
                             .label(label)
                             .small()
                             .compact()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.status_message =
-                                    format!("{config_id} · focus {focus_shell_id}");
-                                cx.notify();
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.focus_shell(&focus_shell_id, window, cx);
                             })),
                     )
                     .child(
@@ -848,13 +1120,27 @@ impl AgentConfigPanelView {
                     )
             }))
             .child(
-                Button::new("launch-shell")
-                    .label("Launch shell")
-                    .compact()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.launch_shell(window, cx);
-                    })),
+                h_flex().w_auto().flex_shrink_0().child(
+                    Button::new("launch-shell")
+                        .label("Launch shell")
+                        .small()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.launch_shell(window, cx);
+                        })),
+                ),
             )
+            .when(self.mode == "shell", |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(
+                            "Opens an OS terminal in the task workspace. Use Settings → Workspaces \
+                             to choose a terminal program.",
+                        ),
+                )
+            })
     }
 
     fn panel_title(&self) -> String {
@@ -878,10 +1164,6 @@ impl Focusable for AgentConfigPanelView {
 
 impl Render for AgentConfigPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.pending_save {
-            self.pending_save = false;
-            self.save(window, cx);
-        }
         self.poll_in_flight_runs(cx);
 
         if !self.is_open() {
@@ -906,8 +1188,13 @@ impl Render for AgentConfigPanelView {
                 v_flex()
                     .gap_1()
                     .items_start()
-                    .child(Self::render_field_label("Work directory", cx))
-                    .child(Input::new(&self.work_dir_input).w(px(WORK_DIR_INPUT_WIDTH))),
+                    .child(Self::render_field_label("Workspace", cx))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(self.workspace_label.clone()),
+                    ),
             )
             .child(
                 v_flex()
@@ -958,28 +1245,42 @@ impl Render for AgentConfigPanelView {
             );
 
         if !self.is_new() {
-            body = body
-                .child(self.render_runs(cx))
-                .child(self.render_shells(cx));
+            body = body.child(self.render_runs(cx));
+            if self.mode == "shell" {
+                body = body.child(self.render_interactive_agent(cx));
+            }
+            body = body.child(self.render_shells(cx));
         }
 
         body = body.child(
-            h_flex().gap_2().child(chrome_control_with_shortcut(
-                Button::new("agent-config-save")
-                    .label(if self.is_new() {
-                        "Save config"
-                    } else {
-                        "Save changes"
-                    })
-                    .primary()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.save(window, cx);
-                    })),
-                window,
-                &AgentConfigSave,
-                AGENT_CONFIG_CONTEXT,
-                cx,
-            )),
+            h_flex()
+                .gap_2()
+                .child(chrome_control_with_shortcut(
+                    Button::new("agent-config-save")
+                        .label(if self.is_new() {
+                            "Save config"
+                        } else {
+                            "Save changes"
+                        })
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save(window, cx);
+                        })),
+                    window,
+                    &AgentConfigSave,
+                    AGENT_CONFIG_CONTEXT,
+                    cx,
+                ))
+                .when(!self.is_new(), |row| {
+                    row.child(
+                        Button::new("agent-config-delete")
+                            .label("Delete")
+                            .ghost()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.delete_config(window, cx);
+                            })),
+                    )
+                }),
         );
 
         let theme = cx.theme();

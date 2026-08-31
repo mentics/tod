@@ -2,6 +2,7 @@ mod always_on_top;
 mod data_root_setup;
 mod fleet_blocked;
 mod history_window;
+mod interactive_agent_window;
 mod no_focus;
 pub mod transcript_window;
 pub mod window;
@@ -12,12 +13,14 @@ use crate::ui::list::register_list_keyboard_bindings;
 use crate::views::agent_config_panel::register_agent_config_keyboard_bindings;
 use crate::views::agent_transcripts::register_agent_transcripts_keyboard_bindings;
 use crate::views::command_history::register_command_history_keyboard_bindings;
+use crate::views::interactive_agent::register_interactive_agent_keyboard_bindings;
 use crate::views::obligations::register_obligations_keyboard_bindings;
 use crate::views::task_edit::register_task_edit_keyboard_bindings;
 use crate::views::task_list::register_task_list_keyboard_bindings;
 use gpui::*;
 
 pub use history_window::HistoryWindowControl;
+pub use interactive_agent_window::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 pub use transcript_window::TranscriptWindowControl;
 pub use window::{open, open_data_root_setup};
 
@@ -30,6 +33,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_agent_config_keyboard_bindings(cx);
     register_sessions_keyboard_bindings(cx);
     register_agent_transcripts_keyboard_bindings(cx);
+    register_interactive_agent_keyboard_bindings(cx);
     window::register_shell_keyboard_bindings(cx);
 }
 

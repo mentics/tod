@@ -108,6 +108,7 @@ pub enum FleetMutation {
     },
     CreateAgentRun {
         config_id: String,
+        run_kind: Option<String>,
     },
     EndAgentRun {
         run_id: String,
@@ -121,6 +122,7 @@ pub enum FleetMutation {
         id: String,
         agent_id: String,
         content: String,
+        run_id: Option<String>,
     },
     /// Paired: response + **waiting** + prompt **complete**.
     CompleteResponse {
@@ -128,6 +130,7 @@ pub enum FleetMutation {
         agent_id: String,
         content: String,
         prompt_id: String,
+        run_id: Option<String>,
     },
     /// Insert prompt without status side-effect (legacy / testing).
     InsertPromptTurn {
@@ -189,13 +192,13 @@ pub enum FleetMutation {
 
 fn resolve_or_create_run(conn: &Connection, config_id: &str) -> Result<String> {
     let run_repo = AgentRunRepo::new(conn);
-    if let Some(run) = run_repo.latest_run(config_id)? {
+    if let Some(run) = run_repo.latest_auto_run(config_id)? {
         if run.runtime_status != "not_running" {
             return Ok(run.id);
         }
     }
     run_repo
-        .create_run(config_id, "starting")
+        .create_run(config_id, "starting", "auto")
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -325,8 +328,12 @@ impl FleetMutation {
             FleetMutation::ClearAgentReconnect { id } => {
                 AgentConfigRepo::new(conn).clear_reconnect(id)?;
             }
-            FleetMutation::CreateAgentRun { config_id } => {
-                AgentRunRepo::new(conn).create_run(config_id, "starting")?;
+            FleetMutation::CreateAgentRun {
+                config_id,
+                run_kind,
+            } => {
+                let kind = run_kind.as_deref().unwrap_or("auto");
+                AgentRunRepo::new(conn).create_run(config_id, "waiting", kind)?;
             }
             FleetMutation::EndAgentRun { run_id } => {
                 AgentRunRepo::new(conn).end_run(run_id)?;
@@ -338,8 +345,12 @@ impl FleetMutation {
                 id,
                 agent_id,
                 content,
+                run_id,
             } => {
-                let run_id = resolve_or_create_run(conn, agent_id)?;
+                let run_id = match run_id {
+                    Some(run_id) => run_id.clone(),
+                    None => resolve_or_create_run(conn, agent_id)?,
+                };
                 TranscriptRepo::new(conn).send_prompt(id, &run_id, content)?;
             }
             FleetMutation::CompleteResponse {
@@ -347,8 +358,12 @@ impl FleetMutation {
                 agent_id,
                 content,
                 prompt_id,
+                run_id,
             } => {
-                let run_id = resolve_or_create_run(conn, agent_id)?;
+                let run_id = match run_id {
+                    Some(run_id) => run_id.clone(),
+                    None => resolve_or_create_run(conn, agent_id)?,
+                };
                 TranscriptRepo::new(conn).complete_response(
                     response_id,
                     &run_id,
@@ -887,6 +902,7 @@ mod tests {
                 id: "p".into(),
                 agent_id: "a".into(),
                 content: "hi".into(),
+                run_id: None,
             }
             .is_immediate()
         );

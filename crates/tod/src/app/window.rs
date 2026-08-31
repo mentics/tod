@@ -9,9 +9,12 @@ use crate::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
 use crate::app::history_window::HistoryWindowControl;
+use crate::app::interactive_agent_window::InteractiveAgentWindowControl;
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
-use crate::fleet::{FleetLaunchError, FleetStore};
+use crate::fleet::{
+    FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
+};
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
@@ -77,6 +80,7 @@ pub struct Shell {
     agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
+    interactive_agent_window: InteractiveAgentWindowControl,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
     paths: TodPaths,
@@ -455,6 +459,74 @@ impl Shell {
         if let Err(err) = self.history_window.open_or_focus(cx) {
             tracing::error!("failed to open history window: {err}");
         }
+    }
+
+    fn handle_open_shell(
+        &mut self,
+        task_id: String,
+        shell_id: Option<String>,
+        agent_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let settings = TodSettings::load(&self.paths).unwrap_or_default();
+        let result: anyhow::Result<String> = (|| {
+            if let Some(shell_id) = shell_id {
+                let shell = self
+                    .fleet
+                    .get_shell(&shell_id)?
+                    .ok_or_else(|| anyhow::anyhow!("shell session not found"))?;
+                let config_id = shell.agent_id.clone();
+                let cwd = focus_shell_session(
+                    &self.fleet,
+                    &self.paths,
+                    &settings,
+                    &config_id,
+                    &task_id,
+                    &shell,
+                )?;
+                return Ok(format!("Opened terminal in {}", cwd.display()));
+            }
+
+            let config_id = if let Some(agent_id) = agent_id {
+                agent_id
+            } else {
+                self.fleet
+                    .list_agent_configs_for_task(&task_id)?
+                    .into_iter()
+                    .next()
+                    .map(|row| row.id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no agent config for this task; create one in Agent config first"
+                        )
+                    })?
+            };
+
+            let (_, cwd) = open_shell_for_agent_config(
+                &self.fleet,
+                &self.paths,
+                &settings,
+                &config_id,
+                &task_id,
+            )?;
+            Ok(format!("Opened terminal in {}", cwd.display()))
+        })();
+
+        match result {
+            Ok(msg) => {
+                let _ = self.fleet.reload_if_stale();
+                self.task_list.update(cx, |list, cx| {
+                    list.set_status_message(msg, cx);
+                    list.request_live_refresh(cx);
+                });
+            }
+            Err(err) => {
+                self.task_list.update(cx, |list, cx| {
+                    list.set_status_message(format!("Shell failed: {err:#}"), cx);
+                });
+            }
+        }
+        cx.notify();
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -862,6 +934,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     };
 
     let transcript_window = TranscriptWindowControl::new();
+    let interactive_agent_window = InteractiveAgentWindowControl::new();
     let history_window = HistoryWindowControl::new();
     let transcript_for_socket = transcript_window.clone();
 
@@ -896,13 +969,20 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         {
             let paths = paths.clone();
             let transcript_window = transcript_window.clone();
+            let interactive_agent_window = interactive_agent_window.clone();
             let history_window = history_window.clone();
             #[cfg(feature = "agent-socket")]
             let shell_for_socket = shell_for_socket.clone();
             move |window, cx| {
                 let paths_for_geometry = paths.clone();
-                window.on_window_should_close(cx, move |window, _| {
+                let transcript_for_close = transcript_window.clone();
+                let history_for_close = history_window.clone();
+                let interactive_for_close = interactive_agent_window.clone();
+                window.on_window_should_close(cx, move |window, cx| {
                     TodSettings::persist_window_geometry(window, &paths_for_geometry);
+                    transcript_for_close.close(cx);
+                    history_for_close.close(cx);
+                    interactive_for_close.close_all(cx);
                     true
                 });
                 match fleet_open {
@@ -914,6 +994,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                     Ok(fleet) => {
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
+                        let app_settings = TodSettings::load(&paths).unwrap_or_default();
+                        interactive_agent_window.bind(
+                            fleet.clone(),
+                            agent.clone(),
+                            paths.clone(),
+                            app_settings,
+                        );
                         let _ = crate::interview::bootstrap(fleet.clone());
                         if opts.import_process {
                             let repo = paths.repo_root().to_path_buf();
@@ -942,7 +1029,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let agent_panel = cx.new(|cx| {
-                            AgentConfigPanelView::new(window, cx, fleet.clone(), agent.clone())
+                            AgentConfigPanelView::new(
+                                window,
+                                cx,
+                                fleet.clone(),
+                                agent.clone(),
+                                interactive_agent_window.clone(),
+                            )
                         });
                         let agent_for_sessions = agent.clone();
                         let gate_for_sessions = bootstrap_gate.clone();
@@ -958,99 +1051,105 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
                         let view = cx.new(|cx| {
-                            let _task_list_subscription = cx.subscribe(
-                            &task_list,
-                            |this: &mut Shell, _, event, cx| match event {
-                                TaskListEvent::OpenInterview {
-                                    task_id,
-                                    node_id,
-                                    lifecycle,
-                                    title,
-                                } => {
-                                    this.queue_open_interview(
-                                        task_id.clone(),
-                                        node_id.clone(),
-                                        lifecycle.clone(),
-                                        title.clone(),
-                                        cx,
-                                    );
-                                }
-                                TaskListEvent::OpenTaskEdit { task_id, .. } => {
-                                    if this.task_edit.read(cx).is_open() {
-                                        this.queue_retarget_task_edit(task_id.clone(), cx);
-                                    } else {
-                                        this.queue_open_task_edit(task_id.clone(), cx);
-                                    }
-                                }
-                                TaskListEvent::OpenObligations { task_id, title } => {
-                                    if this.obligations.read(cx).is_open() {
-                                        this.queue_retarget_obligations(
-                                            task_id.clone(),
-                                            title.clone(),
-                                            cx,
-                                        );
-                                    } else {
-                                        this.queue_open_obligations(
-                                            task_id.clone(),
-                                            title.clone(),
-                                            cx,
-                                        );
-                                    }
-                                }
-                                TaskListEvent::OpenNewTaskCompose => {
-                                    eprintln!("tod: new task compose stub");
-                                }
-                                TaskListEvent::CloseTaskEdit => {
-                                    this.queue_close_task_edit(cx);
-                                }
-                                TaskListEvent::CloseObligations => {
-                                    this.queue_close_obligations(cx);
-                                }
-                                TaskListEvent::OpenLifecycle { lifecycle, .. } => {
-                                    eprintln!("tod: lifecycle panel stub — {lifecycle}");
-                                }
-                                TaskListEvent::OpenAgentDetail { task_id, agent_id } => {
-                                    if this.agent_panel.read(cx).is_open() {
-                                        if let Some(agent_id) = agent_id.clone() {
-                                            this.queue_retarget_agent(
+                            let _task_list_subscription =
+                                cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
+                                    match event {
+                                        TaskListEvent::OpenInterview {
+                                            task_id,
+                                            node_id,
+                                            lifecycle,
+                                            title,
+                                        } => {
+                                            this.queue_open_interview(
                                                 task_id.clone(),
-                                                agent_id,
+                                                node_id.clone(),
+                                                lifecycle.clone(),
+                                                title.clone(),
                                                 cx,
                                             );
-                                        } else {
-                                            this.queue_open_agent(task_id.clone(), None, cx);
                                         }
-                                    } else {
-                                        this.queue_open_agent(
-                                            task_id.clone(),
-                                            agent_id.clone(),
-                                            cx,
-                                        );
+                                        TaskListEvent::OpenTaskEdit { task_id, .. } => {
+                                            if this.task_edit.read(cx).is_open() {
+                                                this.queue_retarget_task_edit(task_id.clone(), cx);
+                                            } else {
+                                                this.queue_open_task_edit(task_id.clone(), cx);
+                                            }
+                                        }
+                                        TaskListEvent::OpenObligations { task_id, title } => {
+                                            if this.obligations.read(cx).is_open() {
+                                                this.queue_retarget_obligations(
+                                                    task_id.clone(),
+                                                    title.clone(),
+                                                    cx,
+                                                );
+                                            } else {
+                                                this.queue_open_obligations(
+                                                    task_id.clone(),
+                                                    title.clone(),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        TaskListEvent::OpenNewTaskCompose => {
+                                            eprintln!("tod: new task compose stub");
+                                        }
+                                        TaskListEvent::CloseTaskEdit => {
+                                            this.queue_close_task_edit(cx);
+                                        }
+                                        TaskListEvent::CloseObligations => {
+                                            this.queue_close_obligations(cx);
+                                        }
+                                        TaskListEvent::OpenLifecycle { lifecycle, .. } => {
+                                            eprintln!("tod: lifecycle panel stub — {lifecycle}");
+                                        }
+                                        TaskListEvent::OpenAgentDetail { task_id, agent_id } => {
+                                            if this.agent_panel.read(cx).is_open() {
+                                                if let Some(agent_id) = agent_id.clone() {
+                                                    this.queue_retarget_agent(
+                                                        task_id.clone(),
+                                                        agent_id,
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.queue_open_agent(
+                                                        task_id.clone(),
+                                                        None,
+                                                        cx,
+                                                    );
+                                                }
+                                            } else {
+                                                this.queue_open_agent(
+                                                    task_id.clone(),
+                                                    agent_id.clone(),
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        TaskListEvent::CloseAgentPanel => {
+                                            this.queue_close_agent_panel(cx);
+                                        }
+                                        TaskListEvent::OpenShell {
+                                            task_id,
+                                            shell_id,
+                                            agent_id,
+                                        } => {
+                                            this.handle_open_shell(
+                                                task_id.clone(),
+                                                shell_id.clone(),
+                                                agent_id.clone(),
+                                                cx,
+                                            );
+                                        }
+                                        TaskListEvent::DeleteTask { task_id } => {
+                                            this.task_list.update(cx, |list, cx| {
+                                                list.schedule_remove_task(task_id.clone(), cx);
+                                            });
+                                        }
+                                        TaskListEvent::StatusMessage(msg) => {
+                                            eprintln!("tod: {msg}");
+                                        }
                                     }
-                                }
-                                TaskListEvent::CloseAgentPanel => {
-                                    this.queue_close_agent_panel(cx);
-                                }
-                                TaskListEvent::OpenShell {
-                                    task_id,
-                                    shell_id,
-                                    agent_id,
-                                } => {
-                                    eprintln!(
-                                        "tod: shell stub — task {task_id} shell {:?} agent {:?}",
-                                        shell_id, agent_id
-                                    );
-                                }
-                                TaskListEvent::DeleteTask { task_id } => {
-                                    this.task_list.update(cx, |list, cx| {
-                                        list.schedule_remove_task(task_id.clone(), cx);
-                                    });
-                                }
-                                TaskListEvent::StatusMessage(msg) => {
-                                    eprintln!("tod: {msg}");
-                                }
-                            },
-                        );
+                                });
                             let _task_edit_subscription =
                                 cx.subscribe(&task_edit, |this: &mut Shell, _, event, cx| {
                                     match event {
@@ -1095,7 +1194,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
-                                        AgentConfigPanelEvent::Saved { .. } => {
+                                        AgentConfigPanelEvent::Saved { .. }
+                                        | AgentConfigPanelEvent::Deleted { .. } => {
                                             this.task_list.update(cx, |list, cx| {
                                                 list.request_live_refresh(cx);
                                             });
@@ -1142,6 +1242,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),
+                                interactive_agent_window: interactive_agent_window.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
                                 paths,

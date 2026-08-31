@@ -653,12 +653,15 @@ impl WorkspaceView {
 
     fn bootstrap_stage_detail(&self) -> Option<String> {
         let scratchpad = self.session_scratchpad_dir();
-        if !scratchpad.is_dir() {
-            return Some("Starting question maker agent…".into());
-        }
         let config_path = scratchpad.join("interview-config.md");
         if !config_path.is_file() {
-            return Some("Creating session files…".into());
+            // Scope export creates scratchpad/scope/ before the agent runs — directory
+            // presence does not mean file creation is in progress.
+            return Some(if self.session_bootstrap_in_flight() {
+                "Question maker agent is preparing the session…".into()
+            } else {
+                "Waiting for question maker to start…".into()
+            });
         }
         let queue_dir = scratchpad.join("queue");
         let count = count_queue_files(&queue_dir);

@@ -292,11 +292,26 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    pub fn get_shell(&self, id: &str) -> Result<Option<ShellSession>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ShellRepo::new(&guard.connection())
+            .find(id)
+            .map_err(Into::into)
+    }
+
     /// Agent runs for a config, newest first.
     pub fn list_runs_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         AgentRunRepo::new(&guard.connection())
             .list_for_config(config_id)
+            .map_err(Into::into)
+    }
+
+    /// Interactive chat sessions for a config, newest first.
+    pub fn list_interactive_sessions_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .list_interactive_for_config(config_id)
             .map_err(Into::into)
     }
 

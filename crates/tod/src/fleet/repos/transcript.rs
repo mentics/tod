@@ -199,7 +199,7 @@ mod tests {
             })
             .unwrap();
         AgentRunRepo::new(conn)
-            .create_run(&config_id, "waiting")
+            .create_run(&config_id, "waiting", "auto")
             .unwrap()
     }
 

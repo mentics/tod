@@ -88,6 +88,18 @@ fn default_agent_platform() -> AgentPlatform {
     AgentPlatform::Claude
 }
 
+fn default_terminal_settings() -> TerminalSettings {
+    TerminalSettings::default()
+}
+
+/// External terminal program for agent shell sessions (`None` = OS default).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TerminalSettings {
+    /// Executable name or path, e.g. `wt.exe`, `powershell.exe`, `/usr/bin/alacritty`.
+    #[serde(default)]
+    pub program: Option<String>,
+}
+
 /// How Tod provisions git worktrees for interview / agent workspaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +189,9 @@ pub struct TodSettings {
     /// Which agent platform runs interview question-maker / answer-processor work.
     #[serde(default = "default_agent_platform")]
     pub agent_platform: AgentPlatform,
+    /// Terminal emulator for interactive shell sessions.
+    #[serde(default = "default_terminal_settings")]
+    pub terminal: TerminalSettings,
     /// Last known main-window placement.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
@@ -193,6 +208,7 @@ impl Default for TodSettings {
             always_on_top: false,
             worktree_backend: WorktreeBackend::default(),
             agent_platform: AgentPlatform::default(),
+            terminal: TerminalSettings::default(),
             window_geometry: None,
         }
     }
@@ -394,6 +410,9 @@ mod tests {
             always_on_top: true,
             worktree_backend: WorktreeBackend::default(),
             agent_platform: AgentPlatform::Claude,
+            terminal: TerminalSettings {
+                program: Some(r"C:\app\dev\Git\git-bash.exe".into()),
+            },
             window_geometry: Some(WindowGeometry {
                 x: 120.0,
                 y: 80.0,

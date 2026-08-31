@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 8;
+pub const CURRENT_USER_VERSION: i32 = 9;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -130,6 +130,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 8 {
         migrate_v7_to_v8(conn)?;
         conn.pragma_update(None, "user_version", 8)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 9 {
+        migrate_v8_to_v9(conn)?;
+        conn.pragma_update(None, "user_version", 9)?;
     }
     Ok(())
 }
@@ -525,6 +530,22 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
 }
 
 /// Gate criteria catalog + per-node evaluation rows.
+fn migrate_v8_to_v9(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE agent_runs ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'auto'
+            CHECK(run_kind IN ('auto', 'interactive'));
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '9')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_v7_to_v8(conn: &Connection) -> Result<()> {
     use crate::outline::gate_criteria_seed::{GATE_CRITERIA_DDL, seed_gate_criteria};
 
