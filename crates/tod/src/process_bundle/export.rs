@@ -127,7 +127,6 @@ fn capitalize_kind(kind: &str) -> &str {
 mod tests {
     use super::*;
     use tod_store::fleet::schema;
-    use tod_store::outline::{CreatePosition, OutlineMutation};
     use tod_store::outline::types::Capability;
     use tod_store::outline::repos::obligations::NodeObligation;
     use tod_store::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};

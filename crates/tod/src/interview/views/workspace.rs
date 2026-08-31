@@ -3611,7 +3611,7 @@ mod tests {
     };
     use crate::interview::agent::RunId;
     use crate::interview::queue::QueueQuestion;
-    use crate::interview::{InterviewSessionStatus, SessionStore, TodPaths};
+    use crate::interview::InterviewSessionStatus;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::time::Instant;

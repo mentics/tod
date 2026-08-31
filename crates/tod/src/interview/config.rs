@@ -283,7 +283,6 @@ mod tests {
     use super::*;
     use tod_store::fleet::FleetStore;
     use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
-    use crate::interview::paths::TodPaths;
     use tod_store::outline::OutlineMutation;
     use std::fs;
 

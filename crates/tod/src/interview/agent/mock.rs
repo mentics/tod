@@ -1,4 +1,6 @@
-use super::answer_pool::{AnswerProcessorPoolManager, AnswerProcessorPoolStats, AnswerSubmitAssignment};
+use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
+#[cfg(test)]
+use super::answer_pool::AnswerProcessorPoolStats;
 use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState,
     DeepDiveContext, RunId,
@@ -869,7 +871,6 @@ fn extract_actions(prompt: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interview::agent::answer_pool::AnswerProcessorPoolStats;
     use crate::interview::config::agent_scratchpad_for_node;
     use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
     use std::time::Duration;

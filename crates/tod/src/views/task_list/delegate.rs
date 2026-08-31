@@ -383,18 +383,6 @@ fn title_label(
                 .child(title),
         )
         .when(selected, |el| {
-            el.child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .right_0()
-                    .px_0p5()
-                    .text_xs()
-                    .opacity(0.5)
-                    .child("E"),
-            )
-        })
-        .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
                 let task_id = task_id.clone();
                 let sink = sink.clone();
@@ -428,7 +416,6 @@ fn action_chip(
 ) -> impl gpui::IntoElement {
     let label = label.into();
     div()
-        .relative()
         .px_2()
         .py_0p5()
         .rounded_md()
@@ -438,19 +425,15 @@ fn action_chip(
         .border_color(if selected { primary } else { border })
         .bg(if selected { secondary } else { background })
         .text_color(foreground)
-        .when_some(badge, |el, badge| {
-            el.child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .right_0()
-                    .px_0p5()
-                    .text_xs()
-                    .opacity(0.5)
-                    .child(badge.to_string()),
-            )
-        })
-        .child(label)
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .when_some(badge, |row, badge| {
+                    row.child(div().text_xs().opacity(0.5).child(badge.to_string()))
+                })
+                .child(label),
+        )
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |_, _, _, cx| {
@@ -463,12 +446,11 @@ fn action_chip(
 fn tag_chip(
     cx: &mut Context<ListState<TaskListDelegate>>,
     tag: String,
-    _active: bool,
+    active: bool,
     badge: Option<String>,
     on_click: impl Fn() + 'static,
 ) -> impl gpui::IntoElement {
     div()
-        .relative()
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
@@ -484,6 +466,10 @@ fn tag_chip(
                 .when_some(badge, |row, b| {
                     row.child(div().text_xs().opacity(0.7).child(b))
                 })
-                .child(Tag::secondary().small().outline().child(tag)),
+                .child(if active {
+                    Tag::primary().small().outline().child(tag)
+                } else {
+                    Tag::secondary().small().outline().child(tag)
+                }),
         )
 }

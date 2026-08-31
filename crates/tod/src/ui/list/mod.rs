@@ -8,8 +8,8 @@ pub use keyboard::{
 use gpui::{App, Entity, Pixels, Styled, Window, px};
 use gpui_component::list::{List, ListDelegate, ListState};
 
-/// Uniform two-line task row height used for viewport/page calculations.
-pub const TWO_LINE_ROW_HEIGHT: Pixels = px(44.);
+/// Uniform tree row height used for viewport/page calculations.
+pub const TWO_LINE_ROW_HEIGHT: Pixels = px(28.);
 
 /// Approximate visible row count from list viewport height.
 pub fn viewport_row_count(viewport_height: Pixels) -> usize {

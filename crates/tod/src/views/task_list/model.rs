@@ -263,6 +263,10 @@ pub fn filter_and_sort_tasks(
         visible.sort_by(|a, b| {
             compare_tasks(a, b, working_set.sort_key, working_set.sort_direction)
         });
+        for task in &mut visible {
+            task.depth = 0;
+            task.has_children = false;
+        }
     }
     visible
 }

@@ -13,7 +13,7 @@ pub mod transcript;
 #[cfg(test)]
 pub(crate) fn test_writer_conn() -> (std::path::PathBuf, rusqlite::Connection) {
     use crate::fleet::schema;
-    use rusqlite::Connection;
+    
     use std::fs;
 
     let dir = std::env::temp_dir().join(format!("tod-fleet-repo-{}", uuid::Uuid::new_v4()));

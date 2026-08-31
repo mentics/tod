@@ -139,6 +139,7 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-up", TaskListMoveUp, context),
         KeyBinding::new("ctrl-down", TaskListMoveDown, context),
         KeyBinding::new("delete", TaskListDelete, context),
+        KeyBinding::new("backspace", TaskListDelete, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
             "up",
@@ -1199,8 +1200,8 @@ impl TaskListView {
         self.move_to_row(new_row, window, cx);
     }
 
-    fn page_delta(&self) -> usize {
-        viewport_row_count(px(728.))
+    fn page_delta(&self, window: &Window) -> usize {
+        viewport_row_count(window.viewport_size().height)
     }
 
     fn on_new_task(&mut self, _: &TaskListNewTask, window: &mut Window, cx: &mut Context<Self>) {
@@ -1503,11 +1504,11 @@ impl TaskListView {
     }
 
     fn on_page_up(&mut self, _: &ListPageUp, window: &mut Window, cx: &mut Context<Self>) {
-        self.move_by_rows(-(self.page_delta() as i32), window, cx);
+        self.move_by_rows(-(self.page_delta(window) as i32), window, cx);
     }
 
     fn on_page_down(&mut self, _: &ListPageDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.move_by_rows(self.page_delta() as i32, window, cx);
+        self.move_by_rows(self.page_delta(window) as i32, window, cx);
     }
 
     fn on_home(&mut self, _: &ListHome, window: &mut Window, cx: &mut Context<Self>) {
@@ -2092,6 +2093,7 @@ mod tests {
     use super::model::ListWorkingSet;
     use super::model::filter_and_sort_tasks;
     use super::model::selection_after_delete;
+    use super::model::{SortDirection, SortKey};
 
     #[test]
     fn large_fixture_set_reaches_scale_target() {
@@ -2133,5 +2135,26 @@ mod tests {
         let next =
             selection_after_delete(&visible_before, &visible_after, Some(&only.id), &only.id);
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn title_sort_flattens_display_depth() {
+        let mut parent = large_fixture_set(1)[0].clone();
+        parent.depth = 0;
+        parent.title = "Parent".into();
+        let mut child = parent.clone();
+        child.id = "child-id".into();
+        child.depth = 1;
+        child.title = "Alpha child".into();
+        child.tree_ordinal = 1;
+        let ws = ListWorkingSet {
+            sort_key: SortKey::Title,
+            sort_direction: SortDirection::Asc,
+            ..ListWorkingSet::default_sort()
+        };
+        let visible = filter_and_sort_tasks(&[parent, child], "", &ws);
+        assert_eq!(visible[0].title, "Alpha child");
+        assert_eq!(visible[0].depth, 0);
+        assert!(!visible[0].has_children);
     }
 }

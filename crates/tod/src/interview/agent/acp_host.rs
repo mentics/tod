@@ -43,13 +43,101 @@ impl AcpHost {
     pub fn resolve_bin(self) -> Result<PathBuf> {
         match self {
             Self::Cursor => resolve_cursor_bin(),
-            Self::Claude => resolve_claude_bin(),
+            Self::Claude => resolve_claude_acp_bin(),
         }
     }
 
-    pub fn spawn_subcommand(self) -> &'static str {
-        "acp"
+    /// Whether spawn should append the `acp` subcommand (Cursor / native Claude) or run
+    /// the binary directly (standalone ACP adapters such as `claude-code-acp`).
+    pub fn uses_acp_subcommand(self, agent_bin: &Path) -> bool {
+        match self {
+            Self::Cursor => true,
+            Self::Claude => !is_standalone_acp_server(agent_bin),
+        }
     }
+}
+
+fn is_standalone_acp_server(agent_bin: &Path) -> bool {
+    let Some(name) = agent_bin.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let stem = name
+        .strip_suffix(".cmd")
+        .or_else(|| name.strip_suffix(".exe"))
+        .unwrap_or(name);
+    stem.contains("claude-code-acp") || stem.contains("claude-code-cli-acp")
+}
+
+/// True when `claude acp` is a supported subcommand (not present on current Claude Code CLI).
+fn claude_supports_native_acp(claude_bin: &Path) -> bool {
+    use std::process::{Command, Stdio};
+
+    Command::new(claude_bin)
+        .args(["acp", "--help"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn claude_acp_adapter_candidates(home: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from(home)
+            .join(".local")
+            .join("bin")
+            .join("claude-code-acp"),
+    ];
+    if cfg!(windows) {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            candidates.push(
+                PathBuf::from(&appdata)
+                    .join("npm")
+                    .join("claude-code-acp.cmd"),
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from("/opt/homebrew/bin/claude-code-acp"));
+        candidates.push(PathBuf::from("/usr/local/bin/claude-code-acp"));
+    }
+    candidates
+}
+
+fn claude_cli_candidates(home: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if cfg!(windows) {
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            candidates.push(
+                PathBuf::from(&local_app_data)
+                    .join("Programs")
+                    .join("claude")
+                    .join("claude.cmd"),
+            );
+        }
+    } else {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".local")
+                .join("bin")
+                .join("claude"),
+        );
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
+            candidates.push(PathBuf::from("/usr/local/bin/claude"));
+            candidates.push(
+                PathBuf::from(home)
+                    .join(".claude")
+                    .join("local")
+                    .join("bin")
+                    .join("claude"),
+            );
+        }
+    }
+    candidates
 }
 
 /// Resolve a CLI on `$PATH` using the user's login shell (macOS GUI apps often
@@ -121,66 +209,65 @@ fn resolve_cursor_bin() -> Result<PathBuf> {
     bail!("Cursor agent CLI not found. Install from https://cursor.com/install or set AGENT_BIN.")
 }
 
-fn resolve_claude_bin() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("CLAUDE_BIN") {
+fn resolve_claude_acp_bin() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("CLAUDE_ACP_BIN") {
         return Ok(PathBuf::from(path));
     }
 
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            candidates.push(
-                PathBuf::from(&local_app_data)
-                    .join("Programs")
-                    .join("claude")
-                    .join("claude.cmd"),
-            );
-        }
-    } else if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(&home)
-                .join(".local")
-                .join("bin")
-                .join("claude"),
-        );
-        #[cfg(target_os = "macos")]
+    if let Ok(path) = std::env::var("CLAUDE_BIN") {
+        let candidate = PathBuf::from(&path);
+        if candidate.is_file()
+            && (is_standalone_acp_server(&candidate) || claude_supports_native_acp(&candidate))
         {
-            candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-            candidates.push(PathBuf::from("/usr/local/bin/claude"));
-            candidates.push(
-                PathBuf::from(&home)
-                    .join(".claude")
-                    .join("local")
-                    .join("bin")
-                    .join("claude"),
-            );
+            return Ok(candidate);
         }
     }
 
-    if let Some(path) = first_existing(&candidates) {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(path) = first_existing(&claude_acp_adapter_candidates(&home)) {
+            return Ok(path);
+        }
+    }
+    if let Some(path) = resolve_via_login_shell("claude-code-acp") {
         return Ok(path);
     }
-    if let Some(path) = resolve_via_login_shell("claude") {
-        return Ok(path);
+
+    if let Ok(home) = std::env::var("HOME") {
+        for candidate in claude_cli_candidates(&home) {
+            if candidate.is_file() && claude_supports_native_acp(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    if let Some(claude) = resolve_via_login_shell("claude") {
+        if claude_supports_native_acp(&claude) {
+            return Ok(claude);
+        }
     }
 
     bail!(
-        "Claude agent CLI not found. Install with `curl -fsSL https://claude.ai/install.sh | bash` \
-         or set CLAUDE_BIN to the full path (e.g. ~/.local/bin/claude)."
+        "Claude ACP adapter not found. The `claude` CLI does not include an `acp` subcommand — \
+         install Zed's adapter:\n  \
+         npm install -g @zed-industries/claude-code-acp\n\
+         Then ensure `claude-code-acp` is on PATH, or set CLAUDE_ACP_BIN to its full path."
     )
 }
 
-/// Spawn `host acp` (or `cmd /C host.cmd acp` on Windows).
+/// Spawn an ACP server process (Cursor/Claude `… acp`, or a standalone adapter).
 pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
 
-    let subcommand = host.spawn_subcommand();
+    let use_subcommand = host.uses_acp_subcommand(agent_bin);
+    let subcommand = "acp";
     let mut command = if agent_bin
         .extension()
         .is_some_and(|ext| ext == "cmd" || ext == "bat")
     {
         let mut cmd = Command::new("cmd");
-        cmd.args(["/C", &agent_bin.to_string_lossy(), subcommand]);
+        cmd.arg("/C").arg(agent_bin);
+        if use_subcommand {
+            cmd.arg(subcommand);
+        }
         cmd
     } else if agent_bin
         .extension()
@@ -188,11 +275,15 @@ pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process
     {
         let mut cmd = Command::new("python");
         cmd.arg(agent_bin);
-        cmd.arg(subcommand);
+        if use_subcommand {
+            cmd.arg(subcommand);
+        }
         cmd
     } else {
         let mut cmd = Command::new(agent_bin);
-        cmd.arg(subcommand);
+        if use_subcommand {
+            cmd.arg(subcommand);
+        }
         cmd
     };
 
@@ -213,6 +304,7 @@ pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn agent_platform_default_is_claude() {
@@ -229,5 +321,20 @@ mod tests {
             agent_platform_acp_host(AgentPlatform::Claude),
             AcpHost::Claude
         );
+    }
+
+    #[test]
+    fn standalone_acp_server_detection() {
+        assert!(is_standalone_acp_server(Path::new(
+            "/usr/local/bin/claude-code-acp"
+        )));
+        assert!(is_standalone_acp_server(Path::new(
+            r"C:\Users\me\AppData\Roaming\npm\claude-code-acp.cmd"
+        )));
+        assert!(!is_standalone_acp_server(Path::new(
+            "/usr/local/bin/claude"
+        )));
+        assert!(AcpHost::Claude.uses_acp_subcommand(Path::new("/usr/local/bin/claude-code-acp")));
+        assert!(AcpHost::Cursor.uses_acp_subcommand(Path::new("/usr/local/bin/agent")));
     }
 }

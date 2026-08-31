@@ -7,7 +7,6 @@ mod question_maker_pool;
 
 pub use acp_host::{AcpHost, AgentPlatform};
 
-
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;
 pub use provider::{AgentProvider, AgentRunState, DeepDiveContext, RunId};
@@ -41,7 +40,9 @@ impl AgentBackend {
             "mock" => Ok(Self::Mock),
             "cursor" | "acp" | "real" => Ok(Self::Cursor),
             "claude" | "anthropic" => Ok(Self::Claude),
-            other => anyhow::bail!("unknown --agent backend `{other}` (expected mock|cursor|claude)"),
+            other => {
+                anyhow::bail!("unknown --agent backend `{other}` (expected mock|cursor|claude)")
+            }
         }
     }
 
@@ -52,13 +53,18 @@ impl AgentBackend {
         }
     }
 
-    pub fn build_provider(self, traffic_log: SharedAgentTrafficLog) -> Box<dyn AgentProvider + Send> {
+    pub fn build_provider(
+        self,
+        traffic_log: SharedAgentTrafficLog,
+    ) -> Box<dyn AgentProvider + Send> {
         match self {
             Self::Mock => Box::new(MockAgentProvider::new().with_traffic_log(traffic_log)),
             Self::Cursor => Box::new(
                 CursorAcpProvider::for_host(AcpHost::Cursor)
                     .unwrap_or_else(|err| {
-                        eprintln!("Cursor ACP provider init failed: {err}; using placeholder agent path");
+                        eprintln!(
+                            "Cursor ACP provider init failed: {err}; using placeholder agent path"
+                        );
                         CursorAcpProvider::with_agent_bin(AcpHost::Cursor, PathBuf::from("agent"))
                     })
                     .with_traffic_log(traffic_log),
@@ -66,8 +72,13 @@ impl AgentBackend {
             Self::Claude => Box::new(
                 CursorAcpProvider::for_host(AcpHost::Claude)
                     .unwrap_or_else(|err| {
-                        eprintln!("Claude ACP provider init failed: {err}; using placeholder agent path");
-                        CursorAcpProvider::with_agent_bin(AcpHost::Claude, PathBuf::from("claude"))
+                        eprintln!(
+                            "Claude ACP provider init failed: {err}; using placeholder adapter path"
+                        );
+                        CursorAcpProvider::with_agent_bin(
+                            AcpHost::Claude,
+                            PathBuf::from("claude-code-acp"),
+                        )
                     })
                     .with_traffic_log(traffic_log),
             ),

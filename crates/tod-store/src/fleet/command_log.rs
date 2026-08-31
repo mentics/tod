@@ -95,7 +95,7 @@ impl CommandLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outline::{CreatePosition, OutlineMutation, ReorderDirection};
+    use crate::outline::{OutlineMutation, ReorderDirection};
 
     fn outline(m: OutlineMutation) -> FleetMutation {
         FleetMutation::Outline(m)
