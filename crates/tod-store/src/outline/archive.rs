@@ -153,6 +153,32 @@ pub fn restore_subtree(conn: &Connection, archive_id: Uuid, _media_root: &Path) 
     Ok(list_id)
 }
 
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}…")
+}
+
+fn node_label(conn: &Connection, node_id: Uuid) -> String {
+    let title = NodeRepo::new(conn)
+        .get(node_id)
+        .ok()
+        .flatten()
+        .map(|node| truncate_title(&node.title, 40))
+        .unwrap_or_default();
+    if title.is_empty() {
+        "this node".into()
+    } else {
+        format!("node \"{title}\"")
+    }
+}
+
 fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
     let outline = OutlineRepo::new(conn);
     let entry = outline
@@ -167,14 +193,11 @@ fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
             |row| row.get(0),
         )?;
         if agent_count > 0 {
-            anyhow::bail!("cannot delete: node has associated agents");
+            let label = node_label(conn, root_id);
+            anyhow::bail!("{label} has associated agents — remove them before deleting");
         }
     }
-    let placeholders = subtree
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders = subtree.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let blobs: Vec<Vec<u8>> = subtree.iter().map(|id| uuid_to_blob(*id)).collect();
     let sql = format!(
         "SELECT id FROM nodes WHERE kind = 'reference' AND ref_target_id IN ({placeholders})
@@ -195,15 +218,14 @@ fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
         }
     }
     if !refs.is_empty() {
-        anyhow::bail!("cannot delete: subtree is referenced by other nodes");
+        let label = node_label(conn, root_id);
+        anyhow::bail!("{label} is referenced by other nodes and cannot be deleted");
     }
     Ok(())
 }
 
 fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
-    let node = NodeRepo::new(conn)
-        .get(node_id)?
-        .context("node missing")?;
+    let node = NodeRepo::new(conn).get(node_id)?.context("node missing")?;
     let outline = OutlineRepo::new(conn)
         .get_entry(node_id)?
         .context("outline entry missing")?;
@@ -461,10 +483,8 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
 }
 
 fn depth_sort(nodes: &[ArchivedNode]) -> Vec<&ArchivedNode> {
-    let parent_map: HashMap<Uuid, Option<Uuid>> = nodes
-        .iter()
-        .map(|n| (n.id, n.outline.parent_id))
-        .collect();
+    let parent_map: HashMap<Uuid, Option<Uuid>> =
+        nodes.iter().map(|n| (n.id, n.outline.parent_id)).collect();
     let depth = |id: Uuid| -> usize {
         let mut d = 0;
         let mut current = parent_map.get(&id).copied().flatten();

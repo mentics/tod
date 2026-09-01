@@ -1,10 +1,6 @@
 //! Right-drawer agent config panel — persistent environment configuration for a task.
 
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
-use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
-use tod_store::fleet::repos::shell::ShellSession;
-use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
-use tod_store::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::settings::TodSettings;
@@ -15,13 +11,17 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Window, actions, div,
+    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    ParentElement, Render, Styled, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
+use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
+use tod_store::fleet::repos::shell::ShellSession;
+use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
+use tod_store::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
 
 const AGENT_CONFIG_CONTEXT: &str = "AgentConfig";
 
@@ -30,8 +30,13 @@ actions!(agent_config, [AgentConfigClose, AgentConfigSave]);
 #[derive(Debug, Clone)]
 pub enum AgentConfigPanelEvent {
     Close,
-    Saved { _task_id: String, _config_id: String },
-    Deleted { _task_id: String },
+    Saved {
+        _task_id: String,
+        _config_id: String,
+    },
+    Deleted {
+        _task_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -289,8 +294,7 @@ impl AgentConfigPanelView {
                 work_directory: work_directory.clone(),
                 use_worktree: self.use_worktree,
             }) {
-                self.status_message = format!("Save failed: {err}");
-                cx.notify();
+                self.show_error(window, cx, format!("Save failed: {err}"));
                 return;
             }
         } else {
@@ -305,16 +309,14 @@ impl AgentConfigPanelView {
                     use_worktree: self.use_worktree,
                 },
             }) {
-                self.status_message = format!("Save failed: {err}");
-                cx.notify();
+                self.show_error(window, cx, format!("Save failed: {err}"));
                 return;
             }
             self.config_id = Some(config_id);
         }
 
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_message = format!("Save failed: {err}");
-            cx.notify();
+            self.show_error(window, cx, format!("Save failed: {err}"));
             return;
         }
         let _ = self.fleet.reload_if_stale();
@@ -361,9 +363,7 @@ impl AgentConfigPanelView {
         cx: &mut Context<Self>,
         message: impl Into<String>,
     ) {
-        let message = message.into();
-        self.set_status(message.clone(), cx);
-        error_toast(window, cx, message);
+        error_toast(window, cx, message.into());
     }
 
     /// Agent row for launch (from saved config).
@@ -372,7 +372,7 @@ impl AgentConfigPanelView {
         self.fleet.get_agent(config_id).ok().flatten()
     }
 
-    fn poll_in_flight_runs(&mut self, cx: &mut Context<Self>) {
+    fn poll_in_flight_runs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.in_flight.is_empty() {
             return;
         }
@@ -427,19 +427,27 @@ impl AgentConfigPanelView {
             self.in_flight.remove(idx);
         }
         if let Err(err) = self.flush_fleet() {
-            self.status_message = format!("Run update failed: {err}");
+            self.show_error(window, cx, format!("Run update failed: {err}"));
         } else {
             let _ = self.fleet.reload_if_stale();
             self.reload_runs();
             self.reload_agent_status();
             if let Some((_, flight, result)) = finished.last() {
-                self.status_message = match result {
-                    Ok(_) => format!(
-                        "{} · run {} complete",
-                        flight.config_id, flight.fleet_run_id
-                    ),
-                    Err(err) => format!("{} · run failed: {err}", flight.config_id),
-                };
+                match result {
+                    Ok(_) => {
+                        self.status_message = format!(
+                            "{} · run {} complete",
+                            flight.config_id, flight.fleet_run_id
+                        );
+                    }
+                    Err(err) => {
+                        self.show_error(
+                            window,
+                            cx,
+                            format!("{} · run failed: {err}", flight.config_id),
+                        );
+                    }
+                }
             }
         }
         cx.notify();
@@ -1011,9 +1019,7 @@ impl AgentConfigPanelView {
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            "Switch to Auto for background agent runs without a chat window.",
-                        ),
+                        .child("Switch to Auto for background agent runs without a chat window."),
                 )
             })
             .when(self.mode == "interview", |col| {
@@ -1041,18 +1047,15 @@ impl AgentConfigPanelView {
             .children(self.chat_sessions.iter().enumerate().map(|(idx, session)| {
                 let label = self.session_label(session);
                 let session_id = session.id.clone();
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new(("chat-session-open", idx))
-                            .label(label)
-                            .small()
-                            .compact()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_interactive_session(&session_id, window, cx);
-                            })),
-                    )
+                h_flex().gap_2().items_center().child(
+                    Button::new(("chat-session-open", idx))
+                        .label(label)
+                        .small()
+                        .compact()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_interactive_session(&session_id, window, cx);
+                        })),
+                )
             }))
             .child(
                 div()
@@ -1164,7 +1167,7 @@ impl Focusable for AgentConfigPanelView {
 
 impl Render for AgentConfigPanelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.poll_in_flight_runs(cx);
+        self.poll_in_flight_runs(window, cx);
 
         if !self.is_open() {
             return div().size_full().into_any_element();

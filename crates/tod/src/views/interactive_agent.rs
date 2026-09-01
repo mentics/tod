@@ -7,12 +7,12 @@ use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Timer, Window, actions, div,
+    KeyBinding, ParentElement, Render, Styled, Timer, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,8 +24,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 actions!(
     interactive_agent,
-    [SubmitInteractivePrompt, InteractiveAgentClose]
+    [
+        SubmitInteractivePrompt,
+        InteractiveAgentClose,
+        InteractiveAgentStopUp,
+        InteractiveAgentStopDown,
+        InteractiveAgentActivate,
+        InteractiveAgentEscape,
+    ]
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveAgentStop {
+    Prompt,
+    Submit,
+}
+
+const INTERACTIVE_AGENT_STOPS: [InteractiveAgentStop; 2] =
+    [InteractiveAgentStop::Prompt, InteractiveAgentStop::Submit];
 
 struct PendingRun {
     run_id: Option<RunId>,
@@ -49,6 +65,8 @@ pub struct InteractiveAgentView {
     error_banner: Option<String>,
     poll_lock_misses: u32,
     focus_handle: FocusHandle,
+    focus_stop: InteractiveAgentStop,
+    prompt_editing: bool,
     _poll_task: gpui::Task<()>,
 }
 
@@ -74,7 +92,7 @@ impl InteractiveAgentView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(4)
-                .placeholder("Enter a prompt… (⌘/Ctrl+Enter to submit)")
+                .placeholder("Enter to edit · Ctrl+Enter to submit")
         });
 
         let poll_entity = cx.weak_entity();
@@ -104,9 +122,82 @@ impl InteractiveAgentView {
             error_banner: None,
             poll_lock_misses: 0,
             focus_handle: cx.focus_handle(),
+            focus_stop: InteractiveAgentStop::Prompt,
+            prompt_editing: false,
             _poll_task,
         };
         view
+    }
+
+    fn text_editing(&self) -> bool {
+        self.prompt_editing
+    }
+
+    fn stop_index(stop: InteractiveAgentStop) -> usize {
+        INTERACTIVE_AGENT_STOPS
+            .iter()
+            .position(|s| *s == stop)
+            .unwrap_or(0)
+    }
+
+    fn stop_focused(&self, stop: InteractiveAgentStop) -> bool {
+        self.focus_stop == stop && !self.text_editing()
+            || (stop == InteractiveAgentStop::Prompt && self.prompt_editing)
+    }
+
+    fn move_stop(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() || self.in_flight() {
+            return;
+        }
+        let idx = Self::stop_index(self.focus_stop) as i32;
+        let len = INTERACTIVE_AGENT_STOPS.len() as i32;
+        let next = ((idx + delta).rem_euclid(len)) as usize;
+        self.focus_stop = INTERACTIVE_AGENT_STOPS[next];
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn enter_prompt_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_flight() {
+            return;
+        }
+        self.focus_stop = InteractiveAgentStop::Prompt;
+        self.prompt_editing = true;
+        cx.notify();
+        let input = self.prompt_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn exit_prompt_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.prompt_editing {
+            return;
+        }
+        self.prompt_editing = false;
+        self.focus_stop = InteractiveAgentStop::Prompt;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn activate_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() || self.in_flight() {
+            return;
+        }
+        match self.focus_stop {
+            InteractiveAgentStop::Prompt => self.enter_prompt_edit(window, cx),
+            InteractiveAgentStop::Submit => self.submit_prompt(window, cx),
+        }
+    }
+
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt_editing {
+            self.exit_prompt_edit(window, cx);
+            return;
+        }
+        self.close(window, cx);
     }
 
     fn in_flight(&self) -> bool {
@@ -398,6 +489,16 @@ impl Focusable for InteractiveAgentView {
 impl Render for InteractiveAgentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_agent(cx);
+        key_context::set_input_tab_stop(&self.prompt_input, self.prompt_editing, cx);
+        if !self.prompt_editing
+            && self
+                .prompt_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_prompt_edit(window, cx);
+        }
 
         let theme = cx.theme();
         let border = theme.border;
@@ -413,6 +514,9 @@ impl Render for InteractiveAgentView {
         let pending_turn_ix = conversation.len();
         const PROMPT_ROWS: f32 = 4.;
         let prompt_height = window.line_height() * PROMPT_ROWS;
+        let list_active_border = theme.list_active_border;
+        let prompt_focused = self.stop_focused(InteractiveAgentStop::Prompt);
+        let submit_focused = self.stop_focused(InteractiveAgentStop::Submit);
 
         div()
             .key_context(INTERACTIVE_AGENT_CONTEXT)
@@ -425,8 +529,21 @@ impl Render for InteractiveAgentView {
                     this.submit_prompt(window, cx);
                 }),
             )
-            .on_action(cx.listener(|this, _: &InteractiveAgentClose, window, cx| {
-                this.close(window, cx);
+            .on_action(cx.listener(|this, _: &InteractiveAgentStopUp, window, cx| {
+                this.move_stop(-1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &InteractiveAgentStopDown, window, cx| {
+                this.move_stop(1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &InteractiveAgentActivate, window, cx| {
+                this.activate_stop(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &InteractiveAgentEscape, window, cx| {
+                this.handle_escape(window, cx);
+                cx.stop_propagation();
             }))
             .child(
                 div()
@@ -551,10 +668,28 @@ impl Render for InteractiveAgentView {
                             .child("Prompt"),
                     )
                     .child(
-                        Input::new(&self.prompt_input)
-                            .disabled(in_flight)
+                        div()
                             .w_full()
-                            .h(prompt_height),
+                            .rounded_md()
+                            .cursor_text()
+                            .when(prompt_focused, |el| {
+                                el.border_1().border_color(list_active_border)
+                            })
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    if !this.in_flight() && !this.prompt_editing {
+                                        this.enter_prompt_edit(window, cx);
+                                    }
+                                }),
+                            )
+                            .child(
+                                Input::new(&self.prompt_input)
+                                    .disabled(in_flight || !self.prompt_editing)
+                                    .focus_bordered(self.prompt_editing)
+                                    .w_full()
+                                    .h(prompt_height),
+                            ),
                     )
                     .child(
                         h_flex()
@@ -565,6 +700,7 @@ impl Render for InteractiveAgentView {
                                     .label("Submit prompt")
                                     .primary()
                                     .compact()
+                                    .selected(submit_focused)
                                     .disabled(in_flight)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.submit_prompt(window, cx);
@@ -574,7 +710,7 @@ impl Render for InteractiveAgentView {
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child("Ctrl+Enter to submit · Enter for newline"),
+                                    .child("↑↓ control · Enter activate · Esc exit edit/close · Ctrl+Enter submit"),
                             ),
                     ),
             )
@@ -596,7 +732,16 @@ impl Render for InteractiveAgentView {
 }
 
 pub fn register_interactive_agent_keyboard_bindings(cx: &mut App) {
-    key_context::bind_panel_escape(cx, InteractiveAgentClose, INTERACTIVE_AGENT_CONTEXT);
+    let context = Some(key_context::excluding_input(INTERACTIVE_AGENT_CONTEXT));
+    let input_context = Some(key_context::including_input(INTERACTIVE_AGENT_CONTEXT));
+    cx.bind_keys([
+        KeyBinding::new("up", InteractiveAgentStopUp, context),
+        KeyBinding::new("down", InteractiveAgentStopDown, context),
+        KeyBinding::new("enter", InteractiveAgentActivate, context),
+        KeyBinding::new("space", InteractiveAgentActivate, context),
+        KeyBinding::new("escape", InteractiveAgentEscape, context),
+        KeyBinding::new("escape", InteractiveAgentEscape, input_context),
+    ]);
     let submit_bindings = [
         "ctrl-enter",
         #[cfg(target_os = "macos")]

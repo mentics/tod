@@ -197,6 +197,7 @@ impl TaskListView {
                     generation,
                     ticket: issue.identifier,
                     title: Some(issue.title),
+                    description: issue.description,
                     error: None,
                     draft_node_id: draft_node_id.clone(),
                     auth_failure: false,
@@ -205,6 +206,7 @@ impl TaskListView {
                     generation,
                     ticket: ticket_owned.clone(),
                     title: None,
+                    description: None,
                     error: Some(err.to_string()),
                     draft_node_id: draft_node_id.clone(),
                     auth_failure: matches!(
@@ -217,6 +219,7 @@ impl TaskListView {
                     generation,
                     ticket: ticket_owned.clone(),
                     title: None,
+                    description: None,
                     error: Some("Linear fetch thread panicked".into()),
                     draft_node_id: draft_node_id.clone(),
                     auth_failure: false,

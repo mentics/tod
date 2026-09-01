@@ -1,0 +1,47 @@
+---
+description: Keyboard navigation vs text edit mode for GPUI views
+globs: crates/tod/src/**/*.rs
+alwaysApply: false
+---
+
+# Keyboard focus and text edit modes
+
+Multi-line text fields must not trap keyboard navigation. Use **two explicit modes**, modeled on the interview workspace.
+
+## Navigation mode (default)
+
+- The parent view owns focus (`focus_handle.focus`).
+- Arrow keys move a **highlight** among interactive stops (buttons, text fields, list rows, actions).
+- Text areas are stops: show a focus ring, but keep the `Input` **disabled** until edit mode.
+- **Enter** (or Space, when appropriate) on a focused text stop enters edit mode.
+- **Mouse click** on a text stop enters edit mode directly (same as Enter).
+- **Tab does not** move between stops; reserve Tab for text editing inside edit mode.
+
+## Edit mode
+
+- Set a `*_editing` flag; re-enable the `Input` and focus it on the **next frame** (after disabled→enabled re-render).
+- Normal text editing: Tab inserts tab, typing works, Input owns focus context (`Input`).
+- **Escape exits edit mode first** — return focus to the parent `focus_handle` and restore the navigation highlight on that stop.
+- While editing, parent navigation bindings must **not** fire: gate handlers with `response_text_editing()`-style checks and `cx.propagate()` so the Input keeps arrow/tab behavior.
+- **Remove disabled inputs from GPUI tab order** via [`set_input_tab_stop`](crates/tod/src/ui/key_context.rs) (otherwise Tab focuses the input, shows a cursor, but typing is blocked). If focus lands on a disabled input anyway, redirect to the parent handle and sync the nav highlight.
+
+## Key bindings
+
+- Surface shortcuts (lists, pane nav, app nav): bind with `key_context::excluding_input(surface)` or [`NOT_INPUT`](crates/tod/src/ui/key_context.rs).
+- Escape while editing: bind with `key_context::including_input(surface)` so it still fires inside the Input.
+- Panel-level Escape (close/dismiss): use `key_context::bind_panel_escape` — but prefer **exit edit mode before** closing the surface (interview pattern).
+
+## Layout-specific navigation
+
+- Vertical stacks (edit panes, form columns): ↑/↓ between stops.
+- Horizontal regions (list + detail): ←/→ between regions, then ↑/↓ within a region.
+- Use arrow keys wherever spatial navigation matches the layout; do not rely on Tab.
+
+## Reference implementation
+
+[`crates/tod/src/interview/views/workspace.rs`](crates/tod/src/interview/views/workspace.rs): `WorkspaceFocus`, `enter_*_edit` / `exit_*_edit`, `response_text_editing`, disabled inputs when not editing, placeholders like `"Enter to edit"`.
+
+## Acceptable variants
+
+- **Inline single-line list edit** (task list, obligations): arrows at field boundary leave the field and move selection — OK for one-line title edits, not a substitute for multi-line fields.
+- **Ctrl+Enter**: submit/action while editing, bound in both surface and `Input` contexts.

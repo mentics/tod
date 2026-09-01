@@ -2,8 +2,10 @@ use gpui::{Context, Window};
 
 use tod_store::outline::{CreatePosition, OutlineMutation};
 
+use crate::views::linear_import::parse_ticket_reference;
+
 use super::TaskListView;
-use super::from_ticket::{TicketImportResult, parse_ticket_reference};
+use super::from_ticket::TicketImportResult;
 
 impl TaskListView {
     pub(super) fn is_editing(&self) -> bool {
@@ -188,13 +190,11 @@ impl TaskListView {
                 title: title.clone(),
             })
         {
-            self.status_line = format!("Failed to save title: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to save title: {err}"), window, cx);
             return false;
         }
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_line = format!("Failed to save title: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to save title: {err}"), window, cx);
             return false;
         }
         if let Some(task) = self.all_tasks.iter_mut().find(|t| t.id == task_id) {

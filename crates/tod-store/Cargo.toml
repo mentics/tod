@@ -18,7 +18,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 toml = "0.8"
 tracing = "0.1"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 chacha20poly1305 = "0.10"
 rand = "0.8"
 sha2 = "0.10"

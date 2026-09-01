@@ -2,10 +2,6 @@
 
 mod delegate;
 
-use tod_store::fleet::FleetStore;
-use tod_store::outline::{
-    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
-};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::list::{
@@ -28,6 +24,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use tod_store::fleet::FleetStore;
+use tod_store::outline::{
+    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
+};
 use uuid::Uuid;
 
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
@@ -94,6 +94,8 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
 #[derive(Debug, Clone)]
 pub enum ObligationsEvent {
     Close,
+    /// Delete key with no obligation item selected — delete the task in the tree.
+    DeleteSelectedTask,
 }
 
 pub struct ObligationsView {
@@ -971,7 +973,11 @@ impl ObligationsView {
         if self.is_editing() {
             return;
         }
-        self.delete_selected(window, cx);
+        if matches!(self.selected_row(), Some(ObligationRow::Item { .. })) {
+            self.delete_selected(window, cx);
+        } else {
+            cx.emit(ObligationsEvent::DeleteSelectedTask);
+        }
     }
 
     fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {

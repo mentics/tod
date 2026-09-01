@@ -14,12 +14,14 @@ use crate::interview::settings::{persist_window_geometry, resolve_open_window_bo
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::process::{interview_phase_for_lifecycle, interview_phase_label};
-use crate::ui::actionable::chrome_control_with_shortcut_in_context;
+use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::app_nav::{
     HasAppNav, ShellGoDatabase, ShellGoSettings, ShellGoTasks, register_app_nav_keyboard_bindings,
 };
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
+use crate::ui::selectable_text::selectable_text;
+use crate::ui::toast::{error_toast, notification_overlay};
 use crate::views::agent_config_panel::{AgentConfigPanelEvent, AgentConfigPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
@@ -44,7 +46,6 @@ actions!(
     [ShellOpenAgentTranscripts, ShellOpenHistory, ShellUndo]
 );
 
-const TASKS_TREE_WIDTH: f32 = 420.0;
 const TASKS_TREE_MIN: f32 = 240.0;
 const TASKS_DRAWER_MIN: f32 = 280.0;
 
@@ -89,6 +90,7 @@ pub struct Shell {
     _interactive_agent_window: InteractiveAgentWindowControl,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
+    status_line: SharedString,
     paths: TodPaths,
     migration_notice_dismissed: bool,
     pending_open_interview: Option<PendingOpenInterview>,
@@ -100,10 +102,12 @@ pub struct Shell {
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
     pending_retarget_obligations: Option<(String, String)>,
+    pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
     pending_open_agent: Option<PendingOpenAgent>,
     pending_close_agent_panel: bool,
     pending_retarget_agent: Option<(String, String)>,
+    pending_error_toast: Option<String>,
     always_on_top: bool,
     tasks_split_state: Entity<PanelSplitState>,
     _task_list_subscription: Subscription,
@@ -294,7 +298,6 @@ impl Shell {
         action: AgentPlatformSocketCommand,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        
         match action {
             AgentPlatformSocketCommand::Get => {
                 let platform = self.settings.read(cx).agent_platform();
@@ -326,7 +329,7 @@ impl Shell {
         });
         if !self.task_edit.read(cx).is_open() {
             self.task_list.update(cx, |list, cx| {
-                list.set_status_message("Could not open node for editing".into(), cx);
+                list.show_error("Could not open node for editing", window, cx);
             });
             cx.notify();
             return;
@@ -475,6 +478,17 @@ impl Shell {
         }
     }
 
+    fn queue_error_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.pending_error_toast = Some(message.into());
+        cx.notify();
+    }
+
+    fn drain_pending_error_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(message) = self.pending_error_toast.take() {
+            error_toast(window, cx, message);
+        }
+    }
+
     fn handle_open_shell(
         &mut self,
         task_id: String,
@@ -535,9 +549,7 @@ impl Shell {
                 });
             }
             Err(err) => {
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(format!("Shell failed: {err:#}"), cx);
-                });
+                self.queue_error_toast(format!("Shell failed: {err:#}"), cx);
             }
         }
         cx.notify();
@@ -569,15 +581,15 @@ impl Shell {
                 });
             }
             Err(err) => {
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(format!("Undo failed: {err}"), cx);
-                });
+                error_toast(window, cx, format!("Undo failed: {err}"));
             }
         }
     }
 
-    fn render_agent_status_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let status = self.status_line.clone();
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -585,24 +597,49 @@ impl Shell {
             .py_1p5()
             .border_t_1()
             .border_color(border)
-            .justify_end()
+            .justify_between()
             .items_center()
-            .child(chrome_control_with_shortcut_in_context(
-                Button::new("open-agent-transcripts")
-                    .outline()
-                    .compact()
-                    .label(self.agent_status_text.clone())
-                    .tooltip(
-                        "Open agent transcripts (requests and responses grouped by agent type)",
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(!status.is_empty(), |el| {
+                        el.child(
+                            selectable_text("shell-status", status, window, cx)
+                                .text_xs()
+                                .text_color(muted),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("open-agent-transcripts")
+                            .outline()
+                            .compact()
+                            .label(self.agent_status_text.clone())
+                            .tooltip(
+                                "Open agent transcripts (requests and responses grouped by agent type)",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_transcript_window(cx);
+                            })),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_transcript_window(cx);
-                    })),
-                window,
-                &ShellOpenAgentTranscripts,
-                None,
-                cx,
-            ))
+                    .when_some(
+                        render_shortcut_pill_in_context(
+                            window,
+                            &ShellOpenAgentTranscripts,
+                            None,
+                            cx,
+                        ),
+                        |el, pill| el.child(pill),
+                    ),
+            )
     }
 
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -645,10 +682,12 @@ impl Render for Shell {
         self.drain_pending_task_edit(window, cx);
         self.drain_pending_obligations(window, cx);
         self.drain_pending_agent_panel(window, cx);
+        self.drain_pending_error_toast(window, cx);
 
         div()
             .v_flex()
             .size_full()
+            .relative()
             .on_action(cx.listener(|this, _: &ShellGoTasks, window, cx| {
                 this.select_view(ShellView::Tasks, window, cx);
             }))
@@ -678,7 +717,10 @@ impl Render for Shell {
                     .w_full()
                     .child(self.render_content(window, cx)),
             )
-            .child(self.render_agent_status_bar(window, cx))
+            .child(self.render_status_bar(window, cx))
+            .when_some(notification_overlay(window, cx), |el, layer| {
+                el.child(layer)
+            })
     }
 }
 
@@ -787,6 +829,12 @@ impl Shell {
         }
         if let Some((task_id, title)) = self.pending_open_obligations.take() {
             self.open_obligations(&task_id, &title, window, cx);
+        }
+        if self.pending_delete_selected_task {
+            self.pending_delete_selected_task = false;
+            self.task_list.update(cx, |list, cx| {
+                list.delete_selected_task(window, cx);
+            });
         }
     }
 
@@ -1135,6 +1183,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
+                                        TaskListEvent::StatusChanged(message) => {
+                                            this.status_line = message.clone();
+                                            cx.notify();
+                                        }
                                     }
                                 });
                             let _task_edit_subscription =
@@ -1163,12 +1215,18 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 });
                             let _obligations_subscription =
                                 cx.subscribe(&obligations, |this: &mut Shell, _, event, cx| {
-                                    if matches!(event, ObligationsEvent::Close) {
-                                        this.task_list.update(cx, |list, cx| {
-                                            list.set_obligations_open(false, cx);
-                                        });
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
+                                    match event {
+                                        ObligationsEvent::Close => {
+                                            this.task_list.update(cx, |list, cx| {
+                                                list.set_obligations_open(false, cx);
+                                            });
+                                            this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
+                                        ObligationsEvent::DeleteSelectedTask => {
+                                            this.pending_delete_selected_task = true;
+                                            cx.notify();
+                                        }
                                     }
                                 });
                             let _agent_panel_subscription =
@@ -1216,8 +1274,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             );
                             let agent_status_text =
                                 format_status_bar(&AgentStatusGroups::default()).into();
-                            let tasks_split_state =
-                                cx.new(|_| PanelSplitState::new(px(TASKS_TREE_WIDTH)));
+                            let tasks_split_state = cx.new(|_| PanelSplitState::centered());
                             let shell = Shell {
                                 active_view: ShellView::Tasks,
                                 task_list,
@@ -1234,6 +1291,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _interactive_agent_window: interactive_agent_window.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
+                                status_line: SharedString::default(),
                                 paths,
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
@@ -1245,10 +1303,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_obligations: None,
                                 pending_close_obligations: false,
                                 pending_retarget_obligations: None,
+                                pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
                                 pending_open_agent: None,
                                 pending_close_agent_panel: false,
                                 pending_retarget_agent: None,
+                                pending_error_toast: None,
                                 always_on_top: restore_always_on_top,
                                 tasks_split_state,
                                 _task_list_subscription,

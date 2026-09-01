@@ -2,8 +2,10 @@ use gpui::{Context, ParentElement, Styled, Window, div};
 use gpui_component::ActiveTheme;
 use gpui_component::input::Input;
 
+use crate::views::linear_import::parse_ticket_reference;
+
 use super::TaskListView;
-use super::from_ticket::{TicketImportResult, parse_ticket_reference};
+use super::from_ticket::TicketImportResult;
 
 impl TaskListView {
     pub(super) fn close_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {

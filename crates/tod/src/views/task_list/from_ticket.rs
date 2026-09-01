@@ -2,9 +2,10 @@ use gpui::{Context, Window};
 use tod_store::{CredentialStore, resolve_linear_api_key};
 use uuid::Uuid;
 
-use tod_store::fleet::FleetMutation;
 use tod_store::outline::types::Capability;
 use tod_store::outline::{CreatePosition, OutlineMutation};
+
+use crate::views::linear_import::{apply_linear_fields_to_node, parse_ticket_reference};
 
 use super::TaskListView;
 use super::credential_prompt::PendingCredentialRequest;
@@ -20,54 +21,10 @@ pub(super) struct PendingTicketImport {
     pub generation: u64,
     pub ticket: String,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub error: Option<String>,
     pub draft_node_id: Option<String>,
     pub auth_failure: bool,
-}
-
-/// Extract a ticket id (e.g. `TOD-142`) from a bare id or Linear issue URL.
-pub fn parse_ticket_reference(text: &str) -> Option<String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if is_bare_ticket_id(text) {
-        return Some(text.to_string());
-    }
-    if text.contains("linear.app") || text.starts_with("http://") || text.starts_with("https://") {
-        return ticket_from_url(text);
-    }
-    None
-}
-
-fn is_bare_ticket_id(text: &str) -> bool {
-    is_ticket_id_segment(text) && !text.contains('/') && !text.contains(':')
-}
-
-fn is_ticket_id_segment(segment: &str) -> bool {
-    let Some((prefix, suffix)) = segment.rsplit_once('-') else {
-        return false;
-    };
-    segment.len() >= 3
-        && !prefix.is_empty()
-        && prefix
-            .chars()
-            .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_')
-        && !suffix.is_empty()
-        && suffix.chars().all(|c| c.is_ascii_digit())
-}
-
-fn ticket_from_url(text: &str) -> Option<String> {
-    let path = text.split(['?', '#']).next()?;
-    for segment in path.split('/').rev() {
-        if segment.is_empty() {
-            continue;
-        }
-        if is_ticket_id_segment(segment) {
-            return Some(segment.to_string());
-        }
-    }
-    None
 }
 
 impl TaskListView {
@@ -136,8 +93,7 @@ impl TaskListView {
                 title: title.to_string(),
             })
         {
-            self.status_line = format!("Failed to create task: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to create task: {err}"), window, cx);
             return;
         }
         if let Err(err) = self
@@ -147,13 +103,11 @@ impl TaskListView {
                 capabilities: vec![Capability::Spec, Capability::Lifecycle],
             })
         {
-            self.status_line = format!("Failed to create task: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to create task: {err}"), window, cx);
             return;
         }
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_line = format!("Failed to create task: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to create task: {err}"), window, cx);
             return;
         }
         self.live_refresh(window, cx);
@@ -199,6 +153,7 @@ impl TaskListView {
         self.complete_ticket_import(
             &pending.ticket,
             &title,
+            pending.description.as_deref(),
             pending.draft_node_id.as_deref(),
             window,
             cx,
@@ -209,6 +164,7 @@ impl TaskListView {
         &mut self,
         ticket: &str,
         title: &str,
+        description: Option<&str>,
         draft_node_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -236,7 +192,7 @@ impl TaskListView {
             },
         };
 
-        if let Err(err) = self.apply_ticket_to_node(node_id, ticket, title) {
+        if let Err(err) = self.apply_ticket_to_node(node_id, ticket, title, description) {
             self.fail_ticket_import(ticket, err, window, cx);
             return;
         }
@@ -263,9 +219,7 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        crate::ui::toast::error_toast(window, cx, &message);
-        self.status_line = format!("Failed to import {ticket}: {message}");
-        cx.notify();
+        self.show_error(format!("Failed to import {ticket}: {message}"), window, cx);
     }
 
     fn apply_ticket_to_node(
@@ -273,33 +227,17 @@ impl TaskListView {
         node_id: Uuid,
         ticket: &str,
         title: &str,
+        description: Option<&str>,
     ) -> Result<(), String> {
-        self.fleet
-            .enqueue_outline(OutlineMutation::UpdateNodeTitle {
-                node_id,
-                title: title.to_string(),
-            })
-            .map_err(|err| err.to_string())?;
-        self.fleet
-            .enqueue(FleetMutation::UpdateTaskLinkedIssues {
-                id: node_id.to_string(),
-                linked_issues: vec![ticket.to_string()],
-            })
-            .map_err(|err| err.to_string())?;
-        self.fleet
-            .enqueue(FleetMutation::UpdateTaskTags {
-                id: node_id.to_string(),
-                tags: vec!["linear".into()],
-            })
-            .map_err(|err| err.to_string())?;
-        self.fleet
-            .enqueue_outline(OutlineMutation::EnableCapabilities {
-                node_id,
-                capabilities: vec![Capability::Spec, Capability::Lifecycle],
-            })
-            .map_err(|err| err.to_string())?;
-        self.fleet.writer().flush().map_err(|err| err.to_string())?;
-        Ok(())
+        apply_linear_fields_to_node(
+            &self.fleet,
+            node_id,
+            ticket,
+            Some(title),
+            description,
+            Some(vec!["linear".into()]),
+            true,
+        )
     }
 
     fn finish_ticket_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -332,38 +270,5 @@ impl TaskListView {
             self.select_task_by_id(task_id, window, cx);
         }
         self.rebuild_visible_list(window, cx);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bare_ticket_ids() {
-        assert_eq!(parse_ticket_reference("TOD-142"), Some("TOD-142".into()));
-        assert_eq!(parse_ticket_reference("  tod-99  "), Some("tod-99".into()));
-        assert!(parse_ticket_reference("fix-login-bug").is_none());
-        assert!(parse_ticket_reference("ab").is_none());
-    }
-
-    #[test]
-    fn linear_urls() {
-        assert_eq!(
-            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142/fix-login"),
-            Some("TOD-142".into())
-        );
-        assert_eq!(
-            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142"),
-            Some("TOD-142".into())
-        );
-        assert_eq!(
-            parse_ticket_reference("linear.app/team/issue/ERR-500"),
-            Some("ERR-500".into())
-        );
-        assert_eq!(
-            parse_ticket_reference("https://linear.app/mentics/issue/TOD-142/slug?foo=bar#frag"),
-            Some("TOD-142".into())
-        );
     }
 }

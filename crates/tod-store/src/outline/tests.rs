@@ -1,9 +1,9 @@
 //! Outline integration tests.
 
 use crate::fleet::store::FleetStore;
-use crate::paths::{clear_data_root_override, set_data_root};
 use crate::outline::types::Capability;
 use crate::outline::{CreatePosition, OutlineMutation, resolve_obligations};
+use crate::paths::{clear_data_root_override, set_data_root};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -486,6 +486,62 @@ fn obligation_crud_and_counts() {
         cons.iter().find(|o| o.id == con).unwrap().body,
         "Con updated"
     );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn delete_node_blocked_when_agents_present() {
+    use crate::fleet::repos::agent_config::NewAgentConfig;
+    use crate::fleet::writer::FleetMutation;
+
+    let root = std::env::temp_dir().join(format!("tod-del-blocked-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "blocked".into(),
+            title: "Blocked".into(),
+        })
+        .unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    let node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Agent task".into(),
+        })
+        .unwrap();
+    store.reload_if_stale().ok();
+
+    store
+        .enqueue(FleetMutation::InsertAgent {
+            agent: NewAgentConfig {
+                id: Uuid::new_v4().to_string(),
+                node_id: node_id.to_string(),
+                env_type: "local".into(),
+                mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
+            },
+        })
+        .unwrap();
+
+    let err = store
+        .enqueue_outline(OutlineMutation::DeleteNode { node_id })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("node \"Agent task\" has associated agents"),
+        "unexpected error: {err}"
+    );
+    store.reload_if_stale().ok();
+    assert_eq!(store.flatten_outline(list_id).unwrap().len(), 1);
 
     drop(store);
     let _ = fs::remove_dir_all(root);

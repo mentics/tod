@@ -26,12 +26,11 @@ use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, ListView,
     viewport_row_count,
 };
-use crate::ui::selectable_text::selectable_text;
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, KeyBinding,
-    ParentElement, Render, Styled, Subscription, Timer, Window, actions, div,
+    ParentElement, Render, SharedString, Styled, Subscription, Timer, Window, actions, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -187,6 +186,7 @@ pub enum TaskListEvent {
         shell_id: Option<String>,
         agent_id: Option<String>,
     },
+    StatusChanged(SharedString),
 }
 
 pub struct TaskListView {
@@ -600,8 +600,7 @@ impl TaskListView {
         let list_id = match self.active_list_id {
             Some(id) => id,
             None => {
-                self.status_line = "Create a list first (Enter or Ctrl+Shift+L)".into();
-                cx.notify();
+                self.show_error("Create a list first (Enter or Ctrl+Shift+L)", window, cx);
                 return None;
             }
         };
@@ -626,13 +625,11 @@ impl TaskListView {
             position,
             title: String::new(),
         }) {
-            self.status_line = format!("Failed to create item: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to create item: {err}"), window, cx);
             return None;
         }
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_line = format!("Failed to create item: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to create item: {err}"), window, cx);
             return None;
         }
         self.live_refresh(window, cx);
@@ -682,8 +679,7 @@ impl TaskListView {
             })
             .is_err()
         {
-            self.status_line = "Failed to create list".into();
-            cx.notify();
+            self.show_error("Failed to create list", window, cx);
             return;
         }
         let _ = self.fleet.writer().flush();
@@ -695,13 +691,11 @@ impl TaskListView {
             .find(|l| l.slug == slug)
             .map(|l| l.id)
         else {
-            self.status_line = "List created but not found".into();
-            cx.notify();
+            self.show_error("List created but not found", window, cx);
             return;
         };
         self.switch_active_list(new_id, window, cx);
-        self.status_line = format!("Created {title}");
-        cx.notify();
+        self.set_status_line(format!("Created {title}"), cx);
     }
 
     fn switch_active_list(
@@ -720,8 +714,7 @@ impl TaskListView {
     fn cycle_list(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
         self.reload_outline_lists();
         if self.outline_lists.is_empty() {
-            self.status_line = "No lists yet — press Enter to create one".into();
-            cx.notify();
+            self.show_error("No lists yet — press Enter to create one", window, cx);
             return;
         }
         let current_ix = self
@@ -733,7 +726,7 @@ impl TaskListView {
         let next_id = self.outline_lists[next_ix].id;
         let title = self.outline_lists[next_ix].title.clone();
         self.switch_active_list(next_id, window, cx);
-        self.status_line = format!("Switched to {title}");
+        self.set_status_line(format!("Switched to {title}"), cx);
     }
 
     fn bump_interaction(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -786,7 +779,7 @@ impl TaskListView {
                 task_id: task_id.to_string(),
                 agent_id: None,
             });
-            self.status_line = format!("Launch agent config for {task_title}");
+            self.set_status_line(format!("Launch agent config for {task_title}"), cx);
         } else {
             self.toggle_agents_menu(task_id, window, cx);
         }
@@ -837,22 +830,31 @@ impl TaskListView {
             return;
         };
         self.bump_interaction(task_id, window, cx);
-        self.handle_lifecycle_control(task_id, &lifecycle, cx);
+        self.handle_lifecycle_control(task_id, &lifecycle, window, cx);
     }
 
-    fn handle_lifecycle_control(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
+    fn handle_lifecycle_control(
+        &mut self,
+        task_id: &str,
+        lifecycle: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if interview_phase_for_lifecycle(lifecycle).is_some() {
             if let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) {
                 if task.is_work_node {
                     let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
-                        self.status_line = "Interview unavailable — invalid task id.".into();
+                        self.show_error("Interview unavailable — invalid task id.", window, cx);
                         return;
                     };
                     if interview_work_remains(node_id, lifecycle) {
                         if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
                             if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
-                                self.status_line =
-                                    "Set repository on task before starting interview.".into();
+                                self.show_error(
+                                    "Set repository on task before starting interview.",
+                                    window,
+                                    cx,
+                                );
                                 return;
                             }
                             let repo = task_row.repo.as_deref().unwrap_or("");
@@ -860,7 +862,11 @@ impl TaskListView {
                             if let Err(err) =
                                 validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
                             {
-                                self.status_line = format!("Interview workspace: {err:#}").into();
+                                self.show_error(
+                                    format!("Interview workspace: {err:#}"),
+                                    window,
+                                    cx,
+                                );
                                 return;
                             }
                         }
@@ -870,16 +876,20 @@ impl TaskListView {
                             lifecycle: lifecycle.to_string(),
                             title: task.title.clone(),
                         });
-                        self.status_line = format!("Opening interview for {}", task.title);
+                        self.set_status_line(format!("Opening interview for {}", task.title), cx);
                     } else {
                         cx.emit(TaskListEvent::OpenLifecycle {
                             _task_id: task_id.to_string(),
                             lifecycle: lifecycle.to_string(),
                         });
-                        self.status_line = format!("Lifecycle panel: {lifecycle}");
+                        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
                     }
                 } else {
-                    self.status_line = "Interview unavailable — task is not a work node.".into();
+                    self.show_error(
+                        "Interview unavailable — task is not a work node.",
+                        window,
+                        cx,
+                    );
                 }
                 return;
             }
@@ -888,7 +898,7 @@ impl TaskListView {
             _task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
-        self.status_line = format!("Lifecycle panel: {lifecycle}");
+        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
     }
 
     /// Open the lifecycle transition panel for a task (bypasses interview routing).
@@ -897,7 +907,7 @@ impl TaskListView {
             _task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
-        self.status_line = format!("Lifecycle panel: {lifecycle}");
+        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
     }
 
     pub fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -933,7 +943,7 @@ impl TaskListView {
             task_id: task_id.to_string(),
             _title: task.title.clone(),
         });
-        self.status_line = format!("Edit: {}", task.title);
+        self.set_status_line(format!("Edit: {}", task.title), cx);
     }
 
     pub fn open_task_edit_panel(
@@ -962,7 +972,7 @@ impl TaskListView {
             task_id: task_id.to_string(),
             title: task.title.clone(),
         });
-        self.status_line = format!("Obligations: {}", task.title);
+        self.set_status_line(format!("Obligations: {}", task.title), cx);
     }
 
     pub fn open_obligations_panel(
@@ -975,8 +985,7 @@ impl TaskListView {
             return;
         };
         if !task.has_spec {
-            self.status_line = "Obligations require the Spec capability.".into();
-            cx.notify();
+            self.show_error("Obligations require the Spec capability.", window, cx);
             return;
         }
         self.close_chrome_overlays(cx);
@@ -991,25 +1000,28 @@ impl TaskListView {
     pub fn set_slide_edit_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.slide_edit_open = open;
         if !open {
-            self.status_line.clear();
+            self.set_status_line("", cx);
+        } else {
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub fn set_obligations_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.obligations_open = open;
         if !open {
-            self.status_line.clear();
+            self.set_status_line("", cx);
+        } else {
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub fn set_agent_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.agent_panel_open = open;
         if !open {
-            self.status_line.clear();
+            self.set_status_line("", cx);
+        } else {
+            cx.notify();
         }
-        cx.notify();
     }
 
     pub fn request_live_refresh(&mut self, cx: &mut Context<Self>) {
@@ -1043,23 +1055,42 @@ impl TaskListView {
         cx: &mut Context<Self>,
     ) {
         let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            self.show_delete_error("invalid node id", window, cx);
             return;
         };
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::DeleteNode { node_id })
         {
-            self.status_line = format!("Delete failed: {err}");
-            cx.notify();
+            self.show_delete_error(err, window, cx);
             return;
         }
         self.finish_node_removal(task_id, window, cx);
     }
 
+    fn show_delete_error(
+        &mut self,
+        err: impl std::fmt::Display,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_error(Self::format_delete_error(err), window, cx);
+    }
+
+    fn format_delete_error(err: impl std::fmt::Display) -> String {
+        let detail = err.to_string();
+        if detail.contains("associated agents") {
+            return detail;
+        }
+        if detail.contains("referenced by other nodes") {
+            return detail;
+        }
+        format!("Delete failed: {detail}")
+    }
+
     fn finish_node_removal(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_line = format!("Delete failed: {err}");
-            cx.notify();
+            self.show_delete_error(err, window, cx);
             return;
         }
         let _ = self.fleet.reload_if_stale();
@@ -1125,7 +1156,26 @@ impl TaskListView {
     }
 
     pub fn set_status_message(&mut self, message: String, cx: &mut Context<Self>) {
-        self.status_line = message;
+        self.set_status_line(message, cx);
+    }
+
+    fn set_status_line(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        if self.status_line == message {
+            return;
+        }
+        self.status_line = message.clone();
+        cx.emit(TaskListEvent::StatusChanged(message.into()));
+        cx.notify();
+    }
+
+    pub fn show_error(
+        &mut self,
+        message: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::ui::toast::error_toast(window, cx, message.into());
         cx.notify();
     }
 
@@ -1250,13 +1300,11 @@ impl TaskListView {
             .fleet
             .enqueue_outline(OutlineMutation::ReorderSibling { node_id, direction })
         {
-            self.status_line = format!("Failed to move item: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to move item: {err}"), window, cx);
             return;
         }
         if let Err(err) = self.fleet.writer().flush() {
-            self.status_line = format!("Failed to move item: {err}");
-            cx.notify();
+            self.show_error(format!("Failed to move item: {err}"), window, cx);
             return;
         }
         self.live_refresh(window, cx);
@@ -1615,8 +1663,13 @@ impl TaskListView {
         self.create_tree_node_and_edit(CreatePosition::Above, window, cx);
     }
 
+    pub fn delete_selected_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_selected_node(window, cx);
+    }
+
     fn delete_selected_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = self.selected_task(cx) else {
+            crate::ui::toast::error_toast(window, cx, "Select a task to delete");
             return;
         };
         self.remove_outline_node(&task.id, window, cx);
@@ -1979,7 +2032,6 @@ impl Render for TaskListView {
         }
         self.drain_row_actions(window, cx);
 
-        let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let body_state = self.body_state(cx);
 
@@ -2069,15 +2121,6 @@ impl Render for TaskListView {
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
             .child(body)
-            .when(!self.status_line.is_empty(), |el| {
-                el.child(
-                    div().px_3().py_1().border_t_1().border_color(border).child(
-                        selectable_text("task-list-status", self.status_line.clone(), window, cx)
-                            .text_xs()
-                            .text_color(muted),
-                    ),
-                )
-            })
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
             .when(self.credential_prompt_open, |el| {
                 el.child(self.render_credential_prompt_overlay(cx))
@@ -2126,6 +2169,22 @@ mod tests {
     }
 
     #[test]
+    fn format_delete_error_shows_agent_message_without_prefix() {
+        let message = super::TaskListView::format_delete_error(
+            "node \"Agent task\" has associated agents — remove them before deleting",
+        );
+        assert!(message.contains("associated agents"));
+        assert!(message.contains("Agent task"));
+        assert!(!message.starts_with("Delete failed:"));
+    }
+
+    #[test]
+    fn format_delete_error_prefixes_unknown_errors() {
+        let message = super::TaskListView::format_delete_error("database locked");
+        assert_eq!(message, "Delete failed: database locked");
+    }
+
+    #[test]
     fn delete_last_visible_task_clears_selection() {
         let tasks = large_fixture_set(1);
         let only = tasks[0].clone();
@@ -2138,23 +2197,37 @@ mod tests {
     }
 
     #[test]
-    fn title_sort_flattens_display_depth() {
+    fn title_sort_preserves_tree_hierarchy() {
         let mut parent = large_fixture_set(1)[0].clone();
+        parent.id = "parent-id".into();
         parent.depth = 0;
         parent.title = "Parent".into();
-        let mut child = parent.clone();
-        child.id = "child-id".into();
-        child.depth = 1;
-        child.title = "Alpha child".into();
-        child.tree_ordinal = 1;
+        parent.parent_id = None;
+        let mut child_a = parent.clone();
+        child_a.id = "child-a".into();
+        child_a.depth = 1;
+        child_a.title = "Alpha child".into();
+        child_a.parent_id = Some("parent-id".into());
+        child_a.tree_ordinal = 1;
+        let mut child_b = child_a.clone();
+        child_b.id = "child-b".into();
+        child_b.title = "Beta child".into();
+        child_b.tree_ordinal = 2;
+        let mut root_other = parent.clone();
+        root_other.id = "root-other".into();
+        root_other.title = "Zeta root".into();
+        root_other.parent_id = None;
         let ws = ListWorkingSet {
             sort_key: SortKey::Title,
             sort_direction: SortDirection::Asc,
             ..ListWorkingSet::default_sort()
         };
-        let visible = filter_and_sort_tasks(&[parent, child], "", &ws);
-        assert_eq!(visible[0].title, "Alpha child");
-        assert_eq!(visible[0].depth, 0);
-        assert!(!visible[0].has_children);
+        let visible = filter_and_sort_tasks(&[parent, child_b, child_a, root_other], "", &ws);
+        assert_eq!(visible.len(), 4);
+        assert_eq!(visible[0].title, "Parent");
+        assert_eq!(visible[1].title, "Alpha child");
+        assert_eq!(visible[2].title, "Beta child");
+        assert_eq!(visible[3].title, "Zeta root");
+        assert_eq!(visible[1].depth, 1);
     }
 }

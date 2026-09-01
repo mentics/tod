@@ -226,13 +226,17 @@ pub fn format_status_bar(groups: &AgentStatusGroups) -> String {
         ));
     }
     if groups.fleet.total > 0 {
-        let mut fleet = format!("Fleet {}", groups.fleet.total);
+        let mut agents = if groups.fleet.total == 1 {
+            "1 agent".to_string()
+        } else {
+            format!("{} agents", groups.fleet.total)
+        };
         if groups.fleet.processing > 0 {
-            fleet.push_str(&format!(" ({} proc)", groups.fleet.processing));
+            agents.push_str(&format!(" ({} processing)", groups.fleet.processing));
         } else if groups.fleet.blocked > 0 {
-            fleet.push_str(&format!(" ({} blocked)", groups.fleet.blocked));
+            agents.push_str(&format!(" ({} blocked)", groups.fleet.blocked));
         }
-        parts.push(fleet);
+        parts.push(agents);
     }
 
     if parts.is_empty() {
@@ -292,6 +296,6 @@ mod tests {
         });
         assert!(text.contains("Question maker 1"));
         assert!(text.contains("Answer 2/5"));
-        assert!(text.contains("Fleet 3"));
+        assert!(text.contains("3 agents"));
     }
 }

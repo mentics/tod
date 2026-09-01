@@ -13,9 +13,7 @@ use crate::fleet::paths::FleetPaths;
 use crate::fleet::projection::FleetProjection;
 use crate::fleet::prompt_queue::MemoryPromptQueue;
 use crate::fleet::reattach;
-use crate::fleet::repos::agent_config::{
-    AgentConfig, AgentConfigRepo, AgentConfigRow,
-};
+use crate::fleet::repos::agent_config::{AgentConfig, AgentConfigRepo, AgentConfigRow};
 use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
@@ -404,6 +402,18 @@ impl FleetStore {
         let guard = self.projection.lock().expect("fleet projection mutex");
         NodeRepo::new(&guard.connection())
             .list_capabilities(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Spec extra content for a node (e.g. `goal` = purpose statement).
+    pub fn get_extra_content(
+        &self,
+        node_id: uuid::Uuid,
+        content_type: &str,
+    ) -> Result<Option<String>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        NodeRepo::new(&guard.connection())
+            .get_extra_content(node_id, content_type)
             .map_err(Into::into)
     }
 

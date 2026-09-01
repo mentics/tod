@@ -4,6 +4,14 @@
 //! [`INPUT`]. Parent views bind shortcuts to their own context (for example
 //! `TaskList`). Because GPUI matches bindings at ancestor depths too, parent
 //! shortcuts still fire unless the binding predicate excludes [`INPUT`].
+//!
+//! ## Navigation vs edit mode
+//!
+//! Text fields should participate in keyboard navigation as **focus stops** while
+//! disabled; **Enter** enters edit mode (enable + focus the `Input`); **Escape**
+//! exits back to the parent navigation focus. While editing, parent arrow/activate
+//! shortcuts must not fire. See `.cursor/rules/keyboard-focus-edit-mode.mdc` and
+//! `interview/views/workspace.rs` for the reference implementation.
 
 use gpui::{Action, App, KeyBinding};
 
@@ -12,6 +20,19 @@ pub const INPUT: &str = "Input";
 
 /// Predicate for app-wide shortcuts that must not fire while a text field is focused.
 pub const NOT_INPUT: &str = "!Input";
+
+/// Include or exclude an [`InputState`] from GPUI tab order.
+///
+/// Disabled inputs still render with `track_focus` and would otherwise receive Tab
+/// focus (showing a cursor without accepting typing). Call while not in edit mode.
+pub fn set_input_tab_stop(
+    input: &gpui::Entity<gpui_component::input::InputState>,
+    tab_stop: bool,
+    cx: &gpui::App,
+) {
+    use gpui::Focusable;
+    let _ = input.read(cx).focus_handle(cx).tab_stop(tab_stop);
+}
 
 /// Build a surface context predicate that excludes text input focus.
 ///

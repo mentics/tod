@@ -1,21 +1,44 @@
-use tod_store::fleet::{FleetStore, explore};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
+use crate::ui::key_context;
 use crate::ui::selectable_text::selectable_text;
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div, px,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
+    px,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
+use tod_store::fleet::{FleetStore, explore};
 
+const DATABASE_CONTEXT: &str = "Database";
 const SQL_INPUT_WIDTH: f32 = 640.0;
 const SQL_INPUT_ROWS: usize = 4;
 
-actions!(database_view, [DatabaseRunSql]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseStop {
+    Table,
+    Sql,
+    Run,
+}
+
+const DATABASE_STOPS: [DatabaseStop; 3] =
+    [DatabaseStop::Table, DatabaseStop::Sql, DatabaseStop::Run];
+
+actions!(
+    database_view,
+    [
+        DatabaseRunSql,
+        DatabaseStopUp,
+        DatabaseStopDown,
+        DatabaseActivate,
+        DatabaseEscape,
+    ]
+);
 
 pub struct DatabaseView {
     fleet: Arc<FleetStore>,
@@ -27,6 +50,8 @@ pub struct DatabaseView {
     result: explore::QueryRows,
     status_line: SharedString,
     error: Option<String>,
+    focus_stop: DatabaseStop,
+    sql_editing: bool,
     _table_select_subscription: Subscription,
 }
 
@@ -39,7 +64,7 @@ impl DatabaseView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(SQL_INPUT_ROWS)
-                .placeholder("SQL query (read-only)")
+                .placeholder("Enter to edit · SQL query (read-only)")
         });
 
         let _table_select_subscription = cx.subscribe(&table_select, |this, _, event, cx| {
@@ -58,6 +83,8 @@ impl DatabaseView {
             result: explore::QueryRows::default(),
             status_line: SharedString::from("Select a table or run SQL"),
             error: None,
+            focus_stop: DatabaseStop::Table,
+            sql_editing: false,
             _table_select_subscription,
         };
 
@@ -69,6 +96,74 @@ impl DatabaseView {
         }
 
         this
+    }
+
+    fn text_editing(&self) -> bool {
+        self.sql_editing
+    }
+
+    fn stop_index(stop: DatabaseStop) -> usize {
+        DATABASE_STOPS.iter().position(|s| *s == stop).unwrap_or(0)
+    }
+
+    fn stop_focused(&self, stop: DatabaseStop) -> bool {
+        self.focus_stop == stop && !self.text_editing()
+            || (stop == DatabaseStop::Sql && self.sql_editing)
+    }
+
+    fn move_stop(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
+        let idx = Self::stop_index(self.focus_stop) as i32;
+        let len = DATABASE_STOPS.len() as i32;
+        let next = ((idx + delta).rem_euclid(len)) as usize;
+        self.focus_stop = DATABASE_STOPS[next];
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn enter_sql_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_stop = DatabaseStop::Sql;
+        self.sql_editing = true;
+        cx.notify();
+        let input = self.sql_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn exit_sql_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sql_editing {
+            return;
+        }
+        self.sql_editing = false;
+        self.focus_stop = DatabaseStop::Sql;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn activate_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
+        match self.focus_stop {
+            DatabaseStop::Table => {
+                self.table_select.update(cx, |select, cx| {
+                    select.focus(window, cx);
+                });
+            }
+            DatabaseStop::Sql => self.enter_sql_edit(window, cx),
+            DatabaseStop::Run => self.run_sql(window, cx),
+        }
+    }
+
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sql_editing {
+            self.exit_sql_edit(window, cx);
+        }
     }
 
     fn load_tables(fleet: &FleetStore) -> Vec<String> {
@@ -167,6 +262,10 @@ impl Focusable for DatabaseView {
 impl Render for DatabaseView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.refresh_tables(window, cx);
+        key_context::set_input_tab_stop(&self.sql_input, self.sql_editing, cx);
+        if !self.sql_editing && self.sql_input.read(cx).focus_handle(cx).is_focused(window) {
+            self.enter_sql_edit(window, cx);
+        }
 
         let theme = cx.theme().clone();
         let border = theme.border;
@@ -174,6 +273,8 @@ impl Render for DatabaseView {
         let foreground = theme.foreground;
         let danger = theme.danger;
         let muted_bg = theme.muted;
+        let list_active = theme.list_active;
+        let list_active_border = theme.list_active_border;
 
         let status = if let Some(err) = &self.error {
             SharedString::from(format!("{err}"))
@@ -182,9 +283,31 @@ impl Render for DatabaseView {
         };
         let status_color = if self.error.is_some() { danger } else { muted };
 
+        let table_focused = self.stop_focused(DatabaseStop::Table);
+        let sql_focused = self.stop_focused(DatabaseStop::Sql);
+        let run_focused = self.stop_focused(DatabaseStop::Run);
+
         let root = v_flex()
+            .key_context(DATABASE_CONTEXT)
             .size_full()
             .bg(theme.background)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &DatabaseStopUp, window, cx| {
+                this.move_stop(-1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DatabaseStopDown, window, cx| {
+                this.move_stop(1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DatabaseActivate, window, cx| {
+                this.activate_stop(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DatabaseEscape, window, cx| {
+                this.handle_escape(window, cx);
+                cx.stop_propagation();
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -211,6 +334,14 @@ impl Render for DatabaseView {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .when(table_focused, |el| {
+                                        el.bg(list_active)
+                                            .border_1()
+                                            .border_color(list_active_border)
+                                    })
                                     .child(div().text_sm().text_color(foreground).child("Table"))
                                     .child(
                                         Select::new(&self.table_select)
@@ -222,30 +353,60 @@ impl Render for DatabaseView {
                                 v_flex()
                                     .gap_1()
                                     .w(px(SQL_INPUT_WIDTH))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_text()
+                                    .when(sql_focused, |el| {
+                                        el.bg(list_active)
+                                            .border_1()
+                                            .border_color(list_active_border)
+                                    })
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            if !this.sql_editing {
+                                                this.enter_sql_edit(window, cx);
+                                            }
+                                        }),
+                                    )
                                     .child(div().text_sm().text_color(foreground).child("SQL"))
-                                    .child(Input::new(&self.sql_input).w_full()),
+                                    .child(
+                                        Input::new(&self.sql_input)
+                                            .disabled(!self.sql_editing)
+                                            .focus_bordered(self.sql_editing)
+                                            .w_full(),
+                                    ),
                             )
-                            .child(Button::new("database-run-sql").label("Run").on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.run_sql(window, cx);
-                                }),
-                            )),
+                            .child(
+                                Button::new("database-run-sql")
+                                    .label("Run")
+                                    .selected(run_focused)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.run_sql(window, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         selectable_text("database-status", status, window, cx)
                             .text_sm()
                             .text_color(status_color),
                     )
-                    .child(self.render_results_table(window, cx, border, foreground, muted, muted_bg)),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("↑↓ control · Enter activate · Esc exit SQL edit"),
+                    )
+                    .child(
+                        self.render_results_table(window, cx, border, foreground, muted, muted_bg),
+                    ),
             )
-            .track_focus(&self.focus_handle);
-
-        self.bind_app_nav_toggle(
-            root.on_action(cx.listener(|this, _: &DatabaseRunSql, window, cx| {
+            .on_action(cx.listener(|this, _: &DatabaseRunSql, window, cx| {
                 this.run_sql(window, cx);
-            })),
-            cx,
-        )
+            }));
+
+        self.bind_app_nav_toggle(root, cx)
     }
 }
 
@@ -337,4 +498,19 @@ impl DatabaseView {
             )
             .into_any_element()
     }
+}
+
+pub fn register_database_keyboard_bindings(cx: &mut App) {
+    let context = Some(key_context::excluding_input(DATABASE_CONTEXT));
+    let input_context = Some(key_context::including_input(DATABASE_CONTEXT));
+    cx.bind_keys([
+        KeyBinding::new("up", DatabaseStopUp, context),
+        KeyBinding::new("down", DatabaseStopDown, context),
+        KeyBinding::new("enter", DatabaseActivate, context),
+        KeyBinding::new("space", DatabaseActivate, context),
+        KeyBinding::new("escape", DatabaseEscape, context),
+        KeyBinding::new("escape", DatabaseEscape, input_context),
+        KeyBinding::new("ctrl-enter", DatabaseRunSql, context),
+        KeyBinding::new("ctrl-enter", DatabaseRunSql, input_context),
+    ]);
 }

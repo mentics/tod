@@ -82,6 +82,11 @@ impl Capability {
     }
 }
 
+/// `node_extra_content.content_type` value for the node's purpose / goal statement.
+pub const EXTRA_CONTENT_GOAL: &str = "goal";
+
+pub const EXTRA_CONTENT_TYPES: [&str; 4] = ["goal", "design", "plan", "notes"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineList {
     pub id: Uuid,
@@ -117,6 +122,7 @@ pub struct OutlineEntry {
 pub struct FlatNodeRow {
     pub node: Node,
     pub depth: usize,
+    pub parent_id: Option<Uuid>,
     pub capabilities: Vec<Capability>,
     pub lifecycle: Option<String>,
     pub tags: Vec<String>,

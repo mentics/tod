@@ -19,24 +19,70 @@ pub struct PanelSplitState {
     pub left_width: Pixels,
     pub(crate) dragging: bool,
     pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) initial_center: bool,
 }
 
 impl PanelSplitState {
+    #[allow(dead_code)]
     pub fn new(left_width: Pixels) -> Self {
         Self {
             left_width,
             dragging: false,
             bounds: Bounds::default(),
+            initial_center: false,
+        }
+    }
+
+    pub fn centered() -> Self {
+        Self {
+            left_width: px(0.),
+            dragging: false,
+            bounds: Bounds::default(),
+            initial_center: true,
         }
     }
 
     pub fn clamp_left_width(&mut self, min_left: Pixels, min_right: Pixels) {
+        if self.initial_center {
+            return;
+        }
         let container = self.bounds.size.width;
         if container <= px(0.) {
             return;
         }
         let max_left = (container - min_right).max(min_left);
         self.left_width = self.left_width.clamp(min_left, max_left);
+    }
+
+    fn apply_initial_center(&mut self, min_left: Pixels, min_right: Pixels) -> bool {
+        if !self.initial_center || self.bounds.size.width <= px(0.) {
+            return false;
+        }
+        self.left_width = centered_left_width(self.bounds.size.width, min_left, min_right);
+        self.initial_center = false;
+        true
+    }
+}
+
+fn centered_left_width(container: Pixels, min_left: Pixels, min_right: Pixels) -> Pixels {
+    let max_left = (container - min_right).max(min_left);
+    px(f32::from(container) / 2.).clamp(min_left, max_left)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_left_width_uses_half_container() {
+        let half = centered_left_width(px(1200.), px(240.), px(280.));
+        assert_eq!(f32::from(half), 600.);
+    }
+
+    #[test]
+    fn centered_left_width_respects_minimums() {
+        let left = centered_left_width(px(400.), px(240.), px(280.));
+        assert_eq!(f32::from(left), 240.);
     }
 }
 
@@ -113,8 +159,11 @@ impl RenderOnce for HPanelSplit {
                     {
                         let state = state.clone();
                         move |bounds, _, cx| {
-                            state.update(cx, |state, _| {
+                            state.update(cx, |state, cx| {
                                 state.bounds = bounds;
+                                if state.apply_initial_center(min_left, min_right) {
+                                    cx.notify();
+                                }
                             })
                         }
                     },

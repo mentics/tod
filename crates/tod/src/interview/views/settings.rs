@@ -1,4 +1,3 @@
-use tod_store::fleet::default_terminal_hint;
 use crate::interview::TodPaths;
 use crate::interview::agent::AgentPlatform;
 use crate::interview::settings::{
@@ -19,6 +18,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::time::Duration;
+use tod_store::fleet::default_terminal_hint;
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -44,8 +44,7 @@ actions!(
         SettingsDecrease,
         SettingsIncrease,
         SettingsActivate,
-        SettingsInputNavUp,
-        SettingsInputNavDown,
+        SettingsEscape,
     ]
 );
 
@@ -62,8 +61,8 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("-", SettingsDecrease, context),
         KeyBinding::new("=", SettingsIncrease, context),
         KeyBinding::new("enter", SettingsActivate, context),
-        KeyBinding::new("up", SettingsInputNavUp, input_context),
-        KeyBinding::new("down", SettingsInputNavDown, input_context),
+        KeyBinding::new("escape", SettingsEscape, context),
+        KeyBinding::new("escape", SettingsEscape, input_context),
     ]);
 }
 
@@ -158,6 +157,7 @@ pub struct SettingsView {
     app_nav: AppNavMenu,
     active_section: SettingsSection,
     selected_field_index: usize,
+    terminal_program_editing: bool,
     save_generation: u64,
     _terminal_subscription: Subscription,
 }
@@ -173,7 +173,7 @@ impl SettingsView {
         );
         let terminal_program_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Auto (OS default)")
+                .placeholder("Enter to edit · Auto (OS default)")
                 .default_value(settings.terminal.program.clone().unwrap_or_default())
         });
         let _terminal_subscription =
@@ -202,33 +202,46 @@ impl SettingsView {
             app_nav: AppNavMenu::default(),
             active_section: SettingsSection::Agents,
             selected_field_index: 0,
+            terminal_program_editing: false,
             save_generation: 0,
             _terminal_subscription,
         }
+    }
+
+    fn text_editing(&self) -> bool {
+        self.terminal_program_editing
     }
 
     fn activate_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         if self.active_section == section {
             return;
         }
+        self.terminal_program_editing = false;
         self.active_section = section;
         self.selected_field_index = 0;
         cx.notify();
     }
 
     fn move_section(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
         let idx = SECTIONS
             .iter()
             .position(|s| *s == self.active_section)
             .unwrap_or(0);
         let len = SECTIONS.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
+        self.terminal_program_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         cx.notify();
     }
 
     fn move_field(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
         let fields = self.active_section.fields();
         if fields.is_empty() {
             return;
@@ -252,6 +265,9 @@ impl SettingsView {
     }
 
     fn adjust_selected(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
         match self.selected_field() {
             SettingField::AgentPlatform => self.cycle_agent_platform(delta, cx),
             SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
@@ -270,9 +286,20 @@ impl SettingsView {
     }
 
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
+        if self.selected_field().is_text_input() {
+            self.enter_terminal_edit(window, cx);
+        }
+    }
+
+    fn enter_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_field().is_text_input() {
             return;
         }
+        self.terminal_program_editing = true;
+        cx.notify();
         let input = self.terminal_program_input.clone();
         cx.on_next_frame(window, move |_, window, cx| {
             input.update(cx, |input, cx| {
@@ -281,9 +308,19 @@ impl SettingsView {
         });
     }
 
-    fn input_nav(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+    fn exit_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.terminal_program_editing {
+            return;
+        }
+        self.terminal_program_editing = false;
         self.focus_handle.focus(window);
-        self.move_field(delta, cx);
+        cx.notify();
+    }
+
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_program_editing {
+            self.exit_terminal_edit(window, cx);
+        }
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
@@ -466,6 +503,21 @@ impl Focusable for SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        key_context::set_input_tab_stop(
+            &self.terminal_program_input,
+            self.terminal_program_editing,
+            cx,
+        );
+        if !self.terminal_program_editing
+            && self
+                .terminal_program_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_terminal_edit(window, cx);
+        }
+
         let theme = cx.theme().clone();
         let focus = self.focus_handle.clone();
         let border = theme.border;
@@ -502,13 +554,10 @@ impl Render for SettingsView {
             }))
             .on_action(cx.listener(|this, _: &SettingsActivate, window, cx| {
                 this.activate_selected(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &SettingsInputNavUp, window, cx| {
-                this.input_nav(-1, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SettingsInputNavDown, window, cx| {
-                this.input_nav(1, window, cx);
+            .on_action(cx.listener(|this, _: &SettingsEscape, window, cx| {
+                this.handle_escape(window, cx);
                 cx.stop_propagation();
             }))
             .child(
@@ -544,12 +593,9 @@ impl Render for SettingsView {
                     .py_2()
                     .border_t_1()
                     .border_color(border)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("[ ] section · ↑↓ field · ←→ adjust · Enter edit text"),
-                    ),
+                    .child(div().text_xs().text_color(muted).child(
+                        "[ ] section · ↑↓ field · ←→ adjust · Enter edit text · Esc exit edit",
+                    )),
             )
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -723,6 +769,7 @@ impl SettingsView {
                     "Terminal program",
                     default_terminal_hint(),
                     &self.terminal_program_input,
+                    self.terminal_program_editing,
                     theme,
                 ))
                 .into_any_element(),
@@ -891,6 +938,7 @@ fn text_input_row(
     label: impl Into<SharedString>,
     help: impl Into<SharedString>,
     input: &Entity<InputState>,
+    editing: bool,
     theme: &gpui_component::Theme,
 ) -> impl IntoElement {
     let selected = view.field_selected(field);
@@ -903,6 +951,7 @@ fn text_input_row(
         .px_3()
         .py_3()
         .rounded_md()
+        .cursor_text()
         .when(selected, |el| {
             el.bg(theme.list_active)
                 .border_1()
@@ -910,7 +959,20 @@ fn text_input_row(
         })
         .on_mouse_down(
             gpui::MouseButton::Left,
-            cx.listener(select_field_listener(field)),
+            cx.listener(move |this, _, window, cx| {
+                if let Some(index) = this
+                    .active_section
+                    .fields()
+                    .iter()
+                    .position(|candidate| *candidate == field)
+                {
+                    this.selected_field_index = index;
+                }
+                if !this.terminal_program_editing {
+                    this.enter_terminal_edit(window, cx);
+                }
+                cx.notify();
+            }),
         )
         .child(
             v_flex()
@@ -930,7 +992,12 @@ fn text_input_row(
                         .child(help),
                 ),
         )
-        .child(Input::new(input).w_full())
+        .child(
+            Input::new(input)
+                .disabled(!editing)
+                .focus_bordered(editing)
+                .w_full(),
+        )
 }
 
 fn read_only_row(

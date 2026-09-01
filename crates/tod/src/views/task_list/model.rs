@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Associated agent summary for row menus.
@@ -31,6 +32,7 @@ pub struct TaskItem {
     pub interaction_timestamp: DateTime<Utc>,
     /// Stable display order from outline flatten (preserved when sort = Tree).
     pub tree_ordinal: usize,
+    pub parent_id: Option<String>,
     pub depth: usize,
     pub collapsed: bool,
     pub is_work_node: bool,
@@ -246,12 +248,63 @@ fn compare_ticket_id(a: Option<&str>, b: Option<&str>) -> Ordering {
     }
 }
 
+fn effective_parent_id(task: &TaskItem, visible_ids: &HashSet<&str>) -> Option<String> {
+    match task.parent_id.as_deref() {
+        None => None,
+        Some(pid) if visible_ids.contains(pid) => Some(pid.to_string()),
+        Some(_) => None,
+    }
+}
+
+fn build_children_map(
+    tasks: &[TaskItem],
+    visible_ids: &HashSet<&str>,
+) -> HashMap<Option<String>, Vec<usize>> {
+    let mut children: HashMap<Option<String>, Vec<usize>> = HashMap::new();
+    for (idx, task) in tasks.iter().enumerate() {
+        children
+            .entry(effective_parent_id(task, visible_ids))
+            .or_default()
+            .push(idx);
+    }
+    children
+}
+
+fn sort_sibling_groups(
+    children: &mut HashMap<Option<String>, Vec<usize>>,
+    tasks: &[TaskItem],
+    key: SortKey,
+    dir: SortDirection,
+) {
+    for indices in children.values_mut() {
+        indices.sort_by(|&a, &b| compare_tasks(&tasks[a], &tasks[b], key, dir));
+    }
+}
+
+fn flatten_sorted_tree(
+    children: &HashMap<Option<String>, Vec<usize>>,
+    tasks: &[TaskItem],
+    parent_key: Option<&str>,
+    out: &mut Vec<TaskItem>,
+) {
+    let key = parent_key.map(String::from);
+    if let Some(indices) = children.get(&key) {
+        for &idx in indices {
+            let task = tasks[idx].clone();
+            out.push(task.clone());
+            if !task.collapsed {
+                flatten_sorted_tree(children, tasks, Some(&task.id), out);
+            }
+        }
+    }
+}
+
 pub fn filter_and_sort_tasks(
     tasks: &[TaskItem],
     search_query: &str,
     working_set: &ListWorkingSet,
 ) -> Vec<TaskItem> {
-    let mut visible: Vec<TaskItem> = tasks
+    let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
             task_matches_tag_filter(t, working_set.tag_filter.as_deref())
@@ -259,15 +312,19 @@ pub fn filter_and_sort_tasks(
         })
         .cloned()
         .collect();
-    if working_set.sort_key != SortKey::TreeOrder {
-        visible.sort_by(|a, b| {
-            compare_tasks(a, b, working_set.sort_key, working_set.sort_direction)
-        });
-        for task in &mut visible {
-            task.depth = 0;
-            task.has_children = false;
-        }
+    if working_set.sort_key == SortKey::TreeOrder {
+        return filtered;
     }
+    let visible_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+    let mut children = build_children_map(&filtered, &visible_ids);
+    sort_sibling_groups(
+        &mut children,
+        &filtered,
+        working_set.sort_key,
+        working_set.sort_direction,
+    );
+    let mut visible = Vec::new();
+    flatten_sorted_tree(&children, &filtered, None, &mut visible);
     visible
 }
 
@@ -347,6 +404,7 @@ mod tests {
             shells: Vec::new(),
             interaction_timestamp: Utc::now(),
             tree_ordinal: 0,
+            parent_id: None,
             depth: 0,
             collapsed: false,
             is_work_node: !lifecycle.is_empty(),
@@ -376,5 +434,38 @@ mod tests {
         let visible = filter_and_sort_tasks(&tasks, "alp", &ws);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn title_sort_preserves_tree_hierarchy() {
+        let mut parent = sample("parent-id", "Parent", "active", &[]);
+        parent.depth = 0;
+        let mut child_a = sample("child-a", "Alpha child", "active", &[]);
+        child_a.depth = 1;
+        child_a.parent_id = Some("parent-id".into());
+        child_a.tree_ordinal = 1;
+        let mut child_b = sample("child-b", "Beta child", "active", &[]);
+        child_b.depth = 1;
+        child_b.parent_id = Some("parent-id".into());
+        child_b.tree_ordinal = 2;
+        let mut root_other = sample("root-other", "Zeta root", "active", &[]);
+        root_other.depth = 0;
+        let ws = ListWorkingSet {
+            sort_key: SortKey::Title,
+            sort_direction: SortDirection::Asc,
+            ..ListWorkingSet::default_sort()
+        };
+        let visible = filter_and_sort_tasks(
+            &[parent, child_b, child_a, root_other],
+            "",
+            &ws,
+        );
+        assert_eq!(visible.len(), 4);
+        assert_eq!(visible[0].title, "Parent");
+        assert_eq!(visible[1].title, "Alpha child");
+        assert_eq!(visible[2].title, "Beta child");
+        assert_eq!(visible[3].title, "Zeta root");
+        assert_eq!(visible[1].depth, 1);
+        assert_eq!(visible[1].parent_id.as_deref(), Some("parent-id"));
     }
 }

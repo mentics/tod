@@ -4,12 +4,14 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const LINEAR_GRAPHQL_URL: &str = "https://api.linear.app/graphql";
-const ISSUE_QUERY: &str = "query Issue($id: String!) { issue(id: $id) { identifier title } }";
+const ISSUE_QUERY: &str =
+    "query Issue($id: String!) { issue(id: $id) { identifier title description } }";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearIssue {
     pub identifier: String,
     pub title: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +68,7 @@ pub fn fetch_issue(api_key: &str, identifier: &str) -> Result<LinearIssue, Linea
     Ok(LinearIssue {
         identifier: issue.identifier,
         title: issue.title,
+        description: issue.description.filter(|d| !d.trim().is_empty()),
     })
 }
 
@@ -84,6 +87,7 @@ struct GraphQlData {
 struct LinearIssueRaw {
     identifier: String,
     title: String,
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

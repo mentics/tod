@@ -110,9 +110,19 @@ fn format_context(
         if body.trim().is_empty() {
             continue;
         }
-        out.push_str(&format!("\n## {kind}\n\n{body}\n"));
+        out.push_str(&format!("\n## {}\n\n{body}\n", extra_content_heading(kind)));
     }
     out
+}
+
+fn extra_content_heading(kind: &str) -> &str {
+    match kind {
+        "goal" => "Purpose",
+        "design" => "Design",
+        "plan" => "Plan",
+        "notes" => "Notes",
+        other => other,
+    }
 }
 
 fn capitalize_kind(kind: &str) -> &str {
@@ -120,6 +130,23 @@ fn capitalize_kind(kind: &str) -> &str {
         "requirement" => "Requirements",
         "constraint" => "Constraints",
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn goal_extra_content_renders_as_purpose_heading() {
+        let out = format_context(
+            "My task",
+            "proposed",
+            &[("goal".into(), "Ship list UI".into())],
+            uuid::Uuid::nil(),
+        );
+        assert!(out.contains("## Purpose"));
+        assert!(out.contains("Ship list UI"));
     }
 }
 

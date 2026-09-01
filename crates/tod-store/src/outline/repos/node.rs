@@ -272,6 +272,33 @@ impl<'a> NodeRepo<'a> {
             .map_err(Into::into)
     }
 
+    pub fn get_extra_content(&self, node_id: Uuid, content_type: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT body FROM node_extra_content WHERE node_id = ?1 AND content_type = ?2",
+                params![uuid_to_blob(node_id), content_type],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_extra_content(&self, node_id: Uuid, content_type: &str, body: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(node_id, content_type) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+            params![
+                uuid_to_blob(Uuid::new_v4()),
+                uuid_to_blob(node_id),
+                content_type,
+                body,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn disable_capability_archive(
         &self,
         node_id: Uuid,

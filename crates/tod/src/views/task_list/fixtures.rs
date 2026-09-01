@@ -7,15 +7,14 @@ use tod_store::outline::types::Capability;
 use super::model::{AgentInfo, TaskItem};
 
 /// Load tree rows from the outline store for `list_id` (or empty when none).
-pub fn load_tasks_from_store(
-    store: &FleetStore,
-    list_id: Option<Uuid>,
-) -> Vec<TaskItem> {
+pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<TaskItem> {
     let Some(list_id) = list_id else {
         return Vec::new();
     };
     let rows = store.flatten_outline(list_id).unwrap_or_default();
-    let counts = store.obligation_counts_for_list(list_id).unwrap_or_default();
+    let counts = store
+        .obligation_counts_for_list(list_id)
+        .unwrap_or_default();
     rows.into_iter()
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
@@ -33,7 +32,11 @@ pub fn load_tasks_from_store(
                     .into_iter()
                     .map(|a| AgentInfo {
                         id: a.id,
-                        label: format!("{} {}", env_chip_label(&a.env_type), mode_chip_label(&a.mode)),
+                        label: format!(
+                            "{} {}",
+                            env_chip_label(&a.env_type),
+                            mode_chip_label(&a.mode)
+                        ),
                         status: a.runtime_status,
                     })
                     .collect()
@@ -51,6 +54,7 @@ pub fn load_tasks_from_store(
                 shells: Vec::new(),
                 interaction_timestamp: row.node.updated_at,
                 tree_ordinal: row.tree_ordinal,
+                parent_id: row.parent_id.map(|id| id.to_string()),
                 depth: row.depth,
                 collapsed: row.collapsed,
                 is_work_node: is_work,
@@ -104,6 +108,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             shells: Vec::new(),
             interaction_timestamp: Utc::now(),
             tree_ordinal: i,
+            parent_id: None,
             depth: 0,
             collapsed: false,
             is_work_node: true,
@@ -118,8 +123,8 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_store::outline::{CreatePosition, OutlineMutation};
     use std::fs;
+    use tod_store::outline::{CreatePosition, OutlineMutation};
 
     #[test]
     fn loads_from_outline_tree() {

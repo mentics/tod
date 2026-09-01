@@ -477,6 +477,10 @@ pub enum FleetWriterError {
 
 enum WriterCommand {
     Mutation(FleetMutation),
+    MutationSync {
+        mutation: FleetMutation,
+        respond: oneshot::Sender<Result<()>>,
+    },
     Flush(oneshot::Sender<Result<()>>),
     SwitchDatabase {
         path: PathBuf,
@@ -558,6 +562,16 @@ impl FleetWriter {
     }
 
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
+        if mutation.is_immediate() {
+            let (respond, rx) = oneshot::channel();
+            self.tx
+                .send(WriterCommand::MutationSync { mutation, respond })
+                .map_err(|_| FleetWriterError::Closed)?;
+            self.runtime
+                .block_on(rx)
+                .map_err(|_| FleetWriterError::Closed)??;
+            return Ok(());
+        }
         self.tx
             .send(WriterCommand::Mutation(mutation))
             .map_err(|_| FleetWriterError::Closed)?;
@@ -636,21 +650,22 @@ async fn writer_loop(
             cmd = rx.recv() => {
                 match cmd {
                     Some(WriterCommand::Mutation(mutation)) => {
-                        if mutation.is_immediate() {
-                            if let Err(err) = flush_batch(
-                                &conn,
-                                &media_root,
-                                std::slice::from_ref(&mutation),
-                                &command_log,
-                            ) {
-                                tracing::error!("fleet immediate write failed: {err:#}");
-                            } else {
-                                commit_notify.notify_waiters();
-                            }
-                            continue;
-                        }
                         pending.push(mutation);
                         debounce_deadline = Some(tokio::time::Instant::now() + debounce);
+                    }
+                    Some(WriterCommand::MutationSync { mutation, respond }) => {
+                        let result = flush_batch(
+                            &conn,
+                            &media_root,
+                            std::slice::from_ref(&mutation),
+                            &command_log,
+                        )
+                        .map_err(Into::into);
+                        let committed = result.is_ok();
+                        let _ = respond.send(result);
+                        if committed {
+                            commit_notify.notify_waiters();
+                        }
                     }
                     Some(WriterCommand::Flush(respond)) => {
                         let had_pending = !pending.is_empty();

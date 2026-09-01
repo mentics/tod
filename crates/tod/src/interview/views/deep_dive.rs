@@ -2,16 +2,38 @@ use crate::interview::agent::{AgentRunState, DeepDiveContext, RunId, SharedAgent
 use crate::interview::config::InterviewConfig;
 use crate::interview::queue::QueueQuestion;
 use crate::interview::{InterviewSession, TodPaths};
+use crate::ui::key_context;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div, px,
+    KeyBinding, ParentElement, Render, SharedString, Styled, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
 use uuid::Uuid;
+
+const DEEP_DIVE_CONTEXT: &str = "DeepDive";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeepDiveStop {
+    Draft,
+    Send,
+}
+
+const DEEP_DIVE_STOPS: [DeepDiveStop; 2] = [DeepDiveStop::Draft, DeepDiveStop::Send];
+
+actions!(
+    deep_dive,
+    [
+        DeepDiveStopUp,
+        DeepDiveStopDown,
+        DeepDiveActivate,
+        DeepDiveEscape,
+        DeepDiveBack,
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepDiveEvent {
@@ -47,6 +69,8 @@ pub struct DeepDiveView {
     status_line: SharedString,
     error_banner: Option<SharedString>,
     focus_handle: FocusHandle,
+    focus_stop: DeepDiveStop,
+    draft_editing: bool,
 }
 
 impl DeepDiveView {
@@ -64,7 +88,7 @@ impl DeepDiveView {
             InputState::new(window, cx)
                 .multi_line(true)
                 .rows(2)
-                .placeholder("Message deep-dive agent…")
+                .placeholder("Enter to edit · Message deep-dive agent…")
         });
         Self {
             parent,
@@ -81,7 +105,81 @@ impl DeepDiveView {
             status_line: "Ready".into(),
             error_banner: None,
             focus_handle: cx.focus_handle().tab_stop(true),
+            focus_stop: DeepDiveStop::Draft,
+            draft_editing: false,
         }
+    }
+
+    fn text_editing(&self) -> bool {
+        self.draft_editing
+    }
+
+    fn in_flight(&self) -> bool {
+        self.active_run.is_some()
+    }
+
+    fn stop_index(stop: DeepDiveStop) -> usize {
+        DEEP_DIVE_STOPS.iter().position(|s| *s == stop).unwrap_or(0)
+    }
+
+    fn stop_focused(&self, stop: DeepDiveStop) -> bool {
+        self.focus_stop == stop && !self.text_editing()
+            || (stop == DeepDiveStop::Draft && self.draft_editing)
+    }
+
+    fn move_stop(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() || self.in_flight() {
+            return;
+        }
+        let idx = Self::stop_index(self.focus_stop) as i32;
+        let len = DEEP_DIVE_STOPS.len() as i32;
+        let next = ((idx + delta).rem_euclid(len)) as usize;
+        self.focus_stop = DEEP_DIVE_STOPS[next];
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn enter_draft_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.in_flight() {
+            return;
+        }
+        self.focus_stop = DeepDiveStop::Draft;
+        self.draft_editing = true;
+        cx.notify();
+        let input = self.draft_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn exit_draft_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.draft_editing {
+            return;
+        }
+        self.draft_editing = false;
+        self.focus_stop = DeepDiveStop::Draft;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn activate_stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() || self.in_flight() {
+            return;
+        }
+        match self.focus_stop {
+            DeepDiveStop::Draft => self.enter_draft_edit(window, cx),
+            DeepDiveStop::Send => self.send_message(window, cx),
+        }
+    }
+
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.draft_editing {
+            self.exit_draft_edit(window, cx);
+            return;
+        }
+        self.back(cx);
     }
 
     fn poll_agent(&mut self, cx: &mut Context<Self>) {
@@ -220,8 +318,18 @@ impl Focusable for DeepDiveView {
 }
 
 impl Render for DeepDiveView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.poll_agent(cx);
+        key_context::set_input_tab_stop(&self.draft_input, self.draft_editing, cx);
+        if !self.draft_editing
+            && self
+                .draft_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_draft_edit(window, cx);
+        }
 
         let theme = cx.theme();
         let border = theme.border;
@@ -229,13 +337,34 @@ impl Render for DeepDiveView {
         let foreground = theme.foreground;
         let muted = theme.muted_foreground;
         let background = theme.background;
-        let in_flight = self.active_run.is_some();
+        let in_flight = self.in_flight();
 
         div()
+            .key_context(DEEP_DIVE_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
             .bg(background)
             .v_flex()
+            .on_action(cx.listener(|this, _: &DeepDiveStopUp, window, cx| {
+                this.move_stop(-1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DeepDiveStopDown, window, cx| {
+                this.move_stop(1, window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DeepDiveActivate, window, cx| {
+                this.activate_stop(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DeepDiveEscape, window, cx| {
+                this.handle_escape(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &DeepDiveBack, _, cx| {
+                this.back(cx);
+                cx.stop_propagation();
+            }))
             .child(
                 h_flex()
                     .items_center()
@@ -446,17 +575,42 @@ impl Render for DeepDiveView {
                                     .child(
                                         div()
                                             .flex_1()
-                                            .child(Input::new(&self.draft_input).disabled(in_flight).w_full()),
+                                            .rounded_md()
+                                            .cursor_text()
+                                            .when(self.stop_focused(DeepDiveStop::Draft), |el| {
+                                                el.border_1().border_color(theme.list_active_border)
+                                            })
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                cx.listener(|this, _, window, cx| {
+                                                    if !this.in_flight() && !this.draft_editing {
+                                                        this.enter_draft_edit(window, cx);
+                                                    }
+                                                }),
+                                            )
+                                            .child(
+                                                Input::new(&self.draft_input)
+                                                    .disabled(in_flight || !self.draft_editing)
+                                                    .focus_bordered(self.draft_editing)
+                                                    .w_full(),
+                                            ),
                                     )
                                     .child(
                                         Button::new("deep-dive-send")
                                             .label("Send")
                                             .primary()
+                                            .selected(self.stop_focused(DeepDiveStop::Send))
                                             .disabled(in_flight)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.send_message(window, cx);
                                             })),
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child("↑↓ control · Enter activate · Esc exit edit/back"),
                             ),
                     ),
             )
@@ -477,3 +631,16 @@ impl Render for DeepDiveView {
 }
 
 impl gpui::EventEmitter<DeepDiveEvent> for DeepDiveView {}
+
+pub fn register_deep_dive_keyboard_bindings(cx: &mut App) {
+    let context = Some(key_context::excluding_input(DEEP_DIVE_CONTEXT));
+    let input_context = Some(key_context::including_input(DEEP_DIVE_CONTEXT));
+    cx.bind_keys([
+        KeyBinding::new("up", DeepDiveStopUp, context),
+        KeyBinding::new("down", DeepDiveStopDown, context),
+        KeyBinding::new("enter", DeepDiveActivate, context),
+        KeyBinding::new("space", DeepDiveActivate, context),
+        KeyBinding::new("escape", DeepDiveEscape, context),
+        KeyBinding::new("escape", DeepDiveEscape, input_context),
+    ]);
+}

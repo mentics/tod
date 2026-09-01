@@ -27,13 +27,7 @@ impl<'a> TreeLoader<'a> {
 
         let by_parent = group_by_parent(&entries);
         let mut out = Vec::new();
-        self.walk(
-            &by_parent,
-            &node_repo,
-            None,
-            0,
-            &mut out,
-        )?;
+        self.walk(&by_parent, &node_repo, None, 0, &mut out)?;
         Ok(out)
     }
 
@@ -66,6 +60,7 @@ impl<'a> TreeLoader<'a> {
             out.push(FlatNodeRow {
                 node,
                 depth,
+                parent_id: entry.parent_id,
                 capabilities,
                 lifecycle,
                 tags,
@@ -123,7 +118,8 @@ impl<'a> TreeLoader<'a> {
     }
 
     pub fn record_loop_issue(&self, list_id: Uuid, cycle: &[Uuid]) -> Result<()> {
-        let detail = serde_json::to_string(&cycle.iter().map(|id| id.to_string()).collect::<Vec<_>>())?;
+        let detail =
+            serde_json::to_string(&cycle.iter().map(|id| id.to_string()).collect::<Vec<_>>())?;
         self.conn.execute(
             "INSERT INTO list_health_issues (id, list_id, issue_type, detail, detected_at, cleared_at)
              VALUES (?1, ?2, 'reference_loop', ?3, ?4, NULL)",

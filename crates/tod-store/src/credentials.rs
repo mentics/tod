@@ -130,7 +130,13 @@ impl CredentialStore {
             ));
         }
 
-        if self.set_in_keyring(kind, secret).is_ok() {
+        if self.set_in_keyring(kind, secret).is_ok()
+            && self
+                .get_from_keyring(kind)
+                .ok()
+                .flatten()
+                .is_some_and(|stored| stored == secret)
+        {
             let _ = self.remove_file(kind);
             return Ok(CredentialBackend::Keyring);
         }
@@ -458,5 +464,41 @@ mod tests {
         let blob = encrypt_with_machine_key(plain).unwrap();
         let decoded = decrypt_with_machine_key(&blob).unwrap();
         assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn set_and_get_use_separate_keyring_entries() {
+        // CredentialStore creates a fresh keyring::Entry on each call; the backend must
+        // persist by service/user identity, not in-memory on the Entry handle.
+        let set_entry = keyring::Entry::new(KEYRING_SERVICE, "linear_api_key").unwrap();
+        let get_entry = keyring::Entry::new(KEYRING_SERVICE, "linear_api_key").unwrap();
+        let _ = set_entry.delete_credential();
+        set_entry.set_password("separate-entry-roundtrip").unwrap();
+        assert_eq!(
+            get_entry.get_password().unwrap(),
+            "separate-entry-roundtrip"
+        );
+        let _ = set_entry.delete_credential();
+    }
+
+    #[test]
+    fn set_get_roundtrip_uses_readable_backend() {
+        // Windows Credential Manager can accept writes that are not readable back
+        // via the keyring crate; set() must fall back to the encrypted file in that case.
+        let dir = std::env::temp_dir().join(format!("tod-cred-kr-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = CredentialStore {
+            credentials_dir: dir.clone(),
+        };
+        let _ = store.delete(CredentialKind::LinearApiKey);
+        let secret = format!("lin_test_{}", uuid::Uuid::new_v4());
+        let backend = store.set(CredentialKind::LinearApiKey, &secret).unwrap();
+        assert_eq!(
+            store.get(CredentialKind::LinearApiKey).as_deref(),
+            Some(secret.as_str()),
+            "credential not readable after set (backend: {backend:?})"
+        );
+        store.delete(CredentialKind::LinearApiKey).unwrap();
+        let _ = fs::remove_dir_all(dir);
     }
 }

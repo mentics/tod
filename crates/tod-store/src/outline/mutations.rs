@@ -103,6 +103,11 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         direction: ReorderDirection,
     },
+    SetExtraContent {
+        node_id: Uuid,
+        content_type: String,
+        body: String,
+    },
 }
 
 impl OutlineMutation {
@@ -124,6 +129,7 @@ impl OutlineMutation {
                 | OutlineMutation::DeleteNode { .. }
                 | OutlineMutation::RestoreNodeSubtree { .. }
                 | OutlineMutation::ReorderObligation { .. }
+                | OutlineMutation::SetExtraContent { .. }
         )
     }
 
@@ -260,6 +266,15 @@ impl OutlineMutation {
                 };
                 ObligationRepo::new(conn).reorder(*obligation_id, delta)?;
             }
+            OutlineMutation::SetExtraContent {
+                node_id,
+                content_type,
+                body,
+            } => {
+                require_spec(conn, *node_id)?;
+                parse_extra_content_type(content_type)?;
+                NodeRepo::new(conn).set_extra_content(*node_id, content_type, body)?;
+            }
         }
         Ok(None)
     }
@@ -304,6 +319,14 @@ fn parse_obligation_kind(kind: &str) -> Result<&'static str> {
         KIND_CONSTRAINT => Ok(KIND_CONSTRAINT),
         _ => anyhow::bail!("invalid obligation kind: {kind}"),
     }
+}
+
+fn parse_extra_content_type(content_type: &str) -> Result<&'static str> {
+    crate::outline::types::EXTRA_CONTENT_TYPES
+        .iter()
+        .find(|t| **t == content_type)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("invalid extra content type: {content_type}"))
 }
 
 enum ParentSiblingJump {
