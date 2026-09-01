@@ -29,21 +29,21 @@ fn input_text(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).text().to_string()
 }
 
-fn field_anchor_key(field: TaskEditField) -> &'static str {
+fn field_anchor_id(field: TaskEditField) -> &'static str {
     match field {
-        TaskEditField::Title => "title",
-        TaskEditField::LinearLink => "linear-link",
-        TaskEditField::GithubPr => "github-pr",
-        TaskEditField::Slug => "slug",
-        TaskEditField::Tags => "tags",
-        TaskEditField::Repo => "repo",
-        TaskEditField::Branch => "branch",
-        TaskEditField::Notes => "notes",
-        TaskEditField::Purpose => "purpose",
-        TaskEditField::Obligations => "obligations",
-        TaskEditField::Capability(Capability::Agent) => "cap-agent",
-        TaskEditField::Capability(Capability::Spec) => "cap-spec",
-        TaskEditField::Capability(Capability::Lifecycle) => "cap-lifecycle",
+        TaskEditField::Title => "task-edit-field-title",
+        TaskEditField::LinearLink => "task-edit-field-linear-link",
+        TaskEditField::GithubPr => "task-edit-field-github-pr",
+        TaskEditField::Slug => "task-edit-field-slug",
+        TaskEditField::Tags => "task-edit-field-tags",
+        TaskEditField::Repo => "task-edit-field-repo",
+        TaskEditField::Branch => "task-edit-field-branch",
+        TaskEditField::Notes => "task-edit-field-notes",
+        TaskEditField::Purpose => "task-edit-field-purpose",
+        TaskEditField::Obligations => "task-edit-field-obligations",
+        TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
+        TaskEditField::Capability(Capability::Spec) => "task-edit-field-cap-spec",
+        TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
     }
 }
 
@@ -1304,7 +1304,7 @@ impl TaskEditView {
         self.apply_focus_scroll_anchor(
             field,
             v_flex()
-                .id(("task-edit-field", field_anchor_key(field)))
+                .id(field_anchor_id(field))
                 .gap_1()
                 .w(px(width))
                 .flex_shrink_0()
@@ -1475,7 +1475,7 @@ impl TaskEditView {
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Slug,
                             v_flex()
-                                .id(("task-edit-field", "slug"))
+                                .id(field_anchor_id(TaskEditField::Slug))
                                 .gap_1()
                                 .w(px(180.))
                                 .flex_shrink_0()
@@ -1494,7 +1494,7 @@ impl TaskEditView {
                 self.apply_focus_scroll_anchor(
                     TaskEditField::Tags,
                     v_flex()
-                        .id(("task-edit-field", "tags"))
+                        .id(field_anchor_id(TaskEditField::Tags))
                         .gap_1()
                         .w_full()
                         .rounded_md()
@@ -1516,7 +1516,7 @@ impl TaskEditView {
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Repo,
                             v_flex()
-                                .id(("task-edit-field", "repo"))
+                                .id(field_anchor_id(TaskEditField::Repo))
                                 .gap_1()
                                 .w(px(280.))
                                 .flex_shrink_0()
@@ -1534,7 +1534,7 @@ impl TaskEditView {
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Branch,
                             v_flex()
-                                .id(("task-edit-field", "branch"))
+                                .id(field_anchor_id(TaskEditField::Branch))
                                 .gap_1()
                                 .w(px(110.))
                                 .flex_shrink_0()
@@ -1553,7 +1553,7 @@ impl TaskEditView {
                 self.apply_focus_scroll_anchor(
                     TaskEditField::Notes,
                     v_flex()
-                        .id(("task-edit-field", "notes"))
+                        .id(field_anchor_id(TaskEditField::Notes))
                         .gap_1()
                         .w_full()
                         .child(Self::render_field_label("Notes", cx))
@@ -1593,7 +1593,7 @@ impl TaskEditView {
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Purpose,
                             v_flex()
-                                .id(("task-edit-field", "purpose"))
+                                .id(field_anchor_id(TaskEditField::Purpose))
                                 .gap_1()
                                 .w_full()
                                 .child(Self::render_field_label("Purpose", cx))
@@ -1610,7 +1610,7 @@ impl TaskEditView {
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Obligations,
                             h_flex()
-                                .id(("task-edit-field", "obligations"))
+                                .id(field_anchor_id(TaskEditField::Obligations))
                                 .items_center()
                                 .justify_end()
                                 .gap_2()
@@ -1619,7 +1619,9 @@ impl TaskEditView {
                                     Button::new("task-edit-open-obligations")
                                         .label("Obligations")
                                         .compact()
-                                        .selected(self.field_nav_focused(TaskEditField::Obligations))
+                                        .selected(
+                                            self.field_nav_focused(TaskEditField::Obligations),
+                                        )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.open_obligations(cx);
                                         })),
@@ -1749,21 +1751,23 @@ impl Render for TaskEditView {
         let mut body = v_flex().gap_3().p_3().w_full();
 
         if has_capabilities {
-            body = body.child(self.apply_focus_scroll_anchor(
-                TaskEditField::Title,
-                v_flex()
-                    .id(("task-edit-field", "title"))
-                    .gap_1()
-                    .w_full()
-                    .child(Self::render_field_label("Title", cx))
-                    .child(self.render_nav_input(
-                        TaskEditField::Title,
-                        &self.title_input,
-                        None,
-                        window,
-                        cx,
-                    )),
-            ));
+            body = body.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::Title,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Title))
+                        .gap_1()
+                        .w_full()
+                        .child(Self::render_field_label("Title", cx))
+                        .child(self.render_nav_input(
+                            TaskEditField::Title,
+                            &self.title_input,
+                            None,
+                            window,
+                            cx,
+                        )),
+                ),
+            );
         }
 
         for (cap_index, cap) in Capability::ALL.into_iter().enumerate() {
