@@ -209,7 +209,11 @@ pub fn sync_scaffolding_from_disk(
     if session
         .scratchpad_path
         .as_ref()
-        .is_some_and(|p| Path::new(p).join("interview-config.md").exists())
+        .is_some_and(|p| {
+            let path = Path::new(p);
+            tod_store::path_is_under(data_root, path)
+                && path.join("interview-config.md").exists()
+        })
     {
         return Ok(true);
     }
@@ -222,6 +226,16 @@ pub fn sync_scaffolding_from_disk(
         return Ok(false);
     }
     if !scaffolding_ready_to_bind(&config) {
+        return Ok(false);
+    }
+    if !tod_store::path_is_under(data_root, &config.scratchpad) {
+        tracing::warn!(
+            event = "interview",
+            action = "reject_scratchpad_outside_data_root",
+            scratchpad = %config.scratchpad.display(),
+            data_root = %data_root.display(),
+            "ignoring interview scaffolding outside data root"
+        );
         return Ok(false);
     }
     bind_session_scaffolding(store, session_id, &config_path, &config)
@@ -238,7 +252,11 @@ pub fn sync_scaffolding_from_disk_after_bootstrap(
     if session
         .scratchpad_path
         .as_ref()
-        .is_some_and(|p| Path::new(p).join("interview-config.md").exists())
+        .is_some_and(|p| {
+            let path = Path::new(p);
+            tod_store::path_is_under(data_root, path)
+                && path.join("interview-config.md").exists()
+        })
     {
         return Ok(true);
     }
@@ -248,6 +266,16 @@ pub fn sync_scaffolding_from_disk_after_bootstrap(
     };
     let config = parse_interview_config(&config_path)?;
     if config.node_id != session.node_id {
+        return Ok(false);
+    }
+    if !tod_store::path_is_under(data_root, &config.scratchpad) {
+        tracing::warn!(
+            event = "interview",
+            action = "reject_scratchpad_outside_data_root",
+            scratchpad = %config.scratchpad.display(),
+            data_root = %data_root.display(),
+            "ignoring interview scaffolding outside data root"
+        );
         return Ok(false);
     }
     bind_session_scaffolding(store, session_id, &config_path, &config)

@@ -1,5 +1,3 @@
-use tod_store::fleet::FleetStore;
-use tod_store::fleet::{ensure_interview_agent_for_node, workspace_cwd_for_interview_agent};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::config::{
     InterviewConfig, parse_interview_config, sync_scaffolding_from_disk,
@@ -22,11 +20,8 @@ use crate::interview::{
     InterviewSession, InterviewSessionStatus, SessionStore, TaskListProceedContext, TodPaths,
     TodSettings,
 };
-use tod_store::outline::repos::NodeRepo;
 use crate::process::lifecycle_for_interview_phase;
-use crate::process_bundle::{
-    InterviewAgentPrompt, ProcessManifest, TodInstallPaths, session_scratchpad,
-};
+use crate::process_bundle::{InterviewAgentPrompt, ProcessManifest, TodInstallPaths};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::selectable_text::selectable_text;
@@ -48,6 +43,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::{ensure_interview_agent_for_node, workspace_cwd_for_interview_agent};
+use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
 const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -623,13 +621,10 @@ impl WorkspaceView {
         if !self.config.scratchpad.as_os_str().is_empty() {
             return self.config.scratchpad.clone();
         }
-        if let Some(p) = self.session.scratchpad_path.as_ref() {
-            return PathBuf::from(p);
-        }
         let root = TodPaths::discover()
             .map(|p| p.data_root().to_path_buf())
             .unwrap_or_else(|_| PathBuf::from("."));
-        session_scratchpad(&root, self.session.node_id, &self.session.id.to_string())
+        crate::process_bundle::resolve_session_scratchpad(&root, &self.session)
     }
 
     fn read_question_maker_status_snapshot(&self) -> QuestionMakerStatusSnapshot {
@@ -3609,9 +3604,9 @@ mod tests {
         question_maker_status_from_text, reopen_complete_with_bound_queue,
         update_replenish_idle_since,
     };
+    use crate::interview::InterviewSessionStatus;
     use crate::interview::agent::RunId;
     use crate::interview::queue::QueueQuestion;
-    use crate::interview::InterviewSessionStatus;
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::time::Instant;
@@ -3698,10 +3693,10 @@ mod tests {
 
     #[test]
     fn reopen_complete_with_nonempty_queue_flips_active() {
-        use tod_store::fleet::FleetStore;
         use crate::interview::db::{NewInterviewSession, SessionStore};
-        use tod_store::outline::OutlineMutation;
         use std::sync::Arc;
+        use tod_store::fleet::FleetStore;
+        use tod_store::outline::OutlineMutation;
 
         let dir = std::env::temp_dir().join(format!("tod-reopen-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();

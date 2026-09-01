@@ -1,9 +1,9 @@
 //! Interview session persistence (fleet DB).
 
+use anyhow::Result;
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::repos::interview_session::InterviewSessionRepo;
 use tod_store::fleet::writer::{FleetMutation, FleetWriterError};
-use anyhow::Result;
 use uuid::Uuid;
 
 pub use tod_store::fleet::repos::interview_session::{
@@ -20,7 +20,14 @@ impl SessionStore {
         Self { fleet }
     }
 
-    fn with_read_repo<R>(&self, f: impl FnOnce(InterviewSessionRepo<'_>) -> Result<R>) -> Result<R> {
+    pub fn storage_root(&self) -> &std::path::Path {
+        self.fleet.paths().root()
+    }
+
+    fn with_read_repo<R>(
+        &self,
+        f: impl FnOnce(InterviewSessionRepo<'_>) -> Result<R>,
+    ) -> Result<R> {
         let fleet_projection = self.fleet.projection();
         let guard = fleet_projection.lock().expect("fleet projection mutex");
         let conn = guard.connection();
@@ -92,8 +99,8 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_store::outline::OutlineMutation;
     use std::fs;
+    use tod_store::outline::OutlineMutation;
 
     #[test]
     fn session_crud_on_fleet_db() {

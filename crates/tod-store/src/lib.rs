@@ -18,7 +18,7 @@ pub use credentials::{
 pub use install::{InstallConfig, load_data_root, load_install_config, save_data_root};
 pub use linear::{LinearError, LinearIssue, fetch_issue};
 pub use log_level::LogLevel;
-pub use path_util::path_for_storage;
+pub use path_util::{canonicalize_if_possible, path_for_storage, path_is_under};
 pub use paths::{
     TodPaths, clear_data_root_override, is_data_root_configured, resolve_data_root,
     resolve_startup_data_root, set_data_root,

@@ -308,6 +308,8 @@ fn build_bootstrap_turn(
          Session scratchpad: {}\n\
          Create interview-config at: {}\n\
          \n\
+         IMPORTANT: Use the session scratchpad path above exactly. It lives under the tod data root, not the git repo root. Do not write under `<repo>/agent/`.\n\
+         \n\
          Follow the bootstrap section in your role instructions:\n\
          1. Create session scratchpad structure under the path above.\n\
          2. Derive session_id from transcript metadata when created.\n\
@@ -351,7 +353,28 @@ pub fn node_scratchpad_root(data_root: &Path, node_id: Uuid) -> PathBuf {
 }
 
 pub fn session_scratchpad(data_root: &Path, node_id: Uuid, session_key: &str) -> PathBuf {
-    node_scratchpad_root(data_root, node_id).join(session_key)
+    let path = node_scratchpad_root(data_root, node_id).join(session_key);
+    tod_store::path_util::canonicalize_if_possible(&path)
+}
+
+/// Session scratchpad under `data_root`, ignoring poisoned paths outside the data root.
+pub fn resolve_session_scratchpad(data_root: &Path, session: &InterviewSession) -> PathBuf {
+    if let Some(existing) = session.scratchpad_path.as_ref().filter(|p| !p.is_empty()) {
+        let path = PathBuf::from(existing);
+        let canonical = tod_store::path_util::canonicalize_if_possible(&path);
+        if tod_store::path_is_under(data_root, &canonical)
+            && canonical.join("interview-config.md").is_file()
+        {
+            return canonical;
+        }
+    }
+    session_scratchpad(data_root, session.node_id, &session.id.to_string())
+}
+
+pub fn session_has_scaffolding(data_root: &Path, session: &InterviewSession) -> bool {
+    resolve_session_scratchpad(data_root, session)
+        .join("interview-config.md")
+        .is_file()
 }
 
 /// Read the bundled deep-dive role doc.

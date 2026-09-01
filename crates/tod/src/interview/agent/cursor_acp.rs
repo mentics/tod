@@ -1,13 +1,10 @@
-use super::acp_host::{AcpHost, spawn_acp_process};
+use super::acp_host::{AcpHost, is_standalone_acp_server, spawn_acp_process};
 use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState,
-    DeepDiveContext, RunId,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, DeepDiveContext, RunId,
 };
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
-use tod_store::agent_traffic::{
-    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
-};
+use crate::interview::paths::TodPaths;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::process_bundle::InterviewAgentPrompt;
 use crate::process_bundle::{TodInstallPaths, build_deep_dive_prompt, load_deep_dive_role_doc};
@@ -22,6 +19,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tod_store::agent_traffic::{
+    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+};
+use tod_store::fleet::paths::normalize_absolute;
+use tod_store::path_is_under;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -775,6 +777,59 @@ fn kill_child_tree(child: &mut Child) {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+fn auth_method_from_initialize(
+    init_result: &Value,
+    host: AcpHost,
+    agent_bin: &Path,
+) -> Option<String> {
+    if host == AcpHost::Claude && is_standalone_acp_server(agent_bin) {
+        return None;
+    }
+    let methods = init_result.get("authMethods")?.as_array()?;
+    if methods.is_empty() {
+        return None;
+    }
+    let preferred = host.auth_method_id();
+    if let Some(found) = methods
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str))
+        .find(|id| *id == preferred)
+    {
+        return Some(found.to_string());
+    }
+    methods
+        .first()
+        .and_then(|m| m.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+fn run_acp_authenticate(
+    session: &mut AcpClient,
+    host: AcpHost,
+    agent_bin: &Path,
+    init_result: &Value,
+) -> Result<()> {
+    let Some(method_id) = auth_method_from_initialize(init_result, host, agent_bin) else {
+        tracing::debug!(
+            event = "agent",
+            action = "acp_authenticate_skip",
+            host = host.label(),
+            "skipping ACP authenticate (adapter uses existing CLI login)"
+        );
+        return Ok(());
+    };
+    tracing::debug!(
+        event = "agent",
+        action = "acp_authenticate",
+        host = host.label(),
+        method_id,
+        "ACP authenticate"
+    );
+    session.send_request("authenticate", json!({ "methodId": method_id }))?;
+    session.await_response(AUTH_TIMEOUT)?;
+    Ok(())
+}
+
 fn run_acp_session(
     host: AcpHost,
     agent_bin: &Path,
@@ -807,9 +862,9 @@ fn run_acp_session(
         traffic_log,
         run_id,
         kind,
+        write_roots: acp_write_roots(cwd),
     };
 
-    let auth_method = host.auth_method_id();
     let client_name = host.client_name();
 
     let result = (|| -> Result<String> {
@@ -833,19 +888,12 @@ fn run_acp_session(
                 "clientInfo": { "name": client_name, "version": "0.1.0" }
             }),
         )?;
-        session.await_response(AUTH_TIMEOUT)?;
+        let init_result = session.await_response(AUTH_TIMEOUT)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        tracing::debug!(
-            event = "agent",
-            action = "acp_authenticate",
-            host = host.label(),
-            "ACP authenticate"
-        );
-        session.send_request("authenticate", json!({ "methodId": auth_method }))?;
-        session.await_response(AUTH_TIMEOUT)?;
+        run_acp_authenticate(&mut session, host, agent_bin, &init_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -934,6 +982,7 @@ struct AcpClient {
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
     kind: AgentRunKind,
+    write_roots: Vec<PathBuf>,
 }
 
 impl AcpClient {
@@ -1045,26 +1094,46 @@ impl AcpClient {
                     .and_then(|t| t.get("title"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                tracing::info!(
-                    event = "agent",
-                    action = "acp_permission",
-                    ?response_id,
-                    option_id,
-                    tool_title,
-                    "auto-approving ACP permission"
-                );
-                if let Some(id) = response_id {
-                    respond(
-                        &mut self.stdin,
-                        id,
-                        json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                    )?;
+                let allowed = tool_path_allowed(tool_title, &self.write_roots);
+                if allowed {
+                    tracing::info!(
+                        event = "agent",
+                        action = "acp_permission",
+                        ?response_id,
+                        option_id,
+                        tool_title,
+                        "auto-approving ACP permission"
+                    );
+                    if let Some(id) = response_id {
+                        respond(
+                            &mut self.stdin,
+                            id,
+                            json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+                        )?;
+                    } else {
+                        tracing::warn!(
+                            event = "agent",
+                            action = "acp_permission_no_id",
+                            "permission request missing response id — cannot approve"
+                        );
+                    }
                 } else {
+                    let deny_id = pick_deny_option_id(&options).unwrap_or("deny-once");
                     tracing::warn!(
                         event = "agent",
-                        action = "acp_permission_no_id",
-                        "permission request missing response id — cannot approve"
+                        action = "acp_permission_denied",
+                        ?response_id,
+                        deny_id,
+                        tool_title,
+                        "denying ACP permission outside allowed write roots"
                     );
+                    if let Some(id) = response_id {
+                        respond(
+                            &mut self.stdin,
+                            id,
+                            json!({ "outcome": { "outcome": "selected", "optionId": deny_id } }),
+                        )?;
+                    }
                 }
             }
             "cursor/ask_question" => {
@@ -1171,6 +1240,72 @@ fn respond(stdin: &mut std::process::ChildStdin, id: i64, result: Value) -> Resu
     Ok(())
 }
 
+fn acp_write_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(paths) = TodPaths::discover() {
+        if let Ok(root) = normalize_absolute(paths.data_root()) {
+            roots.push(root);
+        }
+    }
+    if let Ok(root) = normalize_absolute(cwd) {
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn extract_tool_path(tool_title: &str) -> Option<PathBuf> {
+    let trimmed = tool_title.trim();
+    let rest = trimmed
+        .strip_prefix("Write ")
+        .or_else(|| trimmed.strip_prefix("Edit "))
+        .or_else(|| trimmed.strip_prefix("Delete "))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("Delete `")
+                .and_then(|s| s.strip_suffix('`'))
+        })
+        .or_else(|| {
+            trimmed
+                .strip_prefix("Edit `")
+                .and_then(|s| s.strip_suffix('`'))
+        })
+        .or_else(|| {
+            trimmed
+                .strip_prefix("Write `")
+                .and_then(|s| s.strip_suffix('`'))
+        })?;
+    Some(PathBuf::from(rest.trim().trim_matches('`')))
+}
+
+fn tool_path_allowed(tool_title: &str, write_roots: &[PathBuf]) -> bool {
+    let Some(path) = extract_tool_path(tool_title) else {
+        return true;
+    };
+    write_roots.iter().any(|root| path_is_under(root, &path))
+}
+
+fn pick_deny_option_id(options: &[Value]) -> Option<&str> {
+    let ids: Vec<&str> = options
+        .iter()
+        .filter_map(|o| o.get("optionId").and_then(Value::as_str))
+        .collect();
+    ids.iter()
+        .copied()
+        .find(|id| *id == "deny-once")
+        .or_else(|| {
+            ids.iter()
+                .copied()
+                .find(|id| id.to_ascii_lowercase().contains("deny"))
+        })
+        .or_else(|| {
+            ids.iter()
+                .copied()
+                .find(|id| id.to_ascii_lowercase().contains("reject"))
+        })
+}
+
 fn pick_allow_option_id(options: &[Value]) -> Option<&str> {
     let ids: Vec<&str> = options
         .iter()
@@ -1246,9 +1381,9 @@ impl PersistentAcpSession {
             traffic_log: None,
             run_id: RunId::new(),
             kind: AgentRunKind::AnswerProcessor,
+            write_roots: acp_write_roots(cwd),
         };
 
-        let auth_method = host.auth_method_id();
         let client_name = host.client_name();
 
         if cancelled.load(Ordering::SeqCst) {
@@ -1265,13 +1400,12 @@ impl PersistentAcpSession {
                 "clientInfo": { "name": client_name, "version": "0.1.0" }
             }),
         )?;
-        client.await_response(AUTH_TIMEOUT)?;
+        let init_result = client.await_response(AUTH_TIMEOUT)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        client.send_request("authenticate", json!({ "methodId": auth_method }))?;
-        client.await_response(AUTH_TIMEOUT)?;
+        run_acp_authenticate(&mut client, host, agent_bin, &init_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -1432,6 +1566,28 @@ fn run_acp_pool_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skips_authenticate_for_claude_code_acp_adapter() {
+        let init = json!({
+            "authMethods": [{ "id": "claude_login", "name": "Claude login" }]
+        });
+        let adapter = Path::new("/usr/local/bin/claude-code-acp");
+        assert!(auth_method_from_initialize(&init, AcpHost::Claude, adapter).is_none());
+
+        let cursor_init = json!({
+            "authMethods": [{ "id": "cursor_login", "name": "Cursor login" }]
+        });
+        assert_eq!(
+            auth_method_from_initialize(
+                &cursor_init,
+                AcpHost::Cursor,
+                Path::new("/usr/local/bin/agent")
+            )
+            .as_deref(),
+            Some("cursor_login")
+        );
+    }
 
     #[test]
     fn deep_dive_prompt_includes_context() {

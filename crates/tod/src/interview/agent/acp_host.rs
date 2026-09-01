@@ -57,7 +57,10 @@ impl AcpHost {
     }
 }
 
-fn is_standalone_acp_server(agent_bin: &Path) -> bool {
+/// Standalone ACP bridges (e.g. Zed's `claude-code-acp`) speak ACP on stdio directly
+/// and rely on the user's existing `claude` CLI login — they do not implement
+/// `authenticate` with `claude_login`.
+pub fn is_standalone_acp_server(agent_bin: &Path) -> bool {
     let Some(name) = agent_bin.file_name().and_then(|n| n.to_str()) else {
         return false;
     };

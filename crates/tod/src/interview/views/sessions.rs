@@ -1,4 +1,3 @@
-use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use crate::interview::agent::{AgentRunState, BootstrapGate, SharedAgent};
 use crate::interview::config::{
     sync_scaffolding_from_disk, sync_scaffolding_from_disk_after_bootstrap,
@@ -9,9 +8,7 @@ use crate::interview::{
     InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore,
     TaskListProceedContext, TodPaths, TodSettings,
 };
-use crate::process_bundle::{
-    AgentLaunchContext, ProcessManifest, TodInstallPaths, session_scratchpad,
-};
+use crate::process_bundle::{AgentLaunchContext, ProcessManifest, TodInstallPaths};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
 use crate::ui::list::{ListArrowDown, ListArrowUp};
@@ -28,10 +25,11 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::list::{List, ListEvent, ListState};
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use uuid::Uuid;
 
 const SESSIONS_CONTEXT: &str = "InterviewSessions";
@@ -501,7 +499,7 @@ impl SessionsView {
                 self.selected_id = Some(session.id);
                 self.sync_session_list_items(cx);
                 self.kickoff_status = format!("Opened: {}", session.display_name).into();
-                if Self::session_needs_bootstrap(&session) {
+                if self.session_needs_bootstrap(&session) {
                     self.start_question_maker_bootstrap(session.clone());
                 }
                 self.open_workspace(session, window, cx);
@@ -608,7 +606,7 @@ impl SessionsView {
         if let Some(session) = matches
             .iter()
             .filter(|s| {
-                s.status == InterviewSessionStatus::Active && Self::session_needs_bootstrap(s)
+                s.status == InterviewSessionStatus::Active && self.session_needs_bootstrap(s)
             })
             .max_by_key(|s| s.id)
         {
@@ -646,11 +644,8 @@ impl SessionsView {
         }
     }
 
-    fn session_needs_bootstrap(session: &InterviewSession) -> bool {
-        !session
-            .scratchpad_path
-            .as_ref()
-            .is_some_and(|p| Path::new(p).join("interview-config.md").exists())
+    fn session_needs_bootstrap(&self, session: &InterviewSession) -> bool {
+        !crate::process_bundle::session_has_scaffolding(self.paths.data_root(), session)
     }
 
     /// True when scaffolding was produced by `--agent mock` (fixtures), not a real question maker.
@@ -687,7 +682,7 @@ impl SessionsView {
     }
 
     fn should_prompt_bootstrap(&self, session: &InterviewSession) -> bool {
-        Self::session_needs_bootstrap(session) && !self.bootstrap_in_flight(session.id)
+        self.session_needs_bootstrap(session) && !self.bootstrap_in_flight(session.id)
     }
 
     fn bootstrap_subject_label(session: &InterviewSession) -> SharedString {
@@ -770,17 +765,8 @@ impl SessionsView {
                 return;
             }
         };
-        let scratchpad = session
-            .scratchpad_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                session_scratchpad(
-                    self.paths.data_root(),
-                    session.node_id,
-                    &session.id.to_string(),
-                )
-            });
+        let scratchpad =
+            crate::process_bundle::resolve_session_scratchpad(self.paths.data_root(), &session);
         let ctx = {
             let fleet_projection = self.fleet.projection();
             let guard = fleet_projection.lock().expect("fleet projection mutex");

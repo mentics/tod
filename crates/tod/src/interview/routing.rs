@@ -38,11 +38,7 @@ pub fn interview_work_remains(node_id: Uuid, lifecycle: &str) -> bool {
     interview_work_remains_with_store(&store, node_id, phase)
 }
 
-pub fn interview_work_remains_with_store(
-    store: &SessionStore,
-    node_id: Uuid,
-    phase: &str,
-) -> bool {
+pub fn interview_work_remains_with_store(store: &SessionStore, node_id: Uuid, phase: &str) -> bool {
     let wanted_base = base_interview_phase(phase);
     let Ok(sessions) = store.list_for_node(node_id) else {
         return true;
@@ -56,13 +52,16 @@ pub fn interview_work_remains_with_store(
     if matches.is_empty() {
         return true;
     }
-    if matches.iter().any(|s| session_open_question_count(s) > 0) {
-        return true;
-    }
     if matches
         .iter()
-        .any(|s| s.status == InterviewSessionStatus::Active && session_needs_bootstrap(s))
+        .any(|s| session_open_question_count(store.storage_root(), s) > 0)
     {
+        return true;
+    }
+    if matches.iter().any(|s| {
+        s.status == InterviewSessionStatus::Active
+            && session_needs_bootstrap(store.storage_root(), s)
+    }) {
         return true;
     }
     if matches
@@ -74,18 +73,13 @@ pub fn interview_work_remains_with_store(
     false
 }
 
-fn session_needs_bootstrap(session: &InterviewSession) -> bool {
-    !session
-        .scratchpad_path
-        .as_ref()
-        .is_some_and(|p| std::path::Path::new(p).join("interview-config.md").exists())
+fn session_needs_bootstrap(data_root: &std::path::Path, session: &InterviewSession) -> bool {
+    !crate::process_bundle::session_has_scaffolding(data_root, session)
 }
 
-fn session_open_question_count(session: &InterviewSession) -> usize {
-    let Some(scratch) = session.scratchpad_path.as_ref() else {
-        return 0;
-    };
-    let config_path = std::path::Path::new(scratch).join("interview-config.md");
+fn session_open_question_count(data_root: &std::path::Path, session: &InterviewSession) -> usize {
+    let scratch = crate::process_bundle::resolve_session_scratchpad(data_root, session);
+    let config_path = scratch.join("interview-config.md");
     if !config_path.exists() {
         return 0;
     }
@@ -98,10 +92,10 @@ fn session_open_question_count(session: &InterviewSession) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_store::fleet::FleetStore;
     use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
-    use tod_store::outline::OutlineMutation;
     use std::fs;
+    use tod_store::fleet::FleetStore;
+    use tod_store::outline::OutlineMutation;
 
     fn test_node() -> (PathBuf, std::sync::Arc<FleetStore>, Uuid) {
         let root = std::env::temp_dir().join(format!("tod-route-{}", uuid::Uuid::new_v4()));
