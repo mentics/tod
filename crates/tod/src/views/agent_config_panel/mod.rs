@@ -1,4 +1,4 @@
-//! Right-drawer agent config panel — persistent environment configuration for a task.
+//! Right-drawer action config panel — workspace / environment for a task.
 
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 use crate::interview::TodPaths;
@@ -526,7 +526,7 @@ impl AgentConfigPanelView {
             self.reload_chat_sessions();
             self.reload_terminal_agents();
             self.refresh_workspace_label();
-            self.status_message = format!("Saved agent config {id}");
+            self.status_message = format!("Saved action config {id}");
             cx.emit(AgentConfigPanelEvent::Saved {
                 _task_id: task_id,
                 _config_id: id,
@@ -656,11 +656,11 @@ impl AgentConfigPanelView {
 
     fn launch_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
-            self.set_status("Save the agent config before launching.", cx);
+            self.set_status("Save the action config before launching.", cx);
             return;
         };
         let Some(task_id) = self.task_id.clone() else {
-            self.set_status("No task selected for this agent config.", cx);
+            self.set_status("No task selected for this action config.", cx);
             return;
         };
         if self.mode == "interview" {
@@ -689,7 +689,7 @@ impl AgentConfigPanelView {
         let agent_row = match self.agent_row_for_launch() {
             Some(row) => row,
             None => {
-                self.show_error(window, cx, "Agent config not found.");
+                self.show_error(window, cx, "Action config not found.");
                 return;
             }
         };
@@ -861,11 +861,11 @@ impl AgentConfigPanelView {
 
     fn new_interactive_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
-            self.set_status("Save the agent config before starting a session.", cx);
+            self.set_status("Save the action config before starting a session.", cx);
             return;
         };
         let Some(task_id) = self.task_id.clone() else {
-            self.set_status("No task selected for this agent config.", cx);
+            self.set_status("No task selected for this action config.", cx);
             return;
         };
         if self.mode != "shell" {
@@ -922,11 +922,11 @@ impl AgentConfigPanelView {
 
     fn launch_agent_in_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
-            self.set_status("Save the agent config before launching.", cx);
+            self.set_status("Save the action config before launching.", cx);
             return;
         };
         let Some(_task_id) = self.task_id.clone() else {
-            self.set_status("No task selected for this agent config.", cx);
+            self.set_status("No task selected for this action config.", cx);
             return;
         };
         if self.mode != "shell" {
@@ -1095,11 +1095,11 @@ impl AgentConfigPanelView {
 
     fn launch_zed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
-            self.set_status("Save the agent config before opening Zed.", cx);
+            self.set_status("Save the action config before opening Zed.", cx);
             return;
         };
         let Some(task_id) = self.task_id.clone() else {
-            self.set_status("No task selected for this agent config.", cx);
+            self.set_status("No task selected for this action config.", cx);
             return;
         };
         match open_zed_for_agent_config(
@@ -1618,11 +1618,11 @@ impl AgentConfigPanelView {
 
     fn panel_title(&self) -> String {
         if self.is_new() {
-            "New agent config".into()
+            "New action config".into()
         } else {
             self.config_id
                 .clone()
-                .unwrap_or_else(|| "Agent config".into())
+                .unwrap_or_else(|| "Action config".into())
         }
     }
 }

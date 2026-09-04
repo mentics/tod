@@ -40,7 +40,7 @@ use tod_store::agent_traffic::{
 };
 use tod_store::fleet::{
     FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
-    verify_shell_session,
+    open_zed_for_agent_config,
 };
 use uuid::Uuid;
 
@@ -533,9 +533,7 @@ impl Shell {
                     .next()
                     .map(|row| row.id)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no agent config for this task; create one in Agent config first"
-                        )
+                        anyhow::anyhow!("no action config for this task; create one with F first")
                     })?
             };
 
@@ -571,7 +569,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let Some(agent) = self.fleet.get_agent(&config_id).ok().flatten() else {
-            self.queue_error_toast(format!("Agent config {config_id} not found"), cx);
+            self.queue_error_toast(format!("Action config {config_id} not found"), cx);
             return;
         };
         match agent.mode.as_str() {
@@ -628,6 +626,23 @@ impl Shell {
                     launch_auto: !running,
                 });
                 cx.notify();
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_open_zed(&mut self, task_id: String, config_id: String, cx: &mut Context<Self>) {
+        let settings = TodSettings::load(&self.paths).unwrap_or_default();
+        let result =
+            open_zed_for_agent_config(&self.fleet, &self.paths, &settings, &config_id, &task_id);
+        match result {
+            Ok(cwd) => {
+                self.task_list.update(cx, |list, cx| {
+                    list.set_status_message(format!("Opened Zed in {}", cwd.display()), cx);
+                });
+            }
+            Err(err) => {
+                self.queue_error_toast(format!("Open code failed: {err:#}"), cx);
             }
         }
         cx.notify();
@@ -842,28 +857,29 @@ impl Shell {
     fn render_tasks_split(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let drawer =
-            if self.obligations.read(cx).is_open() {
-                self.obligations.clone().into_any_element()
-            } else if self.task_edit.read(cx).is_open() {
-                self.task_edit.clone().into_any_element()
-            } else if self.agent_panel.read(cx).is_open() {
-                self.agent_panel.clone().into_any_element()
-            } else {
-                div()
-                    .size_full()
-                    .v_flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .bg(theme.background)
-                    .text_color(muted)
-                    .child(div().text_sm().font_semibold().child("Agent configs"))
-                    .child(div().text_xs().child(
-                        "Press A to launch an agent, T for a shell, Shift+A for a new config",
-                    ))
-                    .into_any_element()
-            };
+        let drawer = if self.obligations.read(cx).is_open() {
+            self.obligations.clone().into_any_element()
+        } else if self.task_edit.read(cx).is_open() {
+            self.task_edit.clone().into_any_element()
+        } else if self.agent_panel.read(cx).is_open() {
+            self.agent_panel.clone().into_any_element()
+        } else {
+            div()
+                .size_full()
+                .v_flex()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(theme.background)
+                .text_color(muted)
+                .child(div().text_sm().font_semibold().child("Action configs"))
+                .child(
+                    div()
+                        .text_xs()
+                        .child("A agent · T shell · C code · F action config"),
+                )
+                .into_any_element()
+        };
 
         h_panel_split("tasks-split", &self.tasks_split_state)
             .min_left(px(TASKS_TREE_MIN))
@@ -1275,6 +1291,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 task_id.clone(),
                                                 shell_id.clone(),
                                                 agent_id.clone(),
+                                                cx,
+                                            );
+                                        }
+                                        TaskListEvent::OpenZed { task_id, config_id } => {
+                                            this.handle_open_zed(
+                                                task_id.clone(),
+                                                config_id.clone(),
                                                 cx,
                                             );
                                         }

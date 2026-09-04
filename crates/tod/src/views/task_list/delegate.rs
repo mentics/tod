@@ -232,10 +232,12 @@ impl ListDelegate for TaskListDelegate {
                 },
             );
             let agents_menu_open = selected
-                && self
-                    .open_row_menu
-                    .as_ref()
-                    .is_some_and(|(kind, id)| kind == &RowMenuKind::Agents && id == &item.id);
+                && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
+                    matches!(
+                        kind,
+                        RowMenuKind::Agents | RowMenuKind::AgentsEdit | RowMenuKind::OpenCode
+                    ) && id == &item.id
+                });
             chips = chips.child(row_menu_anchor(
                 agents_chip,
                 agents_menu_open.then(|| self.row_menu.clone()).flatten(),

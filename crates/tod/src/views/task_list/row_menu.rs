@@ -13,6 +13,8 @@ use super::model::{AgentInfo, TaskItem};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowMenuKind {
     Agents,
+    AgentsEdit,
+    OpenCode,
     Shells,
     ShellAgentPick,
 }
@@ -47,6 +49,32 @@ impl TaskListView {
             self.close_row_menu(cx);
         } else {
             self.open_row_menu_for(RowMenuKind::Agents, task_id.to_string(), window, cx);
+        }
+    }
+
+    pub(super) fn toggle_agents_edit_menu(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::AgentsEdit, task_id.to_string())) {
+            self.close_row_menu(cx);
+        } else {
+            self.open_row_menu_for(RowMenuKind::AgentsEdit, task_id.to_string(), window, cx);
+        }
+    }
+
+    pub(super) fn toggle_open_code_menu(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::OpenCode, task_id.to_string())) {
+            self.close_row_menu(cx);
+        } else {
+            self.open_row_menu_for(RowMenuKind::OpenCode, task_id.to_string(), window, cx);
         }
     }
 
@@ -161,7 +189,43 @@ fn build_row_menu(
             let view = view.clone();
             let task_id = task.id.clone();
             menu.item(
-                PopupMenuItem::new("New agent config…").on_click(move |_, _, cx| {
+                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
+                    activate_agent_config(&view, &task_id, None, cx);
+                }),
+            )
+        }
+        RowMenuKind::AgentsEdit => {
+            for agent in &task.agents {
+                let view = view.clone();
+                let label = format!("Edit · {}", agent_menu_label(agent));
+                let task_id = task.id.clone();
+                let agent_id = agent.id.clone();
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    activate_agent_config(&view, &task_id, Some(agent_id.clone()), cx);
+                }));
+            }
+            let view = view.clone();
+            let task_id = task.id.clone();
+            menu.item(
+                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
+                    activate_agent_config(&view, &task_id, None, cx);
+                }),
+            )
+        }
+        RowMenuKind::OpenCode => {
+            for agent in &task.agents {
+                let view = view.clone();
+                let label = agent_menu_label(agent);
+                let task_id = task.id.clone();
+                let agent_id = agent.id.clone();
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    activate_open_zed(&view, &task_id, &agent_id, cx);
+                }));
+            }
+            let view = view.clone();
+            let task_id = task.id.clone();
+            menu.item(
+                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
                     activate_agent_config(&view, &task_id, None, cx);
                 }),
             )
@@ -196,7 +260,7 @@ fn build_row_menu(
             let view = view.clone();
             let task_id = task.id.clone();
             menu.item(
-                PopupMenuItem::new("New agent config…").on_click(move |_, _, cx| {
+                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
                     activate_agent_config(&view, &task_id, None, cx);
                 }),
             )
@@ -243,6 +307,21 @@ fn activate_agent_launch(
     });
 }
 
+fn activate_open_zed(
+    view: &gpui::WeakEntity<TaskListView>,
+    task_id: &str,
+    agent_id: &str,
+    cx: &mut App,
+) {
+    let Some(entity) = view.upgrade() else {
+        return;
+    };
+    entity.update(cx, |this, cx| {
+        this.close_row_menu(cx);
+        this.emit_open_zed(task_id, agent_id, cx);
+    });
+}
+
 fn activate_agent_config(
     view: &gpui::WeakEntity<TaskListView>,
     task_id: &str,
@@ -252,25 +331,9 @@ fn activate_agent_config(
     let Some(entity) = view.upgrade() else {
         return;
     };
-    let status_line = match &agent_id {
-        Some(id) => format!("Opened agent config {id}"),
-        None => "New agent config…".into(),
-    };
     entity.update(cx, |this, cx| {
         this.close_row_menu(cx);
-        if agent_id.is_none() {
-            if this.slide_edit_open {
-                cx.emit(TaskListEvent::CloseTaskEdit);
-            }
-            if this.obligations_open {
-                cx.emit(TaskListEvent::CloseObligations);
-            }
-        }
-        cx.emit(TaskListEvent::OpenAgentDetail {
-            task_id: task_id.to_string(),
-            agent_id,
-        });
-        this.set_status_message(status_line, cx);
+        this.emit_open_agent_config(task_id, agent_id.as_deref(), cx);
     });
 }
 
