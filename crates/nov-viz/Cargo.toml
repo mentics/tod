@@ -1,0 +1,22 @@
+[package]
+name = "nov-viz"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[dependencies]
+anyhow = "1"
+elkrs = "0.1"
+gpui-flow = { git = "https://github.com/pacifio/gpui-flow", rev = "cfa578758ee251657f15f281d893a08b85aedbff" }
+gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", package = "gpui_platform" }
+petgraph = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
