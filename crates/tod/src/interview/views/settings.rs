@@ -367,6 +367,7 @@ impl SettingsView {
         if !matches!(self.selected_field(), SettingField::TreehouseWorktreesRoot) {
             return;
         }
+        self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = true;
         cx.notify();
         let input = self.treehouse_worktrees_root_input.clone();
@@ -378,9 +379,10 @@ impl SettingsView {
     }
 
     fn enter_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_field().is_text_input() {
+        if !matches!(self.selected_field(), SettingField::TerminalProgram) {
             return;
         }
+        self.treehouse_worktrees_root_editing = false;
         self.terminal_program_editing = true;
         cx.notify();
         let input = self.terminal_program_input.clone();
@@ -1078,8 +1080,18 @@ fn text_input_row(
                 {
                     this.selected_field_index = index;
                 }
-                if !this.terminal_program_editing {
-                    this.enter_terminal_edit(window, cx);
+                match field {
+                    SettingField::TerminalProgram => {
+                        if !this.terminal_program_editing {
+                            this.enter_terminal_edit(window, cx);
+                        }
+                    }
+                    SettingField::TreehouseWorktreesRoot => {
+                        if !this.treehouse_worktrees_root_editing {
+                            this.enter_treehouse_worktrees_root_edit(window, cx);
+                        }
+                    }
+                    _ => {}
                 }
                 cx.notify();
             }),
