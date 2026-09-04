@@ -2,15 +2,15 @@
 
 use super::install::TodInstallPaths;
 use super::manifest::ProcessManifest;
-use tod_store::fleet::repos::agent_config::AgentConfigRepo;
-use tod_store::fleet::workspace_cwd_for_agent;
 use crate::interview::agent::DeepDiveContext;
 use crate::interview::config::base_interview_phase;
 use crate::interview::db::InterviewSession;
-use tod_store::outline::repos::NodeRepo;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use tod_store::fleet::repos::agent_config::AgentConfigRepo;
+use tod_store::fleet::workspace_cwd_for_agent;
+use tod_store::outline::repos::NodeRepo;
 use uuid::Uuid;
 
 /// Interview agent prompt split for session reuse.
@@ -424,12 +424,8 @@ pub fn build_fleet_agent_prompt(
     cwd: &Path,
 ) -> Result<String> {
     let base_path = manifest.state_base_doc();
-    let base = read_doc(&base_path).with_context(|| {
-        format!(
-            "read bundled state agent base doc {}",
-            base_path.display()
-        )
-    })?;
+    let base = read_doc(&base_path)
+        .with_context(|| format!("read bundled state agent base doc {}", base_path.display()))?;
     let state_body = manifest
         .state_doc(&task.lifecycle)
         .map(|path| read_doc(&path))

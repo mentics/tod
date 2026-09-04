@@ -16,7 +16,8 @@ pub struct AgentRun {
     pub run_kind: String,
 }
 
-const RUN_SELECT: &str = "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+const RUN_SELECT: &str =
+    "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
                     reconnect_pid, reconnect_birth_token, run_kind";
 
 #[derive(Debug, Error)]
@@ -88,6 +89,40 @@ impl<'a> AgentRunRepo<'a> {
             "{RUN_SELECT}
              FROM agent_runs
              WHERE agent_config_id = ?1 AND run_kind = 'interactive'
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![config_id], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_terminal_for_config(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1 AND run_kind = 'terminal'
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![config_id], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_auto_for_config(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1 AND run_kind = 'auto'
              ORDER BY run_number DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;

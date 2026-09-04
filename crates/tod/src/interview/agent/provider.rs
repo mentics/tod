@@ -1,7 +1,8 @@
-use tod_store::agent_traffic::InterviewAgentCounts;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::process_bundle::InterviewAgentPrompt;
 use std::path::PathBuf;
+use tod_store::AgentLaunchOptions;
+use tod_store::agent_traffic::InterviewAgentCounts;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,7 +51,7 @@ pub struct DeepDiveContext {
     pub question_body: String,
 }
 
-/// Swappable agent backend boundary (`--agent mock|cursor`).
+/// Swappable agent backend boundary (`--agent mock|cursor|claude`).
 pub trait AgentProvider {
     fn start_question_maker_replenishment(
         &mut self,
@@ -58,6 +59,7 @@ pub trait AgentProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &QuestionMakerSettings,
+        options: AgentLaunchOptions,
     ) -> anyhow::Result<AgentRunHandle>;
 
     fn start_answer_processor(
@@ -66,6 +68,7 @@ pub trait AgentProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
+        options: AgentLaunchOptions,
     ) -> anyhow::Result<AgentRunHandle>;
 
     fn start_deep_dive_chat(
@@ -74,6 +77,7 @@ pub trait AgentProvider {
         cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
+        options: AgentLaunchOptions,
     ) -> anyhow::Result<AgentRunHandle>;
 
     /// Start an autonomous fleet agent run for a saved agent config.
@@ -82,6 +86,7 @@ pub trait AgentProvider {
         agent_config_id: &str,
         cwd: PathBuf,
         prompt: String,
+        options: AgentLaunchOptions,
     ) -> anyhow::Result<AgentRunHandle>;
 
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState>;

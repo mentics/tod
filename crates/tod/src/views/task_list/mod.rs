@@ -55,6 +55,7 @@ actions!(
         TaskListClearTagFilter,
         TaskListRowAgents,
         TaskListRowShells,
+        TaskListForceAgentConfig,
         TaskListRowLifecycle,
         TaskListRowEdit,
         TaskListOpenEditPanel,
@@ -106,8 +107,10 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("s", TaskListSortToggle, context),
         KeyBinding::new("cmd-shift-t", TaskListClearTagFilter, context),
         KeyBinding::new("a", TaskListRowAgents, context),
+        KeyBinding::new("shift-a", TaskListForceAgentConfig, context),
         KeyBinding::new("l", TaskListRowLifecycle, context),
         KeyBinding::new("t", TaskListRowShells, context),
+        KeyBinding::new("shift-t", TaskListForceAgentConfig, context),
         KeyBinding::new("o", TaskListOpenObligations, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
@@ -180,6 +183,11 @@ pub enum TaskListEvent {
     OpenAgentDetail {
         task_id: String,
         agent_id: Option<String>,
+    },
+    /// Launch or focus an agent session for a resolved config (interactive or auto).
+    LaunchOrFocusAgent {
+        task_id: String,
+        config_id: String,
     },
     OpenShell {
         task_id: String,
@@ -755,19 +763,52 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let agent_count = self
-            .all_tasks
-            .iter()
-            .find(|t| t.id == task_id)
-            .map(|t| t.agents.len())
-            .unwrap_or(0);
-        let task_title = self
-            .all_tasks
-            .iter()
-            .find(|t| t.id == task_id)
-            .map(|t| t.title.clone())
-            .unwrap_or_default();
-        if agent_count == 0 {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        let task_title = task.title.clone();
+        match task.agents.len() {
+            0 => {
+                self.close_chrome_overlays(cx);
+                if self.slide_edit_open {
+                    cx.emit(TaskListEvent::CloseTaskEdit);
+                }
+                if self.obligations_open {
+                    cx.emit(TaskListEvent::CloseObligations);
+                }
+                cx.emit(TaskListEvent::OpenAgentDetail {
+                    task_id: task_id.to_string(),
+                    agent_id: None,
+                });
+                self.set_status_line(format!("Launch agent config for {task_title}"), cx);
+            }
+            1 => {
+                let config_id = task.agents[0].id.clone();
+                self.emit_launch_or_focus_agent(task_id, &config_id, cx);
+            }
+            _ => {
+                if self.open_row_menu.as_ref() == Some(&(RowMenuKind::Agents, task_id.to_string()))
+                {
+                    let config_id = task.agents[0].id.clone();
+                    self.close_row_menu(cx);
+                    self.emit_launch_or_focus_agent(task_id, &config_id, cx);
+                } else {
+                    self.toggle_agents_menu(task_id, window, cx);
+                }
+            }
+        }
+    }
+
+    fn handle_shells_control(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        if task.agents.is_empty() {
             self.close_chrome_overlays(cx);
             if self.slide_edit_open {
                 cx.emit(TaskListEvent::CloseTaskEdit);
@@ -779,34 +820,96 @@ impl TaskListView {
                 task_id: task_id.to_string(),
                 agent_id: None,
             });
-            self.set_status_line(format!("Launch agent config for {task_title}"), cx);
-        } else {
-            self.toggle_agents_menu(task_id, window, cx);
+            self.set_status_line(
+                format!(
+                    "Create agent config before opening a shell for {}",
+                    task.title
+                ),
+                cx,
+            );
+            return;
+        }
+        if !task.shells.is_empty() {
+            if task.shells.len() == 1 {
+                cx.emit(TaskListEvent::OpenShell {
+                    task_id: task_id.to_string(),
+                    shell_id: Some(task.shells[0].id.clone()),
+                    agent_id: None,
+                });
+                return;
+            }
+            if self.open_row_menu.as_ref() == Some(&(RowMenuKind::Shells, task_id.to_string())) {
+                let shell_id = task.shells[0].id.clone();
+                self.close_row_menu(cx);
+                cx.emit(TaskListEvent::OpenShell {
+                    task_id: task_id.to_string(),
+                    shell_id: Some(shell_id),
+                    agent_id: None,
+                });
+                return;
+            }
+            self.toggle_shells_menu(task_id, window, cx);
+            return;
+        }
+        match task.agents.len() {
+            1 => {
+                cx.emit(TaskListEvent::OpenShell {
+                    task_id: task_id.to_string(),
+                    shell_id: None,
+                    agent_id: Some(task.agents[0].id.clone()),
+                });
+            }
+            _ => {
+                if self.open_row_menu.as_ref()
+                    == Some(&(RowMenuKind::ShellAgentPick, task_id.to_string()))
+                {
+                    let config_id = task.agents[0].id.clone();
+                    self.close_row_menu(cx);
+                    cx.emit(TaskListEvent::OpenShell {
+                        task_id: task_id.to_string(),
+                        shell_id: None,
+                        agent_id: Some(config_id),
+                    });
+                } else {
+                    self.toggle_shell_agent_picker(task_id, window, cx);
+                }
+            }
         }
     }
 
-    fn handle_shells_control(
+    fn handle_force_agent_config(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let task_title = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        self.close_chrome_overlays(cx);
+        if self.slide_edit_open {
+            cx.emit(TaskListEvent::CloseTaskEdit);
+        }
+        if self.obligations_open {
+            cx.emit(TaskListEvent::CloseObligations);
+        }
+        cx.emit(TaskListEvent::OpenAgentDetail {
+            task_id: task_id.to_string(),
+            agent_id: None,
+        });
+        self.set_status_line(format!("New agent config for {task_title}"), cx);
+    }
+
+    fn emit_launch_or_focus_agent(
         &mut self,
         task_id: &str,
-        window: &mut Window,
+        config_id: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
-            return;
-        };
-        if task.shells.is_empty() {
-            if task.agents.len() > 1 {
-                self.toggle_shell_agent_picker(task_id, window, cx);
-                return;
-            }
-            cx.emit(TaskListEvent::OpenShell {
-                task_id: task_id.to_string(),
-                shell_id: None,
-                agent_id: None,
-            });
-        } else {
-            self.toggle_shells_menu(task_id, window, cx);
-        }
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::LaunchOrFocusAgent {
+            task_id: task_id.to_string(),
+            config_id: config_id.to_string(),
+        });
+        self.set_status_line(format!("Launching agent {config_id}"), cx);
     }
 
     fn dismiss_compose_for_row_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1387,6 +1490,24 @@ impl TaskListView {
             return;
         };
         self.handle_row_action(RowAction::AgentsControl { task_id }, window, cx);
+    }
+
+    fn on_force_agent_config(
+        &mut self,
+        _: &TaskListForceAgentConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        let _ = window;
+        self.handle_force_agent_config(&task_id, cx);
     }
 
     fn on_row_shells(
@@ -2087,6 +2208,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_sort_toggle))
             .on_action(cx.listener(Self::on_clear_tag_filter))
             .on_action(cx.listener(Self::on_row_agents))
+            .on_action(cx.listener(Self::on_force_agent_config))
             .on_action(cx.listener(Self::on_row_lifecycle))
             .on_action(cx.listener(Self::on_row_shells))
             .on_action(cx.listener(Self::on_row_edit))

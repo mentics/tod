@@ -198,13 +198,16 @@ impl QuestionMakerPoolManager {
         settings: QuestionMakerSettings,
         prompt: InterviewAgentPrompt,
     ) -> Result<(QuestionMakerSubmitAssignment, RunId), String> {
-        let pool = self.pools.entry(agent_config_id).or_insert_with(|| QuestionMakerPool {
-            settings: settings.clone(),
-            slots: Vec::new(),
-            queue: VecDeque::new(),
-            runs: HashMap::new(),
-            next_slot_id: 0,
-        });
+        let pool = self
+            .pools
+            .entry(agent_config_id)
+            .or_insert_with(|| QuestionMakerPool {
+                settings: settings.clone(),
+                slots: Vec::new(),
+                queue: VecDeque::new(),
+                runs: HashMap::new(),
+                next_slot_id: 0,
+            });
         pool.settings = settings;
         let run_id = RunId::new();
         let assignment = pool.submit(run_id, prompt)?;

@@ -1,8 +1,12 @@
 //! Agent config repository — persistent environment configuration per task.
 
+use crate::agent_launch::{
+    AgentLaunchOptions, DEFAULT_EFFORT, default_model_for, parse_platform, platform_storage,
+};
 use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::fleet::repos::agent_run::AgentRunRepo;
 use crate::outline::uuid_blob::{blob_to_uuid, uuid_to_blob};
+use crate::settings::AgentPlatform;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
@@ -21,6 +25,9 @@ pub struct AgentConfig {
     pub worktree_path: Option<String>,
     pub worktree_lease_id: Option<String>,
     pub worktree_lease_holder: Option<String>,
+    pub platform: String,
+    pub model: String,
+    pub effort: String,
 }
 
 /// Config plus runtime status from the latest agent run (for list/display).
@@ -35,9 +42,23 @@ pub struct AgentConfigRow {
     pub worktree_path: Option<String>,
     pub worktree_lease_id: Option<String>,
     pub worktree_lease_holder: Option<String>,
+    pub platform: String,
+    pub model: String,
+    pub effort: String,
     pub runtime_status: String,
     pub active_run_id: Option<String>,
     pub reconnect: Option<ReconnectIdentity>,
+}
+
+impl AgentConfigRow {
+    pub fn launch_options(&self) -> AgentLaunchOptions {
+        let platform = parse_platform(&self.platform).unwrap_or(AgentPlatform::Claude);
+        AgentLaunchOptions {
+            platform,
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
 }
 
 /// Back-compat alias used across fleet runtime and views.
@@ -51,6 +72,24 @@ pub struct NewAgentConfig {
     pub mode: String,
     pub work_directory: Option<String>,
     pub use_worktree: bool,
+    #[serde(default = "default_new_platform")]
+    pub platform: String,
+    #[serde(default = "default_new_model")]
+    pub model: String,
+    #[serde(default = "default_new_effort")]
+    pub effort: String,
+}
+
+fn default_new_platform() -> String {
+    platform_storage(AgentPlatform::Claude).to_string()
+}
+
+fn default_new_model() -> String {
+    default_model_for(AgentPlatform::Claude).to_string()
+}
+
+fn default_new_effort() -> String {
+    DEFAULT_EFFORT.to_string()
 }
 
 /// Back-compat alias for writer mutations.
@@ -93,7 +132,7 @@ impl<'a> AgentConfigRepo<'a> {
 
     const SELECT_ROW: &'static str = "
         SELECT c.id, c.node_id, c.env_type, c.mode, c.work_directory, c.use_worktree, c.worktree_path,
-               c.worktree_lease_id, c.worktree_lease_holder,
+               c.worktree_lease_id, c.worktree_lease_holder, c.platform, c.model, c.effort,
                COALESCE(r.runtime_status, 'not_running'), r.id, r.reconnect_pid, r.reconnect_birth_token
         FROM agent_configs c
         LEFT JOIN agent_runs r ON r.id = (
@@ -111,8 +150,9 @@ impl<'a> AgentConfigRepo<'a> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO agent_configs (id, node_id, env_type, mode, work_directory, use_worktree, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO agent_configs
+             (id, node_id, env_type, mode, work_directory, use_worktree, created_at, platform, model, effort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 config.id,
                 node_blob,
@@ -121,6 +161,9 @@ impl<'a> AgentConfigRepo<'a> {
                 config.work_directory,
                 i32::from(config.use_worktree),
                 now_ms,
+                config.platform,
+                config.model,
+                config.effort,
             ],
         )?;
         Ok(())
@@ -133,11 +176,24 @@ impl<'a> AgentConfigRepo<'a> {
         mode: &str,
         work_directory: Option<&str>,
         use_worktree: bool,
+        platform: &str,
+        model: &str,
+        effort: &str,
     ) -> Result<(), AgentConfigRepoError> {
         let updated = self.conn.execute(
-            "UPDATE agent_configs SET env_type = ?2, mode = ?3, work_directory = ?4, use_worktree = ?5
+            "UPDATE agent_configs SET env_type = ?2, mode = ?3, work_directory = ?4, use_worktree = ?5,
+             platform = ?6, model = ?7, effort = ?8
              WHERE id = ?1",
-            params![id, env_type, mode, work_directory, i32::from(use_worktree)],
+            params![
+                id,
+                env_type,
+                mode,
+                work_directory,
+                i32::from(use_worktree),
+                platform,
+                model,
+                effort
+            ],
         )?;
         if updated == 0 {
             return Err(AgentConfigRepoError::NotFound);
@@ -270,7 +326,7 @@ impl<'a> AgentConfigRepo<'a> {
         self.conn
             .query_row(
                 "SELECT id, node_id, env_type, mode, work_directory, use_worktree, worktree_path,
-                        worktree_lease_id, worktree_lease_holder
+                        worktree_lease_id, worktree_lease_holder, platform, model, effort
                  FROM agent_configs WHERE id = ?1",
                 params![id],
                 row_to_config,
@@ -383,6 +439,9 @@ fn row_to_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfig> {
         worktree_path: row.get(6)?,
         worktree_lease_id: row.get(7)?,
         worktree_lease_holder: row.get(8)?,
+        platform: row.get(9)?,
+        model: row.get(10)?,
+        effort: row.get(11)?,
     })
 }
 
@@ -392,8 +451,8 @@ fn row_to_config_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfigRow
         .map(|u| u.to_string())
         .unwrap_or_default();
     let use_worktree: i32 = row.get(5)?;
-    let pid: Option<i64> = row.get(11)?;
-    let birth: Option<i64> = row.get(12)?;
+    let pid: Option<i64> = row.get(14)?;
+    let birth: Option<i64> = row.get(15)?;
     let reconnect = match (pid, birth) {
         (Some(pid), Some(birth)) => Some(ReconnectIdentity {
             pid: pid as u32,
@@ -411,8 +470,11 @@ fn row_to_config_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfigRow
         worktree_path: row.get(6)?,
         worktree_lease_id: row.get(7)?,
         worktree_lease_holder: row.get(8)?,
-        runtime_status: row.get(9)?,
-        active_run_id: row.get(10)?,
+        platform: row.get(9)?,
+        model: row.get(10)?,
+        effort: row.get(11)?,
+        runtime_status: row.get(12)?,
+        active_run_id: row.get(13)?,
         reconnect,
     })
 }
@@ -440,6 +502,9 @@ mod tests {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             })
             .unwrap();
         (task_id, config_id)
@@ -454,6 +519,38 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.runtime_status, "not_running");
+        assert_eq!(row.platform, "claude");
+        assert_eq!(row.model, "default");
+        assert_eq!(row.effort, "auto");
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn update_fields_persists_launch_options() {
+        let (dir, conn) = test_writer_conn();
+        let (_, config_id) = seed_node_config(&conn);
+        AgentConfigRepo::new(&conn)
+            .update_fields(
+                &config_id,
+                "local",
+                "shell",
+                None,
+                true,
+                "cursor",
+                "composer-2.5",
+                "high",
+            )
+            .unwrap();
+        let row = AgentConfigRepo::new(&conn)
+            .get(&config_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.platform, "cursor");
+        assert_eq!(row.model, "composer-2.5");
+        assert_eq!(row.effort, "high");
+        let opts = row.launch_options();
+        assert_eq!(opts.platform, AgentPlatform::Cursor);
+        assert_eq!(opts.model, "composer-2.5");
         cleanup_test_dir(&dir);
     }
 

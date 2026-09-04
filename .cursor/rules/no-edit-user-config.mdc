@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+Do not modify the file $APPDATA/tod/install.toml . Pass in the --data-root command line argument to set a different data root.

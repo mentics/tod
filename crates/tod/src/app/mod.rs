@@ -4,7 +4,6 @@ mod fleet_blocked;
 mod history_window;
 mod interactive_agent_window;
 mod no_focus;
-pub mod shell_socket;
 pub mod transcript_window;
 pub mod window;
 

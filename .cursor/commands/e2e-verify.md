@@ -1,0 +1,1 @@
+Launch a subagent that runs the app and drives it with the socket API to verify that the functionality in this context is behaving exactly as expected. Specify a random port for the socket API to avoid conflicts with other instances. If you find any issues, then iteratively launch subagents to fix and verify until it works correctly.

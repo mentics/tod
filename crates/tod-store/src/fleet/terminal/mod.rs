@@ -2,22 +2,24 @@
 
 mod focus;
 mod init;
-mod path_util;
+pub(crate) mod path_util;
 mod state;
 
 use crate::fleet::reconnect_identity::{self};
+use crate::fleet::repos::agent_run::AgentRun;
 use crate::fleet::repos::shell::ShellSession;
 use crate::fleet::{FleetMutation, FleetStore, resolve_agent_workspace};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
 use anyhow::{Context, Result, bail};
 use focus::focus_shell_terminal;
+#[cfg(any(unix, test))]
+use init::posix_launch_command;
 #[cfg(windows)]
 use init::windows_launch_args;
-use init::{
-    ShellInitAssets, ensure_shell_init_assets, msys_path, posix_launch_command,
-    write_session_init_script,
-};
+use init::{ShellInitAssets, ensure_shell_init_assets};
+#[cfg(windows)]
+use init::{msys_path, write_session_init_script};
 use path_util::normalize_launch_path;
 use state::wait_for_shell_state;
 pub use state::{
@@ -31,11 +33,15 @@ use std::process::{Command, Stdio};
 ///
 /// The shell sources a bootstrap script that records the live shell PID in
 /// `state_dir/{shell_id}.json` for focus and liveness checks.
+///
+/// When `startup_command` is set, the shell runs that command after bootstrap
+/// (without `exec`), so the session remains if the command exits.
 pub fn launch_shell_terminal(
     cwd: &Path,
     settings: &TerminalSettings,
     shell_id: &str,
     assets: &ShellInitAssets,
+    startup_command: Option<&str>,
 ) -> Result<()> {
     let cwd = normalize_launch_path(cwd);
     if !cwd.is_dir() {
@@ -56,34 +62,54 @@ pub fn launch_shell_terminal(
         .map(str::trim);
 
     if let Some(program) = program {
-        return spawn_custom(program, &cwd, shell_id, &launch_assets);
+        return spawn_custom(program, &cwd, shell_id, &launch_assets, startup_command);
     }
 
     #[cfg(windows)]
     {
-        return spawn_windows_default(&cwd, shell_id, &launch_assets);
+        return spawn_windows_default(&cwd, shell_id, &launch_assets, startup_command);
     }
     #[cfg(target_os = "macos")]
     {
-        return spawn_macos_default(&cwd, shell_id, &launch_assets);
+        return spawn_macos_default(&cwd, shell_id, &launch_assets, startup_command);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        return spawn_linux_default(&cwd, shell_id, &launch_assets);
+        return spawn_linux_default(&cwd, shell_id, &launch_assets, startup_command);
     }
 }
 
-fn spawn_custom(program: &str, cwd: &Path, shell_id: &str, assets: &ShellInitAssets) -> Result<()> {
+fn spawn_custom(
+    program: &str,
+    cwd: &Path,
+    shell_id: &str,
+    assets: &ShellInitAssets,
+    startup_command: Option<&str>,
+) -> Result<()> {
     #[cfg(windows)]
     {
         if is_git_bash(program) {
-            return spawn_git_bash(program, &cwd, shell_id, assets, "git_bash");
+            return spawn_git_bash(program, &cwd, shell_id, assets, "git_bash", startup_command);
         }
         if is_windows_terminal(program) {
-            return spawn_windows_terminal(program, cwd, shell_id, assets, "windows_terminal");
+            return spawn_windows_terminal(
+                program,
+                cwd,
+                shell_id,
+                assets,
+                "windows_terminal",
+                startup_command,
+            );
         }
         if is_powershell(program) {
-            return spawn_powershell(program, cwd, shell_id, assets, "powershell");
+            return spawn_powershell(
+                program,
+                cwd,
+                shell_id,
+                assets,
+                "powershell",
+                startup_command,
+            );
         }
     }
 
@@ -95,6 +121,7 @@ fn spawn_custom(program: &str, cwd: &Path, shell_id: &str, assets: &ShellInitAss
             &assets.state_dir,
             cwd,
             "posix",
+            startup_command,
         );
         return Command::new(program)
             .current_dir(cwd)
@@ -105,6 +132,7 @@ fn spawn_custom(program: &str, cwd: &Path, shell_id: &str, assets: &ShellInitAss
     }
     #[cfg(not(unix))]
     {
+        let _ = startup_command;
         bail!(
             "custom terminal program `{program}` is not supported on this platform; \
              use wt.exe, powershell.exe, or git-bash.exe"
@@ -156,6 +184,7 @@ fn spawn_git_bash(
     shell_id: &str,
     assets: &ShellInitAssets,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> Result<()> {
     let session_init = write_session_init_script(
         &assets.posix_init,
@@ -163,6 +192,7 @@ fn spawn_git_bash(
         shell_id,
         cwd,
         backend,
+        startup_command,
     )?;
     let session_init = msys_path(&session_init);
     let git_root = Path::new(program)
@@ -235,6 +265,7 @@ fn spawn_windows_terminal(
     shell_id: &str,
     assets: &ShellInitAssets,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> Result<()> {
     let mut args = vec![
         "-w".into(),
@@ -249,6 +280,7 @@ fn spawn_windows_terminal(
         shell_id,
         &assets.state_dir,
         cwd,
+        startup_command,
     ));
     Command::new(program)
         .env("TOD_TERMINAL_BACKEND", backend)
@@ -265,6 +297,7 @@ fn spawn_powershell(
     shell_id: &str,
     assets: &ShellInitAssets,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> Result<()> {
     let mut command = Command::new(program);
     command.current_dir(cwd);
@@ -274,6 +307,7 @@ fn spawn_powershell(
         shell_id,
         &assets.state_dir,
         cwd,
+        startup_command,
     ));
     command
         .spawn()
@@ -282,19 +316,53 @@ fn spawn_powershell(
 }
 
 #[cfg(windows)]
-fn spawn_windows_default(cwd: &Path, shell_id: &str, assets: &ShellInitAssets) -> Result<()> {
+fn spawn_windows_default(
+    cwd: &Path,
+    shell_id: &str,
+    assets: &ShellInitAssets,
+    startup_command: Option<&str>,
+) -> Result<()> {
     if command_available("wt.exe") {
-        return spawn_windows_terminal("wt.exe", cwd, shell_id, assets, "windows_terminal");
+        match spawn_windows_terminal(
+            "wt.exe",
+            cwd,
+            shell_id,
+            assets,
+            "windows_terminal",
+            startup_command,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // WindowsApps execution aliases for wt.exe often fail with os error 1920
+                // (ERROR_CANT_RESOLVE_FILENAME) when spawned via CreateProcess.
+                tracing::warn!(
+                    error = %err,
+                    "wt.exe spawn failed; falling back to PowerShell"
+                );
+            }
+        }
     }
-    spawn_powershell("powershell.exe", cwd, shell_id, assets, "powershell")
+    spawn_powershell(
+        "powershell.exe",
+        cwd,
+        shell_id,
+        assets,
+        "powershell",
+        startup_command,
+    )
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_macos_default(cwd: &Path, shell_id: &str, assets: &ShellInitAssets) -> Result<()> {
+fn spawn_macos_default(
+    cwd: &Path,
+    shell_id: &str,
+    assets: &ShellInitAssets,
+    startup_command: Option<&str>,
+) -> Result<()> {
     if command_available("iTerm.app") || Path::new("/Applications/iTerm.app").exists() {
-        return spawn_macos_terminal(cwd, shell_id, assets, "iterm");
+        return spawn_macos_terminal(cwd, shell_id, assets, "iterm", startup_command);
     }
-    spawn_macos_terminal(cwd, shell_id, assets, "macos_terminal")
+    spawn_macos_terminal(cwd, shell_id, assets, "macos_terminal", startup_command)
 }
 
 #[cfg(target_os = "macos")]
@@ -303,6 +371,7 @@ fn spawn_macos_terminal(
     shell_id: &str,
     assets: &ShellInitAssets,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> Result<()> {
     let launch_cmd = posix_launch_command(
         &assets.posix_init,
@@ -310,6 +379,7 @@ fn spawn_macos_terminal(
         &assets.state_dir,
         cwd,
         backend,
+        startup_command,
     );
     let escaped_cmd = escape_applescript(&launch_cmd);
     let script = if backend == "iterm" {
@@ -352,13 +422,19 @@ fn escape_applescript(s: &str) -> String {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn spawn_linux_default(cwd: &Path, shell_id: &str, assets: &ShellInitAssets) -> Result<()> {
+fn spawn_linux_default(
+    cwd: &Path,
+    shell_id: &str,
+    assets: &ShellInitAssets,
+    startup_command: Option<&str>,
+) -> Result<()> {
     let cmd = posix_launch_command(
         &assets.posix_init,
         shell_id,
         &assets.state_dir,
         cwd,
         "posix",
+        startup_command,
     );
     for candidate in [
         "x-terminal-emulator",
@@ -512,6 +588,66 @@ pub fn prune_stale_shell_sessions(
     Ok(removed)
 }
 
+fn tracked_session_alive(
+    paths: &TodPaths,
+    session_id: &str,
+    reconnect: Option<&reconnect_identity::ReconnectIdentity>,
+) -> bool {
+    if let Some(state) = shell_state_for_session(paths, session_id) {
+        if let Some(id) = reconnect_identity::record(state.pid) {
+            if reconnect_identity::verify(id.pid, id.birth_token) {
+                return true;
+            }
+        }
+        if reconnect_identity::pid_exists(state.pid) {
+            return true;
+        }
+    }
+    if let Some(id) = reconnect {
+        if reconnect_identity::verify(id.pid, id.birth_token) {
+            return true;
+        }
+    }
+    false
+}
+
+fn terminal_agent_is_alive(paths: &TodPaths, run: &AgentRun) -> bool {
+    tracked_session_alive(paths, &run.id, run.reconnect.as_ref())
+}
+
+/// End terminal agent runs whose OS process is gone; clear reconnect + state files.
+pub fn prune_stale_terminal_agent_runs(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    config_id: &str,
+) -> Result<usize> {
+    let runs = fleet.list_terminal_agent_runs_for_config(config_id)?;
+    let mut removed = 0usize;
+    for run in runs {
+        if run.ended_at.is_some() || run.runtime_status == "not_running" {
+            continue;
+        }
+        if terminal_agent_is_alive(paths, &run) {
+            continue;
+        }
+        fleet.enqueue(FleetMutation::ClearAgentRunReconnect {
+            run_id: run.id.clone(),
+        })?;
+        fleet.enqueue(FleetMutation::EndAgentRun {
+            run_id: run.id.clone(),
+        })?;
+        remove_shell_state(paths, &run.id);
+        removed += 1;
+    }
+    if removed > 0 {
+        fleet
+            .writer()
+            .flush()
+            .context("persist terminal agent pruning")?;
+    }
+    Ok(removed)
+}
+
 /// Open a shell session: resolve workspace, spawn terminal, persist session row.
 pub fn open_shell_for_agent_config(
     fleet: &FleetStore,
@@ -520,14 +656,26 @@ pub fn open_shell_for_agent_config(
     config_id: &str,
     node_id: &str,
 ) -> Result<(String, PathBuf)> {
+    open_shell_with_command(fleet, paths, settings, config_id, node_id, None)
+}
+
+/// Open a shell session and optionally run `startup_command` after bootstrap.
+pub fn open_shell_with_command(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    config_id: &str,
+    _node_id: &str,
+    startup_command: Option<&str>,
+) -> Result<(String, PathBuf)> {
     let agent = fleet
         .get_agent(config_id)?
         .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent, node_id)?;
+    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
     let shell_id = uuid::Uuid::new_v4().to_string();
-    launch_shell_terminal(&cwd, &terminal, &shell_id, &assets)?;
+    launch_shell_terminal(&cwd, &terminal, &shell_id, &assets, startup_command)?;
     let state_dir = normalize_launch_path(&assets.state_dir);
     let state = wait_for_shell_state(&state_dir, &shell_id)?;
     let reconnect = reconnect_identity::record(state.pid);
@@ -538,6 +686,117 @@ pub fn open_shell_for_agent_config(
     })?;
     fleet.writer().flush().context("persist shell session")?;
     Ok((shell_id, cwd))
+}
+
+/// Launch the agent CLI in an OS terminal, tracked as a `terminal` agent run (not a shell).
+///
+/// Uses the agent run id as the terminal state-file key for PID focus/liveness.
+pub fn open_terminal_agent_for_config(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    config_id: &str,
+    startup_command: &str,
+) -> Result<(String, PathBuf)> {
+    let agent = fleet
+        .get_agent(config_id)?
+        .with_context(|| format!("agent config {config_id} not found"))?;
+    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+
+    fleet.enqueue(FleetMutation::CreateAgentRun {
+        config_id: config_id.to_string(),
+        run_kind: Some("terminal".into()),
+    })?;
+    fleet
+        .writer()
+        .flush()
+        .context("persist terminal agent run")?;
+    let _ = fleet.reload_if_stale();
+
+    let run_id = fleet
+        .list_terminal_agent_runs_for_config(config_id)?
+        .into_iter()
+        .next()
+        .map(|run| run.id)
+        .with_context(|| format!("terminal agent run not created for {config_id}"))?;
+
+    let terminal = fresh_terminal_settings(paths, &settings.terminal);
+    let assets = ensure_shell_init_assets(paths)?;
+    if let Err(err) =
+        launch_shell_terminal(&cwd, &terminal, &run_id, &assets, Some(startup_command))
+    {
+        let _ = fleet.enqueue(FleetMutation::EndAgentRun {
+            run_id: run_id.clone(),
+        });
+        let _ = fleet.writer().flush();
+        return Err(err);
+    }
+
+    let state_dir = normalize_launch_path(&assets.state_dir);
+    let state = match wait_for_shell_state(&state_dir, &run_id) {
+        Ok(state) => state,
+        Err(err) => {
+            let _ = fleet.enqueue(FleetMutation::EndAgentRun {
+                run_id: run_id.clone(),
+            });
+            let _ = fleet.writer().flush();
+            return Err(err);
+        }
+    };
+    let reconnect = reconnect_identity::record(state.pid)
+        .with_context(|| format!("record reconnect identity for terminal agent {run_id}"))?;
+
+    fleet.enqueue(FleetMutation::UpdateAgentRunReconnect {
+        run_id: run_id.clone(),
+        identity: reconnect,
+    })?;
+    fleet.enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
+        run_id: run_id.clone(),
+        runtime_status: "processing".into(),
+    })?;
+    fleet
+        .writer()
+        .flush()
+        .context("persist terminal agent reconnect")?;
+    Ok((run_id, cwd))
+}
+
+/// Focus a terminal agent window, or relaunch the CLI when the process is gone.
+pub fn focus_terminal_agent_run(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    config_id: &str,
+    run: &AgentRun,
+    startup_command: &str,
+) -> Result<PathBuf> {
+    let agent = fleet
+        .get_agent(config_id)?
+        .with_context(|| format!("agent config {config_id} not found"))?;
+    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+
+    if terminal_agent_is_alive(paths, run) {
+        if let Some(state) = shell_state_for_session(paths, &run.id) {
+            focus_shell_terminal(&state).context("focus existing terminal agent")?;
+        }
+        return Ok(cwd);
+    }
+
+    remove_shell_state(paths, &run.id);
+    fleet.enqueue(FleetMutation::ClearAgentRunReconnect {
+        run_id: run.id.clone(),
+    })?;
+    fleet.enqueue(FleetMutation::EndAgentRun {
+        run_id: run.id.clone(),
+    })?;
+    fleet
+        .writer()
+        .flush()
+        .context("end stale terminal agent run")?;
+
+    let (_, new_cwd) =
+        open_terminal_agent_for_config(fleet, paths, settings, config_id, startup_command)?;
+    Ok(new_cwd)
 }
 
 /// Focus an existing shell terminal, or open a new one when the process is gone.
@@ -552,7 +811,7 @@ pub fn focus_shell_session(
     let agent = fleet
         .get_agent(config_id)?
         .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent, node_id)?;
+    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
 
     if shell_is_alive(paths, shell) {
         if let Some(state) = shell_state_for_session(paths, &shell.id) {
@@ -598,9 +857,23 @@ mod tests {
             Path::new("/tmp/state"),
             Path::new("/tmp/work space"),
             "macos_terminal",
+            None,
         );
         assert!(cmd.contains("'/tmp/work space'"));
         assert!(cmd.contains("TOD_TERMINAL_BACKEND=macos_terminal"));
+    }
+
+    #[test]
+    fn posix_launch_command_appends_startup() {
+        let cmd = posix_launch_command(
+            Path::new("/tmp/init.sh"),
+            "shell-id",
+            Path::new("/tmp/state"),
+            Path::new("/tmp/cwd"),
+            "posix",
+            Some("claude"),
+        );
+        assert!(cmd.ends_with("; claude") || cmd.contains("; claude"));
     }
 
     #[cfg(windows)]
@@ -622,7 +895,7 @@ mod tests {
             ..TerminalSettings::default()
         };
 
-        launch_shell_terminal(&cwd, &settings, &shell_id, &assets).unwrap();
+        launch_shell_terminal(&cwd, &settings, &shell_id, &assets, None).unwrap();
         let state_dir = normalize_launch_path(&assets.state_dir);
         let state = wait_for_shell_state(&state_dir, &shell_id).unwrap();
         assert!(state.pid > 0, "expected mintty pid in shell state");
@@ -677,6 +950,9 @@ mod tests {
                     mode: "shell".into(),
                     work_directory: Some(cwd.display().to_string()),
                     use_worktree: false,
+                    platform: "claude".into(),
+                    model: "default".into(),
+                    effort: "auto".into(),
                 },
             })
             .unwrap();

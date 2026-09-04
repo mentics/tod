@@ -1,8 +1,6 @@
 //! Command history window — view and undo recent mutations.
 
 use crate::app::HistoryWindowControl;
-use tod_store::fleet::FleetStore;
-use tod_store::fleet::command_log::CommandEntry;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::selectable_text::selectable_text;
@@ -15,6 +13,8 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
+use tod_store::fleet::FleetStore;
+use tod_store::fleet::command_log::CommandEntry;
 
 const HISTORY_CONTEXT: &str = "CommandHistory";
 

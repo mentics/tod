@@ -82,7 +82,11 @@ impl InterviewPool {
     }
 
     /// Register a new answer-processor run.
-    fn submit(&mut self, run_id: RunId, prompt: InterviewAgentPrompt) -> Result<AnswerSubmitAssignment, String> {
+    fn submit(
+        &mut self,
+        run_id: RunId,
+        prompt: InterviewAgentPrompt,
+    ) -> Result<AnswerSubmitAssignment, String> {
         if let Some(idx) = self.find_idle_slot() {
             self.runs.insert(run_id, AgentRunState::InFlight);
             self.slots[idx].busy = true;
@@ -171,11 +175,7 @@ impl InterviewPool {
             let slot_id = self.slots[slot_idx].slot_id;
             let responses_received = self.slots[slot_idx].responses_received;
             self.runs.insert(job.run_id, AgentRunState::InFlight);
-            dispatched.push((
-                slot_id,
-                job.run_id,
-                job.prompt.for_slot(responses_received),
-            ));
+            dispatched.push((slot_id, job.run_id, job.prompt.for_slot(responses_received)));
         }
         dispatched
     }
@@ -225,13 +225,16 @@ impl AnswerProcessorPoolManager {
         settings: AnswerProcessorSettings,
         prompt: InterviewAgentPrompt,
     ) -> Result<(AnswerSubmitAssignment, RunId), String> {
-        let pool = self.pools.entry(agent_config_id).or_insert_with(|| InterviewPool {
-            settings: settings.clone(),
-            slots: Vec::new(),
-            queue: VecDeque::new(),
-            runs: HashMap::new(),
-            next_slot_id: 0,
-        });
+        let pool = self
+            .pools
+            .entry(agent_config_id)
+            .or_insert_with(|| InterviewPool {
+                settings: settings.clone(),
+                slots: Vec::new(),
+                queue: VecDeque::new(),
+                runs: HashMap::new(),
+                next_slot_id: 0,
+            });
         pool.settings = settings;
         let run_id = RunId::new();
         let assignment = pool.submit(run_id, prompt)?;
@@ -328,10 +331,14 @@ mod tests {
         };
 
         let (a0, r0) = mgr
-            .submit(agent.clone(), settings.clone(), InterviewAgentPrompt {
-                session_prefix: "prefix".into(),
-                turn: "p0".into(),
-            })
+            .submit(
+                agent.clone(),
+                settings.clone(),
+                InterviewAgentPrompt {
+                    session_prefix: "prefix".into(),
+                    turn: "p0".into(),
+                },
+            )
             .unwrap();
         let slot0 = match a0 {
             AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,
@@ -388,10 +395,14 @@ mod tests {
         };
 
         let (a0, r0) = mgr
-            .submit(agent.clone(), settings.clone(), InterviewAgentPrompt {
-                session_prefix: "prefix".into(),
-                turn: "p0".into(),
-            })
+            .submit(
+                agent.clone(),
+                settings.clone(),
+                InterviewAgentPrompt {
+                    session_prefix: "prefix".into(),
+                    turn: "p0".into(),
+                },
+            )
             .unwrap();
         let slot0 = match a0 {
             AnswerSubmitAssignment::Dispatch { slot_id, .. } => slot_id,

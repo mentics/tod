@@ -788,9 +788,8 @@ impl SessionsView {
         };
         let prompt = ctx.prompt;
         let cwd = workspace_cwd;
-        let question_maker_settings = TodSettings::load(&self.paths)
-            .unwrap_or_default()
-            .question_maker;
+        let question_maker_settings = settings.question_maker.clone();
+        let launch_options = settings.interview_launch_options();
         let agent = self.agent.clone();
         let bootstrap_gate = self.bootstrap_gate.clone();
         let bootstrap_sessions = self.bootstrap_sessions.clone();
@@ -850,6 +849,7 @@ impl SessionsView {
                     cwd,
                     prompt,
                     &question_maker_settings,
+                    launch_options,
                 )
             };
             let Ok(handle) = handle else {

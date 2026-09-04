@@ -1,13 +1,13 @@
 //! Single-instance agent transcript window — open, focus, close.
 
-use tod_store::agent_traffic::SharedAgentTrafficLog;
-use tod_store::fleet::FleetStore;
 use crate::views::agent_transcripts::AgentTranscriptsView;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_component::{Root, TitleBar};
 use std::sync::{Arc, Mutex};
+use tod_store::agent_traffic::SharedAgentTrafficLog;
+use tod_store::fleet::FleetStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptWindowStatus {

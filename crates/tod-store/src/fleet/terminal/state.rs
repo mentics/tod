@@ -36,12 +36,7 @@ pub fn remove_shell_state(paths: &TodPaths, shell_id: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-pub fn write_shell_state(
-    state_dir: &Path,
-    shell_id: &str,
-    pid: u32,
-    backend: &str,
-) -> Result<()> {
+pub fn write_shell_state(state_dir: &Path, shell_id: &str, pid: u32, backend: &str) -> Result<()> {
     let state = ShellState {
         pid,
         tty: None,

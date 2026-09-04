@@ -297,9 +297,11 @@ mod tests {
 
         let conn = schema::open_read_connection(paths.db()).unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM nodes WHERE slug = 'keep-me'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT title FROM nodes WHERE slug = 'keep-me'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(title, "Keep Me");
         let version = schema::peek_user_version(paths.db()).unwrap();
@@ -330,9 +332,11 @@ mod tests {
         FleetLaunch::prepare(&paths).unwrap();
         let conn = schema::open_read_connection(paths.db()).unwrap();
         let title: String = conn
-            .query_row("SELECT title FROM nodes WHERE slug = 'survive'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT title FROM nodes WHERE slug = 'survive'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(title, "Survive");
         assert_eq!(

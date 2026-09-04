@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+When you implement a new feature, launch a subagent to verify it works correctly live by using the /e2e-verify command.

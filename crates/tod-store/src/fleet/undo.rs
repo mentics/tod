@@ -8,13 +8,16 @@ use crate::outline::mutations::{OutlineMutation, ReorderDirection};
 use crate::outline::repos::{NodeRepo, OutlineRepo};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension};
 use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 /// Capture undo info before executing `mutation`. Returns `None` when the mutation
 /// should not be logged (imports, idempotent no-ops, suppressed types).
-pub fn capture_inverse_before(conn: &Connection, mutation: &FleetMutation) -> Result<Option<CommandEntry>> {
+pub fn capture_inverse_before(
+    conn: &Connection,
+    mutation: &FleetMutation,
+) -> Result<Option<CommandEntry>> {
     match mutation {
         FleetMutation::Outline(m) => capture_outline_inverse(conn, m),
         FleetMutation::UpdateTaskTitle { id, title } => {
@@ -158,10 +161,12 @@ pub fn capture_inverse_after_delete(
         id: Uuid::new_v4(),
         label,
         created_at: crate::outline::uuid_blob::now_ms(),
-        inverses: vec![FleetMutation::Outline(OutlineMutation::RestoreNodeSubtree {
-            archive_id,
-            root_node_id: root_id,
-        })],
+        inverses: vec![FleetMutation::Outline(
+            OutlineMutation::RestoreNodeSubtree {
+                archive_id,
+                root_node_id: root_id,
+            },
+        )],
     }))
 }
 
@@ -185,11 +190,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 })],
             }))
         }
-        OutlineMutation::CreateNode {
-            node_id,
-            title,
-            ..
-        } => {
+        OutlineMutation::CreateNode { node_id, title, .. } => {
             let id = node_id.unwrap_or_else(Uuid::new_v4);
             Ok(Some(CommandEntry {
                 id: Uuid::new_v4(),
@@ -286,10 +287,12 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: "Updated obligation".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
-                inverses: vec![FleetMutation::Outline(OutlineMutation::UpdateObligationBody {
-                    obligation_id: *obligation_id,
-                    body: old,
-                })],
+                inverses: vec![FleetMutation::Outline(
+                    OutlineMutation::UpdateObligationBody {
+                        obligation_id: *obligation_id,
+                        body: old,
+                    },
+                )],
             }))
         }
         OutlineMutation::DeleteObligation { obligation_id } => {
@@ -353,9 +356,7 @@ fn task_field<T, F>(conn: &Connection, id: &str, f: F) -> Result<Option<T>>
 where
     F: FnOnce(&crate::fleet::repos::task::FleetTask) -> T,
 {
-    Ok(TaskRepo::new(conn)
-        .get(id)?
-        .map(|t| f(&t)))
+    Ok(TaskRepo::new(conn).get(id)?.map(|t| f(&t)))
 }
 
 /// Label for restore undo (re-delete on undo of a delete).
@@ -364,12 +365,17 @@ pub fn restore_inverse_label(conn: &Connection, root_id: Uuid) -> Result<String>
     Ok(format!("Restored \"{title}\""))
 }
 
-pub fn capture_inverse_after_restore(conn: &Connection, root_id: Uuid) -> Result<Option<CommandEntry>> {
+pub fn capture_inverse_after_restore(
+    conn: &Connection,
+    root_id: Uuid,
+) -> Result<Option<CommandEntry>> {
     let label = restore_inverse_label(conn, root_id)?;
     Ok(Some(CommandEntry {
         id: Uuid::new_v4(),
         label,
         created_at: crate::outline::uuid_blob::now_ms(),
-        inverses: vec![FleetMutation::Outline(OutlineMutation::DeleteNode { node_id: root_id })],
+        inverses: vec![FleetMutation::Outline(OutlineMutation::DeleteNode {
+            node_id: root_id,
+        })],
     }))
 }

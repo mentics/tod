@@ -18,6 +18,9 @@ use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::repos::transcript::{TranscriptRepo, TranscriptTurn};
+use crate::fleet::resolve_agent_config::{
+    ResolvedAgentConfigs, resolve_agent_configs_for_node, resolve_interview_config_for_node,
+};
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
@@ -293,6 +296,20 @@ impl FleetStore {
         self.list_agents_for_task(task_id)
     }
 
+    /// Nearest-ancestor agent configs for a node (reuse, no materialize).
+    pub fn resolve_agents_for_node(&self, node_id: &str) -> Result<ResolvedAgentConfigs> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        resolve_agent_configs_for_node(&conn, node_id).map_err(Into::into)
+    }
+
+    /// Interview-mode agent on this node or a nearer ancestor, if any.
+    pub fn resolve_interview_agent_for_node(&self, node_id: &str) -> Result<Option<AgentConfigRow>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        resolve_interview_config_for_node(&conn, node_id).map_err(Into::into)
+    }
+
     /// Load one agent config row (with latest run status) by id.
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentConfigRow>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
@@ -336,6 +353,22 @@ impl FleetStore {
         let guard = self.projection.lock().expect("fleet projection mutex");
         AgentRunRepo::new(&guard.connection())
             .list_interactive_for_config(config_id)
+            .map_err(Into::into)
+    }
+
+    /// Terminal-launched CLI agent runs for a config, newest first.
+    pub fn list_terminal_agent_runs_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .list_terminal_for_config(config_id)
+            .map_err(Into::into)
+    }
+
+    /// Autonomous (auto) agent runs for a config, newest first.
+    pub fn list_auto_runs_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .list_auto_for_config(config_id)
             .map_err(Into::into)
     }
 

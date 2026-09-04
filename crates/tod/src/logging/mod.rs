@@ -2,8 +2,8 @@
 
 mod prune;
 
-pub use tod_store::LogLevel;
 pub use prune::prune_log_dir;
+pub use tod_store::LogLevel;
 
 use anyhow::{Context, Result};
 use chrono::DateTime;

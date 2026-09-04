@@ -63,15 +63,21 @@ pub fn write_session_init_script(
     shell_id: &str,
     cwd: &Path,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> Result<PathBuf> {
     let path = state_dir.join(format!("{shell_id}-init.sh"));
-    let content = format!(
+    let mut content = format!(
         "#!/usr/bin/env bash\nexport TOD_TERMINAL_BACKEND={backend}\nsource {} {} {} {}\n",
         sh_quote(&msys_path(init_script)),
         sh_quote(shell_id),
         sh_quote(&msys_path(state_dir)),
         sh_quote(&msys_path(cwd)),
     );
+    if let Some(cmd) = startup_command.filter(|c| !c.trim().is_empty()) {
+        // Run without `exec` so the shell stays after the CLI exits.
+        content.push_str(cmd.trim());
+        content.push('\n');
+    }
     std::fs::write(&path, content)
         .with_context(|| format!("write session init {}", path.display()))?;
     #[cfg(unix)]
@@ -86,20 +92,28 @@ pub fn write_session_init_script(
 pub fn msys_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
+
+#[cfg(any(unix, test))]
 pub fn posix_launch_command(
     init_script: &Path,
     shell_id: &str,
     state_dir: &Path,
     cwd: &Path,
     backend: &str,
+    startup_command: Option<&str>,
 ) -> String {
-    format!(
+    let mut cmd = format!(
         "export TOD_TERMINAL_BACKEND={backend}; source {} {} {} {}",
         sh_quote(&init_script.to_string_lossy()),
         sh_quote(shell_id),
         sh_quote(&state_dir.to_string_lossy()),
         sh_quote(&cwd.to_string_lossy()),
-    )
+    );
+    if let Some(startup) = startup_command.filter(|c| !c.trim().is_empty()) {
+        cmd.push_str("; ");
+        cmd.push_str(startup.trim());
+    }
+    cmd
 }
 
 #[cfg(windows)]
@@ -108,8 +122,9 @@ pub fn windows_launch_args(
     shell_id: &str,
     state_dir: &Path,
     cwd: &Path,
+    startup_command: Option<&str>,
 ) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-NoExit".into(),
         "-NoLogo".into(),
         "-File".into(),
@@ -120,5 +135,10 @@ pub fn windows_launch_args(
         state_dir.display().to_string(),
         "-TodCwd".into(),
         cwd.display().to_string(),
-    ]
+    ];
+    if let Some(cmd) = startup_command.filter(|c| !c.trim().is_empty()) {
+        args.push("-TodStartupCommand".into());
+        args.push(cmd.trim().to_string());
+    }
+    args
 }

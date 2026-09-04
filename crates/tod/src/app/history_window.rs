@@ -1,12 +1,12 @@
 //! Single-instance command history window — open, focus, close.
 
-use tod_store::fleet::FleetStore;
 use crate::views::command_history::CommandHistoryView;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, WindowBounds, WindowOptions, point, px, size,
 };
 use gpui_component::{Root, TitleBar};
 use std::sync::{Arc, Mutex};
+use tod_store::fleet::FleetStore;
 
 /// Shared handle for the optional command-history window.
 #[derive(Clone)]
@@ -84,9 +84,8 @@ impl HistoryWindowControl {
                         control_for_close.clear();
                         true
                     });
-                    let view = cx.new(|cx| {
-                        CommandHistoryView::new(window, cx, fleet, control.clone())
-                    });
+                    let view =
+                        cx.new(|cx| CommandHistoryView::new(window, cx, fleet, control.clone()));
                     cx.new(|cx| Root::new(view, window, cx))
                 },
             )

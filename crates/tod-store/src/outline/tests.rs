@@ -528,6 +528,9 @@ fn delete_node_blocked_when_agents_present() {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             },
         })
         .unwrap();

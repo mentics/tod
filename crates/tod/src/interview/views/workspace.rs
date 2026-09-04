@@ -63,6 +63,7 @@ struct SubmitAnswerWork {
     agent_config_id: String,
     cwd: PathBuf,
     settings: AnswerProcessorSettings,
+    launch_options: tod_store::AgentLaunchOptions,
 }
 
 struct SubmitAnswerOutcome {
@@ -81,6 +82,7 @@ struct SubmitActionWork {
     agent_config_id: String,
     cwd: PathBuf,
     question_maker_settings: QuestionMakerSettings,
+    launch_options: tod_store::AgentLaunchOptions,
 }
 
 struct SubmitActionOutcome {
@@ -1239,6 +1241,7 @@ impl WorkspaceView {
                 cwd,
                 prompt,
                 &self.settings.question_maker,
+                self.settings.interview_launch_options(),
             ),
             Err(_) => {
                 self.status_line = "Waiting for agent (bootstrap in progress)…".into();
@@ -1705,6 +1708,7 @@ impl WorkspaceView {
             agent_config_id: self.agent_config_id.clone(),
             cwd,
             settings: self.settings.answer_processor.clone(),
+            launch_options: self.settings.interview_launch_options(),
         };
         let agent = self.agent.clone();
 
@@ -1803,6 +1807,7 @@ impl WorkspaceView {
             agent_config_id: self.agent_config_id.clone(),
             cwd,
             question_maker_settings: self.settings.question_maker.clone(),
+            launch_options: self.settings.interview_launch_options(),
         };
         let agent = self.agent.clone();
 
@@ -2325,6 +2330,7 @@ impl WorkspaceView {
         let session = self.session.clone();
         let workspace_cwd = self.workspace_cwd.clone();
         let agent_config_id = self.agent_config_id.clone();
+        let launch_options = self.settings.interview_launch_options();
         let deep_dive = cx.new(|cx| {
             DeepDiveView::new(
                 question,
@@ -2332,6 +2338,7 @@ impl WorkspaceView {
                 session,
                 agent_config_id,
                 workspace_cwd,
+                launch_options,
                 window,
                 cx,
                 agent,
@@ -2494,7 +2501,13 @@ fn run_submit_answer_work(work: SubmitAnswerWork, agent: SharedAgent) -> SubmitA
             .lock()
             .map_err(|_| "Agent busy (bootstrap in progress) — try again shortly".to_string())?;
         let handle = provider
-            .start_answer_processor(&work.agent_config_id, work.cwd, prompt, &work.settings)
+            .start_answer_processor(
+                &work.agent_config_id,
+                work.cwd,
+                prompt,
+                &work.settings,
+                work.launch_options,
+            )
             .map_err(|err| format!("Failed to start answer processor: {err}"))?;
         Ok((handle.id, snapshot))
     })();
@@ -2559,6 +2572,7 @@ fn run_submit_action_work(work: SubmitActionWork, agent: SharedAgent) -> SubmitA
                 work.cwd,
                 prompt,
                 &work.question_maker_settings,
+                work.launch_options,
             )
             .map_err(|err| format!("Failed to start question maker: {err}"))?;
         Ok((handle.id, snapshot))

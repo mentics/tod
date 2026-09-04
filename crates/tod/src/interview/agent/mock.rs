@@ -1,14 +1,10 @@
-use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 #[cfg(test)]
 use super::answer_pool::AnswerProcessorPoolStats;
+use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState,
-    DeepDiveContext, RunId,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, DeepDiveContext, RunId,
 };
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
-use tod_store::agent_traffic::{
-    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
-};
 use crate::interview::config::path_for_storage;
 use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
 use crate::interview::transcript::new_transcript_filename;
@@ -20,6 +16,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
+use tod_store::AgentLaunchOptions;
+use tod_store::agent_traffic::{
+    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+};
 
 /// Fast in-process agent backend for UI tests. Writes realistic on-disk scaffolding
 /// and queue/status files; never calls Cursor ACP or any external process.
@@ -35,6 +35,8 @@ pub struct MockAgentProvider {
     question_maker_completion_rx: mpsc::Receiver<QuestionMakerJobResult>,
     fleet_run_agent: HashMap<RunId, String>,
     traffic_log: Option<SharedAgentTrafficLog>,
+    /// Last options passed to [`Self::start_fleet_agent`] (tests / diagnostics).
+    pub last_fleet_options: Option<AgentLaunchOptions>,
 }
 
 struct AnswerJobResult {
@@ -69,6 +71,7 @@ impl MockAgentProvider {
             question_maker_completion_rx,
             fleet_run_agent: HashMap::new(),
             traffic_log: None,
+            last_fleet_options: None,
         }
     }
 
@@ -104,13 +107,9 @@ impl MockAgentProvider {
             .get(&run_id)
             .cloned()
             .unwrap_or_else(|| format!("{run_id:?}"));
-        log.lock().expect("traffic log mutex").record(
-            category,
-            agent_id,
-            label,
-            direction,
-            content,
-        );
+        log.lock()
+            .expect("traffic log mutex")
+            .record(category, agent_id, label, direction, content);
     }
 
     fn finish(
@@ -161,7 +160,13 @@ impl MockAgentProvider {
         for (slot_id, run_id, prompt) in outcome.dispatched {
             self.answer_run_agent
                 .insert(run_id, job.agent_config_id.clone());
-            self.spawn_answer_job(job.agent_config_id.clone(), job.cwd.clone(), slot_id, run_id, prompt);
+            self.spawn_answer_job(
+                job.agent_config_id.clone(),
+                job.cwd.clone(),
+                slot_id,
+                run_id,
+                prompt,
+            );
         }
     }
 
@@ -260,6 +265,7 @@ impl AgentProvider for MockAgentProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &QuestionMakerSettings,
+        _options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .question_maker_pool
@@ -294,6 +300,7 @@ impl AgentProvider for MockAgentProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
+        _options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .answer_pool
@@ -328,6 +335,7 @@ impl AgentProvider for MockAgentProvider {
         _cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
+        _options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let body = initial_message
             .clone()
@@ -353,7 +361,9 @@ impl AgentProvider for MockAgentProvider {
         agent_config_id: &str,
         cwd: PathBuf,
         prompt: String,
+        options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
+        self.last_fleet_options = Some(options);
         let preview: String = prompt.chars().take(200).collect();
         let reply = format!(
             "Fleet agent run complete (mock).\n\n\
@@ -423,7 +433,8 @@ impl AgentProvider for MockAgentProvider {
 fn process_question_maker_from_prompt(prompt: &str) -> Result<String> {
     if prompt.contains("Interview UI kickoff") {
         bootstrap_from_prompt(prompt)
-    } else if prompt.contains("Action payload") || prompt.contains("Process question maker action") {
+    } else if prompt.contains("Action payload") || prompt.contains("Process question maker action")
+    {
         action_from_prompt(prompt)
     } else {
         replenish_from_prompt(prompt)
@@ -874,6 +885,11 @@ mod tests {
     use crate::interview::config::agent_scratchpad_for_node;
     use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
     use std::time::Duration;
+    use tod_store::{AgentLaunchOptions, AgentPlatform};
+
+    fn default_options() -> AgentLaunchOptions {
+        AgentLaunchOptions::for_platform(AgentPlatform::Claude)
+    }
 
     fn poll_run(mock: &mut MockAgentProvider, id: RunId) -> AgentRunState {
         for _ in 0..200 {
@@ -917,7 +933,13 @@ mod tests {
             session_dir.join("interview-config.md").display(),
         ));
         let handle = mock
-            .start_question_maker_replenishment("mock-agent", root.clone(), prompt, &pool)
+            .start_question_maker_replenishment(
+                "mock-agent",
+                root.clone(),
+                prompt,
+                &pool,
+                default_options(),
+            )
             .unwrap();
         assert!(matches!(
             poll_run(&mut mock, handle.id),
@@ -951,7 +973,13 @@ mod tests {
             session_dir.join("interview-config.md").display(),
         ));
         let bootstrap_handle = mock
-            .start_question_maker_replenishment("mock-agent", root.clone(), prompt, &pool)
+            .start_question_maker_replenishment(
+                "mock-agent",
+                root.clone(),
+                prompt,
+                &pool,
+                default_options(),
+            )
             .unwrap();
         assert!(matches!(
             poll_run(&mut mock, bootstrap_handle.id),
@@ -970,7 +998,13 @@ mod tests {
             config_path.display()
         ));
         let handle = mock
-            .start_question_maker_replenishment("mock-agent", root.clone(), action_prompt, &pool)
+            .start_question_maker_replenishment(
+                "mock-agent",
+                root.clone(),
+                action_prompt,
+                &pool,
+                default_options(),
+            )
             .unwrap();
         assert!(matches!(
             poll_run(&mut mock, handle.id),
@@ -991,10 +1025,16 @@ mod tests {
         };
 
         let h0 = mock
-            .start_answer_processor("mock-agent", cwd.clone(), prompt.clone(), &pool)
+            .start_answer_processor(
+                "mock-agent",
+                cwd.clone(),
+                prompt.clone(),
+                &pool,
+                default_options(),
+            )
             .unwrap();
         let h1 = mock
-            .start_answer_processor("mock-agent", cwd.clone(), prompt, &pool)
+            .start_answer_processor("mock-agent", cwd.clone(), prompt, &pool, default_options())
             .unwrap();
         assert_eq!(mock.pool_stats("mock-agent", &pool).in_pool, 2);
         assert_eq!(mock.pool_stats("mock-agent", &pool).active, 2);

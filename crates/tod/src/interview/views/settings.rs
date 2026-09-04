@@ -16,10 +16,12 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tod_store::fleet::default_terminal_hint;
+use tod_store::{efforts_for, models_for};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -40,8 +42,10 @@ actions!(
     [
         SettingsSectionPrev,
         SettingsSectionNext,
-        SettingsFieldUp,
-        SettingsFieldDown,
+        SettingsNavUp,
+        SettingsNavDown,
+        SettingsFocusSidebar,
+        SettingsFocusPanel,
         SettingsDecrease,
         SettingsIncrease,
         SettingsActivate,
@@ -55,13 +59,14 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("[", SettingsSectionPrev, context),
         KeyBinding::new("]", SettingsSectionNext, context),
-        KeyBinding::new("up", SettingsFieldUp, context),
-        KeyBinding::new("down", SettingsFieldDown, context),
-        KeyBinding::new("left", SettingsDecrease, context),
-        KeyBinding::new("right", SettingsIncrease, context),
+        KeyBinding::new("up", SettingsNavUp, context),
+        KeyBinding::new("down", SettingsNavDown, context),
+        KeyBinding::new("left", SettingsFocusSidebar, context),
+        KeyBinding::new("right", SettingsFocusPanel, context),
         KeyBinding::new("-", SettingsDecrease, context),
         KeyBinding::new("=", SettingsIncrease, context),
         KeyBinding::new("enter", SettingsActivate, context),
+        KeyBinding::new("space", SettingsActivate, context),
         KeyBinding::new("escape", SettingsEscape, context),
         KeyBinding::new("escape", SettingsEscape, input_context),
     ]);
@@ -70,6 +75,12 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
 #[derive(Debug, Clone)]
 pub enum SettingsEvent {
     AgentPlatformChanged(AgentPlatform),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsFocus {
+    Sidebar,
+    Panel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,15 +168,21 @@ pub struct SettingsView {
     log_dir_display: SharedString,
     terminal_program_input: Entity<InputState>,
     treehouse_worktrees_root_input: Entity<InputState>,
+    model_select: Entity<SelectState<Vec<String>>>,
+    effort_select: Entity<SelectState<Vec<String>>>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
+    focus_region: SettingsFocus,
     active_section: SettingsSection,
     selected_field_index: usize,
     terminal_program_editing: bool,
     treehouse_worktrees_root_editing: bool,
+    pending_launch_select_sync: bool,
     save_generation: u64,
     _terminal_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
+    _model_select_subscription: Subscription,
+    _effort_select_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -219,21 +236,56 @@ impl SettingsView {
                 }
             });
 
+        let platform = settings.agent_platform;
+        let models = catalog_strings(models_for(platform));
+        let efforts = catalog_strings(efforts_for(platform));
+        let model_select = cx.new(|cx| SelectState::new(models, None, window, cx).searchable(true));
+        let effort_select =
+            cx.new(|cx| SelectState::new(efforts, None, window, cx).searchable(true));
+        let initial_model = settings.agent_model().to_string();
+        let initial_effort = settings.agent_effort().to_string();
+        model_select.update(cx, |select, cx| {
+            select.set_selected_value(&initial_model, window, cx);
+        });
+        effort_select.update(cx, |select, cx| {
+            select.set_selected_value(&initial_effort, window, cx);
+        });
+        let _model_select_subscription = cx.subscribe(&model_select, |this, _, event, cx| {
+            if let SelectEvent::Confirm(Some(value)) = event {
+                this.settings.set_agent_model(value.clone());
+                this.schedule_save(cx);
+                cx.notify();
+            }
+        });
+        let _effort_select_subscription = cx.subscribe(&effort_select, |this, _, event, cx| {
+            if let SelectEvent::Confirm(Some(value)) = event {
+                this.settings.set_agent_effort(value.clone());
+                this.schedule_save(cx);
+                cx.notify();
+            }
+        });
+
         Self {
             paths,
             settings,
             log_dir_display,
             terminal_program_input,
             treehouse_worktrees_root_input,
+            model_select,
+            effort_select,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
+            focus_region: SettingsFocus::Panel,
             active_section: SettingsSection::Agents,
             selected_field_index: 0,
             terminal_program_editing: false,
             treehouse_worktrees_root_editing: false,
+            pending_launch_select_sync: false,
             save_generation: 0,
             _terminal_subscription,
             _treehouse_worktrees_root_subscription,
+            _model_select_subscription,
+            _effort_select_subscription,
         }
     }
 
@@ -273,18 +325,40 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn activate_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
-        if self.active_section == section {
-            return;
-        }
+    fn activate_section(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.active_section = section;
         self.selected_field_index = 0;
+        self.focus_region = SettingsFocus::Sidebar;
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
-    fn move_section(&mut self, delta: i32, cx: &mut Context<Self>) {
+    fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
+        self.focus_region = SettingsFocus::Sidebar;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.text_editing() {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn move_section(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
             return;
         }
@@ -298,10 +372,12 @@ impl SettingsView {
         self.treehouse_worktrees_root_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
+        self.focus_region = SettingsFocus::Sidebar;
+        self.focus_handle.focus(window);
         cx.notify();
     }
 
-    fn move_field(&mut self, delta: i32, cx: &mut Context<Self>) {
+    fn move_field(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
             return;
         }
@@ -312,7 +388,23 @@ impl SettingsView {
         let len = fields.len() as i32;
         self.selected_field_index =
             ((self.selected_field_index as i32 + delta).rem_euclid(len)) as usize;
+        self.focus_region = SettingsFocus::Panel;
+        self.focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn navigate_up(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.focus_region {
+            SettingsFocus::Sidebar => self.move_section(-1, window, cx),
+            SettingsFocus::Panel => self.move_field(-1, window, cx),
+        }
+    }
+
+    fn navigate_down(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.focus_region {
+            SettingsFocus::Sidebar => self.move_section(1, window, cx),
+            SettingsFocus::Panel => self.move_field(1, window, cx),
+        }
     }
 
     fn selected_field(&self) -> SettingField {
@@ -324,11 +416,15 @@ impl SettingsView {
     }
 
     fn field_selected(&self, field: SettingField) -> bool {
-        self.selected_field() == field
+        self.focus_region == SettingsFocus::Panel && self.selected_field() == field
+    }
+
+    fn section_focused(&self, section: SettingsSection) -> bool {
+        self.focus_region == SettingsFocus::Sidebar && self.active_section == section
     }
 
     fn adjust_selected(&mut self, delta: i32, cx: &mut Context<Self>) {
-        if self.text_editing() {
+        if self.text_editing() || self.focus_region != SettingsFocus::Panel {
             return;
         }
         match self.selected_field() {
@@ -352,6 +448,10 @@ impl SettingsView {
         if self.text_editing() {
             return;
         }
+        if self.focus_region == SettingsFocus::Sidebar {
+            self.focus_panel(window, cx);
+            return;
+        }
         if self.selected_field().is_text_input() {
             match self.selected_field() {
                 SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
@@ -360,6 +460,9 @@ impl SettingsView {
                 }
                 _ => {}
             }
+        } else {
+            // Cycle/step fields: Enter bumps forward like `=`.
+            self.adjust_selected(1, cx);
         }
     }
 
@@ -367,6 +470,7 @@ impl SettingsView {
         if !matches!(self.selected_field(), SettingField::TreehouseWorktreesRoot) {
             return;
         }
+        self.focus_region = SettingsFocus::Panel;
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = true;
         cx.notify();
@@ -382,6 +486,7 @@ impl SettingsView {
         if !matches!(self.selected_field(), SettingField::TerminalProgram) {
             return;
         }
+        self.focus_region = SettingsFocus::Panel;
         self.treehouse_worktrees_root_editing = false;
         self.terminal_program_editing = true;
         cx.notify();
@@ -508,6 +613,7 @@ impl SettingsView {
             return;
         }
         self.settings.agent_platform = platform;
+        self.pending_launch_select_sync = true;
         cx.emit(SettingsEvent::AgentPlatformChanged(platform));
         self.schedule_save(cx);
         cx.notify();
@@ -519,6 +625,22 @@ impl SettingsView {
 
     fn agent_platform_label(platform: AgentPlatform) -> &'static str {
         platform.label()
+    }
+
+    fn sync_model_effort_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let platform = self.settings.agent_platform;
+        let models = catalog_strings(models_for(platform));
+        let efforts = catalog_strings(efforts_for(platform));
+        let model = self.settings.agent_model().to_string();
+        let effort = self.settings.agent_effort().to_string();
+        self.model_select.update(cx, |select, cx| {
+            select.set_items(models, window, cx);
+            select.set_selected_value(&model, window, cx);
+        });
+        self.effort_select.update(cx, |select, cx| {
+            select.set_items(efforts, window, cx);
+            select.set_selected_value(&effort, window, cx);
+        });
     }
 
     fn cycle_worktree_backend(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -553,6 +675,10 @@ fn step_u32(value: u32, delta: i32) -> u32 {
     } else {
         value.saturating_sub((-delta) as u32)
     }
+}
+
+fn catalog_strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
 }
 
 #[cfg(test)]
@@ -591,6 +717,10 @@ impl Focusable for SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_launch_select_sync {
+            self.sync_model_effort_selects(window, cx);
+            self.pending_launch_select_sync = false;
+        }
         key_context::set_input_tab_stop(
             &self.terminal_program_input,
             self.terminal_program_editing,
@@ -630,20 +760,28 @@ impl Render for SettingsView {
             .bg(theme.background)
             .key_context(SETTINGS_CONTEXT)
             .track_focus(&focus)
-            .on_action(cx.listener(|this, _: &SettingsSectionPrev, _, cx| {
-                this.move_section(-1, cx);
+            .on_action(cx.listener(|this, _: &SettingsSectionPrev, window, cx| {
+                this.move_section(-1, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SettingsSectionNext, _, cx| {
-                this.move_section(1, cx);
+            .on_action(cx.listener(|this, _: &SettingsSectionNext, window, cx| {
+                this.move_section(1, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SettingsFieldUp, _, cx| {
-                this.move_field(-1, cx);
+            .on_action(cx.listener(|this, _: &SettingsNavUp, window, cx| {
+                this.navigate_up(window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &SettingsFieldDown, _, cx| {
-                this.move_field(1, cx);
+            .on_action(cx.listener(|this, _: &SettingsNavDown, window, cx| {
+                this.navigate_down(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SettingsFocusSidebar, window, cx| {
+                this.focus_sidebar(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &SettingsFocusPanel, window, cx| {
+                this.focus_panel(window, cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &SettingsDecrease, _, cx| {
@@ -696,7 +834,7 @@ impl Render for SettingsView {
                     .border_t_1()
                     .border_color(border)
                     .child(div().text_xs().text_color(muted).child(
-                        "[ ] section · ↑↓ field · ←→ adjust · Enter edit text · Esc exit edit",
+                        "←→ sidebar/fields · ↑↓ move · −/= adjust · Enter/Space cycle · Esc exit edit",
                     )),
             )
             .on_mouse_down(
@@ -716,13 +854,18 @@ impl SettingsView {
         cx: &mut Context<Self>,
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
+        let sidebar_focused = self.focus_region == SettingsFocus::Sidebar;
         v_flex()
             .h_full()
             .min_w_0()
             .bg(theme.sidebar)
             .py_2()
+            .when(sidebar_focused, |el| {
+                el.border_r_2().border_color(theme.list_active_border)
+            })
             .children(SECTIONS.iter().map(|section| {
                 let selected = self.active_section == *section;
+                let focused = self.section_focused(*section);
                 Button::new(SharedString::from(format!(
                     "settings-section-{}",
                     section.id()
@@ -730,11 +873,10 @@ impl SettingsView {
                 .label(section.label())
                 .ghost()
                 .w_full()
-                .selected(selected)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.activate_section(*section, cx);
-                    this.selected_field_index = 0;
-                    cx.notify();
+                .selected(selected || focused)
+                .tab_stop(false)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_section(*section, window, cx);
                 }))
                 .into_any_element()
             }))
@@ -767,20 +909,73 @@ impl SettingsView {
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
         match self.active_section {
-            SettingsSection::Agents => v_flex()
-                .gap_1()
-                .child(cycle_row(
-                    cx,
-                    self,
-                    SettingField::AgentPlatform,
-                    Self::agent_platform_label(self.settings.agent_platform),
-                    "Agent platform",
-                    "Which agent runtime runs interview question-maker and answer-processor work. Default is Claude.",
-                    theme,
-                    |this, _, cx| this.cycle_agent_platform(-1, cx),
-                    |this, _, cx| this.cycle_agent_platform(1, cx),
-                ))
-                .into_any_element(),
+            SettingsSection::Agents => {
+                let platform_label =
+                    Self::agent_platform_label(self.settings.agent_platform);
+                v_flex()
+                    .gap_1()
+                    .child(cycle_row(
+                        cx,
+                        self,
+                        SettingField::AgentPlatform,
+                        platform_label,
+                        "Agent platform",
+                        "Which agent runtime runs interview question-maker and answer-processor work. Default is Claude.",
+                        theme,
+                        |this, _, cx| this.cycle_agent_platform(-1, cx),
+                        |this, _, cx| this.cycle_agent_platform(1, cx),
+                    ))
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .mt_2()
+                            .ml_4()
+                            .pl_3()
+                            .border_l_2()
+                            .border_color(theme.border)
+                            .gap_1()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .px_3()
+                                    .pt_1()
+                                    .pb_2()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_semibold()
+                                            .text_color(theme.foreground)
+                                            .child(format!(
+                                                "{platform_label} launch options"
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .whitespace_normal()
+                                            .child(
+                                                "Model and effort apply only to the selected platform. Switch platform above to configure the other.",
+                                            ),
+                                    ),
+                            )
+                            .child(select_row(
+                                "Model",
+                                "Model id used when starting interview agent sessions on this platform.",
+                                &self.model_select,
+                                "Choose model",
+                                theme,
+                            ))
+                            .child(select_row(
+                                "Effort",
+                                "Reasoning / effort level for interview agent sessions on this platform.",
+                                &self.effort_select,
+                                "Choose effort",
+                                theme,
+                            )),
+                    )
+                    .into_any_element()
+            }
             SettingsSection::QuestionMaker => v_flex()
                 .gap_1()
                 .child(stepper_row(
@@ -927,7 +1122,7 @@ impl SettingsView {
 fn select_field_listener(
     field: SettingField,
 ) -> impl Fn(&mut SettingsView, &gpui::MouseDownEvent, &mut Window, &mut Context<SettingsView>) {
-    move |this, _, _, cx| {
+    move |this, _, window, cx| {
         if let Some(index) = this
             .active_section
             .fields()
@@ -935,8 +1130,10 @@ fn select_field_listener(
             .position(|candidate| *candidate == field)
         {
             this.selected_field_index = index;
-            cx.notify();
         }
+        this.focus_region = SettingsFocus::Panel;
+        this.focus_handle.focus(window);
+        cx.notify();
     }
 }
 
@@ -1002,7 +1199,10 @@ fn stepper_row(
                     Button::new(SharedString::from(format!("{id}-dec")))
                         .label("−")
                         .w(px(36.))
+                        .tab_stop(false)
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_region = SettingsFocus::Panel;
+                            this.focus_handle.focus(window);
                             on_dec(this, window, cx);
                         })),
                 )
@@ -1022,7 +1222,10 @@ fn stepper_row(
                     Button::new(SharedString::from(format!("{id}-inc")))
                         .label("+")
                         .w(px(36.))
+                        .tab_stop(false)
                         .on_click(cx.listener(move |this, _, window, cx| {
+                            this.focus_region = SettingsFocus::Panel;
+                            this.focus_handle.focus(window);
                             on_inc(this, window, cx);
                         })),
                 ),
@@ -1041,6 +1244,56 @@ fn cycle_row(
     on_inc: impl Fn(&mut SettingsView, &mut Window, &mut Context<SettingsView>) + 'static,
 ) -> impl IntoElement {
     stepper_row(cx, view, field, value, label, help, theme, on_dec, on_inc)
+}
+
+const SELECT_CONTROL_WIDTH: f32 = 220.0;
+
+fn select_row(
+    label: impl Into<SharedString>,
+    help: impl Into<SharedString>,
+    select: &Entity<SelectState<Vec<String>>>,
+    placeholder: impl Into<SharedString>,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let label = label.into();
+    let help = help.into();
+    let placeholder = placeholder.into();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_start()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_normal()
+                        .child(help),
+                ),
+        )
+        .child(
+            div().w(px(SELECT_CONTROL_WIDTH)).flex_shrink_0().child(
+                Select::new(select)
+                    .placeholder(placeholder)
+                    .search_placeholder("Filter…")
+                    .menu_width(px(SELECT_CONTROL_WIDTH)),
+            ),
+        )
 }
 
 fn text_input_row(
@@ -1080,6 +1333,7 @@ fn text_input_row(
                 {
                     this.selected_field_index = index;
                 }
+                this.focus_region = SettingsFocus::Panel;
                 match field {
                     SettingField::TerminalProgram => {
                         if !this.terminal_program_editing {

@@ -60,10 +60,7 @@ impl ListDelegate for SessionListDelegate {
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let session = self.items.get(ix.row)?;
-        let selected = self
-            .selected_index
-            .map(|s| s.eq_row(ix))
-            .unwrap_or(false);
+        let selected = self.selected_index.map(|s| s.eq_row(ix)).unwrap_or(false);
         let muted = cx.theme().muted_foreground;
         let status = match session.status {
             InterviewSessionStatus::Active => "Active",

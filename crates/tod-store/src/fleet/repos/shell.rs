@@ -167,6 +167,9 @@ mod tests {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             })
             .unwrap();
         agent_id

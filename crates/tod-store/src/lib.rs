@@ -1,5 +1,6 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
+pub mod agent_launch;
 pub mod agent_traffic;
 pub mod credentials;
 pub mod fleet;
@@ -11,6 +12,11 @@ pub mod path_util;
 pub mod paths;
 pub mod settings;
 
+pub use agent_launch::{
+    AgentLaunchOptions, CLAUDE_EFFORTS, CLAUDE_MODELS, CURSOR_EFFORTS, CURSOR_MODELS,
+    DEFAULT_EFFORT, coerce_effort, coerce_model, default_model_for, effort_for_acp, efforts_for,
+    models_for, parse_platform, platform_storage,
+};
 pub use agent_traffic::SharedAgentTrafficLog;
 pub use credentials::{
     CredentialBackend, CredentialError, CredentialKind, CredentialStore, resolve_linear_api_key,
@@ -24,7 +30,7 @@ pub use paths::{
     resolve_startup_data_root, set_data_root,
 };
 pub use settings::{
-    AgentPlatform, AnswerProcessorSettings, DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB,
-    MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry,
-    WorktreeBackend,
+    AgentLaunchByPlatform, AgentPlatform, AnswerProcessorSettings, DEFAULT_LOG_MAX_SIZE_KB,
+    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings,
+    TerminalSettings, TodSettings, WindowGeometry, WorktreeBackend,
 };

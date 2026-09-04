@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tod_store::fleet::repos::transcript::TranscriptTurn;
 use tod_store::fleet::{FleetMutation, FleetStore};
+use tod_store::{AgentLaunchOptions, AgentPlatform, parse_platform, platform_storage};
 
 const INTERACTIVE_AGENT_CONTEXT: &str = "InteractiveAgent";
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -57,6 +58,9 @@ pub struct InteractiveAgentView {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     workspace_cwd: PathBuf,
+    platform: String,
+    model: String,
+    effort: String,
     window_control: InteractiveAgentWindowControl,
     prompt_input: Entity<InputState>,
     conversation: Vec<(String, String)>,
@@ -88,6 +92,13 @@ impl InteractiveAgentView {
             .map(|turns| conversation_from_transcript(&turns))
             .unwrap_or_default();
 
+        let launch = fleet
+            .get_agent(&config_id)
+            .ok()
+            .flatten()
+            .map(|row| row.launch_options())
+            .unwrap_or_else(|| AgentLaunchOptions::for_platform(AgentPlatform::Claude));
+
         let prompt_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -114,6 +125,9 @@ impl InteractiveAgentView {
             fleet,
             agent,
             workspace_cwd,
+            platform: platform_storage(launch.platform).to_string(),
+            model: launch.model,
+            effort: launch.effort,
             window_control,
             prompt_input,
             conversation,
@@ -272,7 +286,25 @@ impl InteractiveAgentView {
 
         let provider_run = match self.agent.lock() {
             Ok(mut provider) => {
-                provider.start_fleet_agent(&self.config_id, self.workspace_cwd.clone(), prompt_body)
+                let options = self
+                    .fleet
+                    .get_agent(&self.config_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.launch_options())
+                    .unwrap_or_else(|| {
+                        AgentLaunchOptions::from_settings(
+                            parse_platform(&self.platform).unwrap_or(AgentPlatform::Claude),
+                            self.model.clone(),
+                            self.effort.clone(),
+                        )
+                    });
+                provider.start_fleet_agent(
+                    &self.config_id,
+                    self.workspace_cwd.clone(),
+                    prompt_body,
+                    options,
+                )
             }
             Err(_) => Err(anyhow::anyhow!("Agent busy — try again shortly")),
         };
@@ -555,8 +587,11 @@ impl Render for InteractiveAgentView {
                     .text_xs()
                     .text_color(muted)
                     .child(format!(
-                        "Task {} · {}",
+                        "Task {} · {} · {} · {} · {}",
                         self.task_id,
+                        self.platform,
+                        self.model,
+                        self.effort,
                         self.workspace_cwd.display()
                     )),
             )

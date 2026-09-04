@@ -91,6 +91,9 @@ pub enum FleetMutation {
         mode: String,
         work_directory: Option<String>,
         use_worktree: bool,
+        platform: String,
+        model: String,
+        effort: String,
     },
     DeleteAgent {
         id: String,
@@ -105,6 +108,17 @@ pub enum FleetMutation {
     },
     ClearAgentReconnect {
         id: String,
+    },
+    UpdateAgentRunReconnect {
+        run_id: String,
+        identity: ReconnectIdentity,
+    },
+    ClearAgentRunReconnect {
+        run_id: String,
+    },
+    UpdateAgentRunRuntimeStatus {
+        run_id: String,
+        runtime_status: String,
     },
     CreateAgentRun {
         config_id: String,
@@ -216,6 +230,9 @@ impl FleetMutation {
                 | FleetMutation::UpdateAgentRuntimeStatus { .. }
                 | FleetMutation::UpdateAgentReconnect { .. }
                 | FleetMutation::ClearAgentReconnect { .. }
+                | FleetMutation::UpdateAgentRunReconnect { .. }
+                | FleetMutation::ClearAgentRunReconnect { .. }
+                | FleetMutation::UpdateAgentRunRuntimeStatus { .. }
                 | FleetMutation::CreateAgentRun { .. }
                 | FleetMutation::EndAgentRun { .. }
                 | FleetMutation::DeleteAgentRun { .. }
@@ -303,6 +320,9 @@ impl FleetMutation {
                 mode,
                 work_directory,
                 use_worktree,
+                platform,
+                model,
+                effort,
             } => {
                 AgentConfigRepo::new(conn).update_fields(
                     id,
@@ -310,6 +330,9 @@ impl FleetMutation {
                     mode,
                     work_directory.as_deref(),
                     *use_worktree,
+                    platform,
+                    model,
+                    effort,
                 )?;
             }
             FleetMutation::DeleteAgent { id } => {
@@ -323,6 +346,18 @@ impl FleetMutation {
             }
             FleetMutation::ClearAgentReconnect { id } => {
                 AgentConfigRepo::new(conn).clear_reconnect(id)?;
+            }
+            FleetMutation::UpdateAgentRunReconnect { run_id, identity } => {
+                AgentRunRepo::new(conn).update_reconnect(run_id, *identity)?;
+            }
+            FleetMutation::ClearAgentRunReconnect { run_id } => {
+                AgentRunRepo::new(conn).clear_reconnect(run_id)?;
+            }
+            FleetMutation::UpdateAgentRunRuntimeStatus {
+                run_id,
+                runtime_status,
+            } => {
+                AgentRunRepo::new(conn).update_runtime_status(run_id, runtime_status)?;
             }
             FleetMutation::CreateAgentRun {
                 config_id,

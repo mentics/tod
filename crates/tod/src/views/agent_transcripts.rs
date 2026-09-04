@@ -1,17 +1,12 @@
-use tod_store::agent_traffic::{
-    AgentCategory, AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
-};
 use crate::app::transcript_window::TranscriptWindowControl;
-use tod_store::fleet::{FleetStore, TranscriptTurn};
 use crate::ui::actionable::{
     chrome_control_with_shortcut, render_label_badge, render_shortcut_pill,
 };
 use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
-    MouseButton, ParentElement, Pixels, Render, SharedString, Styled,
-    Window, actions, div, px,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton,
+    ParentElement, Pixels, Render, SharedString, Styled, Window, actions, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -19,6 +14,10 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use tod_store::agent_traffic::{
+    AgentCategory, AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
+};
+use tod_store::fleet::{FleetStore, TranscriptTurn};
 
 const AGENT_TRANSCRIPTS_CONTEXT: &str = "AgentTranscripts";
 const AGENTS_LIST_WIDTH: f32 = 320.0;

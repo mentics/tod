@@ -1,10 +1,10 @@
 //! One-time bootstrap import from `doc/process/` on disk.
 
-use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
+use crate::fleet::repos::agent_config::AgentConfigRepo;
 use crate::outline::repos::obligations::NodeObligation;
+use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
-use crate::fleet::repos::agent_config::AgentConfigRepo;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::fs;
@@ -19,7 +19,11 @@ pub struct ImportReport {
 }
 
 /// Import `doc/process` under `repo_root` into the outline schema.
-pub fn import_doc_process(conn: &Connection, repo_root: &Path, media_root: &Path) -> Result<ImportReport> {
+pub fn import_doc_process(
+    conn: &Connection,
+    repo_root: &Path,
+    media_root: &Path,
+) -> Result<ImportReport> {
     let list_repo = ListRepo::new(conn);
     let list = list_repo
         .get_by_slug("tod")?
@@ -35,10 +39,7 @@ pub fn import_doc_process(conn: &Connection, repo_root: &Path, media_root: &Path
             if !project_path.is_dir() {
                 continue;
             }
-            let project_slug = project_entry
-                .file_name()
-                .to_string_lossy()
-                .to_string();
+            let project_slug = project_entry.file_name().to_string_lossy().to_string();
             let project_node = import_project(conn, &list.id, &project_path, &project_slug)?;
             projects += 1;
 
@@ -93,7 +94,8 @@ fn import_project(
         return Ok(existing);
     }
 
-    let title = read_title(&project_path.join("user.md")).unwrap_or_else(|| project_slug.to_string());
+    let title =
+        read_title(&project_path.join("user.md")).unwrap_or_else(|| project_slug.to_string());
     let node = node_repo.create_normal(project_slug, &title)?;
     node_repo.enable_capabilities(node.id, &[Capability::Spec, Capability::Lifecycle])?;
 
@@ -176,7 +178,12 @@ fn import_task(
     }
 
     import_history(conn, node.id, &task_path.join("history"))?;
-    import_visual_artifacts(conn, node.id, &task_path.join("artifacts").join("visual"), media_root)?;
+    import_visual_artifacts(
+        conn,
+        node.id,
+        &task_path.join("artifacts").join("visual"),
+        media_root,
+    )?;
 
     Ok(())
 }
@@ -276,7 +283,12 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
     Ok(())
 }
 
-fn insert_extra_content(conn: &Connection, node_id: Uuid, content_type: &str, body: &str) -> Result<()> {
+fn insert_extra_content(
+    conn: &Connection,
+    node_id: Uuid,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -303,7 +315,11 @@ fn import_history(conn: &Connection, node_id: Uuid, history_dir: &Path) -> Resul
         }
         let display_name = path.file_stem().unwrap().to_string_lossy().to_string();
         let body = fs::read_to_string(&path)?;
-        let phase = display_name.split('-').next().unwrap_or("interview").to_string();
+        let phase = display_name
+            .split('-')
+            .next()
+            .unwrap_or("interview")
+            .to_string();
         conn.execute(
             "INSERT INTO interview_transcripts (id, node_id, phase, display_name, body, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
@@ -358,11 +374,7 @@ fn import_visual_artifacts(
                     now_ms()
                 ],
             )?;
-            let role = path
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();
+            let role = path.file_stem().unwrap().to_string_lossy().to_string();
             conn.execute(
                 "INSERT OR IGNORE INTO node_media_links (node_id, media_id, role, label, ordinal)
                  VALUES (?1, ?2, ?3, ?4, 0)",
@@ -375,7 +387,9 @@ fn import_visual_artifacts(
 
 fn sha256_simple(bytes: &[u8]) -> u64 {
     // Lightweight placeholder hash for import (not cryptographic).
-    bytes.iter().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64))
+    bytes
+        .iter()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64))
 }
 
 fn reattach_agents_by_slug(conn: &Connection) -> Result<()> {

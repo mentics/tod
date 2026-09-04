@@ -1,9 +1,8 @@
 //! gpui-specific helpers for persisted settings (core types live in `tod-store`).
 
 pub use tod_store::settings::{
-    AnswerProcessorSettings, QuestionMakerSettings, TodSettings,
-    WorktreeBackend, WindowGeometry, MAX_LOG_MAX_SIZE_KB,
-    MIN_LOG_MAX_SIZE_KB,
+    AnswerProcessorSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings,
+    TodSettings, WindowGeometry, WorktreeBackend,
 };
 
 use crate::interview::paths::TodPaths;

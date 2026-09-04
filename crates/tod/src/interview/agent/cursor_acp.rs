@@ -24,11 +24,11 @@ use tod_store::agent_traffic::{
 };
 use tod_store::fleet::paths::normalize_absolute;
 use tod_store::path_is_under;
+use tod_store::{AgentLaunchOptions, effort_for_acp};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const DEFAULT_MODEL: &str = "auto";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -65,6 +65,8 @@ struct SlotCompletion {
 struct PoolRunContext {
     agent_config_id: String,
     _cwd: PathBuf,
+    model: String,
+    effort: String,
 }
 
 struct AcpLiveSlot {
@@ -78,7 +80,6 @@ struct AcpLiveSlot {
 pub struct CursorAcpProvider {
     host: AcpHost,
     agent_bin: PathBuf,
-    model: String,
     deep_dive_role: String,
     runs: HashMap<RunId, ActiveRun>,
     answer_pool: AnswerProcessorPoolManager,
@@ -109,7 +110,6 @@ impl CursorAcpProvider {
         Ok(Self {
             host,
             agent_bin: host.resolve_bin()?,
-            model: DEFAULT_MODEL.to_string(),
             deep_dive_role: Self::load_deep_dive_role(),
             runs: HashMap::new(),
             answer_pool: AnswerProcessorPoolManager::default(),
@@ -184,7 +184,6 @@ impl CursorAcpProvider {
         Self {
             host,
             agent_bin,
-            model: DEFAULT_MODEL.to_string(),
             deep_dive_role: Self::load_deep_dive_role(),
             runs: HashMap::new(),
             answer_pool: AnswerProcessorPoolManager::default(),
@@ -218,14 +217,29 @@ impl CursorAcpProvider {
                 self.shutdown_answer_slot(&agent_config_id, recycled);
             }
             for (sid, rid, prompt) in outcome.dispatched {
+                let pool_opts = self
+                    .answer_run_context
+                    .get(&run_id)
+                    .map(|ctx| (ctx.model.clone(), ctx.effort.clone()))
+                    .unwrap_or_else(|| ("auto".into(), "auto".into()));
                 self.answer_run_context.insert(
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.clone(),
                         _cwd: cwd.clone(),
+                        model: pool_opts.0.clone(),
+                        effort: pool_opts.1.clone(),
                     },
                 );
-                self.dispatch_answer_prompt(&agent_config_id, &cwd, sid, rid, prompt);
+                self.dispatch_answer_prompt(
+                    &agent_config_id,
+                    &cwd,
+                    sid,
+                    rid,
+                    prompt,
+                    &pool_opts.0,
+                    &pool_opts.1,
+                );
             }
         }
     }
@@ -256,14 +270,29 @@ impl CursorAcpProvider {
                 self.shutdown_question_maker_slot(&agent_config_id, recycled);
             }
             for (sid, rid, prompt) in outcome.dispatched {
+                let pool_opts = self
+                    .question_maker_run_context
+                    .get(&run_id)
+                    .map(|ctx| (ctx.model.clone(), ctx.effort.clone()))
+                    .unwrap_or_else(|| ("auto".into(), "auto".into()));
                 self.question_maker_run_context.insert(
                     rid,
                     PoolRunContext {
                         agent_config_id: agent_config_id.clone(),
                         _cwd: cwd.clone(),
+                        model: pool_opts.0.clone(),
+                        effort: pool_opts.1.clone(),
                     },
                 );
-                self.dispatch_question_maker_prompt(&agent_config_id, &cwd, sid, rid, prompt);
+                self.dispatch_question_maker_prompt(
+                    &agent_config_id,
+                    &cwd,
+                    sid,
+                    rid,
+                    prompt,
+                    &pool_opts.0,
+                    &pool_opts.1,
+                );
             }
         }
     }
@@ -308,6 +337,8 @@ impl CursorAcpProvider {
         agent_config_id: &str,
         cwd: &Path,
         slot_id: u32,
+        model: &str,
+        effort: &str,
     ) -> Result<()> {
         Self::ensure_slot_worker(
             agent_config_id,
@@ -315,7 +346,8 @@ impl CursorAcpProvider {
             slot_id,
             self.host,
             &self.agent_bin,
-            &self.model,
+            model,
+            effort,
             &mut self.answer_slot_workers,
             self.answer_slot_completion_tx.clone(),
         )
@@ -326,6 +358,8 @@ impl CursorAcpProvider {
         agent_config_id: &str,
         cwd: &Path,
         slot_id: u32,
+        model: &str,
+        effort: &str,
     ) -> Result<()> {
         Self::ensure_slot_worker(
             agent_config_id,
@@ -333,7 +367,8 @@ impl CursorAcpProvider {
             slot_id,
             self.host,
             &self.agent_bin,
-            &self.model,
+            model,
+            effort,
             &mut self.question_maker_slot_workers,
             self.question_maker_slot_completion_tx.clone(),
         )
@@ -346,6 +381,7 @@ impl CursorAcpProvider {
         host: AcpHost,
         agent_bin: &Path,
         model: &str,
+        effort: &str,
         slot_workers: &mut HashMap<String, HashMap<u32, AcpLiveSlot>>,
         done_tx: Sender<SlotCompletion>,
     ) -> Result<()> {
@@ -359,6 +395,7 @@ impl CursorAcpProvider {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let agent_bin = agent_bin.to_path_buf();
         let model = model.to_string();
+        let effort = effort.to_string();
         let cwd_buf = cwd.to_path_buf();
         let agent_id = agent_config_id.to_string();
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -373,6 +410,7 @@ impl CursorAcpProvider {
                 &agent_id,
                 &cwd_buf,
                 &model,
+                &effort,
                 slot_id,
                 cmd_rx,
                 done_tx,
@@ -403,9 +441,11 @@ impl CursorAcpProvider {
         slot_id: u32,
         run_id: RunId,
         prompt: String,
+        model: &str,
+        effort: &str,
     ) {
         if self
-            .ensure_answer_slot_worker(agent_config_id, cwd, slot_id)
+            .ensure_answer_slot_worker(agent_config_id, cwd, slot_id, model, effort)
             .is_err()
         {
             let outcome = self.answer_pool.complete_run(
@@ -423,9 +463,11 @@ impl CursorAcpProvider {
                     PoolRunContext {
                         agent_config_id: agent_config_id.to_string(),
                         _cwd: cwd.to_path_buf(),
+                        model: model.to_string(),
+                        effort: effort.to_string(),
                     },
                 );
-                self.dispatch_answer_prompt(agent_config_id, cwd, sid, rid, p);
+                self.dispatch_answer_prompt(agent_config_id, cwd, sid, rid, p, model, effort);
             }
             return;
         }
@@ -445,6 +487,8 @@ impl CursorAcpProvider {
         slot_id: u32,
         run_id: RunId,
         prompt: String,
+        model: &str,
+        effort: &str,
     ) {
         self.log_traffic(
             AgentRunKind::QuestionMakerReplenishment,
@@ -453,7 +497,7 @@ impl CursorAcpProvider {
             &prompt,
         );
         if self
-            .ensure_question_maker_slot_worker(agent_config_id, cwd, slot_id)
+            .ensure_question_maker_slot_worker(agent_config_id, cwd, slot_id, model, effort)
             .is_err()
         {
             let outcome = self.question_maker_pool.complete_run(
@@ -471,9 +515,19 @@ impl CursorAcpProvider {
                     PoolRunContext {
                         agent_config_id: agent_config_id.to_string(),
                         _cwd: cwd.to_path_buf(),
+                        model: model.to_string(),
+                        effort: effort.to_string(),
                     },
                 );
-                self.dispatch_question_maker_prompt(agent_config_id, cwd, sid, rid, p);
+                self.dispatch_question_maker_prompt(
+                    agent_config_id,
+                    cwd,
+                    sid,
+                    rid,
+                    p,
+                    model,
+                    effort,
+                );
             }
             return;
         }
@@ -491,12 +545,13 @@ impl CursorAcpProvider {
         kind: AgentRunKind,
         cwd: PathBuf,
         prompt: String,
+        model: String,
+        effort: String,
     ) -> Result<AgentRunHandle> {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
         let agent_bin = self.agent_bin.clone();
         let host = self.host;
-        let model = self.model.clone();
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let child_for_worker = child_slot.clone();
@@ -511,6 +566,7 @@ impl CursorAcpProvider {
             agent_bin = %agent_bin.display(),
             cwd = %cwd.display(),
             model = %model,
+            effort = %effort,
             prompt_chars = prompt.len(),
             "starting ACP run"
         );
@@ -524,6 +580,7 @@ impl CursorAcpProvider {
                 &agent_bin,
                 &cwd,
                 &model,
+                &effort,
                 &prompt,
                 child_for_worker,
                 cancelled_for_worker,
@@ -582,6 +639,7 @@ impl AgentProvider for CursorAcpProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &QuestionMakerSettings,
+        options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .question_maker_pool
@@ -592,11 +650,21 @@ impl AgentProvider for CursorAcpProvider {
             PoolRunContext {
                 agent_config_id: agent_config_id.to_string(),
                 _cwd: cwd.clone(),
+                model: options.model.clone(),
+                effort: options.effort.clone(),
             },
         );
         match assignment {
             QuestionMakerSubmitAssignment::Dispatch { slot_id, prompt } => {
-                self.dispatch_question_maker_prompt(agent_config_id, &cwd, slot_id, run_id, prompt);
+                self.dispatch_question_maker_prompt(
+                    agent_config_id,
+                    &cwd,
+                    slot_id,
+                    run_id,
+                    prompt,
+                    &options.model,
+                    &options.effort,
+                );
             }
             QuestionMakerSubmitAssignment::Queued { .. } => {}
         }
@@ -609,6 +677,7 @@ impl AgentProvider for CursorAcpProvider {
         cwd: PathBuf,
         prompt: InterviewAgentPrompt,
         pool: &AnswerProcessorSettings,
+        options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let (assignment, run_id) = self
             .answer_pool
@@ -619,11 +688,21 @@ impl AgentProvider for CursorAcpProvider {
             PoolRunContext {
                 agent_config_id: agent_config_id.to_string(),
                 _cwd: cwd.clone(),
+                model: options.model.clone(),
+                effort: options.effort.clone(),
             },
         );
         match assignment {
             AnswerSubmitAssignment::Dispatch { slot_id, prompt } => {
-                self.dispatch_answer_prompt(agent_config_id, &cwd, slot_id, run_id, prompt);
+                self.dispatch_answer_prompt(
+                    agent_config_id,
+                    &cwd,
+                    slot_id,
+                    run_id,
+                    prompt,
+                    &options.model,
+                    &options.effort,
+                );
             }
             AnswerSubmitAssignment::Queued { .. } => {}
         }
@@ -636,11 +715,18 @@ impl AgentProvider for CursorAcpProvider {
         cwd: PathBuf,
         context: DeepDiveContext,
         initial_message: Option<String>,
+        options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
         let prompt =
             build_deep_dive_prompt(&self.deep_dive_role, &context, initial_message.as_deref());
         let _ = agent_config_id;
-        self.spawn_run(AgentRunKind::DeepDiveChat, cwd, prompt)
+        self.spawn_run(
+            AgentRunKind::DeepDiveChat,
+            cwd,
+            prompt,
+            options.model,
+            options.effort,
+        )
     }
 
     fn start_fleet_agent(
@@ -648,8 +734,15 @@ impl AgentProvider for CursorAcpProvider {
         agent_config_id: &str,
         cwd: PathBuf,
         prompt: String,
+        options: AgentLaunchOptions,
     ) -> Result<AgentRunHandle> {
-        let handle = self.spawn_run(AgentRunKind::FleetAgent, cwd, prompt)?;
+        let handle = self.spawn_run(
+            AgentRunKind::FleetAgent,
+            cwd,
+            prompt,
+            options.model,
+            options.effort,
+        )?;
         self.fleet_run_context
             .insert(handle.id, agent_config_id.to_string());
         Ok(handle)
@@ -835,6 +928,7 @@ fn run_acp_session(
     agent_bin: &Path,
     cwd: &Path,
     model: &str,
+    effort: &str,
     prompt: &str,
     child_slot: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
@@ -911,33 +1005,13 @@ fn run_acp_session(
             .and_then(Value::as_str)
             .context("session/new missing sessionId")?;
 
-        if let Some(model_option) = pick_model_option(session_result.get("configOptions")) {
-            let target = if has_model_value(&model_option, model) {
-                model
-            } else {
-                model_option
-                    .get("currentValue")
-                    .and_then(Value::as_str)
-                    .unwrap_or(model)
-            };
-            if model_option.get("currentValue").and_then(Value::as_str) != Some(target) {
-                tracing::debug!(
-                    event = "agent",
-                    action = "acp_set_model",
-                    target,
-                    "ACP session/set_config_option model"
-                );
-                session.send_request(
-                    "session/set_config_option",
-                    json!({
-                        "sessionId": session_id,
-                        "configId": model_option.get("id").cloned().unwrap_or(json!("model")),
-                        "value": target
-                    }),
-                )?;
-                session.await_response(AUTH_TIMEOUT)?;
-            }
-        }
+        apply_session_config_options(
+            &mut session,
+            session_id,
+            session_result.get("configOptions"),
+            model,
+            effort,
+        )?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -1335,15 +1409,110 @@ fn pick_model_option(config_options: Option<&Value>) -> Option<Value> {
         .cloned()
 }
 
-fn has_model_value(model_option: &Value, model_id: &str) -> bool {
-    model_option
+fn pick_effort_option(config_options: Option<&Value>) -> Option<Value> {
+    let options = config_options?.as_array()?;
+    options
+        .iter()
+        .find(|o| {
+            matches!(
+                o.get("category").and_then(Value::as_str),
+                Some("effort") | Some("thinking")
+            )
+        })
+        .or_else(|| {
+            options.iter().find(|o| {
+                o.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| {
+                        let lower = id.to_ascii_lowercase();
+                        lower.contains("effort") || lower.contains("thinking")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .cloned()
+}
+
+fn has_config_option_value(option: &Value, value_id: &str) -> bool {
+    option
         .get("options")
         .and_then(Value::as_array)
         .is_some_and(|options| {
             options
                 .iter()
-                .any(|o| o.get("value").and_then(Value::as_str) == Some(model_id))
+                .any(|o| o.get("value").and_then(Value::as_str) == Some(value_id))
         })
+}
+
+fn apply_session_config_options(
+    session: &mut AcpClient,
+    session_id: &str,
+    config_options: Option<&Value>,
+    model: &str,
+    effort: &str,
+) -> Result<()> {
+    if let Some(model_option) = pick_model_option(config_options) {
+        let target = if has_config_option_value(&model_option, model) {
+            model
+        } else {
+            model_option
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .unwrap_or(model)
+        };
+        if model_option.get("currentValue").and_then(Value::as_str) != Some(target) {
+            tracing::debug!(
+                event = "agent",
+                action = "acp_set_model",
+                target,
+                "ACP session/set_config_option model"
+            );
+            session.send_request(
+                "session/set_config_option",
+                json!({
+                    "sessionId": session_id,
+                    "configId": model_option.get("id").cloned().unwrap_or(json!("model")),
+                    "value": target
+                }),
+            )?;
+            session.await_response(AUTH_TIMEOUT)?;
+        }
+    }
+
+    if let Some(effort_value) = effort_for_acp(effort) {
+        if let Some(effort_option) = pick_effort_option(config_options) {
+            let target = if has_config_option_value(&effort_option, effort_value) {
+                effort_value
+            } else {
+                effort_option
+                    .get("currentValue")
+                    .and_then(Value::as_str)
+                    .unwrap_or(effort_value)
+            };
+            if effort_option.get("currentValue").and_then(Value::as_str) != Some(target) {
+                tracing::debug!(
+                    event = "agent",
+                    action = "acp_set_effort",
+                    target,
+                    "ACP session/set_config_option effort"
+                );
+                session.send_request(
+                    "session/set_config_option",
+                    json!({
+                        "sessionId": session_id,
+                        "configId": effort_option
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(json!("effort")),
+                        "value": target
+                    }),
+                )?;
+                session.await_response(AUTH_TIMEOUT)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 struct PersistentAcpSession {
@@ -1358,6 +1527,7 @@ impl PersistentAcpSession {
         agent_bin: &Path,
         cwd: &Path,
         model: &str,
+        effort: &str,
         child_slot: Arc<Mutex<Option<Child>>>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<Self> {
@@ -1418,27 +1588,13 @@ impl PersistentAcpSession {
             .context("session/new missing sessionId")?
             .to_string();
 
-        if let Some(model_option) = pick_model_option(session_result.get("configOptions")) {
-            let target = if has_model_value(&model_option, model) {
-                model
-            } else {
-                model_option
-                    .get("currentValue")
-                    .and_then(Value::as_str)
-                    .unwrap_or(model)
-            };
-            if model_option.get("currentValue").and_then(Value::as_str) != Some(target) {
-                client.send_request(
-                    "session/set_config_option",
-                    json!({
-                        "sessionId": session_id,
-                        "configId": model_option.get("id").cloned().unwrap_or(json!("model")),
-                        "value": target
-                    }),
-                )?;
-                client.await_response(AUTH_TIMEOUT)?;
-            }
-        }
+        apply_session_config_options(
+            &mut client,
+            &session_id,
+            session_result.get("configOptions"),
+            model,
+            effort,
+        )?;
 
         Ok(Self {
             client,
@@ -1501,6 +1657,7 @@ fn run_acp_pool_slot(
     agent_config_id: &str,
     cwd: &Path,
     model: &str,
+    effort: &str,
     slot_id: u32,
     cmd_rx: Receiver<SlotCommand>,
     done_tx: Sender<SlotCompletion>,
@@ -1514,6 +1671,7 @@ fn run_acp_pool_slot(
         agent_bin,
         cwd,
         model,
+        effort,
         child_slot.clone(),
         cancelled.clone(),
     ) {
@@ -1587,6 +1745,33 @@ mod tests {
             .as_deref(),
             Some("cursor_login")
         );
+    }
+
+    #[test]
+    fn pick_effort_option_matches_category_and_id() {
+        let by_category = json!([
+            { "id": "model", "category": "model", "currentValue": "auto" },
+            {
+                "id": "reasoning",
+                "category": "effort",
+                "currentValue": "medium",
+                "options": [{ "value": "low" }, { "value": "high" }]
+            }
+        ]);
+        let effort = pick_effort_option(Some(&by_category)).expect("effort option");
+        assert_eq!(
+            effort.get("category").and_then(Value::as_str),
+            Some("effort")
+        );
+
+        let by_id = json!([{ "id": "thinking-level", "currentValue": "low" }]);
+        let thinking = pick_effort_option(Some(&by_id)).expect("thinking id");
+        assert_eq!(
+            thinking.get("id").and_then(Value::as_str),
+            Some("thinking-level")
+        );
+
+        assert!(pick_effort_option(Some(&json!([]))).is_none());
     }
 
     #[test]

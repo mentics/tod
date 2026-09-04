@@ -88,9 +88,7 @@ mod tests {
             .join("process");
         if root.join("README.md").is_file() {
             let paths = TodInstallPaths::from_process_root(root).unwrap();
-            assert!(paths
-                .resolve("agents/interview/base.md")
-                .is_file());
+            assert!(paths.resolve("agents/interview/base.md").is_file());
         }
     }
 }

@@ -94,10 +94,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutlineEntry> {
     Ok(OutlineEntry {
         node_id: blob_to_uuid_sql(&node_blob)?,
         list_id: blob_to_uuid_sql(&list_blob)?,
-        parent_id: parent_blob
-            .as_deref()
-            .map(blob_to_uuid_sql)
-            .transpose()?,
+        parent_id: parent_blob.as_deref().map(blob_to_uuid_sql).transpose()?,
         ordinal: row.get(3)?,
         collapsed: row.get::<_, i32>(4)? != 0,
     })

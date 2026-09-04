@@ -17,7 +17,5 @@ pub use routing::{TaskListProceedContext, interview_work_remains};
 
 pub use bootstrap::bootstrap;
 pub use db::{InterviewSession, InterviewSessionStatus, NewInterviewSession, SessionStore};
-pub use paths::{
-    TodPaths, set_data_root,
-};
+pub use paths::{TodPaths, set_data_root};
 pub use settings::TodSettings;

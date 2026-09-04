@@ -114,7 +114,9 @@ mod tests {
     use super::*;
     use crate::fleet::reconnect_identity;
     use crate::fleet::reconnect_identity::ReconnectIdentity;
-    use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
+    use crate::fleet::repos::agent_config::{
+        AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent,
+    };
     use crate::fleet::repos::task::{FleetTask, TaskRepo};
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
     use crate::fleet::runtime::NoopGuestLiveness;
@@ -133,7 +135,12 @@ mod tests {
     fn failed_reattach_persists_not_running_without_notification() {
         let (dir, conn) = test_writer_conn();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10), crate::fleet::command_log::CommandLog::shared()).unwrap();
+        let writer = FleetWriter::open_with_debounce(
+            &path,
+            Duration::from_millis(10),
+            crate::fleet::command_log::CommandLog::shared(),
+        )
+        .unwrap();
         let task_id = uuid::Uuid::new_v4().to_string();
         let agent_id = uuid::Uuid::new_v4().to_string();
         TaskRepo::new(&conn)
@@ -147,6 +154,9 @@ mod tests {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             })
             .unwrap();
         AgentRepo::new(&conn)
@@ -162,8 +172,8 @@ mod tests {
             )
             .unwrap();
 
-        let report = reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_fail_verify)
-            .unwrap();
+        let report =
+            reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_fail_verify).unwrap();
         assert_eq!(report.agents_not_running, 1);
 
         let agent = AgentRepo::new(&conn).get(&agent_id).unwrap().unwrap();
@@ -183,7 +193,12 @@ mod tests {
     fn successful_reattach_persists_live_status() {
         let (dir, conn) = test_writer_conn();
         let path = dir.join("tod.db");
-        let writer = FleetWriter::open_with_debounce(&path, Duration::from_millis(10), crate::fleet::command_log::CommandLog::shared()).unwrap();
+        let writer = FleetWriter::open_with_debounce(
+            &path,
+            Duration::from_millis(10),
+            crate::fleet::command_log::CommandLog::shared(),
+        )
+        .unwrap();
         let task_id = uuid::Uuid::new_v4().to_string();
         let agent_id = uuid::Uuid::new_v4().to_string();
         TaskRepo::new(&conn)
@@ -197,6 +212,9 @@ mod tests {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             })
             .unwrap();
         AgentRepo::new(&conn)
@@ -207,8 +225,8 @@ mod tests {
             .update_reconnect(&agent_id, identity)
             .unwrap();
 
-        let report = reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_pass_verify)
-            .unwrap();
+        let report =
+            reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_pass_verify).unwrap();
         assert_eq!(report.agents_live, 1);
 
         let agent = AgentRepo::new(&conn).get(&agent_id).unwrap().unwrap();

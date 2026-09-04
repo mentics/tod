@@ -92,8 +92,7 @@ mod tests {
                 }
             };
             assert!(
-                matches!(err, FleetLockError::InUse(_))
-                    || matches!(err, FleetLockError::Other(_))
+                matches!(err, FleetLockError::InUse(_)) || matches!(err, FleetLockError::Other(_))
             );
         }
         drop(lock1);

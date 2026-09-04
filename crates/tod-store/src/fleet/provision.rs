@@ -1,12 +1,13 @@
 //! Auto-provision interview-mode agent configs with worktrees.
 
+use crate::agent_launch::platform_storage;
 use crate::fleet::FleetStore;
-use crate::fleet::repos::agent_config::{AgentConfigRepo, AgentConfigRow, NewAgentConfig};
+use crate::fleet::repos::agent_config::{AgentConfigRow, NewAgentConfig};
 use crate::fleet::worktree::{self, WorktreeHandle, validate_git_repo};
 use crate::fleet::writer::FleetMutation;
-use crate::settings::TodSettings;
-use crate::paths::TodPaths;
 use crate::path_util::path_for_storage;
+use crate::paths::TodPaths;
+use crate::settings::TodSettings;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -60,7 +61,7 @@ pub fn workspace_cwd_for_agent(agent: &AgentConfigRow) -> Result<PathBuf> {
 
 fn repo_root_from_task(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> {
     let task = fleet
-        .get_task(node_id)?
+        .get_node(node_id)?
         .with_context(|| format!("task {node_id} not found"))?;
     let repo = task
         .repo
@@ -71,15 +72,17 @@ fn repo_root_from_task(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> {
 
 /// Resolve the workspace directory for an agent config.
 ///
+/// Uses the config owner's node (`agent.node_id`) for repo/branch lookup.
+///
 /// - Worktree enabled: provision or reuse an isolated worktree under the data root.
-/// - Otherwise: optional explicit `work_directory`, else the task's git repository root.
+/// - Otherwise: optional explicit `work_directory`, else the owner's git repository root.
 pub fn resolve_agent_workspace(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
     agent: &AgentConfigRow,
-    node_id: &str,
 ) -> Result<PathBuf> {
+    let node_id = agent.node_id.as_str();
     if agent.use_worktree {
         return ensure_worktree_for_agent_config(fleet, paths, settings, &agent.id, node_id);
     }
@@ -111,7 +114,7 @@ fn ensure_worktree_for_agent_config(
     }
 
     let task = fleet
-        .get_task(node_id)?
+        .get_node(node_id)?
         .with_context(|| format!("task {node_id} not found"))?;
     let repo = task
         .repo
@@ -155,11 +158,8 @@ fn ensure_worktree_for_agent_config(
 }
 
 /// Describe where this config would run (for UI), without provisioning a worktree.
-pub fn describe_agent_workspace(
-    fleet: &FleetStore,
-    agent: &AgentConfigRow,
-    node_id: &str,
-) -> String {
+pub fn describe_agent_workspace(fleet: &FleetStore, agent: &AgentConfigRow) -> String {
+    let node_id = agent.node_id.as_str();
     if agent.use_worktree {
         if let Some(path) = agent.worktree_path.as_deref().filter(|p| !p.is_empty()) {
             return format!("Worktree: {path}");
@@ -176,6 +176,8 @@ pub fn describe_agent_workspace(
 }
 
 /// Ensure an interview-mode agent config exists for `node_id`, with a worktree when needed.
+///
+/// Reuses an interview config on this node or a nearer ancestor before creating a new one.
 pub fn ensure_interview_agent_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
@@ -183,18 +185,13 @@ pub fn ensure_interview_agent_for_node(
     node_id: &str,
 ) -> Result<InterviewAgentContext> {
     fleet.reload_if_stale().ok();
-    {
-        let projection = fleet.projection();
-        let guard = projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        if let Some(existing) = AgentConfigRepo::new(&conn).find_interview_for_node(node_id)? {
-            ensure_worktree_path_valid(&existing)?;
-            let cwd = workspace_cwd_for_agent(&existing)?;
-            return Ok(InterviewAgentContext {
-                agent: existing,
-                cwd,
-            });
-        }
+    if let Some(existing) = fleet.resolve_interview_agent_for_node(node_id)? {
+        ensure_worktree_path_valid(&existing)?;
+        let cwd = workspace_cwd_for_agent(&existing)?;
+        return Ok(InterviewAgentContext {
+            agent: existing,
+            cwd,
+        });
     }
 
     let (repo_path, branch) = task_repo_branch(fleet, node_id)?;
@@ -227,6 +224,9 @@ pub fn ensure_interview_agent_for_node(
             mode: "interview".into(),
             work_directory: None,
             use_worktree: true,
+            platform: platform_storage(settings.agent_platform).to_string(),
+            model: settings.agent_model().to_string(),
+            effort: settings.agent_effort().to_string(),
         },
     })?;
     fleet.enqueue(FleetMutation::UpdateAgentWorktreeDetails {

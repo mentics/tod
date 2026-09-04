@@ -1,10 +1,10 @@
-use tod_store::fleet::FleetStore;
 use crate::interview::TodPaths;
 use crate::process_bundle::{
     AgentLaunchContext, InterviewAgentPrompt, ProcessManifest, TodInstallPaths,
 };
 use std::path::Path;
 use std::sync::Arc;
+use tod_store::fleet::FleetStore;
 
 pub fn question_maker_replenish_prompt(
     fleet: &Arc<FleetStore>,

@@ -1,7 +1,7 @@
 //! Runtime obligation resolution (root → leaf, additive).
 
-use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::repos::obligations::NodeObligation;
+use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::{Capability, NodeKind};
 use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::{Context, Result};
@@ -17,9 +17,7 @@ pub struct ResolvedObligation {
 
 pub fn resolve_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<ResolvedObligation>> {
     let outline = OutlineRepo::new(conn);
-    let entry = outline
-        .get_entry(node_id)?
-        .context("node not in outline")?;
+    let entry = outline.get_entry(node_id)?.context("node not in outline")?;
     let loader = crate::outline::repos::tree::TreeLoader::new(conn);
     if loader.list_has_open_loop(entry.list_id)? {
         anyhow::bail!("reference loop in list — fix before resolving obligations");
@@ -34,7 +32,7 @@ pub fn resolve_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<Resol
         });
     }
 
-    let ancestors = collect_ancestors(conn, node_id, entry.list_id)?;
+    let ancestors = ancestor_chain(conn, node_id)?;
     let node_repo = NodeRepo::new(conn);
     let obl_repo = ObligationRepo::new(conn);
     let mut visited_refs = HashSet::new();
@@ -51,6 +49,17 @@ pub fn resolve_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<Resol
     }
 
     Ok(out)
+}
+
+/// Outline ancestors from root → leaf (inclusive of `node_id`).
+///
+/// Returns a single-element chain (`[node_id]`) when the node is not in the outline.
+pub fn ancestor_chain(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
+    let outline = OutlineRepo::new(conn);
+    let Some(entry) = outline.get_entry(node_id)? else {
+        return Ok(vec![node_id]);
+    };
+    collect_ancestors(conn, node_id, entry.list_id)
 }
 
 fn collect_ancestors(conn: &Connection, node_id: Uuid, list_id: Uuid) -> Result<Vec<Uuid>> {
@@ -111,16 +120,9 @@ fn collect_node_obligations(
 }
 
 /// Copy spec capability data from source to target node.
-pub fn copy_capabilities(
-    conn: &Connection,
-    source_id: Uuid,
-    target_id: Uuid,
-) -> Result<()> {
+pub fn copy_capabilities(conn: &Connection, source_id: Uuid, target_id: Uuid) -> Result<()> {
     let node_repo = NodeRepo::new(conn);
-    node_repo.enable_capabilities(
-        target_id,
-        &[Capability::Spec],
-    )?;
+    node_repo.enable_capabilities(target_id, &[Capability::Spec])?;
 
     let obl_repo = ObligationRepo::new(conn);
     for ob in obl_repo.list_for_node(source_id)? {

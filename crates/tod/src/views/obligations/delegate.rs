@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
 use crate::ui::selectable_text::selectable_text;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -9,6 +8,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, StyledExt, h_flex};
+use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
 
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
 pub const NO_SECTION: &str = "<no section>";

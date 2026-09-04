@@ -70,7 +70,9 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
     for index in 0..TASK_COUNT {
         let task = deterministic_task(index);
         task_ids.push(task.id.clone());
-        TaskRepo::new(conn).insert(&task).expect("scale task insert");
+        TaskRepo::new(conn)
+            .insert(&task)
+            .expect("scale task insert");
     }
 
     for index in 0..AGENT_COUNT {
@@ -85,6 +87,9 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
             mode: "agent".into(),
             work_directory: None,
             use_worktree: false,
+            platform: "claude".into(),
+            model: "default".into(),
+            effort: "auto".into(),
         };
         AgentRepo::new(conn)
             .insert(&agent)

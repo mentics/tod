@@ -8,11 +8,7 @@ use windows::Win32::Foundation::HWND;
 pub fn foreground_hwnd() -> Option<HWND> {
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let hwnd = unsafe { GetForegroundWindow() };
-    if hwnd.0 == 0 {
-        None
-    } else {
-        Some(hwnd)
-    }
+    if hwnd.0 == 0 { None } else { Some(hwnd) }
 }
 
 /// After the main window is created, show it without activating (Windows only).
@@ -20,7 +16,7 @@ pub fn foreground_hwnd() -> Option<HWND> {
 #[cfg(windows)]
 pub fn after_window_open(previous_foreground: Option<HWND>) {
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsWindow, SetForegroundWindow, ShowWindow, SW_SHOWNOACTIVATE,
+        IsWindow, SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow,
     };
 
     let Some(hwnd) = main_hwnd() else {

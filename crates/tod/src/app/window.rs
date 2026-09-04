@@ -6,8 +6,9 @@ use super::no_focus;
 use crate::agent_socket;
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
 use crate::app::history_window::HistoryWindowControl;
-use crate::app::interactive_agent_window::InteractiveAgentWindowControl;
-use crate::app::shell_socket::ShellSocketService;
+use crate::app::interactive_agent_window::{
+    InteractiveAgentOpenParams, InteractiveAgentWindowControl,
+};
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
@@ -76,6 +77,13 @@ struct PendingOpenAgent {
     agent_id: Option<String>,
 }
 
+struct PendingLaunchOrFocusAgent {
+    task_id: String,
+    config_id: String,
+    /// When true, open the panel and launch an auto run after open.
+    launch_auto: bool,
+}
+
 pub struct Shell {
     active_view: ShellView,
     task_list: Entity<TaskListView>,
@@ -107,6 +115,7 @@ pub struct Shell {
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
     pending_open_agent: Option<PendingOpenAgent>,
+    pending_launch_or_focus_agent: Option<PendingLaunchOrFocusAgent>,
     pending_close_agent_panel: bool,
     pending_retarget_agent: Option<(String, String)>,
     pending_error_toast: Option<String>,
@@ -281,16 +290,13 @@ impl Shell {
     }
 
     fn replace_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
-        let backend = AgentBackend::from_platform(platform);
-        let provider = backend.build_provider(self.traffic_log.clone());
-        if let Ok(mut guard) = self.agent.lock() {
-            *guard = provider;
-        }
+        // RoutingAgentProvider already hosts both Cursor and Claude; settings persist the
+        // preferred interview platform without swapping the shared provider mutex.
         tracing::info!(
             event = "agent",
-            action = "platform_swap",
+            action = "platform_settings_updated",
             platform = platform.label(),
-            "swapped interview agent provider"
+            "interview agent platform setting updated (routing provider unchanged)"
         );
         self.refresh_agent_status(cx);
     }
@@ -521,7 +527,8 @@ impl Shell {
                 agent_id
             } else {
                 self.fleet
-                    .list_agent_configs_for_task(&task_id)?
+                    .resolve_agents_for_node(&task_id)?
+                    .configs
                     .into_iter()
                     .next()
                     .map(|row| row.id)
@@ -552,6 +559,75 @@ impl Shell {
             }
             Err(err) => {
                 self.queue_error_toast(format!("Shell failed: {err:#}"), cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn handle_launch_or_focus_agent(
+        &mut self,
+        task_id: String,
+        config_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(agent) = self.fleet.get_agent(&config_id).ok().flatten() else {
+            self.queue_error_toast(format!("Agent config {config_id} not found"), cx);
+            return;
+        };
+        match agent.mode.as_str() {
+            "interview" => {
+                self.queue_error_toast(
+                    "Interview agents are launched from the Interview view.",
+                    cx,
+                );
+            }
+            "shell" => {
+                let sessions = self
+                    .fleet
+                    .list_interactive_sessions_for_config(&config_id)
+                    .unwrap_or_default();
+                let result = if let Some(run) = sessions.first() {
+                    self._interactive_agent_window.open_session(
+                        InteractiveAgentOpenParams {
+                            task_id: task_id.clone(),
+                            config_id: config_id.clone(),
+                            session_run_id: run.id.clone(),
+                        },
+                        cx,
+                    )
+                } else {
+                    self._interactive_agent_window
+                        .create_and_open_session(&task_id, &config_id, cx)
+                        .map(|_| ())
+                };
+                match result {
+                    Ok(()) => {
+                        let _ = self.fleet.reload_if_stale();
+                        self.task_list.update(cx, |list, cx| {
+                            list.set_status_message(
+                                format!("Opened interactive agent {config_id}"),
+                                cx,
+                            );
+                            list.request_live_refresh(cx);
+                        });
+                    }
+                    Err(err) => {
+                        self.queue_error_toast(format!("Interactive agent failed: {err}"), cx);
+                    }
+                }
+            }
+            _ => {
+                // Auto mode: focus panel if running, else open panel and launch.
+                let running = matches!(
+                    agent.runtime_status.as_str(),
+                    "starting" | "processing" | "waiting" | "blocked"
+                );
+                self.pending_launch_or_focus_agent = Some(PendingLaunchOrFocusAgent {
+                    task_id,
+                    config_id,
+                    launch_auto: !running,
+                });
+                cx.notify();
             }
         }
         cx.notify();
@@ -766,29 +842,28 @@ impl Shell {
     fn render_tasks_split(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let drawer = if self.obligations.read(cx).is_open() {
-            self.obligations.clone().into_any_element()
-        } else if self.task_edit.read(cx).is_open() {
-            self.task_edit.clone().into_any_element()
-        } else if self.agent_panel.read(cx).is_open() {
-            self.agent_panel.clone().into_any_element()
-        } else {
-            div()
-                .size_full()
-                .v_flex()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .bg(theme.background)
-                .text_color(muted)
-                .child(div().text_sm().font_semibold().child("Agent configs"))
-                .child(
-                    div()
-                        .text_xs()
-                        .child("Select a task and press A to create or open an agent config"),
-                )
-                .into_any_element()
-        };
+        let drawer =
+            if self.obligations.read(cx).is_open() {
+                self.obligations.clone().into_any_element()
+            } else if self.task_edit.read(cx).is_open() {
+                self.task_edit.clone().into_any_element()
+            } else if self.agent_panel.read(cx).is_open() {
+                self.agent_panel.clone().into_any_element()
+            } else {
+                div()
+                    .size_full()
+                    .v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .bg(theme.background)
+                    .text_color(muted)
+                    .child(div().text_sm().font_semibold().child("Agent configs"))
+                    .child(div().text_xs().child(
+                        "Press A to launch an agent, T for a shell, Shift+A for a new config",
+                    ))
+                    .into_any_element()
+            };
 
         h_panel_split("tasks-split", &self.tasks_split_state)
             .min_left(px(TASKS_TREE_MIN))
@@ -850,6 +925,14 @@ impl Shell {
         }
         if let Some(pending) = self.pending_open_agent.take() {
             self.open_agent_panel(&pending.task_id, pending.agent_id.as_deref(), window, cx);
+        }
+        if let Some(pending) = self.pending_launch_or_focus_agent.take() {
+            self.open_agent_panel(&pending.task_id, Some(&pending.config_id), window, cx);
+            if pending.launch_auto {
+                self.agent_panel.update(cx, |panel, cx| {
+                    panel.launch_auto_run(window, cx);
+                });
+            }
         }
     }
 
@@ -996,9 +1079,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     #[cfg(feature = "agent-socket")]
     let shell_for_socket =
         std::sync::Arc::new(std::sync::Mutex::new(None::<gpui::WeakEntity<Shell>>));
-    #[cfg(feature = "agent-socket")]
-    let shell_socket_service =
-        std::sync::Arc::new(std::sync::Mutex::new(None::<ShellSocketService>));
 
     let handle = cx.open_window(
         WindowOptions {
@@ -1024,8 +1104,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             let history_window = history_window.clone();
             #[cfg(feature = "agent-socket")]
             let shell_for_socket = shell_for_socket.clone();
-            #[cfg(feature = "agent-socket")]
-            let shell_socket_service = shell_socket_service.clone();
             move |window, cx| {
                 let paths_for_geometry = paths.clone();
                 let transcript_for_close = transcript_window.clone();
@@ -1175,6 +1253,16 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 );
                                             }
                                         }
+                                        TaskListEvent::LaunchOrFocusAgent {
+                                            task_id,
+                                            config_id,
+                                        } => {
+                                            this.handle_launch_or_focus_agent(
+                                                task_id.clone(),
+                                                config_id.clone(),
+                                                cx,
+                                            );
+                                        }
                                         TaskListEvent::CloseAgentPanel => {
                                             this.queue_close_agent_panel(cx);
                                         }
@@ -1313,6 +1401,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
                                 pending_open_agent: None,
+                                pending_launch_or_focus_agent: None,
                                 pending_close_agent_panel: false,
                                 pending_retarget_agent: None,
                                 pending_error_toast: None,
@@ -1340,10 +1429,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 if let Ok(mut slot) = shell_for_socket.lock() {
                                     *slot = Some(cx.weak_entity());
                                 }
-                                if let Ok(mut slot) = shell_socket_service.lock() {
-                                    *slot =
-                                        Some(ShellSocketService::new(fleet.clone(), paths.clone()));
-                                }
                             }
                             shell
                         });
@@ -1370,11 +1455,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             .ok()
             .and_then(|slot| slot.clone())
             .expect("shell weak entity for agent socket");
-        let shell_socket = shell_socket_service
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-            .expect("shell socket service for agent socket");
         agent_socket::start(
             cx,
             handle.into(),
@@ -1384,7 +1464,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             height,
             transcript_for_socket,
             shell_weak,
-            shell_socket,
         );
     }
 

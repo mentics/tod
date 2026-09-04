@@ -72,8 +72,12 @@ impl FleetPaths {
     }
 
     pub fn ensure_root(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.root)
-            .with_context(|| format!("failed to create fleet storage root {}", self.root.display()))?;
+        std::fs::create_dir_all(&self.root).with_context(|| {
+            format!(
+                "failed to create fleet storage root {}",
+                self.root.display()
+            )
+        })?;
         std::fs::create_dir_all(self.media())
             .with_context(|| format!("failed to create media dir {}", self.media().display()))?;
         Ok(())

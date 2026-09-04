@@ -4,16 +4,20 @@ mod cursor_acp;
 mod mock;
 mod provider;
 mod question_maker_pool;
+mod routing;
 
+#[allow(unused_imports)] // public API surface for agent backends
 pub use acp_host::{AcpHost, AgentPlatform};
-
+#[allow(unused_imports)]
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;
 pub use provider::{AgentProvider, AgentRunState, DeepDiveContext, RunId};
+pub use routing::RoutingAgentProvider;
+#[allow(unused_imports)]
+pub use tod_store::AgentLaunchOptions;
 
 use tod_store::agent_traffic::SharedAgentTrafficLog;
 
-use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
@@ -59,29 +63,8 @@ impl AgentBackend {
     ) -> Box<dyn AgentProvider + Send> {
         match self {
             Self::Mock => Box::new(MockAgentProvider::new().with_traffic_log(traffic_log)),
-            Self::Cursor => Box::new(
-                CursorAcpProvider::for_host(AcpHost::Cursor)
-                    .unwrap_or_else(|err| {
-                        eprintln!(
-                            "Cursor ACP provider init failed: {err}; using placeholder agent path"
-                        );
-                        CursorAcpProvider::with_agent_bin(AcpHost::Cursor, PathBuf::from("agent"))
-                    })
-                    .with_traffic_log(traffic_log),
-            ),
-            Self::Claude => Box::new(
-                CursorAcpProvider::for_host(AcpHost::Claude)
-                    .unwrap_or_else(|err| {
-                        eprintln!(
-                            "Claude ACP provider init failed: {err}; using placeholder adapter path"
-                        );
-                        CursorAcpProvider::with_agent_bin(
-                            AcpHost::Claude,
-                            PathBuf::from("claude-code-acp"),
-                        )
-                    })
-                    .with_traffic_log(traffic_log),
-            ),
+            // Non-mock: always route so per-config / settings platform can pick either host.
+            Self::Cursor | Self::Claude => Box::new(RoutingAgentProvider::new(traffic_log)),
         }
     }
 

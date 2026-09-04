@@ -11,20 +11,28 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Timer, Window, actions, div,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, Styled, Subscription, Timer, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
+use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
 use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
 use tod_store::fleet::repos::shell::ShellSession;
 use tod_store::fleet::terminal::{
-    focus_shell_session, open_shell_for_agent_config, prune_stale_shell_sessions,
+    focus_shell_session, focus_terminal_agent_run, open_shell_for_agent_config,
+    open_terminal_agent_for_config, prune_stale_shell_sessions, prune_stale_terminal_agent_runs,
     remove_shell_state,
 };
-use tod_store::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
+use tod_store::fleet::{
+    AgentRun, FleetMutation, FleetStore, NewAgentConfig, open_zed_for_agent_config,
+};
+use tod_store::{
+    AgentPlatform, coerce_effort, coerce_model, efforts_for, models_for, parse_platform,
+    platform_storage,
+};
 
 const AGENT_CONFIG_CONTEXT: &str = "AgentConfig";
 
@@ -65,6 +73,13 @@ pub struct AgentConfigPanelView {
     env_type: String,
     mode: String,
     use_worktree: bool,
+    platform: String,
+    model: String,
+    effort: String,
+    platform_select: Entity<SelectState<Vec<String>>>,
+    model_select: Entity<SelectState<Vec<String>>>,
+    effort_select: Entity<SelectState<Vec<String>>>,
+    pending_launch_select_sync: bool,
     runtime_status: String,
     active_run_id: Option<String>,
     worktree_path: Option<String>,
@@ -73,13 +88,17 @@ pub struct AgentConfigPanelView {
     in_flight: Vec<InFlightFleetRun>,
     shells: Vec<ShellSession>,
     chat_sessions: Vec<AgentRun>,
+    terminal_agents: Vec<AgentRun>,
     status_message: String,
     shell_poll_generation: u64,
+    _platform_select_subscription: Subscription,
+    _model_select_subscription: Subscription,
+    _effort_select_subscription: Subscription,
 }
 
 impl AgentConfigPanelView {
     pub fn new(
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
@@ -94,6 +113,57 @@ impl AgentConfigPanelView {
             )
             .expect("dev process bundle fallback")
         });
+        let platform = platform_storage(settings.agent_platform).to_string();
+        let model = settings.agent_model().to_string();
+        let effort = settings.agent_effort().to_string();
+
+        let platform_select = cx.new(|cx| {
+            SelectState::new(vec!["claude".into(), "cursor".into()], None, window, cx)
+                .searchable(true)
+        });
+        let models = catalog_strings(models_for(settings.agent_platform));
+        let efforts = catalog_strings(efforts_for(settings.agent_platform));
+        let model_select = cx.new(|cx| SelectState::new(models, None, window, cx).searchable(true));
+        let effort_select =
+            cx.new(|cx| SelectState::new(efforts, None, window, cx).searchable(true));
+        platform_select.update(cx, |select, cx| {
+            select.set_selected_value(&platform, window, cx);
+        });
+        model_select.update(cx, |select, cx| {
+            select.set_selected_value(&model, window, cx);
+        });
+        effort_select.update(cx, |select, cx| {
+            select.set_selected_value(&effort, window, cx);
+        });
+
+        let _platform_select_subscription = cx.subscribe(
+            &platform_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.platform = value.clone();
+                    this.pending_launch_select_sync = true;
+                    cx.notify();
+                }
+            },
+        );
+        let _model_select_subscription = cx.subscribe(
+            &model_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.model = value.clone();
+                    cx.notify();
+                }
+            },
+        );
+        let _effort_select_subscription = cx.subscribe(
+            &effort_select,
+            |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    this.effort = value.clone();
+                    cx.notify();
+                }
+            },
+        );
 
         Self {
             fleet,
@@ -107,8 +177,15 @@ impl AgentConfigPanelView {
             task_slug: String::new(),
             focus_handle: cx.focus_handle(),
             env_type: "local".into(),
-            mode: "agent".into(),
+            mode: "shell".into(),
             use_worktree: false,
+            platform,
+            model,
+            effort,
+            platform_select,
+            model_select,
+            effort_select,
+            pending_launch_select_sync: false,
             runtime_status: "not_running".into(),
             active_run_id: None,
             worktree_path: None,
@@ -117,8 +194,12 @@ impl AgentConfigPanelView {
             in_flight: Vec::new(),
             shells: Vec::new(),
             chat_sessions: Vec::new(),
+            terminal_agents: Vec::new(),
             status_message: String::new(),
             shell_poll_generation: 0,
+            _platform_select_subscription,
+            _model_select_subscription,
+            _effort_select_subscription,
         }
     }
 
@@ -162,7 +243,7 @@ impl AgentConfigPanelView {
         cx: &mut Context<Self>,
     ) {
         let _ = self.fleet.reload_if_stale();
-        let task = match self.fleet.get_task(task_id) {
+        let task = match self.fleet.get_node(task_id) {
             Ok(Some(task)) => task,
             _ => return,
         };
@@ -170,8 +251,11 @@ impl AgentConfigPanelView {
         self.task_slug = task.slug.clone();
         self.config_id = config_id;
         self.env_type = "local".into();
-        self.mode = "agent".into();
+        self.mode = "shell".into();
         self.use_worktree = false;
+        self.platform = platform_storage(self.settings.agent_platform).to_string();
+        self.model = self.settings.agent_model().to_string();
+        self.effort = self.settings.agent_effort().to_string();
         self.worktree_path = None;
         self.runtime_status = "not_running".into();
         self.active_run_id = None;
@@ -179,6 +263,7 @@ impl AgentConfigPanelView {
         self.in_flight.clear();
         self.shells.clear();
         self.chat_sessions.clear();
+        self.terminal_agents.clear();
         self.status_message.clear();
 
         if let Some(ref id) = self.config_id {
@@ -186,6 +271,9 @@ impl AgentConfigPanelView {
                 self.env_type = row.env_type;
                 self.mode = row.mode;
                 self.use_worktree = row.use_worktree;
+                self.platform = row.platform;
+                self.model = row.model;
+                self.effort = row.effort;
                 self.worktree_path = row.worktree_path;
                 self.runtime_status = row.runtime_status;
                 self.active_run_id = row.active_run_id;
@@ -194,11 +282,38 @@ impl AgentConfigPanelView {
             self.reload_shells();
             self.prune_shells_for_config(cx);
             self.reload_chat_sessions();
+            self.reload_terminal_agents();
+            self.prune_terminal_agents_for_config(cx);
         }
+        self.sync_launch_selects(window, cx);
         self.refresh_workspace_label();
         self.start_shell_liveness_poll(cx);
         self.focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn sync_launch_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let platform = parse_platform(&self.platform).unwrap_or(AgentPlatform::Claude);
+        self.platform = platform_storage(platform).to_string();
+        let models = catalog_strings(models_for(platform));
+        let efforts = catalog_strings(efforts_for(platform));
+        self.model = coerce_model(platform, &self.model);
+        self.effort = coerce_effort(platform, &self.effort);
+        let platform_value = self.platform.clone();
+        let model = self.model.clone();
+        let effort = self.effort.clone();
+        self.platform_select.update(cx, |select, cx| {
+            select.set_selected_value(&platform_value, window, cx);
+        });
+        self.model_select.update(cx, |select, cx| {
+            select.set_items(models, window, cx);
+            select.set_selected_value(&model, window, cx);
+        });
+        self.effort_select.update(cx, |select, cx| {
+            select.set_items(efforts, window, cx);
+            select.set_selected_value(&effort, window, cx);
+        });
+        self.pending_launch_select_sync = false;
     }
 
     fn prune_shells_for_config(&mut self, cx: &mut Context<Self>) {
@@ -209,6 +324,20 @@ impl AgentConfigPanelView {
             if removed > 0 {
                 let _ = self.fleet.reload_if_stale();
                 self.reload_shells();
+                cx.notify();
+            }
+        }
+    }
+
+    fn prune_terminal_agents_for_config(&mut self, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        if let Ok(removed) = prune_stale_terminal_agent_runs(&self.fleet, &self.paths, &config_id) {
+            if removed > 0 {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_terminal_agents();
+                self.reload_agent_status();
                 cx.notify();
             }
         }
@@ -231,6 +360,7 @@ impl AgentConfigPanelView {
                             return true;
                         }
                         this.prune_shells_for_config(cx);
+                        this.prune_terminal_agents_for_config(cx);
                         true
                     })
                     .unwrap_or(false);
@@ -245,12 +375,12 @@ impl AgentConfigPanelView {
 
     fn refresh_workspace_label(&mut self) {
         self.workspace_label = match (self.task_id.as_deref(), self.config_id.as_deref()) {
-            (Some(task_id), Some(config_id)) => self
+            (Some(_), Some(config_id)) => self
                 .fleet
                 .get_agent(config_id)
                 .ok()
                 .flatten()
-                .map(|row| describe_agent_workspace(&self.fleet, &row, task_id))
+                .map(|row| describe_agent_workspace(&self.fleet, &row))
                 .unwrap_or_else(|| "Workspace unavailable".into()),
             (Some(_), None) => "Save config to see workspace".into(),
             _ => String::new(),
@@ -261,7 +391,7 @@ impl AgentConfigPanelView {
         self.runs = self
             .config_id
             .as_ref()
-            .and_then(|id| self.fleet.list_runs_for_config(id).ok())
+            .and_then(|id| self.fleet.list_auto_runs_for_config(id).ok())
             .unwrap_or_default();
     }
 
@@ -278,6 +408,14 @@ impl AgentConfigPanelView {
             .config_id
             .as_ref()
             .and_then(|id| self.fleet.list_interactive_sessions_for_config(id).ok())
+            .unwrap_or_default();
+    }
+
+    fn reload_terminal_agents(&mut self) {
+        self.terminal_agents = self
+            .config_id
+            .as_ref()
+            .and_then(|id| self.fleet.list_terminal_agent_runs_for_config(id).ok())
             .unwrap_or_default();
     }
 
@@ -307,6 +445,7 @@ impl AgentConfigPanelView {
         self.in_flight.clear();
         self.shells.clear();
         self.chat_sessions.clear();
+        self.terminal_agents.clear();
         self.status_message.clear();
         cx.emit(AgentConfigPanelEvent::Close);
         cx.notify();
@@ -343,6 +482,9 @@ impl AgentConfigPanelView {
                 mode: self.mode.clone(),
                 work_directory: work_directory.clone(),
                 use_worktree: self.use_worktree,
+                platform: self.platform.clone(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
             }) {
                 self.show_error(window, cx, format!("Save failed: {err}"));
                 return;
@@ -357,6 +499,9 @@ impl AgentConfigPanelView {
                     mode: self.mode.clone(),
                     work_directory: work_directory.clone(),
                     use_worktree: self.use_worktree,
+                    platform: self.platform.clone(),
+                    model: self.model.clone(),
+                    effort: self.effort.clone(),
                 },
             }) {
                 self.show_error(window, cx, format!("Save failed: {err}"));
@@ -379,6 +524,7 @@ impl AgentConfigPanelView {
             self.reload_runs();
             self.reload_shells();
             self.reload_chat_sessions();
+            self.reload_terminal_agents();
             self.refresh_workspace_label();
             self.status_message = format!("Saved agent config {id}");
             cx.emit(AgentConfigPanelEvent::Saved {
@@ -503,6 +649,11 @@ impl AgentConfigPanelView {
         cx.notify();
     }
 
+    /// Launch an auto (background) agent run when the panel is open on an Auto-mode config.
+    pub fn launch_auto_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_agent(window, cx);
+    }
+
     fn launch_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
             self.set_status("Save the agent config before launching.", cx);
@@ -528,7 +679,7 @@ impl AgentConfigPanelView {
             );
             return;
         }
-        let task = match self.fleet.get_task(&task_id) {
+        let task = match self.fleet.get_node(&task_id) {
             Ok(Some(task)) => task,
             _ => {
                 self.show_error(window, cx, "Task not found.");
@@ -542,19 +693,14 @@ impl AgentConfigPanelView {
                 return;
             }
         };
-        let cwd = match resolve_agent_workspace(
-            &self.fleet,
-            &self.paths,
-            &self.settings,
-            &agent_row,
-            &task_id,
-        ) {
-            Ok(path) => path,
-            Err(err) => {
-                self.show_error(window, cx, format!("Workspace: {err:#}"));
-                return;
-            }
-        };
+        let cwd =
+            match resolve_agent_workspace(&self.fleet, &self.paths, &self.settings, &agent_row) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.show_error(window, cx, format!("Workspace: {err:#}"));
+                    return;
+                }
+            };
         self.set_status(format!("{config_id} · starting agent run…"), cx);
         let manifest = match ProcessManifest::load(&self.install) {
             Ok(manifest) => manifest,
@@ -607,8 +753,15 @@ impl AgentConfigPanelView {
             return;
         }
         let provider_run = {
+            let options = self
+                .fleet
+                .get_agent(&config_id)
+                .ok()
+                .flatten()
+                .map(|row| row.launch_options())
+                .unwrap_or_else(|| agent_row.launch_options());
             let mut agent = self.agent.lock().expect("agent mutex");
-            agent.start_fleet_agent(&config_id, cwd.clone(), prompt)
+            agent.start_fleet_agent(&config_id, cwd.clone(), prompt, options)
         };
         match provider_run {
             Ok(handle) => {
@@ -767,6 +920,146 @@ impl AgentConfigPanelView {
         }
     }
 
+    fn launch_agent_in_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            self.set_status("Save the agent config before launching.", cx);
+            return;
+        };
+        let Some(_task_id) = self.task_id.clone() else {
+            self.set_status("No task selected for this agent config.", cx);
+            return;
+        };
+        if self.mode != "shell" {
+            self.show_error(
+                window,
+                cx,
+                "Terminal agent launch is for Interactive mode configs.",
+            );
+            return;
+        }
+        if let Ok(fresh) = TodSettings::load(&self.paths) {
+            self.settings = fresh;
+        }
+        let cli = match self.settings.agent_platform {
+            AgentPlatform::Claude => "claude",
+            AgentPlatform::Cursor => "cursor-agent",
+        };
+        match open_terminal_agent_for_config(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &config_id,
+            cli,
+        ) {
+            Ok((run_id, cwd)) => {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_terminal_agents();
+                self.reload_agent_status();
+                self.refresh_workspace_label();
+                if let Ok(Some(row)) = self.fleet.get_agent(&config_id) {
+                    self.worktree_path = row.worktree_path;
+                }
+                self.set_status(
+                    format!(
+                        "{config_id} · terminal agent `{cli}` ({run_id}) in {}",
+                        cwd.display()
+                    ),
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_error(
+                    window,
+                    cx,
+                    format!("Launch agent in terminal failed: {err:#}"),
+                );
+            }
+        }
+    }
+
+    fn focus_terminal_agent(&mut self, run_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        let run = match self.terminal_agents.iter().find(|r| r.id == run_id) {
+            Some(run) => run.clone(),
+            None => {
+                self.show_error(window, cx, "Terminal agent run not found.");
+                return;
+            }
+        };
+        if let Ok(fresh) = TodSettings::load(&self.paths) {
+            self.settings = fresh;
+        }
+        let cli = match self.settings.agent_platform {
+            AgentPlatform::Claude => "claude",
+            AgentPlatform::Cursor => "cursor-agent",
+        };
+        match focus_terminal_agent_run(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &config_id,
+            &run,
+            cli,
+        ) {
+            Ok(cwd) => {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_terminal_agents();
+                self.reload_agent_status();
+                let still_listed = self.terminal_agents.iter().any(|r| r.id == run_id);
+                self.set_status(
+                    if still_listed
+                        && self
+                            .terminal_agents
+                            .iter()
+                            .find(|r| r.id == run_id)
+                            .is_some_and(|r| r.reconnect.is_some())
+                    {
+                        format!("{config_id} · focused terminal agent in {}", cwd.display())
+                    } else {
+                        format!(
+                            "{config_id} · relaunched terminal agent in {}",
+                            cwd.display()
+                        )
+                    },
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("Focus terminal agent failed: {err:#}"));
+            }
+        }
+    }
+
+    fn delete_terminal_agent(&mut self, run_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        if let Err(err) = self.fleet.enqueue(FleetMutation::ClearAgentRunReconnect {
+            run_id: run_id.to_string(),
+        }) {
+            error_toast(window, cx, format!("Delete terminal agent failed: {err}"));
+            return;
+        }
+        if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteAgentRun {
+            run_id: run_id.to_string(),
+        }) {
+            error_toast(window, cx, format!("Delete terminal agent failed: {err}"));
+            return;
+        }
+        remove_shell_state(&self.paths, run_id);
+        if let Err(err) = self.flush_fleet() {
+            error_toast(window, cx, format!("Delete terminal agent failed: {err}"));
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        self.reload_terminal_agents();
+        self.reload_agent_status();
+        self.status_message = format!("{config_id} · deleted terminal agent {run_id}");
+        cx.notify();
+    }
+
     fn launch_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(config_id) = self.config_id.clone() else {
             return;
@@ -796,6 +1089,39 @@ impl AgentConfigPanelView {
             }
             Err(err) => {
                 self.show_error(window, cx, format!("Launch shell failed: {err:#}"));
+            }
+        }
+    }
+
+    fn launch_zed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            self.set_status("Save the agent config before opening Zed.", cx);
+            return;
+        };
+        let Some(task_id) = self.task_id.clone() else {
+            self.set_status("No task selected for this agent config.", cx);
+            return;
+        };
+        match open_zed_for_agent_config(
+            &self.fleet,
+            &self.paths,
+            &self.settings,
+            &config_id,
+            &task_id,
+        ) {
+            Ok(cwd) => {
+                let _ = self.fleet.reload_if_stale();
+                self.refresh_workspace_label();
+                if let Ok(Some(row)) = self.fleet.get_agent(&config_id) {
+                    self.worktree_path = row.worktree_path;
+                }
+                self.set_status(
+                    format!("{config_id} · opened in Zed: {}", cwd.display()),
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_error(window, cx, format!("Open in Zed failed: {err:#}"));
             }
         }
     }
@@ -1132,6 +1458,80 @@ impl AgentConfigPanelView {
             )
     }
 
+    fn render_terminal_agents(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(Self::render_field_label("Terminal agents", cx))
+            .when(self.terminal_agents.is_empty(), |col| {
+                col.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("No terminal agents yet."),
+                )
+            })
+            .children(self.terminal_agents.iter().enumerate().map(|(idx, run)| {
+                let running = run.reconnect.is_some()
+                    && run.ended_at.is_none()
+                    && run.runtime_status != "not_running";
+                let label = format!(
+                    "terminal {} · {}",
+                    run.run_number,
+                    format_status_label(&run.runtime_status)
+                );
+                let focus_id = run.id.clone();
+                let delete_id = run.id.clone();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new(("terminal-agent-focus", idx))
+                            .label(label)
+                            .small()
+                            .compact()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.focus_terminal_agent(&focus_id, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if running { "running" } else { "not running" }),
+                    )
+                    .child(
+                        Button::new(("terminal-agent-delete", idx))
+                            .label("Delete")
+                            .small()
+                            .compact()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_terminal_agent(&delete_id, window, cx);
+                            })),
+                    )
+            }))
+            .child(
+                h_flex().w_auto().flex_shrink_0().child(
+                    Button::new("launch-agent-in-terminal")
+                        .label("Launch in terminal")
+                        .small()
+                        .compact()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.launch_agent_in_terminal(window, cx);
+                        })),
+                ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Opens an OS terminal and runs the configured agent CLI (claude / \
+                         cursor-agent). Tracked as an agent run with process lifecycle.",
+                    ),
+            )
+    }
+
     fn render_shells(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_2()
@@ -1180,15 +1580,28 @@ impl AgentConfigPanelView {
                     )
             }))
             .child(
-                h_flex().w_auto().flex_shrink_0().child(
-                    Button::new("launch-shell")
-                        .label("Launch shell")
-                        .small()
-                        .compact()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.launch_shell(window, cx);
-                        })),
-                ),
+                h_flex()
+                    .gap_2()
+                    .w_auto()
+                    .flex_shrink_0()
+                    .child(
+                        Button::new("launch-shell")
+                            .label("Launch shell")
+                            .small()
+                            .compact()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launch_shell(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("open-zed")
+                            .label("Open in Zed")
+                            .small()
+                            .compact()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launch_zed(window, cx);
+                            })),
+                    ),
             )
             .when(self.mode == "shell", |col| {
                 col.child(
@@ -1228,6 +1641,10 @@ impl Render for AgentConfigPanelView {
 
         if !self.is_open() {
             return div().size_full().into_any_element();
+        }
+
+        if self.pending_launch_select_sync {
+            self.sync_launch_selects(window, cx);
         }
 
         let title = self.panel_title();
@@ -1302,12 +1719,52 @@ impl Render for AgentConfigPanelView {
                             },
                         ))
                     }),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .items_start()
+                    .w_full()
+                    .child(Self::render_field_label("Platform", cx))
+                    .child(
+                        Select::new(&self.platform_select)
+                            .placeholder("Choose platform")
+                            .search_placeholder("Filter…")
+                            .menu_width(px(240.)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .items_start()
+                    .w_full()
+                    .child(Self::render_field_label("Model", cx))
+                    .child(
+                        Select::new(&self.model_select)
+                            .placeholder("Choose model")
+                            .search_placeholder("Filter…")
+                            .menu_width(px(280.)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .items_start()
+                    .w_full()
+                    .child(Self::render_field_label("Effort", cx))
+                    .child(
+                        Select::new(&self.effort_select)
+                            .placeholder("Choose effort")
+                            .search_placeholder("Filter…")
+                            .menu_width(px(240.)),
+                    ),
             );
 
         if !self.is_new() {
             body = body.child(self.render_runs(cx));
             if self.mode == "shell" {
                 body = body.child(self.render_interactive_agent(cx));
+                body = body.child(self.render_terminal_agents(cx));
             }
             body = body.child(self.render_shells(cx));
         }
@@ -1424,6 +1881,10 @@ fn format_env_type(env_type: &str) -> String {
         other => other,
     }
     .into()
+}
+
+fn catalog_strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
 }
 
 fn format_status_label(status: &str) -> String {

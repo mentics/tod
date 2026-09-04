@@ -12,6 +12,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
+use tod_store::AgentLaunchOptions;
 use uuid::Uuid;
 
 const DEEP_DIVE_CONTEXT: &str = "DeepDive";
@@ -60,6 +61,7 @@ pub struct DeepDiveView {
     _session: InterviewSession,
     agent_config_id: String,
     workspace_cwd: std::path::PathBuf,
+    launch_options: AgentLaunchOptions,
     turns: Vec<ChatTurn>,
     draft_input: Entity<InputState>,
     agent: SharedAgent,
@@ -80,6 +82,7 @@ impl DeepDiveView {
         session: InterviewSession,
         agent_config_id: String,
         workspace_cwd: std::path::PathBuf,
+        launch_options: AgentLaunchOptions,
         window: &mut Window,
         cx: &mut Context<Self>,
         agent: SharedAgent,
@@ -96,6 +99,7 @@ impl DeepDiveView {
             _session: session,
             agent_config_id,
             workspace_cwd,
+            launch_options,
             turns: Vec::new(),
             draft_input,
             agent,
@@ -245,6 +249,7 @@ impl DeepDiveView {
                     cwd,
                     context,
                     Some(conversation),
+                    self.launch_options.clone(),
                 ) {
                     Ok(handle) => {
                         self.active_run = Some(handle.id);

@@ -1,8 +1,8 @@
 //! Migrate legacy interview SQLite sessions into fleet `interview_sessions`.
 
-use crate::paths::TodPaths;
 use crate::outline::repos::NodeRepo;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
+use crate::paths::TodPaths;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
@@ -50,7 +50,8 @@ pub fn migrate_legacy_interview_sessions(fleet_conn: &Connection, paths: &TodPat
         .collect::<Result<Vec<_>, _>>()?;
 
     let node_repo = NodeRepo::new(fleet_conn);
-    for (_legacy_id, display_name, status, entity_path, phase, session_id, scratchpad_path) in rows {
+    for (_legacy_id, display_name, status, entity_path, phase, session_id, scratchpad_path) in rows
+    {
         let node_id = resolve_node_id(&node_repo, entity_path.as_deref())?;
         let Some(node_id) = node_id else {
             continue;

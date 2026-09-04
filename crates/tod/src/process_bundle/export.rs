@@ -1,12 +1,12 @@
 //! Materialize DB obligations and context to scratchpad files for agents.
 
-use tod_store::outline::resolve::{resolve_obligations, ResolvedObligation};
-use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::uuid_blob::uuid_to_blob;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tod_store::outline::repos::NodeRepo;
+use tod_store::outline::resolve::{ResolvedObligation, resolve_obligations};
+use tod_store::outline::uuid_blob::uuid_to_blob;
 use uuid::Uuid;
 
 /// Exported scope files written under `{scratchpad}/scope/`.
@@ -86,11 +86,7 @@ fn format_obligations(resolved: &[ResolvedObligation], target_node_id: Uuid) -> 
         };
         out.push_str(&format!(
             "{}. [{}] {}{}\n\n{}\n\n",
-            item.obligation.ordinal,
-            source,
-            item.obligation.kind,
-            section,
-            item.obligation.body
+            item.obligation.ordinal, source, item.obligation.kind, section, item.obligation.body
         ));
     }
     out
@@ -153,11 +149,11 @@ mod unit_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tod_store::fleet::schema;
-    use tod_store::outline::types::Capability;
     use tod_store::outline::repos::obligations::NodeObligation;
     use tod_store::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
-    use std::fs;
+    use tod_store::outline::types::Capability;
 
     #[test]
     fn exports_obligations_to_scratchpad() {
@@ -191,15 +187,13 @@ mod tests {
             })
             .unwrap();
         OutlineRepo::new(&conn)
-            .insert(
-                &tod_store::outline::types::OutlineEntry {
-                    node_id: node.id,
-                    list_id,
-                    parent_id: None,
-                    ordinal: 0,
-                    collapsed: false,
-                },
-            )
+            .insert(&tod_store::outline::types::OutlineEntry {
+                node_id: node.id,
+                list_id,
+                parent_id: None,
+                ordinal: 0,
+                collapsed: false,
+            })
             .unwrap();
 
         let scratch = dir.join("scratch");

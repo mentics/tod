@@ -1,6 +1,5 @@
 //! Minimal UI when fleet storage blocks launch (user.md reqs 12–14).
 
-use tod_store::fleet::FleetLaunchError;
 use crate::interview::TodPaths;
 use crate::interview::settings::TodSettings;
 use crate::ui::selectable_text::selectable_text;
@@ -12,6 +11,7 @@ use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
 use std::path::PathBuf;
+use tod_store::fleet::FleetLaunchError;
 
 /// Blocked-launch surface: persistent notice + fleet storage root settings.
 pub struct FleetBlockedView {

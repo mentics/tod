@@ -34,10 +34,7 @@ impl LogLevel {
     }
 
     pub fn step(self, delta: i32) -> Self {
-        let idx = Self::ALL
-            .iter()
-            .position(|l| *l == self)
-            .unwrap_or(1) as i32;
+        let idx = Self::ALL.iter().position(|l| *l == self).unwrap_or(1) as i32;
         let next = (idx + delta).clamp(0, (Self::ALL.len() - 1) as i32) as usize;
         Self::ALL[next]
     }

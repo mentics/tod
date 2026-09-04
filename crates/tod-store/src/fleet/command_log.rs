@@ -104,19 +104,28 @@ mod tests {
     #[test]
     fn undo_through_pops_tail_inclusive() {
         let mut log = CommandLog::new();
-        log.push("a".into(), vec![outline(OutlineMutation::UpdateNodeTitle {
-            node_id: Uuid::new_v4(),
-            title: "a".into(),
-        })]);
-        log.push("b".into(), vec![outline(OutlineMutation::UpdateNodeTitle {
-            node_id: Uuid::new_v4(),
-            title: "b".into(),
-        })]);
+        log.push(
+            "a".into(),
+            vec![outline(OutlineMutation::UpdateNodeTitle {
+                node_id: Uuid::new_v4(),
+                title: "a".into(),
+            })],
+        );
+        log.push(
+            "b".into(),
+            vec![outline(OutlineMutation::UpdateNodeTitle {
+                node_id: Uuid::new_v4(),
+                title: "b".into(),
+            })],
+        );
         let middle_id = log.entries()[1].id;
-        log.push("c".into(), vec![outline(OutlineMutation::UpdateNodeTitle {
-            node_id: Uuid::new_v4(),
-            title: "c".into(),
-        })]);
+        log.push(
+            "c".into(),
+            vec![outline(OutlineMutation::UpdateNodeTitle {
+                node_id: Uuid::new_v4(),
+                title: "c".into(),
+            })],
+        );
         let popped = log.pop_through(middle_id);
         assert_eq!(popped.len(), 2);
         assert_eq!(popped[0].label, "c");
@@ -128,14 +137,20 @@ mod tests {
     #[test]
     fn pop_last_returns_newest() {
         let mut log = CommandLog::new();
-        log.push("first".into(), vec![outline(OutlineMutation::ReorderSibling {
-            node_id: Uuid::new_v4(),
-            direction: ReorderDirection::Up,
-        })]);
-        log.push("second".into(), vec![outline(OutlineMutation::ReorderSibling {
-            node_id: Uuid::new_v4(),
-            direction: ReorderDirection::Down,
-        })]);
+        log.push(
+            "first".into(),
+            vec![outline(OutlineMutation::ReorderSibling {
+                node_id: Uuid::new_v4(),
+                direction: ReorderDirection::Up,
+            })],
+        );
+        log.push(
+            "second".into(),
+            vec![outline(OutlineMutation::ReorderSibling {
+                node_id: Uuid::new_v4(),
+                direction: ReorderDirection::Down,
+            })],
+        );
         let entry = log.pop_last().unwrap();
         assert_eq!(entry.label, "second");
         assert_eq!(log.entries().len(), 1);

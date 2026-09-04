@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)][string]$TodShellId,
     [Parameter(Mandatory)][string]$TodStateDir,
-    [string]$TodCwd = ""
+    [string]$TodCwd = "",
+    [string]$TodStartupCommand = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -51,4 +52,9 @@ if ($TodCwd -and (Test-Path -LiteralPath $TodCwd)) {
 $envHook = Join-Path $TodStateDir "env.ps1"
 if (Test-Path -LiteralPath $envHook) {
     . $envHook
+}
+
+if ($TodStartupCommand) {
+    # Run without replacing the shell so the session stays after the CLI exits.
+    Invoke-Expression $TodStartupCommand
 }

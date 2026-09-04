@@ -142,7 +142,8 @@ fn remove_tod_owned_files(root: &Path) -> Result<()> {
     for name in TOD_OWNED_FILES {
         let path = root.join(name);
         if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
         }
     }
     Ok(())
@@ -302,9 +303,9 @@ impl StorageMigration {
             ));
         }
 
-        destination.ensure_root().map_err(|err| {
-            FleetMigrationError::DestinationNotCreatable(err.to_string())
-        })?;
+        destination
+            .ensure_root()
+            .map_err(|err| FleetMigrationError::DestinationNotCreatable(err.to_string()))?;
 
         let destination_lock = FleetLock::try_acquire(destination.root())?;
         write_migration_intent(source, &destination)?;
@@ -396,7 +397,10 @@ mod tests {
     use std::fs;
 
     fn temp_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("tod-fleet-migration-{name}-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "tod-fleet-migration-{name}-{}",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     fn seed_task(root: &Path, slug: &str, title: &str) {

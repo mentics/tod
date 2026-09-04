@@ -9,6 +9,8 @@ pub struct AgentInfo {
     pub id: String,
     pub label: String,
     pub status: String,
+    /// True when this config is inherited from an ancestor node.
+    pub inherited: bool,
 }
 
 /// Open shell session summary for row menus.
@@ -455,11 +457,7 @@ mod tests {
             sort_direction: SortDirection::Asc,
             ..ListWorkingSet::default_sort()
         };
-        let visible = filter_and_sort_tasks(
-            &[parent, child_b, child_a, root_other],
-            "",
-            &ws,
-        );
+        let visible = filter_and_sort_tasks(&[parent, child_b, child_a, root_other], "", &ws);
         assert_eq!(visible.len(), 4);
         assert_eq!(visible[0].title, "Parent");
         assert_eq!(visible[1].title, "Alpha child");

@@ -21,11 +21,8 @@
 mod capture;
 pub mod commands;
 
-use crate::app::shell_socket::ShellSocketService;
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
-use commands::{
-    AgentPlatformSocketCommand, Command, ShellSocketCommand, TranscriptsCommand, parse_line,
-};
+use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
@@ -59,7 +56,6 @@ enum UiRequest {
     Sync,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
-    Shell(ShellSocketCommand),
 }
 
 struct Pending {
@@ -78,7 +74,6 @@ pub fn start(
     logical_height: f32,
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
-    shell_socket: ShellSocketService,
 ) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let _ = SHUTDOWN.set(shutdown.clone());
@@ -93,7 +88,7 @@ pub fn start(
         .expect("spawn agent socket thread");
 
     cx.spawn(async move |cx| {
-        drain_loop(cx, window, transcript_window, shell, shell_socket, rx).await;
+        drain_loop(cx, window, transcript_window, shell, rx).await;
     })
     .detach();
 }
@@ -131,6 +126,10 @@ fn handle_client(
     logical_width: u32,
     logical_height: u32,
 ) {
+    // Accepted sockets can inherit the listener's non-blocking mode (notably on
+    // Windows). Force blocking so read_line waits for the next command instead
+    // of treating WouldBlock as a disconnect.
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone().expect("clone tcp stream"));
     let mut writer = stream;
@@ -161,9 +160,6 @@ fn handle_client(
             Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),
             Ok(Command::AgentPlatform(action)) => {
                 dispatch_ui(&tx, UiRequest::AgentPlatform(action))
-            }
-            Ok(Command::Shell(action)) => {
-                dispatch_ui_with_timeout(&tx, UiRequest::Shell(action), Duration::from_secs(30))
             }
             Err(e) => Err(e),
         };
@@ -203,7 +199,6 @@ async fn drain_loop(
     window: AnyWindowHandle,
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
-    shell_socket: ShellSocketService,
     rx: async_channel::Receiver<Pending>,
 ) {
     while let Ok(pending) = rx.recv().await {
@@ -211,14 +206,7 @@ async fn drain_loop(
             Timer::after(Duration::from_millis(16)).await;
             Ok("ok".into())
         } else {
-            handle_ui_request(
-                cx,
-                window,
-                &transcript_window,
-                &shell,
-                &shell_socket,
-                pending.request,
-            )
+            handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
         };
         let _ = pending.reply.send(result);
 
@@ -227,14 +215,7 @@ async fn drain_loop(
                 Timer::after(Duration::from_millis(16)).await;
                 Ok("ok".into())
             } else {
-                handle_ui_request(
-                    cx,
-                    window,
-                    &transcript_window,
-                    &shell,
-                    &shell_socket,
-                    pending.request,
-                )
+                handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
             };
             let _ = pending.reply.send(result);
         }
@@ -246,7 +227,6 @@ fn handle_ui_request(
     window: AnyWindowHandle,
     transcript_window: &TranscriptWindowControl,
     shell: &gpui::WeakEntity<crate::app::window::Shell>,
-    shell_socket: &ShellSocketService,
     request: UiRequest,
 ) -> Result<String, String> {
     match request {
@@ -255,7 +235,6 @@ fn handle_ui_request(
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),
         UiRequest::AgentPlatform(action) => apply_agent_platform(cx, shell, action),
-        UiRequest::Shell(action) => shell_socket.handle(action),
     }
 }
 

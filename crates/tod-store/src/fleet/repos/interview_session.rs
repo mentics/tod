@@ -184,13 +184,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<InterviewSession>
         agent_config_id: row.get(2)?,
         display_name: row.get(3)?,
         status: InterviewSessionStatus::from_str(row.get::<_, String>(4)?.as_str()).map_err(
-            |e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    rusqlite::types::Type::Text,
-                    e.into(),
-                )
-            },
+            |e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into()),
         )?,
         phase: row.get(5)?,
         session_id: row.get(6)?,

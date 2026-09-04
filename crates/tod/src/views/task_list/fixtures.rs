@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::{FleetStore, ResolvedAgentConfigs};
 use tod_store::outline::types::Capability;
 
-use super::model::{AgentInfo, TaskItem};
+use super::model::{AgentInfo, ShellInfo, TaskItem};
 
 /// Load tree rows from the outline store for `list_id` (or empty when none).
 pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<TaskItem> {
@@ -19,39 +19,82 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
             let has_spec = row.capabilities.contains(&Capability::Spec);
+            let has_lifecycle = row.capabilities.contains(&Capability::Lifecycle);
             let counts = counts.get(&row.node.id).copied().unwrap_or_default();
-            let lifecycle = if is_work {
+            // Only Lifecycle capability owns a lifecycle chip. Do not invent "proposed"
+            // when Agent/Spec alone are enabled.
+            let lifecycle = if has_lifecycle {
                 row.lifecycle.unwrap_or_else(|| "proposed".into())
             } else {
                 String::new()
             };
-            let agents = if row.capabilities.contains(&Capability::Agent) {
+            let node_id = row.node.id.to_string();
+            let resolved =
                 store
-                    .list_agents_for_task(&row.node.id.to_string())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|a| AgentInfo {
-                        id: a.id,
+                    .resolve_agents_for_node(&node_id)
+                    .unwrap_or_else(|_| ResolvedAgentConfigs {
+                        queried_node_id: node_id.clone(),
+                        source_node_id: node_id.clone(),
+                        inherited: false,
+                        configs: Vec::new(),
+                    });
+            let agents: Vec<AgentInfo> = resolved
+                .configs
+                .iter()
+                .map(|a| {
+                    let mut status = a.runtime_status.clone();
+                    if let Ok(runs) = store.list_terminal_agent_runs_for_config(&a.id) {
+                        let terminal_live = runs.iter().any(|run| {
+                            run.reconnect.is_some()
+                                && run.ended_at.is_none()
+                                && run.runtime_status != "not_running"
+                        });
+                        if terminal_live
+                            && matches!(
+                                status.as_str(),
+                                "not_running" | "waiting" | "starting" | "processing"
+                            )
+                        {
+                            status = "processing".into();
+                        }
+                    }
+                    AgentInfo {
+                        id: a.id.clone(),
                         label: format!(
                             "{} {}",
                             env_chip_label(&a.env_type),
                             mode_chip_label(&a.mode)
                         ),
-                        status: a.runtime_status,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+                        status,
+                        inherited: resolved.inherited,
+                    }
+                })
+                .collect();
+            let mut shells = Vec::new();
+            for config in &resolved.configs {
+                if let Ok(sessions) = store.list_shells_for_config(&config.id) {
+                    for shell in sessions {
+                        let label = if resolved.configs.len() > 1 {
+                            format!("{} · {}", config.id, shell.id)
+                        } else {
+                            shell.id.clone()
+                        };
+                        shells.push(ShellInfo {
+                            id: shell.id,
+                            label,
+                        });
+                    }
+                }
+            }
             TaskItem {
-                id: row.node.id.to_string(),
+                id: node_id,
                 ticket_id: row.ticket_id,
                 title: row.node.title,
                 lifecycle,
                 entity_path: node_scratchpad_path(&row.node.id.to_string()),
                 tags: row.tags,
                 agents,
-                shells: Vec::new(),
+                shells,
                 interaction_timestamp: row.node.updated_at,
                 tree_ordinal: row.tree_ordinal,
                 parent_id: row.parent_id.map(|id| id.to_string()),
@@ -124,6 +167,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
 mod tests {
     use super::*;
     use std::fs;
+    use tod_store::outline::types::Capability;
     use tod_store::outline::{CreatePosition, OutlineMutation};
 
     #[test]
@@ -164,6 +208,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(node.slug, "root-task");
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_capability_alone_does_not_invent_proposed_lifecycle() {
+        let root = std::env::temp_dir().join(format!("tod-fixtures-agent-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: "agent-only".into(),
+                title: "Agent only".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Agent node".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+        let node_id = store.flatten_outline(list_id).unwrap()[0].node.id;
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id,
+                capabilities: vec![Capability::Agent],
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+
+        let items = load_tasks_from_store(&store, Some(list_id));
+        assert_eq!(items.len(), 1);
+        assert!(items[0].lifecycle.is_empty());
         drop(store);
         let _ = fs::remove_dir_all(root);
     }

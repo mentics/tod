@@ -206,15 +206,10 @@ pub fn sync_scaffolding_from_disk(
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-    if session
-        .scratchpad_path
-        .as_ref()
-        .is_some_and(|p| {
-            let path = Path::new(p);
-            tod_store::path_is_under(data_root, path)
-                && path.join("interview-config.md").exists()
-        })
-    {
+    if session.scratchpad_path.as_ref().is_some_and(|p| {
+        let path = Path::new(p);
+        tod_store::path_is_under(data_root, path) && path.join("interview-config.md").exists()
+    }) {
         return Ok(true);
     }
 
@@ -249,15 +244,10 @@ pub fn sync_scaffolding_from_disk_after_bootstrap(
     let session = store
         .get_session(session_id)?
         .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
-    if session
-        .scratchpad_path
-        .as_ref()
-        .is_some_and(|p| {
-            let path = Path::new(p);
-            tod_store::path_is_under(data_root, path)
-                && path.join("interview-config.md").exists()
-        })
-    {
+    if session.scratchpad_path.as_ref().is_some_and(|p| {
+        let path = Path::new(p);
+        tod_store::path_is_under(data_root, path) && path.join("interview-config.md").exists()
+    }) {
         return Ok(true);
     }
 
@@ -309,10 +299,10 @@ fn system_time_to_utc(time: SystemTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_store::fleet::FleetStore;
     use crate::interview::db::{InterviewSessionStatus, NewInterviewSession, SessionStore};
-    use tod_store::outline::OutlineMutation;
     use std::fs;
+    use tod_store::fleet::FleetStore;
+    use tod_store::outline::OutlineMutation;
 
     fn test_fleet() -> (PathBuf, std::sync::Arc<FleetStore>, Uuid) {
         let root = std::env::temp_dir().join(format!("tod-cfg-{}", uuid::Uuid::new_v4()));

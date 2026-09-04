@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 10;
+pub const CURRENT_USER_VERSION: i32 = 12;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -140,6 +140,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 10 {
         migrate_v9_to_v10(conn)?;
         conn.pragma_update(None, "user_version", 10)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 11 {
+        migrate_v10_to_v11(conn)?;
+        conn.pragma_update(None, "user_version", 11)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 12 {
+        migrate_v11_to_v12(conn)?;
+        conn.pragma_update(None, "user_version", 12)?;
     }
     Ok(())
 }
@@ -528,6 +538,68 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '7')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Per-config platform / model / effort for subsequent launches.
+fn migrate_v10_to_v11(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE agent_configs ADD COLUMN platform TEXT NOT NULL DEFAULT 'claude'
+            CHECK(platform IN ('cursor', 'claude'));
+        ALTER TABLE agent_configs ADD COLUMN model TEXT NOT NULL DEFAULT 'auto';
+        ALTER TABLE agent_configs ADD COLUMN effort TEXT NOT NULL DEFAULT 'auto';
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '11')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Terminal-launched CLI agents as `run_kind = 'terminal'` (PID-tracked like shells).
+fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE agent_runs_v12 (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent_config_id TEXT NOT NULL REFERENCES agent_configs(id) ON DELETE RESTRICT,
+            run_number INTEGER NOT NULL,
+            runtime_status TEXT NOT NULL CHECK(runtime_status IN (
+                'starting', 'processing', 'waiting', 'blocked', 'not_running'
+            )),
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            reconnect_pid INTEGER,
+            reconnect_birth_token INTEGER,
+            run_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(run_kind IN ('auto', 'interactive', 'terminal')),
+            UNIQUE(agent_config_id, run_number)
+        );
+        INSERT INTO agent_runs_v12 (
+            id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind
+        )
+        SELECT
+            id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind
+        FROM agent_runs;
+        DROP TABLE agent_runs;
+        ALTER TABLE agent_runs_v12 RENAME TO agent_runs;
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_config_id ON agent_runs(agent_config_id);
+        PRAGMA foreign_keys=ON;
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '12')",
         [],
     )?;
     tx.commit()?;

@@ -548,4 +548,3 @@ fn refresh_loop_health(conn: &Connection, list_id: Uuid) -> Result<()> {
     }
     Ok(())
 }
-

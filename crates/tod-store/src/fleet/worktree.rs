@@ -512,6 +512,9 @@ mod tests {
                 mode: "interview".into(),
                 work_directory: None,
                 use_worktree: true,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             })
             .unwrap();
         AgentConfigRepo::new(&conn)

@@ -24,16 +24,16 @@ fn read_task_title(db_path: &std::path::Path, id: &str) -> Option<String> {
     let blob = uuid::Uuid::parse_str(id)
         .ok()
         .map(|u| u.as_bytes().to_vec())?;
-    conn.query_row(
-        "SELECT title FROM nodes WHERE id = ?1",
-        [blob],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT title FROM nodes WHERE id = ?1", [blob], |row| {
+        row.get(0)
+    })
     .optional()
     .unwrap()
 }
 
-fn list_notifications(store: &FleetStore) -> Vec<crate::fleet::repos::notification::FleetNotification> {
+fn list_notifications(
+    store: &FleetStore,
+) -> Vec<crate::fleet::repos::notification::FleetNotification> {
     let projection = store.projection();
     let guard = projection.lock().unwrap();
     let conn = guard.connection();
@@ -83,15 +83,7 @@ fn external_edit_reloads_fleet_store_projection() {
         .unwrap();
     }
 
-    assert_eq!(
-        store
-            .projection()
-            .lock()
-            .unwrap()
-            .metadata()
-            .task_count,
-        1
-    );
+    assert_eq!(store.projection().lock().unwrap().metadata().task_count, 1);
     assert!(store.reload_if_stale().unwrap());
     assert_eq!(store.list_tasks().unwrap().len(), 2);
 
@@ -105,8 +97,12 @@ fn debounced_mutations_lost_when_writer_abandoned() {
     let db_path = root.join("tod.db");
     schema::open_writer_connection(&db_path).unwrap();
 
-    let writer =
-        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(3600), crate::fleet::command_log::CommandLog::shared()).unwrap();
+    let writer = FleetWriter::open_with_debounce(
+        &db_path,
+        Duration::from_secs(3600),
+        crate::fleet::command_log::CommandLog::shared(),
+    )
+    .unwrap();
     let task_id = uuid::Uuid::new_v4().to_string();
     writer
         .enqueue(FleetMutation::InsertTask {
@@ -151,12 +147,7 @@ fn scale_generator_inserts_tasks_and_agents() {
     drop(conn);
 
     let store = FleetStore::open(&root).unwrap();
-    let meta = store
-        .projection()
-        .lock()
-        .unwrap()
-        .metadata()
-        .clone();
+    let meta = store.projection().lock().unwrap().metadata().clone();
     assert_eq!(meta.task_count, snapshot.task_count);
     assert_eq!(meta.agent_count, snapshot.agent_count);
 
@@ -209,8 +200,12 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     let db_path = root.join("tod.db");
     schema::open_writer_connection(&db_path).unwrap();
 
-    let writer =
-        FleetWriter::open_with_debounce(&db_path, Duration::from_secs(60), crate::fleet::command_log::CommandLog::shared()).unwrap();
+    let writer = FleetWriter::open_with_debounce(
+        &db_path,
+        Duration::from_secs(60),
+        crate::fleet::command_log::CommandLog::shared(),
+    )
+    .unwrap();
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let agent_id = uuid::Uuid::new_v4().to_string();
@@ -240,6 +235,9 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
                 mode: "agent".into(),
                 work_directory: None,
                 use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
             },
         })
         .unwrap();
@@ -327,10 +325,12 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     short_settle();
     {
         let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(NotificationRepo::new(&conn)
-            .get(&notification_id)
-            .unwrap()
-            .is_some());
+        assert!(
+            NotificationRepo::new(&conn)
+                .get(&notification_id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     writer
@@ -364,11 +364,13 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     short_settle();
     {
         let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(ShellRepo::new(&conn)
-            .list_for_agent(&agent_id)
-            .unwrap()
-            .iter()
-            .any(|session| session.id == shell_id));
+        assert!(
+            ShellRepo::new(&conn)
+                .list_for_agent(&agent_id)
+                .unwrap()
+                .iter()
+                .any(|session| session.id == shell_id)
+        );
     }
 
     writer
@@ -465,9 +467,7 @@ fn task_round_trip_survives_store_close_and_reopen() {
     {
         let store = FleetStore::open(&root).unwrap();
         store
-            .enqueue(FleetMutation::InsertTask {
-                task: task.clone(),
-            })
+            .enqueue(FleetMutation::InsertTask { task: task.clone() })
             .unwrap();
         store.writer().flush().unwrap();
     }
@@ -509,6 +509,9 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
                     mode: "agent".into(),
                     work_directory: None,
                     use_worktree: false,
+                    platform: "claude".into(),
+                    model: "default".into(),
+                    effort: "auto".into(),
                 },
             })
             .unwrap();

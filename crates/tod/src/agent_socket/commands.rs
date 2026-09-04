@@ -9,21 +9,6 @@ pub enum TranscriptsCommand {
 }
 
 #[derive(Debug, Clone)]
-pub enum ShellSocketCommand {
-    Launch {
-        task_id: String,
-        config_id: String,
-    },
-    Verify {
-        shell_id: String,
-    },
-    Focus {
-        task_id: String,
-        shell_id: String,
-    },
-}
-
-#[derive(Debug, Clone)]
 pub enum AgentPlatformSocketCommand {
     Get,
     Cycle,
@@ -51,7 +36,6 @@ pub enum Command {
     Sync,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
-    Shell(ShellSocketCommand),
 }
 
 /// Parse one protocol line into a command.
@@ -175,57 +159,6 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 )),
             }
         }
-        "shell" => {
-            let action = parts
-                .next()
-                .ok_or_else(|| "shell requires launch|verify|focus".to_string())?;
-            match action {
-                "launch" => {
-                    let task_id = parts
-                        .next()
-                        .ok_or_else(|| "shell launch requires task_id config_id".to_string())?;
-                    let config_id = parts
-                        .next()
-                        .ok_or_else(|| "shell launch requires task_id config_id".to_string())?;
-                    if parts.next().is_some() {
-                        return Err("shell launch takes exactly two arguments".into());
-                    }
-                    Ok(Command::Shell(ShellSocketCommand::Launch {
-                        task_id: task_id.to_string(),
-                        config_id: config_id.to_string(),
-                    }))
-                }
-                "verify" => {
-                    let shell_id = parts
-                        .next()
-                        .ok_or_else(|| "shell verify requires shell_id".to_string())?;
-                    if parts.next().is_some() {
-                        return Err("shell verify takes exactly one argument".into());
-                    }
-                    Ok(Command::Shell(ShellSocketCommand::Verify {
-                        shell_id: shell_id.to_string(),
-                    }))
-                }
-                "focus" => {
-                    let task_id = parts
-                        .next()
-                        .ok_or_else(|| "shell focus requires task_id shell_id".to_string())?;
-                    let shell_id = parts
-                        .next()
-                        .ok_or_else(|| "shell focus requires task_id shell_id".to_string())?;
-                    if parts.next().is_some() {
-                        return Err("shell focus takes exactly two arguments".into());
-                    }
-                    Ok(Command::Shell(ShellSocketCommand::Focus {
-                        task_id: task_id.to_string(),
-                        shell_id: shell_id.to_string(),
-                    }))
-                }
-                other => Err(format!(
-                    "unknown shell action `{other}` (expected launch|verify|focus)"
-                )),
-            }
-        }
         other => Err(format!("unknown command `{other}`")),
     }
 }
@@ -314,22 +247,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_shell_commands() {
-        match parse_line("shell launch task-1 cfg-1").unwrap() {
-            Command::Shell(ShellSocketCommand::Launch {
-                task_id,
-                config_id,
-            }) => {
-                assert_eq!(task_id, "task-1");
-                assert_eq!(config_id, "cfg-1");
-            }
-            _ => panic!("expected shell launch"),
-        }
-        match parse_line("shell verify abc-123").unwrap() {
-            Command::Shell(ShellSocketCommand::Verify { shell_id }) => {
-                assert_eq!(shell_id, "abc-123");
-            }
-            _ => panic!("expected shell verify"),
-        }
+    fn rejects_removed_domain_helpers() {
+        assert!(parse_line("shell launch task-1 cfg-1").is_err());
+        assert!(parse_line("zed launch task-1 cfg-1").is_err());
+        assert!(parse_line("terminal-agent launch cfg-1").is_err());
     }
 }
