@@ -135,8 +135,8 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-l", TaskListNewList, context),
         KeyBinding::new("ctrl-tab", TaskListNextList, context),
         KeyBinding::new("ctrl-shift-tab", TaskListPrevList, context),
-        KeyBinding::new("ctrl-up", TaskListMoveUp, context),
-        KeyBinding::new("ctrl-down", TaskListMoveDown, context),
+        KeyBinding::new("secondary-up", TaskListMoveUp, context),
+        KeyBinding::new("secondary-down", TaskListMoveDown, context),
         KeyBinding::new("delete", TaskListDelete, context),
         KeyBinding::new("backspace", TaskListDelete, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.

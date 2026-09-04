@@ -72,8 +72,8 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
             Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
         ),
         KeyBinding::new("alt-enter", ObligationsCreateAbove, context),
-        KeyBinding::new("ctrl-up", ObligationsMoveUp, context),
-        KeyBinding::new("ctrl-down", ObligationsMoveDown, context),
+        KeyBinding::new("secondary-up", ObligationsMoveUp, context),
+        KeyBinding::new("secondary-down", ObligationsMoveDown, context),
         KeyBinding::new("backspace", ObligationsDelete, context),
         KeyBinding::new("delete", ObligationsDelete, context),
         // Inline edit: Escape closes panel; arrows leave the field and move selection.
@@ -1158,7 +1158,7 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · Ctrl+↑/↓ reorders · ←/→ collapse/expand · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Esc closes"),
             )
             .into_any_element()
     }
