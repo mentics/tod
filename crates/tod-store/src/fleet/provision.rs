@@ -129,6 +129,8 @@ fn ensure_worktree_for_agent_config(
         worktree::ensure_worktree(
             &conn,
             settings.worktree_backend,
+            settings,
+            paths,
             &data_root,
             &repo_path,
             &branch,
@@ -208,6 +210,8 @@ pub fn ensure_interview_agent_for_node(
         worktree::ensure_worktree(
             &conn,
             backend,
+            settings,
+            paths,
             &data_root,
             &repo_path,
             &branch,

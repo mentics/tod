@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod schema;
 pub mod store;
 pub mod terminal;
+pub mod treehouse;
 pub mod undo;
 pub mod worktree;
 pub mod writer;
@@ -48,7 +49,13 @@ pub use repos::transcript::TranscriptTurn;
 pub use runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
 pub use store::{FleetStore, QuitPromptCounts};
 pub use terminal::{
-    default_terminal_hint, focus_shell_session, launch_terminal, open_shell_for_agent_config,
+    default_terminal_hint, focus_shell_session, launch_shell_terminal, open_shell_for_agent_config,
+    prune_stale_shell_sessions, read_shell_state, remove_shell_state, shells_dir, state_file_path,
+    verify_shell_session,
+};
+pub use treehouse::{
+    TreehouseInvocation, resolve_worktrees_parent, sync_user_config, treehouse_available,
+    treehouse_config_path, treehouse_home,
 };
 pub use worktree::{validate_git_repo, validate_interview_workspace};
 pub use writer::{FleetMutation, FleetWriter};

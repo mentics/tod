@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 9;
+pub const CURRENT_USER_VERSION: i32 = 10;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -135,6 +135,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 9 {
         migrate_v8_to_v9(conn)?;
         conn.pragma_update(None, "user_version", 9)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 10 {
+        migrate_v9_to_v10(conn)?;
+        conn.pragma_update(None, "user_version", 10)?;
     }
     Ok(())
 }
@@ -523,6 +528,30 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '7')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Persistent shell display number per agent config (not renumbered when others close).
+fn migrate_v9_to_v10(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE shell_sessions ADD COLUMN label_number INTEGER NOT NULL DEFAULT 0;
+        WITH numbered AS (
+            SELECT id, ROW_NUMBER() OVER (PARTITION BY agent_config_id ORDER BY id) AS n
+            FROM shell_sessions
+        )
+        UPDATE shell_sessions
+        SET label_number = (
+            SELECT n FROM numbered WHERE numbered.id = shell_sessions.id
+        );
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '10')",
         [],
     )?;
     tx.commit()?;

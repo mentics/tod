@@ -192,6 +192,9 @@ pub struct TodSettings {
     /// Worktree provisioning backend for interview agents.
     #[serde(default = "default_worktree_backend")]
     pub worktree_backend: WorktreeBackend,
+    /// Parent directory for Treehouse worktree pools (`TREEHOUSE_WORKTREES`). When unset, pools live under `TREEHOUSE_HOME`.
+    #[serde(default)]
+    pub treehouse_worktrees_root: Option<PathBuf>,
     /// Which agent platform runs interview question-maker / answer-processor work.
     #[serde(default = "default_agent_platform")]
     pub agent_platform: AgentPlatform,
@@ -213,6 +216,7 @@ impl Default for TodSettings {
             fleet_storage_root: None,
             always_on_top: false,
             worktree_backend: WorktreeBackend::default(),
+            treehouse_worktrees_root: None,
             agent_platform: AgentPlatform::default(),
             terminal: TerminalSettings::default(),
             window_geometry: None,
@@ -277,6 +281,11 @@ impl TodSettings {
             None => paths.fleet_storage_root(),
         };
         crate::fleet::paths::normalize_absolute(&root)
+    }
+
+    /// Write Treehouse user config under the data root after settings change.
+    pub fn sync_treehouse_config(&self, paths: &TodPaths) -> Result<()> {
+        crate::fleet::treehouse::sync_user_config(self, paths)
     }
 }
 
@@ -356,6 +365,7 @@ mod tests {
             fleet_storage_root: None,
             always_on_top: true,
             worktree_backend: WorktreeBackend::default(),
+            treehouse_worktrees_root: None,
             agent_platform: AgentPlatform::Claude,
             terminal: TerminalSettings {
                 program: Some(r"C:\app\dev\Git\git-bash.exe".into()),

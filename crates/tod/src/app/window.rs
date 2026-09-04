@@ -7,6 +7,7 @@ use crate::agent_socket;
 use crate::agent_socket::commands::AgentPlatformSocketCommand;
 use crate::app::history_window::HistoryWindowControl;
 use crate::app::interactive_agent_window::InteractiveAgentWindowControl;
+use crate::app::shell_socket::ShellSocketService;
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
@@ -38,6 +39,7 @@ use tod_store::agent_traffic::{
 };
 use tod_store::fleet::{
     FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
+    verify_shell_session,
 };
 use uuid::Uuid;
 
@@ -994,6 +996,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     #[cfg(feature = "agent-socket")]
     let shell_for_socket =
         std::sync::Arc::new(std::sync::Mutex::new(None::<gpui::WeakEntity<Shell>>));
+    #[cfg(feature = "agent-socket")]
+    let shell_socket_service =
+        std::sync::Arc::new(std::sync::Mutex::new(None::<ShellSocketService>));
 
     let handle = cx.open_window(
         WindowOptions {
@@ -1019,6 +1024,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             let history_window = history_window.clone();
             #[cfg(feature = "agent-socket")]
             let shell_for_socket = shell_for_socket.clone();
+            #[cfg(feature = "agent-socket")]
+            let shell_socket_service = shell_socket_service.clone();
             move |window, cx| {
                 let paths_for_geometry = paths.clone();
                 let transcript_for_close = transcript_window.clone();
@@ -1292,7 +1299,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 history_window: history_window.clone(),
                                 agent_status_text,
                                 status_line: SharedString::default(),
-                                paths,
+                                paths: paths.clone(),
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
                                 pending_open_lifecycle: None,
@@ -1333,6 +1340,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 if let Ok(mut slot) = shell_for_socket.lock() {
                                     *slot = Some(cx.weak_entity());
                                 }
+                                if let Ok(mut slot) = shell_socket_service.lock() {
+                                    *slot =
+                                        Some(ShellSocketService::new(fleet.clone(), paths.clone()));
+                                }
                             }
                             shell
                         });
@@ -1359,6 +1370,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             .ok()
             .and_then(|slot| slot.clone())
             .expect("shell weak entity for agent socket");
+        let shell_socket = shell_socket_service
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .expect("shell socket service for agent socket");
         agent_socket::start(
             cx,
             handle.into(),
@@ -1368,6 +1384,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
             height,
             transcript_for_socket,
             shell_weak,
+            shell_socket,
         );
     }
 

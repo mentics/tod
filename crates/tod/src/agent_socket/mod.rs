@@ -21,8 +21,11 @@
 mod capture;
 pub mod commands;
 
+use crate::app::shell_socket::ShellSocketService;
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
-use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
+use commands::{
+    AgentPlatformSocketCommand, Command, ShellSocketCommand, TranscriptsCommand, parse_line,
+};
 use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
@@ -56,6 +59,7 @@ enum UiRequest {
     Sync,
     Transcripts(TranscriptsCommand),
     AgentPlatform(AgentPlatformSocketCommand),
+    Shell(ShellSocketCommand),
 }
 
 struct Pending {
@@ -74,6 +78,7 @@ pub fn start(
     logical_height: f32,
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
+    shell_socket: ShellSocketService,
 ) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let _ = SHUTDOWN.set(shutdown.clone());
@@ -88,7 +93,7 @@ pub fn start(
         .expect("spawn agent socket thread");
 
     cx.spawn(async move |cx| {
-        drain_loop(cx, window, transcript_window, shell, rx).await;
+        drain_loop(cx, window, transcript_window, shell, shell_socket, rx).await;
     })
     .detach();
 }
@@ -157,6 +162,9 @@ fn handle_client(
             Ok(Command::AgentPlatform(action)) => {
                 dispatch_ui(&tx, UiRequest::AgentPlatform(action))
             }
+            Ok(Command::Shell(action)) => {
+                dispatch_ui_with_timeout(&tx, UiRequest::Shell(action), Duration::from_secs(30))
+            }
             Err(e) => Err(e),
         };
 
@@ -171,6 +179,14 @@ fn handle_client(
 }
 
 fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Result<String, String> {
+    dispatch_ui_with_timeout(tx, request, Duration::from_secs(5))
+}
+
+fn dispatch_ui_with_timeout(
+    tx: &async_channel::Sender<Pending>,
+    request: UiRequest,
+    timeout: Duration,
+) -> Result<String, String> {
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     tx.send_blocking(Pending {
         request,
@@ -178,7 +194,7 @@ fn dispatch_ui(tx: &async_channel::Sender<Pending>, request: UiRequest) -> Resul
     })
     .map_err(|_| "agent UI channel closed".to_string())?;
     reply_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(timeout)
         .map_err(|_| "agent UI command timed out".to_string())?
 }
 
@@ -187,6 +203,7 @@ async fn drain_loop(
     window: AnyWindowHandle,
     transcript_window: TranscriptWindowControl,
     shell: gpui::WeakEntity<crate::app::window::Shell>,
+    shell_socket: ShellSocketService,
     rx: async_channel::Receiver<Pending>,
 ) {
     while let Ok(pending) = rx.recv().await {
@@ -194,7 +211,14 @@ async fn drain_loop(
             Timer::after(Duration::from_millis(16)).await;
             Ok("ok".into())
         } else {
-            handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
+            handle_ui_request(
+                cx,
+                window,
+                &transcript_window,
+                &shell,
+                &shell_socket,
+                pending.request,
+            )
         };
         let _ = pending.reply.send(result);
 
@@ -203,7 +227,14 @@ async fn drain_loop(
                 Timer::after(Duration::from_millis(16)).await;
                 Ok("ok".into())
             } else {
-                handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
+                handle_ui_request(
+                    cx,
+                    window,
+                    &transcript_window,
+                    &shell,
+                    &shell_socket,
+                    pending.request,
+                )
             };
             let _ = pending.reply.send(result);
         }
@@ -215,6 +246,7 @@ fn handle_ui_request(
     window: AnyWindowHandle,
     transcript_window: &TranscriptWindowControl,
     shell: &gpui::WeakEntity<crate::app::window::Shell>,
+    shell_socket: &ShellSocketService,
     request: UiRequest,
 ) -> Result<String, String> {
     match request {
@@ -223,6 +255,7 @@ fn handle_ui_request(
         UiRequest::Text(text) => apply_text(cx, window, text).map(|()| "ok".into()),
         UiRequest::Transcripts(action) => apply_transcripts(cx, transcript_window, action),
         UiRequest::AgentPlatform(action) => apply_agent_platform(cx, shell, action),
+        UiRequest::Shell(action) => shell_socket.handle(action),
     }
 }
 

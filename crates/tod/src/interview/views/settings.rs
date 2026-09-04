@@ -17,6 +17,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
+use std::path::PathBuf;
 use std::time::Duration;
 use tod_store::fleet::default_terminal_hint;
 
@@ -107,7 +108,7 @@ impl SettingsSection {
             Self::Agents => &[AgentPlatform],
             Self::QuestionMaker => &[ReplenishThreshold, SecondQuestionMaker, RunsPerSession],
             Self::AnswerProcessor => &[PoolSize, AnswersPerSession],
-            Self::Workspaces => &[WorktreeBackend, TerminalProgram],
+            Self::Workspaces => &[WorktreeBackend, TreehouseWorktreesRoot, TerminalProgram],
             Self::Logging => &[LogLevel, LogMaxSize],
         }
     }
@@ -122,6 +123,7 @@ enum SettingField {
     PoolSize,
     AnswersPerSession,
     WorktreeBackend,
+    TreehouseWorktreesRoot,
     TerminalProgram,
     LogLevel,
     LogMaxSize,
@@ -137,6 +139,7 @@ impl SettingField {
             Self::PoolSize => "pool-size",
             Self::AnswersPerSession => "answers-per-session",
             Self::WorktreeBackend => "worktree-backend",
+            Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
@@ -144,7 +147,7 @@ impl SettingField {
     }
 
     fn is_text_input(self) -> bool {
-        matches!(self, Self::TerminalProgram)
+        matches!(self, Self::TerminalProgram | Self::TreehouseWorktreesRoot)
     }
 }
 
@@ -153,13 +156,16 @@ pub struct SettingsView {
     settings: TodSettings,
     log_dir_display: SharedString,
     terminal_program_input: Entity<InputState>,
+    treehouse_worktrees_root_input: Entity<InputState>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     active_section: SettingsSection,
     selected_field_index: usize,
     terminal_program_editing: bool,
+    treehouse_worktrees_root_editing: bool,
     save_generation: u64,
     _terminal_subscription: Subscription,
+    _treehouse_worktrees_root_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -171,6 +177,17 @@ impl SettingsView {
                 .display()
                 .to_string(),
         );
+        let treehouse_worktrees_root_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Default: pools under TREEHOUSE_HOME")
+                .default_value(
+                    settings
+                        .treehouse_worktrees_root
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                )
+        });
         let terminal_program_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Enter to edit · Auto (OS default)")
@@ -192,24 +209,68 @@ impl SettingsView {
                     }
                 }
             });
+        let _treehouse_worktrees_root_subscription =
+            cx.subscribe(&treehouse_worktrees_root_input, |this, input, event, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.apply_treehouse_worktrees_root_input(
+                        input.read(cx).text().to_string(),
+                        cx,
+                    );
+                }
+            });
 
         Self {
             paths,
             settings,
             log_dir_display,
             terminal_program_input,
+            treehouse_worktrees_root_input,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             active_section: SettingsSection::Agents,
             selected_field_index: 0,
             terminal_program_editing: false,
+            treehouse_worktrees_root_editing: false,
             save_generation: 0,
             _terminal_subscription,
+            _treehouse_worktrees_root_subscription,
         }
     }
 
+    fn apply_treehouse_worktrees_root_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let trimmed = raw.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            match tod_store::fleet::paths::normalize_absolute(PathBuf::from(trimmed).as_path()) {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    tracing::warn!("invalid treehouse worktrees root: {err:#}");
+                    return;
+                }
+            }
+        };
+        if self.settings.treehouse_worktrees_root == next {
+            return;
+        }
+        self.settings.treehouse_worktrees_root = next;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     fn text_editing(&self) -> bool {
-        self.terminal_program_editing
+        self.terminal_program_editing || self.treehouse_worktrees_root_editing
+    }
+
+    fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_program_editing {
+            self.terminal_program_editing = false;
+        }
+        if self.treehouse_worktrees_root_editing {
+            self.treehouse_worktrees_root_editing = false;
+        }
+        self.focus_handle.focus(window);
+        cx.notify();
     }
 
     fn activate_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
@@ -217,6 +278,7 @@ impl SettingsView {
             return;
         }
         self.terminal_program_editing = false;
+        self.treehouse_worktrees_root_editing = false;
         self.active_section = section;
         self.selected_field_index = 0;
         cx.notify();
@@ -233,6 +295,7 @@ impl SettingsView {
         let len = SECTIONS.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
         self.terminal_program_editing = false;
+        self.treehouse_worktrees_root_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         cx.notify();
@@ -276,7 +339,7 @@ impl SettingsView {
             SettingField::PoolSize => self.step_pool_size(delta, cx),
             SettingField::AnswersPerSession => self.step_answers_per_session(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
-            SettingField::TerminalProgram => {}
+            SettingField::TreehouseWorktreesRoot | SettingField::TerminalProgram => {}
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
                 let step = if delta >= 0 { 1024 } else { -1024 };
@@ -290,8 +353,28 @@ impl SettingsView {
             return;
         }
         if self.selected_field().is_text_input() {
-            self.enter_terminal_edit(window, cx);
+            match self.selected_field() {
+                SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
+                SettingField::TreehouseWorktreesRoot => {
+                    self.enter_treehouse_worktrees_root_edit(window, cx)
+                }
+                _ => {}
+            }
         }
+    }
+
+    fn enter_treehouse_worktrees_root_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::TreehouseWorktreesRoot) {
+            return;
+        }
+        self.treehouse_worktrees_root_editing = true;
+        cx.notify();
+        let input = self.treehouse_worktrees_root_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
     }
 
     fn enter_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -318,8 +401,8 @@ impl SettingsView {
     }
 
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_program_editing {
-            self.exit_terminal_edit(window, cx);
+        if self.text_editing() {
+            self.exit_text_edit(window, cx);
         }
     }
 
@@ -342,6 +425,9 @@ impl SettingsView {
         if let Err(err) = self.settings.save(&self.paths) {
             tracing::error!("failed to save settings: {err:#}");
             return;
+        }
+        if let Err(err) = self.settings.sync_treehouse_config(&self.paths) {
+            tracing::warn!("failed to sync treehouse config: {err:#}");
         }
         let _ = logging::reload_level(self.settings.log_level);
         let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
@@ -508,6 +594,11 @@ impl Render for SettingsView {
             self.terminal_program_editing,
             cx,
         );
+        key_context::set_input_tab_stop(
+            &self.treehouse_worktrees_root_input,
+            self.treehouse_worktrees_root_editing,
+            cx,
+        );
         if !self.terminal_program_editing
             && self
                 .terminal_program_input
@@ -516,6 +607,15 @@ impl Render for SettingsView {
                 .is_focused(window)
         {
             self.enter_terminal_edit(window, cx);
+        }
+        if !self.treehouse_worktrees_root_editing
+            && self
+                .treehouse_worktrees_root_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_treehouse_worktrees_root_edit(window, cx);
         }
 
         let theme = cx.theme().clone();
@@ -761,6 +861,16 @@ impl SettingsView {
                     theme,
                     |this, _, cx| this.cycle_worktree_backend(-1, cx),
                     |this, _, cx| this.cycle_worktree_backend(1, cx),
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::TreehouseWorktreesRoot,
+                    "Treehouse worktrees root",
+                    "Parent directory for Treehouse worktree pools (TREEHOUSE_WORKTREES). Empty uses TREEHOUSE_HOME ({data_root}/treehouse).",
+                    &self.treehouse_worktrees_root_input,
+                    self.treehouse_worktrees_root_editing,
+                    theme,
                 ))
                 .child(text_input_row(
                     cx,

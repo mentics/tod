@@ -1,11 +1,13 @@
 //! Git worktree and Treehouse provisioning for agent workspaces.
 
-use crate::settings::WorktreeBackend;
+use crate::fleet::treehouse::TreehouseInvocation;
+use crate::paths::TodPaths;
+use crate::settings::{TodSettings, WorktreeBackend};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 /// Strip Win32 `\\?\` extended-length prefix so git and error messages see normal paths.
@@ -41,15 +43,7 @@ pub struct WorktreeHandle {
 }
 
 /// Returns true when the `treehouse` CLI is on PATH and responds.
-pub fn treehouse_available() -> bool {
-    Command::new("treehouse")
-        .arg("env")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+pub use crate::fleet::treehouse::treehouse_available;
 
 fn canonical_repo_key(repo: &Path) -> Result<String> {
     let canonical = repo
@@ -210,8 +204,16 @@ struct TreehouseLeaseJson {
     lease_holder: String,
 }
 
-fn treehouse_get_lease(repo: &Path, holder: &str) -> Result<WorktreeHandle> {
-    let output = Command::new("treehouse")
+fn treehouse_get_lease(
+    repo: &Path,
+    holder: &str,
+    settings: &TodSettings,
+    paths: &TodPaths,
+) -> Result<WorktreeHandle> {
+    let invocation = TreehouseInvocation::resolve(settings, paths)?;
+    let mut command = Command::new("treehouse");
+    invocation.apply_to(&mut command);
+    let output = command
         .current_dir(repo)
         .arg("get")
         .arg("--lease")
@@ -265,6 +267,8 @@ fn with_creation_lock<T>(data_root: &Path, f: impl FnOnce() -> Result<T>) -> Res
 pub fn ensure_worktree(
     conn: &Connection,
     backend: WorktreeBackend,
+    settings: &TodSettings,
+    paths: &TodPaths,
     data_root: &Path,
     repo: &Path,
     branch: &str,
@@ -304,10 +308,12 @@ pub fn ensure_worktree(
                 let path = git_worktree_add(repo, &dest, &branch_key)?;
                 WorktreeHandle { path, lease: None }
             }
-            WorktreeBackend::TreehouseRequired => treehouse_get_lease(repo, lease_holder)?,
+            WorktreeBackend::TreehouseRequired => {
+                treehouse_get_lease(repo, lease_holder, settings, paths)?
+            }
             WorktreeBackend::TreehouseWithGitFallback => {
                 if treehouse_available() {
-                    match treehouse_get_lease(repo, lease_holder) {
+                    match treehouse_get_lease(repo, lease_holder, settings, paths) {
                         Ok(h) => h,
                         Err(err) => {
                             tracing::warn!(
@@ -440,12 +446,17 @@ mod tests {
         use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
         use crate::fleet::repos::task::{FleetTask, TaskRepo};
         use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
+        use crate::paths::{clear_data_root_override, set_data_root};
+        use crate::settings::TodSettings;
         use crate::settings::WorktreeBackend;
         use uuid::Uuid;
 
         let git_repo = init_temp_repo();
         let repo_str = git_repo.to_string_lossy().into_owned();
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        set_data_root(data_root.clone());
+        let paths = TodPaths::discover().unwrap();
+        let settings = TodSettings::default();
         let (db_dir, conn) = test_writer_conn();
 
         let node_main = Uuid::new_v4().to_string();
@@ -472,6 +483,8 @@ mod tests {
         let main_handle = ensure_worktree(
             &conn,
             WorktreeBackend::GitOnly,
+            &settings,
+            &paths,
             &data_root,
             &git_repo,
             "feature",
@@ -481,6 +494,8 @@ mod tests {
         let feature_handle = ensure_worktree(
             &conn,
             WorktreeBackend::GitOnly,
+            &settings,
+            &paths,
             &data_root,
             &git_repo,
             "dev",
@@ -511,6 +526,8 @@ mod tests {
         let reused = ensure_worktree(
             &conn,
             WorktreeBackend::GitOnly,
+            &settings,
+            &paths,
             &data_root,
             &git_repo,
             "feature",
@@ -523,5 +540,6 @@ mod tests {
         let _ = fs::remove_dir_all(&git_repo);
         let _ = fs::remove_dir_all(&data_root);
         cleanup_test_dir(&db_dir);
+        clear_data_root_override();
     }
 }

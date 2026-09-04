@@ -132,6 +132,11 @@ impl TodPaths {
         self.data_root.clone()
     }
 
+    /// Tod-owned Treehouse state (`TREEHOUSE_HOME`, `config.toml`).
+    pub fn treehouse_home(&self) -> PathBuf {
+        self.data_root.join("treehouse")
+    }
+
     pub fn ensure_config_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("failed to create config dir {}", self.config_dir.display()))

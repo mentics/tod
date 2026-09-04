@@ -54,6 +54,6 @@ pub struct DefaultShellSpawnMetadata;
 
 impl ShellSpawnMetadata for DefaultShellSpawnMetadata {
     fn shell_label(&self, session: &ShellSession) -> String {
-        format!("shell {}", session.id)
+        format!("shell {}", session.label_number)
     }
 }

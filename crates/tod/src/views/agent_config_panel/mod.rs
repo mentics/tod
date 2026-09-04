@@ -12,7 +12,7 @@ use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, Styled, Window, actions, div,
+    ParentElement, Render, Styled, Timer, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
@@ -20,7 +20,10 @@ use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_fle
 use std::sync::Arc;
 use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
 use tod_store::fleet::repos::shell::ShellSession;
-use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_agent_config};
+use tod_store::fleet::terminal::{
+    focus_shell_session, open_shell_for_agent_config, prune_stale_shell_sessions,
+    remove_shell_state,
+};
 use tod_store::fleet::{AgentRun, FleetMutation, FleetStore, NewAgentConfig};
 
 const AGENT_CONFIG_CONTEXT: &str = "AgentConfig";
@@ -71,6 +74,7 @@ pub struct AgentConfigPanelView {
     shells: Vec<ShellSession>,
     chat_sessions: Vec<AgentRun>,
     status_message: String,
+    shell_poll_generation: u64,
 }
 
 impl AgentConfigPanelView {
@@ -114,6 +118,7 @@ impl AgentConfigPanelView {
             shells: Vec::new(),
             chat_sessions: Vec::new(),
             status_message: String::new(),
+            shell_poll_generation: 0,
         }
     }
 
@@ -187,11 +192,55 @@ impl AgentConfigPanelView {
             }
             self.reload_runs();
             self.reload_shells();
+            self.prune_shells_for_config(cx);
             self.reload_chat_sessions();
         }
         self.refresh_workspace_label();
+        self.start_shell_liveness_poll(cx);
         self.focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn prune_shells_for_config(&mut self, cx: &mut Context<Self>) {
+        let Some(config_id) = self.config_id.clone() else {
+            return;
+        };
+        if let Ok(removed) = prune_stale_shell_sessions(&self.fleet, &self.paths, &config_id) {
+            if removed > 0 {
+                let _ = self.fleet.reload_if_stale();
+                self.reload_shells();
+                cx.notify();
+            }
+        }
+    }
+
+    fn start_shell_liveness_poll(&mut self, cx: &mut Context<Self>) {
+        self.shell_poll_generation = self.shell_poll_generation.saturating_add(1);
+        let generation = self.shell_poll_generation;
+        let weak = cx.weak_entity();
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |_, cx| {
+            loop {
+                Timer::after(std::time::Duration::from_secs(5)).await;
+                let should_continue = weak
+                    .update(cx, |this, cx| {
+                        if !this.is_open() || this.shell_poll_generation != generation {
+                            return false;
+                        }
+                        if this.config_id.is_none() {
+                            return true;
+                        }
+                        this.prune_shells_for_config(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+                let _ = fleet.reload_if_stale();
+            }
+        })
+        .detach();
     }
 
     fn refresh_workspace_label(&mut self) {
@@ -251,6 +300,7 @@ impl AgentConfigPanelView {
         if self.task_id.is_none() {
             return;
         }
+        self.shell_poll_generation = self.shell_poll_generation.saturating_add(1);
         self.task_id = None;
         self.config_id = None;
         self.runs.clear();
@@ -775,8 +825,13 @@ impl AgentConfigPanelView {
             Ok(cwd) => {
                 let _ = self.fleet.reload_if_stale();
                 self.reload_shells();
+                let still_alive = self.shells.iter().any(|row| row.id == shell_id);
                 self.set_status(
-                    format!("{config_id} · opened terminal in {}", cwd.display()),
+                    if still_alive {
+                        format!("{config_id} · focused shell in {}", cwd.display())
+                    } else {
+                        format!("{config_id} · opened terminal in {}", cwd.display())
+                    },
                     cx,
                 );
             }
@@ -796,6 +851,7 @@ impl AgentConfigPanelView {
             error_toast(window, cx, format!("Delete shell failed: {err}"));
             return;
         }
+        remove_shell_state(&self.paths, shell_id);
         if let Err(err) = self.flush_fleet() {
             error_toast(window, cx, format!("Delete shell failed: {err}"));
             return;
@@ -1088,16 +1144,17 @@ impl AgentConfigPanelView {
                         .child("No shells yet."),
                 )
             })
-            .children(self.shells.iter().enumerate().map(|(idx, shell)| {
+            .children(self.shells.iter().map(|shell| {
                 let running = shell.reconnect.is_some();
-                let label = format!("shell {}", idx + 1);
+                let label = format!("shell {}", shell.label_number);
                 let focus_shell_id = shell.id.clone();
                 let delete_shell_id = shell.id.clone();
+                let button_id = shell.label_number as usize;
                 h_flex()
                     .gap_2()
                     .items_center()
                     .child(
-                        Button::new(("shell-focus", idx))
+                        Button::new(("shell-focus", button_id))
                             .label(label)
                             .small()
                             .compact()
@@ -1112,7 +1169,7 @@ impl AgentConfigPanelView {
                             .child(if running { "running" } else { "not running" }),
                     )
                     .child(
-                        Button::new(("shell-delete", idx))
+                        Button::new(("shell-delete", button_id))
                             .label("Delete")
                             .small()
                             .compact()

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/tod-store", "crates/tod"]
+members = ["crates/tod-store", "crates/tod", "crates/nov-viz"]
 resolver = "2"
 
 # Dev profile tuned for fast incremental rebuilds:

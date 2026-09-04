@@ -25,6 +25,34 @@ pub fn verify(pid: u32, birth_token: u64) -> bool {
     record(pid).is_some_and(|id| id.birth_token == birth_token)
 }
 
+/// Best-effort check that a PID still exists (used when sysinfo cannot see MSYS/bash).
+pub fn pid_exists(pid: u32) -> bool {
+    if record(pid).is_some() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        return std::process::Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
