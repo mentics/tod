@@ -20,11 +20,6 @@ fn main() {
 
     if let Err(err) = copy_dir_all(&process_src, &dest) {
         println!("cargo:warning=tod: failed to copy process bundle: {err}");
-    } else {
-        println!(
-            "cargo:warning=tod: copied process bundle to {}",
-            dest.display()
-        );
     }
 }
 

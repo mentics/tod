@@ -299,9 +299,16 @@ fn spawn_powershell(
     backend: &str,
     startup_command: Option<&str>,
 ) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    // GUI hosts (tod.exe) are not console processes. Without CREATE_NEW_CONSOLE,
+    // powershell.exe can start headless (hwnd=0): the agent run registers as
+    // "processing" but no window appears.
+    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
     let mut command = Command::new(program);
     command.current_dir(cwd);
     command.env("TOD_TERMINAL_BACKEND", backend);
+    command.creation_flags(CREATE_NEW_CONSOLE);
     command.args(windows_launch_args(
         &assets.windows_init,
         shell_id,
@@ -615,7 +622,7 @@ fn terminal_agent_is_alive(paths: &TodPaths, run: &AgentRun) -> bool {
     tracked_session_alive(paths, &run.id, run.reconnect.as_ref())
 }
 
-/// End terminal agent runs whose OS process is gone; clear reconnect + state files.
+/// Delete terminal agent runs whose OS process is gone; clear state files.
 pub fn prune_stale_terminal_agent_runs(
     fleet: &FleetStore,
     paths: &TodPaths,
@@ -624,16 +631,10 @@ pub fn prune_stale_terminal_agent_runs(
     let runs = fleet.list_terminal_agent_runs_for_config(config_id)?;
     let mut removed = 0usize;
     for run in runs {
-        if run.ended_at.is_some() || run.runtime_status == "not_running" {
-            continue;
-        }
         if terminal_agent_is_alive(paths, &run) {
             continue;
         }
-        fleet.enqueue(FleetMutation::ClearAgentRunReconnect {
-            run_id: run.id.clone(),
-        })?;
-        fleet.enqueue(FleetMutation::EndAgentRun {
+        fleet.enqueue(FleetMutation::DeleteAgentRun {
             run_id: run.id.clone(),
         })?;
         remove_shell_state(paths, &run.id);
@@ -725,7 +726,7 @@ pub fn open_terminal_agent_for_config(
     if let Err(err) =
         launch_shell_terminal(&cwd, &terminal, &run_id, &assets, Some(startup_command))
     {
-        let _ = fleet.enqueue(FleetMutation::EndAgentRun {
+        let _ = fleet.enqueue(FleetMutation::DeleteAgentRun {
             run_id: run_id.clone(),
         });
         let _ = fleet.writer().flush();
@@ -736,7 +737,7 @@ pub fn open_terminal_agent_for_config(
     let state = match wait_for_shell_state(&state_dir, &run_id) {
         Ok(state) => state,
         Err(err) => {
-            let _ = fleet.enqueue(FleetMutation::EndAgentRun {
+            let _ = fleet.enqueue(FleetMutation::DeleteAgentRun {
                 run_id: run_id.clone(),
             });
             let _ = fleet.writer().flush();
@@ -783,16 +784,13 @@ pub fn focus_terminal_agent_run(
     }
 
     remove_shell_state(paths, &run.id);
-    fleet.enqueue(FleetMutation::ClearAgentRunReconnect {
-        run_id: run.id.clone(),
-    })?;
-    fleet.enqueue(FleetMutation::EndAgentRun {
+    fleet.enqueue(FleetMutation::DeleteAgentRun {
         run_id: run.id.clone(),
     })?;
     fleet
         .writer()
         .flush()
-        .context("end stale terminal agent run")?;
+        .context("delete stale terminal agent run")?;
 
     let (_, new_cwd) =
         open_terminal_agent_for_config(fleet, paths, settings, config_id, startup_command)?;
@@ -913,6 +911,197 @@ mod tests {
             .status();
         clear_data_root_override();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_launch_gets_visible_console() {
+        use crate::paths::{clear_data_root_override, set_data_root};
+        use crate::settings::TerminalSettings;
+        use reconnect_identity;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn FreeConsole() -> i32;
+            fn GetConsoleWindow() -> *mut core::ffi::c_void;
+        }
+
+        let root = std::env::temp_dir().join(format!("tod-shell-ps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        set_data_root(root.clone());
+        let paths = crate::paths::TodPaths::discover().unwrap();
+        let assets = ensure_shell_init_assets(&paths).unwrap();
+        let cwd = normalize_launch_path(std::env::current_dir().unwrap().as_path());
+        let shell_id = uuid::Uuid::new_v4().to_string();
+        let settings = TerminalSettings {
+            program: Some("powershell.exe".into()),
+            ..TerminalSettings::default()
+        };
+
+        // Mimic tod.exe (Windows GUI subsystem): no attached console when spawning.
+        // Without CREATE_NEW_CONSOLE, powershell starts headless (hwnd=0).
+        if unsafe { !GetConsoleWindow().is_null() } {
+            assert_ne!(unsafe { FreeConsole() }, 0, "FreeConsole failed");
+        }
+
+        let launch_result = launch_shell_terminal(&cwd, &settings, &shell_id, &assets, None);
+        let state_dir = normalize_launch_path(&assets.state_dir);
+        let state_result = launch_result.and_then(|_| wait_for_shell_state(&state_dir, &shell_id));
+
+        let cleanup = |pid: Option<u32>| {
+            if let Some(pid) = pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            clear_data_root_override();
+            let _ = std::fs::remove_dir_all(&root);
+        };
+
+        let state = match state_result {
+            Ok(state) => state,
+            Err(err) => {
+                cleanup(None);
+                panic!("powershell launch/register failed: {err:#}");
+            }
+        };
+        assert!(state.pid > 0, "expected powershell pid in shell state");
+        assert_eq!(state.backend, "powershell");
+        assert!(
+            reconnect_identity::pid_exists(state.pid),
+            "powershell pid {} should stay alive",
+            state.pid
+        );
+        let hwnd = state.hwnd.unwrap_or(0);
+        if hwnd == 0 {
+            cleanup(Some(state.pid));
+            panic!(
+                "powershell should own a console window (hwnd), got 0; \
+                 GUI hosts must spawn with CREATE_NEW_CONSOLE"
+            );
+        }
+
+        cleanup(Some(state.pid));
+    }
+
+    #[test]
+    fn prune_stale_terminal_agent_runs_deletes_dead_runs() {
+        use crate::fleet::reconnect_identity::ReconnectIdentity;
+        use crate::fleet::repos::agent_config::NewAgentConfig;
+        use crate::fleet::repos::task::FleetTask;
+        use crate::fleet::store::FleetStore;
+        use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+        use crate::fleet::writer::FleetMutation;
+        use crate::paths::{clear_data_root_override, set_data_root};
+
+        let fleet_root = temp_fleet_root();
+        let store = FleetStore::open(&fleet_root).unwrap();
+        set_data_root(fleet_root.clone());
+        let paths = crate::paths::TodPaths::discover().unwrap();
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let config_id = format!("test-{}", uuid::Uuid::new_v4());
+        store
+            .enqueue(FleetMutation::InsertTask {
+                task: FleetTask::new(&task_id, "Terminal prune", "terminal-prune"),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store
+            .enqueue(FleetMutation::InsertAgent {
+                agent: NewAgentConfig {
+                    id: config_id.clone(),
+                    node_id: task_id.clone(),
+                    env_type: "local".into(),
+                    mode: "agent".into(),
+                    work_directory: Some(std::env::current_dir().unwrap().display().to_string()),
+                    use_worktree: false,
+                    platform: "claude".into(),
+                    model: "default".into(),
+                    effort: "auto".into(),
+                },
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+
+        store
+            .enqueue(FleetMutation::CreateAgentRun {
+                config_id: config_id.clone(),
+                run_kind: Some("terminal".into()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let _ = store.reload_if_stale();
+        let run = store
+            .list_terminal_agent_runs_for_config(&config_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("terminal run");
+        store
+            .enqueue(FleetMutation::UpdateAgentRunReconnect {
+                run_id: run.id.clone(),
+                identity: ReconnectIdentity {
+                    pid: 4_294_967_294,
+                    birth_token: 1,
+                },
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
+                run_id: run.id.clone(),
+                runtime_status: "processing".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+
+        let removed = prune_stale_terminal_agent_runs(&store, &paths, &config_id).unwrap();
+        assert_eq!(removed, 1);
+        let _ = store.reload_if_stale();
+        assert!(
+            store
+                .list_terminal_agent_runs_for_config(&config_id)
+                .unwrap()
+                .is_empty(),
+            "dead processing run should be deleted, not kept as not_running"
+        );
+
+        store
+            .enqueue(FleetMutation::CreateAgentRun {
+                config_id: config_id.clone(),
+                run_kind: Some("terminal".into()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let _ = store.reload_if_stale();
+        let ended = store
+            .list_terminal_agent_runs_for_config(&config_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("second terminal run");
+        store
+            .enqueue(FleetMutation::EndAgentRun {
+                run_id: ended.id.clone(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+
+        let removed = prune_stale_terminal_agent_runs(&store, &paths, &config_id).unwrap();
+        assert_eq!(removed, 1);
+        let _ = store.reload_if_stale();
+        assert!(
+            store
+                .list_terminal_agent_runs_for_config(&config_id)
+                .unwrap()
+                .is_empty(),
+            "already-ended terminal runs should be deleted on prune"
+        );
+
+        clear_data_root_override();
+        cleanup_fleet_root(&fleet_root);
     }
 
     #[cfg(windows)]

@@ -67,6 +67,8 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("=", SettingsIncrease, context),
         KeyBinding::new("enter", SettingsActivate, context),
         KeyBinding::new("space", SettingsActivate, context),
+        // Single-line fields: Enter commits and exits edit (same as Escape).
+        KeyBinding::new("enter", SettingsEscape, input_context),
         KeyBinding::new("escape", SettingsEscape, context),
         KeyBinding::new("escape", SettingsEscape, input_context),
     ]);
@@ -498,15 +500,6 @@ impl SettingsView {
         });
     }
 
-    fn exit_terminal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.terminal_program_editing {
-            return;
-        }
-        self.terminal_program_editing = false;
-        self.focus_handle.focus(window);
-        cx.notify();
-    }
-
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
             self.exit_text_edit(window, cx);
@@ -834,7 +827,7 @@ impl Render for SettingsView {
                     .border_t_1()
                     .border_color(border)
                     .child(div().text_xs().text_color(muted).child(
-                        "←→ sidebar/fields · ↑↓ move · −/= adjust · Enter/Space cycle · Esc exit edit",
+                        "←→ sidebar/fields · ↑↓ move · −/= adjust · Enter/Space activate · Enter/Esc exit edit",
                     )),
             )
             .on_mouse_down(

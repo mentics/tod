@@ -22,6 +22,7 @@ Multi-line text fields must not trap keyboard navigation. Use **two explicit mod
 - Set a `*_editing` flag; re-enable the `Input` and focus it on the **next frame** (after disabled→enabled re-render).
 - Normal text editing: Tab inserts tab, typing works, Input owns focus context (`Input`).
 - **Escape exits edit mode first** — return focus to the parent `focus_handle` and restore the navigation highlight on that stop.
+- **Single-line fields: Enter also exits edit mode** (commit + blur) — bind Enter with `key_context::including_input(surface)` to the same exit handler as Escape. Multi-line fields keep Enter for newlines; use Ctrl+Enter to submit when needed.
 - While editing, parent navigation bindings must **not** fire: gate handlers with `response_text_editing()`-style checks and `cx.propagate()` so the Input keeps arrow/tab behavior.
 - **Remove disabled inputs from GPUI tab order** via [`set_input_tab_stop`](crates/tod/src/ui/key_context.rs) (otherwise Tab focuses the input, shows a cursor, but typing is blocked). If focus lands on a disabled input anyway, redirect to the parent handle and sync the nav highlight.
 
@@ -29,6 +30,7 @@ Multi-line text fields must not trap keyboard navigation. Use **two explicit mod
 
 - Surface shortcuts (lists, pane nav, app nav): bind with `key_context::excluding_input(surface)` or [`NOT_INPUT`](crates/tod/src/ui/key_context.rs).
 - Escape while editing: bind with `key_context::including_input(surface)` so it still fires inside the Input.
+- Enter while editing (single-line): bind with `key_context::including_input(surface)` to exit/commit (Input emits `PressEnter` then propagates).
 - Panel-level Escape (close/dismiss): use `key_context::bind_panel_escape` — but prefer **exit edit mode before** closing the surface (interview pattern).
 
 ## Layout-specific navigation
