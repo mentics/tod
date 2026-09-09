@@ -15,7 +15,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
+use tod_store::fleet::{FleetMutation, FleetStore, NoteItem, validate_interview_workspace};
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, OutlineMutation};
 use tod_store::{CredentialStore, resolve_linear_api_key};
 
@@ -25,6 +25,8 @@ const SLUG_MAX_LEN: usize = 120;
 const MAX_TAGS: usize = 10;
 const MULTI_LINE_ROWS: f32 = 4.;
 const DETAILS_ROWS: f32 = 6.;
+/// Max visible height of the notes list, in equivalent text lines, before it scrolls.
+const NOTES_MAX_LINES: f32 = 16.;
 
 fn input_text(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).text().to_string()
@@ -39,7 +41,6 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Tags => "task-edit-field-tags",
         TaskEditField::Repo => "task-edit-field-repo",
         TaskEditField::Branch => "task-edit-field-branch",
-        TaskEditField::Notes => "task-edit-field-notes",
         TaskEditField::Purpose => "task-edit-field-purpose",
         TaskEditField::Details => "task-edit-field-details",
         TaskEditField::Obligations => "task-edit-field-obligations",
@@ -71,7 +72,6 @@ enum TaskEditField {
     Tags,
     Repo,
     Branch,
-    Notes,
     Purpose,
     Details,
     Obligations,
@@ -109,10 +109,10 @@ pub struct TaskEditView {
     github_pr_input: Entity<InputState>,
     repo_input: Entity<InputState>,
     branch_input: Entity<InputState>,
-    notes_input: Entity<InputState>,
     purpose_input: Entity<InputState>,
     details_input: Entity<InputState>,
     tag_draft_input: Entity<InputState>,
+    note_edit_input: Entity<InputState>,
     tags: Vec<String>,
     capabilities: HashSet<Capability>,
     loaded_title: String,
@@ -122,6 +122,11 @@ pub struct TaskEditView {
     loaded_lifecycle: String,
     loaded_purpose: String,
     loaded_details: String,
+    notes: Vec<NoteItem>,
+    details_collapsed: bool,
+    notes_collapsed: bool,
+    editing_note_id: Option<uuid::Uuid>,
+    notes_scroll_handle: ScrollHandle,
     obligation_requirements: usize,
     obligation_constraints: usize,
     pending_toast: Option<String>,
@@ -144,10 +149,10 @@ pub struct TaskEditView {
     _github_subscription: Subscription,
     _repo_subscription: Subscription,
     _branch_subscription: Subscription,
-    _notes_subscription: Subscription,
     _purpose_subscription: Subscription,
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
+    _note_edit_subscription: Subscription,
 }
 
 impl TaskEditView {
@@ -165,11 +170,11 @@ impl TaskEditView {
         });
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
-        let notes_input = cx.new(|cx| {
+        let note_edit_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(4)
-                .placeholder("Enter to edit · Freeform notes…")
+                .rows(2)
+                .placeholder("Note…")
         });
         let purpose_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -218,9 +223,9 @@ impl TaskEditView {
                 this.persist_branch(cx);
             }
         });
-        let _notes_subscription = cx.subscribe(&notes_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_notes(cx);
+        let _note_edit_subscription = cx.subscribe(&note_edit_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Blur) {
+                this.commit_note_edit(cx);
             }
         });
         let _purpose_subscription = cx.subscribe(&purpose_input, |this, _, event, cx| {
@@ -249,10 +254,10 @@ impl TaskEditView {
             github_pr_input,
             repo_input,
             branch_input,
-            notes_input,
             purpose_input,
             details_input,
             tag_draft_input,
+            note_edit_input,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -262,6 +267,11 @@ impl TaskEditView {
             loaded_lifecycle: String::new(),
             loaded_purpose: String::new(),
             loaded_details: String::new(),
+            notes: Vec::new(),
+            details_collapsed: false,
+            notes_collapsed: false,
+            editing_note_id: None,
+            notes_scroll_handle: ScrollHandle::new(),
             obligation_requirements: 0,
             obligation_constraints: 0,
             pending_toast: None,
@@ -284,10 +294,10 @@ impl TaskEditView {
             _github_subscription,
             _repo_subscription,
             _branch_subscription,
-            _notes_subscription,
             _purpose_subscription,
             _details_subscription,
             _tag_draft_subscription,
+            _note_edit_subscription,
         }
     }
 
@@ -347,10 +357,8 @@ impl TaskEditView {
 
     fn field_stops(&self) -> Vec<TaskEditField> {
         let mut stops = Vec::new();
-        if self.has_any_capability() {
-            stops.push(TaskEditField::Title);
-            stops.push(TaskEditField::Details);
-        }
+        stops.push(TaskEditField::Title);
+        stops.push(TaskEditField::Details);
         if self.capability_enabled(Capability::Agent) {
             stops.extend([
                 TaskEditField::LinearLink,
@@ -359,7 +367,6 @@ impl TaskEditView {
                 TaskEditField::Tags,
                 TaskEditField::Repo,
                 TaskEditField::Branch,
-                TaskEditField::Notes,
             ]);
         }
         if self.capability_enabled(Capability::Spec) {
@@ -436,7 +443,6 @@ impl TaskEditView {
             TaskEditField::Tags => self.tag_draft_input.clone(),
             TaskEditField::Repo => self.repo_input.clone(),
             TaskEditField::Branch => self.branch_input.clone(),
-            TaskEditField::Notes => self.notes_input.clone(),
             TaskEditField::Purpose => self.purpose_input.clone(),
             TaskEditField::Details => self.details_input.clone(),
             TaskEditField::Obligations | TaskEditField::Capability(_) => return None,
@@ -510,7 +516,7 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, Entity<InputState>); 10] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
@@ -518,7 +524,6 @@ impl TaskEditView {
             (TaskEditField::Tags, self.tag_draft_input.clone()),
             (TaskEditField::Repo, self.repo_input.clone()),
             (TaskEditField::Branch, self.branch_input.clone()),
-            (TaskEditField::Notes, self.notes_input.clone()),
             (TaskEditField::Purpose, self.purpose_input.clone()),
             (TaskEditField::Details, self.details_input.clone()),
         ];
@@ -531,7 +536,7 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, Entity<InputState>); 10] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
@@ -539,7 +544,6 @@ impl TaskEditView {
             (TaskEditField::Tags, self.tag_draft_input.clone()),
             (TaskEditField::Repo, self.repo_input.clone()),
             (TaskEditField::Branch, self.branch_input.clone()),
-            (TaskEditField::Notes, self.notes_input.clone()),
             (TaskEditField::Purpose, self.purpose_input.clone()),
             (TaskEditField::Details, self.details_input.clone()),
         ];
@@ -640,7 +644,8 @@ impl TaskEditView {
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
         let branch = self.loaded_branch.clone();
-        let notes = task.notes.clone().unwrap_or_default();
+        self.notes = task.notes.clone();
+        self.editing_note_id = None;
         let purpose = self
             .node_uuid()
             .and_then(|node_id| {
@@ -680,9 +685,6 @@ impl TaskEditView {
         self.branch_input.update(cx, |input, cx| {
             input.set_value(branch, window, cx);
         });
-        self.notes_input.update(cx, |input, cx| {
-            input.set_value(notes, window, cx);
-        });
         self.purpose_input.update(cx, |input, cx| {
             input.set_value(purpose, window, cx);
         });
@@ -702,10 +704,6 @@ impl TaskEditView {
     fn node_uuid(&self) -> Option<uuid::Uuid> {
         self.task_id()
             .and_then(|id| uuid::Uuid::parse_str(&id).ok())
-    }
-
-    fn has_any_capability(&self) -> bool {
-        !self.capabilities.is_empty()
     }
 
     fn capability_enabled(&self, cap: Capability) -> bool {
@@ -849,9 +847,6 @@ impl TaskEditView {
                         input.set_value("", window, cx);
                     });
                     self.branch_input.update(cx, |input, cx| {
-                        input.set_value("", window, cx);
-                    });
-                    self.notes_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
                     self.linear_input.update(cx, |input, cx| {
@@ -1190,19 +1185,71 @@ impl TaskEditView {
         self.loaded_branch = value;
     }
 
-    fn persist_notes(&mut self, cx: &mut Context<Self>) {
+    fn persist_notes(&mut self, _cx: &mut Context<Self>) {
         let Some(id) = self.task_id() else {
             return;
         };
-        let value = input_text(&self.notes_input, cx);
-        let notes = if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
+        let _ = self.fleet.enqueue(FleetMutation::UpdateTaskNotes {
+            id,
+            notes: self.notes.clone(),
+        });
+    }
+
+    fn add_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.task_id().is_none() {
+            return;
+        }
+        self.notes_collapsed = false;
+        let note = NoteItem::new("");
+        let id = note.id;
+        self.notes.push(note);
+        self.start_edit_note(id, window, cx);
+    }
+
+    fn start_edit_note(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(note) = self.notes.iter().find(|n| n.id == id) else {
+            return;
         };
-        let _ = self
-            .fleet
-            .enqueue(FleetMutation::UpdateTaskNotes { id, notes });
+        self.editing_note_id = Some(id);
+        let text = note.text.clone();
+        self.note_edit_input.update(cx, |input, cx| {
+            input.set_value(text, window, cx);
+        });
+        cx.notify();
+        cx.on_next_frame(window, {
+            let input = self.note_edit_input.clone();
+            move |_, window, cx| {
+                input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                });
+            }
+        });
+    }
+
+    fn commit_note_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.editing_note_id.take() else {
+            return;
+        };
+        let text = input_text(&self.note_edit_input, cx).trim().to_string();
+        if text.is_empty() {
+            self.notes.retain(|n| n.id != id);
+        } else if let Some(note) = self.notes.iter_mut().find(|n| n.id == id) {
+            if note.text != text {
+                note.text = text;
+                note.updated_at = tod_store::outline::now_ms();
+            }
+        }
+        self.persist_notes(cx);
+        cx.notify();
+    }
+
+    fn delete_note(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        if self.editing_note_id == Some(id) {
+            self.editing_note_id = None;
+        }
+        self.notes.retain(|n| n.id != id);
+        self.persist_notes(cx);
+        cx.notify();
     }
 
     fn persist_purpose(&mut self, cx: &mut Context<Self>) {
@@ -1306,6 +1353,27 @@ impl TaskEditView {
         self.tags.retain(|t| t != tag);
         self.persist_tags(cx);
         cx.notify();
+    }
+
+    fn render_collapse_header(
+        &self,
+        label: &str,
+        collapsed: bool,
+        on_toggle: impl Fn(&gpui::MouseDownEvent, &mut Window, &mut App) + 'static,
+        cx: &App,
+    ) -> impl IntoElement {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, on_toggle)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if collapsed { "▸" } else { "▾" }),
+            )
+            .child(Self::render_field_label(label, cx))
     }
 
     fn render_field_label(label: &str, cx: &App) -> impl IntoElement {
@@ -1609,23 +1677,121 @@ impl TaskEditView {
                         ),
                     ),
             )
+    }
+
+    fn render_notes_section(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+
+        let header = h_flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .child(self.render_collapse_header(
+                "Notes",
+                self.notes_collapsed,
+                cx.listener(|this, _, _, cx| {
+                    this.notes_collapsed = !this.notes_collapsed;
+                    cx.notify();
+                }),
+                cx,
+            ))
+            .child(div().flex_1())
             .child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::Notes,
-                    v_flex()
-                        .id(field_anchor_id(TaskEditField::Notes))
-                        .gap_1()
+                Button::new("task-edit-notes-add")
+                    .label("+ Add note")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_note(window, cx);
+                    })),
+            );
+
+        let mut section = v_flex()
+            .id("task-edit-field-notes")
+            .gap_1()
+            .w_full()
+            .child(header);
+
+        if !self.notes_collapsed {
+            if self.notes.is_empty() && self.editing_note_id.is_none() {
+                section = section.child(div().text_sm().text_color(muted).child("No notes yet."));
+            } else {
+                let max_h = window.line_height() * NOTES_MAX_LINES;
+                let mut list = v_flex().id("task-edit-notes-list").gap_1().w_full();
+                for note in self.notes.clone() {
+                    list = list.child(self.render_note_row(note, cx));
+                }
+                section = section.child(
+                    div()
+                        .id("task-edit-notes-scroll-wrap")
+                        .relative()
                         .w_full()
-                        .child(Self::render_field_label("Notes", cx))
-                        .child(self.render_nav_input(
-                            TaskEditField::Notes,
-                            &self.notes_input,
-                            Some(MULTI_LINE_ROWS),
-                            window,
-                            cx,
-                        )),
-                ),
+                        .max_h(max_h)
+                        .child(
+                            div()
+                                .id("task-edit-notes-scroll")
+                                .max_h(max_h)
+                                .overflow_y_scroll()
+                                .track_scroll(&self.notes_scroll_handle)
+                                .child(list),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .left_0()
+                                .child(Scrollbar::vertical(&self.notes_scroll_handle)),
+                        ),
+                );
+            }
+        }
+
+        section
+    }
+
+    fn render_note_row(&self, note: NoteItem, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let editing = self.editing_note_id == Some(note.id);
+        let id = note.id;
+
+        if editing {
+            return div()
+                .w_full()
+                .rounded_md()
+                .bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+                .child(Input::new(&self.note_edit_input).w_full())
+                .into_any_element();
+        }
+
+        h_flex()
+            .id(("task-edit-note-row", note.id.as_u128() as u64))
+            .w_full()
+            .items_start()
+            .gap_1()
+            .px_1()
+            .py_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|el| el.bg(theme.list_active))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.start_edit_note(id, window, cx);
+            }))
+            .child(div().flex_1().text_sm().child(note.text))
+            .child(
+                Button::new(("task-edit-note-delete", note.id.as_u128() as u64))
+                    .label("×")
+                    .compact()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.delete_note(id, cx);
+                    })),
             )
+            .into_any_element()
     }
 
     fn render_spec_section(
@@ -1806,46 +1972,53 @@ impl Render for TaskEditView {
         let background = theme.background;
         let secondary = theme.secondary;
         let muted = theme.muted_foreground;
-        let has_capabilities = self.has_any_capability();
-
         let mut body = v_flex().gap_3().p_3().w_full();
 
-        if has_capabilities {
-            body = body.child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::Title,
-                    v_flex()
-                        .id(field_anchor_id(TaskEditField::Title))
-                        .gap_1()
-                        .w_full()
-                        .child(Self::render_field_label("Title", cx))
-                        .child(self.render_nav_input(
-                            TaskEditField::Title,
-                            &self.title_input,
-                            None,
-                            window,
-                            cx,
-                        )),
-                ),
-            );
-            body = body.child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::Details,
-                    v_flex()
-                        .id(field_anchor_id(TaskEditField::Details))
-                        .gap_1()
-                        .w_full()
-                        .child(Self::render_field_label("Details", cx))
-                        .child(self.render_nav_input(
+        body = body.child(
+            self.apply_focus_scroll_anchor(
+                TaskEditField::Title,
+                v_flex()
+                    .id(field_anchor_id(TaskEditField::Title))
+                    .gap_1()
+                    .w_full()
+                    .child(Self::render_field_label("Title", cx))
+                    .child(self.render_nav_input(
+                        TaskEditField::Title,
+                        &self.title_input,
+                        None,
+                        window,
+                        cx,
+                    )),
+            ),
+        );
+        body = body.child(
+            self.apply_focus_scroll_anchor(
+                TaskEditField::Details,
+                v_flex()
+                    .id(field_anchor_id(TaskEditField::Details))
+                    .gap_1()
+                    .w_full()
+                    .child(self.render_collapse_header(
+                        "Details",
+                        self.details_collapsed,
+                        cx.listener(|this, _, _, cx| {
+                            this.details_collapsed = !this.details_collapsed;
+                            cx.notify();
+                        }),
+                        cx,
+                    ))
+                    .when(!self.details_collapsed, |el| {
+                        el.child(self.render_nav_input(
                             TaskEditField::Details,
                             &self.details_input,
                             Some(DETAILS_ROWS),
                             window,
                             cx,
-                        )),
-                ),
-            );
-        }
+                        ))
+                    }),
+            ),
+        );
+        body = body.child(self.render_notes_section(window, cx));
 
         for (cap_index, cap) in Capability::ALL.into_iter().enumerate() {
             body =

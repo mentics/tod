@@ -438,7 +438,15 @@ pub fn build_fleet_agent_prompt(
         });
     let repo = task.repo.as_deref().unwrap_or("(not set)");
     let branch = task.branch.as_deref().unwrap_or("(default)");
-    let notes = task.notes.as_deref().unwrap_or("");
+    let notes = if task.notes.is_empty() {
+        "(none)".to_string()
+    } else {
+        task.notes
+            .iter()
+            .map(|n| format!("- {}", n.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     Ok(format!(
         "## State agent conventions\n\n\
          {base}\n\n\

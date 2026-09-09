@@ -47,7 +47,7 @@ pub use repos::agent_config::{AgentConfig, AgentConfigRow, FleetAgent, NewAgent,
 pub use repos::agent_run::AgentRun;
 pub use repos::notification::FleetNotification;
 pub use repos::shell::ShellSession;
-pub use repos::task::FleetTask;
+pub use repos::task::{FleetTask, NoteItem};
 pub use repos::transcript::TranscriptTurn;
 pub use resolve_agent_config::ResolvedAgentConfigs;
 pub use runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};

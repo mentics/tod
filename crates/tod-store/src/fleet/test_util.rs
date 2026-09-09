@@ -54,7 +54,9 @@ fn deterministic_task(index: usize) -> FleetTask {
         } else {
             format!("feature/{index}")
         }),
-        notes: Some(format!("notes for task {index}")),
+        notes: vec![crate::fleet::repos::task::NoteItem::new(format!(
+            "notes for task {index}"
+        ))],
         tags: vec![format!("tag-{}", index % 5), "scale".into()],
         linked_issues: vec![format!("TOD-{index}")],
         linked_prs: vec![format!("#{index}")],

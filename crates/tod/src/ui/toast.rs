@@ -3,7 +3,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::notification::Notification;
-use gpui_component::{IconName, Root, Sizable, WindowExt, h_flex};
+use gpui_component::{IconName, Root, Sizable, StyledExt, WindowExt, h_flex};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -75,37 +75,55 @@ pub fn confirm_toast(
     let on_yes = Rc::new(RefCell::new(Some(on_yes)));
     let on_no = Rc::new(RefCell::new(Some(on_no)));
 
+    let title = title.into();
+    let message = message.into();
+
     window.push_notification(
-        Notification::warning(message)
-            .title(title)
+        Notification::new()
+            .icon(IconName::TriangleAlert)
             .autohide(false)
             .id::<ConfirmToast>()
-            .content(move |_note, _window, cx| {
+            .content(move |_note, window, cx| {
                 let on_yes = on_yes.clone();
                 let on_no = on_no.clone();
-                h_flex()
-                    .gap_2()
-                    .mt_2()
-                    .child(Button::new("toast-no").label("No").on_click(cx.listener(
-                        move |note, _, window, cx| {
-                            note.dismiss(window, cx);
-                            window.remove_notification::<ConfirmToast>(cx);
-                            if let Some(on_no) = on_no.borrow_mut().take() {
-                                on_no(window, cx);
-                            }
-                        },
-                    )))
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
                     .child(
-                        Button::new("toast-yes")
-                            .label("Yes")
-                            .primary()
-                            .on_click(cx.listener(move |note, _, window, cx| {
-                                note.dismiss(window, cx);
-                                window.remove_notification::<ConfirmToast>(cx);
-                                if let Some(on_yes) = on_yes.borrow_mut().take() {
-                                    on_yes(window, cx);
-                                }
-                            })),
+                        selectable_text("confirm-toast-title", title.clone(), window, cx)
+                            .text_sm()
+                            .font_semibold(),
+                    )
+                    .child(selectable_text(
+                        "confirm-toast-message",
+                        message.clone(),
+                        window,
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .mt_2()
+                            .child(Button::new("toast-no").label("No").on_click(cx.listener(
+                                move |note, _, window, cx| {
+                                    note.dismiss(window, cx);
+                                    if let Some(on_no) = on_no.borrow_mut().take() {
+                                        on_no(window, cx);
+                                    }
+                                },
+                            )))
+                            .child(
+                                Button::new("toast-yes")
+                                    .label("Yes")
+                                    .primary()
+                                    .on_click(cx.listener(move |note, _, window, cx| {
+                                        note.dismiss(window, cx);
+                                        if let Some(on_yes) = on_yes.borrow_mut().take() {
+                                            on_yes(window, cx);
+                                        }
+                                    })),
+                            ),
                     )
                     .into_any_element()
             }),

@@ -167,8 +167,10 @@ impl OutlineMutation {
                 parent_id,
                 ordinal,
             } => {
+                let list_id = outline_list_for_node(conn, *node_id)?;
+                bump_ordinals_after(conn, list_id, *parent_id, *ordinal)?;
                 OutlineRepo::new(conn).set_parent(*node_id, *parent_id, *ordinal)?;
-                refresh_loop_health(conn, outline_list_for_node(conn, *node_id)?)?;
+                refresh_loop_health(conn, list_id)?;
             }
             OutlineMutation::ReorderSibling { node_id, direction } => {
                 reorder_sibling(conn, *node_id, *direction)?;

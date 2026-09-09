@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
             lifecycle: "active".into(),
             repo: Some(workspace.display().to_string()),
             branch: Some("main".into()),
-            notes: None,
+            notes: Vec::new(),
             tags: vec![],
             linked_issues: vec![],
             linked_prs: vec![],

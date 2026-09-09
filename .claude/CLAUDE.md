@@ -47,8 +47,6 @@ For any UI-facing change, prefer driving the real app over guessing: `--agent mo
 
 Requires the default `agent-socket` feature. Launch with `--agent-socket-port PORT` (give parallel instances distinct ports) and drive it with a line-oriented protocol (`key`, `text`, `click`, `sync`, `shot`) — see [README.md](README.md) for the full command table and the `.local/agent/ui-smoke/` scripts. Use a random/unused port per subagent run to avoid clashing with other instances.
 
-**When you implement a new feature, verify it live**: launch a subagent that runs the app with `--agent mock` and drives it via the control socket on a fresh random port, iterating until the behavior is confirmed correct — don't rely on `cargo check` alone for UI behavior.
-
 ## Architecture
 
 ### Workspace layout

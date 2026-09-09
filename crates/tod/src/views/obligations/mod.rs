@@ -1099,11 +1099,15 @@ impl Render for ObligationsView {
                             .flex_1()
                             .child(div().text_sm().font_semibold().child("Obligations"))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .overflow_hidden()
-                                    .child(self.title.clone()),
+                                div().text_xs().text_color(muted).overflow_hidden().child(
+                                    crate::ui::selectable_text::selectable_text(
+                                        "obligations-title",
+                                        self.title.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .text_color(muted),
+                                ),
                             ),
                     )
                     .child(chrome_control_with_shortcut(

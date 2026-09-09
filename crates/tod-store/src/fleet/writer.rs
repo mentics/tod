@@ -37,7 +37,7 @@ pub enum FleetMutation {
     },
     UpdateTaskNotes {
         id: String,
-        notes: Option<String>,
+        notes: Vec<crate::fleet::repos::task::NoteItem>,
     },
     UpdateTaskLifecycle {
         id: String,
@@ -269,7 +269,7 @@ impl FleetMutation {
                 TaskRepo::new(conn).update_slug(id, slug)?;
             }
             FleetMutation::UpdateTaskNotes { id, notes } => {
-                TaskRepo::new(conn).update_notes(id, notes.as_deref())?;
+                TaskRepo::new(conn).update_notes(id, notes)?;
             }
             FleetMutation::UpdateTaskLifecycle { id, lifecycle } => {
                 TaskRepo::new(conn).update_lifecycle(id, lifecycle)?;

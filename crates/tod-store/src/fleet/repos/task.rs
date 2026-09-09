@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// A single note on a node: freeform text plus the time it was last created or edited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteItem {
+    pub id: Uuid,
+    pub text: String,
+    pub updated_at: i64,
+}
+
+impl NoteItem {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            text: text.into(),
+            updated_at: now_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetTask {
     pub id: String,
@@ -17,7 +35,7 @@ pub struct FleetTask {
     pub lifecycle: String,
     pub repo: Option<String>,
     pub branch: Option<String>,
-    pub notes: Option<String>,
+    pub notes: Vec<NoteItem>,
     pub tags: Vec<String>,
     pub linked_issues: Vec<String>,
     pub linked_prs: Vec<String>,
@@ -32,7 +50,7 @@ impl FleetTask {
             lifecycle: "proposed".into(),
             repo: None,
             branch: None,
-            notes: None,
+            notes: Vec::new(),
             tags: Vec::new(),
             linked_issues: Vec::new(),
             linked_prs: Vec::new(),
@@ -91,7 +109,7 @@ impl<'a> TaskRepo<'a> {
                 blob,
                 task.repo,
                 task.branch,
-                task.notes,
+                json_notes(&task.notes)?,
                 json_array(&task.tags)?,
                 json_array(&task.linked_issues)?,
                 json_array(&task.linked_prs)?,
@@ -118,12 +136,12 @@ impl<'a> TaskRepo<'a> {
         Ok(())
     }
 
-    pub fn update_notes(&self, id: &str, notes: Option<&str>) -> Result<(), TaskRepoError> {
+    pub fn update_notes(&self, id: &str, notes: &[NoteItem]) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
         self.ensure_fields_row(node_id)?;
         self.conn.execute(
             "UPDATE node_fields SET notes = ?2, updated_at = ?3 WHERE node_id = ?1",
-            params![uuid_to_blob(node_id), notes, now_ms()],
+            params![uuid_to_blob(node_id), json_notes(notes)?, now_ms()],
         )?;
         Ok(())
     }
@@ -292,7 +310,7 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<FleetTask> {
         lifecycle: row.get(3)?,
         repo: row.get(4)?,
         branch: row.get(5)?,
-        notes: row.get(6)?,
+        notes: parse_notes(row.get::<_, Option<String>>(6)?),
         tags: parse_json_array(row.get::<_, Option<String>>(7)?),
         linked_issues: parse_json_array(row.get::<_, Option<String>>(8)?),
         linked_prs: parse_json_array(row.get::<_, Option<String>>(9)?),
@@ -307,6 +325,25 @@ fn json_array(values: &[String]) -> Result<String> {
 fn parse_json_array(raw: Option<String>) -> Vec<String> {
     raw.and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+fn json_notes(notes: &[NoteItem]) -> Result<String> {
+    serde_json::to_string(notes).map_err(|e| anyhow::anyhow!("failed to serialize notes: {e}"))
+}
+
+/// Parses the `node_fields.notes` column. Rows written before notes became a list hold a
+/// single freeform string there — those are lifted into a one-item list on read.
+fn parse_notes(raw: Option<String>) -> Vec<NoteItem> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    if let Ok(items) = serde_json::from_str::<Vec<NoteItem>>(&raw) {
+        return items;
+    }
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    vec![NoteItem::new(raw)]
 }
 
 #[cfg(test)]
@@ -328,7 +365,7 @@ mod tests {
             lifecycle: "active".into(),
             repo: Some("github.com/org/tod".into()),
             branch: Some("main".into()),
-            notes: Some("notes body".into()),
+            notes: vec![NoteItem::new("notes body")],
             tags: vec!["ui".into(), "backend".into()],
             linked_issues: vec!["TOD-1".into()],
             linked_prs: vec!["#42".into()],

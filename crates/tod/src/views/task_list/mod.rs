@@ -1912,7 +1912,17 @@ impl TaskListView {
                 if ix == 0 {
                     return;
                 }
-                let prev = &rows[ix - 1];
+                let depth = rows[ix].depth;
+                // Walk backward past any descendants of an earlier sibling to
+                // find the previous sibling at this same depth, if any.
+                let prev_sibling = rows[..ix]
+                    .iter()
+                    .rev()
+                    .take_while(|r| r.depth >= depth)
+                    .find(|r| r.depth == depth);
+                let Some(prev) = prev_sibling else {
+                    return;
+                };
                 let ord = outline
                     .next_ordinal(list_id, Some(prev.node.id))
                     .unwrap_or(0);
@@ -1924,9 +1934,15 @@ impl TaskListView {
                 if entry.parent_id.is_none() {
                     return;
                 };
-                let parent_entry = outline.get_entry(entry.parent_id.unwrap()).ok().flatten();
-                let grandparent = parent_entry.and_then(|p| p.parent_id);
-                let ord = entry.ordinal + 1;
+                let parent_id = entry.parent_id.unwrap();
+                let Some(parent_entry) = outline.get_entry(parent_id).ok().flatten() else {
+                    return;
+                };
+                let grandparent = parent_entry.parent_id;
+                // Place immediately after the former parent among its own
+                // siblings (children of `grandparent`); the mutation handler
+                // shifts any later siblings to make room.
+                let ord = parent_entry.ordinal + 1;
                 (grandparent, ord)
             }
         };

@@ -25,6 +25,7 @@ use crate::process_bundle::{InterviewAgentPrompt, ProcessManifest, TodInstallPat
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::selectable_text::selectable_text;
+use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, ClipboardItem, Context, Corner, DismissEvent, Entity, FocusHandle, Focusable,
@@ -90,6 +91,21 @@ struct SubmitActionOutcome {
     result: Result<(RunId, Option<String>), String>,
 }
 
+struct SubmitFreeformWork {
+    submission_id: String,
+    text: String,
+    transcript: PathBuf,
+    prompt: InterviewAgentPrompt,
+    agent_config_id: String,
+    cwd: PathBuf,
+    settings: AnswerProcessorSettings,
+    launch_options: tod_store::AgentLaunchOptions,
+}
+
+struct SubmitFreeformOutcome {
+    result: Result<RunId, String>,
+}
+
 actions!(
     interview_workspace,
     [
@@ -128,6 +144,13 @@ const LIST_COLUMN_MIN: f32 = 120.;
 const BODY_COLUMN_WIDTH: f32 = 250.;
 const BODY_COLUMN_MIN: f32 = 160.;
 const RESPONSE_COLUMN_MIN: f32 = 200.;
+const OBLIGATIONS_COLUMN_WIDTH: f32 = 280.;
+const OBLIGATIONS_COLUMN_MIN: f32 = 220.;
+/// `InputState` has no character-column API, so all multi-line fields (notes,
+/// proposed text, question feedback, freeform submission) share one row count
+/// and pixel height instead of a literal 40-column width.
+const TEXTAREA_ROWS: usize = 4;
+const TEXTAREA_HEIGHT: f32 = 96.;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceFocus {
@@ -142,6 +165,9 @@ enum RunKind {
     AnswerProcessor { question_id: String },
     QuestionMakerReplenish,
     QuestionMakerAction { question_id: String },
+    /// Freeform requirements text submitted directly to the answer processor,
+    /// not tied to any queue question.
+    FreeformAnswer,
 }
 
 /// Submitted / in-flight question state preserved when a workspace is torn down
@@ -177,7 +203,7 @@ impl WorkspaceInFlightState {
             .retain(|id, _| self.pending.contains(id));
         // Drop answer/action runs whose question is no longer pending; keep replenish.
         self.runs.retain(|_, kind| match kind {
-            RunKind::QuestionMakerReplenish => true,
+            RunKind::QuestionMakerReplenish | RunKind::FreeformAnswer => true,
             RunKind::AnswerProcessor { question_id }
             | RunKind::QuestionMakerAction { question_id } => self.pending.contains(question_id),
         });
@@ -317,6 +343,13 @@ pub struct WorkspaceView {
     notes_input: Entity<InputState>,
     proposed_input: Entity<InputState>,
     feedback_input: Entity<InputState>,
+    freeform_input: Entity<InputState>,
+    obligations: Entity<ObligationsView>,
+    /// Keeps the embedded obligations panel alive. Unlike task_list's togglable side
+    /// panel, this column is embedded persistently — there is no "closed" state for it
+    /// here, so an internal `ObligationsEvent::Close` (e.g. Escape while it has focus)
+    /// is immediately reversed by retargeting it back onto this session's node.
+    _obligations_subscription: Subscription,
     /// Question id whose `proposed_text` is currently loaded into `proposed_input`.
     proposed_loaded_for: Option<String>,
     /// None until session scratchpad / queue is bound — never falls back to repo-root queue.
@@ -339,6 +372,7 @@ pub struct WorkspaceView {
     notes_editing: bool,
     proposed_editing: bool,
     feedback_editing: bool,
+    freeform_editing: bool,
     /// Open state for the native PopupMenu. Menu entity is eager (keyboard);
     /// paint uses `deferred` so it stacks above the bottom feedback panel.
     actions_menu_open: bool,
@@ -442,21 +476,46 @@ impl WorkspaceView {
         let notes_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(3)
+                .rows(TEXTAREA_ROWS)
                 .placeholder("Notes (Enter to edit; Ctrl+Enter to submit)")
         });
         let proposed_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(5)
+                .rows(TEXTAREA_ROWS)
                 .placeholder("Proposed durable text (Enter to edit)")
         });
         let feedback_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(3)
+                .rows(TEXTAREA_ROWS)
                 .placeholder("Feedback on this question (e.g. not useful, too meta)")
         });
+        let freeform_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(TEXTAREA_ROWS)
+                .placeholder("Requirements text to send straight to the answer processor")
+        });
+        let obligations = cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
+        obligations.update(cx, |panel, cx| {
+            panel.open(session.node_id, &session.display_name, window, cx);
+        });
+        // Embedded persistently here (unlike task_list's togglable side panel), so
+        // "closed" is not a valid state for this column — reverse it immediately.
+        let obligations_node_id = session.node_id;
+        let obligations_title = session.display_name.clone();
+        let _obligations_subscription =
+            cx.subscribe_in(&obligations, window, move |_this, panel, event, window, cx| {
+                match event {
+                    ObligationsEvent::Close => {
+                        panel.update(cx, |panel, cx| {
+                            panel.retarget(obligations_node_id, &obligations_title, window, cx);
+                        });
+                    }
+                    ObligationsEvent::DeleteSelectedTask => {}
+                }
+            });
         let proposed_loaded_for = selected_question_id.clone().filter(|_| {
             questions
                 .iter()
@@ -573,6 +632,9 @@ impl WorkspaceView {
             notes_input,
             proposed_input,
             feedback_input,
+            freeform_input,
+            obligations,
+            _obligations_subscription,
             proposed_loaded_for,
             queue_watcher,
             agent,
@@ -592,6 +654,7 @@ impl WorkspaceView {
             notes_editing: false,
             proposed_editing: false,
             feedback_editing: false,
+            freeform_editing: false,
             actions_menu_open: false,
             actions_menu: None,
             _actions_menu_subscription: None,
@@ -744,9 +807,12 @@ impl WorkspaceView {
     }
 
     fn answer_in_flight(&self) -> bool {
-        self.runs
-            .values()
-            .any(|kind| matches!(kind, RunKind::AnswerProcessor { .. }))
+        self.runs.values().any(|kind| {
+            matches!(
+                kind,
+                RunKind::AnswerProcessor { .. } | RunKind::FreeformAnswer
+            )
+        })
     }
 
     fn session_bootstrap_in_flight(&self) -> bool {
@@ -871,7 +937,7 @@ impl WorkspaceView {
     }
 
     fn response_text_editing(&self) -> bool {
-        self.notes_editing || self.proposed_editing || self.feedback_editing
+        self.notes_editing || self.proposed_editing || self.feedback_editing || self.freeform_editing
     }
 
     fn has_proposed_editor(&self) -> bool {
@@ -1141,7 +1207,14 @@ impl WorkspaceView {
                         self.status_line =
                             format!("Question maker action completed for {question_id}").into();
                     }
+                    RunKind::FreeformAnswer => {
+                        self.status_line = "Requirements text processed".into();
+                    }
                 }
+            }
+            (RunKind::FreeformAnswer, Err(message)) => {
+                self.error_banner = Some(message.into());
+                self.status_line = "Freeform submission failed".into();
             }
             (RunKind::AnswerProcessor { question_id }, Err(message)) => {
                 self.error_banner = Some(message.into());
@@ -1757,6 +1830,88 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn submit_freeform(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
+        let text = self.freeform_input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            self.error_banner = Some("Enter requirements text before submitting".into());
+            cx.notify();
+            return;
+        }
+        let submission_id = format!("freeform-{}", Uuid::new_v4());
+        let record = AnswerRecord {
+            id: submission_id.clone(),
+            option: None,
+            text_changed: None,
+            body: text.clone(),
+        };
+        let payload = match format_answer_payload(&[record]) {
+            Ok(p) => p,
+            Err(err) => {
+                self.error_banner = Some(format!("Payload error: {err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let transcript = transcript_path_for(&self.config);
+        let (prompt, cwd) = match self.build_answer_processor_prompt(&payload) {
+            Ok(v) => v,
+            Err(message) => {
+                self.error_banner = Some(message.into());
+                cx.notify();
+                return;
+            }
+        };
+        let work = SubmitFreeformWork {
+            submission_id,
+            text,
+            transcript,
+            prompt,
+            agent_config_id: self.agent_config_id.clone(),
+            cwd,
+            settings: self.settings.answer_processor.clone(),
+            launch_options: self.settings.interview_launch_options(),
+        };
+        let agent = self.agent.clone();
+
+        self.error_banner = None;
+        self.status_line = "Submitting requirements text to processor…".into();
+        self.freeform_editing = false;
+        self.freeform_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let outcome = run_submit_freeform_work(work, agent);
+            let _ = tx.send_blocking(outcome);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(outcome) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    this.finish_submit_freeform(outcome, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn finish_submit_freeform(&mut self, outcome: SubmitFreeformOutcome, cx: &mut Context<Self>) {
+        match outcome.result {
+            Ok(run_id) => {
+                self.runs.insert(run_id, RunKind::FreeformAnswer);
+            }
+            Err(message) => {
+                self.error_banner = Some(message.into());
+                self.status_line = "Freeform submit failed".into();
+            }
+        }
+        cx.notify();
+    }
+
     fn submit_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         if action == "deep-dive" {
             if !self.mutations_blocked {
@@ -1979,7 +2134,9 @@ impl WorkspaceView {
             .map(|q| q.options.len())
             .unwrap_or(0);
         let proposed = if self.has_proposed_editor() { 1 } else { 0 };
-        mc + proposed + 5 // Notes, Other action, Submit, feedback field, Submit feedback
+        // Notes, Other action, Submit, feedback field, Submit feedback,
+        // freeform field, Submit to processor
+        mc + proposed + 7
     }
 
     fn proposed_stop_index(&self) -> Option<usize> {
@@ -2015,6 +2172,14 @@ impl WorkspaceView {
 
     fn feedback_submit_stop_index(&self) -> usize {
         self.feedback_stop_index() + 1
+    }
+
+    fn freeform_stop_index(&self) -> usize {
+        self.feedback_submit_stop_index() + 1
+    }
+
+    fn freeform_submit_stop_index(&self) -> usize {
+        self.freeform_stop_index() + 1
     }
 
     fn actions_disabled(&self) -> bool {
@@ -2209,6 +2374,33 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn enter_freeform_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit_notes() {
+            return;
+        }
+        self.notes_editing = false;
+        self.proposed_editing = false;
+        self.feedback_editing = false;
+        self.workspace_focus = WorkspaceFocus::Response(self.freeform_stop_index());
+        self.freeform_editing = true;
+        cx.notify();
+        cx.on_next_frame(window, |this, window, cx| {
+            this.freeform_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn exit_freeform_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.freeform_editing {
+            return;
+        }
+        self.freeform_editing = false;
+        self.workspace_focus = WorkspaceFocus::Response(self.freeform_stop_index());
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
     fn focus_response_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.response_text_editing() {
             return;
@@ -2277,6 +2469,8 @@ impl WorkspaceView {
         let submit_idx = self.submit_stop_index();
         let feedback_idx = self.feedback_stop_index();
         let feedback_submit_idx = self.feedback_submit_stop_index();
+        let freeform_idx = self.freeform_stop_index();
+        let freeform_submit_idx = self.freeform_submit_stop_index();
         if idx == notes_idx {
             self.enter_notes_edit(window, cx);
         } else if idx == submit_idx {
@@ -2287,6 +2481,10 @@ impl WorkspaceView {
             self.enter_feedback_edit(window, cx);
         } else if idx == feedback_submit_idx {
             self.submit_feedback(window, cx);
+        } else if idx == freeform_idx {
+            self.enter_freeform_edit(window, cx);
+        } else if idx == freeform_submit_idx {
+            self.submit_freeform(window, cx);
         }
     }
 
@@ -2295,6 +2493,10 @@ impl WorkspaceView {
     }
 
     fn handle_workspace_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.freeform_editing {
+            self.exit_freeform_edit(window, cx);
+            return;
+        }
         if self.proposed_editing {
             self.exit_proposed_edit(window, cx);
             return;
@@ -2583,6 +2785,35 @@ fn run_submit_action_work(work: SubmitActionWork, agent: SharedAgent) -> SubmitA
     }
 }
 
+fn run_submit_freeform_work(work: SubmitFreeformWork, agent: SharedAgent) -> SubmitFreeformOutcome {
+    let result = (|| -> Result<RunId, String> {
+        append_answer(
+            &work.transcript,
+            &work.submission_id,
+            "(freeform requirements submission)",
+            &work.text,
+            None,
+        )
+        .map_err(|err| format!("Transcript write failed: {err}"))?;
+
+        let prompt = work.prompt;
+        let mut provider = agent
+            .lock()
+            .map_err(|_| "Agent busy (bootstrap in progress) — try again shortly".to_string())?;
+        let handle = provider
+            .start_answer_processor(
+                &work.agent_config_id,
+                work.cwd,
+                prompt,
+                &work.settings,
+                work.launch_options,
+            )
+            .map_err(|err| format!("Failed to start answer processor: {err}"))?;
+        Ok(handle.id)
+    })();
+    SubmitFreeformOutcome { result }
+}
+
 fn question_maker_status_snapshot(path: Option<&Path>) -> QuestionMakerStatusSnapshot {
     let Some(path) = path else {
         return QuestionMakerStatusSnapshot::default();
@@ -2651,6 +2882,9 @@ impl Render for WorkspaceView {
         // Align ListState after queue polls that only had App context (no Window).
         self.sync_question_list_selection(window, cx, false);
         self.sync_proposed_input(window, cx);
+        self.obligations.update(cx, |panel, cx| {
+            panel.reload(window, cx);
+        });
 
         if let Some(text) = self.pending_notes_paste.take() {
             self.notes_input.update(cx, |input, cx| {
@@ -2681,7 +2915,18 @@ impl Render for WorkspaceView {
             .bg(background)
             .v_flex()
             .on_action(cx.listener(|this, _: &SubmitAnswer, window, cx| {
-                this.submit_answer(window, cx);
+                // Ctrl+Enter is bound globally for Input focus; route to whichever
+                // submit action matches the field the user is actually editing.
+                if this
+                    .freeform_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                {
+                    this.submit_freeform(window, cx);
+                } else {
+                    this.submit_answer(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &FocusNotes, window, cx| {
                 if this.can_edit_notes() {
@@ -2868,6 +3113,7 @@ impl Render for WorkspaceView {
                                         &self.proposed_input,
                                         &self.notes_input,
                                         &self.feedback_input,
+                                        &self.freeform_input,
                                         self.can_mutate(),
                                         self.can_edit_notes(),
                                         self.has_proposed_editor(),
@@ -2875,11 +3121,18 @@ impl Render for WorkspaceView {
                                         self.proposed_editing,
                                         self.notes_editing,
                                         self.feedback_editing,
+                                        self.freeform_editing,
                                         self.actions_menu_open,
                                         self.actions_menu.clone(),
                                         &self.focus_handle,
                                         muted,
                                     )),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(OBLIGATIONS_COLUMN_WIDTH))
+                                    .size_range(px(OBLIGATIONS_COLUMN_MIN)..Pixels::MAX)
+                                    .child(self.obligations.clone()),
                             ),
                     ),
             )
@@ -3140,6 +3393,7 @@ fn response_column(
     proposed_input: &Entity<InputState>,
     notes_input: &Entity<InputState>,
     feedback_input: &Entity<InputState>,
+    freeform_input: &Entity<InputState>,
     can_mutate: bool,
     can_edit_notes: bool,
     show_proposed: bool,
@@ -3147,6 +3401,7 @@ fn response_column(
     proposed_editing: bool,
     notes_editing: bool,
     feedback_editing: bool,
+    freeform_editing: bool,
     actions_menu_open: bool,
     actions_menu: Option<Entity<PopupMenu>>,
     _workspace_focus_handle: &FocusHandle,
@@ -3159,6 +3414,8 @@ fn response_column(
     let notes_input_disabled = !can_edit_notes || locked || question.is_none() || !notes_editing;
     let feedback_input_disabled =
         !can_edit_notes || locked || question.is_none() || !feedback_editing;
+    // Freeform submission is independent of the selected question.
+    let freeform_input_disabled = !can_edit_notes || !freeform_editing;
     let focused_idx = match workspace_focus {
         WorkspaceFocus::Response(i) => Some(i),
         WorkspaceFocus::QuestionList => None,
@@ -3212,6 +3469,10 @@ fn response_column(
     let feedback_focused = focused_idx == Some(stop_idx);
     stop_idx += 1;
     let feedback_submit_focused = focused_idx == Some(stop_idx);
+    stop_idx += 1;
+    let freeform_focused = focused_idx == Some(stop_idx);
+    stop_idx += 1;
+    let freeform_submit_focused = focused_idx == Some(stop_idx);
     let notes_view = cx.entity();
     let proposed_view = cx.entity();
     let feedback_view = cx.entity();
@@ -3231,7 +3492,7 @@ fn response_column(
                 ListItem::new("proposed-field")
                     .selected(proposed_focused)
                     .w_full()
-                    .h(px(100.))
+                    .h(px(TEXTAREA_HEIGHT))
                     .overflow_hidden()
                     .on_click(move |_, window, app| {
                         proposed_view.update(app, |this, cx| {
@@ -3244,7 +3505,7 @@ fn response_column(
                         Input::new(proposed_input)
                             .disabled(proposed_input_disabled)
                             .w_full()
-                            .h(px(100.)),
+                            .h(px(TEXTAREA_HEIGHT)),
                     ),
             );
     }
@@ -3254,7 +3515,7 @@ fn response_column(
             ListItem::new("notes-field")
                 .selected(notes_focused)
                 .w_full()
-                .h(px(80.))
+                .h(px(TEXTAREA_HEIGHT))
                 .overflow_hidden()
                 .on_click(move |_, window, app| {
                     notes_view.update(app, |this, cx| {
@@ -3267,7 +3528,7 @@ fn response_column(
                     Input::new(notes_input)
                         .disabled(notes_input_disabled)
                         .w_full()
-                        .h(px(80.)),
+                        .h(px(TEXTAREA_HEIGHT)),
                 ),
         )
         .child(
@@ -3325,7 +3586,7 @@ fn response_column(
             ListItem::new("feedback-field")
                 .selected(feedback_focused)
                 .w_full()
-                .h(px(72.))
+                .h(px(TEXTAREA_HEIGHT))
                 .overflow_hidden()
                 .on_click(move |_, window, app| {
                     feedback_view.update(app, |this, cx| {
@@ -3338,7 +3599,7 @@ fn response_column(
                     Input::new(feedback_input)
                         .disabled(feedback_input_disabled)
                         .w_full()
-                        .h(px(72.)),
+                        .h(px(TEXTAREA_HEIGHT)),
                 ),
         )
         .child(
@@ -3359,6 +3620,59 @@ fn response_column(
                 ),
         );
 
+    let freeform_view = cx.entity();
+    let freeform_panel = v_flex()
+        .id("response-freeform-panel")
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .flex_shrink_0()
+        .gap_2()
+        .pt_2()
+        .border_t_1()
+        .border_color(muted.opacity(0.25))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("Submit requirements text"),
+        )
+        .child(
+            ListItem::new("freeform-field")
+                .selected(freeform_focused)
+                .w_full()
+                .h(px(TEXTAREA_HEIGHT))
+                .overflow_hidden()
+                .on_click(move |_, window, app| {
+                    freeform_view.update(app, |this, cx| {
+                        this.enter_freeform_edit(window, cx);
+                    });
+                })
+                .child(
+                    Input::new(freeform_input)
+                        .disabled(freeform_input_disabled)
+                        .w_full()
+                        .h(px(TEXTAREA_HEIGHT)),
+                ),
+        )
+        .child(
+            ListItem::new("freeform-submit-focus")
+                .selected(freeform_submit_focused)
+                .child(
+                    Button::new("submit-freeform")
+                        .label("Submit to processor")
+                        .compact()
+                        .disabled(!can_mutate)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.submit_freeform(window, cx);
+                                cx.stop_propagation();
+                            }),
+                        ),
+                ),
+        );
+
     col.child(
         div()
             .id("response-scroll")
@@ -3371,6 +3685,7 @@ fn response_column(
             .child(scroll_body.child(response_body)),
     )
     .child(feedback_panel)
+    .child(freeform_panel)
 }
 
 fn populate_action_menu(menu: PopupMenu, view: WeakEntity<WorkspaceView>) -> PopupMenu {

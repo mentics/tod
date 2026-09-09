@@ -6,7 +6,7 @@ use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
-use crate::fleet::repos::task::{FleetTask, TaskRepo};
+use crate::fleet::repos::task::{FleetTask, NoteItem, TaskRepo};
 use crate::fleet::schema;
 use crate::fleet::store::FleetStore;
 use crate::fleet::test_util::{cleanup_fleet_root, insert_scale_data, temp_fleet_root};
@@ -458,7 +458,7 @@ fn task_round_trip_survives_store_close_and_reopen() {
         lifecycle: "active".into(),
         repo: Some("github.com/org/tod".into()),
         branch: Some("main".into()),
-        notes: Some("persist me".into()),
+        notes: vec![NoteItem::new("persist me")],
         tags: vec!["ui".into(), "persistence".into()],
         linked_issues: vec!["TOD-99".into()],
         linked_prs: vec!["#7".into()],
