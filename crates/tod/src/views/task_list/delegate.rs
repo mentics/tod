@@ -380,15 +380,15 @@ fn title_label(
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
         .child(
-            div().text_sm().font_medium().child(
-                crate::ui::selectable_text::selectable_text(
-                    SharedString::from(format!("task-title-{task_id}")),
-                    title,
-                    window,
-                    cx,
-                )
-                .text_color(foreground),
-            ),
+            crate::ui::selectable_text::selectable_text(
+                SharedString::from(format!("task-title-{task_id}")),
+                title,
+                window,
+                cx,
+            )
+            .text_sm()
+            .font_medium()
+            .text_color(foreground),
         )
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
