@@ -108,7 +108,7 @@ impl ListDelegate for TaskListDelegate {
     fn render_item(
         &mut self,
         ix: IndexPath,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let item = self.items.get(ix.row)?.clone();
@@ -299,6 +299,7 @@ impl ListDelegate for TaskListDelegate {
             };
             title_row = title_row.child(div().flex_1().min_w_0().overflow_hidden().child(
                 title_label(
+                    window,
                     cx,
                     title_color,
                     display_title.clone(),
@@ -365,6 +366,7 @@ impl ListDelegate for TaskListDelegate {
 }
 
 fn title_label(
+    window: &mut Window,
     cx: &mut Context<ListState<TaskListDelegate>>,
     foreground: gpui::Hsla,
     title: String,
@@ -378,11 +380,15 @@ fn title_label(
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
         .child(
-            div()
-                .text_sm()
-                .font_medium()
-                .text_color(foreground)
-                .child(title),
+            crate::ui::selectable_text::selectable_text(
+                gpui::SharedString::from(format!("task-title-{task_id}")),
+                title,
+                window,
+                cx,
+            )
+            .text_sm()
+            .font_medium()
+            .text_color(foreground),
         )
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {

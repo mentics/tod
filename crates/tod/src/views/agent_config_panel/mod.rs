@@ -1280,7 +1280,7 @@ impl AgentConfigPanelView {
             )
     }
 
-    fn render_type_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_type_field(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.is_new() {
             self.render_selection_group(
                 "type",
@@ -1298,10 +1298,14 @@ impl AgentConfigPanelView {
             )
             .into_any_element()
         } else {
-            div()
-                .text_sm()
-                .child(format_env_type(&self.env_type))
-                .into_any_element()
+            selectable_text(
+                "agent-config-env-type",
+                format_env_type(&self.env_type),
+                window,
+                cx,
+            )
+            .text_sm()
+            .into_any_element()
         }
     }
 
@@ -1319,7 +1323,7 @@ impl AgentConfigPanelView {
         )
     }
 
-    fn render_runs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_runs(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_launch = self.mode == "agent";
         v_flex()
             .gap_2()
@@ -1345,7 +1349,9 @@ impl AgentConfigPanelView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_sm().child(label))
+                    .child(
+                        selectable_text(("agent-run-label", idx), label, window, cx).text_sm(),
+                    )
                     .when(active, |row| {
                         row.child(
                             Button::new(("run-stop", idx))
@@ -1368,10 +1374,9 @@ impl AgentConfigPanelView {
                             })),
                     )
                     .child(
-                        div()
+                        selectable_text(("agent-run-config-id", idx), config_id, window, cx)
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(config_id.clone()),
+                            .text_color(cx.theme().muted_foreground),
                     )
             }))
             .when(can_launch, |col| {
@@ -1659,7 +1664,7 @@ impl Render for AgentConfigPanelView {
                     .gap_1()
                     .items_start()
                     .child(Self::render_field_label("Type", cx))
-                    .child(self.render_type_field(cx)),
+                    .child(self.render_type_field(window, cx)),
             )
             .child(
                 v_flex()
@@ -1667,10 +1672,14 @@ impl Render for AgentConfigPanelView {
                     .items_start()
                     .child(Self::render_field_label("Workspace", cx))
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(self.workspace_label.clone()),
+                        selectable_text(
+                            "agent-config-workspace-label",
+                            self.workspace_label.clone(),
+                            window,
+                            cx,
+                        )
+                        .text_sm()
+                        .text_color(muted),
                     ),
             )
             .child(
@@ -1690,7 +1699,11 @@ impl Render for AgentConfigPanelView {
                     ))
                     .when(self.use_worktree && !self.is_new(), |col| {
                         col.when_some(self.worktree_path.clone(), |col, path| {
-                            col.child(div().text_xs().text_color(muted).child(path))
+                            col.child(
+                                selectable_text("agent-config-worktree-path", path, window, cx)
+                                    .text_xs()
+                                    .text_color(muted),
+                            )
                         })
                     }),
             )
@@ -1761,7 +1774,7 @@ impl Render for AgentConfigPanelView {
             );
 
         if !self.is_new() {
-            body = body.child(self.render_runs(cx));
+            body = body.child(self.render_runs(window, cx));
             if self.mode == "shell" {
                 body = body.child(self.render_interactive_agent(cx));
                 body = body.child(self.render_terminal_agents(cx));
@@ -1824,7 +1837,11 @@ impl Render for AgentConfigPanelView {
                     .border_b_1()
                     .border_color(border)
                     .bg(theme.secondary)
-                    .child(div().text_sm().font_semibold().child(title))
+                    .child(
+                        selectable_text("agent-config-title", title, window, cx)
+                            .text_sm()
+                            .font_semibold(),
+                    )
                     .child(div().flex_1())
                     .child(chrome_control_with_shortcut(
                         Button::new("agent-config-close")

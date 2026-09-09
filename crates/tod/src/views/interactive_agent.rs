@@ -584,16 +584,23 @@ impl Render for InteractiveAgentView {
                     .py_2()
                     .border_b_1()
                     .border_color(border)
-                    .text_xs()
-                    .text_color(muted)
-                    .child(format!(
-                        "Task {} · {} · {} · {} · {}",
-                        self.task_id,
-                        self.platform,
-                        self.model,
-                        self.effort,
-                        self.workspace_cwd.display()
-                    )),
+                    .child(
+                        crate::ui::selectable_text::selectable_text(
+                            "interactive-agent-info-line",
+                            format!(
+                                "Task {} · {} · {} · {} · {}",
+                                self.task_id,
+                                self.platform,
+                                self.model,
+                                self.effort,
+                                self.workspace_cwd.display()
+                            ),
+                            window,
+                            cx,
+                        )
+                        .text_xs()
+                        .text_color(muted),
+                    ),
             )
             .when_some(self.error_banner.clone(), |el, msg| {
                 el.child(
@@ -602,10 +609,17 @@ impl Render for InteractiveAgentView {
                         .px_4()
                         .py_2()
                         .bg(gpui::red())
-                        .text_color(gpui::white())
                         .border_b_1()
                         .border_color(border)
-                        .child(msg),
+                        .child(
+                            crate::ui::selectable_text::selectable_text(
+                                "interactive-agent-error-banner",
+                                msg,
+                                window,
+                                cx,
+                            )
+                            .text_color(gpui::white()),
+                        ),
                 )
             })
             .child(
@@ -757,10 +771,14 @@ impl Render for InteractiveAgentView {
                     .border_t_1()
                     .border_color(border)
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(self.status_line.clone()),
+                        crate::ui::selectable_text::selectable_text(
+                            "interactive-agent-status-line",
+                            self.status_line.clone(),
+                            window,
+                            cx,
+                        )
+                        .text_xs()
+                        .text_color(muted),
                     ),
             )
     }

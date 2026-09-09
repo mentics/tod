@@ -493,15 +493,30 @@ impl Render for AgentTranscriptsView {
                                                         px(0.)
                                                     })
                                                     .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(foreground)
-                                                            .child(agent.label.clone()),
+                                                        selectable_text(
+                                                            gpui::SharedString::from(format!(
+                                                                "agent-pick-label-{}",
+                                                                agent.id
+                                                            )),
+                                                            agent.label.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .text_sm()
+                                                        .text_color(foreground),
                                                     )
                                                     .child(
-                                                        div().text_xs().text_color(muted).child(
+                                                        selectable_text(
+                                                            gpui::SharedString::from(format!(
+                                                                "agent-pick-turns-{}",
+                                                                agent.id
+                                                            )),
                                                             format!("{} turns", agent.entry_count),
-                                                        ),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                        .text_xs()
+                                                        .text_color(muted),
                                                     ),
                                             )
                                             .when_some(badge, |row, label| {
@@ -536,11 +551,15 @@ impl Render for AgentTranscriptsView {
                                             .justify_between()
                                             .items_center()
                                             .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_semibold()
-                                                    .text_color(foreground)
-                                                    .child(self.header.clone()),
+                                                selectable_text(
+                                                    "agent-transcript-header",
+                                                    self.header.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                                .text_sm()
+                                                .font_semibold()
+                                                .text_color(foreground),
                                             ),
                                     )
                                     .child(
