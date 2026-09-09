@@ -16,7 +16,7 @@ use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tod_store::fleet::{FleetMutation, FleetStore, validate_interview_workspace};
-use tod_store::outline::{Capability, EXTRA_CONTENT_GOAL, OutlineMutation};
+use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, OutlineMutation};
 use tod_store::{CredentialStore, resolve_linear_api_key};
 
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
@@ -24,6 +24,7 @@ const TITLE_MAX_LEN: usize = 120;
 const SLUG_MAX_LEN: usize = 120;
 const MAX_TAGS: usize = 10;
 const MULTI_LINE_ROWS: f32 = 4.;
+const DETAILS_ROWS: f32 = 6.;
 
 fn input_text(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).text().to_string()
@@ -40,6 +41,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Branch => "task-edit-field-branch",
         TaskEditField::Notes => "task-edit-field-notes",
         TaskEditField::Purpose => "task-edit-field-purpose",
+        TaskEditField::Details => "task-edit-field-details",
         TaskEditField::Obligations => "task-edit-field-obligations",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Spec) => "task-edit-field-cap-spec",
@@ -71,6 +73,7 @@ enum TaskEditField {
     Branch,
     Notes,
     Purpose,
+    Details,
     Obligations,
     Capability(Capability),
 }
@@ -108,6 +111,7 @@ pub struct TaskEditView {
     branch_input: Entity<InputState>,
     notes_input: Entity<InputState>,
     purpose_input: Entity<InputState>,
+    details_input: Entity<InputState>,
     tag_draft_input: Entity<InputState>,
     tags: Vec<String>,
     capabilities: HashSet<Capability>,
@@ -117,6 +121,7 @@ pub struct TaskEditView {
     loaded_branch: String,
     loaded_lifecycle: String,
     loaded_purpose: String,
+    loaded_details: String,
     obligation_requirements: usize,
     obligation_constraints: usize,
     pending_toast: Option<String>,
@@ -141,6 +146,7 @@ pub struct TaskEditView {
     _branch_subscription: Subscription,
     _notes_subscription: Subscription,
     _purpose_subscription: Subscription,
+    _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
 }
 
@@ -170,6 +176,12 @@ impl TaskEditView {
                 .multi_line(true)
                 .rows(4)
                 .placeholder("Enter to edit · Goal, context, or problem statement…")
+        });
+        let details_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(6)
+                .placeholder("Enter to edit · Imported ticket description or freeform details…")
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
@@ -216,6 +228,11 @@ impl TaskEditView {
                 this.persist_purpose(cx);
             }
         });
+        let _details_subscription = cx.subscribe(&details_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Blur) {
+                this.persist_details(cx);
+            }
+        });
         let _tag_draft_subscription = cx.subscribe(&tag_draft_input, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.commit_tag_draft(cx);
@@ -234,6 +251,7 @@ impl TaskEditView {
             branch_input,
             notes_input,
             purpose_input,
+            details_input,
             tag_draft_input,
             tags: Vec::new(),
             capabilities: HashSet::new(),
@@ -243,6 +261,7 @@ impl TaskEditView {
             loaded_branch: String::new(),
             loaded_lifecycle: String::new(),
             loaded_purpose: String::new(),
+            loaded_details: String::new(),
             obligation_requirements: 0,
             obligation_constraints: 0,
             pending_toast: None,
@@ -267,6 +286,7 @@ impl TaskEditView {
             _branch_subscription,
             _notes_subscription,
             _purpose_subscription,
+            _details_subscription,
             _tag_draft_subscription,
         }
     }
@@ -329,6 +349,7 @@ impl TaskEditView {
         let mut stops = Vec::new();
         if self.has_any_capability() {
             stops.push(TaskEditField::Title);
+            stops.push(TaskEditField::Details);
         }
         if self.capability_enabled(Capability::Agent) {
             stops.extend([
@@ -417,6 +438,7 @@ impl TaskEditView {
             TaskEditField::Branch => self.branch_input.clone(),
             TaskEditField::Notes => self.notes_input.clone(),
             TaskEditField::Purpose => self.purpose_input.clone(),
+            TaskEditField::Details => self.details_input.clone(),
             TaskEditField::Obligations | TaskEditField::Capability(_) => return None,
         })
     }
@@ -488,7 +510,7 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 10] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
@@ -498,6 +520,7 @@ impl TaskEditView {
             (TaskEditField::Branch, self.branch_input.clone()),
             (TaskEditField::Notes, self.notes_input.clone()),
             (TaskEditField::Purpose, self.purpose_input.clone()),
+            (TaskEditField::Details, self.details_input.clone()),
         ];
         for (field, input) in inputs {
             key_context::set_input_tab_stop(&input, self.field_editing(field), cx);
@@ -508,7 +531,7 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 10] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
@@ -518,6 +541,7 @@ impl TaskEditView {
             (TaskEditField::Branch, self.branch_input.clone()),
             (TaskEditField::Notes, self.notes_input.clone()),
             (TaskEditField::Purpose, self.purpose_input.clone()),
+            (TaskEditField::Details, self.details_input.clone()),
         ];
         for (field, input) in inputs {
             if input.read(cx).focus_handle(cx).is_focused(window) {
@@ -627,6 +651,16 @@ impl TaskEditView {
             })
             .unwrap_or_default();
         self.loaded_purpose = purpose.clone();
+        let details = self
+            .node_uuid()
+            .and_then(|node_id| {
+                self.fleet
+                    .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        self.loaded_details = details.clone();
 
         self.title_input.update(cx, |input, cx| {
             input.set_value(task.title, window, cx);
@@ -651,6 +685,9 @@ impl TaskEditView {
         });
         self.purpose_input.update(cx, |input, cx| {
             input.set_value(purpose, window, cx);
+        });
+        self.details_input.update(cx, |input, cx| {
+            input.set_value(details, window, cx);
         });
         self.tag_draft_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -1192,6 +1229,29 @@ impl TaskEditView {
             return;
         }
         self.loaded_purpose = value;
+    }
+
+    fn persist_details(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        let value = input_text(&self.details_input, cx);
+        if value == self.loaded_details {
+            return;
+        }
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::SetExtraContent {
+                node_id,
+                content_type: EXTRA_CONTENT_DETAILS.to_string(),
+                body: value.clone(),
+            })
+        {
+            self.pending_toast = Some(format!("Failed to save details: {err}"));
+            cx.notify();
+            return;
+        }
+        self.loaded_details = value;
         cx.emit(TaskEditEvent::Changed);
     }
 
@@ -1763,6 +1823,23 @@ impl Render for TaskEditView {
                             TaskEditField::Title,
                             &self.title_input,
                             None,
+                            window,
+                            cx,
+                        )),
+                ),
+            );
+            body = body.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::Details,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Details))
+                        .gap_1()
+                        .w_full()
+                        .child(Self::render_field_label("Details", cx))
+                        .child(self.render_nav_input(
+                            TaskEditField::Details,
+                            &self.details_input,
+                            Some(DETAILS_ROWS),
                             window,
                             cx,
                         )),

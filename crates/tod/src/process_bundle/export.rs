@@ -117,6 +117,7 @@ fn extra_content_heading(kind: &str) -> &str {
         "design" => "Design",
         "plan" => "Plan",
         "notes" => "Notes",
+        "details" => "Details",
         other => other,
     }
 }

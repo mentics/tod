@@ -2,7 +2,7 @@
 
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::outline::types::Capability;
-use tod_store::outline::{EXTRA_CONTENT_GOAL, OutlineMutation};
+use tod_store::outline::{EXTRA_CONTENT_DETAILS, OutlineMutation};
 use uuid::Uuid;
 
 /// Extract a ticket id (e.g. `TOD-142`) from a bare id or Linear issue URL.
@@ -94,7 +94,7 @@ pub fn apply_linear_fields_to_node(
         fleet
             .enqueue_outline(OutlineMutation::SetExtraContent {
                 node_id,
-                content_type: EXTRA_CONTENT_GOAL.to_string(),
+                content_type: EXTRA_CONTENT_DETAILS.to_string(),
                 body: body.to_string(),
             })
             .map_err(|err| err.to_string())?;

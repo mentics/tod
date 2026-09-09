@@ -3,7 +3,7 @@
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
 use crate::outline::repos::tree::TreeLoader;
 use crate::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
-use crate::outline::types::{Capability, OutlineEntry};
+use crate::outline::types::{Capability, EXTRA_CONTENT_DETAILS, OutlineEntry};
 use crate::outline::uuid_blob::now_ms;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -271,8 +271,10 @@ impl OutlineMutation {
                 content_type,
                 body,
             } => {
-                require_spec(conn, *node_id)?;
                 parse_extra_content_type(content_type)?;
+                if content_type != EXTRA_CONTENT_DETAILS {
+                    require_spec(conn, *node_id)?;
+                }
                 NodeRepo::new(conn).set_extra_content(*node_id, content_type, body)?;
             }
         }

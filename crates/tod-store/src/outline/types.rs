@@ -85,7 +85,10 @@ impl Capability {
 /// `node_extra_content.content_type` value for the node's purpose / goal statement.
 pub const EXTRA_CONTENT_GOAL: &str = "goal";
 
-pub const EXTRA_CONTENT_TYPES: [&str; 4] = ["goal", "design", "plan", "notes"];
+/// `node_extra_content.content_type` value for the node's imported/freeform details.
+pub const EXTRA_CONTENT_DETAILS: &str = "details";
+
+pub const EXTRA_CONTENT_TYPES: [&str; 5] = ["goal", "design", "plan", "notes", "details"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineList {

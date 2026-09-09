@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 12;
+pub const CURRENT_USER_VERSION: i32 = 13;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -150,6 +150,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 12 {
         migrate_v11_to_v12(conn)?;
         conn.pragma_update(None, "user_version", 12)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 13 {
+        migrate_v12_to_v13(conn)?;
+        conn.pragma_update(None, "user_version", 13)?;
     }
     Ok(())
 }
@@ -600,6 +605,35 @@ fn migrate_v11_to_v12(conn: &Connection) -> Result<()> {
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '12')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Allow 'details' as a `node_extra_content.content_type` (imported ticket description).
+fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE node_extra_content_v13 (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details')),
+            body         TEXT NOT NULL DEFAULT '',
+            updated_at   INTEGER NOT NULL,
+            UNIQUE (node_id, content_type)
+        );
+        INSERT INTO node_extra_content_v13 (id, node_id, content_type, body, updated_at)
+        SELECT id, node_id, content_type, body, updated_at FROM node_extra_content;
+        DROP TABLE node_extra_content;
+        ALTER TABLE node_extra_content_v13 RENAME TO node_extra_content;
+        PRAGMA foreign_keys=ON;
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '13')",
         [],
     )?;
     tx.commit()?;

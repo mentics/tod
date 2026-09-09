@@ -241,6 +241,9 @@ pub struct TaskListView {
     pending_live_refresh: bool,
     pending_new_list: bool,
     pending_create_below: bool,
+    /// Set when a row click focuses the nested list widget, so Enter would otherwise
+    /// be swallowed as a list Confirm instead of reaching the task-list create action.
+    pending_refocus_list: bool,
     ticket_import_generation: u64,
     pending_ticket_import: Option<PendingTicketImport>,
     status_line: String,
@@ -337,6 +340,11 @@ impl TaskListView {
                 if this.pending_revert.is_none() {
                     this.sync_selected_id(cx);
                 }
+                // A click confirms via the nested list widget and leaves it focused;
+                // reclaim focus for the task-list surface so Enter still creates a node
+                // instead of being swallowed as another list Confirm.
+                this.pending_refocus_list = true;
+                cx.notify();
             }
             ListEvent::Cancel => {}
         });
@@ -377,6 +385,7 @@ impl TaskListView {
             pending_live_refresh: false,
             pending_new_list: false,
             pending_create_below: false,
+            pending_refocus_list: false,
             ticket_import_generation: 0,
             pending_ticket_import: None,
             status_line: String::new(),
@@ -2210,6 +2219,12 @@ impl Render for TaskListView {
         if self.pending_create_below {
             self.pending_create_below = false;
             self.create_tree_node_and_edit(CreatePosition::Below, window, cx);
+        }
+        if self.pending_refocus_list {
+            self.pending_refocus_list = false;
+            if !self.is_editing() {
+                self.focus_handle.focus(window);
+            }
         }
         if let Some(pending) = self.pending_ticket_import.take() {
             self.apply_pending_ticket_import(pending, window, cx);

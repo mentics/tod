@@ -91,16 +91,14 @@ mod tests {
 
     #[test]
     fn resolve_open_window_bounds_uses_saved_geometry() {
-        let settings = TodSettings {
-            window_geometry: Some(WindowGeometry {
-                x: 100.0,
-                y: 200.0,
-                width: 1600.0,
-                height: 900.0,
-                maximized: false,
-            }),
-            ..TodSettings::default()
-        };
+        let mut settings = TodSettings::default();
+        settings.window_geometry = Some(WindowGeometry {
+            x: 100.0,
+            y: 200.0,
+            width: 1600.0,
+            height: 900.0,
+            maximized: false,
+        });
         let bounds = resolve_open_window_bounds(&settings, 1280.0, 768.0, false, false);
         let WindowBounds::Windowed(saved) = bounds else {
             panic!("expected windowed bounds");
@@ -113,16 +111,14 @@ mod tests {
 
     #[test]
     fn resolve_open_window_bounds_honors_cli_size_overrides() {
-        let settings = TodSettings {
-            window_geometry: Some(WindowGeometry {
-                x: 100.0,
-                y: 200.0,
-                width: 1600.0,
-                height: 900.0,
-                maximized: false,
-            }),
-            ..TodSettings::default()
-        };
+        let mut settings = TodSettings::default();
+        settings.window_geometry = Some(WindowGeometry {
+            x: 100.0,
+            y: 200.0,
+            width: 1600.0,
+            height: 900.0,
+            maximized: false,
+        });
         let bounds = resolve_open_window_bounds(&settings, 1024.0, 600.0, true, true);
         let WindowBounds::Windowed(saved) = bounds else {
             panic!("expected windowed bounds");
