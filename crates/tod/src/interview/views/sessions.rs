@@ -12,9 +12,12 @@ use crate::ui::app_nav::{AppDestination, AppNavMenu};
 use crate::ui::toast::confirm_toast;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window,
+    prelude::FluentBuilder as _, div,
 };
-use gpui_component::{ActiveTheme, StyledExt};
+use gpui_component::button::Button;
+use gpui_component::spinner::Spinner;
+use gpui_component::{ActiveTheme, Sizable as _, Size, StyledExt};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -57,6 +60,10 @@ pub struct SessionsView {
     /// SQLite session ids with a bootstrap thread already running.
     bootstrap_sessions: Arc<Mutex<HashSet<Uuid>>>,
     kickoff_status: SharedString,
+    /// True while a kickoff/provisioning call is in flight, so the fallback
+    /// view can show a spinner instead of leaving the user staring at static
+    /// text with no sign anything is happening.
+    kickoff_in_progress: bool,
     focus_handle: FocusHandle,
     workspace: Option<Entity<WorkspaceView>>,
     workspace_return_target: WorkspaceReturnTarget,
@@ -68,6 +75,10 @@ pub struct SessionsView {
     _workspace_subscription: Option<Subscription>,
     /// Deferred bootstrap prompt after workspace detects missing scaffolding.
     pending_bootstrap_prompt: Option<InterviewSession>,
+    /// Session provisioned by a background kickoff, waiting to be opened on the
+    /// next render (opening needs `&mut Window`, which the async completion
+    /// callback doesn't have).
+    pending_opened_session: Option<InterviewSession>,
     app_nav: AppNavMenu,
 }
 
@@ -92,6 +103,7 @@ impl SessionsView {
             bootstrap_gate,
             bootstrap_sessions: Arc::new(Mutex::new(HashSet::new())),
             kickoff_status: SharedString::default(),
+            kickoff_in_progress: false,
             focus_handle: cx.focus_handle(),
             workspace: None,
             workspace_return_target: WorkspaceReturnTarget::TaskList,
@@ -99,6 +111,7 @@ impl SessionsView {
             in_flight_by_session: HashMap::new(),
             _workspace_subscription: None,
             pending_bootstrap_prompt: None,
+            pending_opened_session: None,
             app_nav: AppNavMenu::default(),
         }
     }
@@ -117,20 +130,12 @@ impl SessionsView {
     fn hide_workspace(&mut self, cx: &mut Context<Self>) {
         self.reload();
         self.kickoff_status = SharedString::default();
+        self.kickoff_in_progress = false;
         cx.notify();
     }
 
     fn reload(&mut self) {
         self.sessions = self.store.list_sessions().unwrap_or_default();
-    }
-
-    fn provision_interview_agent(
-        &self,
-        node_id: &str,
-    ) -> Result<tod_store::fleet::InterviewAgentContext, String> {
-        let settings = TodSettings::load(&self.paths).map_err(|e| e.to_string())?;
-        ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, node_id)
-            .map_err(|e| e.to_string())
     }
 
     /// Open an active interview for `node_id` + base `phase`, or insert a new session.
@@ -185,39 +190,66 @@ impl SessionsView {
         }
 
         self.kickoff_status = "Provisioning interview workspace…".into();
+        self.kickoff_in_progress = true;
         cx.notify();
-        let agent_ctx = match self.provision_interview_agent(&node_id.to_string()) {
-            Ok(ctx) => ctx,
-            Err(err) => {
-                self.kickoff_status = format!("Interview workspace: {err}").into();
-                cx.notify();
-                return;
-            }
-        };
 
+        // Provisioning does blocking disk/SQLite work, so it runs on a background
+        // thread — doing it inline here would finish before GPUI ever paints a
+        // frame with `kickoff_in_progress` set, and the spinner would never
+        // actually appear on screen.
+        let paths = self.paths.clone();
+        let fleet = self.fleet.clone();
+        let node_id_str = node_id.to_string();
+        let phase_owned = phase.to_string();
         let display_name = format!("{entity_label} — {phase_label}");
-        match self.store.insert_session_with_metadata(
-            NewInterviewSession {
-                node_id,
-                agent_config_id: Some(agent_ctx.agent.id.clone()),
-                display_name: display_name.clone(),
-                phase: phase.to_string(),
-            },
-            InterviewSessionStatus::Active,
-            Some(agent_ctx.agent.id),
-        ) {
-            Ok(session) => {
-                self.kickoff_status = format!("Kickoff started: {display_name}").into();
-                self.reload();
-                self.start_question_maker_bootstrap(session.clone());
-                self.open_workspace(session, window, cx);
-                cx.notify();
-            }
-            Err(err) => {
-                self.kickoff_status = format!("Failed to create session: {err}").into();
-                cx.notify();
-            }
-        }
+        let entity = cx.weak_entity();
+
+        cx.spawn(async move |_, cx| {
+            let display_name_for_thread = display_name.clone();
+            let result = std::thread::spawn(move || -> Result<InterviewSession, String> {
+                let settings = TodSettings::load(&paths).map_err(|e| e.to_string())?;
+                let agent_ctx =
+                    ensure_interview_agent_for_node(&fleet, &paths, &settings, &node_id_str)
+                        .map_err(|e| e.to_string())?;
+                let store = SessionStore::open(fleet.clone());
+                store
+                    .insert_session_with_metadata(
+                        NewInterviewSession {
+                            node_id,
+                            agent_config_id: Some(agent_ctx.agent.id.clone()),
+                            display_name: display_name_for_thread,
+                            phase: phase_owned,
+                        },
+                        InterviewSessionStatus::Active,
+                        Some(agent_ctx.agent.id),
+                    )
+                    .map_err(|e| e.to_string())
+            })
+            .join();
+
+            let outcome = match result {
+                Ok(Ok(session)) => Ok(session),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err("interview provisioning thread panicked".to_string()),
+            };
+
+            let _ = entity.update(cx, |this, cx| match outcome {
+                Ok(session) => {
+                    this.kickoff_status = format!("Kickoff started: {display_name}").into();
+                    this.kickoff_in_progress = false;
+                    this.reload();
+                    this.start_question_maker_bootstrap(session.clone());
+                    this.pending_opened_session = Some(session);
+                    cx.notify();
+                }
+                Err(err) => {
+                    this.kickoff_status = format!("Failed to create session: {err}").into();
+                    this.kickoff_in_progress = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn session_matches_node_phase(
@@ -786,6 +818,10 @@ impl Render for SessionsView {
             }
         }
 
+        if let Some(session) = self.pending_opened_session.take() {
+            self.open_workspace(session, window, cx);
+        }
+
         if let Some(workspace) = &self.workspace {
             // Absolute fill gives Workspace a definite width/height. Without this,
             // percentage `w_full` on the three-column row stayed indefinite, the row
@@ -814,7 +850,9 @@ impl Render for SessionsView {
         }
 
         // No workspace yet: this only happens transiently while an interview is
-        // being provisioned/kicked off for a node picked from the task list.
+        // being provisioned/kicked off for a node picked from the task list, or
+        // after that provisioning failed. Either way this view must never be a
+        // dead end — always offer a way back to the task list.
         let theme = cx.theme();
         div()
             .key_context(SESSIONS_CONTEXT)
@@ -823,7 +861,11 @@ impl Render for SessionsView {
             .size_full()
             .items_center()
             .justify_center()
+            .gap_3()
             .bg(theme.background)
+            .when(self.kickoff_in_progress, |el| {
+                el.child(Spinner::new().with_size(Size::Large))
+            })
             .child(
                 div()
                     .text_sm()
@@ -833,6 +875,15 @@ impl Render for SessionsView {
                     } else {
                         self.kickoff_status.clone()
                     }),
+            )
+            .child(
+                Button::new("sessions-back-to-tasks")
+                    .label("Back to Tasks")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.kickoff_status = SharedString::default();
+                        this.kickoff_in_progress = false;
+                        cx.emit(SessionsEvent::ReturnToTaskList);
+                    })),
             )
             .into_any_element()
     }

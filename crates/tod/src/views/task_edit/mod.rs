@@ -745,12 +745,21 @@ impl TaskEditView {
         cx.notify();
     }
 
-    fn enable_capability(&mut self, cap: Capability, cx: &mut Context<Self>) {
+    fn enable_capability(&mut self, cap: Capability, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
         if self.capabilities.contains(&cap) {
             return;
+        }
+        if cap == Capability::Agent && self.loaded_repo.is_empty() {
+            if let Ok(cwd) = std::env::current_dir() {
+                let cwd = cwd.to_string_lossy().into_owned();
+                self.repo_input.update(cx, |input, cx| {
+                    input.set_value(cwd, window, cx);
+                });
+                self.persist_repo(cx);
+            }
         }
         if let Err(err) = self
             .fleet
@@ -867,7 +876,7 @@ impl TaskEditView {
         if self.capability_enabled(cap) {
             self.request_disable_capability(cap, window, cx);
         } else {
-            self.enable_capability(cap, cx);
+            self.enable_capability(cap, window, cx);
         }
         self.clamp_focus_index();
     }

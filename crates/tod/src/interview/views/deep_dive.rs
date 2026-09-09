@@ -342,6 +342,8 @@ impl Render for DeepDiveView {
         let foreground = theme.foreground;
         let muted = theme.muted_foreground;
         let background = theme.background;
+        let group_box = theme.group_box;
+        let list_active_border = theme.list_active_border;
         let in_flight = self.in_flight();
 
         div()
@@ -409,10 +411,17 @@ impl Render for DeepDiveView {
                         .px_4()
                         .py_2()
                         .bg(gpui::red())
-                        .text_color(gpui::white())
                         .border_b_1()
                         .border_color(border)
-                        .child(msg),
+                        .child(
+                            crate::ui::selectable_text::selectable_text(
+                                "deep-dive-error-banner",
+                                msg,
+                                window,
+                                cx,
+                            )
+                            .text_color(gpui::white()),
+                        ),
                 )
             })
             .child(
@@ -423,7 +432,7 @@ impl Render for DeepDiveView {
                     .max_w(px(720.))
                     .border_1()
                     .border_color(border)
-                    .bg(theme.group_box)
+                    .bg(group_box)
                     .child(
                         h_flex()
                             .items_center()
@@ -432,7 +441,7 @@ impl Render for DeepDiveView {
                             .py_2()
                             .border_b_1()
                             .border_color(border)
-                            .bg(theme.group_box)
+                            .bg(group_box)
                             .child(
                                 div()
                                     .text_xs()
@@ -440,17 +449,26 @@ impl Render for DeepDiveView {
                                     .child("Parent"),
                             )
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(self.parent.id.clone()),
+                                div().text_xs().text_color(muted).child(
+                                    crate::ui::selectable_text::selectable_text(
+                                        "deep-dive-parent-id",
+                                        self.parent.id.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .text_color(muted),
+                                ),
                             )
                             .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(foreground)
-                                    .child(self.parent.short_label.clone()),
+                                div().text_xs().font_semibold().text_color(foreground).child(
+                                    crate::ui::selectable_text::selectable_text(
+                                        "deep-dive-parent-label",
+                                        self.parent.short_label.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .text_color(foreground),
+                                ),
                             )
                             .child(div().flex_1())
                             .child(
@@ -558,14 +576,19 @@ impl Render for DeepDiveView {
                             .border_color(border)
                             .child(
                                 if let Some(preview) = &self.pasted_preview {
-                                    div()
-                                        .text_xs()
-                                        .text_color(muted)
-                                        .child(format!(
-                                            "Parent answer preview: {}{}",
-                                            preview.chars().take(72).collect::<String>(),
-                                            if preview.len() > 72 { "…" } else { "" }
-                                        ))
+                                    div().text_xs().text_color(muted).child(
+                                        crate::ui::selectable_text::selectable_text(
+                                            "deep-dive-pasted-preview",
+                                            format!(
+                                                "Parent answer preview: {}{}",
+                                                preview.chars().take(72).collect::<String>(),
+                                                if preview.len() > 72 { "…" } else { "" }
+                                            ),
+                                            window,
+                                            cx,
+                                        )
+                                        .text_color(muted),
+                                    )
                                 } else {
                                     div()
                                         .text_xs()
@@ -583,7 +606,7 @@ impl Render for DeepDiveView {
                                             .rounded_md()
                                             .cursor_text()
                                             .when(self.stop_focused(DeepDiveStop::Draft), |el| {
-                                                el.border_1().border_color(theme.list_active_border)
+                                                el.border_1().border_color(list_active_border)
                                             })
                                             .on_mouse_down(
                                                 gpui::MouseButton::Left,
@@ -626,10 +649,15 @@ impl Render for DeepDiveView {
                     .border_t_1()
                     .border_color(border)
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(self.status_line.clone()),
+                        div().text_xs().text_color(muted).child(
+                            crate::ui::selectable_text::selectable_text(
+                                "deep-dive-status-line",
+                                self.status_line.clone(),
+                                window,
+                                cx,
+                            )
+                            .text_color(muted),
+                        ),
                     ),
             )
     }

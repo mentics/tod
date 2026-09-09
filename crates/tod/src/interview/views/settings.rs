@@ -815,7 +815,7 @@ impl Render for SettingsView {
                         .child(
                             resizable_panel()
                                 .size_range(px(PANEL_MIN)..Pixels::MAX)
-                                .child(self.render_section_panel(cx, &theme)),
+                                .child(self.render_section_panel(window, cx, &theme)),
                         ),
                 ),
             )
@@ -877,6 +877,7 @@ impl SettingsView {
 
     fn render_section_panel(
         &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
@@ -893,11 +894,12 @@ impl SettingsView {
                     .text_color(theme.foreground)
                     .child(self.active_section.label()),
             )
-            .child(self.render_active_section(cx, theme))
+            .child(self.render_active_section(window, cx, theme))
     }
 
     fn render_active_section(
         &self,
+        window: &mut Window,
         cx: &mut Context<Self>,
         theme: &gpui_component::Theme,
     ) -> impl IntoElement {
@@ -1076,6 +1078,7 @@ impl SettingsView {
             SettingsSection::Logging => v_flex()
                 .gap_1()
                 .child(read_only_row(
+                    window,
                     cx,
                     self,
                     "log-dir-path",
@@ -1370,7 +1373,8 @@ fn text_input_row(
 }
 
 fn read_only_row(
-    _cx: &mut Context<SettingsView>,
+    window: &mut Window,
+    cx: &mut Context<SettingsView>,
     _view: &SettingsView,
     id: &'static str,
     label: impl Into<SharedString>,
@@ -1397,8 +1401,15 @@ fn read_only_row(
             div()
                 .id(id)
                 .text_sm()
-                .text_color(theme.muted_foreground)
                 .whitespace_normal()
-                .child(value.into()),
+                .child(
+                    crate::ui::selectable_text::selectable_text(
+                        SharedString::from(format!("{id}-selectable-value")),
+                        value.into(),
+                        window,
+                        cx,
+                    )
+                    .text_color(theme.muted_foreground),
+                ),
         )
 }
