@@ -70,18 +70,23 @@ impl From<anyhow::Error> for CredentialError {
 #[derive(Debug, Clone)]
 pub struct CredentialStore {
     credentials_dir: PathBuf,
+    /// OS keyring service name. Always `KEYRING_SERVICE` outside tests; tests use a
+    /// unique name so they never touch (or delete) the user's real stored credentials.
+    keyring_service: String,
 }
 
 impl CredentialStore {
     pub fn new(paths: &TodPaths) -> Self {
         Self {
             credentials_dir: paths.credentials_dir(),
+            keyring_service: KEYRING_SERVICE.to_string(),
         }
     }
 
     pub fn from_data_root(data_root: &Path) -> Self {
         Self {
             credentials_dir: data_root.join("credentials"),
+            keyring_service: KEYRING_SERVICE.to_string(),
         }
     }
 
@@ -151,9 +156,13 @@ impl CredentialStore {
         Ok(())
     }
 
+    fn keyring_entry(&self, kind: CredentialKind) -> Result<keyring::Entry, CredentialError> {
+        keyring::Entry::new(&self.keyring_service, kind.keyring_account())
+            .map_err(|err| CredentialError::Message(err.to_string()))
+    }
+
     fn get_from_keyring(&self, kind: CredentialKind) -> Result<Option<String>, CredentialError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, kind.keyring_account())
-            .map_err(|err| CredentialError::Message(err.to_string()))?;
+        let entry = self.keyring_entry(kind)?;
         match entry.get_password() {
             Ok(value) => {
                 let value = value.trim().to_string();
@@ -169,16 +178,14 @@ impl CredentialStore {
     }
 
     fn set_in_keyring(&self, kind: CredentialKind, secret: &str) -> Result<(), CredentialError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, kind.keyring_account())
-            .map_err(|err| CredentialError::Message(err.to_string()))?;
+        let entry = self.keyring_entry(kind)?;
         entry
             .set_password(secret)
             .map_err(|err| CredentialError::Message(err.to_string()))
     }
 
     fn delete_from_keyring(&self, kind: CredentialKind) -> Result<(), CredentialError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, kind.keyring_account())
-            .map_err(|err| CredentialError::Message(err.to_string()))?;
+        let entry = self.keyring_entry(kind)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(CredentialError::Message(err.to_string())),
@@ -439,13 +446,38 @@ pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A `CredentialStore` isolated from the user's real credentials: a unique temp
+    /// credentials dir and a unique OS-keyring service name (never `KEYRING_SERVICE`).
+    /// Keyring entries and the dir are removed on drop, including when a test panics.
+    struct IsolatedStore {
+        store: CredentialStore,
+    }
+
+    impl IsolatedStore {
+        fn new() -> Self {
+            let id = uuid::Uuid::new_v4();
+            let dir = std::env::temp_dir().join(format!("tod-cred-{id}"));
+            fs::create_dir_all(&dir).unwrap();
+            Self {
+                store: CredentialStore {
+                    credentials_dir: dir,
+                    keyring_service: format!("tod-test-{id}"),
+                },
+            }
+        }
+    }
+
+    impl Drop for IsolatedStore {
+        fn drop(&mut self) {
+            let _ = self.store.delete(CredentialKind::LinearApiKey);
+            let _ = fs::remove_dir_all(&self.store.credentials_dir);
+        }
+    }
+
     #[test]
     fn encrypted_file_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("tod-cred-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let store = CredentialStore {
-            credentials_dir: dir.clone(),
-        };
+        let isolated = IsolatedStore::new();
+        let store = &isolated.store;
         store
             .set_in_file(CredentialKind::LinearApiKey, "lin_api_test")
             .unwrap();
@@ -454,8 +486,18 @@ mod tests {
             Some("lin_api_test")
         );
         store.delete(CredentialKind::LinearApiKey).unwrap();
-        assert!(store.get(CredentialKind::LinearApiKey).is_none());
-        let _ = fs::remove_dir_all(dir);
+        // Check the backends directly: `get` would also consult LINEAR_API_KEY.
+        assert!(matches!(
+            store.get_from_file(CredentialKind::LinearApiKey),
+            Err(CredentialError::NotFound)
+        ));
+        assert!(
+            store
+                .get_from_keyring(CredentialKind::LinearApiKey)
+                .ok()
+                .flatten()
+                .is_none()
+        );
     }
 
     #[test]
@@ -470,27 +512,23 @@ mod tests {
     fn set_and_get_use_separate_keyring_entries() {
         // CredentialStore creates a fresh keyring::Entry on each call; the backend must
         // persist by service/user identity, not in-memory on the Entry handle.
-        let set_entry = keyring::Entry::new(KEYRING_SERVICE, "linear_api_key").unwrap();
-        let get_entry = keyring::Entry::new(KEYRING_SERVICE, "linear_api_key").unwrap();
-        let _ = set_entry.delete_credential();
+        let isolated = IsolatedStore::new();
+        let kind = CredentialKind::LinearApiKey;
+        let set_entry = isolated.store.keyring_entry(kind).unwrap();
+        let get_entry = isolated.store.keyring_entry(kind).unwrap();
         set_entry.set_password("separate-entry-roundtrip").unwrap();
         assert_eq!(
             get_entry.get_password().unwrap(),
             "separate-entry-roundtrip"
         );
-        let _ = set_entry.delete_credential();
     }
 
     #[test]
     fn set_get_roundtrip_uses_readable_backend() {
         // Windows Credential Manager can accept writes that are not readable back
         // via the keyring crate; set() must fall back to the encrypted file in that case.
-        let dir = std::env::temp_dir().join(format!("tod-cred-kr-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let store = CredentialStore {
-            credentials_dir: dir.clone(),
-        };
-        let _ = store.delete(CredentialKind::LinearApiKey);
+        let isolated = IsolatedStore::new();
+        let store = &isolated.store;
         let secret = format!("lin_test_{}", uuid::Uuid::new_v4());
         let backend = store.set(CredentialKind::LinearApiKey, &secret).unwrap();
         assert_eq!(
@@ -498,7 +536,5 @@ mod tests {
             Some(secret.as_str()),
             "credential not readable after set (backend: {backend:?})"
         );
-        store.delete(CredentialKind::LinearApiKey).unwrap();
-        let _ = fs::remove_dir_all(dir);
     }
 }
