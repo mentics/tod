@@ -1,7 +1,5 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
-pub mod agent_launch;
-pub mod agent_traffic;
 pub mod credentials;
 pub mod fleet;
 pub mod install;
@@ -11,6 +9,12 @@ pub mod outline;
 pub mod path_util;
 pub mod paths;
 pub mod settings;
+
+/// Agent launch options and live traffic counters live in `tod-agent` (they
+/// describe how a session is started and how it is doing, not how it is
+/// stored); re-exported so store consumers keep a single import path.
+pub use tod_agent::agent_launch;
+pub use tod_agent::agent_traffic;
 
 pub use agent_launch::{
     AgentLaunchOptions, CLAUDE_EFFORTS, CLAUDE_MODELS, CURSOR_EFFORTS, CURSOR_MODELS,

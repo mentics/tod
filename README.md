@@ -177,13 +177,27 @@ See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 ```text
 Cargo.toml              # workspace root
 assets/process/         # bundled agent docs (source; copied to target/.../process at build)
-crates/tod/             # desktop application binary
-  src/main.rs           # CLI + App::run()
+crates/tod/             # thin launcher binary
+  build.rs              # installs process/ and media/ next to the executable
+  media/context/        # agent context docs (copied to target/.../media at build)
+crates/tod-ui/          # all GPUI code
   src/cli.rs            # LaunchOptions / CLI parsing
   src/app/              # GPUI application startup / window
+  src/views/            # task list, obligations, agent panels, transcripts
   src/agent_socket/     # optional control socket (agent-socket feature)
+crates/tod-cli/         # `tod-cli` binary that agents shell out to
+crates/tod-core/        # policy + orchestration shared by UI and CLI
+  src/interview/        # interview flow
   src/process_bundle/   # install discovery, manifest, scope export, prompts
+  src/media.rs          # agent context doc resolution
+  src/agent_context.rs  # assembles an agent chat's first message
+crates/tod-agent/       # agent transport (leaf crate; no tod-* deps)
+crates/tod-store/       # persistence (SQLite, credentials, settings, paths)
 ```
+
+Crates are layered so each depends only on the ones below it: `tod` → `tod-ui`
+→ `tod-core` → `tod-agent`, with `tod-store` alongside. See CLAUDE.md for the
+rationale.
 
 ## Stack
 

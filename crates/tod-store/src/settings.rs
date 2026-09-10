@@ -13,29 +13,9 @@ pub const DEFAULT_LOG_MAX_SIZE_KB: u64 = 51_200;
 pub const MIN_LOG_MAX_SIZE_KB: u64 = 1;
 pub const MAX_LOG_MAX_SIZE_KB: u64 = 104_857_600;
 
-/// Interview agent platform — persisted in `tod.yml` and shown in Settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentPlatform {
-    Cursor,
-    #[serde(alias = "anthropic")]
-    Claude,
-}
-
-impl Default for AgentPlatform {
-    fn default() -> Self {
-        Self::Claude
-    }
-}
-
-impl AgentPlatform {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Cursor => "Cursor",
-            Self::Claude => "Claude",
-        }
-    }
-}
+/// Agent platform lives in `tod-agent` (it describes the agent, not storage);
+/// re-exported here because it is persisted in `tod.yml` and agent config rows.
+pub use tod_agent::AgentPlatform;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionMakerSettings {

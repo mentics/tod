@@ -1,0 +1,48 @@
+[package]
+name = "tod-ui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tod_ui"
+path = "src/lib.rs"
+
+[features]
+default = ["agent-socket"]
+agent-socket = []
+
+[dependencies]
+anyhow = "1.0"
+async-channel = "2.5"
+dirs = "6.0"
+fs2 = "0.4"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+notify = "8.0"
+rusqlite = { version = "0.37", features = ["bundled", "backup"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "2.0"
+toml = "0.8"
+tod-agent = { path = "../tod-agent" }
+tod-core = { path = "../tod-core" }
+tod-store = { path = "../tod-store" }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-rolling-file = { version = "0.1.3", features = ["non-blocking"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.57", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+] }

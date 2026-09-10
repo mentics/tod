@@ -1,0 +1,19 @@
+[package]
+name = "tod-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tod-cli"
+path = "src/main.rs"
+
+# No GPUI and no agent transport: this binary is shelled out to repeatedly by
+# agents, so startup cost matters.
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tod-core = { path = "../tod-core" }
+tod-store = { path = "../tod-store" }
+uuid = { version = "1.0", features = ["v4"] }

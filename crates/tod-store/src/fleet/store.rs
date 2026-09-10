@@ -304,7 +304,10 @@ impl FleetStore {
     }
 
     /// Interview-mode agent on this node or a nearer ancestor, if any.
-    pub fn resolve_interview_agent_for_node(&self, node_id: &str) -> Result<Option<AgentConfigRow>> {
+    pub fn resolve_interview_agent_for_node(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<AgentConfigRow>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         let conn = guard.connection();
         resolve_interview_config_for_node(&conn, node_id).map_err(Into::into)

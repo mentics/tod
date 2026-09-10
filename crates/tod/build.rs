@@ -21,6 +21,19 @@ fn main() {
     if let Err(err) = copy_dir_all(&process_src, &dest) {
         println!("cargo:warning=tod: failed to copy process bundle: {err}");
     }
+
+    // Agent context docs ship the same way, landing as a `media/` sibling of the
+    // executable so an installed build resolves them without the source tree.
+    let media_src = manifest_dir.join("media");
+    if media_src.join("context").is_dir() {
+        println!("cargo:rerun-if-changed={}", media_src.display());
+        let media_dest = target_root.join(&profile).join("media");
+        if let Err(err) = copy_dir_all(&media_src, &media_dest) {
+            println!("cargo:warning=tod: failed to copy media bundle: {err}");
+        }
+    } else {
+        println!("cargo:warning=tod: media/context not found; skipping media bundle copy");
+    }
 }
 
 fn copy_dir_all(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
