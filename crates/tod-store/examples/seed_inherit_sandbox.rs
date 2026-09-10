@@ -27,11 +27,10 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
 
     let store = FleetStore::open(&root)?;
-    store
-        .enqueue_outline(OutlineMutation::CreateList {
-            slug: "inherit".into(),
-            title: "Inherit".into(),
-        })?;
+    store.enqueue_outline(OutlineMutation::CreateList {
+        slug: "inherit".into(),
+        title: "Inherit".into(),
+    })?;
     store.writer().flush()?;
     let list_id = store.list_outline_lists()?[0].id;
 

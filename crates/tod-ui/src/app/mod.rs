@@ -12,6 +12,7 @@ use crate::interview::views::{
     register_deep_dive_keyboard_bindings, register_sessions_keyboard_bindings,
     register_settings_keyboard_bindings,
 };
+use crate::ui::agent_chat::register_agent_chat_keyboard_bindings;
 use crate::ui::list::register_list_keyboard_bindings;
 use crate::views::agent_config_panel::register_agent_config_keyboard_bindings;
 use crate::views::agent_transcripts::register_agent_transcripts_keyboard_bindings;
@@ -29,6 +30,7 @@ pub use window::{open, open_data_root_setup};
 
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_list_keyboard_bindings(cx);
+    register_agent_chat_keyboard_bindings(cx);
     register_task_list_keyboard_bindings(cx);
     register_command_history_keyboard_bindings(cx);
     register_task_edit_keyboard_bindings(cx);

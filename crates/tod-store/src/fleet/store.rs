@@ -398,6 +398,14 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// A single agent run by id.
+    pub fn get_run(&self, id: &str) -> Result<Option<AgentRun>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .get(id)
+            .map_err(Into::into)
+    }
+
     /// Terminal-launched CLI agent runs for a config, newest first.
     pub fn list_terminal_agent_runs_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>> {
         let guard = self.projection.lock().expect("fleet projection mutex");

@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 const INSTALL_VERSION: u32 = 1;
 
+/// Env var overriding the app config directory that holds `install.toml`.
+/// Tests must set this so they never touch the user's real bootstrap file.
+pub const TOD_CONFIG_DIR_ENV: &str = "TOD_CONFIG_DIR";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallConfig {
     pub data_root: PathBuf,
@@ -17,8 +21,11 @@ fn default_version() -> u32 {
     INSTALL_VERSION
 }
 
-/// OS-standard app config directory (`…/tod/`).
+/// App config directory: `{TOD_CONFIG_DIR}` if set, else the OS-standard `…/tod/`.
 pub fn app_config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os(TOD_CONFIG_DIR_ENV).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     dirs::config_dir()
         .map(|dir| dir.join("tod"))
         .context("failed to resolve OS config directory")
@@ -87,10 +94,17 @@ mod tests {
         let _lock = env_lock();
         let base = std::env::temp_dir().join(format!("tod-install-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        // `dirs::config_dir()` ignores XDG_CONFIG_HOME on Windows and macOS, so
+        // only the tod-specific override reliably keeps this test off the real file.
+        let prev = std::env::var_os(TOD_CONFIG_DIR_ENV);
+        let config_dir = base.join("config");
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &base);
+            std::env::set_var(TOD_CONFIG_DIR_ENV, &config_dir);
         }
+        assert_eq!(
+            install_config_path().unwrap(),
+            config_dir.join("install.toml")
+        );
 
         let data_root = base.join("tod-data");
         save_data_root(&data_root).unwrap();
@@ -103,9 +117,9 @@ mod tests {
 
         unsafe {
             if let Some(v) = prev {
-                std::env::set_var("XDG_CONFIG_HOME", v);
+                std::env::set_var(TOD_CONFIG_DIR_ENV, v);
             } else {
-                std::env::remove_var("XDG_CONFIG_HOME");
+                std::env::remove_var(TOD_CONFIG_DIR_ENV);
             }
         }
         let _ = std::fs::remove_dir_all(base);

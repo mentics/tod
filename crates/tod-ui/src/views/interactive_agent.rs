@@ -16,6 +16,7 @@ use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tod_agent::{SessionOpening, SessionTurn};
 use tod_store::fleet::repos::transcript::TranscriptTurn;
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::{AgentLaunchOptions, AgentPlatform, parse_platform, platform_storage};
@@ -51,7 +52,6 @@ struct PendingRun {
 }
 
 pub struct InteractiveAgentView {
-    task_id: String,
     config_id: String,
     session_run_id: String,
     fleet: Arc<FleetStore>,
@@ -70,9 +70,14 @@ pub struct InteractiveAgentView {
     focus_handle: FocusHandle,
     focus_stop: InteractiveAgentStop,
     prompt_editing: bool,
-    /// Assembled app context. Nothing is sent until the user submits their
-    /// first prompt; from then on it leads every prompt body, because each
-    /// agent run is a fresh, stateless process (see `build_prompt`).
+    /// Human-readable session name, shown in the header and given to the
+    /// agent-side session when the first message goes out.
+    session_name: String,
+    /// Agent-side session id, recorded after the first reply so a later process
+    /// can resume the conversation.
+    agent_session_id: Option<String>,
+    /// Assembled app context for a new session. Nothing is sent until the user
+    /// submits their first message; it goes out once, ahead of that message.
     context_prefix: Option<String>,
     /// The context panel is collapsed by default — it is rarely worth reading.
     context_expanded: bool,
@@ -81,14 +86,13 @@ pub struct InteractiveAgentView {
 
 impl InteractiveAgentView {
     pub fn new(
-        task_id: String,
         config_id: String,
         session_run_id: String,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
         workspace_cwd: PathBuf,
         window_control: InteractiveAgentWindowControl,
-        // Assembled app context, prepended to the first prompt the user sends.
+        // Assembled app context, sent once ahead of the session's first message.
         initial_context: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -105,6 +109,13 @@ impl InteractiveAgentView {
             .flatten()
             .map(|row| row.launch_options())
             .unwrap_or_else(|| AgentLaunchOptions::for_platform(AgentPlatform::Claude));
+
+        let run = fleet.get_run(&session_run_id).ok().flatten();
+        let session_name = run
+            .as_ref()
+            .and_then(|run| run.session_name.clone())
+            .unwrap_or_else(|| format!("Session {}", run.as_ref().map_or(0, |run| run.run_number)));
+        let agent_session_id = run.and_then(|run| run.agent_session_id);
 
         let prompt_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -125,15 +136,14 @@ impl InteractiveAgentView {
             }
         });
 
-        // A session that already has turns carries its context in the
-        // transcript; re-prefixing it would duplicate it.
+        // A session that already has turns was opened with its context, and its
+        // agent session still holds it.
         let context_prefix = if conversation.is_empty() {
             initial_context
         } else {
             None
         };
         let view = Self {
-            task_id,
             config_id,
             session_run_id,
             fleet,
@@ -152,6 +162,8 @@ impl InteractiveAgentView {
             focus_handle: cx.focus_handle(),
             focus_stop: InteractiveAgentStop::Prompt,
             prompt_editing: false,
+            session_name,
+            agent_session_id,
             context_prefix,
             context_expanded: false,
             _poll_task,
@@ -249,12 +261,14 @@ impl InteractiveAgentView {
         self.pending.is_some()
     }
 
-    fn build_prompt(&self, new_user_text: &str) -> String {
-        assemble_prompt(
-            self.context_prefix.as_deref(),
-            &self.conversation,
-            new_user_text,
-        )
+    /// What opens the agent session — its name and the app context. Only the
+    /// session's first message carries it; the agent keeps it from then on.
+    fn opening(&self) -> Option<SessionOpening> {
+        let first_message = self.conversation.is_empty() && self.agent_session_id.is_none();
+        first_message.then(|| SessionOpening {
+            title: self.session_name.clone(),
+            context: self.context_prefix.clone(),
+        })
     }
 
     fn fail_submit(&mut self, message: String, cx: &mut Context<Self>) {
@@ -283,7 +297,6 @@ impl InteractiveAgentView {
             input.set_value("", window, cx);
         });
 
-        let prompt_body = self.build_prompt(&text);
         let prompt_id = uuid::Uuid::new_v4().to_string();
         let response_id = uuid::Uuid::new_v4().to_string();
         let session_run_id = self.session_run_id.clone();
@@ -300,7 +313,7 @@ impl InteractiveAgentView {
         if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
             id: prompt_id.clone(),
             agent_id: self.config_id.clone(),
-            content: prompt_body.clone(),
+            content: text.clone(),
             run_id: Some(session_run_id.clone()),
         }) {
             self.fail_submit(format!("Fleet: {err}"), cx);
@@ -326,12 +339,15 @@ impl InteractiveAgentView {
                             self.effort.clone(),
                         )
                     });
-                provider.start_fleet_agent(
-                    &self.config_id,
-                    self.workspace_cwd.clone(),
-                    prompt_body,
+                provider.send_session_turn(SessionTurn {
+                    key: session_run_id,
+                    agent_config_id: self.config_id.clone(),
+                    cwd: self.workspace_cwd.clone(),
                     options,
-                )
+                    resume_session_id: self.agent_session_id.clone(),
+                    opening: self.opening(),
+                    message: text,
+                })
             }
             Err(_) => Err(anyhow::anyhow!("Agent busy — try again shortly")),
         };
@@ -366,6 +382,8 @@ impl InteractiveAgentView {
         let Some(state) = agent.poll_run(run_id) else {
             return;
         };
+        let agent_session_id = agent.session_id(&self.session_run_id);
+        drop(agent);
 
         let PendingRun {
             prompt_id,
@@ -403,6 +421,7 @@ impl InteractiveAgentView {
                 }
                 self.status_line = "Agent replied".into();
                 self.error_banner = None;
+                self.record_agent_session_id(agent_session_id);
             }
             AgentRunState::Failure(message) => {
                 self.error_banner = Some(message);
@@ -412,10 +431,53 @@ impl InteractiveAgentView {
         cx.notify();
     }
 
+    /// Persist the agent-side session id when the agent first reports it (or
+    /// when a resume landed on a different one).
+    fn record_agent_session_id(&mut self, agent_session_id: Option<String>) {
+        let Some(agent_session_id) = agent_session_id else {
+            return;
+        };
+        if self.agent_session_id.as_deref() == Some(agent_session_id.as_str()) {
+            return;
+        }
+        if let Err(err) = self.fleet.enqueue(FleetMutation::SetAgentRunSessionId {
+            run_id: self.session_run_id.clone(),
+            agent_session_id: agent_session_id.clone(),
+        }) {
+            self.error_banner = Some(format!("Fleet: {err}"));
+            return;
+        }
+        let _ = self.fleet.writer().flush();
+        self.agent_session_id = Some(agent_session_id);
+    }
+
     fn close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
-        self.window_control.remove_handle(&self.session_run_id);
+        self.window_control.release_session(&self.session_run_id);
         window.remove_window();
     }
+}
+
+/// A "Label value" pair in the chat header, so what the session runs with is
+/// visible at a glance.
+fn render_header_field(
+    id: &'static str,
+    label: &'static str,
+    value: impl Into<gpui::SharedString>,
+    foreground: gpui::Hsla,
+    muted: gpui::Hsla,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .child(div().text_xs().text_color(muted).child(label))
+        .child(
+            crate::ui::selectable_text::selectable_text(id, value, window, cx)
+                .text_sm()
+                .font_semibold()
+                .text_color(foreground),
+        )
 }
 
 fn render_user_panel(
@@ -445,9 +507,8 @@ fn render_user_panel(
                 .child("You"),
         )
         .child(
-            // Turn 0 carries the assembled app context, which is a markdown
-            // document; later turns are whatever the user typed. Both read
-            // better rendered than as source.
+            // Messages often carry markdown (lists, pasted notes, code); it
+            // reads better rendered than as source.
             selectable_markdown(("interactive-agent-user-text", turn_ix), text, window, cx)
                 .text_sm()
                 .text_color(foreground),
@@ -518,32 +579,6 @@ fn render_agent_thinking_panel(
         )
 }
 
-/// Build the prompt body for the next turn.
-///
-/// Runs are stateless — each turn spawns a fresh agent process — so the
-/// conversation so far, and the app context ahead of it, are replayed every
-/// time. The context never goes out on its own: it is worthless without a user
-/// prompt, so it rides along with the first prompt the user submits.
-fn assemble_prompt(
-    context: Option<&str>,
-    conversation: &[(String, String)],
-    new_user_text: &str,
-) -> String {
-    let mut prompt = String::new();
-    if let Some(context) = context {
-        prompt.push_str(context.trim_end());
-        prompt.push_str("\n\n");
-    }
-    if prompt.is_empty() && conversation.is_empty() {
-        return new_user_text.to_string();
-    }
-    for (user, assistant) in conversation {
-        prompt.push_str(&format!("User:\n{user}\n\nAssistant:\n{assistant}\n\n"));
-    }
-    prompt.push_str(&format!("User:\n{new_user_text}"));
-    prompt
-}
-
 fn conversation_from_transcript(turns: &[TranscriptTurn]) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     let mut i = 0;
@@ -606,6 +641,8 @@ impl Render for InteractiveAgentView {
         let background = theme.background;
         let prompt_focused = self.stop_focused(InteractiveAgentStop::Prompt);
         let submit_focused = self.stop_focused(InteractiveAgentStop::Submit);
+        let platform_label = parse_platform(&self.platform)
+            .map_or_else(|| self.platform.clone(), |p| p.label().to_string());
 
         // The context leads the prompt body, so it leads the transcript too —
         // collapsed, because it is rarely what the reader came for.
@@ -620,7 +657,7 @@ impl Render for InteractiveAgentView {
                 let when = if show_empty {
                     "sent ahead of your first prompt"
                 } else {
-                    "leads every prompt"
+                    "leads every session"
                 };
                 format!("{lines} {unit} · {when}")
             };
@@ -700,21 +737,62 @@ impl Render for InteractiveAgentView {
                 cx.stop_propagation();
             }))
             .child(
-                div()
+                v_flex()
                     .flex_shrink_0()
+                    .gap_1()
                     .px_4()
                     .py_2()
                     .border_b_1()
                     .border_color(border)
                     .child(
+                        h_flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_x_4()
+                            .gap_y_1()
+                            .child(render_header_field(
+                                "interactive-agent-header-agent",
+                                "Agent",
+                                self.config_id.clone(),
+                                foreground,
+                                muted,
+                                window,
+                                cx,
+                            ))
+                            .child(render_header_field(
+                                "interactive-agent-header-platform",
+                                "Platform",
+                                platform_label,
+                                foreground,
+                                muted,
+                                window,
+                                cx,
+                            ))
+                            .child(render_header_field(
+                                "interactive-agent-header-model",
+                                "Model",
+                                self.model.clone(),
+                                foreground,
+                                muted,
+                                window,
+                                cx,
+                            ))
+                            .child(render_header_field(
+                                "interactive-agent-header-effort",
+                                "Effort",
+                                self.effort.clone(),
+                                foreground,
+                                muted,
+                                window,
+                                cx,
+                            )),
+                    )
+                    .child(
                         crate::ui::selectable_text::selectable_text(
                             "interactive-agent-info-line",
                             format!(
-                                "Task {} · {} · {} · {} · {}",
-                                self.task_id,
-                                self.platform,
-                                self.model,
-                                self.effort,
+                                "{} · {}",
+                                self.session_name,
                                 self.workspace_cwd.display()
                             ),
                             window,
@@ -936,34 +1014,5 @@ pub fn register_interactive_agent_keyboard_bindings(cx: &mut App) {
                 Some(INTERACTIVE_AGENT_CONTEXT),
             ),
         ]);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::assemble_prompt;
-
-    fn turn(user: &str, assistant: &str) -> (String, String) {
-        (user.to_string(), assistant.to_string())
-    }
-
-    #[test]
-    fn first_prompt_leads_with_context_then_user_text() {
-        let prompt = assemble_prompt(Some("APP CONTEXT\n"), &[], "do the thing");
-        assert_eq!(prompt, "APP CONTEXT\n\nUser:\ndo the thing");
-    }
-
-    #[test]
-    fn context_precedes_the_replayed_conversation() {
-        let prompt = assemble_prompt(Some("APP CONTEXT"), &[turn("first", "reply")], "second");
-        assert_eq!(
-            prompt,
-            "APP CONTEXT\n\nUser:\nfirst\n\nAssistant:\nreply\n\nUser:\nsecond"
-        );
-    }
-
-    #[test]
-    fn without_context_a_lone_prompt_is_sent_verbatim() {
-        assert_eq!(assemble_prompt(None, &[], "hello"), "hello");
     }
 }

@@ -65,6 +65,8 @@ On first launch, tod prompts for a **data root** (defaulting to the OS app data 
 
 Resolution order: `--data-root` → `TOD_DATA_ROOT` → `install.toml`. If none are set, the first-run picker appears.
 
+Set `TOD_CONFIG_DIR` to relocate the directory holding `install.toml` (tests use this to avoid touching the real file).
+
 Everything lives flat under the chosen data root: `tod.db`, `tod.yml`, `task-list-working-set.json`, logs in `log/`.
 
 **Dogfooding (daily use in this repo):**

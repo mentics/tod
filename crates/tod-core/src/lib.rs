@@ -12,6 +12,7 @@ pub mod logging;
 pub mod media;
 pub mod process;
 pub mod process_bundle;
+pub mod session_name;
 pub mod task;
 
 pub use interview::{TodPaths, set_data_root};

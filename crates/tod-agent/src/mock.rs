@@ -1,7 +1,9 @@
 #[cfg(test)]
 use super::answer_pool::AnswerProcessorPoolStats;
 use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
-use super::provider::{AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId};
+use super::provider::{
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId, SessionTurn,
+};
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{
@@ -30,9 +32,16 @@ pub struct MockAgentProvider {
     question_maker_completion_tx: mpsc::Sender<QuestionMakerJobResult>,
     question_maker_completion_rx: mpsc::Receiver<QuestionMakerJobResult>,
     fleet_run_agent: HashMap<RunId, String>,
+    sessions: HashMap<String, MockSession>,
     traffic_log: Option<SharedAgentTrafficLog>,
     /// Last options passed to [`Self::start_fleet_agent`] (tests / diagnostics).
     pub last_fleet_options: Option<AgentLaunchOptions>,
+}
+
+/// A conversation the mock is "holding": an id and how many messages it took.
+struct MockSession {
+    session_id: String,
+    messages: u32,
 }
 
 struct AnswerJobResult {
@@ -66,6 +75,7 @@ impl MockAgentProvider {
             question_maker_completion_tx,
             question_maker_completion_rx,
             fleet_run_agent: HashMap::new(),
+            sessions: HashMap::new(),
             traffic_log: None,
             last_fleet_options: None,
         }
@@ -372,6 +382,39 @@ impl AgentProvider for MockAgentProvider {
         Ok(handle)
     }
 
+    fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
+        let request = turn.prompt_blocks().join("\n\n");
+        let session = self
+            .sessions
+            .entry(turn.key.clone())
+            .or_insert_with(|| MockSession {
+                session_id: turn
+                    .resume_session_id
+                    .clone()
+                    .unwrap_or_else(|| format!("mock-session-{}", uuid::Uuid::new_v4())),
+                messages: 0,
+            });
+        session.messages += 1;
+        let reply = mock_session_reply(session.messages, &turn);
+        let handle = self.finish(
+            AgentRunKind::FleetAgent,
+            Some(&request),
+            AgentRunState::Success(Some(reply)),
+        );
+        self.fleet_run_agent.insert(handle.id, turn.agent_config_id);
+        Ok(handle)
+    }
+
+    fn session_id(&self, key: &str) -> Option<String> {
+        self.sessions
+            .get(key)
+            .map(|session| session.session_id.clone())
+    }
+
+    fn close_session(&mut self, key: &str) {
+        self.sessions.remove(key);
+    }
+
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
         self.drain_question_maker_completions();
         self.drain_answer_completions();
@@ -418,6 +461,27 @@ impl AgentProvider for MockAgentProvider {
             ..Default::default()
         }
     }
+}
+
+/// Spell out what reached the agent, so UI checks can see a session's opening
+/// arrive exactly once.
+fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
+    let mut reply = format!("Mock session reply · message {message_number}\n\n");
+    match &turn.opening {
+        Some(opening) => {
+            reply.push_str(&format!("- Session named **{}**\n", opening.title));
+            match opening.context.as_deref() {
+                Some(context) => reply.push_str(&format!(
+                    "- Received {} lines of context ahead of this message\n",
+                    context.lines().count()
+                )),
+                None => reply.push_str("- No context was sent\n"),
+            }
+        }
+        None => reply.push_str("- Nothing re-sent: the session already has its context\n"),
+    }
+    reply.push_str(&format!("\nYou said: {}", turn.message));
+    reply
 }
 
 fn process_question_maker_from_prompt(prompt: &str) -> Result<String> {
@@ -908,6 +972,69 @@ mod tests {
             session_prefix: String::new(),
             turn: turn.into(),
         }
+    }
+
+    fn session_turn(
+        key: &str,
+        opening: Option<crate::provider::SessionOpening>,
+        resume_session_id: Option<&str>,
+        message: &str,
+    ) -> SessionTurn {
+        SessionTurn {
+            key: key.into(),
+            agent_config_id: "config".into(),
+            cwd: PathBuf::from("."),
+            options: default_options(),
+            resume_session_id: resume_session_id.map(str::to_string),
+            opening,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn mock_session_sends_opening_once_and_keeps_its_id() {
+        use crate::provider::SessionOpening;
+
+        let mut mock = MockAgentProvider::new();
+        let opening = SessionOpening {
+            title: "Obligations · Demo".into(),
+            context: Some("line one\nline two".into()),
+        };
+        let first = mock
+            .send_session_turn(session_turn("run-7", Some(opening), None, "first"))
+            .unwrap();
+        let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, first.id) else {
+            panic!("first message failed");
+        };
+        assert!(reply.contains("Obligations · Demo"), "{reply}");
+        assert!(reply.contains("2 lines of context"), "{reply}");
+        let session_id = mock
+            .session_id("run-7")
+            .expect("session id after first message");
+
+        let second = mock
+            .send_session_turn(session_turn("run-7", None, None, "second"))
+            .unwrap();
+        let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, second.id) else {
+            panic!("second message failed");
+        };
+        assert!(reply.contains("Nothing re-sent"), "{reply}");
+        assert_eq!(mock.session_id("run-7"), Some(session_id));
+    }
+
+    #[test]
+    fn mock_session_resumes_a_recorded_session_id() {
+        let mut mock = MockAgentProvider::new();
+        mock.send_session_turn(session_turn(
+            "run-8",
+            None,
+            Some("earlier-session"),
+            "again",
+        ))
+        .unwrap();
+        assert_eq!(mock.session_id("run-8").as_deref(), Some("earlier-session"));
+        mock.close_session("run-8");
+        assert_eq!(mock.session_id("run-8"), None);
     }
 
     #[test]

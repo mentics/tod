@@ -75,7 +75,11 @@ pattern).
 
 There is a strict precedence for where durable state lives, checked in this order: `--data-root` CLI flag → `TOD_DATA_ROOT` env var → `install.toml` (in the OS config dir, e.g. `%APPDATA%\tod\install.toml` on Windows). If none are set, the app shows a first-run picker. Everything (the SQLite DB, YAML config, working-set JSON, logs) lives flat under that one data root.
 
-**Never edit `%APPDATA%\tod\install.toml` or `$APPDATA/tod/install.toml`**. Those are for the user's use only. Always use `--data-root` to point at a different root.
+**Never write the user's `install.toml`** (`%APPDATA%\tod\install.toml` on Windows, `~/Library/Application Support/tod/install.toml` on macOS, `~/.config/tod/install.toml` on Linux) — directly *or indirectly*. It is for the user's use only. Always use `--data-root` to point at a different root. In practice:
+
+- Don't edit it, even if the app can't find its data root — pass `--data-root` instead.
+- Never launch `tod` without `--data-root` (or `TOD_DATA_ROOT`). Without one the first-run picker appears, and completing it — including via the agent socket — calls `save_data_root` and overwrites the file.
+- Code or tests that exercise `install.toml` must set `TOD_CONFIG_DIR` to a temp dir first. Don't rely on `XDG_CONFIG_HOME`: `dirs::config_dir()` ignores it on Windows and macOS.
 
 Bundled agent docs resolve separately via `TodInstallPaths` (`TOD_PROCESS_ROOT` env → `{executable_dir}/process/` → walk-up-from-cwd fallback to `assets/process/`) — this is distinct from the data root and holds no user data. Agent context docs resolve the same way via `MediaPaths` (`TOD_MEDIA_ROOT` env → `{executable_dir}/media/` → walk-up to `crates/tod/media/`).
 
@@ -85,10 +89,23 @@ A chat icon appears in the upper-right of a context panel when the node has the
 Agent capability, and opens an agent conversation scoped to that panel. Sessions
 are **not** reused — every click starts a fresh one.
 
+**Ctrl+J** opens an agent chat everywhere. `crates/tod-ui/src/ui/agent_chat.rs`
+owns the app-wide `OpenAgentChat` action (bound with no key context); any surface
+that offers a chat handles it with `on_action`, propagating when it can't open one,
+and shows the badge via `chrome_control_with_shortcut_in_context(.., &OpenAgentChat, None, ..)`.
+
 The context is assembled by `tod_core::agent_context` and held until the user
-submits their first prompt — it is worthless on its own, so nothing reaches the
-agent before then. It then leads that prompt body, and (because every turn spawns
-a fresh, stateless agent process) every later one. It is:
+submits their first message — nothing reaches the agent before then. A chat
+window holds one long-lived agent session (`AgentProvider::send_session_turn`):
+the first message opens it — the context and the message go out together as one
+turn, and the session is given its name (for Claude, a `custom-title` record
+written once that first turn has created the session log; Cursor names its own
+sessions) — and every later message sends only itself.
+The provider keeps the agent process alive between messages; when the window
+closes or the process idles out, the next message resumes the recorded
+agent-side session id (`agent_runs.agent_session_id`) instead of replaying
+history. Session names come from `tod_core::session_name` (surface, task title,
+start time). The context is:
 
 1. **Static layers** from `crates/tod/media/context/`, outermost first. The key
    is a `/`-separated path, and every ancestor level contributes: `obligations`

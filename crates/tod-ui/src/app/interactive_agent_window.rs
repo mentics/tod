@@ -17,10 +17,9 @@ use tod_store::fleet::writer::FleetMutation;
 
 #[derive(Debug, Clone)]
 pub struct InteractiveAgentOpenParams {
-    pub task_id: String,
     pub config_id: String,
     pub session_run_id: String,
-    /// Assembled app context, prepended to the first prompt the user sends.
+    /// Assembled app context, sent once ahead of the session's first message.
     /// `None` when reopening an existing session.
     pub initial_context: Option<String>,
 }
@@ -68,20 +67,41 @@ impl InteractiveAgentWindowControl {
             .remove(session_run_id);
     }
 
+    /// Forget a closed session window and stop its agent process. The
+    /// agent-side session is kept, so reopening the window resumes it.
+    pub fn release_session(&self, session_run_id: &str) {
+        self.remove_handle(session_run_id);
+        self.close_agent_session(session_run_id);
+    }
+
+    fn close_agent_session(&self, session_run_id: &str) {
+        let agent = self
+            .agent
+            .lock()
+            .expect("interactive agent agent mutex")
+            .clone();
+        if let Some(agent) = agent {
+            if let Ok(mut provider) = agent.lock() {
+                provider.close_session(session_run_id);
+            }
+        }
+    }
+
     /// Close every open interactive agent window (e.g. when the main shell exits).
     pub fn close_all(&self, cx: &mut App) {
-        let handles: Vec<AnyWindowHandle> = self
+        let sessions: Vec<(String, AnyWindowHandle)> = self
             .handles
             .lock()
             .expect("interactive agent handles mutex")
-            .values()
-            .copied()
+            .iter()
+            .map(|(id, handle)| (id.clone(), *handle))
             .collect();
-        for handle in handles {
+        for (session_run_id, handle) in sessions {
             let _ = handle.update(cx, |_, window, _| {
                 window.remove_window();
                 Ok::<(), String>(())
             });
+            self.close_agent_session(&session_run_id);
         }
         self.handles
             .lock()
@@ -143,18 +163,32 @@ impl InteractiveAgentWindowControl {
     }
 
     /// Create a new interactive chat session and open its window.
+    ///
+    /// `context_key` names where the chat was opened from (the agent-context
+    /// key, `None` for a plain chat); with the task title and the start time it
+    /// gives the session its human-readable name.
     pub fn create_and_open_session(
         &self,
         task_id: &str,
         config_id: &str,
+        context_key: Option<&str>,
         initial_context: Option<String>,
         cx: &mut App,
     ) -> Result<String, String> {
         let (fleet, _, _, _) = self.bound_resources()?;
+        let subject = fleet
+            .get_node(task_id)
+            .ok()
+            .flatten()
+            .map(|node| node.title)
+            .unwrap_or_default();
+        let session_name =
+            tod_core::session_name::session_name(context_key, &subject, chrono::Local::now());
         fleet
             .enqueue(FleetMutation::CreateAgentRun {
                 config_id: config_id.to_string(),
                 run_kind: Some("interactive".into()),
+                session_name: Some(session_name),
             })
             .map_err(|err| format!("create session failed: {err}"))?;
         fleet
@@ -171,7 +205,6 @@ impl InteractiveAgentWindowControl {
             .ok_or_else(|| "create session failed: run not created".to_string())?;
         self.open_session(
             InteractiveAgentOpenParams {
-                task_id: task_id.to_string(),
                 config_id: config_id.to_string(),
                 session_run_id: session_run_id.clone(),
                 initial_context,
@@ -200,19 +233,17 @@ impl InteractiveAgentWindowControl {
         let workspace_cwd = resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
             .map_err(|err| format!("workspace: {err:#}"))?;
 
-        let session_number = fleet
-            .list_runs_for_config(&params.config_id)
-            .ok()
-            .and_then(|runs| {
-                runs.iter()
-                    .find(|run| run.id == params.session_run_id)
-                    .map(|run| run.run_number)
-            })
-            .unwrap_or(0);
-        let window_title = format!("Session {} · {}", session_number, params.config_id);
+        let run = fleet.get_run(&params.session_run_id).ok().flatten();
+        let window_title = match run.as_ref().and_then(|run| run.session_name.clone()) {
+            Some(name) => name,
+            None => format!(
+                "Session {} · {}",
+                run.map_or(0, |run| run.run_number),
+                params.config_id
+            ),
+        };
 
         let session_run_id = params.session_run_id.clone();
-        let task_id = params.task_id.clone();
         let config_id = params.config_id.clone();
         let initial_context = params.initial_context.clone();
         let control = self.clone();
@@ -234,12 +265,11 @@ impl InteractiveAgentWindowControl {
                     let session_for_close = session_run_id.clone();
                     let control_for_close = control.clone();
                     window.on_window_should_close(cx, move |_, _| {
-                        control_for_close.remove_handle(&session_for_close);
+                        control_for_close.release_session(&session_for_close);
                         true
                     });
                     let view = cx.new(|cx| {
                         InteractiveAgentView::new(
-                            task_id,
                             config_id,
                             session_run_id,
                             fleet,

@@ -2,7 +2,10 @@
 
 mod delegate;
 
-use crate::ui::actionable::chrome_control_with_shortcut;
+use crate::ui::actionable::{
+    chrome_control_with_shortcut, chrome_control_with_shortcut_in_context,
+};
+use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::key_context;
 use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
@@ -1212,6 +1215,14 @@ impl Render for ObligationsView {
                 cx.emit(ObligationsEvent::FocusTaskList);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(|this, _: &OpenAgentChat, window, cx| {
+                if !this.node_has_agent {
+                    cx.propagate();
+                    return;
+                }
+                this.open_agent_chat(window, cx);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_create_below))
@@ -1273,16 +1284,21 @@ impl Render for ObligationsView {
                                 )
                             },
                         ))
-                        .child(
+                        .child(chrome_control_with_shortcut_in_context(
                             Button::new("obligations-agent-chat")
                                 .icon(IconName::Bot)
-                                .ghost()
+                                .label("Chat")
+                                .outline()
                                 .compact()
                                 .tooltip("Chat with an agent about these obligations")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.open_agent_chat(window, cx);
                                 })),
-                        )
+                            window,
+                            &OpenAgentChat,
+                            None,
+                            cx,
+                        ))
                     })
                     .child(chrome_control_with_shortcut(
                         Button::new("obligations-close")
@@ -1336,7 +1352,7 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
             )
             .into_any_element()
     }

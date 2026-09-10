@@ -82,10 +82,7 @@ impl NovGraph {
         self.inner.add_edge(source, target, edge)
     }
 
-    pub fn remove_edge(
-        &mut self,
-        index: petgraph::stable_graph::EdgeIndex,
-    ) -> Option<NovEdge> {
+    pub fn remove_edge(&mut self, index: petgraph::stable_graph::EdgeIndex) -> Option<NovEdge> {
         self.inner.remove_edge(index)
     }
 

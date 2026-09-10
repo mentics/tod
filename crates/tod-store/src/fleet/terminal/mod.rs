@@ -707,6 +707,7 @@ pub fn open_terminal_agent_for_config(
     fleet.enqueue(FleetMutation::CreateAgentRun {
         config_id: config_id.to_string(),
         run_kind: Some("terminal".into()),
+        session_name: None,
     })?;
     fleet
         .writer()
@@ -1030,6 +1031,7 @@ mod tests {
             .enqueue(FleetMutation::CreateAgentRun {
                 config_id: config_id.clone(),
                 run_kind: Some("terminal".into()),
+                session_name: None,
             })
             .unwrap();
         store.writer().flush().unwrap();
@@ -1072,6 +1074,7 @@ mod tests {
             .enqueue(FleetMutation::CreateAgentRun {
                 config_id: config_id.clone(),
                 run_kind: Some("terminal".into()),
+                session_name: None,
             })
             .unwrap();
         store.writer().flush().unwrap();

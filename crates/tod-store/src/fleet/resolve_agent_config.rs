@@ -272,10 +272,12 @@ mod tests {
     #[test]
     fn interview_resolve_none_when_empty() {
         let (store, root, _gp, _parent, child) = setup_tree();
-        assert!(store
-            .resolve_interview_agent_for_node(&child)
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .resolve_interview_agent_for_node(&child)
+                .unwrap()
+                .is_none()
+        );
         drop(store);
         let _ = fs::remove_dir_all(root);
     }

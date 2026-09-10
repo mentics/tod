@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 13;
+pub const CURRENT_USER_VERSION: i32 = 14;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -155,6 +155,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 13 {
         migrate_v12_to_v13(conn)?;
         conn.pragma_update(None, "user_version", 13)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 14 {
+        migrate_v13_to_v14(conn)?;
+        conn.pragma_update(None, "user_version", 14)?;
     }
     Ok(())
 }
@@ -634,6 +639,24 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<()> {
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '13')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Interactive chat sessions: a human-readable name, and the agent-side session
+/// id that lets a later process resume the conversation.
+fn migrate_v13_to_v14(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE agent_runs ADD COLUMN session_name TEXT;
+        ALTER TABLE agent_runs ADD COLUMN agent_session_id TEXT;
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '14')",
         [],
     )?;
     tx.commit()?;

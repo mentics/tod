@@ -493,8 +493,8 @@ impl Shell {
     /// Open an agent conversation scoped to the obligations panel.
     ///
     /// Sessions are deliberately not reused: every click starts a fresh
-    /// conversation whose first prompt carries the assembled app context.
-    /// Nothing is sent to the agent until the user submits that prompt.
+    /// conversation whose first message carries the assembled app context.
+    /// Nothing is sent to the agent until the user submits that message.
     fn open_obligations_agent_chat(
         &mut self,
         node_id: uuid::Uuid,
@@ -532,6 +532,7 @@ impl Shell {
         if let Err(err) = self._interactive_agent_window.create_and_open_session(
             &node_id.to_string(),
             &config_id,
+            Some("obligations"),
             context,
             cx,
         ) {
@@ -539,16 +540,17 @@ impl Shell {
         }
     }
 
-    /// Create an action config from app settings (platform/model/effort).
+    /// Create an action config from the "Chat with agent" settings
+    /// (platform/model/effort).
     fn create_default_agent_config(
         &mut self,
         node_id: uuid::Uuid,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        let launch = {
-            let settings = self.settings.read(cx);
-            tod_agent::AgentLaunchOptions::for_platform(settings.agent_platform())
-        };
+        let launch = self
+            .settings
+            .read(cx)
+            .launch_options_for(tod_store::AgentRole::Chat);
         let node_slug = self
             .fleet
             .get_node(&node_id.to_string())
@@ -740,7 +742,6 @@ impl Shell {
                 let result = if let Some(run) = sessions.first() {
                     self._interactive_agent_window.open_session(
                         InteractiveAgentOpenParams {
-                            task_id: task_id.clone(),
                             config_id: config_id.clone(),
                             session_run_id: run.id.clone(),
                             initial_context: None,
@@ -749,7 +750,7 @@ impl Shell {
                     )
                 } else {
                     self._interactive_agent_window
-                        .create_and_open_session(&task_id, &config_id, None, cx)
+                        .create_and_open_session(&task_id, &config_id, None, None, cx)
                         .map(|_| ())
                 };
                 match result {

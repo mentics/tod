@@ -123,6 +123,14 @@ pub enum FleetMutation {
     CreateAgentRun {
         config_id: String,
         run_kind: Option<String>,
+        /// Human-readable name, for interactive chat sessions.
+        #[serde(default)]
+        session_name: Option<String>,
+    },
+    /// Record the agent-side session id behind an interactive chat run.
+    SetAgentRunSessionId {
+        run_id: String,
+        agent_session_id: String,
     },
     EndAgentRun {
         run_id: String,
@@ -234,6 +242,7 @@ impl FleetMutation {
                 | FleetMutation::ClearAgentRunReconnect { .. }
                 | FleetMutation::UpdateAgentRunRuntimeStatus { .. }
                 | FleetMutation::CreateAgentRun { .. }
+                | FleetMutation::SetAgentRunSessionId { .. }
                 | FleetMutation::EndAgentRun { .. }
                 | FleetMutation::DeleteAgentRun { .. }
                 | FleetMutation::SendPrompt { .. }
@@ -362,9 +371,21 @@ impl FleetMutation {
             FleetMutation::CreateAgentRun {
                 config_id,
                 run_kind,
+                session_name,
             } => {
                 let kind = run_kind.as_deref().unwrap_or("auto");
-                AgentRunRepo::new(conn).create_run(config_id, "waiting", kind)?;
+                AgentRunRepo::new(conn).create_named_run(
+                    config_id,
+                    "waiting",
+                    kind,
+                    session_name.as_deref(),
+                )?;
+            }
+            FleetMutation::SetAgentRunSessionId {
+                run_id,
+                agent_session_id,
+            } => {
+                AgentRunRepo::new(conn).set_agent_session_id(run_id, agent_session_id)?;
             }
             FleetMutation::EndAgentRun { run_id } => {
                 AgentRunRepo::new(conn).end_run(run_id)?;

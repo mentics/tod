@@ -152,6 +152,39 @@ impl AgentLaunchByPlatform {
     }
 }
 
+/// Which agent a set of platform / model / effort settings is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// New action configs, and anything without a more specific setting.
+    Default,
+    /// Action configs created when chatting with an agent from a panel.
+    Chat,
+    /// Interview question-maker / answer-processor work.
+    Interview,
+}
+
+impl AgentRole {
+    /// Settings display order.
+    pub const ALL: [AgentRole; 3] = [Self::Default, Self::Chat, Self::Interview];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default agent",
+            Self::Chat => "Chat with agent",
+            Self::Interview => "Interview agent",
+        }
+    }
+}
+
+/// Platform plus per-platform model / effort for one [`AgentRole`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentRoleSettings {
+    #[serde(default = "default_agent_platform")]
+    pub platform: AgentPlatform,
+    #[serde(default)]
+    pub launch: AgentLaunchByPlatform,
+}
+
 /// External terminal program for agent shell sessions (`None` = OS default).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TerminalSettings {
@@ -233,6 +266,12 @@ pub struct TodSettings {
     /// Parent directory for Treehouse worktree pools (`TREEHOUSE_WORKTREES`). When unset, pools live under `TREEHOUSE_HOME`.
     #[serde(default)]
     pub treehouse_worktrees_root: Option<PathBuf>,
+    /// Platform / model / effort for new action configs.
+    #[serde(default)]
+    pub default_agent: AgentRoleSettings,
+    /// Platform / model / effort for action configs created by "chat with agent".
+    #[serde(default)]
+    pub chat_agent: AgentRoleSettings,
     /// Which agent platform runs interview question-maker / answer-processor work.
     #[serde(default = "default_agent_platform")]
     pub agent_platform: AgentPlatform,
@@ -264,6 +303,8 @@ impl Default for TodSettings {
             always_on_top: false,
             worktree_backend: WorktreeBackend::default(),
             treehouse_worktrees_root: None,
+            default_agent: AgentRoleSettings::default(),
+            chat_agent: AgentRoleSettings::default(),
             agent_platform: AgentPlatform::default(),
             agent_launch: AgentLaunchByPlatform::default(),
             legacy_agent_model: None,
@@ -275,38 +316,96 @@ impl Default for TodSettings {
 }
 
 impl TodSettings {
+    /// Interview settings predate roles and keep their flat `tod.yml` keys.
+    fn role_slot(&self, role: AgentRole) -> (AgentPlatform, &AgentLaunchByPlatform) {
+        match role {
+            AgentRole::Default => (self.default_agent.platform, &self.default_agent.launch),
+            AgentRole::Chat => (self.chat_agent.platform, &self.chat_agent.launch),
+            AgentRole::Interview => (self.agent_platform, &self.agent_launch),
+        }
+    }
+
+    fn role_slot_mut(
+        &mut self,
+        role: AgentRole,
+    ) -> (&mut AgentPlatform, &mut AgentLaunchByPlatform) {
+        match role {
+            AgentRole::Default => (
+                &mut self.default_agent.platform,
+                &mut self.default_agent.launch,
+            ),
+            AgentRole::Chat => (&mut self.chat_agent.platform, &mut self.chat_agent.launch),
+            AgentRole::Interview => (&mut self.agent_platform, &mut self.agent_launch),
+        }
+    }
+
+    pub fn platform_for(&self, role: AgentRole) -> AgentPlatform {
+        self.role_slot(role).0
+    }
+
+    pub fn set_platform_for(&mut self, role: AgentRole, platform: AgentPlatform) {
+        *self.role_slot_mut(role).0 = platform;
+    }
+
+    /// Model for the role's active platform.
+    pub fn model_for(&self, role: AgentRole) -> &str {
+        let (platform, launch) = self.role_slot(role);
+        &launch.get(platform).model
+    }
+
+    /// Effort for the role's active platform.
+    pub fn effort_for(&self, role: AgentRole) -> &str {
+        let (platform, launch) = self.role_slot(role);
+        &launch.get(platform).effort
+    }
+
+    /// Update model for the role's active platform.
+    pub fn set_model_for(&mut self, role: AgentRole, model: impl Into<String>) {
+        let (platform, launch) = self.role_slot_mut(role);
+        let platform = *platform;
+        launch.get_mut(platform).model = crate::agent_launch::coerce_model(platform, &model.into());
+    }
+
+    /// Update effort for the role's active platform.
+    pub fn set_effort_for(&mut self, role: AgentRole, effort: impl Into<String>) {
+        let (platform, launch) = self.role_slot_mut(role);
+        let platform = *platform;
+        launch.get_mut(platform).effort =
+            crate::agent_launch::coerce_effort(platform, &effort.into());
+    }
+
+    /// Launch options for the role's active platform.
+    pub fn launch_options_for(&self, role: AgentRole) -> crate::agent_launch::AgentLaunchOptions {
+        crate::agent_launch::AgentLaunchOptions::from_settings(
+            self.platform_for(role),
+            self.model_for(role),
+            self.effort_for(role),
+        )
+    }
+
     /// Launch options for the currently selected interview platform.
     pub fn interview_launch_options(&self) -> crate::agent_launch::AgentLaunchOptions {
-        let launch = self.agent_launch.get(self.agent_platform);
-        crate::agent_launch::AgentLaunchOptions::from_settings(
-            self.agent_platform,
-            launch.model.clone(),
-            launch.effort.clone(),
-        )
+        self.launch_options_for(AgentRole::Interview)
     }
 
     /// Model for the active interview platform.
     pub fn agent_model(&self) -> &str {
-        &self.agent_launch.get(self.agent_platform).model
+        self.model_for(AgentRole::Interview)
     }
 
     /// Effort for the active interview platform.
     pub fn agent_effort(&self) -> &str {
-        &self.agent_launch.get(self.agent_platform).effort
+        self.effort_for(AgentRole::Interview)
     }
 
     /// Update model for the active interview platform.
     pub fn set_agent_model(&mut self, model: impl Into<String>) {
-        let platform = self.agent_platform;
-        let model = crate::agent_launch::coerce_model(platform, &model.into());
-        self.agent_launch.get_mut(platform).model = model;
+        self.set_model_for(AgentRole::Interview, model);
     }
 
     /// Update effort for the active interview platform.
     pub fn set_agent_effort(&mut self, effort: impl Into<String>) {
-        let platform = self.agent_platform;
-        let effort = crate::agent_launch::coerce_effort(platform, &effort.into());
-        self.agent_launch.get_mut(platform).effort = effort;
+        self.set_effort_for(AgentRole::Interview, effort);
     }
 
     /// Apply legacy flat `agent_model` / `agent_effort` into the active platform slot.
@@ -478,6 +577,17 @@ mod tests {
             always_on_top: true,
             worktree_backend: WorktreeBackend::default(),
             treehouse_worktrees_root: None,
+            default_agent: AgentRoleSettings {
+                platform: AgentPlatform::Cursor,
+                launch: AgentLaunchByPlatform {
+                    claude: PlatformLaunchSettings::for_platform(AgentPlatform::Claude),
+                    cursor: PlatformLaunchSettings {
+                        model: "composer-2.5".into(),
+                        effort: "low".into(),
+                    },
+                },
+            },
+            chat_agent: AgentRoleSettings::default(),
             agent_platform: AgentPlatform::Claude,
             agent_launch: AgentLaunchByPlatform {
                 claude: PlatformLaunchSettings {
@@ -548,6 +658,29 @@ mod tests {
         settings.agent_platform = AgentPlatform::Claude;
         assert_eq!(settings.agent_model(), "opus");
         assert_eq!(settings.agent_effort(), "high");
+    }
+
+    #[test]
+    fn agent_roles_are_independent() {
+        let mut settings = TodSettings::default();
+        settings.set_platform_for(AgentRole::Chat, AgentPlatform::Cursor);
+        settings.set_model_for(AgentRole::Chat, "composer-2.5");
+        settings.set_effort_for(AgentRole::Default, "high");
+        settings.set_model_for(AgentRole::Interview, "opus");
+
+        let chat = settings.launch_options_for(AgentRole::Chat);
+        assert_eq!(chat.platform, AgentPlatform::Cursor);
+        assert_eq!(chat.model, "composer-2.5");
+        assert_eq!(chat.effort, "auto");
+
+        let default = settings.launch_options_for(AgentRole::Default);
+        assert_eq!(default.platform, AgentPlatform::Claude);
+        assert_eq!(default.model, "default");
+        assert_eq!(default.effort, "high");
+
+        assert_eq!(settings.agent_platform, AgentPlatform::Claude);
+        assert_eq!(settings.agent_model(), "opus");
+        assert_eq!(settings.agent_effort(), "auto");
     }
 
     #[test]

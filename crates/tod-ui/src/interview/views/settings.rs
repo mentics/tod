@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tod_core::logging;
 use tod_store::fleet::default_terminal_hint;
-use tod_store::{efforts_for, models_for};
+use tod_store::{AgentLaunchOptions, AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -100,7 +100,7 @@ enum SettingsSection {
 impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
-            Self::Agents => "Interview agents",
+            Self::Agents => "Agents",
             Self::QuestionMaker => "Question maker",
             Self::AnswerProcessor => "Answer processor",
             Self::Workspaces => "Workspaces",
@@ -121,7 +121,11 @@ impl SettingsSection {
     fn fields(self) -> &'static [SettingField] {
         use SettingField::*;
         match self {
-            Self::Agents => &[AgentPlatform],
+            Self::Agents => &[
+                Agent(AgentRole::Default),
+                Agent(AgentRole::Chat),
+                Agent(AgentRole::Interview),
+            ],
             Self::QuestionMaker => &[ReplenishThreshold, SecondQuestionMaker, RunsPerSession],
             Self::AnswerProcessor => &[PoolSize, AnswersPerSession],
             Self::Workspaces => &[WorktreeBackend, TreehouseWorktreesRoot, TerminalProgram],
@@ -132,7 +136,8 @@ impl SettingsSection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingField {
-    AgentPlatform,
+    /// One line per role: platform, model, effort. `-`/`=` cycle the platform.
+    Agent(AgentRole),
     ReplenishThreshold,
     SecondQuestionMaker,
     RunsPerSession,
@@ -148,7 +153,9 @@ enum SettingField {
 impl SettingField {
     fn id(self) -> &'static str {
         match self {
-            Self::AgentPlatform => "agent-platform",
+            Self::Agent(AgentRole::Default) => "default-agent",
+            Self::Agent(AgentRole::Chat) => "chat-agent",
+            Self::Agent(AgentRole::Interview) => "interview-agent",
             Self::ReplenishThreshold => "replenish",
             Self::SecondQuestionMaker => "second",
             Self::RunsPerSession => "question-maker-runs-per-session",
@@ -167,14 +174,101 @@ impl SettingField {
     }
 }
 
+const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+
+/// Platform / model / effort dropdowns for one agent role's settings line.
+struct AgentRoleSelects {
+    role: AgentRole,
+    platform: Entity<SelectState<Vec<String>>>,
+    model: Entity<SelectState<Vec<String>>>,
+    effort: Entity<SelectState<Vec<String>>>,
+    _subscriptions: [Subscription; 3],
+}
+
+impl AgentRoleSelects {
+    fn new(
+        role: AgentRole,
+        settings: &TodSettings,
+        window: &mut Window,
+        cx: &mut Context<SettingsView>,
+    ) -> Self {
+        let platform = settings.platform_for(role);
+        let platforms: Vec<String> = PLATFORM_ORDER
+            .iter()
+            .map(|p| p.label().to_string())
+            .collect();
+        let platform_select = cx.new(|cx| SelectState::new(platforms, None, window, cx));
+        let model_select = cx.new(|cx| {
+            SelectState::new(catalog_strings(models_for(platform)), None, window, cx)
+                .searchable(true)
+        });
+        let effort_select = cx.new(|cx| {
+            SelectState::new(catalog_strings(efforts_for(platform)), None, window, cx)
+                .searchable(true)
+        });
+        let platform_label = platform.label().to_string();
+        let model = settings.model_for(role).to_string();
+        let effort = settings.effort_for(role).to_string();
+        platform_select.update(cx, |select, cx| {
+            select.set_selected_value(&platform_label, window, cx);
+        });
+        model_select.update(cx, |select, cx| {
+            select.set_selected_value(&model, window, cx);
+        });
+        effort_select.update(cx, |select, cx| {
+            select.set_selected_value(&effort, window, cx);
+        });
+
+        let _subscriptions = [
+            cx.subscribe(
+                &platform_select,
+                move |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some(platform) = parse_platform(value) {
+                            this.set_platform_for(role, platform, cx);
+                        }
+                    }
+                },
+            ),
+            cx.subscribe(
+                &model_select,
+                move |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.settings.set_model_for(role, value.clone());
+                        this.schedule_save(cx);
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe(
+                &effort_select,
+                move |this, _, event: &SelectEvent<Vec<String>>, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        this.settings.set_effort_for(role, value.clone());
+                        this.schedule_save(cx);
+                        cx.notify();
+                    }
+                },
+            ),
+        ];
+
+        Self {
+            role,
+            platform: platform_select,
+            model: model_select,
+            effort: effort_select,
+            _subscriptions,
+        }
+    }
+}
+
 pub struct SettingsView {
     paths: TodPaths,
     settings: TodSettings,
     log_dir_display: SharedString,
     terminal_program_input: Entity<InputState>,
     treehouse_worktrees_root_input: Entity<InputState>,
-    model_select: Entity<SelectState<Vec<String>>>,
-    effort_select: Entity<SelectState<Vec<String>>>,
+    agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     focus_region: SettingsFocus,
@@ -186,8 +280,6 @@ pub struct SettingsView {
     save_generation: u64,
     _terminal_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
-    _model_select_subscription: Subscription,
-    _effort_select_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -241,34 +333,10 @@ impl SettingsView {
                 }
             });
 
-        let platform = settings.agent_platform;
-        let models = catalog_strings(models_for(platform));
-        let efforts = catalog_strings(efforts_for(platform));
-        let model_select = cx.new(|cx| SelectState::new(models, None, window, cx).searchable(true));
-        let effort_select =
-            cx.new(|cx| SelectState::new(efforts, None, window, cx).searchable(true));
-        let initial_model = settings.agent_model().to_string();
-        let initial_effort = settings.agent_effort().to_string();
-        model_select.update(cx, |select, cx| {
-            select.set_selected_value(&initial_model, window, cx);
-        });
-        effort_select.update(cx, |select, cx| {
-            select.set_selected_value(&initial_effort, window, cx);
-        });
-        let _model_select_subscription = cx.subscribe(&model_select, |this, _, event, cx| {
-            if let SelectEvent::Confirm(Some(value)) = event {
-                this.settings.set_agent_model(value.clone());
-                this.schedule_save(cx);
-                cx.notify();
-            }
-        });
-        let _effort_select_subscription = cx.subscribe(&effort_select, |this, _, event, cx| {
-            if let SelectEvent::Confirm(Some(value)) = event {
-                this.settings.set_agent_effort(value.clone());
-                this.schedule_save(cx);
-                cx.notify();
-            }
-        });
+        let agent_selects = AgentRole::ALL
+            .into_iter()
+            .map(|role| AgentRoleSelects::new(role, &settings, window, cx))
+            .collect();
 
         Self {
             paths,
@@ -276,8 +344,7 @@ impl SettingsView {
             log_dir_display,
             terminal_program_input,
             treehouse_worktrees_root_input,
-            model_select,
-            effort_select,
+            agent_selects,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             focus_region: SettingsFocus::Panel,
@@ -289,8 +356,6 @@ impl SettingsView {
             save_generation: 0,
             _terminal_subscription,
             _treehouse_worktrees_root_subscription,
-            _model_select_subscription,
-            _effort_select_subscription,
         }
     }
 
@@ -433,7 +498,7 @@ impl SettingsView {
             return;
         }
         match self.selected_field() {
-            SettingField::AgentPlatform => self.cycle_agent_platform(delta, cx),
+            SettingField::Agent(role) => self.cycle_platform_for(role, delta, cx),
             SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
             SettingField::SecondQuestionMaker => self.step_second(delta, cx),
             SettingField::RunsPerSession => self.step_question_maker_runs_per_session(delta, cx),
@@ -593,50 +658,79 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub(crate) fn cycle_agent_platform(&mut self, delta: i32, cx: &mut Context<Self>) {
-        const ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
-        let idx = ORDER
+    fn cycle_platform_for(&mut self, role: AgentRole, delta: i32, cx: &mut Context<Self>) {
+        let idx = PLATFORM_ORDER
             .iter()
-            .position(|p| *p == self.settings.agent_platform)
+            .position(|p| *p == self.settings.platform_for(role))
             .unwrap_or(0);
-        let len = ORDER.len() as i32;
+        let len = PLATFORM_ORDER.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
-        self.set_agent_platform(ORDER[next], cx);
+        self.set_platform_for(role, PLATFORM_ORDER[next], cx);
+    }
+
+    fn set_platform_for(
+        &mut self,
+        role: AgentRole,
+        platform: AgentPlatform,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.platform_for(role) == platform {
+            return;
+        }
+        self.settings.set_platform_for(role, platform);
+        self.pending_launch_select_sync = true;
+        if role == AgentRole::Interview {
+            cx.emit(SettingsEvent::AgentPlatformChanged(platform));
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_agent_platform(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.cycle_platform_for(AgentRole::Interview, delta, cx);
     }
 
     pub fn set_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
-        if self.settings.agent_platform == platform {
-            return;
-        }
-        self.settings.agent_platform = platform;
-        self.pending_launch_select_sync = true;
-        cx.emit(SettingsEvent::AgentPlatformChanged(platform));
-        self.schedule_save(cx);
-        cx.notify();
+        self.set_platform_for(AgentRole::Interview, platform, cx);
     }
 
     pub fn agent_platform(&self) -> AgentPlatform {
         self.settings.agent_platform
     }
 
-    fn agent_platform_label(platform: AgentPlatform) -> &'static str {
-        platform.label()
+    pub fn launch_options_for(&self, role: AgentRole) -> AgentLaunchOptions {
+        self.settings.launch_options_for(role)
     }
 
-    fn sync_model_effort_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let platform = self.settings.agent_platform;
-        let models = catalog_strings(models_for(platform));
-        let efforts = catalog_strings(efforts_for(platform));
-        let model = self.settings.agent_model().to_string();
-        let effort = self.settings.agent_effort().to_string();
-        self.model_select.update(cx, |select, cx| {
-            select.set_items(models, window, cx);
-            select.set_selected_value(&model, window, cx);
-        });
-        self.effort_select.update(cx, |select, cx| {
-            select.set_items(efforts, window, cx);
-            select.set_selected_value(&effort, window, cx);
-        });
+    fn agent_selects(&self, role: AgentRole) -> &AgentRoleSelects {
+        self.agent_selects
+            .iter()
+            .find(|selects| selects.role == role)
+            .expect("selects exist for every agent role")
+    }
+
+    /// Point every role's dropdowns at its current platform's catalog.
+    fn sync_agent_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for selects in &self.agent_selects {
+            let role = selects.role;
+            let platform = self.settings.platform_for(role);
+            let platform_label = platform.label().to_string();
+            let models = catalog_strings(models_for(platform));
+            let efforts = catalog_strings(efforts_for(platform));
+            let model = self.settings.model_for(role).to_string();
+            let effort = self.settings.effort_for(role).to_string();
+            selects.platform.update(cx, |select, cx| {
+                select.set_selected_value(&platform_label, window, cx);
+            });
+            selects.model.update(cx, |select, cx| {
+                select.set_items(models, window, cx);
+                select.set_selected_value(&model, window, cx);
+            });
+            selects.effort.update(cx, |select, cx| {
+                select.set_items(efforts, window, cx);
+                select.set_selected_value(&effort, window, cx);
+            });
+        }
     }
 
     fn cycle_worktree_backend(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -714,7 +808,7 @@ impl Focusable for SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_launch_select_sync {
-            self.sync_model_effort_selects(window, cx);
+            self.sync_agent_selects(window, cx);
             self.pending_launch_select_sync = false;
         }
         key_context::set_input_tab_stop(
@@ -908,71 +1002,11 @@ impl SettingsView {
     ) -> impl IntoElement {
         match self.active_section {
             SettingsSection::Agents => {
-                let platform_label =
-                    Self::agent_platform_label(self.settings.agent_platform);
-                v_flex()
-                    .gap_1()
-                    .child(cycle_row(
-                        cx,
-                        self,
-                        SettingField::AgentPlatform,
-                        platform_label,
-                        "Agent platform",
-                        "Which agent runtime runs interview question-maker and answer-processor work. Default is Claude.",
-                        theme,
-                        |this, _, cx| this.cycle_agent_platform(-1, cx),
-                        |this, _, cx| this.cycle_agent_platform(1, cx),
-                    ))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .mt_2()
-                            .ml_4()
-                            .pl_3()
-                            .border_l_2()
-                            .border_color(theme.border)
-                            .gap_1()
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .px_3()
-                                    .pt_1()
-                                    .pb_2()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_semibold()
-                                            .text_color(theme.foreground)
-                                            .child(format!(
-                                                "{platform_label} launch options"
-                                            )),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(theme.muted_foreground)
-                                            .whitespace_normal()
-                                            .child(
-                                                "Model and effort apply only to the selected platform. Switch platform above to configure the other.",
-                                            ),
-                                    ),
-                            )
-                            .child(select_row(
-                                "Model",
-                                "Model id used when starting interview agent sessions on this platform.",
-                                &self.model_select,
-                                "Choose model",
-                                theme,
-                            ))
-                            .child(select_row(
-                                "Effort",
-                                "Reasoning / effort level for interview agent sessions on this platform.",
-                                &self.effort_select,
-                                "Choose effort",
-                                theme,
-                            )),
-                    )
-                    .into_any_element()
+                let mut rows = v_flex().gap_1();
+                for role in AgentRole::ALL {
+                    rows = rows.child(agent_role_row(cx, self, role, theme));
+                }
+                rows.into_any_element()
             }
             SettingsSection::QuestionMaker => v_flex()
                 .gap_1()
@@ -1245,54 +1279,72 @@ fn cycle_row(
     stepper_row(cx, view, field, value, label, help, theme, on_dec, on_inc)
 }
 
-const SELECT_CONTROL_WIDTH: f32 = 220.0;
+const AGENT_ROLE_LABEL_WIDTH: f32 = 130.0;
+const AGENT_PLATFORM_SELECT_WIDTH: f32 = 110.0;
+const AGENT_LAUNCH_SELECT_WIDTH: f32 = 160.0;
 
-fn select_row(
-    label: impl Into<SharedString>,
-    help: impl Into<SharedString>,
-    select: &Entity<SelectState<Vec<String>>>,
-    placeholder: impl Into<SharedString>,
+/// One line per agent role: label, then platform / model / effort.
+fn agent_role_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    role: AgentRole,
     theme: &gpui_component::Theme,
 ) -> impl IntoElement {
-    let label = label.into();
-    let help = help.into();
-    let placeholder = placeholder.into();
-
+    let field = SettingField::Agent(role);
+    let selects = view.agent_selects(role);
     h_flex()
         .w_full()
-        .gap_4()
+        .gap_2()
         .px_3()
-        .py_3()
+        .py_2()
         .rounded_md()
-        .items_start()
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_semibold()
-                        .text_color(theme.foreground)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .whitespace_normal()
-                        .child(help),
-                ),
+        .items_center()
+        .when(view.field_selected(field), |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
         )
         .child(
-            div().w(px(SELECT_CONTROL_WIDTH)).flex_shrink_0().child(
-                Select::new(select)
-                    .placeholder(placeholder)
-                    .search_placeholder("Filter…")
-                    .menu_width(px(SELECT_CONTROL_WIDTH)),
-            ),
+            div()
+                .w(px(AGENT_ROLE_LABEL_WIDTH))
+                .flex_shrink_0()
+                .text_sm()
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child(role.label()),
         )
+        .child(select_control(
+            &selects.platform,
+            "Platform",
+            AGENT_PLATFORM_SELECT_WIDTH,
+        ))
+        .child(select_control(
+            &selects.model,
+            "Model",
+            AGENT_LAUNCH_SELECT_WIDTH,
+        ))
+        .child(select_control(
+            &selects.effort,
+            "Effort",
+            AGENT_LAUNCH_SELECT_WIDTH,
+        ))
+}
+
+fn select_control(
+    select: &Entity<SelectState<Vec<String>>>,
+    placeholder: &'static str,
+    width: f32,
+) -> impl IntoElement {
+    div().w(px(width)).flex_shrink_0().child(
+        Select::new(select)
+            .placeholder(placeholder)
+            .search_placeholder("Filter…")
+            .menu_width(px(width)),
+    )
 }
 
 fn text_input_row(

@@ -88,7 +88,7 @@ use agent_traffic::SharedAgentTrafficLog;
 #[allow(unused_imports)]
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::MockAgentProvider;
-pub use provider::{AgentProvider, AgentRunState, RunId};
+pub use provider::{AgentProvider, AgentRunState, RunId, SessionOpening, SessionTurn};
 pub use routing::RoutingAgentProvider;
 
 use std::sync::atomic::AtomicBool;

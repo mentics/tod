@@ -2,7 +2,7 @@
 
 use super::acp_host::AcpHost;
 use super::cursor_acp::CursorAcpProvider;
-use super::provider::{AgentProvider, AgentRunHandle, RunId};
+use super::provider::{AgentProvider, AgentRunHandle, RunId, SessionTurn};
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{InterviewAgentCounts, SharedAgentTrafficLog};
 use crate::platform::AgentPlatform;
@@ -113,6 +113,22 @@ impl AgentProvider for RoutingAgentProvider {
     ) -> Result<AgentRunHandle> {
         self.for_platform(options.platform)
             .start_fleet_agent(agent_config_id, cwd, prompt, options)
+    }
+
+    fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
+        self.for_platform(turn.options.platform)
+            .send_session_turn(turn)
+    }
+
+    fn session_id(&self, key: &str) -> Option<String> {
+        self.cursor
+            .session_id(key)
+            .or_else(|| self.claude.session_id(key))
+    }
+
+    fn close_session(&mut self, key: &str) {
+        self.cursor.close_session(key);
+        self.claude.close_session(key);
     }
 
     fn poll_run(&mut self, id: RunId) -> Option<super::provider::AgentRunState> {

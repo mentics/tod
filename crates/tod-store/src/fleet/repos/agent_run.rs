@@ -14,11 +14,15 @@ pub struct AgentRun {
     pub ended_at: Option<i64>,
     pub reconnect: Option<ReconnectIdentity>,
     pub run_kind: String,
+    /// Human-readable name, for interactive chat sessions.
+    pub session_name: Option<String>,
+    /// Agent-side session id, so a later process can resume the conversation.
+    pub agent_session_id: Option<String>,
 }
 
 const RUN_SELECT: &str =
     "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
-                    reconnect_pid, reconnect_birth_token, run_kind";
+                    reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -53,6 +57,17 @@ impl<'a> AgentRunRepo<'a> {
         runtime_status: &str,
         run_kind: &str,
     ) -> Result<String, AgentRunRepoError> {
+        self.create_named_run(config_id, runtime_status, run_kind, None)
+    }
+
+    /// Create a new run with a human-readable session name.
+    pub fn create_named_run(
+        &self,
+        config_id: &str,
+        runtime_status: &str,
+        run_kind: &str,
+        session_name: Option<&str>,
+    ) -> Result<String, AgentRunRepoError> {
         let run_number = self.next_run_number(config_id)?;
         let run_id = format!("{config_id}-run-{run_number}");
         let now_ms: i64 = std::time::SystemTime::now()
@@ -60,9 +75,9 @@ impl<'a> AgentRunRepo<'a> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at, run_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![run_id, config_id, run_number, runtime_status, now_ms, run_kind],
+            "INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at, run_kind, session_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![run_id, config_id, run_number, runtime_status, now_ms, run_kind, session_name],
         )?;
         Ok(run_id)
     }
@@ -198,6 +213,21 @@ impl<'a> AgentRunRepo<'a> {
         Ok(())
     }
 
+    pub fn set_agent_session_id(
+        &self,
+        id: &str,
+        agent_session_id: &str,
+    ) -> Result<(), AgentRunRepoError> {
+        let updated = self.conn.execute(
+            "UPDATE agent_runs SET agent_session_id = ?2 WHERE id = ?1",
+            params![id, agent_session_id],
+        )?;
+        if updated == 0 {
+            return Err(AgentRunRepoError::NotFound);
+        }
+        Ok(())
+    }
+
     pub fn clear_reconnect(&self, id: &str) -> Result<(), AgentRunRepoError> {
         let updated = self.conn.execute(
             "UPDATE agent_runs SET reconnect_pid = NULL, reconnect_birth_token = NULL WHERE id = ?1",
@@ -259,5 +289,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         ended_at: row.get(5)?,
         reconnect,
         run_kind: row.get(8)?,
+        session_name: row.get(9)?,
+        agent_session_id: row.get(10)?,
     })
 }

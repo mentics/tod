@@ -27,8 +27,7 @@ pub use resolve::{ancestor_chain, resolve_obligations};
 pub use slug::{SLUG_MAX_LEN, allocate_unique_slug, derive_node_slug, slugify};
 pub use types::{
     Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, EXTRA_CONTENT_TYPES, FlatNodeRow, Node,
-    NodeKind, OutlineEntry,
-    OutlineList,
+    NodeKind, OutlineEntry, OutlineList,
 };
 pub use uuid_blob::{blob_to_uuid, ms_to_datetime, now_ms, uuid_to_blob};
 pub use workspace::workspace_cwd_for_node;

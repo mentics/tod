@@ -269,17 +269,19 @@ fn main() {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window, cx);
 
-                    let camera = cx.spawn(async move |this: WeakEntity<DemoView>, cx| loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(16))
-                            .await;
-                        if this
-                            .update(cx, |this, cx| {
-                                this.tick_camera(cx);
-                            })
-                            .is_err()
-                        {
-                            break;
+                    let camera = cx.spawn(async move |this: WeakEntity<DemoView>, cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(16))
+                                .await;
+                            if this
+                                .update(cx, |this, cx| {
+                                    this.tick_camera(cx);
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                     });
 
@@ -293,8 +295,7 @@ fn main() {
                             entity.update(cx, |this, cx| {
                                 let key = event.keystroke.key.clone();
                                 let is_held = !this.keys_down.insert(key);
-                                let handled =
-                                    this.on_key(&event.keystroke, is_held, window, cx);
+                                let handled = this.on_key(&event.keystroke, is_held, window, cx);
                                 if handled {
                                     cx.stop_propagation();
                                 }

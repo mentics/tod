@@ -1,4 +1,5 @@
 pub mod actionable;
+pub mod agent_chat;
 pub mod app_nav;
 pub mod key_context;
 pub mod list;

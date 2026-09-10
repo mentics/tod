@@ -116,16 +116,17 @@ impl AgentConfigPanelView {
             )
             .expect("dev process bundle fallback")
         });
-        let platform = platform_storage(settings.agent_platform).to_string();
-        let model = settings.agent_model().to_string();
-        let effort = settings.agent_effort().to_string();
+        let default_launch = settings.launch_options_for(tod_store::AgentRole::Default);
+        let platform = platform_storage(default_launch.platform).to_string();
+        let model = default_launch.model.clone();
+        let effort = default_launch.effort.clone();
 
         let platform_select = cx.new(|cx| {
             SelectState::new(vec!["claude".into(), "cursor".into()], None, window, cx)
                 .searchable(true)
         });
-        let models = catalog_strings(models_for(settings.agent_platform));
-        let efforts = catalog_strings(efforts_for(settings.agent_platform));
+        let models = catalog_strings(models_for(default_launch.platform));
+        let efforts = catalog_strings(efforts_for(default_launch.platform));
         let model_select = cx.new(|cx| SelectState::new(models, None, window, cx).searchable(true));
         let effort_select =
             cx.new(|cx| SelectState::new(efforts, None, window, cx).searchable(true));
@@ -256,9 +257,17 @@ impl AgentConfigPanelView {
         self.env_type = "local".into();
         self.mode = "shell".into();
         self.use_worktree = false;
-        self.platform = platform_storage(self.settings.agent_platform).to_string();
-        self.model = self.settings.agent_model().to_string();
-        self.effort = self.settings.agent_effort().to_string();
+        // New configs start from the Default agent settings, which may have
+        // changed since this panel was built.
+        if let Ok(fresh) = TodSettings::load(&self.paths) {
+            self.settings = fresh;
+        }
+        let default_launch = self
+            .settings
+            .launch_options_for(tod_store::AgentRole::Default);
+        self.platform = platform_storage(default_launch.platform).to_string();
+        self.model = default_launch.model;
+        self.effort = default_launch.effort;
         self.worktree_path = None;
         self.runtime_status = "not_running".into();
         self.active_run_id = None;
@@ -423,6 +432,9 @@ impl AgentConfigPanelView {
     }
 
     fn session_label(&self, session: &AgentRun) -> String {
+        if let Some(name) = session.session_name.as_deref() {
+            return name.to_string();
+        }
         if let Ok(turns) = self.fleet.list_transcript_for_agent(&session.id) {
             if let Some(first) = turns.iter().find(|t| t.kind == "prompt") {
                 let preview: String = first.content.chars().take(48).collect();
@@ -722,6 +734,7 @@ impl AgentConfigPanelView {
         if let Err(err) = self.fleet.enqueue(FleetMutation::CreateAgentRun {
             config_id: config_id.clone(),
             run_kind: Some("auto".into()),
+            session_name: None,
         }) {
             self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
@@ -881,7 +894,7 @@ impl AgentConfigPanelView {
         }
         match self
             .interactive_window
-            .create_and_open_session(&task_id, &config_id, None, cx)
+            .create_and_open_session(&task_id, &config_id, None, None, cx)
         {
             Ok(session_id) => {
                 let _ = self.fleet.reload_if_stale();
@@ -903,16 +916,15 @@ impl AgentConfigPanelView {
         let Some(config_id) = self.config_id.clone() else {
             return;
         };
-        let Some(task_id) = self.task_id.clone() else {
+        if self.task_id.is_none() {
             return;
-        };
+        }
         match self.interactive_window.open_session(
             InteractiveAgentOpenParams {
-                task_id,
                 config_id: config_id.clone(),
                 session_run_id: session_run_id.to_string(),
-                // Reopening an existing session: its transcript already carries
-                // any context that was sent.
+                // Reopening an existing session: its agent session already holds
+                // the context it was opened with.
                 initial_context: None,
             },
             cx,

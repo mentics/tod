@@ -51,7 +51,10 @@ pub fn capture_inverse_before(
             }))
         }
         FleetMutation::UpdateTaskNotes { id, notes } => {
-            let old = TaskRepo::new(conn).get(id)?.map(|t| t.notes).unwrap_or_default();
+            let old = TaskRepo::new(conn)
+                .get(id)?
+                .map(|t| t.notes)
+                .unwrap_or_default();
             if old == *notes {
                 return Ok(None);
             }

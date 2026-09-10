@@ -34,7 +34,7 @@ pub use paths::{
     resolve_startup_data_root, set_data_root,
 };
 pub use settings::{
-    AgentLaunchByPlatform, AgentPlatform, AnswerProcessorSettings, DEFAULT_LOG_MAX_SIZE_KB,
-    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings,
-    TerminalSettings, TodSettings, WindowGeometry, WorktreeBackend,
+    AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, AnswerProcessorSettings,
+    DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings,
+    QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry, WorktreeBackend,
 };

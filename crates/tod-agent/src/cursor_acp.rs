@@ -1,6 +1,8 @@
 use super::acp_host::{AcpHost, is_standalone_acp_server, spawn_acp_process};
 use super::answer_pool::{AnswerProcessorPoolManager, AnswerSubmitAssignment};
-use super::provider::{AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId};
+use super::provider::{
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId, SessionTurn,
+};
 use super::question_maker_pool::{QuestionMakerPoolManager, QuestionMakerSubmitAssignment};
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::agent_traffic::{
@@ -26,6 +28,11 @@ use std::os::windows::process::CommandExt;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Idle time after which a conversation's agent process is released. The
+/// agent-side session survives, so the next message resumes it.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long to wait for Claude Code to write a new session's log before naming it.
+const SESSION_LOG_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum WorkerMessage {
@@ -71,6 +78,191 @@ struct AcpLiveSlot {
     cancelled: Arc<AtomicBool>,
 }
 
+/// How a conversation process attaches to its agent-side session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionStart {
+    New,
+    Resume(String),
+}
+
+#[derive(Debug)]
+enum ConversationCommand {
+    Turn {
+        run_id: RunId,
+        blocks: Vec<String>,
+        title: Option<String>,
+        reply: Sender<WorkerMessage>,
+    },
+    Shutdown,
+}
+
+/// Everything a conversation worker needs to (re)connect its process.
+#[derive(Clone)]
+struct ConversationSpec {
+    host: AcpHost,
+    agent_bin: PathBuf,
+    cwd: PathBuf,
+    model: String,
+    effort: String,
+    write_roots: Arc<Vec<PathBuf>>,
+    traffic_log: Option<SharedAgentTrafficLog>,
+}
+
+/// A long-lived conversation: a worker thread owning at most one agent process.
+struct LiveConversation {
+    cmd_tx: Sender<ConversationCommand>,
+    child: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    session_id: Arc<Mutex<Option<String>>>,
+}
+
+impl LiveConversation {
+    fn spawn(spec: ConversationSpec, resume_session_id: Option<String>) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let worker = ConversationWorker {
+            spec,
+            child: Arc::new(Mutex::new(None)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
+            session_id: Arc::new(Mutex::new(resume_session_id)),
+        };
+        let conversation = Self {
+            cmd_tx,
+            child: worker.child.clone(),
+            cancelled: worker.cancelled.clone(),
+            closed: worker.closed.clone(),
+            session_id: worker.session_id.clone(),
+        };
+        thread::spawn(move || worker.run(cmd_rx));
+        conversation
+    }
+
+    fn session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Stop the worker; it releases the process on its way out. A turn in
+    /// progress is cancelled rather than waited for.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.cancelled.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(ConversationCommand::Shutdown);
+    }
+}
+
+struct ConversationWorker {
+    spec: ConversationSpec,
+    child: Arc<Mutex<Option<Child>>>,
+    cancelled: Arc<AtomicBool>,
+    closed: Arc<AtomicBool>,
+    session_id: Arc<Mutex<Option<String>>>,
+}
+
+impl ConversationWorker {
+    fn run(self, commands: Receiver<ConversationCommand>) {
+        let mut live: Option<PersistentAcpSession> = None;
+        loop {
+            let command = match commands.recv_timeout(SESSION_IDLE_TIMEOUT) {
+                Ok(command) => command,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(session) = live.take() {
+                        tracing::info!(
+                            event = "agent",
+                            action = "acp_session_idle",
+                            session_id = %session.session_id,
+                            "releasing idle agent process; the session stays resumable"
+                        );
+                        session.shutdown(self.child.clone());
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            let ConversationCommand::Turn {
+                run_id,
+                blocks,
+                title,
+                reply,
+            } = command
+            else {
+                break;
+            };
+            if self.closed.load(Ordering::SeqCst) {
+                let _ = reply.send(WorkerMessage::Completed(Err(anyhow::anyhow!(
+                    "agent session closed"
+                ))));
+                break;
+            }
+            self.cancelled.store(false, Ordering::SeqCst);
+            let result = self.turn(&mut live, run_id, &blocks);
+            if result.is_err() {
+                // A failed or cancelled turn can leave the process mid-reply;
+                // the next message starts clean by resuming the session.
+                if let Some(session) = live.take() {
+                    session.shutdown(self.child.clone());
+                }
+            }
+            let succeeded = result.is_ok();
+            let _ = reply.send(WorkerMessage::Completed(result));
+            // Naming waits for a successful first turn: only then does the
+            // agent-side session exist anywhere a name can be recorded.
+            if let (true, Some(title), Some(session_id)) =
+                (succeeded, title, self.current_session_id())
+            {
+                name_session(self.spec.host, &session_id, &title);
+            }
+        }
+        if let Some(session) = live.take() {
+            session.shutdown(self.child.clone());
+        }
+    }
+
+    fn current_session_id(&self) -> Option<String> {
+        self.session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn turn(
+        &self,
+        live: &mut Option<PersistentAcpSession>,
+        run_id: RunId,
+        blocks: &[String],
+    ) -> Result<String> {
+        if live.is_none() {
+            let start = match self.current_session_id() {
+                Some(id) => SessionStart::Resume(id),
+                None => SessionStart::New,
+            };
+            let spec = &self.spec;
+            let session = PersistentAcpSession::connect(
+                spec.host,
+                &spec.agent_bin,
+                &spec.cwd,
+                &spec.model,
+                &spec.effort,
+                self.child.clone(),
+                self.cancelled.clone(),
+                &spec.write_roots,
+                &start,
+                spec.traffic_log.clone(),
+                AgentRunKind::FleetAgent,
+            )?;
+            *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(session.session_id.clone());
+            *live = Some(session);
+        }
+        live.as_mut()
+            .expect("connected above")
+            .prompt_blocks(blocks, run_id)
+    }
+}
+
 /// ACP agent backend (Cursor, Claude, …).
 pub struct CursorAcpProvider {
     host: AcpHost,
@@ -90,6 +282,8 @@ pub struct CursorAcpProvider {
     question_maker_slot_completions: Receiver<SlotCompletion>,
     question_maker_slot_completion_tx: Sender<SlotCompletion>,
     fleet_run_context: HashMap<RunId, String>,
+    /// Long-lived conversations by caller key (see [`SessionTurn`]).
+    conversations: HashMap<String, LiveConversation>,
     traffic_log: Option<SharedAgentTrafficLog>,
 }
 
@@ -121,6 +315,7 @@ impl CursorAcpProvider {
             question_maker_slot_completions,
             question_maker_slot_completion_tx,
             fleet_run_context: HashMap::new(),
+            conversations: HashMap::new(),
             traffic_log: None,
         })
     }
@@ -195,6 +390,7 @@ impl CursorAcpProvider {
             question_maker_slot_completions,
             question_maker_slot_completion_tx,
             fleet_run_context: HashMap::new(),
+            conversations: HashMap::new(),
             traffic_log: None,
         }
     }
@@ -627,6 +823,24 @@ impl CursorAcpProvider {
     }
 }
 
+impl Drop for CursorAcpProvider {
+    fn drop(&mut self) {
+        // Workers release their processes as they exit, but the app may exit
+        // first; do not leave agent processes behind.
+        for (_, conversation) in self.conversations.drain() {
+            conversation.close();
+            let child = conversation
+                .child
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(mut child) = child {
+                kill_child_tree(&mut child);
+            }
+        }
+    }
+}
+
 impl Default for CursorAcpProvider {
     fn default() -> Self {
         Self::for_host(AcpHost::Cursor).unwrap_or_else(|err| {
@@ -747,6 +961,87 @@ impl AgentProvider for CursorAcpProvider {
         self.fleet_run_context
             .insert(handle.id, agent_config_id.to_string());
         Ok(handle)
+    }
+
+    fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
+        let blocks = turn.prompt_blocks();
+        let SessionTurn {
+            key,
+            agent_config_id,
+            cwd,
+            options,
+            resume_session_id,
+            opening,
+            ..
+        } = turn;
+        let title = opening
+            .map(|opening| opening.title)
+            .filter(|title| !title.trim().is_empty());
+        let spec = ConversationSpec {
+            host: self.host,
+            agent_bin: self.agent_bin.clone(),
+            cwd,
+            model: options.model,
+            effort: options.effort,
+            write_roots: self.extra_write_roots.clone(),
+            traffic_log: self.traffic_log.clone(),
+        };
+
+        let id = RunId::new();
+        let (reply, receiver) = mpsc::channel();
+        let command = ConversationCommand::Turn {
+            run_id: id,
+            blocks: blocks.clone(),
+            title,
+            reply,
+        };
+        let conversation = self
+            .conversations
+            .entry(key.clone())
+            .or_insert_with(|| LiveConversation::spawn(spec.clone(), resume_session_id.clone()));
+        if let Err(mpsc::SendError(command)) = conversation.cmd_tx.send(command) {
+            // The worker is gone: start another, resuming the session it reached.
+            let resume = conversation.session_id().or(resume_session_id);
+            let fresh = LiveConversation::spawn(spec, resume);
+            fresh
+                .cmd_tx
+                .send(command)
+                .map_err(|_| anyhow::anyhow!("agent session worker unavailable"))?;
+            self.conversations.insert(key.clone(), fresh);
+        }
+
+        self.fleet_run_context.insert(id, agent_config_id);
+        self.log_traffic(
+            AgentRunKind::FleetAgent,
+            id,
+            TrafficDirection::Request,
+            &blocks.join("\n\n"),
+        );
+        let conversation = &self.conversations[&key];
+        self.runs.insert(
+            id,
+            ActiveRun {
+                kind: AgentRunKind::FleetAgent,
+                state: AgentRunState::InFlight,
+                child: conversation.child.clone(),
+                cancelled: conversation.cancelled.clone(),
+                worker: None,
+                receiver,
+            },
+        );
+        Ok(AgentRunHandle { id })
+    }
+
+    fn session_id(&self, key: &str) -> Option<String> {
+        self.conversations
+            .get(key)
+            .and_then(LiveConversation::session_id)
+    }
+
+    fn close_session(&mut self, key: &str) {
+        if let Some(conversation) = self.conversations.remove(key) {
+            conversation.close();
+        }
     }
 
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
@@ -921,6 +1216,117 @@ fn run_acp_authenticate(
     );
     session.send_request("authenticate", json!({ "methodId": method_id }))?;
     session.await_response(AUTH_TIMEOUT)?;
+    Ok(())
+}
+
+/// The ACP request that reattaches to an existing session, preferring
+/// `session/resume` (no history replay) over `session/load`.
+fn resume_method(init_result: &Value) -> Option<&'static str> {
+    let capabilities = init_result.get("agentCapabilities")?;
+    if capabilities
+        .pointer("/sessionCapabilities/resume")
+        .is_some_and(Value::is_object)
+    {
+        return Some("session/resume");
+    }
+    capabilities
+        .get("loadSession")
+        .and_then(Value::as_bool)
+        .filter(|loads| *loads)
+        .map(|_| "session/load")
+}
+
+/// Give the agent-side session a human-readable name.
+///
+/// ACP has no rename request. Claude Code's `/rename` only runs in interactive
+/// sessions — headless ones, which the ACP adapter drives, drop it — so for
+/// Claude this records the title the way `/rename` does: a `custom-title` entry
+/// in the session log, which `claude --resume` and the adapter's session list
+/// read. Cursor names sessions itself and exposes no way to override it.
+fn name_session(host: AcpHost, session_id: &str, title: &str) {
+    match host {
+        AcpHost::Claude => {
+            let result = claude_config_dir()
+                .context("no home directory for Claude Code session logs")
+                .and_then(|dir| {
+                    append_claude_custom_title(&dir, session_id, title, SESSION_LOG_WAIT)
+                });
+            match result {
+                Ok(()) => tracing::info!(
+                    event = "agent",
+                    action = "acp_session_named",
+                    session_id,
+                    title,
+                    "named Claude session"
+                ),
+                Err(err) => tracing::warn!(
+                    event = "agent",
+                    action = "acp_session_name_failed",
+                    session_id,
+                    error = %err,
+                    "could not name Claude session"
+                ),
+            }
+        }
+        AcpHost::Cursor => tracing::debug!(
+            event = "agent",
+            action = "acp_session_name_skipped",
+            session_id,
+            "Cursor names its own sessions"
+        ),
+    }
+}
+
+/// Claude Code's config directory, resolved the way the CLI resolves it.
+fn claude_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
+    } else {
+        std::env::var_os("HOME")
+    };
+    home.map(|home| PathBuf::from(home).join(".claude"))
+}
+
+/// Claude Code keeps one `<session-id>.jsonl` per session, under a directory per project.
+fn find_claude_session_log(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    std::fs::read_dir(config_dir.join("projects"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(&file_name))
+        .find(|path| path.is_file())
+}
+
+fn append_claude_custom_title(
+    config_dir: &Path,
+    session_id: &str,
+    title: &str,
+    wait: Duration,
+) -> Result<()> {
+    // The log is written as the first turn streams; give a just-finished turn
+    // a moment to land.
+    let deadline = std::time::Instant::now() + wait;
+    let path = loop {
+        if let Some(path) = find_claude_session_log(config_dir, session_id) {
+            break path;
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "session log {session_id}.jsonl not found under {}",
+                config_dir.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let record = json!({ "type": "custom-title", "customTitle": title, "sessionId": session_id });
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(log, "{record}")?;
     Ok(())
 }
 
@@ -1535,6 +1941,9 @@ impl PersistentAcpSession {
         child_slot: Arc<Mutex<Option<Child>>>,
         cancelled: Arc<AtomicBool>,
         extra_write_roots: &[PathBuf],
+        start: &SessionStart,
+        traffic_log: Option<SharedAgentTrafficLog>,
+        kind: AgentRunKind,
     ) -> Result<Self> {
         let mut child = spawn_acp_process(host, agent_bin)?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
@@ -1553,9 +1962,9 @@ impl PersistentAcpSession {
             request_rx,
             assistant_text: String::new(),
             cancelled: cancelled.clone(),
-            traffic_log: None,
+            traffic_log,
             run_id: RunId::new(),
-            kind: AgentRunKind::AnswerProcessor,
+            kind,
             write_roots: acp_write_roots(cwd, extra_write_roots),
         };
 
@@ -1585,13 +1994,39 @@ impl PersistentAcpSession {
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
         }
-        client.send_request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))?;
-        let session_result = client.await_response(AUTH_TIMEOUT)?;
-        let session_id = session_result
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .context("session/new missing sessionId")?
-            .to_string();
+        let (session_id, session_result) = match start {
+            SessionStart::New => {
+                client.send_request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))?;
+                let result = client.await_response(AUTH_TIMEOUT)?;
+                let session_id = result
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .context("session/new missing sessionId")?
+                    .to_string();
+                (session_id, result)
+            }
+            SessionStart::Resume(session_id) => {
+                let method = resume_method(&init_result).with_context(|| {
+                    format!("{} cannot resume session {session_id}", host.label())
+                })?;
+                tracing::info!(
+                    event = "agent",
+                    action = "acp_session_resume",
+                    method,
+                    session_id = %session_id,
+                    "resuming ACP session"
+                );
+                client.send_request(
+                    method,
+                    json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+                )?;
+                let result = client.await_response(AUTH_TIMEOUT)?;
+                // `session/load` replays the history as message updates; none of
+                // it is a reply to anything this process sends.
+                client.assistant_text.clear();
+                (session_id.clone(), result)
+            }
+        };
 
         apply_session_config_options(
             &mut client,
@@ -1609,13 +2044,20 @@ impl PersistentAcpSession {
     }
 
     fn prompt(&mut self, prompt: &str) -> Result<String> {
+        self.prompt_blocks(&[prompt.to_string()], self.client.run_id)
+    }
+
+    /// Send one turn made of several text blocks, in order.
+    fn prompt_blocks(&mut self, blocks: &[String], run_id: RunId) -> Result<String> {
         self.client.assistant_text.clear();
+        self.client.run_id = run_id;
+        let content: Vec<Value> = blocks
+            .iter()
+            .map(|text| json!({ "type": "text", "text": text }))
+            .collect();
         self.client.send_request(
             "session/prompt",
-            json!({
-                "sessionId": self.session_id,
-                "prompt": [{ "type": "text", "text": prompt }]
-            }),
+            json!({ "sessionId": self.session_id, "prompt": content }),
         )?;
         self.client.await_response(PROMPT_TIMEOUT)?;
         Ok(self.client.assistant_text.clone())
@@ -1681,6 +2123,9 @@ fn run_acp_pool_slot(
         child_slot.clone(),
         cancelled.clone(),
         &extra_write_roots,
+        &SessionStart::New,
+        None,
+        AgentRunKind::AnswerProcessor,
     ) {
         Ok(session) => session,
         Err(err) => {
@@ -1752,6 +2197,200 @@ mod tests {
             .as_deref(),
             Some("cursor_login")
         );
+    }
+
+    #[test]
+    fn resume_prefers_session_resume_over_load() {
+        let claude = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "sessionCapabilities": { "resume": {}, "list": {} }
+            }
+        });
+        assert_eq!(resume_method(&claude), Some("session/resume"));
+        let cursor = json!({
+            "agentCapabilities": { "loadSession": true, "sessionCapabilities": { "list": {} } }
+        });
+        assert_eq!(resume_method(&cursor), Some("session/load"));
+        let neither = json!({ "agentCapabilities": { "loadSession": false } });
+        assert_eq!(resume_method(&neither), None);
+    }
+
+    fn scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tod-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn claude_session_title_is_appended_to_the_session_log() {
+        let config_dir = scratch_dir("claude-title");
+        let project = config_dir.join("projects").join("C--work-repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let log = project.join("abc-123.jsonl");
+        std::fs::write(&log, concat!(r#"{"type":"user"}"#, "\n")).unwrap();
+
+        append_claude_custom_title(&config_dir, "abc-123", "Obligations · Demo", Duration::ZERO)
+            .unwrap();
+
+        let records: Vec<Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[1],
+            json!({ "type": "custom-title", "customTitle": "Obligations · Demo", "sessionId": "abc-123" })
+        );
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    #[test]
+    fn naming_a_session_without_a_log_fails() {
+        let config_dir = scratch_dir("claude-title-missing");
+        assert!(append_claude_custom_title(&config_dir, "nope", "Title", Duration::ZERO).is_err());
+        let _ = std::fs::remove_dir_all(&config_dir);
+    }
+
+    /// Scripted ACP agent: answers each prompt with the text blocks it got, and
+    /// records every request next to itself.
+    const FAKE_ACP_AGENT: &str = r##"
+import json, os, sys
+
+LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requests.jsonl")
+
+def send(message):
+    print(json.dumps(message), flush=True)
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    if method is None or "id" not in message:
+        continue
+    params = message.get("params", {})
+    with open(LOG, "a") as log:
+        print(json.dumps({"method": method, "params": params}), file=log)
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "sessionCapabilities": {"resume": {}}}, "authMethods": []}
+    elif method == "session/new":
+        result = {"sessionId": "fake-session-1"}
+    elif method == "session/prompt":
+        texts = [block.get("text", "") for block in params.get("prompt", [])]
+        update = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "reply to: " + " | ".join(texts)}}
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params.get("sessionId"), "update": update}})
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+"##;
+
+    fn python_available() -> bool {
+        Command::new("python")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn wait_for_reply(provider: &mut CursorAcpProvider, id: RunId) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            match provider.poll_run(id) {
+                Some(AgentRunState::Success(text)) => return text.unwrap_or_default(),
+                Some(AgentRunState::Failure(err)) => panic!("turn failed: {err}"),
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        panic!("timed out waiting for run {id:?}");
+    }
+
+    #[test]
+    fn conversation_sends_opening_once_and_resumes_after_close() {
+        use crate::agent_launch::AgentLaunchOptions;
+        use crate::platform::AgentPlatform;
+        use crate::provider::SessionOpening;
+
+        if !python_available() {
+            eprintln!("skipping: python is not available to run the fake ACP agent");
+            return;
+        }
+        let dir = scratch_dir("fake-acp");
+        // The name marks it as a standalone adapter: no `acp` subcommand, no login.
+        let agent_bin = dir.join("fake-claude-code-acp.py");
+        std::fs::write(&agent_bin, FAKE_ACP_AGENT).unwrap();
+        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::Claude, agent_bin);
+        let turn =
+            |opening: Option<SessionOpening>, resume: Option<String>, message: &str| SessionTurn {
+                key: "run-1".into(),
+                agent_config_id: "config".into(),
+                cwd: dir.clone(),
+                options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+                resume_session_id: resume,
+                opening,
+                message: message.into(),
+            };
+        // An empty title skips naming, which would touch the real ~/.claude.
+        let opening = SessionOpening {
+            title: String::new(),
+            context: Some("CONTEXT".into()),
+        };
+
+        let first = provider
+            .send_session_turn(turn(Some(opening), None, "first"))
+            .unwrap();
+        assert_eq!(
+            wait_for_reply(&mut provider, first.id),
+            "reply to: CONTEXT | first"
+        );
+        let second = provider
+            .send_session_turn(turn(None, None, "second"))
+            .unwrap();
+        assert_eq!(wait_for_reply(&mut provider, second.id), "reply to: second");
+        let session_id = provider.session_id("run-1").expect("session id");
+        assert_eq!(session_id, "fake-session-1");
+
+        provider.close_session("run-1");
+        let third = provider
+            .send_session_turn(turn(None, Some(session_id.clone()), "third"))
+            .unwrap();
+        assert_eq!(wait_for_reply(&mut provider, third.id), "reply to: third");
+
+        let requests: Vec<Value> = std::fs::read_to_string(dir.join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| request.get("method").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "session/new",
+                "session/prompt",
+                "session/prompt",
+                "initialize",
+                "session/resume",
+                "session/prompt",
+            ]
+        );
+        assert_eq!(
+            requests[5].pointer("/params/sessionId"),
+            Some(&json!(session_id))
+        );
+
+        drop(provider);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
