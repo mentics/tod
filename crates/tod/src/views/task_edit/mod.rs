@@ -1,5 +1,6 @@
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
+use crate::ui::pane_nav::{PaneFocusLeft, bind_pane_nav};
 use crate::ui::toast::{confirm_toast, error_toast};
 use crate::views::linear_import::parse_ticket_reference;
 use crate::views::linear_import::{apply_linear_fields_to_node, tags_with_linear};
@@ -87,8 +88,13 @@ impl TaskEditField {
 #[derive(Debug, Clone)]
 pub enum TaskEditEvent {
     Close,
+    /// Left / Ctrl+Left — move keyboard focus back to the task tree, leaving the panel open.
+    FocusTaskList,
     Changed,
-    OpenObligations { task_id: String, title: String },
+    OpenObligations {
+        task_id: String,
+        title: String,
+    },
 }
 
 struct PendingLinearApply {
@@ -796,6 +802,24 @@ impl TaskEditView {
     ) {
         if !self.capabilities.contains(&cap) {
             return;
+        }
+        if cap == Capability::Agent {
+            if let Some(task_id) = self.task_id() {
+                match self.fleet.agent_capability_disable_blocker(&task_id) {
+                    Ok(Some(reason)) => {
+                        self.pending_toast = Some(reason);
+                        cx.notify();
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        self.pending_toast =
+                            Some(format!("Failed to check action configs: {err}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
         }
         let view = cx.entity().downgrade();
         let title = format!("Disable {}?", cap.label());
@@ -2046,6 +2070,14 @@ impl Render for TaskEditView {
             .bg(background)
             .border_l_2()
             .border_color(accent)
+            .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
+                if this.editing.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                cx.emit(TaskEditEvent::FocusTaskList);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(|this, _: &TaskEditFieldUp, window, cx| {
                 this.move_field_stop(-1, window, cx);
                 cx.stop_propagation();
@@ -2153,4 +2185,6 @@ pub fn register_task_edit_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("escape", TaskEditEscape, context),
         KeyBinding::new("escape", TaskEditEscape, input_context),
     ]);
+    // Field stops move with Up/Down, so the plain arrows are free to cross panels.
+    bind_pane_nav(cx, TASK_EDIT_CONTEXT);
 }

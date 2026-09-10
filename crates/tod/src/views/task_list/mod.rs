@@ -26,6 +26,7 @@ use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, ListView,
     viewport_row_count,
 };
+use crate::ui::pane_nav::{PaneFocusRight, bind_modified_pane_nav};
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
@@ -155,11 +156,15 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
             Some(key_context::including_input(TASK_LIST_CONTEXT)),
         ),
     ]);
+    // Left/Right drive the tree here, so crossing to the right drawer uses Ctrl+arrows.
+    bind_modified_pane_nav(cx, TASK_LIST_CONTEXT);
     key_context::bind_panel_escape(cx, TaskListDismissOverlay, TASK_LIST_CONTEXT);
 }
 
 #[derive(Debug, Clone)]
 pub enum TaskListEvent {
+    /// Ctrl+Right — move keyboard focus to the right drawer, if one is open.
+    FocusDrawer,
     OpenInterview {
         task_id: String,
         node_id: uuid::Uuid,
@@ -188,6 +193,10 @@ pub enum TaskListEvent {
     /// Launch or focus an agent session for a resolved config (interactive or auto).
     LaunchOrFocusAgent {
         task_id: String,
+        config_id: String,
+    },
+    /// Delete an action config (and its runs/shells/transcripts).
+    DeleteAgentConfig {
         config_id: String,
     },
     OpenShell {
@@ -782,6 +791,14 @@ impl TaskListView {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
         };
+        if !task.has_agent && task.agents.is_empty() {
+            self.show_error(
+                "Enable the Agent capability on this task first.",
+                window,
+                cx,
+            );
+            return;
+        }
         match task.agents.len() {
             0 => {
                 self.emit_open_agent_config(task_id, None, cx);
@@ -814,6 +831,14 @@ impl TaskListView {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
         };
+        if !task.has_agent && task.agents.is_empty() {
+            self.show_error(
+                "Enable the Agent capability on this task first.",
+                window,
+                cx,
+            );
+            return;
+        }
         if task.agents.is_empty() {
             self.emit_open_agent_config(task_id, None, cx);
             self.set_status_line("Create an action config to open a shell", cx);
@@ -875,6 +900,14 @@ impl TaskListView {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
         };
+        if !task.has_agent && task.agents.is_empty() {
+            self.show_error(
+                "Enable the Agent capability on this task first.",
+                window,
+                cx,
+            );
+            return;
+        }
         match task.agents.len() {
             0 => {
                 self.emit_open_agent_config(task_id, None, cx);
@@ -913,6 +946,14 @@ impl TaskListView {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
         };
+        if !task.has_agent && task.agents.is_empty() {
+            self.show_error(
+                "Enable the Agent capability on this task first.",
+                window,
+                cx,
+            );
+            return;
+        }
         if task.agents.is_empty() {
             self.emit_open_agent_config(task_id, None, cx);
             return;
@@ -1634,6 +1675,11 @@ impl TaskListView {
             .map(|t| t.lifecycle.clone())
             .filter(|lc| !lc.is_empty())
         else {
+            self.show_error(
+                "Enable the Lifecycle capability on this task to start an interview",
+                window,
+                cx,
+            );
             return;
         };
         self.handle_row_action(
@@ -1787,6 +1833,11 @@ impl TaskListView {
 
     fn on_outdent(&mut self, _: &TaskListOutdent, window: &mut Window, cx: &mut Context<Self>) {
         self.reparent_selected(-1, window, cx);
+    }
+
+    fn on_focus_drawer(&mut self, _: &PaneFocusRight, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TaskListEvent::FocusDrawer);
+        cx.stop_propagation();
     }
 
     fn on_select_parent(
@@ -2303,6 +2354,7 @@ impl Render for TaskListView {
             .v_flex()
             .size_full()
             .relative()
+            .on_action(cx.listener(Self::on_focus_drawer))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))

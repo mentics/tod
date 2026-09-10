@@ -20,6 +20,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
             let is_work = !row.capabilities.is_empty();
             let has_spec = row.capabilities.contains(&Capability::Spec);
             let has_lifecycle = row.capabilities.contains(&Capability::Lifecycle);
+            let has_agent = row.capabilities.contains(&Capability::Agent);
             let counts = counts.get(&row.node.id).copied().unwrap_or_default();
             // Only Lifecycle capability owns a lifecycle chip. Do not invent "proposed"
             // when Agent/Spec alone are enabled.
@@ -38,8 +39,15 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                         inherited: false,
                         configs: Vec::new(),
                     });
-            let agents: Vec<AgentInfo> = resolved
+            // Interview-mode configs are auto-provisioned/managed by the interview
+            // flow itself and are not user-facing action configs — keep them out of
+            // the regular agent list/pickers entirely (see CLAUDE.md interview notes).
+            let action_configs: Vec<_> = resolved
                 .configs
+                .iter()
+                .filter(|a| a.mode != "interview")
+                .collect();
+            let agents: Vec<AgentInfo> = action_configs
                 .iter()
                 .map(|a| {
                     let mut status = a.runtime_status.clone();
@@ -71,10 +79,10 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 })
                 .collect();
             let mut shells = Vec::new();
-            for config in &resolved.configs {
+            for config in &action_configs {
                 if let Ok(sessions) = store.list_shells_for_config(&config.id) {
                     for shell in sessions {
-                        let label = if resolved.configs.len() > 1 {
+                        let label = if action_configs.len() > 1 {
                             format!("{} · {}", config.id, shell.id)
                         } else {
                             shell.id.clone()
@@ -102,6 +110,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 collapsed: row.collapsed,
                 is_work_node: is_work,
                 has_spec,
+                has_agent,
                 requirement_count: counts.requirements,
                 constraint_count: counts.constraints,
                 has_children: row.has_children,
@@ -156,6 +165,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             collapsed: false,
             is_work_node: true,
             has_spec: false,
+            has_agent: false,
             requirement_count: 0,
             constraint_count: 0,
             has_children: false,

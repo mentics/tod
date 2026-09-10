@@ -549,3 +549,90 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
 
     cleanup_fleet_root(&root);
 }
+
+#[test]
+fn agent_capability_disable_blocker_reflects_owned_configs_and_liveness() {
+    let root = temp_fleet_root();
+    let store = FleetStore::open(&root).unwrap();
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = uuid::Uuid::new_v4().to_string();
+
+    store
+        .enqueue(FleetMutation::InsertTask {
+            task: FleetTask::new(&task_id, "Blocker check", "blocker-check"),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // No owned configs — nothing to block on.
+    assert!(
+        store
+            .agent_capability_disable_blocker(&task_id)
+            .unwrap()
+            .is_none()
+    );
+
+    store
+        .enqueue(FleetMutation::InsertAgent {
+            agent: NewAgent {
+                id: agent_id.clone(),
+                node_id: task_id.clone(),
+                env_type: "local".into(),
+                mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
+                platform: "claude".into(),
+                model: "default".into(),
+                effort: "auto".into(),
+            },
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // An idle config still blocks — disabling must never orphan or silently delete it.
+    let idle_reason = store
+        .agent_capability_disable_blocker(&task_id)
+        .unwrap()
+        .expect("idle config should block disable");
+    assert!(idle_reason.contains("action config"));
+    assert!(!idle_reason.contains("running"));
+
+    let shell_id = uuid::Uuid::new_v4().to_string();
+    store
+        .enqueue(FleetMutation::CreateShellSession {
+            id: shell_id.clone(),
+            agent_id: agent_id.clone(),
+            reconnect: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // An open shell sharpens the message to call out live sessions specifically.
+    let running_reason = store
+        .agent_capability_disable_blocker(&task_id)
+        .unwrap()
+        .expect("open shell should block disable");
+    assert!(running_reason.contains("running"));
+
+    store
+        .enqueue(FleetMutation::DismissShellSession {
+            id: shell_id.clone(),
+        })
+        .unwrap();
+    store
+        .enqueue(FleetMutation::DeleteAgent {
+            id: agent_id.clone(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // Once the config is gone, disabling is unblocked again.
+    assert!(
+        store
+            .agent_capability_disable_blocker(&task_id)
+            .unwrap()
+            .is_none()
+    );
+
+    cleanup_fleet_root(&root);
+}

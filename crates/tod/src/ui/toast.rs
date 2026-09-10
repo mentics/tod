@@ -113,17 +113,14 @@ pub fn confirm_toast(
                                     }
                                 },
                             )))
-                            .child(
-                                Button::new("toast-yes")
-                                    .label("Yes")
-                                    .primary()
-                                    .on_click(cx.listener(move |note, _, window, cx| {
-                                        note.dismiss(window, cx);
-                                        if let Some(on_yes) = on_yes.borrow_mut().take() {
-                                            on_yes(window, cx);
-                                        }
-                                    })),
-                            ),
+                            .child(Button::new("toast-yes").label("Yes").primary().on_click(
+                                cx.listener(move |note, _, window, cx| {
+                                    note.dismiss(window, cx);
+                                    if let Some(on_yes) = on_yes.borrow_mut().take() {
+                                        on_yes(window, cx);
+                                    }
+                                }),
+                            )),
                     )
                     .into_any_element()
             }),

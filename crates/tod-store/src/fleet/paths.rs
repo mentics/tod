@@ -90,16 +90,39 @@ impl FleetPaths {
 }
 
 /// Resolve to an absolute path, canonicalizing when the path already exists.
+///
+/// On Windows, `canonicalize()` returns the `\\?\` extended-length verbatim
+/// prefix. That form is fine for Rust's own filesystem calls, but external
+/// tools invoked over env vars or CLI args (git, treehouse) either reject it
+/// or mix it with forward slashes and blow up ("Invalid argument"), so strip
+/// it back to a normal drive-letter path.
 pub fn normalize_absolute(path: &Path) -> Result<PathBuf> {
     let absolute = std::path::absolute(path)
         .with_context(|| format!("failed to resolve absolute path for {}", path.display()))?;
-    if absolute.exists() {
+    let resolved = if absolute.exists() {
         absolute
             .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", absolute.display()))
+            .with_context(|| format!("failed to canonicalize {}", absolute.display()))?
     } else {
-        Ok(absolute)
+        absolute
+    };
+    Ok(strip_verbatim_prefix(resolved))
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(s) => match s.strip_prefix(r"\\?\") {
+            Some(stripped) => PathBuf::from(stripped),
+            None => path,
+        },
+        None => path,
     }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
 }
 
 #[cfg(test)]

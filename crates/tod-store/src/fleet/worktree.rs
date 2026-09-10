@@ -22,7 +22,6 @@ fn path_for_git(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[cfg(test)]
 fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -333,7 +332,13 @@ pub fn ensure_worktree(
             }
         };
 
-        checkout_branch(&handle.path, &branch_key)?;
+        // Git only allows a branch to be checked out in one worktree at a time. If it's
+        // already held elsewhere (e.g. the primary repo), leave a freshly provisioned
+        // worktree (Treehouse's, typically detached) as-is rather than fail here.
+        match worktree_holding_branch(repo, &branch_key)? {
+            Some(holder) if !paths_refer_to_same_location(&holder, &handle.path) => {}
+            _ => checkout_branch(&handle.path, &branch_key)?,
+        }
         Ok(handle)
     })
 }

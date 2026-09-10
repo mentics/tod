@@ -7,6 +7,7 @@ use crate::ui::key_context;
 use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
 };
+use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use delegate::{
     NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, obligation_section,
     section_row_key,
@@ -88,12 +89,16 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
             Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
         ),
     ]);
+    // Left/Right collapse/expand rows here, so crossing back to the tree uses Ctrl+arrows.
+    bind_modified_pane_nav(cx, OBLIGATIONS_CONTEXT);
     key_context::bind_panel_escape(cx, ObligationsClose, OBLIGATIONS_CONTEXT);
 }
 
 #[derive(Debug, Clone)]
 pub enum ObligationsEvent {
     Close,
+    /// Ctrl+Left — move keyboard focus back to the task tree, leaving the panel open.
+    FocusTaskList,
     /// Delete key with no obligation item selected — delete the task in the tree.
     DeleteSelectedTask,
 }
@@ -1064,6 +1069,14 @@ impl Render for ObligationsView {
             .bg(theme.background)
             .border_l_2()
             .border_color(accent)
+            .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
+                if this.editing_id.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                cx.emit(ObligationsEvent::FocusTaskList);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_create_below))

@@ -1,4 +1,4 @@
-//! Auto-provision interview-mode agent configs with worktrees.
+//! Auto-provision interview-mode agent configs.
 
 use crate::agent_launch::platform_storage;
 use crate::fleet::FleetStore;
@@ -175,12 +175,13 @@ pub fn describe_agent_workspace(fleet: &FleetStore, agent: &AgentConfigRow) -> S
     }
 }
 
-/// Ensure an interview-mode agent config exists for `node_id`, with a worktree when needed.
+/// Ensure an interview-mode agent config exists for `node_id`, working directly in the
+/// repo root rather than an isolated worktree.
 ///
 /// Reuses an interview config on this node or a nearer ancestor before creating a new one.
 pub fn ensure_interview_agent_for_node(
     fleet: &FleetStore,
-    paths: &TodPaths,
+    _paths: &TodPaths,
     settings: &TodSettings,
     node_id: &str,
 ) -> Result<InterviewAgentContext> {
@@ -194,27 +195,8 @@ pub fn ensure_interview_agent_for_node(
         });
     }
 
-    let (repo_path, branch) = task_repo_branch(fleet, node_id)?;
+    let (repo_path, _branch) = task_repo_branch(fleet, node_id)?;
     let config_id = format!("interview-{}", Uuid::new_v4());
-    let lease_holder = format!("tod-{config_id}");
-    let data_root = settings.resolve_fleet_storage_root(paths)?;
-    let backend = settings.worktree_backend;
-
-    let handle: WorktreeHandle = {
-        let projection = fleet.projection();
-        let guard = projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        worktree::ensure_worktree(
-            &conn,
-            backend,
-            settings,
-            paths,
-            &data_root,
-            &repo_path,
-            &branch,
-            &lease_holder,
-        )?
-    };
 
     fleet.enqueue(FleetMutation::InsertAgent {
         agent: NewAgentConfig {
@@ -222,18 +204,12 @@ pub fn ensure_interview_agent_for_node(
             node_id: node_id.to_string(),
             env_type: "local".into(),
             mode: "interview".into(),
-            work_directory: None,
-            use_worktree: true,
+            work_directory: Some(path_for_storage(&repo_path)),
+            use_worktree: false,
             platform: platform_storage(settings.agent_platform).to_string(),
             model: settings.agent_model().to_string(),
             effort: settings.agent_effort().to_string(),
         },
-    })?;
-    fleet.enqueue(FleetMutation::UpdateAgentWorktreeDetails {
-        id: config_id.clone(),
-        worktree_path: Some(path_for_storage(&handle.path)),
-        worktree_lease_id: handle.lease.as_ref().map(|l| l.lease_id.clone()),
-        worktree_lease_holder: handle.lease.as_ref().map(|l| l.lease_holder.clone()),
     })?;
     fleet.writer().flush()?;
     fleet.reload_if_stale()?;

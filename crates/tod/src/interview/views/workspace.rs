@@ -162,9 +162,13 @@ enum WorkspaceFocus {
 
 #[derive(Debug, Clone)]
 enum RunKind {
-    AnswerProcessor { question_id: String },
+    AnswerProcessor {
+        question_id: String,
+    },
     QuestionMakerReplenish,
-    QuestionMakerAction { question_id: String },
+    QuestionMakerAction {
+        question_id: String,
+    },
     /// Freeform requirements text submitted directly to the answer processor,
     /// not tied to any queue question.
     FreeformAnswer,
@@ -505,17 +509,24 @@ impl WorkspaceView {
         // "closed" is not a valid state for this column — reverse it immediately.
         let obligations_node_id = session.node_id;
         let obligations_title = session.display_name.clone();
-        let _obligations_subscription =
-            cx.subscribe_in(&obligations, window, move |_this, panel, event, window, cx| {
+        let _obligations_subscription = cx.subscribe_in(
+            &obligations,
+            window,
+            move |this, panel, event, window, cx| {
                 match event {
                     ObligationsEvent::Close => {
                         panel.update(cx, |panel, cx| {
                             panel.retarget(obligations_node_id, &obligations_title, window, cx);
                         });
                     }
+                    // Ctrl+Left out of the third column lands on the response column.
+                    ObligationsEvent::FocusTaskList => {
+                        this.focus_response_right(window, cx);
+                    }
                     ObligationsEvent::DeleteSelectedTask => {}
                 }
-            });
+            },
+        );
         let proposed_loaded_for = selected_question_id.clone().filter(|_| {
             questions
                 .iter()
@@ -937,7 +948,10 @@ impl WorkspaceView {
     }
 
     fn response_text_editing(&self) -> bool {
-        self.notes_editing || self.proposed_editing || self.feedback_editing || self.freeform_editing
+        self.notes_editing
+            || self.proposed_editing
+            || self.feedback_editing
+            || self.freeform_editing
     }
 
     fn has_proposed_editor(&self) -> bool {
@@ -2410,6 +2424,17 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// Focus the third (obligations) column.
+    fn focus_obligations_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.response_text_editing() {
+            return;
+        }
+        self.obligations.update(cx, |panel, cx| {
+            panel.focus_handle(cx).focus(window);
+        });
+        cx.notify();
+    }
+
     fn focus_list_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.response_text_editing() {
             return;
@@ -2643,6 +2668,9 @@ fn register_workspace_keys(cx: &mut App) {
         KeyBinding::new("down", QuestionMoveDown, context),
         KeyBinding::new("right", FocusRight, context),
         KeyBinding::new("left", FocusLeft, context),
+        // Ctrl+arrows cross panels everywhere in the app; accept them here too.
+        KeyBinding::new("ctrl-right", FocusRight, context),
+        KeyBinding::new("ctrl-left", FocusLeft, context),
         KeyBinding::new("enter", ActivateFocused, context),
         KeyBinding::new("space", ActivateFocused, context),
         KeyBinding::new("escape", WorkspaceEscape, context),
@@ -3017,9 +3045,15 @@ impl Render for WorkspaceView {
                     cx.propagate();
                     return;
                 }
-                if this.workspace_focus == WorkspaceFocus::QuestionList {
-                    this.focus_response_right(window, cx);
-                    cx.stop_propagation();
+                match this.workspace_focus {
+                    WorkspaceFocus::QuestionList => {
+                        this.focus_response_right(window, cx);
+                        cx.stop_propagation();
+                    }
+                    WorkspaceFocus::Response(_) => {
+                        this.focus_obligations_right(window, cx);
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
@@ -3215,7 +3249,7 @@ fn body_column(
     muted: gpui::Hsla,
 ) -> impl IntoElement {
     let body = if complete {
-        complete_body(cx, session, show_proceed, foreground, muted).into_any_element()
+        complete_body(window, cx, session, show_proceed, foreground, muted).into_any_element()
     } else if let Some(q) = question {
         question_body_view(q, foreground, muted, window, cx).into_any_element()
     } else if let Some(wait) = question_maker_wait {
@@ -3349,6 +3383,7 @@ fn question_body_view(
 }
 
 fn complete_body(
+    window: &mut Window,
     cx: &mut Context<WorkspaceView>,
     session: &InterviewSession,
     show_proceed: bool,
@@ -3364,10 +3399,17 @@ fn complete_body(
                 .text_color(foreground)
                 .child("Complete"),
         )
-        .child(div().text_sm().text_color(muted).child(format!(
-            "No open questions remain for \"{}\".",
-            session.display_name
-        )));
+        .child(
+            div().text_sm().text_color(muted).child(
+                selectable_text(
+                    "complete-body-summary",
+                    format!("No open questions remain for \"{}\".", session.display_name),
+                    window,
+                    cx,
+                )
+                .text_color(muted),
+            ),
+        );
 
     if show_proceed {
         col = col.child(

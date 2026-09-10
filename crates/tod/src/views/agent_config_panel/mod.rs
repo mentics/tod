@@ -7,6 +7,7 @@ use crate::interview::settings::TodSettings;
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, build_fleet_agent_prompt};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context::{self, INPUT};
+use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
@@ -41,6 +42,8 @@ actions!(agent_config, [AgentConfigClose, AgentConfigSave]);
 #[derive(Debug, Clone)]
 pub enum AgentConfigPanelEvent {
     Close,
+    /// Ctrl+Left — move keyboard focus back to the task tree, leaving the panel open.
+    FocusTaskList,
     Saved {
         _task_id: String,
         _config_id: String,
@@ -1349,9 +1352,7 @@ impl AgentConfigPanelView {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        selectable_text(("agent-run-label", idx), label, window, cx).text_sm(),
-                    )
+                    .child(selectable_text(("agent-run-label", idx), label, window, cx).text_sm())
                     .when(active, |row| {
                         row.child(
                             Button::new(("run-stop", idx))
@@ -1825,6 +1826,10 @@ impl Render for AgentConfigPanelView {
             .bg(theme.background)
             .border_l_2()
             .border_color(accent)
+            .on_action(cx.listener(|_, _: &PaneFocusLeft, _, cx| {
+                cx.emit(AgentConfigPanelEvent::FocusTaskList);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_save))
             .child(
@@ -1918,6 +1923,8 @@ fn format_status_label(status: &str) -> String {
 
 pub fn register_agent_config_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, AgentConfigClose, AGENT_CONFIG_CONTEXT);
+    // Ctrl-only: the panel's `Select` popups consume the plain arrows while open.
+    bind_modified_pane_nav(cx, AGENT_CONFIG_CONTEXT);
     let context = Some(key_context::excluding_input(AGENT_CONFIG_CONTEXT));
     cx.bind_keys([gpui::KeyBinding::new("enter", AgentConfigSave, context)]);
     cx.bind_keys([gpui::KeyBinding::new("enter", AgentConfigSave, Some(INPUT))]);

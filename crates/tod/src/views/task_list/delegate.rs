@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    Context, Entity, InteractiveElement, MouseButton, ParentElement, SharedString, Styled,
-    Window, div, prelude::FluentBuilder, px,
+    Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
 use gpui_component::input::Input;
@@ -209,39 +209,44 @@ impl ListDelegate for TaskListDelegate {
                     },
                 ));
             }
-            let agents_count = item.agent_count();
-            let agents_label = format!("A {agents_count}");
-            let task_id_agents = item.id.clone();
-            let agents_chip = action_chip(
-                cx,
-                border,
-                primary,
-                secondary,
-                background,
-                foreground,
-                agents_label,
-                selected,
-                if selected { Some("A") } else { None },
-                {
-                    let sink = sink.clone();
-                    move || {
-                        sink.borrow_mut().push(RowAction::AgentsControl {
-                            task_id: task_id_agents.clone(),
-                        });
-                    }
-                },
-            );
-            let agents_menu_open = selected
-                && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-                    matches!(
-                        kind,
-                        RowMenuKind::Agents | RowMenuKind::AgentsEdit | RowMenuKind::OpenCode
-                    ) && id == &item.id
-                });
-            chips = chips.child(row_menu_anchor(
-                agents_chip,
-                agents_menu_open.then(|| self.row_menu.clone()).flatten(),
-            ));
+            // Only show the agent chip when this node owns (or inherits) an actual
+            // action config target — without the Agent capability there is no
+            // directory to launch against.
+            if item.has_agent || !item.agents.is_empty() {
+                let agents_count = item.agent_count();
+                let agents_label = format!("A {agents_count}");
+                let task_id_agents = item.id.clone();
+                let agents_chip = action_chip(
+                    cx,
+                    border,
+                    primary,
+                    secondary,
+                    background,
+                    foreground,
+                    agents_label,
+                    selected,
+                    if selected { Some("A") } else { None },
+                    {
+                        let sink = sink.clone();
+                        move || {
+                            sink.borrow_mut().push(RowAction::AgentsControl {
+                                task_id: task_id_agents.clone(),
+                            });
+                        }
+                    },
+                );
+                let agents_menu_open = selected
+                    && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
+                        matches!(
+                            kind,
+                            RowMenuKind::Agents | RowMenuKind::AgentsEdit | RowMenuKind::OpenCode
+                        ) && id == &item.id
+                    });
+                chips = chips.child(row_menu_anchor(
+                    agents_chip,
+                    agents_menu_open.then(|| self.row_menu.clone()).flatten(),
+                ));
+            }
             for (tag_ix, tag) in item.sorted_tags().iter().enumerate() {
                 let tag = tag.clone();
                 let active = tag_filter
@@ -366,7 +371,7 @@ impl ListDelegate for TaskListDelegate {
 }
 
 fn title_label(
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<ListState<TaskListDelegate>>,
     foreground: gpui::Hsla,
     title: String,
@@ -380,15 +385,11 @@ fn title_label(
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
         .child(
-            crate::ui::selectable_text::selectable_text(
-                SharedString::from(format!("task-title-{task_id}")),
-                title,
-                window,
-                cx,
-            )
-            .text_sm()
-            .font_medium()
-            .text_color(foreground),
+            div()
+                .text_sm()
+                .font_medium()
+                .text_color(foreground)
+                .child(title),
         )
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {

@@ -192,9 +192,8 @@ impl InteractiveAgentWindowControl {
             .get_agent(&params.config_id)
             .map_err(|err| format!("load agent config: {err}"))?
             .ok_or_else(|| format!("agent config {} not found", params.config_id))?;
-        let workspace_cwd =
-            resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
-                .map_err(|err| format!("workspace: {err:#}"))?;
+        let workspace_cwd = resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
+            .map_err(|err| format!("workspace: {err:#}"))?;
 
         let session_number = fleet
             .list_runs_for_config(&params.config_id)

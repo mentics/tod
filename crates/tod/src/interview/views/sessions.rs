@@ -12,8 +12,8 @@ use crate::ui::app_nav::{AppDestination, AppNavMenu};
 use crate::ui::toast::confirm_toast;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window,
-    prelude::FluentBuilder as _, div,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::button::Button;
 use gpui_component::spinner::Spinner;
@@ -206,32 +206,32 @@ impl SessionsView {
 
         cx.spawn(async move |_, cx| {
             let display_name_for_thread = display_name.clone();
-            let result = std::thread::spawn(move || -> Result<InterviewSession, String> {
-                let settings = TodSettings::load(&paths).map_err(|e| e.to_string())?;
-                let agent_ctx =
-                    ensure_interview_agent_for_node(&fleet, &paths, &settings, &node_id_str)
-                        .map_err(|e| e.to_string())?;
-                let store = SessionStore::open(fleet.clone());
-                store
-                    .insert_session_with_metadata(
-                        NewInterviewSession {
-                            node_id,
-                            agent_config_id: Some(agent_ctx.agent.id.clone()),
-                            display_name: display_name_for_thread,
-                            phase: phase_owned,
-                        },
-                        InterviewSessionStatus::Active,
-                        Some(agent_ctx.agent.id),
-                    )
-                    .map_err(|e| e.to_string())
-            })
-            .join();
-
-            let outcome = match result {
-                Ok(Ok(session)) => Ok(session),
-                Ok(Err(err)) => Err(err),
-                Err(_) => Err("interview provisioning thread panicked".to_string()),
-            };
+            // `cx.background_spawn` runs this on the background executor's thread
+            // pool and returns a `Task` we can `.await` here without blocking the
+            // foreground (UI) thread this `cx.spawn` future itself runs on — unlike
+            // `std::thread::spawn(..).join()`, which would block that same UI
+            // thread and prevent GPUI from ever painting the spinner frame.
+            let outcome: Result<InterviewSession, String> = cx
+                .background_spawn(async move {
+                    let settings = TodSettings::load(&paths).map_err(|e| e.to_string())?;
+                    let agent_ctx =
+                        ensure_interview_agent_for_node(&fleet, &paths, &settings, &node_id_str)
+                            .map_err(|e| e.to_string())?;
+                    let store = SessionStore::open(fleet.clone());
+                    store
+                        .insert_session_with_metadata(
+                            NewInterviewSession {
+                                node_id,
+                                agent_config_id: Some(agent_ctx.agent.id.clone()),
+                                display_name: display_name_for_thread,
+                                phase: phase_owned,
+                            },
+                            InterviewSessionStatus::Active,
+                            Some(agent_ctx.agent.id),
+                        )
+                        .map_err(|e| e.to_string())
+                })
+                .await;
 
             let _ = entity.update(cx, |this, cx| match outcome {
                 Ok(session) => {
@@ -853,7 +853,8 @@ impl Render for SessionsView {
         // being provisioned/kicked off for a node picked from the task list, or
         // after that provisioning failed. Either way this view must never be a
         // dead end — always offer a way back to the task list.
-        let theme = cx.theme();
+        let background = cx.theme().background;
+        let muted_foreground = cx.theme().muted_foreground;
         div()
             .key_context(SESSIONS_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -862,19 +863,24 @@ impl Render for SessionsView {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(theme.background)
+            .bg(background)
             .when(self.kickoff_in_progress, |el| {
                 el.child(Spinner::new().with_size(Size::Large))
             })
             .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(if self.kickoff_status.is_empty() {
-                        "No interview open.".into()
-                    } else {
-                        self.kickoff_status.clone()
-                    }),
+                div().text_sm().text_color(muted_foreground).child(
+                    crate::ui::selectable_text::selectable_text(
+                        "sessions-kickoff-status",
+                        if self.kickoff_status.is_empty() {
+                            SharedString::from("No interview open.")
+                        } else {
+                            self.kickoff_status.clone()
+                        },
+                        window,
+                        cx,
+                    )
+                    .text_color(muted_foreground),
+                ),
             )
             .child(
                 Button::new("sessions-back-to-tasks")

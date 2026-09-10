@@ -63,6 +63,9 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("down", SettingsNavDown, context),
         KeyBinding::new("left", SettingsFocusSidebar, context),
         KeyBinding::new("right", SettingsFocusPanel, context),
+        // Ctrl+arrows cross panels everywhere in the app; accept them here too.
+        KeyBinding::new("ctrl-left", SettingsFocusSidebar, context),
+        KeyBinding::new("ctrl-right", SettingsFocusPanel, context),
         KeyBinding::new("-", SettingsDecrease, context),
         KeyBinding::new("=", SettingsIncrease, context),
         KeyBinding::new("enter", SettingsActivate, context),
@@ -1398,18 +1401,14 @@ fn read_only_row(
             ),
         )
         .child(
-            div()
-                .id(id)
-                .text_sm()
-                .whitespace_normal()
-                .child(
-                    crate::ui::selectable_text::selectable_text(
-                        SharedString::from(format!("{id}-selectable-value")),
-                        value.into(),
-                        window,
-                        cx,
-                    )
-                    .text_color(theme.muted_foreground),
-                ),
+            div().id(id).text_sm().whitespace_normal().child(
+                crate::ui::selectable_text::selectable_text(
+                    SharedString::from(format!("{id}-selectable-value")),
+                    value.into(),
+                    window,
+                    cx,
+                )
+                .text_color(theme.muted_foreground),
+            ),
         )
 }

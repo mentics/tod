@@ -310,6 +310,45 @@ impl FleetStore {
         resolve_interview_config_for_node(&conn, node_id).map_err(Into::into)
     }
 
+    /// Checks whether it is safe to disable the Agent capability on `node_id` without
+    /// orphaning or destroying data. Returns `Some(reason)` to block the disable, or
+    /// `None` when the node owns no action configs.
+    ///
+    /// Disabling never deletes an action config itself — that would drop its runs and
+    /// transcripts (see `AgentConfigRepo::delete_cascade`) — so any config the node owns
+    /// must be dealt with (stopped, then deleted) by the user first.
+    pub fn agent_capability_disable_blocker(&self, node_id: &str) -> Result<Option<String>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        let configs = AgentConfigRepo::new(&conn).list_for_node(node_id)?;
+        if configs.is_empty() {
+            return Ok(None);
+        }
+        let mut running = 0usize;
+        for config in &configs {
+            let has_open_run = AgentRunRepo::new(&conn)
+                .list_for_config(&config.id)?
+                .iter()
+                .any(|run| run.ended_at.is_none());
+            let has_open_shell = !ShellRepo::new(&conn).list_for_agent(&config.id)?.is_empty();
+            if has_open_run || has_open_shell {
+                running += 1;
+            }
+        }
+        if running > 0 {
+            return Ok(Some(format!(
+                "{running} of {} action config(s) on this task have a running agent or open shell. \
+                 Stop them first, then delete the action config(s) before disabling Agent.",
+                configs.len()
+            )));
+        }
+        Ok(Some(format!(
+            "This task has {} action config(s). Disabling Agent won't remove them (and won't \
+             touch their transcripts) — delete the action config(s) first from the row menu.",
+            configs.len()
+        )))
+    }
+
     /// Load one agent config row (with latest run status) by id.
     pub fn get_agent(&self, id: &str) -> Result<Option<AgentConfigRow>> {
         let guard = self.projection.lock().expect("fleet projection mutex");

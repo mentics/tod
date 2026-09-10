@@ -196,12 +196,18 @@ fn build_row_menu(
         }
         RowMenuKind::AgentsEdit => {
             for agent in &task.agents {
-                let view = view.clone();
+                let edit_view = view.clone();
                 let label = format!("Edit · {}", agent_menu_label(agent));
                 let task_id = task.id.clone();
                 let agent_id = agent.id.clone();
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_agent_config(&view, &task_id, Some(agent_id.clone()), cx);
+                    activate_agent_config(&edit_view, &task_id, Some(agent_id.clone()), cx);
+                }));
+                let delete_view = view.clone();
+                let delete_label = format!("Delete · {}", agent_menu_label(agent));
+                let agent_id = agent.id.clone();
+                menu = menu.item(PopupMenuItem::new(delete_label).on_click(move |_, _, cx| {
+                    activate_agent_delete(&delete_view, &agent_id, cx);
                 }));
             }
             let view = view.clone();
@@ -304,6 +310,18 @@ fn activate_agent_launch(
             config_id: agent_id.to_string(),
         });
         this.set_status_message(format!("Launching agent {agent_id}"), cx);
+    });
+}
+
+fn activate_agent_delete(view: &gpui::WeakEntity<TaskListView>, agent_id: &str, cx: &mut App) {
+    let Some(entity) = view.upgrade() else {
+        return;
+    };
+    entity.update(cx, |this, cx| {
+        this.close_row_menu(cx);
+        cx.emit(TaskListEvent::DeleteAgentConfig {
+            config_id: agent_id.to_string(),
+        });
     });
 }
 

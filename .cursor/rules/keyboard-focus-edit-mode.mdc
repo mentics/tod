@@ -37,6 +37,8 @@ Multi-line text fields must not trap keyboard navigation. Use **two explicit mod
 
 - Vertical stacks (edit panes, form columns): ↑/↓ between stops.
 - Horizontal regions (list + detail): ←/→ between regions, then ↑/↓ within a region.
+- **Where ←/→ already act on the panel's own content** (tree collapse/expand, select parent), bind **Ctrl+← / Ctrl+→** to cross panels instead. Ctrl+arrows are registered on *every* multi-column surface, so the same chord always works; plain arrows are added only where they are otherwise free. Use [`ui::pane_nav`](crates/tod/src/ui/pane_nav.rs) (`bind_pane_nav` / `bind_modified_pane_nav`, actions `PaneFocusLeft` / `PaneFocusRight`).
+- A panel that is a child of a shell (task tree ↔ right drawer) emits a `Focus*` event instead of moving focus itself; the shell owns cross-panel focus (see `Shell::drain_pending_focus_drawer` in `crates/tod/src/app/window.rs`).
 - Use arrow keys wherever spatial navigation matches the layout; do not rely on Tab.
 
 ## Reference implementation

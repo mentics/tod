@@ -39,7 +39,7 @@ use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
 use tod_store::fleet::{
-    FleetLaunchError, FleetStore, focus_shell_session, open_shell_for_agent_config,
+    FleetLaunchError, FleetMutation, FleetStore, focus_shell_session, open_shell_for_agent_config,
     open_zed_for_agent_config,
 };
 use uuid::Uuid;
@@ -114,6 +114,7 @@ pub struct Shell {
     pending_retarget_obligations: Option<(String, String)>,
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
+    pending_focus_drawer: bool,
     pending_open_agent: Option<PendingOpenAgent>,
     pending_launch_or_focus_agent: Option<PendingLaunchOrFocusAgent>,
     pending_close_agent_panel: bool,
@@ -648,6 +649,25 @@ impl Shell {
         cx.notify();
     }
 
+    fn handle_delete_agent_config(&mut self, config_id: String, cx: &mut Context<Self>) {
+        if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteAgent {
+            id: config_id.clone(),
+        }) {
+            self.queue_error_toast(format!("Delete failed: {err}"), cx);
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.queue_error_toast(format!("Delete failed: {err}"), cx);
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        self.task_list.update(cx, |list, cx| {
+            list.set_status_message(format!("Deleted action config {config_id}"), cx);
+            list.request_live_refresh(cx);
+        });
+        cx.notify();
+    }
+
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.fleet.undo_last() {
             Ok(Some(label)) => {
@@ -775,6 +795,7 @@ impl Render for Shell {
         self.drain_pending_task_edit(window, cx);
         self.drain_pending_obligations(window, cx);
         self.drain_pending_agent_panel(window, cx);
+        self.drain_pending_focus_drawer(window, cx);
         self.drain_pending_error_toast(window, cx);
 
         div()
@@ -904,6 +925,28 @@ impl Shell {
         if let Some(task_id) = self.pending_open_task_edit.take() {
             self.open_task_edit(&task_id, window, cx);
         }
+    }
+
+    /// Ctrl+Right from the task tree: hand focus to whichever drawer is open.
+    fn drain_pending_focus_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.pending_focus_drawer {
+            return;
+        }
+        self.pending_focus_drawer = false;
+        if self.obligations.read(cx).is_open() {
+            self.obligations.update(cx, |panel, cx| {
+                panel.focus_handle(cx).focus(window);
+            });
+        } else if self.task_edit.read(cx).is_open() {
+            self.task_edit.update(cx, |panel, cx| {
+                panel.focus_handle(cx).focus(window);
+            });
+        } else if self.agent_panel.read(cx).is_open() {
+            self.agent_panel.update(cx, |panel, cx| {
+                panel.focus_handle(cx).focus(window);
+            });
+        }
+        cx.notify();
     }
 
     fn drain_pending_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1201,6 +1244,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let _task_list_subscription =
                                 cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
                                     match event {
+                                        TaskListEvent::FocusDrawer => {
+                                            this.pending_focus_drawer = true;
+                                            cx.notify();
+                                        }
                                         TaskListEvent::OpenInterview {
                                             task_id,
                                             node_id,
@@ -1279,6 +1326,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
+                                        TaskListEvent::DeleteAgentConfig { config_id } => {
+                                            this.handle_delete_agent_config(config_id.clone(), cx);
+                                        }
                                         TaskListEvent::CloseAgentPanel => {
                                             this.queue_close_agent_panel(cx);
                                         }
@@ -1317,6 +1367,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
+                                        TaskEditEvent::FocusTaskList => {
+                                            this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
                                         TaskEditEvent::Changed => {
                                             this.task_list.update(cx, |list, cx| {
                                                 list.request_live_refresh(cx);
@@ -1341,6 +1395,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
+                                        ObligationsEvent::FocusTaskList => {
+                                            this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
                                         ObligationsEvent::DeleteSelectedTask => {
                                             this.pending_delete_selected_task = true;
                                             cx.notify();
@@ -1354,6 +1412,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.task_list.update(cx, |list, cx| {
                                                 list.set_agent_panel_open(false, cx);
                                             });
+                                            this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
+                                        AgentConfigPanelEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
@@ -1423,6 +1485,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_retarget_obligations: None,
                                 pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
+                                pending_focus_drawer: false,
                                 pending_open_agent: None,
                                 pending_launch_or_focus_agent: None,
                                 pending_close_agent_panel: false,
