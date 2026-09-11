@@ -9,7 +9,9 @@
       "Bash(C:/data/git/tod/target/debug/tod-cli.exe:*)",
       "WebFetch(domain:linear.app)",
       "WebFetch(domain:studio.apollographql.com)",
-      "Bash(./target/debug/tod-cli:*)"
+      "Bash(./target/debug/tod-cli:*)",
+      "Bash(test:*)",
+      "Bash(echo:*)"
     ]
   }
 }

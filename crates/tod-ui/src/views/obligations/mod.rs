@@ -57,6 +57,7 @@ actions!(
         ObligationsCollapse,
         ObligationsExpand,
         ObligationsDelete,
+        ObligationsAddSection,
     ]
 );
 
@@ -85,6 +86,7 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("secondary-down", ObligationsMoveDown, context),
         KeyBinding::new("backspace", ObligationsDelete, context),
         KeyBinding::new("delete", ObligationsDelete, context),
+        KeyBinding::new("s", ObligationsAddSection, context),
         // Inline edit is a multi-line text area: arrows move the cursor as usual,
         // Escape abandons the edit, and Ctrl+Enter commits it.
         KeyBinding::new(
@@ -1404,6 +1406,26 @@ impl ObligationsView {
         }
     }
 
+    fn on_add_section(
+        &mut self,
+        _: &ObligationsAddSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_editing() {
+            return;
+        }
+        let kind = match self.selected_row() {
+            Some(ObligationRow::Group { kind, .. }) => kind,
+            Some(ObligationRow::Section { kind, .. }) => kind,
+            Some(ObligationRow::Item { obligation }) if obligation.kind == KIND_CONSTRAINT => {
+                KIND_CONSTRAINT
+            }
+            _ => KIND_REQUIREMENT,
+        };
+        self.add_section(kind, window, cx);
+    }
+
     fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
@@ -1510,6 +1532,7 @@ impl Render for ObligationsView {
             .on_action(cx.listener(Self::on_collapse))
             .on_action(cx.listener(Self::on_expand))
             .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_add_section))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))
@@ -1631,7 +1654,7 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
             )
             .into_any_element()
     }

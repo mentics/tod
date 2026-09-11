@@ -13,7 +13,6 @@ impl ProcessManifest {
     const BASE: &'static str = "agents/interview/base.md";
     const QUESTION_MAKER: &'static str = "agents/interview/question-maker.md";
     const ANSWER_PROCESSOR: &'static str = "agents/interview/answer-processor.md";
-    const DEEP_DIVE: &'static str = "agents/interview/deep-dive.md";
     const PHASE_PROPOSED: &'static str = "agents/interview/phases/proposed.md";
     const PHASE_DESIGN: &'static str = "agents/interview/phases/design.md";
     const PHASE_PLANNING: &'static str = "agents/interview/phases/planning.md";
