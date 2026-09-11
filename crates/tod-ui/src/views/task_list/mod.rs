@@ -198,7 +198,10 @@ pub enum TaskListEvent {
     CloseObligations,
     CloseAgentPanel,
     OpenLifecycle {
-        _task_id: String,
+        task_id: String,
+        /// Current lifecycle at emit time; the panel re-loads the task's
+        /// live lifecycle when it opens, so this is informational only.
+        #[allow(dead_code)]
         lifecycle: String,
     },
     OpenAgentDetail {
@@ -1124,7 +1127,7 @@ impl TaskListView {
                         self.set_status_line(format!("Opening interview for {}", task.title), cx);
                     } else {
                         cx.emit(TaskListEvent::OpenLifecycle {
-                            _task_id: task_id.to_string(),
+                            task_id: task_id.to_string(),
                             lifecycle: lifecycle.to_string(),
                         });
                         self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
@@ -1140,7 +1143,7 @@ impl TaskListView {
             }
         }
         cx.emit(TaskListEvent::OpenLifecycle {
-            _task_id: task_id.to_string(),
+            task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
         self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
@@ -1149,7 +1152,7 @@ impl TaskListView {
     /// Open the lifecycle transition panel for a task (bypasses interview routing).
     pub fn open_lifecycle_panel(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
         cx.emit(TaskListEvent::OpenLifecycle {
-            _task_id: task_id.to_string(),
+            task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
         });
         self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);

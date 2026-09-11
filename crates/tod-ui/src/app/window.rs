@@ -26,6 +26,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::{error_toast, notification_overlay};
 use crate::views::agent_config_panel::{AgentConfigPanelEvent, AgentConfigPanelView};
 use crate::views::database::DatabaseView;
+use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
@@ -91,6 +92,7 @@ pub struct Shell {
     task_list: Entity<TaskListView>,
     task_edit: Entity<TaskEditView>,
     obligations: Entity<ObligationsView>,
+    lifecycle_panel: Entity<LifecyclePanelView>,
     agent_panel: Entity<AgentConfigPanelView>,
     sessions: Entity<SessionsView>,
     settings: Entity<SettingsView>,
@@ -112,6 +114,9 @@ pub struct Shell {
     pending_open_task_edit: Option<String>,
     pending_close_task_edit: bool,
     pending_retarget_task_edit: Option<String>,
+    pending_open_lifecycle_panel: Option<String>,
+    pending_close_lifecycle_panel: bool,
+    pending_retarget_lifecycle_panel: Option<String>,
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
     pending_retarget_obligations: Option<(String, String, bool)>,
@@ -128,6 +133,7 @@ pub struct Shell {
     _task_list_subscription: Subscription,
     _task_edit_subscription: Subscription,
     _obligations_subscription: Subscription,
+    _lifecycle_panel_subscription: Subscription,
     _agent_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
     _settings_subscription: Subscription,
@@ -337,6 +343,9 @@ impl Shell {
         if self.obligations.read(cx).is_open() {
             self.close_obligations(window, cx);
         }
+        if self.lifecycle_panel.read(cx).is_open() {
+            self.close_lifecycle_panel(window, cx);
+        }
         self.task_edit.update(cx, |edit, cx| {
             edit.open(task_id, window, cx);
         });
@@ -374,6 +383,44 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_lifecycle_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.obligations.read(cx).is_open() {
+            self.close_obligations(window, cx);
+        }
+        if self.task_edit.read(cx).is_open() {
+            self.close_task_edit(window, cx);
+        }
+        self.lifecycle_panel.update(cx, |panel, cx| {
+            panel.open(task_id, cx);
+        });
+        if !self.lifecycle_panel.read(cx).is_open() {
+            self.task_list.update(cx, |list, cx| {
+                list.show_error("Could not open lifecycle panel", window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn close_lifecycle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.lifecycle_panel.update(cx, |panel, cx| {
+            panel.close(cx);
+        });
+        self.task_list.update(cx, |list, cx| {
+            list.restore_focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn retarget_lifecycle_panel(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        if !self.lifecycle_panel.read(cx).is_open() {
+            return;
+        }
+        self.lifecycle_panel.update(cx, |panel, cx| {
+            panel.retarget(task_id, cx);
+        });
+        cx.notify();
+    }
+
     fn open_obligations(
         &mut self,
         task_id: &str,
@@ -386,6 +433,9 @@ impl Shell {
         };
         if self.task_edit.read(cx).is_open() {
             self.close_task_edit(window, cx);
+        }
+        if self.lifecycle_panel.read(cx).is_open() {
+            self.close_lifecycle_panel(window, cx);
         }
         self.obligations.update(cx, |panel, cx| {
             panel.open(node_id, title, window, cx);
@@ -954,6 +1004,7 @@ impl Render for Shell {
         self.drain_pending_task_edit(window, cx);
         self.drain_pending_obligations(window, cx);
         self.drain_pending_agent_panel(window, cx);
+        self.drain_pending_lifecycle_panel(window, cx);
         self.drain_pending_focus_drawer(window, cx);
         self.drain_pending_error_toast(window, cx);
 
@@ -1041,6 +1092,8 @@ impl Shell {
             self.obligations.clone().into_any_element()
         } else if self.task_edit.read(cx).is_open() {
             self.task_edit.clone().into_any_element()
+        } else if self.lifecycle_panel.read(cx).is_open() {
+            self.lifecycle_panel.clone().into_any_element()
         } else if self.agent_panel.read(cx).is_open() {
             self.agent_panel.clone().into_any_element()
         } else {
@@ -1104,8 +1157,25 @@ impl Shell {
             self.agent_panel.update(cx, |panel, cx| {
                 panel.focus_handle(cx).focus(window);
             });
+        } else if self.lifecycle_panel.read(cx).is_open() {
+            self.lifecycle_panel.update(cx, |panel, cx| {
+                panel.focus_handle(cx).focus(window);
+            });
         }
         cx.notify();
+    }
+
+    fn drain_pending_lifecycle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close_lifecycle_panel {
+            self.pending_close_lifecycle_panel = false;
+            self.close_lifecycle_panel(window, cx);
+        }
+        if let Some(task_id) = self.pending_retarget_lifecycle_panel.take() {
+            self.retarget_lifecycle_panel(&task_id, cx);
+        }
+        if let Some(task_id) = self.pending_open_lifecycle_panel.take() {
+            self.open_lifecycle_panel(&task_id, window, cx);
+        }
     }
 
     fn drain_pending_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1390,6 +1460,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let task_edit = cx.new(|cx| TaskEditView::new(window, cx, fleet.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
+                        let lifecycle_panel =
+                            cx.new(|cx| LifecyclePanelView::new(cx, fleet.clone()));
                         let agent_panel = cx.new(|cx| {
                             AgentConfigPanelView::new(
                                 window,
@@ -1460,8 +1532,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         TaskListEvent::CloseObligations => {
                                             this.queue_close_obligations(cx);
                                         }
-                                        TaskListEvent::OpenLifecycle { lifecycle, .. } => {
-                                            eprintln!("tod: lifecycle panel stub — {lifecycle}");
+                                        TaskListEvent::OpenLifecycle { task_id, .. } => {
+                                            if this.lifecycle_panel.read(cx).is_open() {
+                                                this.pending_retarget_lifecycle_panel =
+                                                    Some(task_id.clone());
+                                            } else {
+                                                this.pending_open_lifecycle_panel =
+                                                    Some(task_id.clone());
+                                            }
+                                            cx.notify();
                                         }
                                         TaskListEvent::OpenAgentDetail { task_id, agent_id } => {
                                             if this.agent_panel.read(cx).is_open() {
@@ -1594,6 +1673,22 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
+                            let _lifecycle_panel_subscription = cx.subscribe(
+                                &lifecycle_panel,
+                                |this: &mut Shell, _, event, cx| match event {
+                                    LifecyclePanelEvent::Close => {
+                                        this.task_list.update(cx, |list, cx| {
+                                            list.request_live_refresh(cx);
+                                        });
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
+                                    LifecyclePanelEvent::FocusTaskList => {
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
+                                },
+                            );
                             let _agent_panel_subscription =
                                 cx.subscribe(&agent_panel, |this: &mut Shell, _, event, cx| {
                                     match event {
@@ -1649,6 +1744,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 task_list,
                                 task_edit,
                                 obligations,
+                                lifecycle_panel,
                                 agent_panel,
                                 sessions,
                                 settings,
@@ -1670,6 +1766,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_task_edit: None,
                                 pending_close_task_edit: false,
                                 pending_retarget_task_edit: None,
+                                pending_open_lifecycle_panel: None,
+                                pending_close_lifecycle_panel: false,
+                                pending_retarget_lifecycle_panel: None,
                                 pending_open_obligations: None,
                                 pending_close_obligations: false,
                                 pending_retarget_obligations: None,
@@ -1686,6 +1785,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _task_list_subscription,
                                 _task_edit_subscription,
                                 _obligations_subscription,
+                                _lifecycle_panel_subscription,
                                 _agent_panel_subscription,
                                 _sessions_subscription,
                                 _settings_subscription,

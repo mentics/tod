@@ -130,6 +130,11 @@ pub enum OutlineMutation {
         content_type: String,
         body: String,
     },
+    /// Manually advance (or otherwise change) a task's lifecycle state.
+    SetLifecycle {
+        node_id: Uuid,
+        state: String,
+    },
 }
 
 impl OutlineMutation {
@@ -155,6 +160,7 @@ impl OutlineMutation {
                 | OutlineMutation::RestoreNodeSubtree { .. }
                 | OutlineMutation::ReorderObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
+                | OutlineMutation::SetLifecycle { .. }
         )
     }
 
@@ -338,6 +344,9 @@ impl OutlineMutation {
                     require_spec(conn, *node_id)?;
                 }
                 NodeRepo::new(conn).set_extra_content(*node_id, content_type, body)?;
+            }
+            OutlineMutation::SetLifecycle { node_id, state } => {
+                NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
             }
         }
         Ok(None)

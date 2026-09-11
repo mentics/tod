@@ -182,6 +182,36 @@ pub fn lifecycle_rank(lifecycle: &str) -> usize {
     }
 }
 
+/// Ordered lifecycle states, indexed by `lifecycle_rank`.
+pub const LIFECYCLE_STATES: [&str; 12] = [
+    "proposed", "design", "planning", "ready", "active", "verifying", "review", "approved",
+    "merged", "released", "learn", "done",
+];
+
+/// The state one step ahead of `lifecycle` in `LIFECYCLE_STATES`, if any.
+/// Returns `None` for the last state or an unrecognized one.
+pub fn next_lifecycle(lifecycle: &str) -> Option<&'static str> {
+    let rank = lifecycle_rank(lifecycle);
+    LIFECYCLE_STATES.get(rank + 1).copied()
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn next_lifecycle_advances_through_known_states() {
+        assert_eq!(next_lifecycle("proposed"), Some("design"));
+        assert_eq!(next_lifecycle("learn"), Some("done"));
+    }
+
+    #[test]
+    fn next_lifecycle_none_at_end_or_unknown() {
+        assert_eq!(next_lifecycle("done"), None);
+        assert_eq!(next_lifecycle("bogus"), None);
+    }
+}
+
 /// Simple fuzzy match: query chars must appear in order in text (case-insensitive).
 pub fn fuzzy_matches(query: &str, text: &str) -> bool {
     let query = query.trim();
