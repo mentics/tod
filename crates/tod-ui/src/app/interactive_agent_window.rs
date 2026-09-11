@@ -384,6 +384,10 @@ fn write_terminal_scratch_file(
 ) -> anyhow::Result<std::path::PathBuf> {
     let dir = paths.data_root().join("shells");
     std::fs::create_dir_all(&dir)?;
+    // Canonicalize: the launcher command embeds this path verbatim and is run
+    // from the agent workspace's cwd (a worktree, typically not the data
+    // root), so a relative path here would fail to resolve there.
+    let dir = dir.canonicalize().unwrap_or(dir);
     let path = dir.join(format!("{prefix}-{}.{extension}", uuid::Uuid::new_v4()));
     std::fs::write(&path, contents)?;
     Ok(path)
