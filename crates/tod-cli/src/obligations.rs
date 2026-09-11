@@ -1,7 +1,10 @@
 //! `tod-cli obligations` — read and modify a node's requirements and constraints.
 
 use crate::Invocation;
-use tod_store::fleet::FleetStore;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+use tod_store::fleet::{FleetPaths, FleetStore};
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation};
 use uuid::Uuid;
 
@@ -23,17 +26,26 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
     }
     let command = args.remove(0);
     let opts = Options::parse(&args)?;
-    let store = FleetStore::open(&inv.data_root)
-        .map_err(|err| anyhow::anyhow!("open store at {}: {err}", inv.data_root.display()))?;
 
     match command.as_str() {
-        "list" => list(&store, &opts, inv.json),
-        "show" => show(&store, &opts, inv.json),
-        "add" => add(&store, &opts, inv.json),
-        "update" => update(&store, &opts, inv.json),
-        "delete" => delete(&store, &opts, inv.json),
+        "list" => {
+            let store = open_store(&inv)?;
+            list(&store, &opts, inv.json)
+        }
+        "show" => {
+            let store = open_store(&inv)?;
+            show(&store, &opts, inv.json)
+        }
+        "add" => add(&inv, &opts),
+        "update" => update(&inv, &opts),
+        "delete" => delete(&inv, &opts),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
+}
+
+fn open_store(inv: &Invocation) -> anyhow::Result<FleetStore> {
+    FleetStore::open(&inv.data_root)
+        .map_err(|err| anyhow::anyhow!("open store at {}: {err}", inv.data_root.display()))
 }
 
 #[derive(Default)]
@@ -135,7 +147,7 @@ fn show(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String
     Ok(render(std::slice::from_ref(&row), json))
 }
 
-fn add(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String> {
+fn add(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
     let node = opts.node()?;
     let kind = opts
         .kind
@@ -147,7 +159,7 @@ fn add(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String>
         .ok_or_else(|| anyhow::anyhow!("--body <TEXT> is required"))?;
     let id = Uuid::new_v4();
     apply(
-        store,
+        inv,
         OutlineMutation::CreateObligation {
             obligation_id: Some(id),
             node_id: node,
@@ -157,37 +169,48 @@ fn add(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String>
             body,
         },
     )?;
-    Ok(ack(id, "created", json))
+    Ok(ack(id, "created", inv.json))
 }
 
-fn update(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String> {
+fn update(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
     let id = opts.target()?;
     let body = opts
         .body
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--body <TEXT> is required"))?;
     apply(
-        store,
+        inv,
         OutlineMutation::UpdateObligationBody {
             obligation_id: id,
             body,
         },
     )?;
-    Ok(ack(id, "updated", json))
+    Ok(ack(id, "updated", inv.json))
 }
 
-fn delete(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String> {
+fn delete(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
     let id = opts.target()?;
     apply(
-        store,
+        inv,
         OutlineMutation::DeleteObligation { obligation_id: id },
     )?;
-    Ok(ack(id, "deleted", json))
+    Ok(ack(id, "deleted", inv.json))
 }
 
-/// Enqueue through the same mutation path the GUI uses, then flush so the change
-/// is durable before the process exits.
-fn apply(store: &FleetStore, mutation: OutlineMutation) -> anyhow::Result<()> {
+/// Forward to a live `tod` GUI instance over the mutation socket when one is
+/// running against this data root (avoids ever touching the exclusive
+/// `FleetLock` it holds); otherwise fall back to opening the store directly,
+/// exactly as before this feature existed.
+fn apply(inv: &Invocation, mutation: OutlineMutation) -> anyhow::Result<()> {
+    if let Some(reply) = try_forward(&inv.data_root, &mutation) {
+        let reply = reply?;
+        if let Some(msg) = reply.strip_prefix("err ") {
+            anyhow::bail!("{msg}");
+        }
+        return Ok(());
+    }
+
+    let store = open_store(inv)?;
     store
         .enqueue_outline(mutation)
         .map_err(|err| anyhow::anyhow!("enqueue: {err}"))?;
@@ -196,6 +219,37 @@ fn apply(store: &FleetStore, mutation: OutlineMutation) -> anyhow::Result<()> {
         .flush()
         .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
     Ok(())
+}
+
+/// Returns `None` when no live instance is reachable (no port file, unreadable,
+/// or connect failed — including a stale port file left by a crashed process),
+/// signaling the caller to use the direct-open fallback. Returns `Some(Err(_))`
+/// only for errors that happened *after* a connection was established.
+fn try_forward(data_root: &std::path::Path, mutation: &OutlineMutation) -> Option<anyhow::Result<String>> {
+    let paths = FleetPaths::new(data_root).ok()?;
+    let port: u16 = std::fs::read_to_string(paths.mutation_port())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+
+    let payload = match serde_json::to_string(mutation) {
+        Ok(p) => p,
+        Err(err) => return Some(Err(anyhow::anyhow!("serialize mutation: {err}"))),
+    };
+    if let Err(err) = writeln!(stream, "{payload}") {
+        return Some(Err(anyhow::anyhow!("send mutation: {err}")));
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => Some(Err(anyhow::anyhow!("mutation socket closed without a reply"))),
+        Ok(_) => Some(Ok(line.trim_end_matches(['\r', '\n']).to_string())),
+        Err(err) => Some(Err(anyhow::anyhow!("read reply: {err}"))),
+    }
 }
 
 fn ack(id: Uuid, verb: &str, json: bool) -> String {

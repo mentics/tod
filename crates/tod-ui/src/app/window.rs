@@ -96,6 +96,7 @@ pub struct Shell {
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
     fleet: Arc<FleetStore>,
+    _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
     agent: SharedAgent,
     traffic_log: SharedAgentTrafficLog,
     transcript_window: TranscriptWindowControl,
@@ -1336,6 +1337,17 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         cx.new(|cx| Root::new(view, window, cx))
                     }
                     Ok(fleet) => {
+                        // Only the one long-lived GUI process should run this listener, so it
+                        // starts here rather than inside `FleetStore::open` (which `tod-cli`
+                        // also calls, as a one-shot process, when no GUI instance is running).
+                        let mutation_socket = tod_store::fleet::mutation_socket::start(
+                            fleet.clone(),
+                            fleet.paths().root(),
+                        )
+                        .inspect_err(|err| {
+                            tracing::error!("mutation socket failed to start: {err:#}");
+                        })
+                        .ok();
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
                         let app_settings = TodSettings::load(&paths).unwrap_or_default();
@@ -1638,6 +1650,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 settings,
                                 database,
                                 fleet: fleet.clone(),
+                                _mutation_socket: mutation_socket,
                                 agent: agent.clone(),
                                 traffic_log: traffic_log.clone(),
                                 transcript_window: transcript_window.clone(),

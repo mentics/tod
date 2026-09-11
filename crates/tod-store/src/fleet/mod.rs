@@ -5,6 +5,7 @@ pub mod explore;
 pub mod launch;
 pub mod lock;
 pub mod migration;
+pub mod mutation_socket;
 pub mod notices;
 pub mod open_zed;
 pub mod paths;

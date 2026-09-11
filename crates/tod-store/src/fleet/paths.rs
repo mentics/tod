@@ -12,6 +12,7 @@ pub struct FleetPaths {
     stale_copy: PathBuf,
     pre_upgrade_bak: PathBuf,
     held_writes: PathBuf,
+    mutation_port: PathBuf,
 }
 
 impl FleetPaths {
@@ -25,6 +26,7 @@ impl FleetPaths {
             stale_copy: root.join("tod.stale-copy"),
             pre_upgrade_bak: root.join("tod.pre-upgrade.bak"),
             held_writes: root.join("tod.held-writes"),
+            mutation_port: root.join("tod.mutation-port"),
             root,
         })
     }
@@ -59,6 +61,13 @@ impl FleetPaths {
 
     pub fn held_writes(&self) -> &Path {
         &self.held_writes
+    }
+
+    /// Port file for the always-on outline-mutation forwarding listener (see
+    /// `fleet::mutation_socket`). Lets a one-shot `tod-cli` process discover a
+    /// live GUI instance without a fixed, potentially-colliding port.
+    pub fn mutation_port(&self) -> &Path {
+        &self.mutation_port
     }
 
     /// Staging path for atomic pre-upgrade backup creation.
