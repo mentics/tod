@@ -109,7 +109,7 @@ impl SettingsSection {
         match self {
             Self::Agents => "Agents",
             Self::QuestionMaker => "Question maker",
-            Self::AnswerProcessor => "Answer processor",
+            Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
             Self::Logging => "Logging",
         }
@@ -134,8 +134,8 @@ impl SettingsSection {
                 Agent(AgentRole::Interview),
                 ChatLaunchMode,
             ],
-            Self::QuestionMaker => &[ReplenishThreshold, SecondQuestionMaker, RunsPerSession],
-            Self::AnswerProcessor => &[PoolSize, AnswersPerSession],
+            Self::QuestionMaker => &[ReplenishThreshold],
+            Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
             Self::Workspaces => &[WorktreeBackend, TreehouseWorktreesRoot, TerminalProgram],
             Self::Logging => &[LogLevel, LogMaxSize],
         }
@@ -147,10 +147,9 @@ enum SettingField {
     /// One line per role: platform, model, effort. `-`/`=` cycle the platform.
     Agent(AgentRole),
     ReplenishThreshold,
-    SecondQuestionMaker,
-    RunsPerSession,
-    PoolSize,
-    AnswersPerSession,
+    ContextBudget,
+    PromptCacheIdle,
+    AnsweredHistoryCap,
     WorktreeBackend,
     TreehouseWorktreesRoot,
     TerminalProgram,
@@ -166,10 +165,9 @@ impl SettingField {
             Self::Agent(AgentRole::Chat) => "chat-agent",
             Self::Agent(AgentRole::Interview) => "interview-agent",
             Self::ReplenishThreshold => "replenish",
-            Self::SecondQuestionMaker => "second",
-            Self::RunsPerSession => "question-maker-runs-per-session",
-            Self::PoolSize => "pool-size",
-            Self::AnswersPerSession => "answers-per-session",
+            Self::ContextBudget => "context-budget",
+            Self::PromptCacheIdle => "prompt-cache-idle",
+            Self::AnsweredHistoryCap => "answered-history-cap",
             Self::WorktreeBackend => "worktree-backend",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
@@ -532,10 +530,9 @@ impl SettingsView {
         match self.selected_field() {
             SettingField::Agent(role) => self.cycle_platform_for(role, delta, cx),
             SettingField::ReplenishThreshold => self.step_replenish(delta, cx),
-            SettingField::SecondQuestionMaker => self.step_second(delta, cx),
-            SettingField::RunsPerSession => self.step_question_maker_runs_per_session(delta, cx),
-            SettingField::PoolSize => self.step_pool_size(delta, cx),
-            SettingField::AnswersPerSession => self.step_answers_per_session(delta, cx),
+            SettingField::ContextBudget => self.step_context_budget(delta, cx),
+            SettingField::PromptCacheIdle => self.step_prompt_cache_idle(delta, cx),
+            SettingField::AnsweredHistoryCap => self.step_answered_history_cap(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
             SettingField::ChatLaunchMode => self.cycle_chat_launch_mode(delta, cx),
             SettingField::TreehouseWorktreesRoot | SettingField::TerminalProgram => {}
@@ -720,32 +717,35 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn step_second(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.question_maker.second_question_maker_threshold = step_u32(
-            self.settings.question_maker.second_question_maker_threshold,
-            delta,
-        );
+    fn step_context_budget(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let budget = &mut self.settings.interview_context.context_budget_tokens;
+        *budget = if delta >= 0 {
+            budget.saturating_add(10_000)
+        } else {
+            budget.saturating_sub(10_000).max(10_000)
+        };
         self.schedule_save(cx);
         cx.notify();
     }
 
-    fn step_question_maker_runs_per_session(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.question_maker.runs_per_session =
-            step_u32(self.settings.question_maker.runs_per_session, delta);
+    fn step_prompt_cache_idle(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let minutes = &mut self.settings.interview_context.prompt_cache_idle_minutes;
+        *minutes = if delta >= 0 {
+            minutes.saturating_add(1)
+        } else {
+            minutes.saturating_sub(1).max(1)
+        };
         self.schedule_save(cx);
         cx.notify();
     }
 
-    fn step_pool_size(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.answer_processor.session_pool_size =
-            step_u32(self.settings.answer_processor.session_pool_size, delta);
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
-    fn step_answers_per_session(&mut self, delta: i32, cx: &mut Context<Self>) {
-        self.settings.answer_processor.answers_per_session =
-            step_u32(self.settings.answer_processor.answers_per_session, delta);
+    fn step_answered_history_cap(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let cap = &mut self.settings.interview_context.answered_history_cap;
+        *cap = if delta >= 0 {
+            cap.saturating_add(10)
+        } else {
+            cap.saturating_sub(10).max(10)
+        };
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1160,36 +1160,11 @@ impl SettingsView {
                     self,
                     SettingField::ReplenishThreshold,
                     self.settings.question_maker.replenish_threshold.to_string(),
-                    "Replenish below",
-                    "Start a question maker run when open questions fall under this count. Default 8.",
+                    "Target open questions",
+                    "Start a question maker turn when open questions fall below this count. A second answer processor session starts when unprocessed answers exceed half of it. Default 8.",
                     theme,
                     |this, _, cx| this.step_replenish(-1, cx),
                     |this, _, cx| this.step_replenish(1, cx),
-                ))
-                .child(stepper_row(
-                    cx,
-                    self,
-                    SettingField::SecondQuestionMaker,
-                    self.settings
-                        .question_maker
-                        .second_question_maker_threshold
-                        .to_string(),
-                    "Second question maker below",
-                    "While one question maker is already running, start a second if open count drops under this lower threshold. Max two runs. Default 2.",
-                    theme,
-                    |this, _, cx| this.step_second(-1, cx),
-                    |this, _, cx| this.step_second(1, cx),
-                ))
-                .child(stepper_row(
-                    cx,
-                    self,
-                    SettingField::RunsPerSession,
-                    self.settings.question_maker.runs_per_session.to_string(),
-                    "Runs per session",
-                    "After the Nth question maker response on one session, close that session and open a fresh one. Default 8.",
-                    theme,
-                    |this, _, cx| this.step_question_maker_runs_per_session(-1, cx),
-                    |this, _, cx| this.step_question_maker_runs_per_session(1, cx),
                 ))
                 .into_any_element(),
             SettingsSection::AnswerProcessor => v_flex()
@@ -1197,30 +1172,44 @@ impl SettingsView {
                 .child(stepper_row(
                     cx,
                     self,
-                    SettingField::PoolSize,
+                    SettingField::ContextBudget,
                     self.settings
-                        .answer_processor
-                        .session_pool_size
+                        .interview_context
+                        .context_budget_tokens
                         .to_string(),
-                    "Maximum session pool size",
-                    "Cap on concurrent open answer-processor sessions. Default 4.",
+                    "Context budget (tokens)",
+                    "An interview agent session rotates to a fresh snapshot once its estimated context passes this. Default 100000.",
                     theme,
-                    |this, _, cx| this.step_pool_size(-1, cx),
-                    |this, _, cx| this.step_pool_size(1, cx),
+                    |this, _, cx| this.step_context_budget(-1, cx),
+                    |this, _, cx| this.step_context_budget(1, cx),
                 ))
                 .child(stepper_row(
                     cx,
                     self,
-                    SettingField::AnswersPerSession,
+                    SettingField::PromptCacheIdle,
                     self.settings
-                        .answer_processor
-                        .answers_per_session
+                        .interview_context
+                        .prompt_cache_idle_minutes
                         .to_string(),
-                    "Answers per session",
-                    "After the Nth answer-processor response on one session, close that session. Default 16.",
+                    "Prompt cache idle (minutes)",
+                    "A session idle longer than this, and much larger than its snapshot, starts fresh instead of resuming uncached. Default 5.",
                     theme,
-                    |this, _, cx| this.step_answers_per_session(-1, cx),
-                    |this, _, cx| this.step_answers_per_session(1, cx),
+                    |this, _, cx| this.step_prompt_cache_idle(-1, cx),
+                    |this, _, cx| this.step_prompt_cache_idle(1, cx),
+                ))
+                .child(stepper_row(
+                    cx,
+                    self,
+                    SettingField::AnsweredHistoryCap,
+                    self.settings
+                        .interview_context
+                        .answered_history_cap
+                        .to_string(),
+                    "Answered questions in a snapshot",
+                    "Most recent answered questions included when an interview agent session starts. Default 100.",
+                    theme,
+                    |this, _, cx| this.step_answered_history_cap(-1, cx),
+                    |this, _, cx| this.step_answered_history_cap(1, cx),
                 ))
                 .into_any_element(),
             SettingsSection::Workspaces => v_flex()

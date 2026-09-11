@@ -1,40 +1,27 @@
-## Design interview
+# Phase: design
 
-**Lifecycle:** `design` → forward gate **`planning`** when complete.
+Leads to **planning**. Settle how the requirements will be met, deeply enough that a plan can be written without re-opening decisions.
 
-### Coverage targets
+## Produces
 
-Gather until planning can start with enough design intent:
+- **Design content** — decisions and their reasons, appended to the node's design (`content` type `design`, `append: true`). One decision per addition, stated so a planner can act on it.
+- **Obligation changes** when a design decision binds or reveals requirements.
 
-- What **done** looks like (commands/checks, observable behavior)
-- **Irreversible choices** and named **constructions**
-- Open design questions resolved or explicitly deferred with decision trees
-- User-visible **UI** appearance/layout (human Accept before exit unless waived)
+Step-by-step implementation detail is **parked** for planning.
 
-### Probe
+## Ask about, roughly in order
 
-- Prefer principles/clusters; do not re-ask settled obligations
-- Consume phase-overflow items tagged **`design`** — promote into design content or discuss with the human; mark consumed when done
-- **Do not** probe optional metadata (Links, non-goals) unless the human volunteers
-- Record waivers in the transcript
+1. **Parked detail** for design — the user already volunteered it, so confirm it rather than asking again.
+2. **Irreversible or expensive choices** — data shapes, storage, protocols, public interfaces, named constructions.
+3. **What "done" looks like** — the observable behavior or checks that prove each requirement.
+4. **Appearance and layout** of anything the user will see. The user must accept these; don't infer them.
+5. **Open unknowns** — resolve each, or record it as a deliberate spike with a decision tree: *if we find X, we do Y*.
 
-**Implementation planning belongs in the planning interview — not here.**
+When external references matter, say whether each one is **required** or only a **guideline**.
 
-### Outcomes (this phase)
+## Done when
 
-| Belongs here | Does not belong here |
-|--|--|
-| Design extra content on the node (intention, constructions) | Step-by-step implementation plan |
-| Obligation updates at the correct `layer` when design decisions bind requirements | Detailed vendor/tool selection unless it blocks design |
-
-External references in design content: label **required** vs **guideline**.
-
-When the node has user-visible UI, hand off to the **visual design** side tool when appropriate; link accepted packages from design content.
-
-### Completion
-
-Design-phase information sufficient for an actionable plan; deferred spikes have explicit **decision trees** (outcome → action). Design content may be deliberately omitted when obligations + plan would suffice — note waiver in transcript.
-
-### Phase overflow
-
-Park implementation detail and planning steps in `to-process.md` with `suggested_phase: planning`. Read open overflow before asking.
+- Every irreversible choice is decided or has a decision tree.
+- Each requirement has an observable way to be verified.
+- User-visible appearance is accepted, or the user has waived it.
+- No open memory is parked for design.

@@ -11,7 +11,6 @@ pub enum AgentCategory {
     Fleet,
     QuestionMaker,
     AnswerProcessor,
-    DeepDive,
 }
 
 impl AgentCategory {
@@ -20,7 +19,6 @@ impl AgentCategory {
             Self::Fleet => "Fleet",
             Self::QuestionMaker => "Question maker",
             Self::AnswerProcessor => "Answer",
-            Self::DeepDive => "Deep dive",
         }
     }
 }
@@ -65,7 +63,6 @@ pub struct InterviewAgentCounts {
     pub answer_active: u32,
     pub answer_pool: u32,
     pub answer_max: u32,
-    pub deep_dive_in_flight: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -219,12 +216,6 @@ pub fn format_status_bar(groups: &AgentStatusGroups) -> String {
             groups.interview.answer_active, groups.interview.answer_max
         ));
     }
-    if groups.interview.deep_dive_in_flight > 0 {
-        parts.push(format!(
-            "Deep dive {}",
-            groups.interview.deep_dive_in_flight
-        ));
-    }
     if groups.fleet.total > 0 {
         let mut agents = if groups.fleet.total == 1 {
             "1 agent".to_string()
@@ -285,7 +276,6 @@ mod tests {
                 answer_active: 2,
                 answer_pool: 2,
                 answer_max: 5,
-                deep_dive_in_flight: 0,
             },
             fleet: FleetAgentCounts {
                 total: 3,

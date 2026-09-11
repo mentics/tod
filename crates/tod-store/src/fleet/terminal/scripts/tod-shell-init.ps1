@@ -2,7 +2,8 @@ param(
     [Parameter(Mandatory)][string]$TodShellId,
     [Parameter(Mandatory)][string]$TodStateDir,
     [string]$TodCwd = "",
-    [string]$TodStartupCommand = ""
+    [string]$TodStartupCommand = "",
+    [string]$TodBackend = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,7 +18,8 @@ public class TodWin32 {
 
 $shellPid = $PID
 $hwnd = [int64]0
-$backend = $env:TOD_TERMINAL_BACKEND
+$backend = $TodBackend
+if (-not $backend) { $backend = $env:TOD_TERMINAL_BACKEND }
 if (-not $backend) { $backend = "windows" }
 
 $p = Get-Process -Id $shellPid -ErrorAction SilentlyContinue

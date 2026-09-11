@@ -44,7 +44,7 @@ May spawn subagents across code areas when separation is clear; parent merges re
 When child nodes are added or scope evolves:
 
 - Ensure new work conforms to this node's obligations (report conflicts; do not silently override).
-- Capture clarifications in transcripts.
+- Capture clarifications as obligations (with permission) or interview memory.
 - Update obligations only with explicit human permission (app persists).
 
 ### Child-node decomposition (optional)
@@ -70,4 +70,4 @@ When implementation is verified complete against plan, design, and obligations, 
 
 ## Blockers
 
-Requirement gap, needed spike, or unresolvable conflict → paused/blocked; capture new user info in transcripts when provided.
+Requirement gap, needed spike, or unresolvable conflict → paused/blocked; capture new user info in interview memory when provided.

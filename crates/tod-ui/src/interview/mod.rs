@@ -9,10 +9,7 @@ pub mod agent;
 pub mod settings;
 pub mod views;
 
-pub use tod_core::interview::{
-    bootstrap, config, kickoff, paths, question_feedback, queue, queue_watcher, replenishment,
-    transcript,
-};
+pub use tod_core::interview::{bootstrap, paths, question_feedback};
 
 pub use tod_core::interview::{TaskListProceedContext, interview_work_remains};
 

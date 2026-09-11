@@ -34,6 +34,13 @@ tod --verify-process-bundle
 
 CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. Code behind `#[cfg(target_os = "...")]` is only type-checked on the matching OS — a change can pass locally and still fail on another platform until CI or a same-OS build runs it.
 
+### Running builds/tests without getting stuck
+
+- Always run `cargo check` / `cargo test` / `cargo build` with an explicit ~120s timeout, even when you expect them to be fast. Tests can hang intermittently (a spawned process, a port, a wait on stdin); a timeout is cheap insurance and should be the default, not a special case. If 120s proves too short for a particular command, raise it for that command rather than dropping the policy.
+- Scope test runs to what the change actually touches (`cargo test -p tod-store ...`) rather than defaulting to `cargo test --workspace`, which pulls in the full GPUI build. Use `--workspace` when the change is broad or you need the CI-equivalent check.
+- Piping through `grep`/`head` to cut noise is fine and preferred — don't remove that just to see more output.
+- If you do intentionally background a long-running command (e.g. an ultra review, a release build), don't just sit idle waiting on it — either continue other work, or if there's nothing else to do, poll it periodically (sleep, then check) rather than blocking indefinitely on a single wait.
+
 ### `--agent mock` for UI work
 
 For any UI-facing change, prefer driving the real app over guessing: `--agent mock` gives an instant, in-process fake agent (no real API calls), and `--no-focus` lets it run without stealing OS focus while you keep working. `--agent cursor` drives the real Cursor Agent CLI over ACP and is only for rare protocol-level smoke tests.
@@ -63,7 +70,7 @@ reverse.**
 When adding code, put it in the lowest layer that can hold it. In particular, do
 not reach into `tod-core` or `tod-store` from `tod-agent`: pass what the provider
 needs in as a parameter instead (see `CursorAcpProvider::with_write_roots` and
-the assembled-prompt argument to `start_deep_dive_chat` for the established
+the assembled-prompt argument to `send_session_turn` for the established
 pattern).
 
 ### Data root resolution
@@ -134,7 +141,7 @@ A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `mi
 
 ### `crates/tod-core::interview` — conversational task creation
 
-The interview flow turns a running conversation with an agent into obligations/tasks: `kickoff.rs` starts a session, `queue.rs`/`queue_watcher.rs` manage question flow, `replenishment.rs` decides when to ask for more, `routing.rs` decides what happens next (`interview_work_remains` gates whether the task list can proceed). `db.rs` is the interview-session store (separate from the fleet/outline stores in `tod-store`).
+The interview flow turns a conversation with two agents (question maker, answer processor) into obligations. All interview data — questions (queue and history), agent memory, a trigger-fed change log, and agent sessions — lives in the database (`tod_store::interview`, schema v15); every write is an `InterviewCommand` run on the fleet writer and attributed to an actor (the user, or an agent session via `TOD_INTERVIEW_ACTOR`). `driver.rs` decides when each agent takes a turn and which session it goes to (reuse, resume, or rotate to a fresh snapshot); `context.rs` builds the snapshot a session gets once and the per-turn delta of changes it did not make itself; `client.rs` is how `tod-cli` and the mock agents reach the data (mutation socket when the app is running, direct store otherwise); `mock.rs` plays both agents for `--agent mock`; `routing.rs` decides completion (`interview_work_remains` gates whether the task list can proceed). `db.rs` is the interview-session store. Spec: `doc/new-reqs/interview-protocol.md`.
 
 ### `crates/tod-ui::views` and `ui`
 

@@ -4,7 +4,7 @@
 
 ## On entry
 
-1. Read lifecycle state, obligations, design/plan content, session transcripts, and evidence from the full lifecycle.
+1. Read lifecycle state, obligations, design/plan content, the interview history (answered questions and interview memory), and evidence from the full lifecycle.
 2. If a learn retrospective already ran with findings recorded → verify completeness and proceed to exit.
 
 ## Responsibilities
@@ -22,7 +22,7 @@ Ask:
 
 ### Capture findings
 
-Record outcomes in evidence notes and/or session transcripts. **Process improvements** when warranted: propose new **gate criteria** rows or edits to state agent role files — only when there is something concrete to improve. The app or human applies catalog and bundle changes; do not assume filesystem access to the process bundle.
+Record outcomes in evidence notes and/or interview memory. **Process improvements** when warranted: propose new **gate criteria** rows or edits to state agent role files — only when there is something concrete to improve. The app or human applies catalog and bundle changes; do not assume filesystem access to the process bundle.
 
 No requirement to change the process every time—only that the retrospective **ran** and outcomes are captured when there is something to improve.
 

@@ -3,6 +3,7 @@
 pub mod credentials;
 pub mod fleet;
 pub mod install;
+pub mod interview;
 pub mod linear;
 pub mod log_level;
 pub mod outline;
@@ -34,7 +35,7 @@ pub use paths::{
     resolve_startup_data_root, set_data_root,
 };
 pub use settings::{
-    AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, AnswerProcessorSettings,
+    AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, InterviewContextSettings,
     ChatLaunchMode, DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
     PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry,
     WorktreeBackend,

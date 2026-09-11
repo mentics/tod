@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 14;
+pub const CURRENT_USER_VERSION: i32 = 15;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -161,6 +161,220 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v13_to_v14(conn)?;
         conn.pragma_update(None, "user_version", 14)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 15 {
+        migrate_v14_to_v15(conn)?;
+        conn.pragma_update(None, "user_version", 15)?;
+    }
+    Ok(())
+}
+
+/// Interview data in the database: questions (queue + history), agent memory,
+/// agent sessions, and a change log fed by triggers so interview agents can
+/// receive only what changed since their last turn.
+fn migrate_v14_to_v15(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS interview_questions (
+            id                  BLOB PRIMARY KEY NOT NULL,
+            node_id             BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            session_id          BLOB REFERENCES interview_sessions(id) ON DELETE SET NULL,
+            seq                 INTEGER NOT NULL,
+            phase               TEXT NOT NULL CHECK (phase IN ('requirements', 'design', 'planning')),
+            author              TEXT NOT NULL CHECK (author IN ('question-maker', 'answer-processor', 'user')),
+            status              TEXT NOT NULL CHECK (status IN ('open', 'answered', 'deferred', 'withdrawn')),
+            covers              TEXT NOT NULL DEFAULT '[]',
+            context             TEXT,
+            question            TEXT,
+            intent              TEXT,
+            recommend           TEXT,
+            options             TEXT NOT NULL DEFAULT '[]',
+            proposal            TEXT,
+            answer_option       INTEGER,
+            answer_text         TEXT,
+            answer_edited_text  TEXT,
+            applied             TEXT,
+            processed_at        INTEGER,
+            processed_summary   TEXT,
+            withdrawn_by        TEXT CHECK (withdrawn_by IN ('question-maker', 'answer-processor', 'user')),
+            withdrawn_reason    TEXT,
+            created_at          INTEGER NOT NULL,
+            answered_at         INTEGER,
+            updated_at          INTEGER NOT NULL,
+            UNIQUE (node_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_interview_questions_node
+            ON interview_questions(node_id, status, seq);
+
+        CREATE TABLE IF NOT EXISTS interview_memory (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            seq          INTEGER NOT NULL,
+            kind         TEXT NOT NULL CHECK (kind IN ('context', 'handoff', 'parked', 'plan')),
+            phase        TEXT CHECK (phase IN ('requirements', 'design', 'planning')),
+            status       TEXT NOT NULL CHECK (status IN ('open', 'done')),
+            author       TEXT NOT NULL CHECK (author IN ('question-maker', 'answer-processor', 'user')),
+            question_seq INTEGER,
+            body         TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            UNIQUE (node_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_interview_memory_node
+            ON interview_memory(node_id, kind, status);
+
+        CREATE TABLE IF NOT EXISTS interview_changes (
+            rev        INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id    BLOB NOT NULL,
+            entity     TEXT NOT NULL CHECK (entity IN ('question', 'memory', 'obligation', 'content')),
+            entity_id  BLOB NOT NULL,
+            op         TEXT NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
+            fields     TEXT,
+            actor      TEXT NOT NULL,
+            at         INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_interview_changes_node ON interview_changes(node_id, rev);
+        CREATE INDEX IF NOT EXISTS idx_interview_changes_entity ON interview_changes(entity_id, rev);
+
+        CREATE TABLE IF NOT EXISTS interview_agent_sessions (
+            id                    BLOB PRIMARY KEY NOT NULL,
+            node_id               BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            interview_session_id  BLOB REFERENCES interview_sessions(id) ON DELETE SET NULL,
+            phase                 TEXT NOT NULL,
+            role                  TEXT NOT NULL CHECK (role IN ('question-maker', 'answer-processor')),
+            lane                  INTEGER NOT NULL DEFAULT 0,
+            agent_session_id      TEXT,
+            synced_rev            INTEGER NOT NULL,
+            est_tokens            INTEGER NOT NULL DEFAULT 0,
+            snapshot_tokens       INTEGER NOT NULL DEFAULT 0,
+            turns                 INTEGER NOT NULL DEFAULT 0,
+            state                 TEXT NOT NULL CHECK (state IN ('live', 'retired')),
+            created_at            INTEGER NOT NULL,
+            last_turn_at          INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_interview_agent_sessions_key
+            ON interview_agent_sessions(node_id, phase, role, state);
+
+        CREATE TABLE IF NOT EXISTS interview_actor (
+            id     INTEGER PRIMARY KEY CHECK (id = 1),
+            actor  TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO interview_actor (id, actor) VALUES (1, 'user');
+        ",
+    )?;
+
+    let triggers = format!(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_ic_obligation_insert AFTER INSERT ON node_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'obligation', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_obligation_update AFTER UPDATE ON node_obligations
+        WHEN OLD.node_id = NEW.node_id
+            AND (OLD.body IS NOT NEW.body OR OLD.section IS NOT NEW.section OR OLD.kind IS NOT NEW.kind)
+        BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'obligation', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
+                    || CASE WHEN OLD.section IS NOT NEW.section THEN 'section,' ELSE '' END
+                    || CASE WHEN OLD.kind IS NOT NEW.kind THEN 'kind,' ELSE '' END, ','),
+                {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_obligation_move AFTER UPDATE ON node_obligations
+        WHEN OLD.node_id != NEW.node_id BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'obligation', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_obligation_delete AFTER DELETE ON node_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_insert AFTER INSERT ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_update AFTER UPDATE ON node_extra_content
+        WHEN OLD.body IS NOT NEW.body BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'update',
+                CASE WHEN length(NEW.body) > length(OLD.body)
+                        AND substr(NEW.body, 1, length(OLD.body)) = OLD.body
+                    THEN 'append:' || length(CAST(OLD.body AS BLOB)) ELSE 'body' END,
+                {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_delete AFTER DELETE ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'content', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_question_insert AFTER INSERT ON interview_questions BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'question', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_question_update AFTER UPDATE ON interview_questions
+        WHEN OLD.status IS NOT NEW.status OR OLD.answer_option IS NOT NEW.answer_option
+            OR OLD.answer_text IS NOT NEW.answer_text OR OLD.answer_edited_text IS NOT NEW.answer_edited_text
+            OR OLD.applied IS NOT NEW.applied OR OLD.processed_summary IS NOT NEW.processed_summary
+            OR OLD.withdrawn_reason IS NOT NEW.withdrawn_reason
+        BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'question', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.status IS NOT NEW.status THEN 'status,' ELSE '' END
+                    || CASE WHEN OLD.answer_option IS NOT NEW.answer_option
+                            OR OLD.answer_text IS NOT NEW.answer_text
+                            OR OLD.answer_edited_text IS NOT NEW.answer_edited_text THEN 'answer,' ELSE '' END
+                    || CASE WHEN OLD.applied IS NOT NEW.applied THEN 'applied,' ELSE '' END
+                    || CASE WHEN OLD.processed_summary IS NOT NEW.processed_summary THEN 'processed,' ELSE '' END
+                    || CASE WHEN OLD.withdrawn_reason IS NOT NEW.withdrawn_reason THEN 'withdrawn,' ELSE '' END, ','),
+                {ACTOR}, {NOW});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_memory_insert AFTER INSERT ON interview_memory BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'memory', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_memory_update AFTER UPDATE ON interview_memory
+        WHEN OLD.body IS NOT NEW.body OR OLD.status IS NOT NEW.status BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'memory', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
+                    || CASE WHEN OLD.status IS NOT NEW.status THEN 'status,' ELSE '' END, ','),
+                {ACTOR}, {NOW});
+        END;
+        "
+    );
+    tx.execute_batch(&triggers)?;
+
+    for (column, ddl) in [
+        (
+            "question_maker_state",
+            "ALTER TABLE interview_sessions ADD COLUMN question_maker_state TEXT NOT NULL DEFAULT 'idle'",
+        ),
+        (
+            "exhausted_reason",
+            "ALTER TABLE interview_sessions ADD COLUMN exhausted_reason TEXT",
+        ),
+    ] {
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('interview_sessions') WHERE name = ?1",
+            [column],
+            |row| row.get(0),
+        )?;
+        if exists == 0 {
+            tx.execute_batch(ddl)?;
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '15')",
+        [],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

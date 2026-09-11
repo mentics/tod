@@ -97,6 +97,17 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    pub fn update_section(&self, id: Uuid, section: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET section = ?1, updated_at = ?2 WHERE id = ?3",
+            params![section, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let Some(row) = self.get(id)? else {
             return Ok(None);

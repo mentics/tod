@@ -9,18 +9,14 @@ First turn of each pooled session (order matters):
 1. **Role** — `interview/question-maker.md` or `interview/answer-processor.md`
 2. **Interview phase** — `interview/phases/{proposed|design|planning}.md` (from session phase)
 3. **Shared conventions** — `interview/base.md`
-4. **Scope export** — obligations + node context
-5. **Session paths** — config, scratchpad, queue
 
-Subsequent turns on a reused session: session paths + turn instruction only.
+Then a compact **node snapshot**, once per agent session. Every later turn carries only the **changes** since that session's previous turn, excluding its own writes, plus the turn instruction. Sessions rotate to a fresh snapshot instead of using `/compact`. Agents read and write through `tod-cli`. See [doc/new-reqs/interview-protocol.md](../../../doc/new-reqs/interview-protocol.md).
 
 | Phase key | Phase doc |
 |--|--|
 | `task-requirements-interview`, `project-defining` | [phases/proposed.md](interview/phases/proposed.md) |
 | `design-interview` | [phases/design.md](interview/phases/design.md) |
 | `planning-interview` | [phases/planning.md](interview/phases/planning.md) |
-
-Deep dive: [interview/deep-dive.md](interview/deep-dive.md) each turn.
 
 ## State agents
 

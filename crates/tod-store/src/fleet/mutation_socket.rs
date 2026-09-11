@@ -11,6 +11,7 @@
 
 use crate::fleet::paths::FleetPaths;
 use crate::fleet::store::FleetStore;
+use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::outline::OutlineMutation;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -95,8 +96,9 @@ fn handle_client(stream: TcpStream, store: &FleetStore) {
 
         let reply = apply_line(store, trimmed);
         let msg = match reply {
-            Ok(()) => "ok\n".to_string(),
-            Err(err) => format!("err {err}\n"),
+            Ok(payload) if payload.is_empty() => "ok\n".to_string(),
+            Ok(payload) => format!("ok {payload}\n"),
+            Err(err) => format!("err {}\n", err.replace(['\r', '\n'], " ")),
         };
         if writer.write_all(msg.as_bytes()).is_err() || writer.flush().is_err() {
             break;
@@ -104,7 +106,40 @@ fn handle_client(stream: TcpStream, store: &FleetStore) {
     }
 }
 
-fn apply_line(store: &FleetStore, line: &str) -> Result<(), String> {
+/// An attributed request: `{"actor": …, "interview": {…}}` or
+/// `{"actor": …, "outline": {…}}`. A bare `OutlineMutation` is still accepted
+/// and attributed to the user.
+#[derive(serde::Deserialize)]
+struct Request {
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    outline: Option<OutlineMutation>,
+    #[serde(default)]
+    interview: Option<InterviewCommand>,
+}
+
+/// Returns the reply payload (empty for plain acknowledgements).
+fn apply_line(store: &FleetStore, line: &str) -> Result<String, String> {
+    if let Ok(request) = serde_json::from_str::<Request>(line) {
+        let actor = request.actor.as_deref().unwrap_or(ACTOR_USER);
+        if let Some(command) = request.interview {
+            let value = store
+                .interview(actor, command)
+                .map_err(|err| format!("{err:#}"))?;
+            return Ok(value.to_string());
+        }
+        if let Some(mutation) = request.outline {
+            store
+                .enqueue_outline_as(actor, mutation)
+                .map_err(|err| format!("{err:#}"))?;
+            store
+                .writer()
+                .flush()
+                .map_err(|err| format!("flush: {err}"))?;
+            return Ok(String::new());
+        }
+    }
     let mutation: OutlineMutation =
         serde_json::from_str(line).map_err(|err| format!("parse mutation: {err}"))?;
     store
@@ -114,5 +149,5 @@ fn apply_line(store: &FleetStore, line: &str) -> Result<(), String> {
         .writer()
         .flush()
         .map_err(|err| format!("flush: {err}"))?;
-    Ok(())
+    Ok(String::new())
 }

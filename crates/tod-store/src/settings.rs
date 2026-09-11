@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_REPLENISH_THRESHOLD: u32 = 8;
-const DEFAULT_SECOND_QUESTION_MAKER_THRESHOLD: u32 = 2;
-const DEFAULT_QUESTION_MAKER_RUNS_PER_SESSION: u32 = 8;
-const DEFAULT_SESSION_POOL_SIZE: u32 = 4;
-const DEFAULT_ANSWERS_PER_SESSION: u32 = 16;
+const DEFAULT_CONTEXT_BUDGET_TOKENS: u64 = 100_000;
+const DEFAULT_PROMPT_CACHE_IDLE_MINUTES: u64 = 5;
+const DEFAULT_ANSWERED_HISTORY_CAP: u32 = 100;
 pub const DEFAULT_LOG_MAX_SIZE_KB: u64 = 51_200;
 pub const MIN_LOG_MAX_SIZE_KB: u64 = 1;
 pub const MAX_LOG_MAX_SIZE_KB: u64 = 104_857_600;
@@ -19,20 +18,16 @@ pub use tod_agent::AgentPlatform;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionMakerSettings {
+    /// Target number of open questions; a question maker run starts below it,
+    /// and the answer processor fans out when unprocessed answers exceed half.
     #[serde(default = "default_replenish_threshold")]
     pub replenish_threshold: u32,
-    #[serde(default = "default_second_question_maker_threshold")]
-    pub second_question_maker_threshold: u32,
-    #[serde(default = "default_question_maker_runs_per_session")]
-    pub runs_per_session: u32,
 }
 
 impl Default for QuestionMakerSettings {
     fn default() -> Self {
         Self {
             replenish_threshold: DEFAULT_REPLENISH_THRESHOLD,
-            second_question_maker_threshold: DEFAULT_SECOND_QUESTION_MAKER_THRESHOLD,
-            runs_per_session: DEFAULT_QUESTION_MAKER_RUNS_PER_SESSION,
         }
     }
 }
@@ -41,37 +36,40 @@ fn default_replenish_threshold() -> u32 {
     DEFAULT_REPLENISH_THRESHOLD
 }
 
-fn default_second_question_maker_threshold() -> u32 {
-    DEFAULT_SECOND_QUESTION_MAKER_THRESHOLD
-}
-
-fn default_question_maker_runs_per_session() -> u32 {
-    DEFAULT_QUESTION_MAKER_RUNS_PER_SESSION
-}
-
+/// How interview agent sessions keep their context small.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnswerProcessorSettings {
-    #[serde(default = "default_session_pool_size")]
-    pub session_pool_size: u32,
-    #[serde(default = "default_answers_per_session")]
-    pub answers_per_session: u32,
+pub struct InterviewContextSettings {
+    /// Rotate a session to a fresh snapshot once its estimated context exceeds this.
+    #[serde(default = "default_context_budget_tokens")]
+    pub context_budget_tokens: u64,
+    /// Idle time after which a resumed session would miss the provider's prompt cache.
+    #[serde(default = "default_prompt_cache_idle_minutes")]
+    pub prompt_cache_idle_minutes: u64,
+    /// Most answered questions (current phase) included in a snapshot.
+    #[serde(default = "default_answered_history_cap")]
+    pub answered_history_cap: u32,
 }
 
-impl Default for AnswerProcessorSettings {
+impl Default for InterviewContextSettings {
     fn default() -> Self {
         Self {
-            session_pool_size: DEFAULT_SESSION_POOL_SIZE,
-            answers_per_session: DEFAULT_ANSWERS_PER_SESSION,
+            context_budget_tokens: DEFAULT_CONTEXT_BUDGET_TOKENS,
+            prompt_cache_idle_minutes: DEFAULT_PROMPT_CACHE_IDLE_MINUTES,
+            answered_history_cap: DEFAULT_ANSWERED_HISTORY_CAP,
         }
     }
 }
 
-fn default_session_pool_size() -> u32 {
-    DEFAULT_SESSION_POOL_SIZE
+fn default_context_budget_tokens() -> u64 {
+    DEFAULT_CONTEXT_BUDGET_TOKENS
 }
 
-fn default_answers_per_session() -> u32 {
-    DEFAULT_ANSWERS_PER_SESSION
+fn default_prompt_cache_idle_minutes() -> u64 {
+    DEFAULT_PROMPT_CACHE_IDLE_MINUTES
+}
+
+fn default_answered_history_cap() -> u32 {
+    DEFAULT_ANSWERED_HISTORY_CAP
 }
 
 fn default_log_level() -> LogLevel {
@@ -279,7 +277,7 @@ pub struct TodSettings {
     #[serde(default, alias = "researcher")]
     pub question_maker: QuestionMakerSettings,
     #[serde(default)]
-    pub answer_processor: AnswerProcessorSettings,
+    pub interview_context: InterviewContextSettings,
     #[serde(default = "default_log_level")]
     pub log_level: LogLevel,
     #[serde(default = "default_log_max_size_kb")]
@@ -329,7 +327,7 @@ impl Default for TodSettings {
     fn default() -> Self {
         Self {
             question_maker: QuestionMakerSettings::default(),
-            answer_processor: AnswerProcessorSettings::default(),
+            interview_context: InterviewContextSettings::default(),
             log_level: LogLevel::Info,
             log_max_size_kb: DEFAULT_LOG_MAX_SIZE_KB,
             fleet_storage_root: None,
@@ -547,10 +545,8 @@ mod tests {
         let path = dir.join("tod.yml");
         let settings = TodSettings::load_from_path(&path).unwrap();
         assert_eq!(settings.question_maker.replenish_threshold, 8);
-        assert_eq!(settings.question_maker.second_question_maker_threshold, 2);
-        assert_eq!(settings.question_maker.runs_per_session, 8);
-        assert_eq!(settings.answer_processor.session_pool_size, 4);
-        assert_eq!(settings.answer_processor.answers_per_session, 16);
+        assert_eq!(settings.interview_context.context_budget_tokens, 100_000);
+        assert_eq!(settings.interview_context.answered_history_cap, 100);
         assert_eq!(settings.log_level, LogLevel::Info);
         assert_eq!(settings.log_max_size_kb, DEFAULT_LOG_MAX_SIZE_KB);
         assert_eq!(settings.fleet_storage_root, None);
@@ -601,10 +597,8 @@ mod tests {
         let settings = TodSettings {
             question_maker: QuestionMakerSettings {
                 replenish_threshold: 10,
-                second_question_maker_threshold: 3,
-                runs_per_session: 8,
             },
-            answer_processor: AnswerProcessorSettings::default(),
+            interview_context: InterviewContextSettings::default(),
             log_level: LogLevel::Debug,
             log_max_size_kb: 1024,
             fleet_storage_root: None,

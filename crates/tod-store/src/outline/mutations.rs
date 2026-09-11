@@ -91,6 +91,11 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         body: String,
     },
+    /// Move one obligation into `section` (`None` = the "no section" bucket).
+    UpdateObligationSection {
+        obligation_id: Uuid,
+        section: Option<String>,
+    },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
     /// `new_section`.
@@ -142,6 +147,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeCollapsed { .. }
                 | OutlineMutation::CreateObligation { .. }
                 | OutlineMutation::UpdateObligationBody { .. }
+                | OutlineMutation::UpdateObligationSection { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::MoveObligation { .. }
@@ -260,6 +266,13 @@ impl OutlineMutation {
                 body,
             } => {
                 ObligationRepo::new(conn).update_body(*obligation_id, body)?;
+            }
+            OutlineMutation::UpdateObligationSection {
+                obligation_id,
+                section,
+            } => {
+                let section = section.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                ObligationRepo::new(conn).update_section(*obligation_id, section)?;
             }
             OutlineMutation::RenameObligationSection {
                 node_id,

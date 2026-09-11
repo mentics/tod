@@ -7,6 +7,7 @@ use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::repos::transcript::TranscriptRepo;
 use crate::fleet::schema;
+use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::fleet::undo::{
     capture_inverse_after_delete, capture_inverse_after_restore, capture_inverse_before,
 };
@@ -535,7 +536,13 @@ enum WriterCommand {
     Mutation(FleetMutation),
     MutationSync {
         mutation: FleetMutation,
+        actor: String,
         respond: oneshot::Sender<Result<()>>,
+    },
+    Interview {
+        command: InterviewCommand,
+        actor: String,
+        respond: oneshot::Sender<Result<serde_json::Value>>,
     },
     Flush(oneshot::Sender<Result<()>>),
     SwitchDatabase {
@@ -618,10 +625,20 @@ impl FleetWriter {
     }
 
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
+        self.enqueue_as(ACTOR_USER, mutation)
+    }
+
+    /// Enqueue `mutation`, attributing its interview change-log entries to
+    /// `actor`. Debounced mutations are always attributed to the user.
+    pub fn enqueue_as(&self, actor: &str, mutation: FleetMutation) -> Result<(), FleetWriterError> {
         if mutation.is_immediate() {
             let (respond, rx) = oneshot::channel();
             self.tx
-                .send(WriterCommand::MutationSync { mutation, respond })
+                .send(WriterCommand::MutationSync {
+                    mutation,
+                    actor: actor.to_string(),
+                    respond,
+                })
                 .map_err(|_| FleetWriterError::Closed)?;
             self.runtime
                 .block_on(rx)
@@ -644,6 +661,26 @@ impl FleetWriter {
             .block_on(rx)
             .map_err(|_| FleetWriterError::Closed)??;
         Ok(())
+    }
+
+    /// Run an interview command as `actor` in one transaction and return its result.
+    pub fn execute_interview(
+        &self,
+        actor: &str,
+        command: InterviewCommand,
+    ) -> Result<serde_json::Value, FleetWriterError> {
+        let (respond, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCommand::Interview {
+                command,
+                actor: actor.to_string(),
+                respond,
+            })
+            .map_err(|_| FleetWriterError::Closed)?;
+        Ok(self
+            .runtime
+            .block_on(rx)
+            .map_err(|_| FleetWriterError::Closed)??)
     }
 
     pub fn commit_notify(&self) -> Arc<tokio::sync::Notify> {
@@ -709,11 +746,20 @@ async fn writer_loop(
                         pending.push(mutation);
                         debounce_deadline = Some(tokio::time::Instant::now() + debounce);
                     }
-                    Some(WriterCommand::MutationSync { mutation, respond }) => {
+                    Some(WriterCommand::Interview { command, actor, respond }) => {
+                        let result = run_interview(&conn, &media_root, &actor, &command);
+                        let committed = result.is_ok();
+                        let _ = respond.send(result);
+                        if committed {
+                            commit_notify.notify_waiters();
+                        }
+                    }
+                    Some(WriterCommand::MutationSync { mutation, actor, respond }) => {
                         let result = flush_batch(
                             &conn,
                             &media_root,
                             std::slice::from_ref(&mutation),
+                            &actor,
                             &command_log,
                         )
                         .map_err(Into::into);
@@ -728,7 +774,7 @@ async fn writer_loop(
                         let result = if had_pending {
                             let batch = std::mem::take(&mut pending);
                             debounce_deadline = None;
-                            flush_batch(&conn, &media_root, &batch, &command_log).map_err(Into::into)
+                            flush_batch(&conn, &media_root, &batch, ACTOR_USER, &command_log).map_err(Into::into)
                         } else {
                             Ok(())
                         };
@@ -742,7 +788,7 @@ async fn writer_loop(
                         if !pending.is_empty() {
                             let batch = std::mem::take(&mut pending);
                             debounce_deadline = None;
-                            if let Err(err) = flush_batch(&conn, &media_root, &batch, &command_log) {
+                            if let Err(err) = flush_batch(&conn, &media_root, &batch, ACTOR_USER, &command_log) {
                                 let _ = respond.send(Err(err));
                                 continue;
                             }
@@ -761,7 +807,7 @@ async fn writer_loop(
                     }
                     Some(WriterCommand::Shutdown) | None => {
                         if !pending.is_empty() {
-                            let _ = flush_batch(&conn, &media_root, &pending, &command_log);
+                            let _ = flush_batch(&conn, &media_root, &pending, ACTOR_USER, &command_log);
                         }
                         break;
                     }
@@ -777,7 +823,7 @@ async fn writer_loop(
                 if !pending.is_empty() {
                     let batch = std::mem::take(&mut pending);
                     debounce_deadline = None;
-                    if let Err(err) = flush_batch(&conn, &media_root, &batch, &command_log) {
+                    if let Err(err) = flush_batch(&conn, &media_root, &batch, ACTOR_USER, &command_log) {
                         tracing::error!("fleet debounced write failed: {err:#}");
                     } else {
                         commit_notify.notify_waiters();
@@ -792,6 +838,7 @@ fn flush_batch(
     conn: &Arc<Mutex<Connection>>,
     media_root: &Path,
     batch: &[FleetMutation],
+    actor: &str,
     command_log: &Arc<Mutex<CommandLog>>,
 ) -> Result<()> {
     let guard = conn.lock().expect("fleet writer connection mutex");
@@ -819,7 +866,9 @@ fn flush_batch(
             _ => None,
         };
         let tx = guard.unchecked_transaction()?;
+        set_actor(&guard, actor)?;
         let archive_id = mutation.execute_with_outcome(&guard, media_root)?;
+        set_actor(&guard, ACTOR_USER)?;
         tx.commit()?;
         if suppressed {
             continue;
@@ -846,6 +895,28 @@ fn flush_batch(
         }
     }
     Ok(())
+}
+
+/// Record who is writing, for the interview change-log triggers. Always
+/// reset to the user before the transaction commits.
+fn set_actor(conn: &Connection, actor: &str) -> Result<()> {
+    conn.execute("UPDATE interview_actor SET actor = ?1 WHERE id = 1", [actor])?;
+    Ok(())
+}
+
+fn run_interview(
+    conn: &Arc<Mutex<Connection>>,
+    media_root: &Path,
+    actor: &str,
+    command: &InterviewCommand,
+) -> Result<serde_json::Value> {
+    let guard = conn.lock().expect("fleet writer connection mutex");
+    let tx = guard.unchecked_transaction()?;
+    set_actor(&guard, actor)?;
+    let value = crate::interview::execute(&guard, media_root, actor, command)?;
+    set_actor(&guard, ACTOR_USER)?;
+    tx.commit()?;
+    Ok(value)
 }
 
 #[cfg(test)]

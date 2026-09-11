@@ -1,40 +1,26 @@
-## Requirements interview
+# Phase: requirements
 
-**Lifecycle:** `proposed` → forward gate **`design`** when complete.
+Leads to **design**. Settle what the work is for and what must be true when it is done — not how it gets built.
 
-### Coverage targets
+## Produces
 
-Gather until design can start with clear product intent:
+- **Goal** — the node's purpose, in a sentence or two (`content` type `goal`).
+- **Requirements** — checkable statements of what must be true.
+- **Constraints** — binding limits on how the work may be done.
 
-- **Goal** — what success looks like at a product level
-- **Requirements** — numbered, measurable via statement and/or success criteria (omit redundant criteria)
-- **Constraints** — binding limits that always hold
+Vendors, tools, constructions, and step-level choices are **parked** for design or planning. Keep the *kind* of thing in the requirement ("syncs with the team's issue tracker") and park the specifics ("Linear, via its GraphQL API").
 
-### Probe
+## Ask about, roughly in order
 
-- Prefer **principles / clusters** over per-feature clones
-- Read inherited obligations before asking; skip settled concerns
-- Use write-from-decision / `proposed_text` Accept — do not ask the user to approve a paraphrase of an answer they already gave
-- **Do not** probe for non-goals, Links, Overview, or other optional metadata unless the human volunteers
-- Ensure node requirements do not conflict with inherited obligations
+1. Purpose, and who it is for.
+2. Boundaries — what is in and out of this node, especially against sibling and parent nodes.
+3. The capabilities that make the goal real.
+4. Cross-cutting constraints the purpose actually implies — platform, data durability, security and privacy, compatibility. Only when grounded; never as a checklist.
+5. How success would be recognized, where the requirements alone don't already say.
 
-### Outcomes (this phase)
+## Done when
 
-| Belongs here | Does not belong here |
-|--|--|
-| Requirements, constraints, goal at the correct `layer` | Vendors, tools, constructions, step-level implementation choices |
-| Node-specific deltas, exceptions, cross-sibling ownership | Duplicates of inherited ancestor obligations |
-
-Wrong-phase detail → **phase overflow** (`to-process.md`), not requirements.
-
-### Inheritance
-
-Nodes inherit ancestor obligations automatically. Record only what is **new or exceptional** at this node. Never copy or paraphrase inherited text here.
-
-### Completion
-
-Enough measurable requirements and constraints to pass **obligation dedupe** and start design. Use defaults for local/reversible detail; record defaults in the transcript.
-
-### Phase overflow
-
-Read entity `to-process.md` before asking. Open items are already known — do not make the human restate. When consuming overflow from earlier sessions, promote only what belongs in requirements; leave design/planning detail parked with `suggested_phase: design | planning`.
+- The goal is recorded.
+- Every requirement and constraint is checkable, and none conflicts with another or with an inherited one.
+- No open memory is parked for requirements.
+- The user has had the chance to confirm the set is complete.

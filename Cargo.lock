@@ -7893,6 +7893,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tod-core",
  "tod-store",
  "uuid",

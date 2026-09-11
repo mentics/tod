@@ -6,7 +6,6 @@ use super::provider::{AgentProvider, AgentRunHandle, RunId, SessionTurn};
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{InterviewAgentCounts, SharedAgentTrafficLog};
 use crate::platform::AgentPlatform;
-use crate::prompt::{AgentPrompt, SessionPoolConfig};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -54,56 +53,11 @@ fn sum_interview_counts(a: InterviewAgentCounts, b: InterviewAgentCounts) -> Int
         question_maker_in_flight: a.question_maker_in_flight + b.question_maker_in_flight,
         answer_active: a.answer_active + b.answer_active,
         answer_pool: a.answer_pool + b.answer_pool,
-        answer_max: a.answer_max + b.answer_max,
-        deep_dive_in_flight: a.deep_dive_in_flight + b.deep_dive_in_flight,
+        answer_max: a.answer_max.max(b.answer_max),
     }
 }
 
 impl AgentProvider for RoutingAgentProvider {
-    fn start_question_maker_replenishment(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: AgentPrompt,
-        pool: &SessionPoolConfig,
-        options: AgentLaunchOptions,
-    ) -> Result<AgentRunHandle> {
-        self.for_platform(options.platform)
-            .start_question_maker_replenishment(agent_config_id, cwd, prompt, pool, options)
-    }
-
-    fn start_answer_processor(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: AgentPrompt,
-        pool: &SessionPoolConfig,
-        options: AgentLaunchOptions,
-    ) -> Result<AgentRunHandle> {
-        self.for_platform(options.platform).start_answer_processor(
-            agent_config_id,
-            cwd,
-            prompt,
-            pool,
-            options,
-        )
-    }
-
-    fn start_deep_dive_chat(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: String,
-        options: AgentLaunchOptions,
-    ) -> Result<AgentRunHandle> {
-        self.for_platform(options.platform).start_deep_dive_chat(
-            agent_config_id,
-            cwd,
-            prompt,
-            options,
-        )
-    }
-
     fn start_fleet_agent(
         &mut self,
         agent_config_id: &str,
@@ -126,16 +80,19 @@ impl AgentProvider for RoutingAgentProvider {
             .or_else(|| self.claude.session_id(key))
     }
 
+    fn session_context_chars(&self, key: &str) -> Option<u64> {
+        self.cursor
+            .session_context_chars(key)
+            .or_else(|| self.claude.session_context_chars(key))
+    }
+
     fn close_session(&mut self, key: &str) {
         self.cursor.close_session(key);
         self.claude.close_session(key);
     }
 
     fn poll_run(&mut self, id: RunId) -> Option<super::provider::AgentRunState> {
-        // Drain both hosts so pool completions advance even when the run lives on the other.
-        let cursor = self.cursor.poll_run(id);
-        let claude = self.claude.poll_run(id);
-        cursor.or(claude)
+        self.cursor.poll_run(id).or_else(|| self.claude.poll_run(id))
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {

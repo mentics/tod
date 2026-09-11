@@ -6,8 +6,6 @@
 
 #[allow(unused_imports)] // transitional facade; removed in the tod-ui split
 pub use tod_agent::{
-    AcpHost, AgentBackend, AgentLaunchOptions, AgentPlatform, AgentPrompt, AgentProvider,
-    AgentRunState, BootstrapGate, CursorAcpProvider, MockAgentProvider, RoutingAgentProvider,
-    RunId, SessionPoolConfig, SharedAgent,
+    AcpHost, AgentBackend, AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunState,
+    CursorAcpProvider, MockAgentProvider, RoutingAgentProvider, RunId, SharedAgent,
 };
-pub use tod_core::process_bundle::DeepDiveContext;

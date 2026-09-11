@@ -1258,13 +1258,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     } else {
         AgentBackend::from_platform(app_settings.agent_platform)
     };
-    let agent: SharedAgent;
-    let bootstrap_gate: crate::interview::agent::BootstrapGate;
-    {
-        let (a, g) = agent_backend.create(traffic_log.clone());
-        agent = a;
-        bootstrap_gate = g;
-    }
+    let agent: SharedAgent = agent_backend.create(traffic_log.clone());
 
     let fleet_open = open_fleet_store(traffic_log.clone());
     let restore_always_on_top = app_settings.always_on_top;
@@ -1353,6 +1347,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             tracing::error!("mutation socket failed to start: {err:#}");
                         })
                         .ok();
+                        if agent_backend == AgentBackend::Mock {
+                            // Mock interview agents write through the socket just started,
+                            // the same path `tod-cli` gives real agents.
+                            tod_core::interview::mock::install_mock_interview_handler(
+                                fleet.paths().root().to_path_buf(),
+                            );
+                        }
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
                         let app_settings = TodSettings::load(&paths).unwrap_or_default();
@@ -1399,15 +1400,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             )
                         });
                         let agent_for_sessions = agent.clone();
-                        let gate_for_sessions = bootstrap_gate.clone();
                         let sessions = cx.new(|cx| {
-                            SessionsView::new(
-                                window,
-                                cx,
-                                agent_for_sessions,
-                                gate_for_sessions,
-                                fleet.clone(),
-                            )
+                            SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));

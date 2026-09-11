@@ -11,9 +11,9 @@ Some or all of the following appear in your prompt:
 | Node metadata | Always — `node_id`, title, lifecycle, `mode` (interactive \| autonomous), `phase_purpose` |
 | Obligations | Always — resolved obligations (inherited + local), with source when inherited |
 | Phase content | When present — goal, design body, plan body |
-| Phase overflow | When present — open overflow items (wrong-phase detail parked during interviews) |
+| Parked items | When present — open `parked` interview memory (later-phase detail volunteered during interviews) |
 | Gate check | When `phase_purpose: gate_check` — see below |
-| Transcript excerpts | When relevant |
+| Interview history | When relevant — answered interview questions and interview memory |
 | Blockers | When paused/blocked |
 | Workspace | Implementation states — `cwd`, repo ref, branch |
 

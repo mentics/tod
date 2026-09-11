@@ -1,35 +1,23 @@
-## Implementation interview
+# Phase: planning
 
-**Lifecycle:** `planning` → forward gate **`ready`** when complete.
+Leads to **ready**. Settle an ordered plan that someone can start working from.
 
-### Coverage targets
+## Produces
 
-Gather until the node can enter **`active`** with an actionable plan:
+- **Plan content** — ordered steps, each tied to the requirements it delivers and how it will be verified (`content` type `plan`).
+- **Obligation changes** when planning uncovers a missing or wrong requirement.
 
-- How the work will be built **step-by-step**
-- How verification will prove **each requirement**
-- Assumptions — accept or convert to requirements
-- Named constructions from design (when present) carried into plan steps
+## Ask about, roughly in order
 
-### Probe
+1. **Everything still parked**, for any phase — each item is promoted into the plan or obligations, or discarded with the user's agreement. Nothing may remain open.
+2. **Order and slicing** — what comes first, what can ship independently.
+3. **Verification** — how each requirement will be proven, using what design already decided.
+4. **Assumptions** — each is either accepted by the user or turned into a requirement.
 
-- Prefer write-from-decision / `proposed_text` when constructions are clear
-- Do not re-ask settled obligations or design decisions
-- Record waiver in transcript if explicitly skipped
+Don't reopen settled design decisions. If planning shows one is wrong, raise that as its own question.
 
-### Outcomes (this phase)
+## Done when
 
-| Belongs here | Does not belong here |
-|--|--|
-| **Plan** extra content — ordered steps, traceability to requirements | New design spikes without decision trees |
-| Obligation updates when planning reveals missing requirements | Open phase-overflow items |
-
-**Traceability:** each requirement maps through the plan to verification. List assumptions explicitly.
-
-### Drain phase overflow (blocking)
-
-Before this phase completes, **every open item** in entity `to-process.md` must be consumed, promoted, or explicitly discarded. None may remain blocking **`planning` → `ready`**. When this interview drains, the file should be empty or deleted.
-
-### Completion
-
-Plan is **actionable** and traceable; assumptions explicit; overflow drained. Interactive mode may include human look-over before `ready` — autonomous mode waives that when other gate criteria pass.
+- Every requirement traces through a plan step to a verification.
+- Assumptions are explicit and accepted.
+- **No open parked memory remains on the node.** Don't declare exhaustion while any does.

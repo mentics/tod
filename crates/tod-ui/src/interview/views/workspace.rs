@@ -1,24 +1,8 @@
-use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
-use crate::interview::config::{
-    InterviewConfig, parse_interview_config, sync_scaffolding_from_disk,
-};
-use crate::interview::kickoff::{
-    answer_processor_prompt, question_maker_action_prompt, question_maker_replenish_prompt,
-};
+use crate::interview::agent::SharedAgent;
 use crate::interview::question_feedback::append_question_feedback;
-use crate::interview::queue::{QueueQuestion, load_queue_dir};
-use crate::interview::queue_watcher::QueueWatcher;
-use crate::interview::replenishment::{question_maker_starts_needed, retry_backoff_secs};
-use crate::interview::settings::{AnswerProcessorSettings, QuestionMakerSettings};
-use crate::interview::transcript::{
-    ActionRecord, AnswerRecord, append_action, append_answer, format_action_payload,
-    format_answer_payload,
-};
-use crate::interview::views::deep_dive::{DeepDiveEvent, DeepDiveView};
 use crate::interview::views::question_list::QuestionListDelegate;
 use crate::interview::{
     InterviewSession, InterviewSessionStatus, SessionStore, TaskListProceedContext, TodPaths,
-    TodSettings,
 };
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::list::{ListArrowDown, ListArrowUp};
@@ -37,74 +21,25 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::list::{List, ListEvent, ListItem, ListState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tod_core::interview::driver::{DriverEvent, DriverStatus, InterviewDriver};
+use tod_core::interview::interview_complete;
 use tod_core::process::lifecycle_for_interview_phase;
-use tod_core::process_bundle::{InterviewAgentPrompt, ProcessManifest, TodInstallPaths};
 use tod_store::fleet::FleetStore;
-use tod_store::fleet::{ensure_interview_agent_for_node, workspace_cwd_for_interview_agent};
-use tod_store::outline::repos::NodeRepo;
+use tod_store::interview::{
+    ACTOR_USER, InterviewCommand, InterviewQuestion, InterviewRepo, Proposal, ProposalOp,
+    STATUS_ANSWERED, STATUS_OPEN, phase_for_session_key,
+};
+use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use uuid::Uuid;
 
-const QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Brief red flash before a queue row disappears so removals feel intentional.
-const QUESTION_REMOVAL_FLASH: Duration = Duration::from_millis(500);
-
-struct SubmitAnswerWork {
-    question_id: String,
-    question_path: PathBuf,
-    question_body: String,
-    answer_text: String,
-    mc: Option<String>,
-    transcript: PathBuf,
-    prompt: InterviewAgentPrompt,
-    agent_config_id: String,
-    cwd: PathBuf,
-    settings: AnswerProcessorSettings,
-    launch_options: tod_store::AgentLaunchOptions,
-}
-
-struct SubmitAnswerOutcome {
-    question_id: String,
-    result: Result<(RunId, Option<String>), String>,
-}
-
-struct SubmitActionWork {
-    question_id: String,
-    question_path: PathBuf,
-    action: String,
-    notes: String,
-    question_body: String,
-    transcript: PathBuf,
-    prompt: InterviewAgentPrompt,
-    agent_config_id: String,
-    cwd: PathBuf,
-    question_maker_settings: QuestionMakerSettings,
-    launch_options: tod_store::AgentLaunchOptions,
-}
-
-struct SubmitActionOutcome {
-    question_id: String,
-    result: Result<(RunId, Option<String>), String>,
-}
-
-struct SubmitFreeformWork {
-    submission_id: String,
-    text: String,
-    transcript: PathBuf,
-    prompt: InterviewAgentPrompt,
-    agent_config_id: String,
-    cwd: PathBuf,
-    settings: AnswerProcessorSettings,
-    launch_options: tod_store::AgentLaunchOptions,
-}
-
-struct SubmitFreeformOutcome {
-    result: Result<RunId, String>,
-}
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Recent answers listed under the question.
+const RECENT_ANSWERS: usize = 5;
 
 actions!(
     interview_workspace,
@@ -131,12 +66,10 @@ actions!(
 );
 
 const WORKSPACE_CONTEXT: &str = "InterviewWorkspace";
-const MAX_RESEARCHER_RETRIES: u32 = 3;
-const OTHER_ACTION_ITEMS: [(&str, &str); 4] = [
-    ("reconsider", "Consider / Reconsider"),
-    ("defer", "Defer"),
+const OTHER_ACTION_ITEMS: [(&str, &str); 3] = [
+    ("improve", "Improve this question"),
     ("more-options", "More options"),
-    ("deep-dive", "Deep dive"),
+    ("defer", "Defer"),
 ];
 const LIST_COLUMN_WIDTH: f32 = 160.;
 const LIST_COLUMN_MIN: f32 = 120.;
@@ -156,167 +89,8 @@ const TEXTAREA_HEIGHT: f32 = 96.;
 enum WorkspaceFocus {
     QuestionList,
     /// Index into response interactive controls (MC options, optional proposed text, Notes,
-    /// Other action, Submit, feedback field, Submit feedback).
+    /// Other action, Submit, feedback field, Submit feedback, freeform field, Submit freeform).
     Response(usize),
-}
-
-#[derive(Debug, Clone)]
-enum RunKind {
-    AnswerProcessor {
-        question_id: String,
-    },
-    QuestionMakerReplenish,
-    QuestionMakerAction {
-        question_id: String,
-    },
-    /// Freeform requirements text submitted directly to the answer processor,
-    /// not tied to any queue question.
-    FreeformAnswer,
-}
-
-/// Submitted / in-flight question state preserved when a workspace is torn down
-/// (e.g. switching interviews) so reopen still shows those questions as pending.
-#[derive(Debug, Clone, Default)]
-pub struct WorkspaceInFlightState {
-    pending: HashSet<String>,
-    pending_snapshots: HashMap<String, String>,
-    runs: HashMap<RunId, RunKind>,
-}
-
-impl WorkspaceInFlightState {
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty() && self.runs.is_empty()
-    }
-
-    /// Keep only ids still present in the queue; drop pending whose file content
-    /// already diverged from the submit-time snapshot (req 7 re-enable).
-    fn pruned_for_queue(mut self, questions: &[QueueQuestion]) -> Self {
-        let mut still_pending = HashSet::new();
-        for id in self.pending.iter() {
-            if let Some(q) = questions.iter().find(|q| &q.id == id) {
-                if let Some(snapshot) = self.pending_snapshots.get(id) {
-                    if file_contents(&q.path).as_deref() != Some(snapshot.as_str()) {
-                        continue;
-                    }
-                }
-                still_pending.insert(id.clone());
-            }
-        }
-        self.pending = still_pending;
-        self.pending_snapshots
-            .retain(|id, _| self.pending.contains(id));
-        // Drop answer/action runs whose question is no longer pending; keep replenish.
-        self.runs.retain(|_, kind| match kind {
-            RunKind::QuestionMakerReplenish | RunKind::FreeformAnswer => true,
-            RunKind::AnswerProcessor { question_id }
-            | RunKind::QuestionMakerAction { question_id } => self.pending.contains(question_id),
-        });
-        self
-    }
-}
-
-#[derive(Debug, Default)]
-struct ReplenishState {
-    retry_count: u32,
-    next_retry_at: Option<Instant>,
-    manual_required: bool,
-    /// After a successful replenishment that left the queue empty, treat as exhausted
-    /// even if question-maker status still says `idle` (agent should set `complete`).
-    exhausted: bool,
-    /// When question-maker status first flipped to idle/complete during the current
-    /// replenishment batch — grace period for ACP to exit after disk work is done.
-    status_idle_since: Option<Instant>,
-    /// Last observed question-maker status while replenishment is in flight.
-    last_question_maker_status: QuestionMakerStatusKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum QuestionMakerStatusKind {
-    Idle,
-    Working,
-    Complete,
-    #[default]
-    Unknown,
-}
-
-#[derive(Debug, Clone, Default)]
-struct QuestionMakerStatusSnapshot {
-    kind: QuestionMakerStatusKind,
-    notes: Option<String>,
-    queue_depth: Option<u32>,
-    queue_target: Option<u32>,
-}
-
-/// Rich waiting UI while bootstrap or replenishment is in flight.
-#[derive(Debug, Clone)]
-struct QuestionMakerWaitUi {
-    headline: SharedString,
-    detail: Option<SharedString>,
-    queue_depth: Option<u32>,
-    queue_target: Option<u32>,
-    elapsed_secs: u64,
-    animate_dots: usize,
-}
-
-impl QuestionMakerWaitUi {
-    fn status_line(&self) -> SharedString {
-        let mut line = self.headline.to_string();
-        if self.elapsed_secs >= 5 {
-            line.push_str(&format!(" ({})", format_elapsed(self.elapsed_secs)));
-        }
-        if let Some(detail) = &self.detail {
-            if !detail.is_empty() {
-                line.push_str(" — ");
-                line.push_str(detail);
-            }
-        }
-        line.into()
-    }
-}
-
-const HUNG_REPLENISH_SECS: u64 = 45;
-
-fn question_maker_status_is_idle(kind: QuestionMakerStatusKind) -> bool {
-    matches!(
-        kind,
-        QuestionMakerStatusKind::Idle | QuestionMakerStatusKind::Complete
-    )
-}
-
-/// Start or clear the idle grace timer when status changes during replenishment.
-fn update_replenish_idle_since(
-    last: QuestionMakerStatusKind,
-    current: QuestionMakerStatusKind,
-    idle_since: Option<Instant>,
-) -> Option<Instant> {
-    if question_maker_status_is_idle(current) {
-        if idle_since.is_some() {
-            idle_since
-        } else if question_maker_status_is_idle(last) {
-            // Stale idle from before this run (seeded at replenish start).
-            None
-        } else {
-            Some(Instant::now())
-        }
-    } else {
-        None
-    }
-}
-
-/// If SQLite says Complete but the bound queue has open questions, reopen Active
-/// so replenish / answers are allowed (H8 / req 18).
-fn reopen_complete_with_bound_queue(
-    session: &mut InterviewSession,
-    store: &SessionStore,
-    queue_nonempty: bool,
-) -> bool {
-    if session.status == InterviewSessionStatus::Complete && queue_nonempty {
-        let _ = store.set_status(session.id, InterviewSessionStatus::Active);
-        session.status = InterviewSessionStatus::Active;
-        true
-    } else {
-        false
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,50 +99,67 @@ pub enum WorkspaceEvent {
     SessionComplete,
     /// User chose **Proceed** on the in-place Complete state (task-list origin).
     ProceedToLifecycle,
-    /// Scaffolding never bound and no bootstrap is running — return to list for setup prompt.
-    NeedsBootstrap,
+}
+
+/// Options the user can pick for `q`: its own, or a lone Accept for a
+/// proposal offered without alternatives.
+fn option_labels(q: &InterviewQuestion) -> Vec<String> {
+    if q.options.is_empty() && q.proposal.is_some() {
+        vec!["Accept".to_string()]
+    } else {
+        q.options.clone()
+    }
+}
+
+/// The part of a proposal the user may edit before accepting.
+fn proposal_text(q: &InterviewQuestion) -> Option<&str> {
+    let proposal = q.proposal.as_ref()?;
+    match proposal.op {
+        ProposalOp::Add | ProposalOp::Update | ProposalOp::Content => proposal.text.as_deref(),
+        ProposalOp::Delete => None,
+    }
+}
+
+/// The edited proposal text to send, when it differs from what was proposed.
+fn edited_proposal_text(original: Option<&str>, edited: &str) -> Option<String> {
+    let original = original?.trim();
+    let edited = edited.trim();
+    (!edited.is_empty() && edited != original).then(|| edited.to_string())
 }
 
 pub struct WorkspaceView {
     session: InterviewSession,
-    config: InterviewConfig,
-    settings: TodSettings,
     store: SessionStore,
     fleet: Arc<FleetStore>,
-    agent_config_id: String,
-    workspace_cwd: PathBuf,
-    questions: Vec<QueueQuestion>,
-    pending: HashSet<String>,
-    pending_snapshots: HashMap<String, String>,
-    /// Queue ids flashing red before drop; values are snapshots kept in `questions` until finalize.
-    removing: HashSet<String>,
-    selected_question_id: Option<String>,
+    agent: SharedAgent,
+    driver: Arc<Mutex<InterviewDriver>>,
+    phase: &'static str,
+    questions: Vec<InterviewQuestion>,
+    recent: Vec<InterviewQuestion>,
+    /// Plain-language description of each open question's proposal, by seq.
+    proposal_summaries: HashMap<i64, String>,
+    selected_seq: Option<i64>,
     selected_mc: Option<String>,
     notes_input: Entity<InputState>,
     proposed_input: Entity<InputState>,
     feedback_input: Entity<InputState>,
     freeform_input: Entity<InputState>,
     obligations: Entity<ObligationsView>,
-    /// Keeps the embedded obligations panel alive. Unlike task_list's togglable side
-    /// panel, this column is embedded persistently — there is no "closed" state for it
-    /// here, so an internal `ObligationsEvent::Close` (e.g. Escape while it has focus)
-    /// is immediately reversed by retargeting it back onto this session's node.
+    /// Keeps the embedded obligations panel alive; "closed" is not a valid state
+    /// for this column, so a Close event is reversed immediately.
     _obligations_subscription: Subscription,
-    /// Question id whose `proposed_text` is currently loaded into `proposed_input`.
-    proposed_loaded_for: Option<String>,
-    /// None until session scratchpad / queue is bound — never falls back to repo-root queue.
-    queue_watcher: Option<QueueWatcher>,
-    agent: SharedAgent,
-    /// Session ids with a kickoff bootstrap thread still running.
-    bootstrap_sessions: Arc<Mutex<HashSet<Uuid>>>,
-    runs: HashMap<RunId, RunKind>,
-    replenish_state: ReplenishState,
+    /// Question seq whose proposal text is currently loaded into `proposed_input`.
+    proposed_loaded_for: Option<i64>,
+    /// Response fields were reset without a Window; clear their text on the next render.
+    notes_pending_clear: bool,
+    driver_status: DriverStatus,
+    /// Set once the first `reload` has completed, to avoid a "No open questions"
+    /// flash before the driver status has had a chance to report itself.
+    loaded_once: bool,
+    complete: bool,
     status_line: SharedString,
     error_banner: Option<SharedString>,
     mutations_blocked: bool,
-    deep_dive: Option<Entity<DeepDiveView>>,
-    _deep_dive_subscription: Option<Subscription>,
-    pending_notes_paste: Option<String>,
     focus_handle: FocusHandle,
     question_list_state: Entity<ListState<QuestionListDelegate>>,
     _question_list_subscription: Subscription,
@@ -380,13 +171,11 @@ pub struct WorkspaceView {
     /// Open state for the native PopupMenu. Menu entity is eager (keyboard);
     /// paint uses `deferred` so it stacks above the bottom feedback panel.
     actions_menu_open: bool,
-    /// Live PopupMenu entity while open (created eagerly so keyboard can drive it).
     actions_menu: Option<Entity<PopupMenu>>,
     _actions_menu_subscription: Option<Subscription>,
-    scaffolding_pending: bool,
-    needs_bootstrap_handoff: bool,
-    /// When the current question-maker wait began (bootstrap or replenish).
-    question_maker_wait_started: Option<Instant>,
+    /// When the current wait for questions began.
+    wait_started: Option<Instant>,
+    replenish_target: u32,
     _poll_task: Task<()>,
     app_nav: AppNavMenu,
     task_list_proceed: Option<TaskListProceedContext>,
@@ -401,15 +190,6 @@ impl WorkspaceView {
         &self.session
     }
 
-    /// Snapshot in-flight submit state for restore after this view is dropped.
-    pub fn export_in_flight_state(&self) -> WorkspaceInFlightState {
-        WorkspaceInFlightState {
-            pending: self.pending.clone(),
-            pending_snapshots: self.pending_snapshots.clone(),
-            runs: self.runs.clone(),
-        }
-    }
-
     pub fn set_task_list_proceed(&mut self, context: Option<TaskListProceedContext>) {
         self.task_list_proceed = context;
     }
@@ -420,149 +200,58 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
         agent: SharedAgent,
         fleet: Arc<FleetStore>,
-        bootstrap_sessions: Arc<Mutex<HashSet<Uuid>>>,
-        restored_in_flight: Option<WorkspaceInFlightState>,
+        driver: Arc<Mutex<InterviewDriver>>,
         task_list_proceed: Option<TaskListProceedContext>,
     ) -> Self {
         register_workspace_keys(cx);
-        let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let store = SessionStore::open(fleet.clone());
-        let settings = TodSettings::load(&paths).unwrap_or_default();
-        let (agent_config_id, workspace_cwd) = {
-            if let Some(ref id) = session.agent_config_id {
-                let cwd = workspace_cwd_for_interview_agent(&fleet, id, &paths, session.node_id)
-                    .unwrap_or_else(|_| paths.repo_root().to_path_buf());
-                (id.clone(), cwd)
-            } else {
-                match ensure_interview_agent_for_node(
-                    &fleet,
-                    &paths,
-                    &settings,
-                    &session.node_id.to_string(),
-                ) {
-                    Ok(ctx) => (ctx.agent.id, ctx.cwd),
-                    Err(_) => (
-                        format!("interview-{}", session.node_id),
-                        paths.repo_root().to_path_buf(),
-                    ),
-                }
-            }
+        let replenish_target = driver
+            .lock()
+            .map(|d| d.config().replenish_threshold)
+            .unwrap_or(8);
+        let textarea = |placeholder: &'static str, window: &mut Window, cx: &mut App| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .rows(TEXTAREA_ROWS)
+                    .placeholder(placeholder)
+            })
         };
+        let notes_input = textarea("Notes (Enter to edit; Ctrl+Enter to submit)", window, cx);
+        let proposed_input = textarea("Proposed text (Enter to edit)", window, cx);
+        let feedback_input =
+            textarea("Feedback on this question (e.g. not useful, too meta)", window, cx);
+        let freeform_input =
+            textarea("Anything to tell the interview directly (Ctrl+Enter to submit)", window, cx);
 
-        let bound_config_path = session_config_path(&session);
-
-        let (config, queue_watcher, questions, scaffolding_pending) =
-            if let Some(config_path) = bound_config_path {
-                match parse_interview_config(&config_path) {
-                    Ok(config) => {
-                        let watcher = QueueWatcher::new(config.queue.clone()).ok();
-                        let questions = load_queue_dir(&config.queue).unwrap_or_default();
-                        (config, watcher, questions, false)
-                    }
-                    Err(_) => (unbound_config(&session, &paths), None, Vec::new(), true),
-                }
-            } else {
-                (unbound_config(&session, &paths), None, Vec::new(), true)
-            };
-
-        let restored = restored_in_flight
-            .unwrap_or_default()
-            .pruned_for_queue(&questions);
-        let pending = restored.pending;
-        let pending_snapshots = restored.pending_snapshots;
-        let runs = restored.runs;
-
-        let selected_question_id = questions
-            .iter()
-            .find(|q| !pending.contains(&q.id))
-            .or_else(|| questions.first())
-            .map(|q| q.id.clone());
-        let notes_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(TEXTAREA_ROWS)
-                .placeholder("Notes (Enter to edit; Ctrl+Enter to submit)")
-        });
-        let proposed_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(TEXTAREA_ROWS)
-                .placeholder("Proposed durable text (Enter to edit)")
-        });
-        let feedback_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(TEXTAREA_ROWS)
-                .placeholder("Feedback on this question (e.g. not useful, too meta)")
-        });
-        let freeform_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .rows(TEXTAREA_ROWS)
-                .placeholder("Requirements text to send straight to the answer processor")
-        });
         let obligations = cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
         obligations.update(cx, |panel, cx| {
             panel.open(session.node_id, &session.display_name, window, cx);
         });
-        // Embedded persistently here (unlike task_list's togglable side panel), so
-        // "closed" is not a valid state for this column — reverse it immediately.
         let obligations_node_id = session.node_id;
         let obligations_title = session.display_name.clone();
         let _obligations_subscription = cx.subscribe_in(
             &obligations,
             window,
-            move |this, panel, event, window, cx| {
-                match event {
-                    ObligationsEvent::Close => {
-                        panel.update(cx, |panel, cx| {
-                            panel.retarget(obligations_node_id, &obligations_title, true, window, cx);
-                        });
-                    }
-                    // Ctrl+Left out of the third column lands on the response column.
-                    ObligationsEvent::FocusTaskList => {
-                        this.focus_response_right(window, cx);
-                    }
-                    ObligationsEvent::DeleteSelectedTask => {}
-                    // Agent chat is launched from the Tasks shell, which owns
-                    // the window control; the interview workspace ignores it.
-                    ObligationsEvent::OpenAgentChat { .. }
-                    | ObligationsEvent::OpenAgentConfig { .. } => {}
+            move |this, panel, event, window, cx| match event {
+                ObligationsEvent::Close => {
+                    panel.update(cx, |panel, cx| {
+                        panel.retarget(obligations_node_id, &obligations_title, true, window, cx);
+                    });
                 }
+                // Ctrl+Left out of the third column lands on the response column.
+                ObligationsEvent::FocusTaskList => this.focus_response_right(window, cx),
+                ObligationsEvent::DeleteSelectedTask
+                | ObligationsEvent::OpenAgentChat { .. }
+                | ObligationsEvent::OpenAgentConfig { .. } => {}
             },
         );
-        let proposed_loaded_for = selected_question_id.clone().filter(|_| {
-            questions
-                .iter()
-                .find(|q| selected_question_id.as_ref() == Some(&q.id))
-                .and_then(|q| q.proposed_text.as_ref())
-                .is_some()
-        });
-        if let Some(id) = proposed_loaded_for.as_ref() {
-            if let Some(text) = questions
-                .iter()
-                .find(|q| &q.id == id)
-                .and_then(|q| q.proposed_text.clone())
-            {
-                proposed_input.update(cx, |input, cx| {
-                    input.set_value(text, window, cx);
-                });
-            }
-        }
-        // H8 / req 18: Complete must not stick over a non-empty bound queue.
-        // Reopen Active on open so can_replenish works (same as apply_queue_update /
-        // try_bind_bootstrap_scaffolding).
-        let mut session = session;
-        let _ = reopen_complete_with_bound_queue(&mut session, &store, !questions.is_empty());
-        // Archived always blocks; Complete only blocks while truly finished (no open Qs).
-        let mutations_blocked = session.status == InterviewSessionStatus::Archived
-            || (session.status == InterviewSessionStatus::Complete && questions.is_empty());
 
         let poll_task = cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(QUEUE_POLL_INTERVAL).await;
+                Timer::after(POLL_INTERVAL).await;
                 let Ok(()) = this.update(cx, |this, cx| {
-                    if this.poll_runs_and_queue(cx) {
+                    if this.poll(cx) {
                         cx.notify();
                     }
                 }) else {
@@ -571,78 +260,36 @@ impl WorkspaceView {
             }
         });
 
-        let bootstrap_in_progress = bootstrap_sessions
-            .lock()
-            .map(|s| s.contains(&session.id))
-            .unwrap_or(false);
-
-        let initial_selected = selected_question_id.clone();
-        let initial_pending = pending.clone();
-        let delegate = QuestionListDelegate::new(questions.clone());
         let question_list_state =
-            cx.new(|cx| ListState::new(delegate, window, cx).searchable(false));
-        question_list_state.update(cx, |state, cx| {
-            state.delegate_mut().set_pending(initial_pending);
-            let ix = initial_selected
-                .as_ref()
-                .and_then(|id| state.delegate().index_of_id(id))
-                .map(IndexPath::new);
-            state.set_selected_index(ix, window, cx);
-            if ix.is_some() {
-                state.scroll_to_selected_item(window, cx);
-            }
-        });
+            cx.new(|cx| ListState::new(QuestionListDelegate::new(Vec::new()), window, cx).searchable(false));
         let _question_list_subscription =
             cx.subscribe(&question_list_state, |this, state, event, cx| match event {
                 ListEvent::Select(ix) | ListEvent::Confirm(ix) => {
-                    let id = state
-                        .read(cx)
-                        .delegate()
-                        .items()
-                        .get(ix.row)
-                        .map(|q| q.id.clone());
-                    if let Some(id) = id {
+                    let seq = state.read(cx).delegate().items().get(ix.row).map(|q| q.seq);
+                    if let Some(seq) = seq {
                         this.workspace_focus = WorkspaceFocus::QuestionList;
                         this.notes_editing = false;
                         this.proposed_editing = false;
                         this.feedback_editing = false;
-                        this.select_question_without_window(&id, cx);
+                        this.select_question_without_window(seq, cx);
                     }
                 }
                 ListEvent::Cancel => {}
             });
 
-        let status_line = if scaffolding_pending {
-            if bootstrap_in_progress {
-                "Question maker bootstrap in progress…".into()
-            } else {
-                "Waiting for question maker scaffolding…".into()
-            }
-        } else if !pending.is_empty() {
-            "Waiting for in-flight answers to finish…".into()
-        } else {
-            SharedString::default()
-        };
-
-        let question_maker_wait_started = if scaffolding_pending {
-            Some(Instant::now())
-        } else {
-            None
-        };
-
-        let view = Self {
+        let phase = phase_for_session_key(&session.phase);
+        let mutations_blocked = session.status == InterviewSessionStatus::Archived;
+        let mut view = Self {
             session,
-            config,
-            settings,
             store,
             fleet,
-            agent_config_id,
-            workspace_cwd,
-            questions,
-            pending,
-            pending_snapshots,
-            removing: HashSet::new(),
-            selected_question_id,
+            agent,
+            driver,
+            phase,
+            questions: Vec::new(),
+            recent: Vec::new(),
+            proposal_summaries: HashMap::new(),
+            selected_seq: None,
             selected_mc: None,
             notes_input,
             proposed_input,
@@ -650,18 +297,14 @@ impl WorkspaceView {
             freeform_input,
             obligations,
             _obligations_subscription,
-            proposed_loaded_for,
-            queue_watcher,
-            agent,
-            bootstrap_sessions,
-            runs,
-            replenish_state: ReplenishState::default(),
-            status_line,
+            proposed_loaded_for: None,
+            notes_pending_clear: false,
+            driver_status: DriverStatus::default(),
+            loaded_once: false,
+            complete: false,
+            status_line: SharedString::default(),
             error_banner: None,
             mutations_blocked,
-            deep_dive: None,
-            _deep_dive_subscription: None,
-            pending_notes_paste: None,
             focus_handle: cx.focus_handle().tab_stop(true),
             question_list_state,
             _question_list_subscription,
@@ -673,13 +316,13 @@ impl WorkspaceView {
             actions_menu_open: false,
             actions_menu: None,
             _actions_menu_subscription: None,
-            scaffolding_pending,
-            needs_bootstrap_handoff: false,
-            question_maker_wait_started,
+            wait_started: None,
+            replenish_target,
             _poll_task: poll_task,
             app_nav: AppNavMenu::default(),
             task_list_proceed,
         };
+        view.reload(cx);
 
         // Prefer List key context so ↑/↓ resolve to ListArrow* while in the question list.
         cx.defer_in(window, |this, window, cx| {
@@ -689,278 +332,188 @@ impl WorkspaceView {
                 });
             }
         });
-
         view
     }
 
-    fn question_maker_waiting(&self) -> bool {
-        self.scaffolding_pending || self.question_maker_in_flight() > 0
-    }
-
-    fn session_scratchpad_dir(&self) -> PathBuf {
-        if !self.config.scratchpad.as_os_str().is_empty() {
-            return self.config.scratchpad.clone();
-        }
-        let root = TodPaths::discover()
-            .map(|p| p.data_root().to_path_buf())
-            .unwrap_or_else(|_| PathBuf::from("."));
-        tod_core::process_bundle::resolve_session_scratchpad(&root, &self.session)
-    }
-
-    fn read_question_maker_status_snapshot(&self) -> QuestionMakerStatusSnapshot {
-        let scratchpad = self.session_scratchpad_dir();
-        let primary = scratchpad.join("question-maker-status.md");
-        let legacy = scratchpad.join("researcher-status.md");
-        let path = if primary.is_file() {
-            Some(primary)
-        } else if legacy.is_file() {
-            Some(legacy)
-        } else {
-            None
-        };
-        question_maker_status_snapshot(path.as_deref())
-    }
-
-    fn bootstrap_stage_detail(&self) -> Option<String> {
-        let scratchpad = self.session_scratchpad_dir();
-        let config_path = scratchpad.join("interview-config.md");
-        if !config_path.is_file() {
-            // Scope export creates scratchpad/scope/ before the agent runs — directory
-            // presence does not mean file creation is in progress.
-            return Some(if self.session_bootstrap_in_flight() {
-                "Question maker agent is preparing the session…".into()
-            } else {
-                "Waiting for question maker to start…".into()
-            });
-        }
-        let queue_dir = scratchpad.join("queue");
-        let count = count_queue_files(&queue_dir);
-        if count == 0 {
-            return Some("Generating initial questions…".into());
-        }
-        Some(format!(
-            "Generated {count} question{}…",
-            if count == 1 { "" } else { "s" }
-        ))
-    }
-
-    fn build_question_maker_wait_ui(&self) -> QuestionMakerWaitUi {
-        let started = self
-            .question_maker_wait_started
-            .unwrap_or_else(Instant::now);
-        let elapsed_secs = started.elapsed().as_secs();
-        let animate_dots = ((started.elapsed().as_millis() / 500) % 4) as usize;
-        let snapshot = self.read_question_maker_status_snapshot();
-
-        if self.scaffolding_pending {
-            let bootstrap_running = self.session_bootstrap_in_flight();
-            let headline = if bootstrap_running {
-                "Question maker is setting up this interview"
-            } else {
-                "Waiting for question maker to start"
-            };
-            let detail = snapshot
-                .notes
-                .clone()
-                .or_else(|| self.bootstrap_stage_detail());
-            return QuestionMakerWaitUi {
-                headline: headline.into(),
-                detail: detail.map(Into::into),
-                queue_depth: snapshot.queue_depth,
-                queue_target: snapshot.queue_target.or(Some(8)),
-                elapsed_secs,
-                animate_dots,
-            };
-        }
-
-        let headline = match snapshot.kind {
-            QuestionMakerStatusKind::Working => "Question maker is working",
-            QuestionMakerStatusKind::Complete => "Question maker finishing up",
-            _ => "Question maker is preparing questions",
-        };
-        let detail = snapshot.notes.or_else(|| {
-            Some(match snapshot.kind {
-                QuestionMakerStatusKind::Working => "Updating the question queue…".into(),
-                _ => "Agent run in progress…".into(),
-            })
-        });
-        QuestionMakerWaitUi {
-            headline: headline.into(),
-            detail: detail.map(Into::into),
-            queue_depth: snapshot.queue_depth,
-            queue_target: snapshot
-                .queue_target
-                .or(self.config.queue_target)
-                .or(Some(self.settings.question_maker.replenish_threshold)),
-            elapsed_secs,
-            animate_dots,
-        }
-    }
-
-    fn sync_question_maker_wait_display(&mut self) {
-        if self.question_maker_waiting() {
-            if self.question_maker_wait_started.is_none() {
-                self.question_maker_wait_started = Some(Instant::now());
+    /// Advance the agents and refresh from the database. Returns whether anything changed.
+    fn poll(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        if !self.mutations_blocked {
+            if let (Ok(mut agent), Ok(mut driver)) = (self.agent.try_lock(), self.driver.lock()) {
+                for event in driver.tick(&self.fleet, agent.as_mut()) {
+                    changed = true;
+                    match event {
+                        DriverEvent::QuestionMakerFinished { error: None } => {}
+                        DriverEvent::AnswersFinished { questions, error: None } => {
+                            let labels: Vec<String> =
+                                questions.iter().map(|s| format!("q-{s}")).collect();
+                            self.status_line = format!("Processed {}", labels.join(", ")).into();
+                        }
+                        DriverEvent::QuestionMakerFinished { error: Some(err) }
+                        | DriverEvent::AnswersFinished { error: Some(err), .. } => {
+                            self.error_banner = Some(err.into());
+                        }
+                    }
+                }
+                let status = driver.status();
+                if status != self.driver_status {
+                    self.driver_status = status;
+                    changed = true;
+                }
             }
-            let ui = self.build_question_maker_wait_ui();
-            self.status_line = ui.status_line();
-        } else {
-            self.question_maker_wait_started = None;
         }
-    }
-
-    fn question_maker_in_flight(&self) -> usize {
-        self.runs
-            .values()
-            .filter(|kind| {
-                matches!(
-                    kind,
-                    RunKind::QuestionMakerReplenish | RunKind::QuestionMakerAction { .. }
-                )
-            })
-            .count()
-    }
-
-    fn answer_in_flight(&self) -> bool {
-        self.runs.values().any(|kind| {
-            matches!(
-                kind,
-                RunKind::AnswerProcessor { .. } | RunKind::FreeformAnswer
-            )
-        })
-    }
-
-    fn session_bootstrap_in_flight(&self) -> bool {
-        self.bootstrap_sessions
-            .lock()
-            .map(|s| s.contains(&self.session.id))
-            .unwrap_or(false)
-    }
-
-    fn can_replenish(&self) -> bool {
-        self.session.status == InterviewSessionStatus::Active
-            && !self.scaffolding_pending
-            && !self.session_bootstrap_in_flight()
-            && self.queue_watcher.is_some()
-            && !self.is_complete()
-            && !self.replenish_state.manual_required
-            && !self.replenish_state.exhausted
-    }
-
-    fn question_maker_status_path(&self) -> PathBuf {
-        self.session_scratchpad_dir()
-            .join("question-maker-status.md")
-    }
-
-    fn current_question_maker_status(&self) -> QuestionMakerStatusKind {
-        let primary = self.question_maker_status_path();
-        let legacy = self.session_scratchpad_dir().join("researcher-status.md");
-        let path = if primary.is_file() {
-            Some(primary.as_path())
-        } else if legacy.is_file() {
-            Some(legacy.as_path())
+        if self.reload(cx) {
+            changed = true;
+        }
+        if self.question_maker_waiting() {
+            self.wait_started.get_or_insert_with(Instant::now);
+            changed = true;
         } else {
-            None
+            self.wait_started = None;
+        }
+        changed
+    }
+
+    /// Re-read questions and completion; returns whether anything visible changed.
+    fn reload(&mut self, cx: &mut Context<Self>) -> bool {
+        let node = self.session.node_id;
+        let session_id = self.session.id;
+        let phase = self.phase;
+        let Ok((questions, recent, summaries, complete)) = self.fleet.read(|conn| {
+            let repo = InterviewRepo::new(conn);
+            let all = repo.list_questions(node, &[])?;
+            let questions: Vec<InterviewQuestion> =
+                all.iter().filter(|q| q.status == STATUS_OPEN).cloned().collect();
+            let mut recent: Vec<InterviewQuestion> = all
+                .iter()
+                .filter(|q| q.status == STATUS_ANSWERED && q.phase == phase)
+                .cloned()
+                .collect();
+            recent.sort_by_key(|q| std::cmp::Reverse(q.answered_at));
+            recent.truncate(RECENT_ANSWERS);
+            let obligations = ObligationRepo::new(conn);
+            let summaries = questions
+                .iter()
+                .filter_map(|q| {
+                    q.proposal
+                        .as_ref()
+                        .map(|p| (q.seq, describe_proposal(p, &obligations)))
+                })
+                .collect();
+            Ok((questions, recent, summaries, interview_complete(conn, node, session_id)?))
+        }) else {
+            return false;
         };
-        question_maker_status_kind(path)
+
+        let mut changed = false;
+        if questions != self.questions {
+            self.questions = questions;
+            self.proposal_summaries = summaries;
+            if self
+                .selected_seq
+                .is_none_or(|seq| !self.questions.iter().any(|q| q.seq == seq))
+            {
+                self.selected_seq = self.questions.first().map(|q| q.seq);
+                self.reset_response_fields(None, cx);
+            }
+            self.sync_question_list_items(cx);
+            changed = true;
+        }
+        if recent != self.recent {
+            self.recent = recent;
+            changed = true;
+        }
+
+        if complete != self.complete {
+            self.complete = complete;
+            changed = true;
+        }
+        if complete && self.session.status == InterviewSessionStatus::Active {
+            if let Ok(session) = self
+                .store
+                .set_status(self.session.id, InterviewSessionStatus::Complete)
+            {
+                self.session = session;
+            }
+            self.status_line = "Interview complete".into();
+            cx.emit(WorkspaceEvent::SessionComplete);
+        } else if !complete && self.session.status == InterviewSessionStatus::Complete {
+            if let Ok(session) = self
+                .store
+                .set_status(self.session.id, InterviewSessionStatus::Active)
+            {
+                self.session = session;
+            }
+            if self.status_line.as_ref() == "Interview complete" {
+                self.status_line = SharedString::default();
+            }
+        }
+        self.loaded_once = true;
+        changed
     }
 
-    fn build_answer_processor_prompt(
-        &self,
-        payload: &str,
-    ) -> Result<(InterviewAgentPrompt, PathBuf), String> {
-        let paths = TodPaths::discover().map_err(|e| e.to_string())?;
-        let install = TodInstallPaths::discover().map_err(|e| e.to_string())?;
-        let manifest = ProcessManifest::load(&install).map_err(|e| e.to_string())?;
-        let prompt = answer_processor_prompt(
-            &self.fleet,
-            &install,
-            &manifest,
-            &paths,
-            self.config.node_id,
-            &self.config.phase,
-            &self.config.scratchpad,
-            &self.config.config_path,
-            payload,
-            Some(&self.agent_config_id),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok((prompt, self.workspace_cwd.clone()))
+    fn question_maker_waiting(&self) -> bool {
+        self.questions.is_empty() && self.driver_status.question_maker_running
     }
 
-    fn build_question_maker_action_prompt(
-        &self,
-        payload: &str,
-    ) -> Result<(InterviewAgentPrompt, PathBuf), String> {
-        let paths = TodPaths::discover().map_err(|e| e.to_string())?;
-        let install = TodInstallPaths::discover().map_err(|e| e.to_string())?;
-        let manifest = ProcessManifest::load(&install).map_err(|e| e.to_string())?;
-        let prompt = question_maker_action_prompt(
-            &self.fleet,
-            &install,
-            &manifest,
-            &paths,
-            self.config.node_id,
-            &self.config.phase,
-            &self.config.scratchpad,
-            &self.config.config_path,
-            payload,
-            Some(&self.agent_config_id),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok((prompt, self.workspace_cwd.clone()))
+    fn agent_status_text(&self) -> SharedString {
+        let mut parts = Vec::new();
+        if self.driver_status.question_maker_running {
+            parts.push("Question maker is writing questions".to_string());
+        }
+        if self.driver_status.answers_in_flight > 0 {
+            let lanes = if self.driver_status.answer_lanes_busy > 1 {
+                format!(" in {} sessions", self.driver_status.answer_lanes_busy)
+            } else {
+                String::new()
+            };
+            parts.push(format!(
+                "Processing {} answer{}{lanes}",
+                self.driver_status.answers_in_flight,
+                if self.driver_status.answers_in_flight == 1 { "" } else { "s" }
+            ));
+        }
+        if parts.is_empty() {
+            return self.status_line.clone();
+        }
+        parts.join(" · ").into()
     }
 
     fn interview_node_context(&self) -> (String, String) {
-        let fleet_projection = self.fleet.projection();
-        let guard = fleet_projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        let node_repo = NodeRepo::new(&conn);
-        let title = node_repo
-            .get(self.session.node_id)
-            .ok()
-            .flatten()
-            .map(|n| n.title)
-            .unwrap_or_else(|| self.session.display_name.clone());
-        let lifecycle = node_repo
-            .get_lifecycle(self.session.node_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| lifecycle_for_interview_phase(&self.config.phase).into());
-        (title, lifecycle)
+        self.fleet
+            .read(|conn| {
+                let nodes = NodeRepo::new(conn);
+                let title = nodes
+                    .get(self.session.node_id)?
+                    .map(|n| n.title)
+                    .unwrap_or_else(|| self.session.display_name.clone());
+                let lifecycle = nodes
+                    .get_lifecycle(self.session.node_id)?
+                    .unwrap_or_else(|| lifecycle_for_interview_phase(&self.session.phase).into());
+                Ok((title, lifecycle))
+            })
+            .unwrap_or_else(|_| (self.session.display_name.clone(), String::new()))
     }
 
     fn notes_focused(&self, window: &Window, cx: &App) -> bool {
-        self.notes_input
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window)
+        self.notes_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn proposed_focused(&self, window: &Window, cx: &App) -> bool {
-        self.proposed_input
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window)
+        self.proposed_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn feedback_focused(&self, window: &Window, cx: &App) -> bool {
-        self.feedback_input
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window)
+        self.feedback_input.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn response_text_editing(&self) -> bool {
-        self.notes_editing
-            || self.proposed_editing
-            || self.feedback_editing
-            || self.freeform_editing
+        self.notes_editing || self.proposed_editing || self.feedback_editing || self.freeform_editing
     }
 
     fn has_proposed_editor(&self) -> bool {
         self.selected_question()
-            .and_then(|q| q.proposed_text.as_ref())
+            .and_then(proposal_text)
             .is_some_and(|t| !t.trim().is_empty())
     }
 
@@ -968,611 +521,43 @@ impl WorkspaceView {
         if self
             .error_banner
             .as_ref()
-            .is_some_and(|msg| msg.as_ref() == "Enter notes and/or select an MC option")
+            .is_some_and(|msg| msg.as_ref() == "Pick an option and/or write notes")
         {
             self.error_banner = None;
         }
     }
 
-    /// If kickoff left paths NULL, pick up question maker scaffolding when it appears on disk.
-    fn try_bind_bootstrap_scaffolding(&mut self, cx: &mut Context<Self>) -> bool {
-        if session_config_path(&self.session).is_some() {
-            return false;
+    fn retry_agents(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut driver) = self.driver.lock() {
+            driver.retry();
         }
-        let Ok(paths) = TodPaths::discover() else {
-            return false;
-        };
-        match sync_scaffolding_from_disk(&self.store, paths.data_root(), self.session.id) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return false,
-        }
-        let Ok(Some(session)) = self.store.get_session(self.session.id) else {
-            return false;
-        };
-        let Some(config_path) = session_config_path(&session) else {
-            return false;
-        };
-        let Ok(config) = parse_interview_config(&config_path) else {
-            return false;
-        };
-        let queue_watcher = QueueWatcher::new(config.queue.clone()).ok();
-        let questions = load_queue_dir(&config.queue).unwrap_or_default();
-        let selected_question_id = questions.first().map(|q| q.id.clone());
-        self.session = session;
-        self.config = config;
-        self.queue_watcher = queue_watcher;
-        self.questions = questions;
-        self.selected_question_id = selected_question_id;
-        self.selected_mc = None;
-        self.scaffolding_pending = false;
-        self.workspace_focus = WorkspaceFocus::QuestionList;
-        self.notes_editing = false;
-        self.proposed_editing = false;
-        self.proposed_loaded_for = None;
-        self.sync_question_list_items(cx);
-        if self.session.status == InterviewSessionStatus::Complete && !self.questions.is_empty() {
-            if reopen_complete_with_bound_queue(&mut self.session, &self.store, true) {
-                self.mutations_blocked = false;
-            }
-        }
-        tracing::info!(
-            event = "interview",
-            action = "workspace_bound",
-            session_id = %self.session.id.to_string(),
-            questions = self.questions.len(),
-            queue = %self.config.queue.display(),
-            "workspace bound bootstrap scaffolding"
-        );
-        self.status_line = "Scaffolding bound from question maker bootstrap".into();
-        true
-    }
-
-    fn sync_scaffolding_status_line(&mut self) {
-        if self.scaffolding_pending {
-            self.sync_question_maker_wait_display();
-        }
-    }
-
-    fn poll_runs_and_queue(&mut self, cx: &mut Context<Self>) -> bool {
-        let mut changed = false;
-
-        if self.try_bind_bootstrap_scaffolding(cx) {
-            changed = true;
-        }
-
-        if self.scaffolding_pending {
-            self.sync_scaffolding_status_line();
-            changed = true;
-            // Only hand off after THIS session's bootstrap thread exits unbound.
-            // Do not use the shared gate — another session clearing it would close us
-            // mid-flight, and agent_finished clears the gate before disk sync binds.
-            if !self.session_bootstrap_in_flight() && !self.needs_bootstrap_handoff {
-                self.needs_bootstrap_handoff = true;
-                cx.emit(WorkspaceEvent::NeedsBootstrap);
-                changed = true;
-            }
-        }
-
-        let mut finished = Vec::new();
-        if let Ok(mut agent) = self.agent.try_lock() {
-            for (run_id, kind) in &self.runs {
-                if let Some(state) = agent.poll_run(*run_id) {
-                    match state {
-                        AgentRunState::InFlight(_) => {}
-                        AgentRunState::Success(_) => {
-                            finished.push((*run_id, kind.clone(), Ok(())));
-                        }
-                        AgentRunState::Failure(message) => {
-                            finished.push((*run_id, kind.clone(), Err(message)));
-                        }
-                    }
-                }
-            }
-        }
-        for (run_id, kind, result) in finished {
-            self.runs.remove(&run_id);
-            self.handle_run_finished(kind, result, cx);
-            changed = true;
-        }
-
-        if self.reconcile_hung_replenishment(cx) {
-            changed = true;
-        }
-
-        if let Some(watcher) = self.queue_watcher.as_mut() {
-            if let Ok(Some(questions)) = watcher.poll() {
-                self.apply_queue_update(questions, cx);
-                changed = true;
-            }
-        }
-
-        if self.selected_question().is_none() {
-            self.clear_validation_banner();
-        }
-
-        let runs_before = self.runs.len();
-        let status_before = self.status_line.clone();
-        let error_before = self.error_banner.clone();
-        self.maybe_start_replenishment(cx);
-        self.sync_status_line_hygiene();
-        if self.runs.len() != runs_before
-            || self.status_line != status_before
-            || self.error_banner != error_before
-        {
-            changed = true;
-        }
-
-        if self.is_complete() && self.session.status == InterviewSessionStatus::Active {
-            let _ = self
-                .store
-                .set_status(self.session.id, InterviewSessionStatus::Complete);
-            self.session.status = InterviewSessionStatus::Complete;
-            self.mutations_blocked = true;
-            self.error_banner = None;
-            self.status_line = "Interview complete".into();
-            self.question_maker_wait_started = None;
-            cx.emit(WorkspaceEvent::SessionComplete);
-            changed = true;
-        }
-
-        if self.question_maker_waiting() {
-            self.sync_question_maker_wait_display();
-            changed = true;
-        }
-
-        changed
-    }
-
-    /// If ACP stays InFlight but question-maker status is idle/complete for long enough
-    /// after flipping idle, cancel the hung replenish runs as failure (do not mark
-    /// success / exhausted).
-    fn reconcile_hung_replenishment(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.question_maker_in_flight() == 0 {
-            self.replenish_state.status_idle_since = None;
-            return false;
-        }
-        let current = self.current_question_maker_status();
-        let last = self.replenish_state.last_question_maker_status;
-        self.replenish_state.status_idle_since =
-            update_replenish_idle_since(last, current, self.replenish_state.status_idle_since);
-        self.replenish_state.last_question_maker_status = current;
-
-        let Some(idle_since) = self.replenish_state.status_idle_since else {
-            return false;
-        };
-        if idle_since.elapsed() < Duration::from_secs(HUNG_REPLENISH_SECS) {
-            return false;
-        }
-        let hung: Vec<_> = self
-            .runs
-            .iter()
-            .filter(|(_, k)| matches!(k, RunKind::QuestionMakerReplenish))
-            .map(|(id, k)| (*id, k.clone()))
-            .collect();
-        if hung.is_empty() {
-            return false;
-        }
-        for (run_id, kind) in hung {
-            if let Ok(mut agent) = self.agent.try_lock() {
-                let _ = agent.cancel_run(run_id);
-            }
-            self.runs.remove(&run_id);
-            self.handle_run_finished(
-                kind,
-                Err("Question maker replenishment timed out (cancelled hung run)".into()),
-                cx,
-            );
-        }
-        true
-    }
-
-    fn sync_status_line_hygiene(&mut self) {
-        if self.question_maker_in_flight() == 0
-            && self
-                .status_line
-                .as_ref()
-                .contains("replenishment in progress")
-        {
-            self.status_line = if self.replenish_state.exhausted || self.is_complete() {
-                "Interview complete".into()
-            } else {
-                "Ready".into()
-            };
-            self.replenish_state.status_idle_since = None;
-        }
-    }
-
-    fn reset_replenish_hung_tracking(&mut self) {
-        self.replenish_state.status_idle_since = None;
-        self.replenish_state.last_question_maker_status = self.current_question_maker_status();
-    }
-
-    fn handle_run_finished(
-        &mut self,
-        kind: RunKind,
-        result: Result<(), String>,
-        cx: &mut Context<Self>,
-    ) {
-        match (&kind, result) {
-            (_, Ok(())) => {
-                self.error_banner = None;
-                match kind {
-                    RunKind::AnswerProcessor { question_id } => {
-                        self.status_line = format!("Answer processed for {question_id}").into();
-                    }
-                    RunKind::QuestionMakerReplenish => {
-                        self.replenish_state.retry_count = 0;
-                        self.replenish_state.next_retry_at = None;
-                        self.replenish_state.status_idle_since = None;
-                        if self.live_question_count() == 0 && self.removing.is_empty() {
-                            // AP may wipe the queue while the question maker is still mid-refill
-                            // (`status: working`). Do not treat that as interview exhausted.
-                            let status = self.current_question_maker_status();
-                            if matches!(status, QuestionMakerStatusKind::Working) {
-                                self.replenish_state.exhausted = false;
-                                self.status_line = "Question maker still filling the queue…".into();
-                            } else {
-                                self.replenish_state.exhausted = true;
-                                self.status_line =
-                                    "Question maker returned no further questions".into();
-                            }
-                        } else {
-                            self.replenish_state.exhausted = false;
-                            self.status_line = "Question maker replenishment succeeded".into();
-                        }
-                    }
-                    RunKind::QuestionMakerAction { question_id } => {
-                        self.status_line =
-                            format!("Question maker action completed for {question_id}").into();
-                    }
-                    RunKind::FreeformAnswer => {
-                        self.status_line = "Requirements text processed".into();
-                    }
-                }
-            }
-            (RunKind::FreeformAnswer, Err(message)) => {
-                self.error_banner = Some(message.into());
-                self.status_line = "Freeform submission failed".into();
-            }
-            (RunKind::AnswerProcessor { question_id }, Err(message)) => {
-                self.error_banner = Some(message.into());
-                self.status_line = "Answer processor failed".into();
-                self.pending.remove(question_id);
-                self.pending_snapshots.remove(question_id);
-            }
-            (RunKind::QuestionMakerReplenish, Err(message)) => {
-                self.error_banner = Some(message.clone().into());
-                self.status_line = "Question maker replenishment failed".into();
-                self.replenish_state.status_idle_since = None;
-                self.replenish_state.retry_count += 1;
-                if self.replenish_state.retry_count >= MAX_RESEARCHER_RETRIES {
-                    self.replenish_state.manual_required = true;
-                    self.status_line =
-                        "Question maker failed — use Kickoff question maker to retry".into();
-                } else {
-                    let delay = retry_backoff_secs(self.replenish_state.retry_count - 1);
-                    self.replenish_state.next_retry_at =
-                        Some(Instant::now() + std::time::Duration::from_secs(delay));
-                    self.status_line = format!("Question maker retry in {delay}s…").into();
-                }
-            }
-            (RunKind::QuestionMakerAction { question_id }, Err(message)) => {
-                self.error_banner = Some(message.into());
-                self.status_line = "Question maker action failed".into();
-                self.pending.remove(question_id);
-                self.pending_snapshots.remove(question_id);
-            }
-        }
-        let _ = cx;
-    }
-
-    fn maybe_start_replenishment(&mut self, cx: &mut Context<Self>) {
-        if !self.can_replenish() {
-            return;
-        }
-        if let Some(retry_at) = self.replenish_state.next_retry_at {
-            if Instant::now() < retry_at {
-                return;
-            }
-            self.replenish_state.next_retry_at = None;
-        }
-        let open_count = self.live_question_count();
-        let in_flight = self.question_maker_in_flight();
-        let needed =
-            question_maker_starts_needed(open_count, in_flight, &self.settings.question_maker);
-        for _ in 0..needed {
-            self.start_question_maker_replenishment(cx);
-        }
-    }
-
-    fn start_question_maker_replenishment(&mut self, cx: &mut Context<Self>) {
-        if self.question_maker_in_flight() >= 2 {
-            return;
-        }
-        let queue_target = self
-            .config
-            .queue_target
-            .unwrap_or(self.settings.question_maker.replenish_threshold);
-        let paths = match TodPaths::discover() {
-            Ok(p) => p,
-            Err(err) => {
-                self.error_banner = Some(format!("Paths error: {err}").into());
-                cx.notify();
-                return;
-            }
-        };
-        let (prompt, cwd) = match (|| -> Result<(InterviewAgentPrompt, PathBuf), String> {
-            let install = TodInstallPaths::discover().map_err(|e| e.to_string())?;
-            let manifest = ProcessManifest::load(&install).map_err(|e| e.to_string())?;
-            let prompt = question_maker_replenish_prompt(
-                &self.fleet,
-                &install,
-                &manifest,
-                &paths,
-                self.config.node_id,
-                &self.config.phase,
-                &self.config.scratchpad,
-                &self.config.config_path,
-                queue_target,
-                Some(&self.agent_config_id),
-            )
-            .map_err(|e| e.to_string())?;
-            Ok((prompt, self.workspace_cwd.clone()))
-        })() {
-            Ok(v) => v,
-            Err(message) => {
-                self.error_banner = Some(message.into());
-                cx.notify();
-                return;
-            }
-        };
-        let start_result = match self.agent.try_lock() {
-            Ok(mut agent) => agent.start_question_maker_replenishment(
-                &self.agent_config_id,
-                cwd,
-                prompt,
-                &tod_core::settings::question_maker_pool(&self.settings.question_maker),
-                self.settings.interview_launch_options(),
-            ),
-            Err(_) => {
-                self.status_line = "Waiting for agent (bootstrap in progress)…".into();
-                cx.notify();
-                return;
-            }
-        };
-        match start_result {
-            Ok(handle) => {
-                let first_replenish = !self
-                    .runs
-                    .values()
-                    .any(|kind| matches!(kind, RunKind::QuestionMakerReplenish));
-                if first_replenish {
-                    self.reset_replenish_hung_tracking();
-                }
-                self.runs.insert(handle.id, RunKind::QuestionMakerReplenish);
-                if self.status_line.is_empty() || self.replenish_state.retry_count == 0 {
-                    self.status_line = "Question maker replenishment in progress…".into();
-                }
-                self.error_banner = None;
-            }
-            Err(err) => {
-                self.error_banner = Some(format!("Failed to start question maker: {err}").into());
-            }
-        }
-        cx.notify();
-    }
-
-    fn manual_question_maker_kickoff(&mut self, cx: &mut Context<Self>) {
-        self.replenish_state.manual_required = false;
-        self.replenish_state.retry_count = 0;
-        self.replenish_state.next_retry_at = None;
-        self.replenish_state.exhausted = false;
-        self.start_question_maker_replenishment(cx);
-    }
-
-    fn apply_queue_update(&mut self, questions: Vec<QueueQuestion>, cx: &mut Context<Self>) {
-        let live_before = self.live_question_count();
-        let new_ids: HashSet<String> = questions.iter().map(|q| q.id.clone()).collect();
-        let disappearing: HashSet<String> = self
-            .questions
-            .iter()
-            .filter(|q| !new_ids.contains(&q.id))
-            .map(|q| q.id.clone())
-            .collect();
-
-        // Resurrect any flash-pending rows that reappeared on disk.
-        self.removing.retain(|id| !new_ids.contains(id));
-
-        let mut still_pending = HashSet::new();
-        for id in self.pending.iter() {
-            if let Some(q) = questions.iter().find(|q| &q.id == id) {
-                if let Some(snapshot) = self.pending_snapshots.get(id) {
-                    if file_contents(&q.path).as_deref() != Some(snapshot.as_str()) {
-                        continue;
-                    }
-                }
-                still_pending.insert(id.clone());
-            }
-            // Keep pending while the row is flashing after disk delete.
-            if self.removing.contains(id) || disappearing.contains(id) {
-                still_pending.insert(id.clone());
-            }
-        }
-        self.pending = still_pending;
-        self.pending_snapshots
-            .retain(|id, _| self.pending.contains(id));
-
-        let previous = std::mem::take(&mut self.questions);
-        let mut merged = Vec::with_capacity(previous.len().max(questions.len()));
-        let mut used_new = HashSet::new();
-        let mut newly_removing = Vec::new();
-
-        for old in previous {
-            if let Some(fresh) = questions.iter().find(|q| q.id == old.id) {
-                used_new.insert(old.id.clone());
-                merged.push(fresh.clone());
-            } else if self.removing.contains(&old.id) {
-                // Still flashing from an earlier update.
-                merged.push(old);
-            } else {
-                // Just disappeared from disk — flash, then drop.
-                newly_removing.push(old.id.clone());
-                self.removing.insert(old.id.clone());
-                merged.push(old);
-            }
-        }
-        for q in &questions {
-            if !used_new.contains(&q.id) {
-                merged.push(q.clone());
-            }
-        }
-        self.questions = merged;
-
-        let live_after = self.live_question_count();
-        if live_after > 0 {
-            self.replenish_state.exhausted = false;
-            if reopen_complete_with_bound_queue(&mut self.session, &self.store, true) {
-                self.mutations_blocked = false;
-            }
-        } else if live_before > 0 && live_after == 0 {
-            // Queue drained under us (typically AP invalidated remaining questions).
-            // Clear exhausted/manual so maybe_start_replenishment can refill.
-            self.replenish_state.exhausted = false;
-            self.replenish_state.manual_required = false;
-            self.replenish_state.retry_count = 0;
-            self.replenish_state.next_retry_at = None;
-            self.status_line = "Queue cleared — requesting question maker refill…".into();
-        }
-
-        // Selected row departing: lock interaction immediately; keep selection for the flash.
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|id| newly_removing.iter().any(|rid| rid == id))
-        {
-            self.notes_editing = false;
-            self.proposed_editing = false;
-            self.actions_menu_open = false;
-            self.actions_menu = None;
-            self._actions_menu_subscription = None;
-        }
-
-        // Keep selection on a departing row so the user sees the red flash + disabled detail.
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_none_or(|id| !self.questions.iter().any(|q| &q.id == id))
-        {
-            self.selected_question_id = self
-                .questions
-                .iter()
-                .find(|q| !self.pending.contains(&q.id) && !self.removing.contains(&q.id))
-                .map(|q| q.id.clone());
-            self.reset_response_fields(None, cx);
-            if self.selected_question_id.is_none() {
-                self.clear_validation_banner();
-            }
-        }
-
-        self.sync_question_list_items(cx);
-
-        for id in newly_removing {
-            self.schedule_question_removal_finalize(id, cx);
-        }
-    }
-
-    fn live_question_count(&self) -> usize {
-        self.questions
-            .iter()
-            .filter(|q| !self.removing.contains(&q.id))
-            .count()
-    }
-
-    fn schedule_question_removal_finalize(&mut self, question_id: String, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            Timer::after(QUESTION_REMOVAL_FLASH).await;
-            let _ = this.update(cx, |this, cx| {
-                this.finalize_question_removal(&question_id, cx);
-            });
-        })
-        .detach();
-    }
-
-    fn finalize_question_removal(&mut self, question_id: &str, cx: &mut Context<Self>) {
-        if !self.removing.remove(question_id) {
-            return;
-        }
-        self.pending.remove(question_id);
-        self.pending_snapshots.remove(question_id);
-        self.questions.retain(|q| q.id != question_id);
-
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|id| id == question_id)
-        {
-            self.selected_question_id = self
-                .questions
-                .iter()
-                .find(|q| !self.pending.contains(&q.id) && !self.removing.contains(&q.id))
-                .map(|q| q.id.clone());
-            self.reset_response_fields(None, cx);
-            if self.selected_question_id.is_none() {
-                self.clear_validation_banner();
-            }
-        }
-
-        if self.live_question_count() == 0 && self.removing.is_empty() {
-            self.replenish_state.exhausted = false;
-            self.replenish_state.manual_required = false;
-            self.replenish_state.retry_count = 0;
-            self.replenish_state.next_retry_at = None;
-            if self.status_line.is_empty() {
-                self.status_line = "Queue cleared — requesting question maker refill…".into();
-            }
-        }
-
-        self.sync_question_list_items(cx);
-        self.maybe_start_replenishment(cx);
+        self.error_banner = None;
         cx.notify();
     }
 
     fn sync_question_list_items(&mut self, cx: &mut Context<Self>) {
         let questions = self.questions.clone();
-        let pending = self.pending.clone();
-        let removing = self.removing.clone();
-        let selected_id = self.selected_question_id.clone();
+        let selected = self.selected_seq;
         self.question_list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(questions);
-            state.delegate_mut().set_pending(pending);
-            state.delegate_mut().set_removing(removing);
-            if let Some(id) = selected_id.as_deref() {
-                let _ = state.delegate_mut().select_by_id(id);
-            } else {
-                state.delegate_mut().clear_selected_index();
+            match selected {
+                Some(seq) => {
+                    let _ = state.delegate_mut().select_by_seq(seq);
+                }
+                None => state.delegate_mut().clear_selected_index(),
             }
             cx.notify();
         });
     }
 
     /// Keep ListState selection aligned with workspace selection (needs a Window).
-    fn sync_question_list_selection(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        scroll: bool,
-    ) {
+    fn sync_question_list_selection(&mut self, window: &mut Window, cx: &mut Context<Self>, scroll: bool) {
         let questions = self.questions.clone();
-        let pending = self.pending.clone();
-        let removing = self.removing.clone();
-        let selected_id = self.selected_question_id.clone();
+        let selected = self.selected_seq;
         self.question_list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(questions);
-            state.delegate_mut().set_pending(pending);
-            state.delegate_mut().set_removing(removing);
-            let ix = selected_id
-                .as_deref()
-                .and_then(|id| state.delegate().index_of_id(id))
+            let ix = selected
+                .and_then(|seq| state.delegate().index_of_seq(seq))
                 .map(IndexPath::new);
             state.set_selected_index(ix, window, cx);
             if scroll && ix.is_some() {
@@ -1581,59 +566,27 @@ impl WorkspaceView {
         });
     }
 
-    fn is_complete(&self) -> bool {
-        // Bound open questions always win over SQLite `complete` (H8 / req 18).
-        if !self.questions.is_empty()
-            || self.answer_in_flight()
-            || self.question_maker_in_flight() > 0
-        {
-            return false;
-        }
-        if self.scaffolding_pending {
-            return false;
-        }
-        if self.replenish_state.exhausted {
-            return true;
-        }
-        if self.session.status == InterviewSessionStatus::Complete {
-            return true;
-        }
-        matches!(
-            self.current_question_maker_status(),
-            QuestionMakerStatusKind::Complete
-        )
+    fn selected_question(&self) -> Option<&InterviewQuestion> {
+        self.selected_seq
+            .and_then(|seq| self.questions.iter().find(|q| q.seq == seq))
     }
 
-    fn selected_question(&self) -> Option<&QueueQuestion> {
-        self.selected_question_id
-            .as_ref()
-            .and_then(|id| self.questions.iter().find(|q| &q.id == id))
-    }
-
-    fn select_question(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|current| current == id)
-        {
+    fn select_question(&mut self, seq: i64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_seq == Some(seq) {
             return;
         }
-        self.selected_question_id = Some(id.to_string());
+        self.selected_seq = Some(seq);
         self.reset_response_fields(Some(window), cx);
         self.clear_validation_banner();
         self.sync_question_list_selection(window, cx, true);
         cx.notify();
     }
 
-    fn select_question_without_window(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|current| current == id)
-        {
+    fn select_question_without_window(&mut self, seq: i64, cx: &mut Context<Self>) {
+        if self.selected_seq == Some(seq) {
             return;
         }
-        self.selected_question_id = Some(id.to_string());
+        self.selected_seq = Some(seq);
         self.reset_response_fields(None, cx);
         self.clear_validation_banner();
         self.sync_question_list_items(cx);
@@ -1645,26 +598,32 @@ impl WorkspaceView {
             return;
         }
         let current = self
-            .question_list_state
-            .read(cx)
-            .selected_index()
-            .map(|ix| ix.row)
-            .or_else(|| {
-                self.selected_question_id
-                    .as_ref()
-                    .and_then(|id| self.questions.iter().position(|q| &q.id == id))
-            })
+            .selected_seq
+            .and_then(|seq| self.questions.iter().position(|q| q.seq == seq))
             .unwrap_or(0);
         let new_idx = if delta < 0 {
             current.saturating_sub((-delta) as usize)
         } else {
             (current + delta as usize).min(self.questions.len() - 1)
         };
-        if new_idx == current {
-            return;
+        if new_idx != current {
+            let seq = self.questions[new_idx].seq;
+            self.select_question(seq, window, cx);
         }
-        let id = self.questions[new_idx].id.clone();
-        self.select_question(&id, window, cx);
+    }
+
+    /// Select the question after the current one (wrapping), once it is gone.
+    fn select_next_question(&mut self, after: i64, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let next = self
+            .questions
+            .iter()
+            .find(|q| q.seq > after)
+            .or_else(|| self.questions.iter().find(|q| q.seq != after))
+            .map(|q| q.seq);
+        self.selected_seq = next;
+        self.reset_response_fields(window, cx);
+        self.clear_validation_banner();
+        self.sync_question_list_items(cx);
     }
 
     fn reset_response_fields(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
@@ -1683,57 +642,51 @@ impl WorkspaceView {
         self.feedback_editing = false;
         self.proposed_loaded_for = None;
         if let Some(window) = window {
-            self.notes_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
-            self.feedback_input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-            });
+            self.notes_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
             self.sync_proposed_input(window, cx);
             if should_unfocus {
                 self.focus_handle.focus(window);
             }
+        } else {
+            // Cleared on the next render, which has a Window.
+            self.notes_pending_clear = true;
         }
         if matches!(self.workspace_focus, WorkspaceFocus::Response(_)) {
-            self.workspace_focus = WorkspaceFocus::Response(0);
+            self.workspace_focus = if self.selected_seq.is_none() {
+                WorkspaceFocus::QuestionList
+            } else {
+                WorkspaceFocus::Response(0)
+            };
         }
     }
 
-    /// Load `proposed_text` for the selected question into the editor (or clear it).
+    /// Load the selected question's proposal text into the editor (or clear it).
     fn sync_proposed_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.selected_question_id.clone();
-        if self.proposed_loaded_for == id {
+        if self.proposed_loaded_for == self.selected_seq {
             return;
         }
         let text = self
             .selected_question()
-            .and_then(|q| q.proposed_text.clone())
-            .unwrap_or_default();
-        self.proposed_input.update(cx, |input, cx| {
-            input.set_value(text, window, cx);
-        });
-        self.proposed_loaded_for = id;
-    }
-
-    fn is_question_pending(&self, id: &str) -> bool {
-        self.pending.contains(id)
-    }
-
-    fn is_question_removing(&self, id: &str) -> bool {
-        self.removing.contains(id)
-    }
-
-    /// Pending or departing — response controls must not accept input.
-    fn is_question_locked(&self, id: &str) -> bool {
-        self.is_question_pending(id) || self.is_question_removing(id)
+            .and_then(proposal_text)
+            .unwrap_or_default()
+            .to_string();
+        self.proposed_input.update(cx, |input, cx| input.set_value(text, window, cx));
+        self.proposed_loaded_for = self.selected_seq;
     }
 
     fn can_mutate(&self) -> bool {
         !self.mutations_blocked
     }
 
-    fn can_edit_notes(&self) -> bool {
-        !self.mutations_blocked
+    fn interview(&mut self, command: InterviewCommand) -> Option<serde_json::Value> {
+        match self.fleet.interview(ACTOR_USER, command) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                self.error_banner = Some(format!("{err:#}").into());
+                None
+            }
+        }
     }
 
     fn submit_answer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1745,106 +698,35 @@ impl WorkspaceView {
             cx.notify();
             return;
         };
-        if self.is_question_locked(&question.id) {
-            return;
-        }
-        let notes = self.notes_input.read(cx).value().to_string();
-        let proposed_edited = self.proposed_input.read(cx).value().to_string();
-        let mc = self.selected_mc.clone();
-        if notes.trim().is_empty() && mc.is_none() {
-            self.error_banner = Some("Enter notes and/or select an MC option".into());
+        let notes = self.notes_input.read(cx).value().trim().to_string();
+        let option = self.selected_mc.as_deref().and_then(|k| k.parse::<i64>().ok());
+        if notes.is_empty() && option.is_none() {
+            self.error_banner = Some("Pick an option and/or write notes".into());
             cx.notify();
             return;
         }
-
-        let (text_changed, payload_body, answer_text) = build_proposed_answer_parts(
-            question.proposed_text.as_deref(),
-            &proposed_edited,
-            &notes,
+        let edited = edited_proposal_text(
+            proposal_text(&question),
+            &self.proposed_input.read(cx).value(),
         );
-
-        let record = AnswerRecord {
-            id: question.id.clone(),
-            option: mc.clone(),
-            text_changed,
-            body: payload_body.clone(),
+        let Some(value) = self.interview(InterviewCommand::AnswerQuestion {
+            node_id: self.session.node_id,
+            seq: question.seq,
+            option,
+            text: Some(notes).filter(|n| !n.is_empty()),
+            edited_text: edited,
+        }) else {
+            cx.notify();
+            return;
         };
-        let payload = match format_answer_payload(&[record]) {
-            Ok(p) => p,
-            Err(err) => {
-                self.error_banner = Some(format!("Payload error: {err}").into());
-                cx.notify();
-                return;
-            }
-        };
-
-        let transcript = transcript_path_for(&self.config);
-        let (prompt, cwd) = match self.build_answer_processor_prompt(&payload) {
-            Ok(v) => v,
-            Err(message) => {
-                self.error_banner = Some(message.into());
-                cx.notify();
-                return;
-            }
-        };
-
-        let work = SubmitAnswerWork {
-            question_id: question.id.clone(),
-            question_path: question.path.clone(),
-            question_body: question.display_body(),
-            answer_text,
-            mc,
-            transcript,
-            prompt,
-            agent_config_id: self.agent_config_id.clone(),
-            cwd,
-            settings: self.settings.answer_processor.clone(),
-            launch_options: self.settings.interview_launch_options(),
-        };
-        let agent = self.agent.clone();
-
-        self.error_banner = None;
-        self.status_line = format!("Processing answer for {}", work.question_id).into();
-        self.pending.insert(work.question_id.clone());
-        self.select_next_question(Some(window), cx);
-        cx.notify();
-
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let outcome = run_submit_answer_work(work, agent);
-            let _ = tx.send_blocking(outcome);
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    this.finish_submit_answer(outcome, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn finish_submit_answer(&mut self, outcome: SubmitAnswerOutcome, cx: &mut Context<Self>) {
-        match outcome.result {
-            Ok((run_id, snapshot)) => {
-                self.runs.insert(
-                    run_id,
-                    RunKind::AnswerProcessor {
-                        question_id: outcome.question_id.clone(),
-                    },
-                );
-                if let Some(contents) = snapshot {
-                    self.pending_snapshots
-                        .insert(outcome.question_id.clone(), contents);
-                }
-            }
-            Err(message) => {
-                self.pending.remove(&outcome.question_id);
-                self.pending_snapshots.remove(&outcome.question_id);
-                self.error_banner = Some(message.into());
-                self.status_line = "Answer submit failed".into();
-            }
-        }
+        self.error_banner = value
+            .pointer("/applied/error")
+            .and_then(|e| e.as_str())
+            .map(|err| format!("Answer recorded, but the proposal was not applied: {err}").into());
+        self.status_line = format!("Answered {}", question.label()).into();
+        self.questions.retain(|q| q.seq != question.seq);
+        self.select_next_question(question.seq, Some(window), cx);
+        self.reload(cx);
         cx.notify();
     }
 
@@ -1854,179 +736,78 @@ impl WorkspaceView {
         }
         let text = self.freeform_input.read(cx).value().trim().to_string();
         if text.is_empty() {
-            self.error_banner = Some("Enter requirements text before submitting".into());
+            self.error_banner = Some("Enter some text before submitting".into());
             cx.notify();
             return;
         }
-        let submission_id = format!("freeform-{}", Uuid::new_v4());
-        let record = AnswerRecord {
-            id: submission_id.clone(),
-            option: None,
-            text_changed: None,
-            body: text.clone(),
-        };
-        let payload = match format_answer_payload(&[record]) {
-            Ok(p) => p,
-            Err(err) => {
-                self.error_banner = Some(format!("Payload error: {err}").into());
-                cx.notify();
-                return;
-            }
-        };
-        let transcript = transcript_path_for(&self.config);
-        let (prompt, cwd) = match self.build_answer_processor_prompt(&payload) {
-            Ok(v) => v,
-            Err(message) => {
-                self.error_banner = Some(message.into());
-                cx.notify();
-                return;
-            }
-        };
-        let work = SubmitFreeformWork {
-            submission_id,
-            text,
-            transcript,
-            prompt,
-            agent_config_id: self.agent_config_id.clone(),
-            cwd,
-            settings: self.settings.answer_processor.clone(),
-            launch_options: self.settings.interview_launch_options(),
-        };
-        let agent = self.agent.clone();
-
-        self.error_banner = None;
-        self.status_line = "Submitting requirements text to processor…".into();
-        self.freeform_editing = false;
-        self.freeform_input.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-        });
-        cx.notify();
-
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let outcome = run_submit_freeform_work(work, agent);
-            let _ = tx.send_blocking(outcome);
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    this.finish_submit_freeform(outcome, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn finish_submit_freeform(&mut self, outcome: SubmitFreeformOutcome, cx: &mut Context<Self>) {
-        match outcome.result {
-            Ok(run_id) => {
-                self.runs.insert(run_id, RunKind::FreeformAnswer);
-            }
-            Err(message) => {
-                self.error_banner = Some(message.into());
-                self.status_line = "Freeform submit failed".into();
-            }
+        if self
+            .interview(InterviewCommand::SubmitFreeform {
+                node_id: self.session.node_id,
+                session_id: Some(self.session.id),
+                phase: self.phase.to_string(),
+                text,
+            })
+            .is_some()
+        {
+            self.error_banner = None;
+            self.status_line = "Sent to the interview".into();
+            self.freeform_editing = false;
+            self.freeform_input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
     }
 
     fn submit_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if action == "deep-dive" {
-            if !self.mutations_blocked {
-                self.open_deep_dive(window, cx);
-            }
-            return;
-        }
         if !self.can_mutate() {
             return;
         }
         let Some(question) = self.selected_question().cloned() else {
             return;
         };
-        if self.is_question_locked(&question.id) {
+        let notes = self.notes_input.read(cx).value().trim().to_string();
+        let node_id = self.session.node_id;
+        let command = match action {
+            "defer" => InterviewCommand::DeferQuestion {
+                node_id,
+                seq: question.seq,
+            },
+            "more-options" => InterviewCommand::WithdrawQuestion {
+                node_id,
+                seq: question.seq,
+                reason: if notes.is_empty() {
+                    "The user wants more options.".into()
+                } else {
+                    format!("The user wants more options: {notes}")
+                },
+            },
+            _ => InterviewCommand::WithdrawQuestion {
+                node_id,
+                seq: question.seq,
+                reason: if notes.is_empty() {
+                    "The user asked for a better question.".into()
+                } else {
+                    notes
+                },
+            },
+        };
+        if self.interview(command).is_none() {
+            cx.notify();
             return;
         }
-        let notes = self.notes_input.read(cx).value().to_string();
-        let record = ActionRecord {
-            action: action.to_string(),
-            id: question.id.clone(),
-            body: notes.trim().to_string(),
-        };
-        let payload = match format_action_payload(&[record]) {
-            Ok(p) => p,
-            Err(err) => {
-                self.error_banner = Some(format!("Payload error: {err}").into());
-                cx.notify();
-                return;
-            }
-        };
-        let transcript = transcript_path_for(&self.config);
-        let (prompt, cwd) = match self.build_question_maker_action_prompt(&payload) {
-            Ok(v) => v,
-            Err(message) => {
-                self.error_banner = Some(message.into());
-                cx.notify();
-                return;
-            }
-        };
-        let work = SubmitActionWork {
-            question_id: question.id.clone(),
-            question_path: question.path.clone(),
-            action: action.to_string(),
-            notes: notes.trim().to_string(),
-            question_body: question.display_body(),
-            transcript,
-            prompt,
-            agent_config_id: self.agent_config_id.clone(),
-            cwd,
-            question_maker_settings: self.settings.question_maker.clone(),
-            launch_options: self.settings.interview_launch_options(),
-        };
-        let agent = self.agent.clone();
-
-        self.error_banner = None;
-        self.status_line =
-            format!("Question maker action {action} for {}", work.question_id).into();
-        self.pending.insert(work.question_id.clone());
-        self.select_next_question(Some(window), cx);
-        cx.notify();
-
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let outcome = run_submit_action_work(work, agent);
-            let _ = tx.send_blocking(outcome);
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(outcome) = rx.recv().await {
-                let _ = this.update(cx, |this, cx| {
-                    this.finish_submit_action(outcome, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn finish_submit_action(&mut self, outcome: SubmitActionOutcome, cx: &mut Context<Self>) {
-        match outcome.result {
-            Ok((run_id, snapshot)) => {
-                self.runs.insert(
-                    run_id,
-                    RunKind::QuestionMakerAction {
-                        question_id: outcome.question_id.clone(),
-                    },
-                );
-                if let Some(contents) = snapshot {
-                    self.pending_snapshots
-                        .insert(outcome.question_id.clone(), contents);
-                }
-            }
-            Err(message) => {
-                self.pending.remove(&outcome.question_id);
-                self.pending_snapshots.remove(&outcome.question_id);
-                self.error_banner = Some(message.into());
-                self.status_line = "Question maker action submit failed".into();
+        if action != "defer" {
+            if let Ok(mut driver) = self.driver.lock() {
+                driver.wake_question_maker();
             }
         }
+        self.error_banner = None;
+        self.status_line = match action {
+            "defer" => format!("Deferred {}", question.label()),
+            _ => format!("Sent {} back for a better version", question.label()),
+        }
+        .into();
+        self.questions.retain(|q| q.seq != question.seq);
+        self.select_next_question(question.seq, Some(window), cx);
+        self.reload(cx);
         cx.notify();
     }
 
@@ -2043,7 +824,6 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        let raw_source = file_contents(&question.path).unwrap_or_default();
         let paths = match TodPaths::discover() {
             Ok(p) => p,
             Err(err) => {
@@ -2055,79 +835,41 @@ impl WorkspaceView {
         let (node_title, lifecycle_state) = self.interview_node_context();
         if let Err(err) = append_question_feedback(
             &paths,
-            &question.id,
+            &question.label(),
             &node_title,
             &lifecycle_state,
             &feedback,
-            &raw_source,
+            &question_source(&question),
         ) {
             self.error_banner = Some(format!("Feedback write failed: {err}").into());
-            self.status_line = "Question feedback submit failed".into();
             cx.notify();
             return;
         }
-
         self.error_banner = None;
-        self.status_line = format!("Feedback saved for {}", question.id).into();
+        self.status_line = format!("Feedback saved for {}", question.label()).into();
         self.feedback_editing = false;
-        self.feedback_input.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-        });
+        self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
     fn copy_question_source(&mut self, cx: &mut Context<Self>) {
-        let (question_id, question_path) = match self.selected_question() {
-            Some(q) => (q.id.clone(), q.path.clone()),
-            None => {
-                self.error_banner = Some("No question selected".into());
-                cx.notify();
-                return;
-            }
-        };
-        let Some(raw) = file_contents(&question_path) else {
-            self.error_banner =
-                Some(format!("Could not read question file {}", question_path.display()).into());
+        let Some(question) = self.selected_question().cloned() else {
+            self.error_banner = Some("No question selected".into());
             cx.notify();
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(raw));
+        cx.write_to_clipboard(ClipboardItem::new_string(question_source(&question)));
         self.error_banner = None;
-        self.status_line = format!("Copied raw source for {question_id}").into();
+        self.status_line = format!("Copied raw source for {}", question.label()).into();
         cx.notify();
     }
 
-    fn select_next_question(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
-        let current_idx = self
-            .selected_question_id
-            .as_ref()
-            .and_then(|id| self.questions.iter().position(|q| &q.id == id));
-        let start = current_idx.map(|i| i + 1).unwrap_or(0);
-        for offset in 0..self.questions.len() {
-            let idx = (start + offset) % self.questions.len();
-            let q = &self.questions[idx];
-            if !self.pending.contains(&q.id) && !self.removing.contains(&q.id) {
-                self.selected_question_id = Some(q.id.clone());
-                self.reset_response_fields(window, cx);
-                self.clear_validation_banner();
-                self.sync_question_list_items(cx);
-                return;
-            }
-        }
-        // No non-pending question left — clear selection so we don't keep a stale banner.
-        self.selected_question_id = None;
-        self.reset_response_fields(window, cx);
-        self.clear_validation_banner();
-        self.sync_question_list_items(cx);
-    }
-
     fn on_digit_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Text edit mode suppresses digit MC submit (req 21.6 / 22.7a) — not mere focus.
+        // Text edit mode suppresses digit MC submit — not mere focus.
         if self.response_text_editing() {
             cx.propagate();
             return;
         }
-        let _ = window;
         self.submit_mc_option(key, window, cx);
     }
 
@@ -2138,7 +880,8 @@ impl WorkspaceView {
         let Some(q) = self.selected_question() else {
             return;
         };
-        if !q.options.iter().any(|o| o.key == key) {
+        let count = option_labels(q).len();
+        if !key.parse::<usize>().is_ok_and(|n| n >= 1 && n <= count) {
             return;
         }
         self.selected_mc = Some(key.to_string());
@@ -2146,34 +889,23 @@ impl WorkspaceView {
         self.submit_answer(window, cx);
     }
 
+    fn option_count(&self) -> usize {
+        self.selected_question().map(|q| option_labels(q).len()).unwrap_or(0)
+    }
+
     fn response_stop_count(&self) -> usize {
-        let mc = self
-            .selected_question()
-            .map(|q| q.options.len())
-            .unwrap_or(0);
-        let proposed = if self.has_proposed_editor() { 1 } else { 0 };
+        let proposed = usize::from(self.has_proposed_editor());
         // Notes, Other action, Submit, feedback field, Submit feedback,
-        // freeform field, Submit to processor
-        mc + proposed + 7
+        // freeform field, Submit freeform
+        self.option_count() + proposed + 7
     }
 
     fn proposed_stop_index(&self) -> Option<usize> {
-        if !self.has_proposed_editor() {
-            return None;
-        }
-        Some(
-            self.selected_question()
-                .map(|q| q.options.len())
-                .unwrap_or(0),
-        )
+        self.has_proposed_editor().then(|| self.option_count())
     }
 
     fn notes_stop_index(&self) -> usize {
-        let mc = self
-            .selected_question()
-            .map(|q| q.options.len())
-            .unwrap_or(0);
-        mc + if self.has_proposed_editor() { 1 } else { 0 }
+        self.option_count() + usize::from(self.has_proposed_editor())
     }
 
     fn actions_stop_index(&self) -> usize {
@@ -2201,12 +933,7 @@ impl WorkspaceView {
     }
 
     fn actions_disabled(&self) -> bool {
-        !self.can_mutate()
-            || self
-                .selected_question_id
-                .as_deref()
-                .is_some_and(|id| self.is_question_locked(id))
-            || self.selected_question().is_none()
+        !self.can_mutate() || self.selected_question().is_none()
     }
 
     fn set_actions_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
@@ -2244,9 +971,7 @@ impl WorkspaceView {
 
     fn focus_actions_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(menu) = self.actions_menu.clone() {
-            menu.update(cx, |menu, cx| {
-                menu.focus_handle(cx).focus(window);
-            });
+            menu.update(cx, |menu, cx| menu.focus_handle(cx).focus(window));
         }
     }
 
@@ -2290,14 +1015,7 @@ impl WorkspaceView {
     }
 
     fn enter_notes_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit_notes() {
-            return;
-        }
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|id| self.is_question_locked(id))
-        {
+        if !self.can_mutate() || self.selected_question().is_none() {
             return;
         }
         self.proposed_editing = false;
@@ -2306,9 +1024,7 @@ impl WorkspaceView {
         cx.notify();
         // Focus after Input re-renders enabled (disabled when !notes_editing).
         cx.on_next_frame(window, |this, window, cx| {
-            this.notes_input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+            this.notes_input.update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -2323,14 +1039,7 @@ impl WorkspaceView {
     }
 
     fn enter_proposed_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit_notes() || !self.has_proposed_editor() {
-            return;
-        }
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|id| self.is_question_locked(id))
-        {
+        if !self.can_mutate() || !self.has_proposed_editor() {
             return;
         }
         let Some(idx) = self.proposed_stop_index() else {
@@ -2341,9 +1050,7 @@ impl WorkspaceView {
         self.proposed_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.proposed_input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+            this.proposed_input.update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -2360,14 +1067,7 @@ impl WorkspaceView {
     }
 
     fn enter_feedback_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit_notes() {
-            return;
-        }
-        if self
-            .selected_question_id
-            .as_ref()
-            .is_some_and(|id| self.is_question_locked(id))
-        {
+        if !self.can_mutate() || self.selected_question().is_none() {
             return;
         }
         self.notes_editing = false;
@@ -2376,9 +1076,7 @@ impl WorkspaceView {
         self.feedback_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.feedback_input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+            this.feedback_input.update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -2393,7 +1091,7 @@ impl WorkspaceView {
     }
 
     fn enter_freeform_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_edit_notes() {
+        if !self.can_mutate() {
             return;
         }
         self.notes_editing = false;
@@ -2403,9 +1101,7 @@ impl WorkspaceView {
         self.freeform_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.freeform_input.update(cx, |input, cx| {
-                input.focus(window, cx);
-            });
+            this.freeform_input.update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -2433,9 +1129,7 @@ impl WorkspaceView {
         if self.response_text_editing() {
             return;
         }
-        self.obligations.update(cx, |panel, cx| {
-            panel.focus_handle(cx).focus(window);
-        });
+        self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
         cx.notify();
     }
 
@@ -2444,9 +1138,7 @@ impl WorkspaceView {
             return;
         }
         self.workspace_focus = WorkspaceFocus::QuestionList;
-        self.question_list_state.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
+        self.question_list_state.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
 
@@ -2476,119 +1168,43 @@ impl WorkspaceView {
         let WorkspaceFocus::Response(idx) = self.workspace_focus else {
             return;
         };
-        let mc_count = self
-            .selected_question()
-            .map(|q| q.options.len())
-            .unwrap_or(0);
-        if idx < mc_count {
-            if let Some(key) = self
-                .selected_question()
-                .and_then(|q| q.options.get(idx).map(|o| o.key.clone()))
-            {
-                self.submit_mc_option(&key, window, cx);
-            }
+        if idx < self.option_count() {
+            self.submit_mc_option(&(idx + 1).to_string(), window, cx);
             return;
         }
         if self.proposed_stop_index() == Some(idx) {
             self.enter_proposed_edit(window, cx);
-            return;
-        }
-        let notes_idx = self.notes_stop_index();
-        let actions_idx = self.actions_stop_index();
-        let submit_idx = self.submit_stop_index();
-        let feedback_idx = self.feedback_stop_index();
-        let feedback_submit_idx = self.feedback_submit_stop_index();
-        let freeform_idx = self.freeform_stop_index();
-        let freeform_submit_idx = self.freeform_submit_stop_index();
-        if idx == notes_idx {
+        } else if idx == self.notes_stop_index() {
             self.enter_notes_edit(window, cx);
-        } else if idx == submit_idx {
+        } else if idx == self.submit_stop_index() {
             self.submit_answer(window, cx);
-        } else if idx == actions_idx && !self.actions_disabled() {
+        } else if idx == self.actions_stop_index() && !self.actions_disabled() {
             self.open_actions_menu_from_keyboard(window, cx);
-        } else if idx == feedback_idx {
+        } else if idx == self.feedback_stop_index() {
             self.enter_feedback_edit(window, cx);
-        } else if idx == feedback_submit_idx {
+        } else if idx == self.feedback_submit_stop_index() {
             self.submit_feedback(window, cx);
-        } else if idx == freeform_idx {
+        } else if idx == self.freeform_stop_index() {
             self.enter_freeform_edit(window, cx);
-        } else if idx == freeform_submit_idx {
+        } else if idx == self.freeform_submit_stop_index() {
             self.submit_freeform(window, cx);
         }
-    }
-
-    fn focus_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.enter_notes_edit(window, cx);
     }
 
     fn handle_workspace_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.freeform_editing {
             self.exit_freeform_edit(window, cx);
-            return;
-        }
-        if self.proposed_editing {
+        } else if self.proposed_editing {
             self.exit_proposed_edit(window, cx);
-            return;
-        }
-        if self.notes_editing {
+        } else if self.notes_editing {
             self.exit_notes_edit(window, cx);
-            return;
-        }
-        if self.feedback_editing {
+        } else if self.feedback_editing {
             self.exit_feedback_edit(window, cx);
-            return;
-        }
-        if self.actions_menu_open {
+        } else if self.actions_menu_open {
             self.close_actions_menu(window, cx);
-            return;
+        } else {
+            cx.emit(WorkspaceEvent::NavigateBack);
         }
-        self.navigate_back(cx);
-    }
-
-    fn navigate_back(&mut self, cx: &mut Context<Self>) {
-        cx.emit(WorkspaceEvent::NavigateBack);
-    }
-
-    fn open_deep_dive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(question) = self.selected_question().cloned() else {
-            return;
-        };
-        if self.is_question_locked(&question.id) {
-            return;
-        }
-        let agent = self.agent.clone();
-        let config = self.config.clone();
-        let session = self.session.clone();
-        let workspace_cwd = self.workspace_cwd.clone();
-        let agent_config_id = self.agent_config_id.clone();
-        let launch_options = self.settings.interview_launch_options();
-        let deep_dive = cx.new(|cx| {
-            DeepDiveView::new(
-                question,
-                config,
-                session,
-                agent_config_id,
-                workspace_cwd,
-                launch_options,
-                window,
-                cx,
-                agent,
-            )
-        });
-        let subscription = cx.subscribe(&deep_dive, |this, _, event, cx| match event {
-            DeepDiveEvent::Back => {
-                this.deep_dive = None;
-                this._deep_dive_subscription = None;
-                cx.notify();
-            }
-            DeepDiveEvent::UseThis(text) => {
-                this.pending_notes_paste = Some(text.clone());
-                cx.notify();
-            }
-        });
-        self.deep_dive = Some(deep_dive);
-        self._deep_dive_subscription = Some(subscription);
-        cx.notify();
     }
 
     fn render_workspace_header(
@@ -2642,6 +1258,63 @@ impl WorkspaceView {
     }
 }
 
+/// Plain-language description of what accepting `proposal` does, naming any
+/// obligation it removes.
+fn describe_proposal(proposal: &Proposal, obligations: &ObligationRepo<'_>) -> String {
+    let body_of = |raw: &str| {
+        Uuid::parse_str(raw)
+            .ok()
+            .and_then(|id| obligations.get(id).ok().flatten())
+            .map(|o| format!("\"{}\"", o.body))
+            .unwrap_or_else(|| format!("[{}] (no longer exists)", raw.get(..8).unwrap_or(raw)))
+    };
+    let section = proposal
+        .section
+        .as_deref()
+        .map(|s| format!(" under {s}"))
+        .unwrap_or_default();
+    let mut text = match proposal.op {
+        ProposalOp::Add => format!(
+            "Accepting adds a {}{section}.",
+            proposal.kind.as_deref().unwrap_or("obligation")
+        ),
+        ProposalOp::Update => format!(
+            "Accepting rewrites {}.",
+            body_of(proposal.id.as_deref().unwrap_or(""))
+        ),
+        ProposalOp::Delete => format!(
+            "Accepting removes {}.",
+            body_of(proposal.id.as_deref().unwrap_or(""))
+        ),
+        ProposalOp::Content => format!(
+            "Accepting {} the node's {}.",
+            if proposal.append { "adds to" } else { "sets" },
+            proposal.content_type.as_deref().unwrap_or("content")
+        ),
+    };
+    for raw in &proposal.replaces {
+        text.push_str(&format!(" It also removes {}.", body_of(raw)));
+    }
+    text
+}
+
+/// The question as stored, for "Copy raw source" and feedback logs.
+fn question_source(q: &InterviewQuestion) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "id": q.label(),
+        "author": q.author,
+        "phase": q.phase,
+        "covers": q.covers,
+        "context": q.context,
+        "question": q.question,
+        "options": q.options,
+        "recommend": q.recommend,
+        "proposal": q.proposal,
+        "intent": q.intent,
+    }))
+    .unwrap_or_default()
+}
+
 fn register_workspace_keys(cx: &mut App) {
     let context = Some(WORKSPACE_CONTEXT);
     let input = Some("Input");
@@ -2682,213 +1355,6 @@ fn register_workspace_keys(cx: &mut App) {
     ]);
 }
 
-fn session_config_path(session: &InterviewSession) -> Option<PathBuf> {
-    session.scratchpad_path.as_ref().and_then(|p| {
-        let path = PathBuf::from(p).join("interview-config.md");
-        path.exists().then_some(path)
-    })
-}
-
-fn transcript_path_for(config: &InterviewConfig) -> PathBuf {
-    config.scratchpad.join("transcript.md")
-}
-
-fn unbound_config(session: &InterviewSession, _paths: &TodPaths) -> InterviewConfig {
-    InterviewConfig {
-        session_id: session.session_id.clone().unwrap_or_default(),
-        node_id: session.node_id,
-        phase: session.phase.clone(),
-        scratchpad: session
-            .scratchpad_path
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_default(),
-        // Sentinel — never watch repo-root queue (F5).
-        queue: PathBuf::from("__unbound_queue__"),
-        config_path: PathBuf::from("__unbound_config__"),
-        queue_target: None,
-        role_doc: None,
-        scope: Vec::new(),
-    }
-}
-
-fn file_contents(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
-fn run_submit_answer_work(work: SubmitAnswerWork, agent: SharedAgent) -> SubmitAnswerOutcome {
-    let question_id = work.question_id.clone();
-    let result = (|| -> Result<(RunId, Option<String>), String> {
-        append_answer(
-            &work.transcript,
-            &work.question_id,
-            &work.question_body,
-            &work.answer_text,
-            work.mc.as_deref(),
-        )
-        .map_err(|err| format!("Transcript write failed: {err}"))?;
-
-        let prompt = work.prompt;
-        let snapshot = file_contents(&work.question_path);
-
-        let mut provider = agent
-            .lock()
-            .map_err(|_| "Agent busy (bootstrap in progress) — try again shortly".to_string())?;
-        let handle = provider
-            .start_answer_processor(
-                &work.agent_config_id,
-                work.cwd,
-                prompt,
-                &tod_core::settings::answer_processor_pool(&work.settings),
-                work.launch_options,
-            )
-            .map_err(|err| format!("Failed to start answer processor: {err}"))?;
-        Ok((handle.id, snapshot))
-    })();
-    SubmitAnswerOutcome {
-        question_id,
-        result,
-    }
-}
-
-/// Build answer-processor `text_changed` / body and transcript answer text (req 4 / 4a).
-fn build_proposed_answer_parts(
-    original_proposed: Option<&str>,
-    edited_proposed: &str,
-    notes: &str,
-) -> (Option<bool>, String, String) {
-    let notes = notes.trim().to_string();
-    let Some(original) = original_proposed.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (None, notes.clone(), notes);
-    };
-    let edited = edited_proposed.trim();
-    if edited == original {
-        // Unedited Accept — do not resend proposed_text as the body.
-        let answer = if notes.is_empty() {
-            "Accepted proposed text as written.".to_string()
-        } else {
-            notes.clone()
-        };
-        (Some(false), notes, answer)
-    } else {
-        let edited = edited.to_string();
-        let answer = if notes.is_empty() {
-            edited.clone()
-        } else {
-            format!("{edited}\n\nNotes: {notes}")
-        };
-        (Some(true), edited, answer)
-    }
-}
-
-fn run_submit_action_work(work: SubmitActionWork, agent: SharedAgent) -> SubmitActionOutcome {
-    let question_id = work.question_id.clone();
-    let _action = work.action.clone();
-    let result = (|| -> Result<(RunId, Option<String>), String> {
-        append_action(
-            &work.transcript,
-            &work.question_id,
-            &work.action,
-            Some(&work.notes),
-            Some(&work.question_body),
-        )
-        .map_err(|err| format!("Transcript write failed: {err}"))?;
-
-        let prompt = work.prompt;
-        let snapshot = file_contents(&work.question_path);
-
-        let mut provider = agent
-            .lock()
-            .map_err(|_| "Agent busy (bootstrap in progress) — try again shortly".to_string())?;
-        let handle = provider
-            .start_question_maker_replenishment(
-                &work.agent_config_id,
-                work.cwd,
-                prompt,
-                &tod_core::settings::question_maker_pool(&work.question_maker_settings),
-                work.launch_options,
-            )
-            .map_err(|err| format!("Failed to start question maker: {err}"))?;
-        Ok((handle.id, snapshot))
-    })();
-    SubmitActionOutcome {
-        question_id,
-        result,
-    }
-}
-
-fn run_submit_freeform_work(work: SubmitFreeformWork, agent: SharedAgent) -> SubmitFreeformOutcome {
-    let result = (|| -> Result<RunId, String> {
-        append_answer(
-            &work.transcript,
-            &work.submission_id,
-            "(freeform requirements submission)",
-            &work.text,
-            None,
-        )
-        .map_err(|err| format!("Transcript write failed: {err}"))?;
-
-        let prompt = work.prompt;
-        let mut provider = agent
-            .lock()
-            .map_err(|_| "Agent busy (bootstrap in progress) — try again shortly".to_string())?;
-        let handle = provider
-            .start_answer_processor(
-                &work.agent_config_id,
-                work.cwd,
-                prompt,
-                &tod_core::settings::answer_processor_pool(&work.settings),
-                work.launch_options,
-            )
-            .map_err(|err| format!("Failed to start answer processor: {err}"))?;
-        Ok(handle.id)
-    })();
-    SubmitFreeformOutcome { result }
-}
-
-fn question_maker_status_snapshot(path: Option<&Path>) -> QuestionMakerStatusSnapshot {
-    let Some(path) = path else {
-        return QuestionMakerStatusSnapshot::default();
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return QuestionMakerStatusSnapshot::default();
-    };
-    question_maker_status_from_text(&text)
-}
-
-fn question_maker_status_kind(path: Option<&Path>) -> QuestionMakerStatusKind {
-    question_maker_status_snapshot(path).kind
-}
-
-fn question_maker_status_from_text(text: &str) -> QuestionMakerStatusSnapshot {
-    let mut snapshot = QuestionMakerStatusSnapshot::default();
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("status:") {
-            let value = rest.trim().to_ascii_lowercase();
-            snapshot.kind = if value.contains("complete") {
-                QuestionMakerStatusKind::Complete
-            } else if value.contains("working") {
-                QuestionMakerStatusKind::Working
-            } else if value.contains("idle") {
-                QuestionMakerStatusKind::Idle
-            } else {
-                QuestionMakerStatusKind::Unknown
-            };
-        } else if let Some(rest) = t.strip_prefix("notes:") {
-            let notes = rest.trim();
-            if !notes.is_empty() {
-                snapshot.notes = Some(notes.to_string());
-            }
-        } else if let Some(rest) = t.strip_prefix("queue_depth:") {
-            snapshot.queue_depth = rest.trim().parse().ok();
-        } else if let Some(rest) = t.strip_prefix("queue_target:") {
-            snapshot.queue_target = rest.trim().parse().ok();
-        }
-    }
-    snapshot
-}
-
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2911,32 +1377,36 @@ impl HasAppNav for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Align ListState after queue polls that only had App context (no Window).
+        // Align ListState after polls that only had App context (no Window).
         self.sync_question_list_selection(window, cx, false);
+        if self.notes_pending_clear {
+            self.notes_pending_clear = false;
+            self.notes_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
         self.sync_proposed_input(window, cx);
-        self.obligations.update(cx, |panel, cx| {
-            panel.reload(window, cx);
-        });
-
-        if let Some(text) = self.pending_notes_paste.take() {
-            self.notes_input.update(cx, |input, cx| {
-                input.set_value(text, window, cx);
-            });
-        }
-
-        if let Some(deep_dive) = &self.deep_dive {
-            return div()
-                .size_full()
-                .min_w_0()
-                .overflow_hidden()
-                .child(deep_dive.clone());
-        }
+        self.obligations.update(cx, |panel, cx| panel.reload(window, cx));
 
         let background = cx.theme().background;
         let border = cx.theme().border;
         let foreground = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let archived = self.session.status == InterviewSessionStatus::Archived;
+        let wait = self.question_maker_waiting().then(|| QuestionMakerWaitUi {
+            open: self.questions.len(),
+            target: self.replenish_target as usize,
+            elapsed_secs: self.wait_started.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            animate_dots: self
+                .wait_started
+                .map(|t| ((t.elapsed().as_millis() / 500) % 4) as usize)
+                .unwrap_or(0),
+        });
+        let selected = self.selected_question().cloned();
+        let summary = selected
+            .as_ref()
+            .and_then(|q| self.proposal_summaries.get(&q.seq).cloned());
+        let status_text = self.agent_status_text();
+        let show_retry = self.driver_status.manual_required || self.driver_status.last_error.is_some();
 
         div()
             .key_context(WORKSPACE_CONTEXT)
@@ -2948,89 +1418,46 @@ impl Render for WorkspaceView {
             .v_flex()
             .on_action(cx.listener(|this, _: &SubmitAnswer, window, cx| {
                 // Ctrl+Enter is bound globally for Input focus; route to whichever
-                // submit action matches the field the user is actually editing.
-                if this
-                    .freeform_input
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window)
-                {
+                // submit matches the field the user is actually editing.
+                if this.freeform_input.read(cx).focus_handle(cx).is_focused(window) {
                     this.submit_freeform(window, cx);
                 } else {
                     this.submit_answer(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNotes, window, cx| {
-                if this.can_edit_notes() {
-                    this.focus_notes(window, cx);
-                }
+                this.enter_notes_edit(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &McDigit1, window, cx| {
-                this.on_digit_key("1", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit2, window, cx| {
-                this.on_digit_key("2", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit3, window, cx| {
-                this.on_digit_key("3", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit4, window, cx| {
-                this.on_digit_key("4", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit5, window, cx| {
-                this.on_digit_key("5", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit6, window, cx| {
-                this.on_digit_key("6", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit7, window, cx| {
-                this.on_digit_key("7", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit8, window, cx| {
-                this.on_digit_key("8", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &McDigit9, window, cx| {
-                this.on_digit_key("9", window, cx);
-            }))
+            .on_action(cx.listener(|this, _: &McDigit1, window, cx| this.on_digit_key("1", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit2, window, cx| this.on_digit_key("2", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit3, window, cx| this.on_digit_key("3", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit4, window, cx| this.on_digit_key("4", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit5, window, cx| this.on_digit_key("5", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit6, window, cx| this.on_digit_key("6", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit7, window, cx| this.on_digit_key("7", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit8, window, cx| this.on_digit_key("8", window, cx)))
+            .on_action(cx.listener(|this, _: &McDigit9, window, cx| this.on_digit_key("9", window, cx)))
             .on_action(cx.listener(|this, _: &QuestionMoveUp, window, cx| {
-                if this.actions_menu_focused(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                if this.response_text_editing() {
+                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
                 match this.workspace_focus {
-                    WorkspaceFocus::QuestionList => {
-                        this.move_question_list_by(-1, window, cx);
-                        cx.stop_propagation();
-                    }
-                    WorkspaceFocus::Response(_) => {
-                        this.move_response_focus(-1, window, cx);
-                        cx.stop_propagation();
-                    }
+                    WorkspaceFocus::QuestionList => this.move_question_list_by(-1, window, cx),
+                    WorkspaceFocus::Response(_) => this.move_response_focus(-1, window, cx),
                 }
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &QuestionMoveDown, window, cx| {
-                if this.actions_menu_focused(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                if this.response_text_editing() {
+                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
                 match this.workspace_focus {
-                    WorkspaceFocus::QuestionList => {
-                        this.move_question_list_by(1, window, cx);
-                        cx.stop_propagation();
-                    }
-                    WorkspaceFocus::Response(_) => {
-                        this.move_response_focus(1, window, cx);
-                        cx.stop_propagation();
-                    }
+                    WorkspaceFocus::QuestionList => this.move_question_list_by(1, window, cx),
+                    WorkspaceFocus::Response(_) => this.move_response_focus(1, window, cx),
                 }
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ListArrowUp, window, cx| {
                 if this.workspace_focus == WorkspaceFocus::QuestionList {
@@ -3050,15 +1477,10 @@ impl Render for WorkspaceView {
                     return;
                 }
                 match this.workspace_focus {
-                    WorkspaceFocus::QuestionList => {
-                        this.focus_response_right(window, cx);
-                        cx.stop_propagation();
-                    }
-                    WorkspaceFocus::Response(_) => {
-                        this.focus_obligations_right(window, cx);
-                        cx.stop_propagation();
-                    }
+                    WorkspaceFocus::QuestionList => this.focus_response_right(window, cx),
+                    WorkspaceFocus::Response(_) => this.focus_obligations_right(window, cx),
                 }
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
                 if this.response_text_editing() {
@@ -3071,11 +1493,7 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateFocused, window, cx| {
-                if this.actions_menu_focused(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                if this.response_text_editing() {
+                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
                     cx.propagate();
                     return;
                 }
@@ -3083,8 +1501,8 @@ impl Render for WorkspaceView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
-            .on_action(cx.listener(|this, _: &NavigateBack, _, cx| {
-                this.navigate_back(cx);
+            .on_action(cx.listener(|_, _: &NavigateBack, _, cx| {
+                cx.emit(WorkspaceEvent::NavigateBack);
             }))
             .on_action(cx.listener(|this, _: &WorkspaceEscape, window, cx| {
                 if this.actions_menu_focused(window, cx) {
@@ -3121,13 +1539,11 @@ impl Render for WorkspaceView {
                                     .child(body_column(
                                         cx,
                                         window,
-                                        self.is_complete(),
-                                        if self.question_maker_waiting() {
-                                            Some(self.build_question_maker_wait_ui())
-                                        } else {
-                                            None
-                                        },
-                                        self.selected_question(),
+                                        self.complete,
+                                        self.loaded_once,
+                                        wait,
+                                        selected.as_ref(),
+                                        summary,
                                         &self.session,
                                         self.task_list_proceed.is_some(),
                                         foreground,
@@ -3139,21 +1555,13 @@ impl Render for WorkspaceView {
                                     .size_range(px(RESPONSE_COLUMN_MIN)..Pixels::MAX)
                                     .child(response_column(
                                         cx,
-                                        window,
-                                        self.selected_question(),
-                                        self.is_question_pending(
-                                            self.selected_question_id.as_deref().unwrap_or(""),
-                                        ),
-                                        self.is_question_removing(
-                                            self.selected_question_id.as_deref().unwrap_or(""),
-                                        ),
+                                        selected.as_ref(),
                                         &self.selected_mc,
                                         &self.proposed_input,
                                         &self.notes_input,
                                         &self.feedback_input,
                                         &self.freeform_input,
                                         self.can_mutate(),
-                                        self.can_edit_notes(),
                                         self.has_proposed_editor(),
                                         self.workspace_focus,
                                         self.proposed_editing,
@@ -3162,7 +1570,6 @@ impl Render for WorkspaceView {
                                         self.freeform_editing,
                                         self.actions_menu_open,
                                         self.actions_menu.clone(),
-                                        &self.focus_handle,
                                         muted,
                                     )),
                             )
@@ -3177,13 +1584,22 @@ impl Render for WorkspaceView {
             .child(status_footer(
                 cx,
                 window,
-                &self.status_line,
+                &status_text,
                 border,
                 muted,
-                self.replenish_state.manual_required,
-                self.question_maker_waiting(),
+                show_retry,
+                self.driver_status.question_maker_running || self.driver_status.answers_in_flight > 0,
             ))
     }
+}
+
+/// Waiting UI while the question maker writes the first questions.
+#[derive(Debug, Clone)]
+struct QuestionMakerWaitUi {
+    open: usize,
+    target: usize,
+    elapsed_secs: u64,
+    animate_dots: usize,
 }
 
 fn archived_banner(border: gpui::Hsla, muted: gpui::Hsla) -> impl IntoElement {
@@ -3194,7 +1610,7 @@ fn archived_banner(border: gpui::Hsla, muted: gpui::Hsla) -> impl IntoElement {
         .border_color(border)
         .text_sm()
         .text_color(muted)
-        .child("Archived — answer submit and replenishment are blocked")
+        .child("Archived — answering and agent work are paused")
 }
 
 fn error_banner(
@@ -3241,12 +1657,15 @@ fn question_list_column(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn body_column(
     cx: &mut Context<WorkspaceView>,
     window: &mut Window,
     complete: bool,
-    question_maker_wait: Option<QuestionMakerWaitUi>,
-    question: Option<&QueueQuestion>,
+    loaded_once: bool,
+    wait: Option<QuestionMakerWaitUi>,
+    question: Option<&InterviewQuestion>,
+    proposal_summary: Option<String>,
     session: &InterviewSession,
     show_proceed: bool,
     foreground: gpui::Hsla,
@@ -3255,9 +1674,13 @@ fn body_column(
     let body = if complete {
         complete_body(window, cx, session, show_proceed, foreground, muted).into_any_element()
     } else if let Some(q) = question {
-        question_body_view(q, foreground, muted, window, cx).into_any_element()
-    } else if let Some(wait) = question_maker_wait {
+        question_body_view(q, proposal_summary, foreground, muted, window, cx).into_any_element()
+    } else if let Some(wait) = wait {
         question_maker_waiting_body(wait, foreground, muted).into_any_element()
+    } else if !loaded_once {
+        // Avoid a "No open questions" flash before the first reload has had a
+        // chance to report the driver's actual status.
+        div().into_any_element()
     } else {
         div()
             .text_sm()
@@ -3265,124 +1688,51 @@ fn body_column(
             .child("No open questions")
             .into_any_element()
     };
-    let copy_disabled = question.is_none();
     v_flex()
+        .id("body-column-scroll")
         .size_full()
         .min_w_0()
-        .overflow_hidden()
+        .overflow_y_scrollbar()
         .p_4()
-        .child(
-            div()
-                .id("question-body-scroll")
-                .flex_1()
-                .min_h_0()
-                .size_full()
-                .min_w_0()
-                .overflow_hidden()
-                .overflow_y_scroll()
-                .child(body),
-        )
+        .gap_4()
+        .child(v_flex().w_full().gap_4().child(body))
         .child(
             div().flex_none().pt_2().child(
                 Button::new("copy-question-source")
                     .label("Copy raw source")
                     .compact()
-                    .disabled(copy_disabled)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.copy_question_source(cx);
-                    })),
+                    .disabled(question.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.copy_question_source(cx))),
             ),
         )
 }
 
 fn question_body_view(
-    q: &QueueQuestion,
+    q: &InterviewQuestion,
+    proposal_summary: Option<String>,
     foreground: gpui::Hsla,
     muted: gpui::Hsla,
     window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
-    let has_structured = q.context.is_some() || q.question.is_some();
     let mut col = v_flex().w_full().min_w_0().gap_3();
-
-    if let Some(context) = q
-        .context
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        col = col.child(
-            selectable_text(
-                SharedString::from(format!("question-context-{}", q.id)),
-                SharedString::from(context.to_string()),
-                window,
-                cx,
-            )
+    let text = |id: String, body: String, color: gpui::Hsla, bold: bool, window: &mut Window, cx: &mut App| {
+        let el = selectable_text(SharedString::from(id), SharedString::from(body), window, cx)
             .w_full()
             .min_w_0()
             .text_sm()
-            .text_color(muted),
-        );
+            .text_color(color);
+        if bold { el.font_semibold() } else { el }
+    };
+    if let Some(context) = q.context.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        col = col.child(text(format!("question-context-{}", q.seq), context.into(), muted, false, window, cx));
     }
-
-    if let Some(question) = q
-        .question
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        col = col.child(
-            selectable_text(
-                SharedString::from(format!("question-text-{}", q.id)),
-                SharedString::from(question.to_string()),
-                window,
-                cx,
-            )
-            .w_full()
-            .min_w_0()
-            .text_sm()
-            .font_semibold()
-            .text_color(foreground),
-        );
-    } else if !has_structured {
-        let legacy = crate::interview::queue::strip_mc_option_lines(&q.body, &q.options);
-        let (legacy, _) = crate::interview::queue::split_recommend_from_body(&legacy);
-        if !legacy.trim().is_empty() {
-            col = col.child(
-                selectable_text(
-                    SharedString::from(format!("question-legacy-body-{}", q.id)),
-                    SharedString::from(legacy),
-                    window,
-                    cx,
-                )
-                .w_full()
-                .min_w_0()
-                .text_sm()
-                .text_color(foreground),
-            );
-        }
+    if let Some(question) = q.question.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        col = col.child(text(format!("question-text-{}", q.seq), question.into(), foreground, true, window, cx));
     }
-
-    if let Some(recommend) = q
-        .recommend
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        col = col.child(
-            selectable_text(
-                SharedString::from(format!("question-recommend-{}", q.id)),
-                format!("Recommend: {recommend}"),
-                window,
-                cx,
-            )
-            .w_full()
-            .min_w_0()
-            .text_sm()
-            .text_color(muted),
-        );
+    if let Some(summary) = proposal_summary {
+        col = col.child(text(format!("question-proposal-{}", q.seq), summary, muted, false, window, cx));
     }
-
     col
 }
 
@@ -3414,7 +1764,6 @@ fn complete_body(
                 .text_color(muted),
             ),
         );
-
     if show_proceed {
         col = col.child(
             Button::new("proceed-lifecycle")
@@ -3425,23 +1774,19 @@ fn complete_body(
                 })),
         );
     }
-
     col
 }
 
+#[allow(clippy::too_many_arguments)]
 fn response_column(
     cx: &mut Context<WorkspaceView>,
-    _window: &mut Window,
-    question: Option<&QueueQuestion>,
-    pending: bool,
-    removing: bool,
+    question: Option<&InterviewQuestion>,
     selected_mc: &Option<String>,
     proposed_input: &Entity<InputState>,
     notes_input: &Entity<InputState>,
     feedback_input: &Entity<InputState>,
     freeform_input: &Entity<InputState>,
     can_mutate: bool,
-    can_edit_notes: bool,
     show_proposed: bool,
     workspace_focus: WorkspaceFocus,
     proposed_editing: bool,
@@ -3450,18 +1795,14 @@ fn response_column(
     freeform_editing: bool,
     actions_menu_open: bool,
     actions_menu: Option<Entity<PopupMenu>>,
-    _workspace_focus_handle: &FocusHandle,
     muted: gpui::Hsla,
 ) -> impl IntoElement {
-    let locked = pending || removing;
-    let disabled = !can_mutate || locked || question.is_none();
-    let proposed_input_disabled =
-        !can_edit_notes || locked || question.is_none() || !proposed_editing;
-    let notes_input_disabled = !can_edit_notes || locked || question.is_none() || !notes_editing;
-    let feedback_input_disabled =
-        !can_edit_notes || locked || question.is_none() || !feedback_editing;
+    let disabled = !can_mutate || question.is_none();
+    let proposed_input_disabled = disabled || !proposed_editing;
+    let notes_input_disabled = disabled || !notes_editing;
+    let feedback_input_disabled = disabled || !feedback_editing;
     // Freeform submission is independent of the selected question.
-    let freeform_input_disabled = !can_edit_notes || !freeform_editing;
+    let freeform_input_disabled = !can_mutate || !freeform_editing;
     let focused_idx = match workspace_focus {
         WorkspaceFocus::Response(i) => Some(i),
         WorkspaceFocus::QuestionList => None,
@@ -3473,30 +1814,21 @@ fn response_column(
         .overflow_hidden()
         .p_3()
         .gap_2()
-        .child(div().text_xs().text_color(muted).child(if removing {
-            "Removing…"
-        } else if pending {
-            "Pending — waiting for agent"
-        } else {
-            "Response"
-        }));
-    let mut scroll_body = v_flex()
-        .id("response-scroll-body")
-        .w_full()
-        .min_w_0()
-        .gap_2();
+        .child(div().text_xs().text_color(muted).child("Response"));
+    let mut scroll_body = v_flex().id("response-scroll-body").w_full().min_w_0().gap_2();
     let mut stop_idx = 0usize;
     if let Some(q) = question {
-        for (idx, opt) in q.options.iter().enumerate() {
-            let key = opt.key.clone();
-            let focused = focused_idx == Some(stop_idx);
+        let recommended_key = q.recommend.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        for (idx, label) in option_labels(q).into_iter().enumerate() {
+            let key = (idx + 1).to_string();
             scroll_body = scroll_body.child(mc_option_row(
                 cx,
                 idx,
-                opt.clone(),
+                key.clone(),
+                label,
                 selected_mc.as_ref().is_some_and(|k| k == &key),
-                focused,
-                muted,
+                recommended_key == Some(key.as_str()),
+                focused_idx == Some(stop_idx),
                 disabled,
             ));
             stop_idx += 1;
@@ -3507,21 +1839,16 @@ fn response_column(
         stop_idx += 1;
     }
     let notes_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let actions_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let submit_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let feedback_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let feedback_submit_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let freeform_focused = focused_idx == Some(stop_idx);
-    stop_idx += 1;
-    let freeform_submit_focused = focused_idx == Some(stop_idx);
+    let actions_focused = focused_idx == Some(stop_idx + 1);
+    let submit_focused = focused_idx == Some(stop_idx + 2);
+    let feedback_focused = focused_idx == Some(stop_idx + 3);
+    let feedback_submit_focused = focused_idx == Some(stop_idx + 4);
+    let freeform_focused = focused_idx == Some(stop_idx + 5);
+    let freeform_submit_focused = focused_idx == Some(stop_idx + 6);
     let notes_view = cx.entity();
     let proposed_view = cx.entity();
     let feedback_view = cx.entity();
+    let freeform_view = cx.entity();
 
     let mut response_body = v_flex()
         .id("response-body")
@@ -3530,10 +1857,9 @@ fn response_column(
         .flex_none()
         .flex_shrink_0()
         .gap_2();
-
     if show_proposed {
         response_body = response_body
-            .child(div().text_xs().text_color(muted).child("Proposed text"))
+            .child(div().text_xs().text_color(muted).child("Proposed text (applied with option 1)"))
             .child(
                 ListItem::new("proposed-field")
                     .selected(proposed_focused)
@@ -3541,11 +1867,7 @@ fn response_column(
                     .h(px(TEXTAREA_HEIGHT))
                     .overflow_hidden()
                     .on_click(move |_, window, app| {
-                        proposed_view.update(app, |this, cx| {
-                            if this.can_edit_notes() {
-                                this.enter_proposed_edit(window, cx);
-                            }
-                        });
+                        proposed_view.update(app, |this, cx| this.enter_proposed_edit(window, cx));
                     })
                     .child(
                         Input::new(proposed_input)
@@ -3555,7 +1877,6 @@ fn response_column(
                     ),
             );
     }
-
     response_body = response_body
         .child(
             ListItem::new("notes-field")
@@ -3564,11 +1885,7 @@ fn response_column(
                 .h(px(TEXTAREA_HEIGHT))
                 .overflow_hidden()
                 .on_click(move |_, window, app| {
-                    notes_view.update(app, |this, cx| {
-                        if this.can_edit_notes() {
-                            this.enter_notes_edit(window, cx);
-                        }
-                    });
+                    notes_view.update(app, |this, cx| this.enter_notes_edit(window, cx));
                 })
                 .child(
                     Input::new(notes_input)
@@ -3589,31 +1906,23 @@ fn response_column(
                 .child(
                     ListItem::new("other-actions-focus")
                         .selected(actions_focused && !actions_menu_open)
-                        .child(action_dropdown(
-                            cx,
-                            disabled,
-                            actions_menu_open,
-                            actions_focused,
-                            actions_menu,
-                        )),
+                        .child(action_dropdown(cx, disabled, actions_menu_open, actions_focused, actions_menu)),
                 )
                 .child(
-                    ListItem::new("submit-focus")
-                        .selected(submit_focused)
-                        .child(
-                            Button::new("submit-answer")
-                                .label("Submit")
-                                .primary()
-                                .compact()
-                                .disabled(disabled)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.submit_answer(window, cx);
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        ),
+                    ListItem::new("submit-focus").selected(submit_focused).child(
+                        Button::new("submit-answer")
+                            .label("Submit")
+                            .primary()
+                            .compact()
+                            .disabled(disabled)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.submit_answer(window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    ),
                 ),
         );
 
@@ -3635,11 +1944,7 @@ fn response_column(
                 .h(px(TEXTAREA_HEIGHT))
                 .overflow_hidden()
                 .on_click(move |_, window, app| {
-                    feedback_view.update(app, |this, cx| {
-                        if this.can_edit_notes() {
-                            this.enter_feedback_edit(window, cx);
-                        }
-                    });
+                    feedback_view.update(app, |this, cx| this.enter_feedback_edit(window, cx));
                 })
                 .child(
                     Input::new(feedback_input)
@@ -3666,7 +1971,6 @@ fn response_column(
                 ),
         );
 
-    let freeform_view = cx.entity();
     let freeform_panel = v_flex()
         .id("response-freeform-panel")
         .w_full()
@@ -3677,12 +1981,7 @@ fn response_column(
         .pt_2()
         .border_t_1()
         .border_color(muted.opacity(0.25))
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child("Submit requirements text"),
-        )
+        .child(div().text_xs().text_color(muted).child("Tell the interview something"))
         .child(
             ListItem::new("freeform-field")
                 .selected(freeform_focused)
@@ -3690,9 +1989,7 @@ fn response_column(
                 .h(px(TEXTAREA_HEIGHT))
                 .overflow_hidden()
                 .on_click(move |_, window, app| {
-                    freeform_view.update(app, |this, cx| {
-                        this.enter_freeform_edit(window, cx);
-                    });
+                    freeform_view.update(app, |this, cx| this.enter_freeform_edit(window, cx));
                 })
                 .child(
                     Input::new(freeform_input)
@@ -3706,7 +2003,7 @@ fn response_column(
                 .selected(freeform_submit_focused)
                 .child(
                     Button::new("submit-freeform")
-                        .label("Submit to processor")
+                        .label("Send")
                         .compact()
                         .disabled(!can_mutate)
                         .on_mouse_down(
@@ -3728,27 +2025,28 @@ fn response_column(
             .min_w_0()
             .overflow_hidden()
             .overflow_y_scroll()
-            .child(scroll_body.child(response_body)),
+            .child(
+                scroll_body
+                    .child(response_body)
+                    .child(feedback_panel)
+                    .child(freeform_panel),
+            ),
     )
-    .child(feedback_panel)
-    .child(freeform_panel)
 }
 
 fn populate_action_menu(menu: PopupMenu, view: WeakEntity<WorkspaceView>) -> PopupMenu {
-    OTHER_ACTION_ITEMS
-        .iter()
-        .fold(menu, |menu, (action, label)| {
-            let view = view.clone();
-            let action = (*action).to_string();
-            menu.item(PopupMenuItem::new(*label).on_click(move |_, window, cx| {
-                if let Some(entity) = view.upgrade() {
-                    entity.update(cx, |this, cx| {
-                        this.set_actions_menu_open(false, cx);
-                        this.submit_action(&action, window, cx);
-                    });
-                }
-            }))
-        })
+    OTHER_ACTION_ITEMS.iter().fold(menu, |menu, (action, label)| {
+        let view = view.clone();
+        let action = (*action).to_string();
+        menu.item(PopupMenuItem::new(*label).on_click(move |_, window, cx| {
+            if let Some(entity) = view.upgrade() {
+                entity.update(cx, |this, cx| {
+                    this.set_actions_menu_open(false, cx);
+                    this.submit_action(&action, window, cx);
+                });
+            }
+        }))
+    })
 }
 
 /// Native `PopupMenu` anchored under the trigger.
@@ -3795,17 +2093,14 @@ fn action_dropdown(
 fn mc_option_row(
     cx: &mut Context<WorkspaceView>,
     idx: usize,
-    opt: crate::interview::queue::McOption,
+    key: String,
+    label: String,
     selected: bool,
+    recommended: bool,
     focused: bool,
-    muted: gpui::Hsla,
     disabled: bool,
 ) -> impl IntoElement {
-    let key = opt.key.clone();
-    let submit_key = key.clone();
-    let label: SharedString = format!("{}. {}", opt.key, opt.label).into();
-    let _ = muted;
-
+    let label: SharedString = format!("{key}. {label}").into();
     ListItem::new(("mc-option", idx))
         .selected(focused || selected)
         .disabled(disabled)
@@ -3816,12 +2111,22 @@ fn mc_option_row(
                 .label(label)
                 .ghost()
                 .compact()
+                .justify_start()
                 .w_full()
                 .disabled(disabled)
                 .selected(focused || selected)
+                .when(recommended, |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(cx.theme().accent_foreground)
+                            .child("Recommended"),
+                    )
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if !disabled {
-                        this.submit_mc_option(&submit_key, window, cx);
+                        this.submit_mc_option(&key, window, cx);
                     }
                 })),
         )
@@ -3833,7 +2138,7 @@ fn status_footer(
     status: &SharedString,
     border: gpui::Hsla,
     muted: gpui::Hsla,
-    show_manual_kickoff: bool,
+    show_retry: bool,
     show_activity_indicator: bool,
 ) -> impl IntoElement {
     let status_text = if status.is_empty() {
@@ -3870,13 +2175,11 @@ fn status_footer(
                     ),
                 ),
         )
-        .when(show_manual_kickoff, |el| {
+        .when(show_retry, |el| {
             el.child(
-                Button::new("manual-question-maker-kickoff")
-                    .label("Kickoff question maker")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.manual_question_maker_kickoff(cx);
-                    })),
+                Button::new("retry-interview-agents")
+                    .label("Retry agents")
+                    .on_click(cx.listener(|this, _, _, cx| this.retry_agents(cx))),
             )
         })
 }
@@ -3887,20 +2190,13 @@ fn question_maker_waiting_body(
     muted: gpui::Hsla,
 ) -> impl IntoElement {
     let dots = ".".repeat(wait.animate_dots.max(1));
-    let mut col = v_flex().w_full().min_w_0().gap_3();
-
-    col = col.child(
+    let mut col = v_flex().w_full().min_w_0().gap_3().child(
         div()
             .text_sm()
             .font_semibold()
             .text_color(foreground)
-            .child(format!("{}{dots}", wait.headline)),
+            .child(format!("Question maker is preparing questions{dots}")),
     );
-
-    if let Some(detail) = wait.detail {
-        col = col.child(div().text_sm().text_color(muted).child(detail));
-    }
-
     if wait.elapsed_secs >= 3 {
         col = col.child(
             div()
@@ -3909,42 +2205,38 @@ fn question_maker_waiting_body(
                 .child(format!("Elapsed {}", format_elapsed(wait.elapsed_secs))),
         );
     }
-
-    if let (Some(depth), Some(target)) = (wait.queue_depth, wait.queue_target) {
-        if target > 0 {
-            let pct = (depth as f32 / target as f32).clamp(0., 1.);
-            col = col.child(
-                v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("Queue: {depth} / {target}")),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(4.))
-                            .rounded(px(2.))
-                            .bg(muted.opacity(0.2))
-                            .child(
-                                div()
-                                    .h_full()
-                                    .rounded(px(2.))
-                                    .bg(muted.opacity(0.55))
-                                    .w(gpui::relative(pct)),
-                            ),
-                    ),
-            );
-        }
+    if wait.target > 0 {
+        let pct = (wait.open as f32 / wait.target as f32).clamp(0., 1.);
+        col = col.child(
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Queue: {} / {}", wait.open, wait.target)),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(4.))
+                        .rounded(px(2.))
+                        .bg(muted.opacity(0.2))
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded(px(2.))
+                                .bg(muted.opacity(0.55))
+                                .w(gpui::relative(pct)),
+                        ),
+                ),
+        );
     }
-
     col.child(
         div()
             .text_xs()
             .text_color(muted)
-            .child("This can take a minute or two on first setup. The status bar below updates as work progresses."),
+            .child("Questions appear here one by one as they are written."),
     )
 }
 
@@ -3956,308 +2248,71 @@ fn format_elapsed(secs: u64) -> String {
     }
 }
 
-fn count_queue_files(queue_dir: &Path) -> usize {
-    if !queue_dir.is_dir() {
-        return 0;
-    }
-    std::fs::read_dir(queue_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-                .count()
-        })
-        .unwrap_or(0)
-}
-
 impl gpui::EventEmitter<WorkspaceEvent> for WorkspaceView {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        QuestionMakerStatusKind, RunKind, WorkspaceInFlightState, build_proposed_answer_parts,
-        question_maker_status_from_text, reopen_complete_with_bound_queue,
-        update_replenish_idle_since,
-    };
-    use crate::interview::InterviewSessionStatus;
-    use crate::interview::agent::RunId;
-    use crate::interview::queue::QueueQuestion;
-    use std::collections::{HashMap, HashSet};
-    use std::fs;
-    use std::time::Instant;
+    use super::{edited_proposal_text, option_labels};
+    use tod_store::interview::{InterviewQuestion, Proposal, ProposalOp};
+    use uuid::Uuid;
 
-    #[test]
-    fn idle_grace_starts_on_transition_from_working() {
-        assert!(
-            update_replenish_idle_since(
-                QuestionMakerStatusKind::Working,
-                QuestionMakerStatusKind::Idle,
-                None,
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn idle_grace_not_started_for_stale_idle_at_replenish_start() {
-        assert!(
-            update_replenish_idle_since(
-                QuestionMakerStatusKind::Idle,
-                QuestionMakerStatusKind::Idle,
-                None,
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn idle_grace_cleared_when_agent_working() {
-        assert!(
-            update_replenish_idle_since(
-                QuestionMakerStatusKind::Idle,
-                QuestionMakerStatusKind::Working,
-                Some(Instant::now()),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn idle_grace_continues_while_still_idle() {
-        let since = Instant::now();
-        assert_eq!(
-            update_replenish_idle_since(
-                QuestionMakerStatusKind::Idle,
-                QuestionMakerStatusKind::Complete,
-                Some(since),
-            ),
-            Some(since),
-        );
-    }
-
-    #[test]
-    fn parses_question_maker_status_kinds() {
-        assert_eq!(
-            question_maker_status_from_text("status: complete\n").kind,
-            QuestionMakerStatusKind::Complete
-        );
-        assert_eq!(
-            question_maker_status_from_text("status: idle\n").kind,
-            QuestionMakerStatusKind::Idle
-        );
-        assert_eq!(
-            question_maker_status_from_text("status: working\n").kind,
-            QuestionMakerStatusKind::Working
-        );
-        assert_eq!(
-            question_maker_status_from_text("notes: only\n").kind,
-            QuestionMakerStatusKind::Unknown
-        );
-    }
-
-    #[test]
-    fn parses_question_maker_status_notes_and_queue() {
-        let snap = question_maker_status_from_text(
-            "status: working\nqueue_depth: 3\nqueue_target: 8\nnotes: Drafting questions\n",
-        );
-        assert_eq!(snap.kind, QuestionMakerStatusKind::Working);
-        assert_eq!(snap.queue_depth, Some(3));
-        assert_eq!(snap.queue_target, Some(8));
-        assert_eq!(snap.notes.as_deref(), Some("Drafting questions"));
-    }
-
-    #[test]
-    fn reopen_complete_with_nonempty_queue_flips_active() {
-        use std::sync::Arc;
-        use tod_core::interview::db::{NewInterviewSession, SessionStore};
-        use tod_store::fleet::FleetStore;
-        use tod_store::outline::OutlineMutation;
-
-        let dir = std::env::temp_dir().join(format!("tod-reopen-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let fleet = Arc::new(FleetStore::open(&dir).unwrap());
-        fleet
-            .enqueue_outline(OutlineMutation::CreateList {
-                slug: "t".into(),
-                title: "T".into(),
-            })
-            .unwrap();
-        fleet.writer().flush().unwrap();
-        let list_id = fleet.list_outline_lists().unwrap()[0].id;
-        fleet
-            .enqueue_outline(OutlineMutation::CreateNode {
-                node_id: None,
-                list_id,
-                parent_id: None,
-                anchor_id: None,
-                position: tod_store::outline::CreatePosition::Below,
-                title: "Node".into(),
-            })
-            .unwrap();
-        fleet.writer().flush().unwrap();
-        fleet.reload_if_stale().unwrap();
-        let node_id = fleet.flatten_outline(list_id).unwrap()[0].node.id;
-
-        let store = SessionStore::open(fleet.clone());
-        let mut session = store
-            .insert_session_with_metadata(
-                NewInterviewSession {
-                    node_id,
-                    agent_config_id: None,
-                    display_name: "Complete with queue".into(),
-                    phase: "design-interview".into(),
-                },
-                InterviewSessionStatus::Complete,
-                None,
-            )
-            .unwrap();
-        assert_eq!(session.status, InterviewSessionStatus::Complete);
-
-        assert!(reopen_complete_with_bound_queue(&mut session, &store, true));
-        assert_eq!(session.status, InterviewSessionStatus::Active);
-        let reloaded = store.get_session(session.id).unwrap().unwrap();
-        assert_eq!(reloaded.status, InterviewSessionStatus::Active);
-
-        let mut done = store
-            .insert_session_with_metadata(
-                NewInterviewSession {
-                    node_id,
-                    agent_config_id: None,
-                    display_name: "Truly complete".into(),
-                    phase: "design-interview".into(),
-                },
-                InterviewSessionStatus::Complete,
-                None,
-            )
-            .unwrap();
-        assert!(!reopen_complete_with_bound_queue(&mut done, &store, false));
-        assert_eq!(done.status, InterviewSessionStatus::Complete);
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn in_flight_prune_drops_removed_and_modified_questions() {
-        let dir = std::env::temp_dir().join(format!("tod-inflight-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let path_keep = dir.join("q-001.md");
-        let path_mod = dir.join("q-002.md");
-        fs::write(&path_keep, "same").unwrap();
-        fs::write(&path_mod, "changed").unwrap();
-
-        let questions = vec![
-            QueueQuestion {
-                id: "q-001".into(),
-                path: path_keep.clone(),
-                created: None,
-                layer: None,
-                kind: None,
-                covers: Vec::new(),
-                context: None,
-                question: None,
-                recommend: None,
-                proposed_text: None,
-                options: Vec::new(),
-                body: "keep".into(),
-                short_label: "keep".into(),
-            },
-            QueueQuestion {
-                id: "q-002".into(),
-                path: path_mod.clone(),
-                created: None,
-                layer: None,
-                kind: None,
-                covers: Vec::new(),
-                context: None,
-                question: None,
-                recommend: None,
-                proposed_text: None,
-                options: Vec::new(),
-                body: "mod".into(),
-                short_label: "mod".into(),
-            },
-        ];
-
-        let mut pending = HashSet::new();
-        pending.insert("q-001".into());
-        pending.insert("q-002".into());
-        pending.insert("q-gone".into());
-        let mut snapshots = HashMap::new();
-        snapshots.insert("q-001".into(), "same".into());
-        snapshots.insert("q-002".into(), "original".into());
-        let mut runs = HashMap::new();
-        runs.insert(
-            RunId::new(),
-            RunKind::AnswerProcessor {
-                question_id: "q-001".into(),
-            },
-        );
-        runs.insert(
-            RunId::new(),
-            RunKind::AnswerProcessor {
-                question_id: "q-002".into(),
-            },
-        );
-        runs.insert(
-            RunId::new(),
-            RunKind::AnswerProcessor {
-                question_id: "q-gone".into(),
-            },
-        );
-        runs.insert(RunId::new(), RunKind::QuestionMakerReplenish);
-
-        let pruned = WorkspaceInFlightState {
-            pending,
-            pending_snapshots: snapshots,
-            runs,
+    fn question(options: Vec<String>, proposal: Option<Proposal>) -> InterviewQuestion {
+        InterviewQuestion {
+            id: Uuid::nil(),
+            node_id: Uuid::nil(),
+            session_id: None,
+            seq: 1,
+            phase: "requirements".into(),
+            author: "question-maker".into(),
+            status: "open".into(),
+            covers: Vec::new(),
+            context: None,
+            question: Some("Q?".into()),
+            intent: None,
+            recommend: None,
+            options,
+            proposal,
+            answer_option: None,
+            answer_text: None,
+            answer_edited_text: None,
+            applied: None,
+            processed_at: None,
+            processed_summary: None,
+            withdrawn_by: None,
+            withdrawn_reason: None,
+            created_at: 0,
+            answered_at: None,
+            updated_at: 0,
         }
-        .pruned_for_queue(&questions);
+    }
 
-        assert!(pruned.pending.contains("q-001"));
-        assert!(!pruned.pending.contains("q-002"));
-        assert!(!pruned.pending.contains("q-gone"));
-        assert_eq!(pruned.runs.len(), 2); // q-001 answer + replenish
-        assert!(pruned.runs.values().any(|k| matches!(
-            k,
-            RunKind::AnswerProcessor { question_id } if question_id == "q-001"
-        )));
-        assert!(
-            pruned
-                .runs
-                .values()
-                .any(|k| matches!(k, RunKind::QuestionMakerReplenish))
+    #[test]
+    fn unedited_proposal_text_is_not_resent() {
+        assert_eq!(edited_proposal_text(Some("Fleet uses SQLite."), " Fleet uses SQLite. "), None);
+        assert_eq!(
+            edited_proposal_text(Some("Fleet uses SQLite."), "Fleet uses SQLite under the root."),
+            Some("Fleet uses SQLite under the root.".into())
         );
-
-        let _ = fs::remove_dir_all(dir);
+        assert_eq!(edited_proposal_text(None, "anything"), None);
     }
 
     #[test]
-    fn proposed_answer_parts_unchanged_omits_text_from_body() {
-        let (changed, body, answer) =
-            build_proposed_answer_parts(Some("Fleet uses SQLite."), "Fleet uses SQLite.", "");
-        assert_eq!(changed, Some(false));
-        assert!(body.is_empty());
-        assert!(answer.contains("Accepted"));
-    }
-
-    #[test]
-    fn proposed_answer_parts_edited_sends_full_text() {
-        let (changed, body, answer) = build_proposed_answer_parts(
-            Some("Fleet uses SQLite."),
-            "Fleet uses SQLite under the storage root.",
-            "extra note",
+    fn a_bare_proposal_offers_accept() {
+        let proposal = Proposal {
+            op: ProposalOp::Add,
+            kind: Some("requirement".into()),
+            section: None,
+            node: None,
+            id: None,
+            content_type: None,
+            text: Some("X".into()),
+            append: false,
+            replaces: Vec::new(),
+        };
+        assert_eq!(option_labels(&question(Vec::new(), Some(proposal))), vec!["Accept"]);
+        assert_eq!(
+            option_labels(&question(vec!["A".into(), "B".into()], None)),
+            vec!["A", "B"]
         );
-        assert_eq!(changed, Some(true));
-        assert_eq!(body, "Fleet uses SQLite under the storage root.");
-        assert!(answer.contains("extra note"));
-        assert!(answer.contains("storage root"));
-    }
-
-    #[test]
-    fn proposed_answer_parts_absent_proposed_keeps_notes_only() {
-        let (changed, body, answer) = build_proposed_answer_parts(None, "ignored", "just notes");
-        assert_eq!(changed, None);
-        assert_eq!(body, "just notes");
-        assert_eq!(answer, "just notes");
     }
 }

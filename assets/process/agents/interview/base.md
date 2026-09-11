@@ -1,79 +1,90 @@
-An interview gathers blocking information in small steps. Durable outcomes are returned for persistence (with human approval where required). Exact Q&A is recorded in a **transcript** — not summaries.
+# Interview
 
-Prefer **decisions with `proposed_text`** (Accept after optional edit) over a gather step plus a later wording rubber-stamp.
+An interview turns a conversation with the user into the obligations — and, in later phases, the design and plan — of one **node**. Two agents cooperate through the database while the user answers questions in the app at their own pace.
 
-## Two sessions
-
-| Session | `queue/` |
+| Actor | Does |
 |--|--|
-| **Question maker** | Creates question files |
-| **Answer processor** | Deletes or modifies question files when answers are handled |
+| **Question maker** | Keeps a short queue of the most valuable open questions. |
+| **User** (in the app) | Answers, defers, or sends a question back to be improved. Accepting a proposal applies it immediately. |
+| **Answer processor** | Works out what each answer means: settles obligations, repairs whatever the answer made wrong, and keeps memory current. |
 
-Dedicated pooled sessions — no orchestrator, no nesting on every answer.
+Neither agent talks to the user. Everything flows through **questions**, **obligations**, and **memory**.
 
-## Question queue
+## What you are given
 
-One markdown file per open question: `{scratchpad}/queue/q-NNN.md`. UI lists and submits answers in any order, including parallel.
+Your context is given once and then only added to.
 
-## Transcript
+- **Your first turn** carries these docs and a **snapshot** of the node: purpose from the root down, this node's obligations by section, inherited obligations by source node, content, the memory your role sees, open and deferred questions, and one line per answered question.
+- **Every later turn** carries only **what changed** since your previous turn, then the instruction. Your own changes are left out — you made them. Anything new to you arrives in full once; after that, only its changed fields.
 
-| Actor | Transcript |
-|--|--|
-| Question maker | Creates on bootstrap (session header only) |
-| UI | Appends exact Q&A **before** answer-processor invoke |
-| Answer processor | Read only |
+Your context is therefore current. **Don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else in the meantime, `tod-cli` refuses the write and prints the current version — decide again with that.
 
-Append format:
+A session can be replaced by a fresh one between turns. Anything worth keeping beyond this turn must be in obligations, interview memory, or a question — never only in the conversation or in a memory feature of your own.
 
-```markdown
-## {question-id}
+Questions and memory belong to the **node**, not to one session. They survive app restarts and carry over when the user returns to this node, including in later phases.
 
-{question body from queue file}
+## Obligations form a hierarchy
 
-**Answer:** {user answer — include MC option when selected}
+**Requirements** say what must be true for the work to be done. **Constraints** bound how it may be done — platforms, compatibility, data rules, boundaries with other work.
 
-**Default stated:** {optional}
+**Across the tree.** A node inherits every obligation of its ancestors. Put an obligation on the highest node where it is true for everything beneath; by default that is the interview node. Never restate an inherited obligation on this node. When this node genuinely needs to differ from an inherited one, that is a conflict for the user to settle: propose rewording the ancestor's obligation to carve out the exception, not a contradicting copy here.
+
+**Within a node.** Obligations are grouped by kind, then by optional **section**. Use existing section names exactly. Start a new section only when several related obligations would share it; small lists stay unsectioned. Regrouping an existing list is not interview work.
+
+## Writing obligations
+
+Whoever drafts obligation text — as a proposal or a direct write — holds it to this standard:
+
+- **Checkable.** Someone could look at the finished work and say pass or fail. If that takes more than a sentence or two, it is probably several obligations.
+- **Grounded.** Only what the user said, accepted, or clearly implied. No invented scope.
+- **Positive.** State what must hold. Don't record that something *doesn't* happen unless something would otherwise suggest it does.
+- **Right phase.** Requirements say *what*, not *how*. Vendors, tools, and implementation belong in design or planning — park them (see Memory).
+- **No meta-obligations** such as "follows the parent's requirements" — inheritance already does that.
+
+## Memory
+
+Interview memory — the notes you read and write with `tod-cli memory` — is how the interview keeps what isn't an obligation, and how the two agents pass context to each other. It is the only memory here: don't use any memory feature of your own agent platform (memory files, saved notes). Nothing written there reaches the app, the other agent, or a fresh session. Keep every note short and specific: one fact or request per note. Update or close an existing note rather than adding a near-duplicate.
+
+| Kind | Written by | Read by | Holds | Closed when |
+|--|--|--|--|--|
+| `context` | either | both | Facts that shape future questions or how to read answers: who the users are, priorities, vocabulary, defaults the user is happy with | It stops being true |
+| `handoff` | answer processor | question maker | A follow-up the question maker should ask, and why | The question maker acts on it |
+| `parked` | either | both | Detail volunteered for a later phase, tagged with that phase | Promoted or discarded in that phase |
+| `plan` | question maker | question maker | What is settled, what remains, and what to ask next — one per phase, each new plan replaces the last | Replaced |
+
+Questions also carry an `intent` the user never sees: the question maker's note to the answer processor on how to read the answers.
+
+## tod-cli
+
+Every command takes `--data-root <DATA_ROOT>` (from your snapshot). Ids: obligations by the 8-character prefix shown to you; questions `q-<n>` and memory notes `m-<n>`, numbered per node. Writes print one line. Use `list` / `show` only when you truly lack something.
+
+```
+obligations list      --node <NODE> [--inherited]
+obligations add       --node <NODE> --kind requirement|constraint --body <TEXT> [--section <NAME>]
+obligations update    <ID> [--body <TEXT>] [--section <NAME>]
+obligations delete    <ID>
+
+content get           --node <NODE> --type goal|design|plan
+content set           --node <NODE> --type goal|design|plan --body <TEXT> [--append]
+
+questions list        --node <NODE> [--status open|answered|deferred|withdrawn]
+questions show        --node <NODE> <Q>
+questions add         --node <NODE>                              # question YAML on stdin; prints its id
+questions withdraw    --node <NODE> <Q> --reason <TEXT>
+questions processed   --node <NODE> <Q> --summary <TEXT>
+
+memory list           --node <NODE> [--kind context|handoff|parked|plan] [--status open|done]
+memory add            --node <NODE> --kind context|handoff|parked|plan --body <TEXT> [--phase requirements|design|planning] [--question <Q>]
+memory update         --node <NODE> <M> [--body <TEXT>] [--status done]
+
+interview exhausted   --session <SESSION> --reason <TEXT>
 ```
 
-Question maker actions (defer, reconsider, more-options):
-
-```markdown
-## {question-id} (action: {action})
-
-{optional user notes}
-```
-
-## Session files
-
-| Path | Purpose |
-|--|--|
-| `{scratchpad}/interview-config.md` | Session manifest |
-| `{scratchpad}/queue/` | Open questions |
-| `{scratchpad}/scope/` | Obligations + node context export |
-| Entity `…/scratchpad/to-process.md` | Phase overflow (entity-level, shared across sessions on the node) |
-| Transcript | App-managed per session |
-
-Never share a session scratchpad across concurrent interviews.
-
-## Phase overflow
-
-Answers often mix current-phase content with later-phase detail. Only the **current interview phase** slice belongs in outcomes for this session.
-
-Park wrong-phase detail in entity `to-process.md`. Answer processor appends; question maker reads before asking; later phases consume. Do not lose volunteered detail; do not force it into the wrong artifact.
-
-## Obligation inheritance
-
-Before asking or writing at this node, read **inherited obligations**. If an applicable obligation already exists, do not ask and do not duplicate at this node. Target writes use question `layer`.
+Never open the database directly.
 
 ## Principles
 
-1. **Propose, do not own** — human-owned obligations; Accept / write-from-decision is permission to return that item now; no second “OK to add already-accepted items?” ask
-2. **Defaults explicit** — state assumed defaults in the transcript
-3. **One session, one scratchpad**
-4. **Waivers explicit** — silence or hurry is not waiver
-5. **No process commentary** in user-visible replies (agents, queue, lifecycle jargon)
-6. **Numbered lists for referral** in question `context` when the user may refer to items by number — not for MC options (those use `options:`) or external obligation indices (use short labels)
-
-## Completion
-
-Interview complete when `queue/` is empty, question maker status is `complete`, and answer processing has drained.
+1. **Obligations belong to the user.** Change one only when an answer decides it or the user confirms the change.
+2. **Make answering cheap.** A good question takes one keystroke and a moment's thought. The agents do the drafting, categorizing, and checking.
+3. **Nothing volunteered is lost.** Detail that doesn't fit yet is parked, not dropped and not forced in.
+4. **Plain language in anything the user reads.** Name the phase in plain words (requirements, design, planning). Never mention agents, queues, memory, sessions, or ids. Refer to an existing obligation by a short label taken from its text — never by its position or id.

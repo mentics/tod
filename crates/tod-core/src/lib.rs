@@ -21,27 +21,8 @@ pub use interview::{TodPaths, set_data_root};
 /// CLI callers have a single import path. GUI-only geometry helpers stay in the
 /// UI crate.
 pub mod settings {
-    use tod_agent::SessionPoolConfig;
-
-    /// Pool config for question-maker replenishment.
-    ///
-    /// `replenish_threshold` and `second_question_maker_threshold` are interview
-    /// policy and stay in core (see `interview::replenishment`); only session
-    /// reuse reaches the transport layer.
-    pub fn question_maker_pool(settings: &QuestionMakerSettings) -> SessionPoolConfig {
-        SessionPoolConfig::new(
-            tod_agent::RESEARCHER_SESSION_POOL_SIZE,
-            settings.runs_per_session,
-        )
-    }
-
-    /// Pool config for answer processing.
-    pub fn answer_processor_pool(settings: &AnswerProcessorSettings) -> SessionPoolConfig {
-        SessionPoolConfig::new(settings.session_pool_size, settings.answers_per_session)
-    }
-
     pub use tod_store::settings::{
-        AnswerProcessorSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings,
+        InterviewContextSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings,
         TodSettings, WindowGeometry, WorktreeBackend,
     };
 }

@@ -126,6 +126,9 @@ fn spawn_custom(
         return Command::new(program)
             .current_dir(cwd)
             .args(["-e", "bash", "-lc", &cmd])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map(|_| ())
             .with_context(|| format!("spawn terminal `{program}` in {}", cwd.display()));
@@ -200,7 +203,12 @@ fn spawn_git_bash(
         .with_context(|| format!("resolve Git for Windows root from `{program}`"))?;
     let mintty = git_root.join("usr").join("bin").join("mintty.exe");
     if mintty.is_file() {
+        // The terminal opens its own window. Inheriting our stdio would let the
+        // shell hold a caller's pipe open long after this process exits.
         Command::new(mintty)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .args([
                 "-h",
                 "always",
@@ -219,6 +227,9 @@ fn spawn_git_bash(
         return Ok(());
     }
     Command::new(program)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .arg(format!("--cd={}", cwd.display()))
         .arg("/bin/bash")
         .arg("--init-file")
@@ -280,6 +291,7 @@ fn spawn_windows_terminal(
         shell_id,
         &assets.state_dir,
         cwd,
+        backend,
         startup_command,
     ));
     Command::new(program)
@@ -299,27 +311,98 @@ fn spawn_powershell(
     backend: &str,
     startup_command: Option<&str>,
 ) -> Result<()> {
-    use std::os::windows::process::CommandExt;
-    // GUI hosts (tod.exe) are not console processes. Without CREATE_NEW_CONSOLE,
-    // powershell.exe can start headless (hwnd=0): the agent run registers as
-    // "processing" but no window appears.
-    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-
-    let mut command = Command::new(program);
-    command.current_dir(cwd);
-    command.env("TOD_TERMINAL_BACKEND", backend);
-    command.creation_flags(CREATE_NEW_CONSOLE);
-    command.args(windows_launch_args(
+    // GUI hosts (tod.exe) are not console processes, and `CreateProcess` +
+    // `CREATE_NEW_CONSOLE` ties the child's std handles to whatever the
+    // caller's own (possibly redirected/piped, non-console) handles are —
+    // which can make an interactive `-NoExit` PowerShell see EOF on stdin
+    // and exit almost immediately. `ShellExecuteExW` launches the process
+    // the way Explorer/"Run" does: fully detached from our own std handles,
+    // always with a real console for the new process.
+    let args = windows_launch_args(
         &assets.windows_init,
         shell_id,
         &assets.state_dir,
         cwd,
+        backend,
         startup_command,
-    ));
-    command
-        .spawn()
-        .map(|_| ())
+    );
+    let params = join_windows_args(&args);
+    shell_execute_new_console(program, cwd, &params)
         .with_context(|| format!("spawn PowerShell `{program}` in {}", cwd.display()))
+}
+
+#[cfg(windows)]
+fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|c| c == ' ' || c == '\t' || c == '"')
+    {
+        return arg.to_string();
+    }
+    // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw
+    // parameters are parsed with the same argv quoting rules as CommandLineToArgvW.
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(windows)]
+fn join_windows_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| quote_windows_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn shell_execute_new_console(program: &str, cwd: &Path, params: &str) -> Result<()> {
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let file = wide(program);
+    let params_w = wide(params);
+    let dir = wide(&cwd.display().to_string());
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params_w.as_ptr()),
+        lpDirectory: PCWSTR(dir.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+
+    if unsafe { ShellExecuteExW(&mut info) }.is_err() || info.hProcess.is_invalid() {
+        bail!("ShellExecuteExW failed to launch `{program}`");
+    }
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -850,6 +933,36 @@ mod tests {
         assert!(cmd.ends_with("; claude") || cmd.contains("; claude"));
     }
 
+    /// When dropped — including when an assertion fails — kills every process
+    /// launched for a terminal session, matched by the shell id in its command
+    /// line. `taskkill /T` from the recorded pid misses Git Bash's `bash.exe`,
+    /// whose Windows parent has already exited; left running it holds the test
+    /// runner's output pipe open and hangs any piped `cargo test`.
+    #[cfg(windows)]
+    struct KillShellSession(String);
+
+    #[cfg(windows)]
+    impl Drop for KillShellSession {
+        fn drop(&mut self) {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let needle = self.0.replace('\'', "''");
+            let script = format!(
+                "$needle = '{needle}'; \
+                 Get-CimInstance Win32_Process | \
+                 Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like \"*$needle*\" }} | \
+                 ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+            );
+            let _ = std::process::Command::new("powershell.exe")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", &script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn git_bash_launch_stays_alive() {
@@ -864,6 +977,7 @@ mod tests {
         let assets = ensure_shell_init_assets(&paths).unwrap();
         let cwd = normalize_launch_path(std::env::current_dir().unwrap().as_path());
         let shell_id = uuid::Uuid::new_v4().to_string();
+        let _kill_session = KillShellSession(shell_id.clone());
         let settings = TerminalSettings {
             program: Some(r"C:\app\dev\Git\git-bash.exe".into()),
             ..TerminalSettings::default()
@@ -909,6 +1023,7 @@ mod tests {
         let assets = ensure_shell_init_assets(&paths).unwrap();
         let cwd = normalize_launch_path(std::env::current_dir().unwrap().as_path());
         let shell_id = uuid::Uuid::new_v4().to_string();
+        let _kill_session = KillShellSession(shell_id.clone());
         let settings = TerminalSettings {
             program: Some("powershell.exe".into()),
             ..TerminalSettings::default()
@@ -1098,6 +1213,18 @@ mod tests {
         let store = FleetStore::open(&fleet_root).unwrap();
         set_data_root(fleet_root.clone());
         let paths = crate::paths::TodPaths::discover().unwrap();
+
+        // Registered before the launch call (whose shell id isn't known until
+        // it returns) by the fleet root's unique path instead, which appears
+        // in the child's command line (`-TodStateDir <fleet_root>\shells`)
+        // regardless of backend, so a panic mid-launch still gets cleaned up.
+        let _kill_session = KillShellSession(
+            fleet_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("fleet root has a name")
+                .to_string(),
+        );
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let config_id = format!("test-{}", uuid::Uuid::new_v4());

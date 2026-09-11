@@ -30,7 +30,6 @@ impl ProcessManifest {
             Self::BASE,
             Self::QUESTION_MAKER,
             Self::ANSWER_PROCESSOR,
-            Self::DEEP_DIVE,
             Self::PHASE_PROPOSED,
             Self::PHASE_DESIGN,
             Self::PHASE_PLANNING,
@@ -61,11 +60,6 @@ impl ProcessManifest {
     pub fn answer_processor_doc(&self, base_phase: &str) -> Result<PathBuf> {
         self.phase(base_phase)?;
         Ok(self.resolve(Self::ANSWER_PROCESSOR))
-    }
-
-    /// Deep-dive chat role doc (not phase-specific).
-    pub fn deep_dive_doc(&self) -> PathBuf {
-        self.resolve(Self::DEEP_DIVE)
     }
 
     /// Shared interview conventions (question maker + answer processor).

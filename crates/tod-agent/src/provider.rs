@@ -1,6 +1,5 @@
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::InterviewAgentCounts;
-use crate::prompt::{AgentPrompt, SessionPoolConfig};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -23,8 +22,30 @@ impl Default for RunId {
 pub enum AgentRunKind {
     QuestionMakerReplenishment,
     AnswerProcessor,
-    DeepDiveChat,
     FleetAgent,
+}
+
+/// What a long-lived conversation is for. Only affects how its traffic is
+/// labeled and counted; the transport treats every conversation the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionPurpose {
+    /// A user-facing chat.
+    #[default]
+    Chat,
+    /// An interview question maker session.
+    QuestionMaker,
+    /// An interview answer processor session.
+    AnswerProcessor,
+}
+
+impl SessionPurpose {
+    pub(crate) fn run_kind(self) -> AgentRunKind {
+        match self {
+            Self::Chat => AgentRunKind::FleetAgent,
+            Self::QuestionMaker => AgentRunKind::QuestionMakerReplenishment,
+            Self::AnswerProcessor => AgentRunKind::AnswerProcessor,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +90,10 @@ pub struct SessionTurn {
     /// Set on the conversation's first message only.
     pub opening: Option<SessionOpening>,
     pub message: String,
+    pub purpose: SessionPurpose,
+    /// Extra environment for the agent process. Applied when the process for
+    /// this key is started, so it must stay the same for the life of the key.
+    pub env: Vec<(String, String)>,
 }
 
 impl SessionTurn {
@@ -90,32 +115,6 @@ impl SessionTurn {
 
 /// Swappable agent backend boundary (`--agent mock|cursor|claude`).
 pub trait AgentProvider {
-    fn start_question_maker_replenishment(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: AgentPrompt,
-        pool: &SessionPoolConfig,
-        options: AgentLaunchOptions,
-    ) -> anyhow::Result<AgentRunHandle>;
-
-    fn start_answer_processor(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: AgentPrompt,
-        pool: &SessionPoolConfig,
-        options: AgentLaunchOptions,
-    ) -> anyhow::Result<AgentRunHandle>;
-
-    fn start_deep_dive_chat(
-        &mut self,
-        agent_config_id: &str,
-        cwd: PathBuf,
-        prompt: String,
-        options: AgentLaunchOptions,
-    ) -> anyhow::Result<AgentRunHandle>;
-
     /// Start an autonomous fleet agent run for a saved agent config.
     fn start_fleet_agent(
         &mut self,
@@ -132,6 +131,11 @@ pub trait AgentProvider {
     /// Agent-side session id for conversation `key`, once the agent assigned
     /// one. Callers persist it so a later process can resume the session.
     fn session_id(&self, key: &str) -> Option<String>;
+
+    /// Characters that have entered conversation `key`'s context since this
+    /// provider started holding it: prompts sent, replies, and tool output the
+    /// agent reported. A size estimate for callers deciding when to rotate.
+    fn session_context_chars(&self, key: &str) -> Option<u64>;
 
     /// Stop the live process behind conversation `key`. The agent-side session
     /// is left intact, so a later turn can resume it.
@@ -159,6 +163,8 @@ mod tests {
             resume_session_id: None,
             opening,
             message: "hello".into(),
+            purpose: SessionPurpose::Chat,
+            env: Vec::new(),
         }
     }
 

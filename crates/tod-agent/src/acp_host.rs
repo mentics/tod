@@ -295,7 +295,11 @@ fn resolve_git_bash_path() -> Option<PathBuf> {
 }
 
 /// Spawn an ACP server process (Cursor/Claude `… acp`, or a standalone adapter).
-pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process::Child> {
+pub fn spawn_acp_process(
+    host: AcpHost,
+    agent_bin: &Path,
+    env: &[(String, String)],
+) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
 
     let use_subcommand = host.uses_acp_subcommand(agent_bin);
@@ -333,6 +337,10 @@ pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process
         if let Some(bash) = resolve_git_bash_path() {
             command.env("CLAUDE_CODE_GIT_BASH_PATH", bash);
         }
+    }
+
+    for (key, value) in env {
+        command.env(key, value);
     }
 
     command
@@ -388,7 +396,7 @@ mod tests {
         let script = dir.join("claude-code-acp.cmd");
         std::fs::write(&script, "@echo %CLAUDE_CODE_GIT_BASH_PATH%\r\n").unwrap();
 
-        let mut child = spawn_acp_process(AcpHost::Claude, &script).expect("spawn should succeed");
+        let mut child = spawn_acp_process(AcpHost::Claude, &script, &[]).expect("spawn should succeed");
         let mut stdout = String::new();
         child
             .stdout

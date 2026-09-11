@@ -1,50 +1,32 @@
-use crate::interview::queue::QueueQuestion;
 use gpui::{Context, ParentElement, SharedString, Styled, Window, div};
 use gpui_component::IndexPath;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
 use gpui_component::{ActiveTheme, StyledExt};
-use std::collections::HashSet;
+use tod_store::interview::InterviewQuestion;
 
 pub struct QuestionListDelegate {
-    items: Vec<QueueQuestion>,
-    pending: HashSet<String>,
-    /// Queue ids about to be dropped — brief red flash before removal.
-    removing: HashSet<String>,
+    items: Vec<InterviewQuestion>,
     selected_index: Option<IndexPath>,
 }
 
 impl QuestionListDelegate {
-    pub fn new(items: Vec<QueueQuestion>) -> Self {
+    pub fn new(items: Vec<InterviewQuestion>) -> Self {
         Self {
             items,
-            pending: HashSet::new(),
-            removing: HashSet::new(),
             selected_index: None,
         }
     }
 
-    pub fn set_items(&mut self, items: Vec<QueueQuestion>) {
+    pub fn set_items(&mut self, items: Vec<InterviewQuestion>) {
         self.items = items;
     }
 
-    pub fn set_pending(&mut self, pending: HashSet<String>) {
-        self.pending = pending;
-    }
-
-    pub fn set_removing(&mut self, removing: HashSet<String>) {
-        self.removing = removing;
-    }
-
-    pub fn items(&self) -> &[QueueQuestion] {
+    pub fn items(&self) -> &[InterviewQuestion] {
         &self.items
     }
 
-    pub fn select_by_id(&mut self, id: &str) -> Option<IndexPath> {
-        let ix = self
-            .items
-            .iter()
-            .position(|q| q.id == id)
-            .map(IndexPath::new)?;
+    pub fn select_by_seq(&mut self, seq: i64) -> Option<IndexPath> {
+        let ix = self.index_of_seq(seq).map(IndexPath::new)?;
         self.selected_index = Some(ix);
         Some(ix)
     }
@@ -53,9 +35,18 @@ impl QuestionListDelegate {
         self.selected_index = None;
     }
 
-    pub fn index_of_id(&self, id: &str) -> Option<usize> {
-        self.items.iter().position(|q| q.id == id)
+    pub fn index_of_seq(&self, seq: i64) -> Option<usize> {
+        self.items.iter().position(|q| q.seq == seq)
     }
+}
+
+fn short_label(q: &InterviewQuestion) -> String {
+    q.question
+        .as_deref()
+        .unwrap_or("(freeform)")
+        .chars()
+        .take(72)
+        .collect()
 }
 
 impl ListDelegate for QuestionListDelegate {
@@ -73,38 +64,20 @@ impl ListDelegate for QuestionListDelegate {
     ) -> Option<Self::Item> {
         let item = self.items.get(ix.row)?;
         let selected = self.selected_index.map(|s| s.eq_row(ix)).unwrap_or(false);
-        let is_removing = self.removing.contains(&item.id);
-        let is_pending = self.pending.contains(&item.id);
-        let label: SharedString = format!("{} · {}", item.id, item.short_label).into();
-        let muted = cx.theme().muted_foreground;
-        let foreground = cx.theme().foreground;
-        let danger = cx.theme().danger;
-        let danger_fg = cx.theme().danger_foreground;
-
-        let mut row = ListItem::new(("question-row", ix.row))
-            .selected(selected && !is_removing)
-            .disabled(is_pending || is_removing)
-            .child(
-                div()
-                    .text_sm()
-                    .font_semibold()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .text_color(if is_removing {
-                        danger_fg
-                    } else if is_pending {
-                        muted
-                    } else {
-                        foreground
-                    })
-                    .child(label),
-            );
-
-        if is_removing {
-            row = row.bg(danger);
-        }
-
-        Some(row)
+        let label: SharedString = format!("{} · {}", item.label(), short_label(item)).into();
+        Some(
+            ListItem::new(("question-row", ix.row))
+                .selected(selected)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                ),
+        )
     }
 
     fn set_selected_index(

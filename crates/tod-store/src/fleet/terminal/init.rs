@@ -122,6 +122,7 @@ pub fn windows_launch_args(
     shell_id: &str,
     state_dir: &Path,
     cwd: &Path,
+    backend: &str,
     startup_command: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -135,6 +136,8 @@ pub fn windows_launch_args(
         state_dir.display().to_string(),
         "-TodCwd".into(),
         cwd.display().to_string(),
+        "-TodBackend".into(),
+        backend.to_string(),
     ];
     if let Some(cmd) = startup_command.filter(|c| !c.trim().is_empty()) {
         args.push("-TodStartupCommand".into());

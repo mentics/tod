@@ -1,288 +1,228 @@
 //! `tod-cli obligations` — read and modify a node's requirements and constraints.
 
 use crate::Invocation;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::time::Duration;
-use tod_store::fleet::{FleetPaths, FleetStore};
-use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation};
+use crate::args::Args;
+use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
+use tod_store::outline::repos::{NodeRepo, ObligationRepo};
+use tod_store::outline::{
+    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, resolve_obligations,
+};
 use uuid::Uuid;
 
 const USAGE: &str = "\
 tod-cli obligations — requirements and constraints on a node
 
+Obligation ids may be given in full or as the 8-character prefix shown in listings.
+
 COMMANDS:
-    list   --node <UUID> [--kind requirement|constraint]
-    show   <OBLIGATION_UUID>
-    add    --node <UUID> --kind requirement|constraint --body <TEXT> [--after <UUID>] [--before]
-    update <OBLIGATION_UUID> --body <TEXT>
-    delete <OBLIGATION_UUID>
+    list   --node <UUID> [--kind requirement|constraint] [--inherited]
+    show   <ID>
+    add    --node <UUID> --kind requirement|constraint --body <TEXT> [--section <NAME>] [--after <ID>] [--before]
+    update <ID> [--body <TEXT>] [--section <NAME>]      (--section \"\" clears it)
+    delete <ID>
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
-    let mut args = inv.rest.clone();
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+    let mut rest = inv.rest.clone();
+    if rest.is_empty() || rest.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(USAGE.trim_end().to_string());
     }
-    let command = args.remove(0);
-    let opts = Options::parse(&args)?;
-
+    let command = rest.remove(0);
+    let args = Args::parse(&rest)?;
     match command.as_str() {
-        "list" => {
-            let store = open_store(&inv)?;
-            list(&store, &opts, inv.json)
-        }
-        "show" => {
-            let store = open_store(&inv)?;
-            show(&store, &opts, inv.json)
-        }
-        "add" => add(&inv, &opts),
-        "update" => update(&inv, &opts),
-        "delete" => delete(&inv, &opts),
+        "list" => list(&inv, &args),
+        "show" => show(&inv, &args),
+        "add" => add(&inv, &args),
+        "update" => update(&inv, &args),
+        "delete" => delete(&inv, &args),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
 }
 
-fn open_store(inv: &Invocation) -> anyhow::Result<FleetStore> {
-    FleetStore::open(&inv.data_root)
-        .map_err(|err| anyhow::anyhow!("open store at {}: {err}", inv.data_root.display()))
-}
-
-#[derive(Default)]
-struct Options {
-    positional: Vec<String>,
-    node: Option<Uuid>,
-    kind: Option<String>,
-    body: Option<String>,
-    after: Option<Uuid>,
-    before: bool,
-}
-
-impl Options {
-    fn parse(args: &[String]) -> anyhow::Result<Self> {
-        let mut out = Options::default();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--node" => {
-                    i += 1;
-                    out.node = Some(parse_uuid(args.get(i), "--node")?);
-                }
-                "--after" => {
-                    i += 1;
-                    out.after = Some(parse_uuid(args.get(i), "--after")?);
-                }
-                "--kind" => {
-                    i += 1;
-                    out.kind =
-                        Some(normalize_kind(args.get(i).ok_or_else(|| {
-                            anyhow::anyhow!("--kind requires a value")
-                        })?)?);
-                }
-                "--body" => {
-                    i += 1;
-                    out.body = Some(
-                        args.get(i)
-                            .ok_or_else(|| anyhow::anyhow!("--body requires text"))?
-                            .clone(),
-                    );
-                }
-                "--before" => out.before = true,
-                other => out.positional.push(other.to_string()),
-            }
-            i += 1;
-        }
-        Ok(out)
-    }
-
-    fn node(&self) -> anyhow::Result<Uuid> {
-        self.node
-            .ok_or_else(|| anyhow::anyhow!("--node <UUID> is required"))
-    }
-
-    fn target(&self) -> anyhow::Result<Uuid> {
-        let raw = self
-            .positional
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("an obligation UUID is required"))?;
-        Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("`{raw}` is not a valid UUID"))
-    }
-}
-
-fn parse_uuid(raw: Option<&String>, flag: &str) -> anyhow::Result<Uuid> {
-    let raw = raw.ok_or_else(|| anyhow::anyhow!("{flag} requires a UUID"))?;
-    Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("{flag}: `{raw}` is not a valid UUID"))
-}
-
-fn normalize_kind(raw: &str) -> anyhow::Result<String> {
+fn normalize_kind(raw: &str) -> anyhow::Result<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "requirement" | "requirements" | "req" => Ok(KIND_REQUIREMENT.to_string()),
-        "constraint" | "constraints" | "con" => Ok(KIND_CONSTRAINT.to_string()),
+        "requirement" | "requirements" | "req" => Ok(KIND_REQUIREMENT),
+        "constraint" | "constraints" | "con" => Ok(KIND_CONSTRAINT),
         other => anyhow::bail!("unknown kind `{other}` (expected requirement|constraint)"),
     }
 }
 
-fn list(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String> {
-    let node = opts.node()?;
-    let mut rows = store
-        .list_obligations_for_node(node)
-        .map_err(|err| anyhow::anyhow!("list obligations: {err}"))?;
-    if let Some(kind) = opts.kind.as_deref() {
-        rows.retain(|r| r.kind == kind);
-    }
-    Ok(render(&rows, json))
+fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
+    inv.client()
+        .read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw))
 }
 
-fn show(store: &FleetStore, opts: &Options, json: bool) -> anyhow::Result<String> {
-    let id = opts.target()?;
-    // No direct by-id lookup on the store; the node's list is small.
-    let node = opts.node()?;
-    let rows = store
-        .list_obligations_for_node(node)
-        .map_err(|err| anyhow::anyhow!("show obligation: {err}"))?;
-    let row = rows
+fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let node = args.node()?;
+    let kind = args.get("--kind").map(normalize_kind).transpose()?;
+    let rows: Vec<(NodeObligation, Option<String>)> = inv.client().read(|conn| {
+        let nodes = NodeRepo::new(conn);
+        let rows = if args.has("--inherited") {
+            resolve_obligations(conn, node)?
+                .into_iter()
+                .map(|r| {
+                    let source = (r.source_node_id != node).then(|| {
+                        if r.source_node_id.is_nil() {
+                            "global".to_string()
+                        } else {
+                            nodes
+                                .get(r.source_node_id)
+                                .ok()
+                                .flatten()
+                                .map(|n| n.title)
+                                .unwrap_or_default()
+                        }
+                    });
+                    (r.obligation, source)
+                })
+                .collect()
+        } else {
+            ObligationRepo::new(conn)
+                .list_for_node(node)?
+                .into_iter()
+                .map(|o| (o, None))
+                .collect()
+        };
+        Ok(rows)
+    })?;
+    let rows: Vec<_> = rows
         .into_iter()
-        .find(|r| r.id == id)
-        .ok_or_else(|| anyhow::anyhow!("obligation {id} not found on node {node}"))?;
-    Ok(render(std::slice::from_ref(&row), json))
-}
-
-fn add(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
-    let node = opts.node()?;
-    let kind = opts
-        .kind
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--kind requirement|constraint is required"))?;
-    let body = opts
-        .body
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--body <TEXT> is required"))?;
-    let id = Uuid::new_v4();
-    apply(
-        inv,
-        OutlineMutation::CreateObligation {
-            obligation_id: Some(id),
-            node_id: node,
-            kind,
-            after_id: opts.after,
-            before: opts.before,
-            section: None,
-            body,
-        },
-    )?;
-    Ok(ack(id, "created", inv.json))
-}
-
-fn update(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
-    let id = opts.target()?;
-    let body = opts
-        .body
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--body <TEXT> is required"))?;
-    apply(
-        inv,
-        OutlineMutation::UpdateObligationBody {
-            obligation_id: id,
-            body,
-        },
-    )?;
-    Ok(ack(id, "updated", inv.json))
-}
-
-fn delete(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
-    let id = opts.target()?;
-    apply(
-        inv,
-        OutlineMutation::DeleteObligation { obligation_id: id },
-    )?;
-    Ok(ack(id, "deleted", inv.json))
-}
-
-/// Forward to a live `tod` GUI instance over the mutation socket when one is
-/// running against this data root (avoids ever touching the exclusive
-/// `FleetLock` it holds); otherwise fall back to opening the store directly,
-/// exactly as before this feature existed.
-fn apply(inv: &Invocation, mutation: OutlineMutation) -> anyhow::Result<()> {
-    if let Some(reply) = try_forward(&inv.data_root, &mutation) {
-        let reply = reply?;
-        if let Some(msg) = reply.strip_prefix("err ") {
-            anyhow::bail!("{msg}");
-        }
-        return Ok(());
-    }
-
-    let store = open_store(inv)?;
-    store
-        .enqueue_outline(mutation)
-        .map_err(|err| anyhow::anyhow!("enqueue: {err}"))?;
-    store
-        .writer()
-        .flush()
-        .map_err(|err| anyhow::anyhow!("flush: {err}"))?;
-    Ok(())
-}
-
-/// Returns `None` when no live instance is reachable (no port file, unreadable,
-/// or connect failed — including a stale port file left by a crashed process),
-/// signaling the caller to use the direct-open fallback. Returns `Some(Err(_))`
-/// only for errors that happened *after* a connection was established.
-fn try_forward(data_root: &std::path::Path, mutation: &OutlineMutation) -> Option<anyhow::Result<String>> {
-    let paths = FleetPaths::new(data_root).ok()?;
-    let port: u16 = std::fs::read_to_string(paths.mutation_port())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-
-    let payload = match serde_json::to_string(mutation) {
-        Ok(p) => p,
-        Err(err) => return Some(Err(anyhow::anyhow!("serialize mutation: {err}"))),
-    };
-    if let Err(err) = writeln!(stream, "{payload}") {
-        return Some(Err(anyhow::anyhow!("send mutation: {err}")));
-    }
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => Some(Err(anyhow::anyhow!("mutation socket closed without a reply"))),
-        Ok(_) => Some(Ok(line.trim_end_matches(['\r', '\n']).to_string())),
-        Err(err) => Some(Err(anyhow::anyhow!("read reply: {err}"))),
-    }
-}
-
-fn ack(id: Uuid, verb: &str, json: bool) -> String {
-    if json {
-        serde_json::json!({ "id": id.to_string(), "status": verb }).to_string()
-    } else {
-        format!("{verb} {id}")
-    }
-}
-
-fn render(rows: &[NodeObligation], json: bool) -> String {
-    if json {
+        .filter(|(o, _)| kind.is_none_or(|k| o.kind == k))
+        .collect();
+    if inv.json {
         let items: Vec<serde_json::Value> = rows
             .iter()
-            .map(|r| {
+            .map(|(r, source)| {
                 serde_json::json!({
                     "id": r.id.to_string(),
                     "node_id": r.node_id.to_string(),
                     "kind": r.kind,
-                    "ordinal": r.ordinal,
                     "section": r.section,
                     "body": r.body,
+                    "inherited_from": source,
                 })
             })
             .collect();
-        return serde_json::Value::Array(items).to_string();
+        return Ok(serde_json::Value::Array(items).to_string());
     }
     if rows.is_empty() {
-        return "(none)".to_string();
+        return Ok("(none)".to_string());
     }
-    rows.iter()
-        .map(|r| format!("{}  [{}]  {}", r.id, r.kind, r.body))
+    Ok(rows
+        .iter()
+        .map(|(o, source)| {
+            let section = o
+                .section
+                .as_deref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            let from = source
+                .as_deref()
+                .map(|s| format!(" [from \"{s}\"]"))
+                .unwrap_or_default();
+            format!("[{}] {}{section}{from}: {}", short_id(o.id), o.kind, o.body)
+        })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
+}
+
+fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let raw = args.target("an obligation id")?;
+    let row = inv.client().read(|conn| {
+        let id = InterviewRepo::new(conn).resolve_obligation_id(raw)?;
+        ObligationRepo::new(conn)
+            .get(id)?
+            .ok_or_else(|| anyhow::anyhow!("obligation {raw} not found"))
+    })?;
+    if inv.json {
+        return Ok(serde_json::json!({
+            "id": row.id.to_string(),
+            "node_id": row.node_id.to_string(),
+            "kind": row.kind,
+            "section": row.section,
+            "body": row.body,
+        })
+        .to_string());
+    }
+    let section = row
+        .section
+        .as_deref()
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    Ok(format!(
+        "[{}] {}{section} on node {}\n{}",
+        short_id(row.id),
+        row.kind,
+        row.node_id,
+        row.body
+    ))
+}
+
+fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let node = args.node()?;
+    let kind = normalize_kind(args.require("--kind")?)?;
+    let body = args.require("--body")?.to_string();
+    let after = args.get("--after").map(|raw| resolve(inv, raw)).transpose()?;
+    let id = Uuid::new_v4();
+    inv.client().outline(OutlineMutation::CreateObligation {
+        obligation_id: Some(id),
+        node_id: node,
+        kind: kind.to_string(),
+        after_id: after,
+        before: args.has("--before"),
+        section: args
+            .get("--section")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        body,
+    })?;
+    Ok(ack(id, inv.json))
+}
+
+fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let id = resolve(inv, args.target("an obligation id")?)?;
+    let body = args.get("--body");
+    let section = args.get("--section");
+    if body.is_none() && section.is_none() {
+        anyhow::bail!("--body and/or --section is required");
+    }
+    let client = inv.client();
+    let mut target = Some(id);
+    if let Some(body) = body {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdateObligationBody {
+                obligation_id: id,
+                body: body.to_string(),
+            },
+            target: target.take(),
+        })?;
+    }
+    if let Some(section) = section {
+        client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::UpdateObligationSection {
+                obligation_id: id,
+                section: Some(section.to_string()).filter(|s| !s.trim().is_empty()),
+            },
+            target,
+        })?;
+    }
+    Ok(ack(id, inv.json))
+}
+
+fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let id = resolve(inv, args.target("an obligation id")?)?;
+    inv.client().interview(InterviewCommand::Outline {
+        mutation: OutlineMutation::DeleteObligation { obligation_id: id },
+        target: Some(id),
+    })?;
+    Ok(ack(id, inv.json))
+}
+
+fn ack(id: Uuid, json: bool) -> String {
+    if json {
+        serde_json::json!({ "id": id.to_string(), "status": "ok" }).to_string()
+    } else {
+        format!("ok {}", short_id(id))
+    }
 }

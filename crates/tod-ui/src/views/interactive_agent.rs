@@ -364,6 +364,8 @@ impl InteractiveAgentView {
                     resume_session_id: self.agent_session_id.clone(),
                     opening: self.opening(),
                     message: text,
+                    purpose: tod_agent::SessionPurpose::Chat,
+                    env: Vec::new(),
                 })
             }
             Err(_) => Err(anyhow::anyhow!("Agent busy — try again shortly")),

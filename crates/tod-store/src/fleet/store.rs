@@ -561,6 +561,38 @@ impl FleetStore {
         self.enqueue(FleetMutation::Outline(mutation))
     }
 
+    /// Enqueue an outline mutation attributed to `actor` in the interview
+    /// change log (see [`FleetWriter::enqueue_as`]).
+    pub fn enqueue_outline_as(
+        &self,
+        actor: &str,
+        mutation: OutlineMutation,
+    ) -> Result<(), FleetWriterError> {
+        if self.migration.is_some() {
+            return Err(FleetWriterError::MigrationBlocked);
+        }
+        self.writer.enqueue_as(actor, FleetMutation::Outline(mutation))
+    }
+
+    /// Run an interview command as `actor` and return its JSON result.
+    pub fn interview(
+        &self,
+        actor: &str,
+        command: crate::interview::InterviewCommand,
+    ) -> Result<serde_json::Value, FleetWriterError> {
+        if self.migration.is_some() {
+            return Err(FleetWriterError::MigrationBlocked);
+        }
+        self.writer.execute_interview(actor, command)
+    }
+
+    /// Read through the projection connection, which sees every committed write.
+    pub fn read<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> Result<R>) -> Result<R> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        f(&conn)
+    }
+
     /// Bootstrap-import `doc/process` from `repo_root`.
     pub fn import_doc_process(
         &self,
