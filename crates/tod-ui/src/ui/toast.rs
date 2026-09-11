@@ -23,7 +23,7 @@ pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedS
     window.push_notification(
         Notification::new()
             .id::<ErrorBannerNotification>()
-            .autohide(true)
+            .autohide(false)
             .bg(gpui::hsla(0., 0., 0., 0.))
             .border_0()
             .shadow_none()

@@ -166,6 +166,7 @@ fn add(inv: &Invocation, opts: &Options) -> anyhow::Result<String> {
             kind,
             after_id: opts.after,
             before: opts.before,
+            section: None,
             body,
         },
     )?;

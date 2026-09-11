@@ -116,6 +116,7 @@ impl<'a> ObligationRepo<'a> {
         node_id: Uuid,
         kind: &str,
         index: usize,
+        section: Option<&str>,
         body: &str,
     ) -> Result<()> {
         let mut ids = self.list_ids_for_kind(node_id, kind)?;
@@ -126,11 +127,40 @@ impl<'a> ObligationRepo<'a> {
             node_id,
             kind: kind.to_string(),
             ordinal: temp_ordinal,
-            section: None,
+            section: section.map(str::to_string),
             body: body.to_string(),
         })?;
         ids.insert(index, id);
         self.write_ordinals(node_id, kind, &ids)?;
+        Ok(())
+    }
+
+    /// Bulk-rename every obligation in `kind` whose section matches `old_section`
+    /// (`None` meaning the implicit "no section" bucket) to `new_section`.
+    pub fn rename_section(
+        &self,
+        node_id: Uuid,
+        kind: &str,
+        old_section: Option<&str>,
+        new_section: &str,
+    ) -> Result<()> {
+        let now = now_ms();
+        match old_section {
+            Some(old) => {
+                self.conn.execute(
+                    "UPDATE node_obligations SET section = ?1, updated_at = ?2
+                     WHERE node_id = ?3 AND kind = ?4 AND section = ?5",
+                    params![new_section, now, uuid_to_blob(node_id), kind, old],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "UPDATE node_obligations SET section = ?1, updated_at = ?2
+                     WHERE node_id = ?3 AND kind = ?4 AND section IS NULL",
+                    params![new_section, now, uuid_to_blob(node_id), kind],
+                )?;
+            }
+        }
         Ok(())
     }
 

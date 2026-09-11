@@ -114,7 +114,7 @@ pub struct Shell {
     pending_retarget_task_edit: Option<String>,
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
-    pending_retarget_obligations: Option<(String, String)>,
+    pending_retarget_obligations: Option<(String, String, bool)>,
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
     pending_focus_drawer: bool,
@@ -411,6 +411,7 @@ impl Shell {
         &mut self,
         task_id: &str,
         title: &str,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -421,7 +422,7 @@ impl Shell {
             return;
         };
         self.obligations.update(cx, |panel, cx| {
-            panel.retarget(node_id, title, window, cx);
+            panel.retarget(node_id, title, focus, window, cx);
         });
         cx.notify();
     }
@@ -1118,8 +1119,8 @@ impl Shell {
                 list.restore_focus(window, cx);
             });
         }
-        if let Some((task_id, title)) = self.pending_retarget_obligations.take() {
-            self.retarget_obligations(&task_id, &title, window, cx);
+        if let Some((task_id, title, focus)) = self.pending_retarget_obligations.take() {
+            self.retarget_obligations(&task_id, &title, focus, window, cx);
         }
         if let Some((task_id, title)) = self.pending_open_obligations.take() {
             self.open_obligations(&task_id, &title, window, cx);
@@ -1197,9 +1198,10 @@ impl Shell {
         &mut self,
         task_id: String,
         title: String,
+        focus: bool,
         cx: &mut Context<Self>,
     ) {
-        self.pending_retarget_obligations = Some((task_id, title));
+        self.pending_retarget_obligations = Some((task_id, title, focus));
         cx.notify();
     }
 
@@ -1438,11 +1440,16 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 this.queue_open_task_edit(task_id.clone(), cx);
                                             }
                                         }
-                                        TaskListEvent::OpenObligations { task_id, title } => {
+                                        TaskListEvent::OpenObligations {
+                                            task_id,
+                                            title,
+                                            focus,
+                                        } => {
                                             if this.obligations.read(cx).is_open() {
                                                 this.queue_retarget_obligations(
                                                     task_id.clone(),
                                                     title.clone(),
+                                                    *focus,
                                                     cx,
                                                 );
                                             } else {

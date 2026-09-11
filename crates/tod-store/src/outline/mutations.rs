@@ -81,11 +81,24 @@ pub enum OutlineMutation {
         after_id: Option<Uuid>,
         /// When true and `after_id` is set, insert before that item instead.
         before: bool,
+        /// Section to place the new obligation in; `None` uses the implicit
+        /// "no section" bucket.
+        #[serde(default)]
+        section: Option<String>,
         body: String,
     },
     UpdateObligationBody {
         obligation_id: Uuid,
         body: String,
+    },
+    /// Bulk-rename every obligation in `node_id`/`kind` whose section is
+    /// `old_section` (`None` meaning the implicit "no section" bucket) to
+    /// `new_section`.
+    RenameObligationSection {
+        node_id: Uuid,
+        kind: String,
+        old_section: Option<String>,
+        new_section: String,
     },
     DeleteObligation {
         obligation_id: Uuid,
@@ -129,6 +142,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeCollapsed { .. }
                 | OutlineMutation::CreateObligation { .. }
                 | OutlineMutation::UpdateObligationBody { .. }
+                | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::MoveObligation { .. }
                 | OutlineMutation::DeleteNode { .. }
@@ -227,6 +241,7 @@ impl OutlineMutation {
                 kind,
                 after_id,
                 before,
+                section,
                 body,
             } => {
                 create_obligation(
@@ -236,6 +251,7 @@ impl OutlineMutation {
                     kind,
                     *after_id,
                     *before,
+                    section.as_deref(),
                     body,
                 )?;
             }
@@ -244,6 +260,25 @@ impl OutlineMutation {
                 body,
             } => {
                 ObligationRepo::new(conn).update_body(*obligation_id, body)?;
+            }
+            OutlineMutation::RenameObligationSection {
+                node_id,
+                kind,
+                old_section,
+                new_section,
+            } => {
+                require_spec(conn, *node_id)?;
+                let kind = parse_obligation_kind(kind)?;
+                let new_section = new_section.trim();
+                if new_section.is_empty() {
+                    anyhow::bail!("section name cannot be empty");
+                }
+                ObligationRepo::new(conn).rename_section(
+                    *node_id,
+                    kind,
+                    old_section.as_deref(),
+                    new_section,
+                )?;
             }
             OutlineMutation::DeleteObligation { obligation_id } => {
                 ObligationRepo::new(conn).delete(*obligation_id)?;
@@ -303,6 +338,7 @@ fn create_obligation(
     kind: &str,
     after_id: Option<Uuid>,
     before: bool,
+    section: Option<&str>,
     body: &str,
 ) -> Result<Uuid> {
     require_spec(conn, node_id)?;
@@ -317,7 +353,7 @@ fn create_obligation(
         }
     };
     let id = obligation_id.unwrap_or_else(Uuid::new_v4);
-    repo.insert_at(id, node_id, kind, index, body)?;
+    repo.insert_at(id, node_id, kind, index, section, body)?;
     Ok(id)
 }
 

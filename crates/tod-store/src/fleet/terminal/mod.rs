@@ -27,7 +27,7 @@ pub use state::{
     write_shell_state,
 };
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Spawn an interactive terminal whose working directory is `cwd`.
 ///
@@ -269,7 +269,7 @@ fn spawn_windows_terminal(
 ) -> Result<()> {
     let mut args = vec![
         "-w".into(),
-        "0".into(),
+        "-1".into(),
         "new-tab".into(),
         "-d".into(),
         cwd.display().to_string(),
@@ -329,26 +329,13 @@ fn spawn_windows_default(
     assets: &ShellInitAssets,
     startup_command: Option<&str>,
 ) -> Result<()> {
-    if command_available("wt.exe") {
-        match spawn_windows_terminal(
-            "wt.exe",
-            cwd,
-            shell_id,
-            assets,
-            "windows_terminal",
-            startup_command,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                // WindowsApps execution aliases for wt.exe often fail with os error 1920
-                // (ERROR_CANT_RESOLVE_FILENAME) when spawned via CreateProcess.
-                tracing::warn!(
-                    error = %err,
-                    "wt.exe spawn failed; falling back to PowerShell"
-                );
-            }
-        }
-    }
+    // Go straight to powershell.exe rather than wt.exe: `wt` re-tokenizes and
+    // re-quotes the trailing command line itself (it's not a plain CreateProcess
+    // argv pass-through), which corrupts a startup command containing quotes/
+    // spaces (e.g. a `--name "..."` with an embedded space); it also opens as a
+    // new tab in the last-used window (`-w 0`) rather than a new window.
+    // `spawn_powershell` passes args straight through via `Command::args` (no
+    // re-tokenizing) and always opens a new console window.
     spawn_powershell(
         "powershell.exe",
         cwd,
@@ -478,32 +465,20 @@ fn spawn_linux_default(
     bail!("no terminal emulator found on PATH; set terminal.program in tod.yml")
 }
 
+#[cfg(unix)]
 fn command_available(name: &str) -> bool {
-    #[cfg(windows)]
-    {
-        Command::new("where")
-            .arg(name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {name} >/dev/null 2>&1"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub fn default_terminal_hint() -> &'static str {
     #[cfg(windows)]
     {
-        "Auto: Windows Terminal (wt.exe), else PowerShell"
+        "Auto: PowerShell (new window). Set to wt.exe for Windows Terminal instead."
     }
     #[cfg(target_os = "macos")]
     {

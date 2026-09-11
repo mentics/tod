@@ -35,6 +35,7 @@ pub use paths::{
 };
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, AnswerProcessorSettings,
-    DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings,
-    QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry, WorktreeBackend,
+    ChatLaunchMode, DEFAULT_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
+    PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry,
+    WorktreeBackend,
 };

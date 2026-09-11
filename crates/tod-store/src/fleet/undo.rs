@@ -318,7 +318,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                     },
                 )
                 .optional()?;
-            let Some((node_id, kind, body, _ord, _section, _, _)) = row else {
+            let Some((node_id, kind, body, _ord, section, _, _)) = row else {
                 return Ok(None);
             };
             Ok(Some(CommandEntry {
@@ -331,6 +331,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                     kind,
                     after_id: None,
                     before: false,
+                    section,
                     body,
                 })],
             }))
@@ -373,6 +374,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::DisableCapability { .. }
         | OutlineMutation::EnableCapabilities { .. }
         | OutlineMutation::CreateObligation { .. }
+        | OutlineMutation::RenameObligationSection { .. }
         | OutlineMutation::ReorderObligation { .. }
         | OutlineMutation::SetExtraContent { .. } => Ok(None),
     }

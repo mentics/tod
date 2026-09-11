@@ -193,6 +193,36 @@ pub struct TerminalSettings {
     pub program: Option<String>,
 }
 
+/// Where "chat with agent" opens a session: the app's own window, or an
+/// external terminal running the platform CLI directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatLaunchMode {
+    Window,
+    Terminal,
+}
+
+impl ChatLaunchMode {
+    pub const ALL: [ChatLaunchMode; 2] = [Self::Window, Self::Terminal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Window => "App window",
+            Self::Terminal => "Terminal",
+        }
+    }
+}
+
+impl Default for ChatLaunchMode {
+    fn default() -> Self {
+        Self::Window
+    }
+}
+
+fn default_chat_launch_mode() -> ChatLaunchMode {
+    ChatLaunchMode::default()
+}
+
 /// How Tod provisions git worktrees for interview / agent workspaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -272,6 +302,9 @@ pub struct TodSettings {
     /// Platform / model / effort for action configs created by "chat with agent".
     #[serde(default)]
     pub chat_agent: AgentRoleSettings,
+    /// Where "chat with agent" opens a session: app window or external terminal.
+    #[serde(default = "default_chat_launch_mode")]
+    pub chat_launch_mode: ChatLaunchMode,
     /// Which agent platform runs interview question-maker / answer-processor work.
     #[serde(default = "default_agent_platform")]
     pub agent_platform: AgentPlatform,
@@ -305,6 +338,7 @@ impl Default for TodSettings {
             treehouse_worktrees_root: None,
             default_agent: AgentRoleSettings::default(),
             chat_agent: AgentRoleSettings::default(),
+            chat_launch_mode: ChatLaunchMode::default(),
             agent_platform: AgentPlatform::default(),
             agent_launch: AgentLaunchByPlatform::default(),
             legacy_agent_model: None,
@@ -588,6 +622,7 @@ mod tests {
                 },
             },
             chat_agent: AgentRoleSettings::default(),
+            chat_launch_mode: ChatLaunchMode::Terminal,
             agent_platform: AgentPlatform::Claude,
             agent_launch: AgentLaunchByPlatform {
                 claude: PlatformLaunchSettings {

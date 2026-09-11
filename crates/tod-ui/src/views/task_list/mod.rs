@@ -190,6 +190,9 @@ pub enum TaskListEvent {
     OpenObligations {
         task_id: String,
         title: String,
+        /// Whether to move keyboard focus into the obligations panel.
+        /// False when merely following tree selection.
+        focus: bool,
     },
     CloseTaskEdit,
     CloseObligations,
@@ -538,6 +541,9 @@ impl TaskListView {
         }
         if self.slide_edit_open && previous.as_deref() != Some(new_id.as_str()) {
             self.emit_open_edit_for(&new_id, cx);
+        }
+        if self.obligations_open && previous.as_deref() != Some(new_id.as_str()) {
+            self.emit_open_obligations_for(&new_id, false, cx);
         }
         self.working_set.selected_id = Some(new_id);
         self.persist_working_set();
@@ -1200,7 +1206,7 @@ impl TaskListView {
         cx.notify();
     }
 
-    fn emit_open_obligations_for(&mut self, task_id: &str, cx: &mut Context<Self>) {
+    fn emit_open_obligations_for(&mut self, task_id: &str, focus: bool, cx: &mut Context<Self>) {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
@@ -1210,6 +1216,7 @@ impl TaskListView {
         cx.emit(TaskListEvent::OpenObligations {
             task_id: task_id.to_string(),
             title: task.title.clone(),
+            focus,
         });
         self.set_status_line(format!("Obligations: {}", task.title), cx);
     }
@@ -1231,7 +1238,7 @@ impl TaskListView {
         if self.slide_edit_open {
             cx.emit(TaskListEvent::CloseTaskEdit);
         }
-        self.emit_open_obligations_for(task_id, cx);
+        self.emit_open_obligations_for(task_id, true, cx);
         self.bump_interaction(task_id, window, cx);
         cx.notify();
     }

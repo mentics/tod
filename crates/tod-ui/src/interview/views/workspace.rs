@@ -516,7 +516,7 @@ impl WorkspaceView {
                 match event {
                     ObligationsEvent::Close => {
                         panel.update(cx, |panel, cx| {
-                            panel.retarget(obligations_node_id, &obligations_title, window, cx);
+                            panel.retarget(obligations_node_id, &obligations_title, true, window, cx);
                         });
                     }
                     // Ctrl+Left out of the third column lands on the response column.

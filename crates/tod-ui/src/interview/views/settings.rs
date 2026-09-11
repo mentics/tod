@@ -1,7 +1,7 @@
 use crate::interview::TodPaths;
 use crate::interview::agent::AgentPlatform;
 use crate::interview::settings::{
-    MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WorktreeBackend,
+    ChatLaunchMode, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, TodSettings, WorktreeBackend,
 };
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
@@ -132,6 +132,7 @@ impl SettingsSection {
                 Agent(AgentRole::Default),
                 Agent(AgentRole::Chat),
                 Agent(AgentRole::Interview),
+                ChatLaunchMode,
             ],
             Self::QuestionMaker => &[ReplenishThreshold, SecondQuestionMaker, RunsPerSession],
             Self::AnswerProcessor => &[PoolSize, AnswersPerSession],
@@ -155,6 +156,7 @@ enum SettingField {
     TerminalProgram,
     LogLevel,
     LogMaxSize,
+    ChatLaunchMode,
 }
 
 impl SettingField {
@@ -173,6 +175,7 @@ impl SettingField {
             Self::TerminalProgram => "terminal-program",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
+            Self::ChatLaunchMode => "chat-launch-mode",
         }
     }
 
@@ -534,6 +537,7 @@ impl SettingsView {
             SettingField::PoolSize => self.step_pool_size(delta, cx),
             SettingField::AnswersPerSession => self.step_answers_per_session(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
+            SettingField::ChatLaunchMode => self.cycle_chat_launch_mode(delta, cx),
             SettingField::TreehouseWorktreesRoot | SettingField::TerminalProgram => {}
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
@@ -864,6 +868,19 @@ impl SettingsView {
             WorktreeBackend::GitOnly => "Git worktree only",
         }
     }
+
+    fn cycle_chat_launch_mode(&mut self, delta: i32, cx: &mut Context<Self>) {
+        const ORDER: [ChatLaunchMode; 2] = [ChatLaunchMode::Window, ChatLaunchMode::Terminal];
+        let idx = ORDER
+            .iter()
+            .position(|m| *m == self.settings.chat_launch_mode)
+            .unwrap_or(0);
+        let len = ORDER.len() as i32;
+        let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
+        self.settings.chat_launch_mode = ORDER[next];
+        self.schedule_save(cx);
+        cx.notify();
+    }
 }
 
 fn step_u32(value: u32, delta: i32) -> u32 {
@@ -1123,6 +1140,17 @@ impl SettingsView {
                 for role in AgentRole::ALL {
                     rows = rows.child(agent_role_row(cx, self, role, theme));
                 }
+                rows = rows.child(cycle_row(
+                    cx,
+                    self,
+                    SettingField::ChatLaunchMode,
+                    self.settings.chat_launch_mode.label(),
+                    "Chat with agent opens in",
+                    "Where \"chat with agent\" starts a session: the app's own window, or an external terminal running the platform CLI directly (using the terminal program configured under Workspaces).",
+                    theme,
+                    |this, _, cx| this.cycle_chat_launch_mode(-1, cx),
+                    |this, _, cx| this.cycle_chat_launch_mode(1, cx),
+                ));
                 rows.into_any_element()
             }
             SettingsSection::QuestionMaker => v_flex()

@@ -9,16 +9,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Dogfooding: use a persistent local data root instead of OS app-data dir
-# ALWAYS set this (or pass --data-root) before running tod — running it with
-# neither shows a first-run picker whose default value IS your real
-# %APPDATA%/tod install.toml, and accepting it overwrites that real file.
-export TOD_DATA_ROOT=.local/data
-cargo run -p tod
+cargo run -p tod -- --data-root .local/agent/scratchpad/tod/root-<unique if needed>
 
 # Fresh, isolated sandbox (recommended for testing changes)
 rm -rf .local/test/my-sandbox
-cargo run -p tod -- --data-root .local/test/my-sandbox --agent mock --no-focus
+cargo run -p tod -- --data-root .local/agent/scratchpad/tod/root-<unique if needed> --agent mock --no-focus
 
 # Type-check across the workspace (matches CI)
 cargo check --workspace --all-targets

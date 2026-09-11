@@ -2,7 +2,7 @@
 
 use crate::interview::TodPaths;
 use crate::interview::agent::SharedAgent;
-use crate::interview::settings::TodSettings;
+use crate::interview::settings::{ChatLaunchMode, TodSettings};
 use crate::views::interactive_agent::InteractiveAgentView;
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point,
@@ -11,8 +11,10 @@ use gpui::{
 use gpui_component::Root;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tod_store::AgentRole;
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::provision::resolve_agent_workspace;
+use tod_store::fleet::terminal::open_terminal_agent_for_config;
 use tod_store::fleet::writer::FleetMutation;
 
 #[derive(Debug, Clone)]
@@ -175,7 +177,10 @@ impl InteractiveAgentWindowControl {
         initial_context: Option<String>,
         cx: &mut App,
     ) -> Result<String, String> {
-        let (fleet, _, _, _) = self.bound_resources()?;
+        let (fleet, _, paths, bound_settings) = self.bound_resources()?;
+        // Settings are bound once at startup; reload from disk so a setting
+        // changed in this run (e.g. chat launch mode) takes effect immediately.
+        let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
         let subject = fleet
             .get_node(task_id)
             .ok()
@@ -184,6 +189,18 @@ impl InteractiveAgentWindowControl {
             .unwrap_or_default();
         let session_name =
             tod_core::session_name::session_name(context_key, &subject, chrono::Local::now());
+
+        if settings.chat_launch_mode == ChatLaunchMode::Terminal {
+            return launch_chat_in_terminal(
+                &fleet,
+                &paths,
+                &settings,
+                config_id,
+                &session_name,
+                initial_context.as_deref(),
+            );
+        }
+
         fleet
             .enqueue(FleetMutation::CreateAgentRun {
                 config_id: config_id.to_string(),
@@ -293,4 +310,134 @@ impl InteractiveAgentWindowControl {
             .insert(params.session_run_id, opened.into());
         Ok(())
     }
+}
+
+/// Launch a "chat with agent" session in an external terminal (`ChatLaunchMode::Terminal`)
+/// instead of the app's own window: the assembled context goes out as `claude`'s
+/// `--append-system-prompt`, with the role's configured model/effort and a generated
+/// session name.
+///
+/// The full command (which can contain quotes, unicode, and arbitrary-length
+/// context text) is written to a launcher script file rather than passed as a
+/// startup-command argument: the terminal-launch path threads that argument
+/// through several layers of re-tokenizing (process argv, then a shell/PowerShell
+/// startup script, then `Invoke-Expression`), and quoted values do not survive
+/// that intact. A launcher script sidesteps all of it — only a plain file path
+/// (no embedded quotes) needs to travel through those layers.
+fn launch_chat_in_terminal(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    config_id: &str,
+    session_name: &str,
+    initial_context: Option<&str>,
+) -> Result<String, String> {
+    let platform = settings.platform_for(AgentRole::Chat);
+    let startup_command = match platform {
+        tod_store::AgentPlatform::Claude => {
+            let mut cmd = format!("claude --name {}", shell_quote(session_name));
+            // "default" / "auto" are this app's own sentinels for "no override" —
+            // passing them through as literal CLI flag values isn't meaningful to
+            // `claude` and can throw off its argument parsing (letting a stray
+            // token, e.g. from the session name, leak through as an initial
+            // prompt). Only pass real overrides.
+            let model = settings.model_for(AgentRole::Chat);
+            if model != tod_store::default_model_for(tod_store::AgentPlatform::Claude) {
+                cmd.push_str(" --model ");
+                cmd.push_str(&shell_quote(model));
+            }
+            if let Some(effort) = tod_store::effort_for_acp(settings.effort_for(AgentRole::Chat)) {
+                cmd.push_str(" --effort ");
+                cmd.push_str(&shell_quote(effort));
+            }
+            if let Some(context) = initial_context.filter(|c| !c.trim().is_empty()) {
+                let context_path = write_terminal_scratch_file(paths, "chat-context", "md", context)
+                    .map_err(|err| format!("write terminal chat context failed: {err:#}"))?;
+                // `claude` resolves (on Windows) through an npm `.cmd` shim, which
+                // routes the whole command line through cmd.exe's ~8191-character
+                // limit; embedding the full context text as a `Get-Content`/`cat`
+                // substitution could silently truncate it mid-argument, spilling
+                // the tail out as a bare positional token that `claude` then
+                // auto-submits as the initial prompt. `--append-system-prompt-file`
+                // takes just the (short) path, so the context text itself never
+                // has to survive that command line at all.
+                cmd.push_str(" --append-system-prompt-file ");
+                cmd.push_str(&shell_quote(&context_path.display().to_string()));
+            }
+            write_terminal_launcher_script(paths, &cmd)
+                .map_err(|err| format!("write terminal chat launcher failed: {err:#}"))?
+        }
+        tod_store::AgentPlatform::Cursor => "cursor-agent".to_string(),
+    };
+    let (run_id, _cwd) =
+        open_terminal_agent_for_config(fleet, paths, settings, config_id, &startup_command)
+            .map_err(|err| format!("launch terminal chat session failed: {err:#}"))?;
+    Ok(run_id)
+}
+
+/// Write `contents` to a scratch file under the data root's `shells` directory.
+fn write_terminal_scratch_file(
+    paths: &TodPaths,
+    prefix: &str,
+    extension: &str,
+    contents: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = paths.data_root().join("shells");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{prefix}-{}.{extension}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, contents)?;
+    Ok(path)
+}
+
+/// Write `command` (the real, fully-quoted launch line) to a launcher script and
+/// return the short, quote-free startup command that invokes it.
+fn write_terminal_launcher_script(paths: &TodPaths, command: &str) -> anyhow::Result<String> {
+    if cfg!(windows) {
+        // Windows PowerShell 5.1 (unlike pwsh) guesses a script file's encoding
+        // from its system codepage unless it starts with a UTF-8 BOM, which can
+        // garble the non-ASCII characters in a generated session name.
+        let mut contents = String::from("\u{feff}");
+        contents.push_str(command);
+        let script_path = write_terminal_scratch_file(paths, "chat-launch", "ps1", &contents)?;
+        // Single-quoted, not `powershell_quote`: this value still has to survive
+        // one more hop through `powershell.exe -File` argument parsing before it
+        // reaches `Invoke-Expression`, and that hop does not tolerate embedded
+        // double quotes (which is what actually corrupted the previous, more
+        // elaborate startup command). A bare path has no single quotes to escape.
+        Ok(format!(
+            "& '{}'",
+            script_path.display().to_string().replace('\'', "''")
+        ))
+    } else {
+        let script = format!("#!/usr/bin/env bash\n{command}\n");
+        let script_path = write_terminal_scratch_file(paths, "chat-launch", "sh", &script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(format!("bash {}", posix_quote(&script_path.display().to_string())))
+    }
+}
+
+/// Quote a value for the terminal the launch command will actually run in
+/// (PowerShell on Windows, POSIX shell elsewhere).
+fn shell_quote(value: &str) -> String {
+    if cfg!(windows) {
+        powershell_quote(value)
+    } else {
+        posix_quote(value)
+    }
+}
+
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn powershell_quote(value: &str) -> String {
+    let escaped = value
+        .replace('`', "``")
+        .replace('$', "`$")
+        .replace('"', "`\"");
+    format!("\"{escaped}\"")
 }

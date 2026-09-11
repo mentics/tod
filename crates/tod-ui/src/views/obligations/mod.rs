@@ -12,8 +12,8 @@ use crate::ui::list::{
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use delegate::{
-    NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, obligation_section,
-    section_row_key,
+    NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, SECTION_EDIT_TAG,
+    new_section_row_key, obligation_section, section_row_key,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -92,6 +92,12 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
             ObligationsCommitEdit,
             Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
         ),
+        // The section-name field is single-line, so plain Enter commits it.
+        KeyBinding::new(
+            "enter",
+            ObligationsCommitEdit,
+            Some(key_context::including_tag(OBLIGATIONS_CONTEXT, SECTION_EDIT_TAG)),
+        ),
     ]);
     // Left/Right collapse/expand rows here, so crossing back to the tree uses Ctrl+arrows.
     bind_modified_pane_nav(cx, OBLIGATIONS_CONTEXT);
@@ -139,6 +145,12 @@ pub struct ObligationsView {
     edit_original_body: Option<String>,
     inline_edit_input: Entity<InputState>,
     pending_abandon_edit: bool,
+    /// Kind/original-name of the section currently being renamed.
+    section_edit_target: Option<(&'static str, String)>,
+    /// Set while a brand-new (not yet created) section's name is being typed.
+    new_section_kind: Option<&'static str>,
+    section_edit_input: Entity<InputState>,
+    pending_abandon_section_edit: bool,
     pending_live_refresh: bool,
     selected_key: Option<String>,
     /// Whether the current node has the Agent capability. Cached because
@@ -148,6 +160,7 @@ pub struct ObligationsView {
     agent_menu: Option<Entity<PopupMenu>>,
     _agent_menu_subscription: Option<Subscription>,
     _inline_edit_subscription: Subscription,
+    _section_edit_subscription: Subscription,
 }
 
 impl ObligationsView {
@@ -155,8 +168,7 @@ impl ObligationsView {
         let action_sink = Rc::new(RefCell::new(Vec::new()));
         let inline_edit_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
-                .rows(INLINE_EDIT_ROWS)
+                .auto_grow(INLINE_EDIT_ROWS, INLINE_EDIT_ROWS)
                 .placeholder("Obligation text… (Ctrl+Enter to save, Esc to cancel)")
         });
         let _inline_edit_subscription = cx.subscribe(&inline_edit_input, |this, _, event, cx| {
@@ -166,7 +178,18 @@ impl ObligationsView {
             }
         });
 
-        let delegate = ObligationListDelegate::new(Vec::new(), action_sink.clone());
+        let section_edit_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Section name… (Enter to save, Esc to cancel)")
+        });
+        let _section_edit_subscription =
+            cx.subscribe(&section_edit_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.pending_abandon_section_edit = true;
+                    cx.notify();
+                }
+            });
+
+        let delegate = ObligationListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -208,12 +231,17 @@ impl ObligationsView {
             edit_original_body: None,
             inline_edit_input,
             pending_abandon_edit: false,
+            section_edit_target: None,
+            new_section_kind: None,
+            section_edit_input,
+            pending_abandon_section_edit: false,
             pending_live_refresh: false,
             selected_key: None,
             node_has_agent: false,
             agent_menu: None,
             _agent_menu_subscription: None,
             _inline_edit_subscription,
+            _section_edit_subscription,
         }
     }
 
@@ -240,10 +268,14 @@ impl ObligationsView {
         cx.notify();
     }
 
+    /// `focus` controls whether keyboard focus moves into the panel — true
+    /// for an explicit "open obligations" action, false when the panel is
+    /// merely following tree selection and focus should stay put.
     pub fn retarget(
         &mut self,
         node_id: Uuid,
         title: &str,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -252,7 +284,18 @@ impl ObligationsView {
             self.reload(window, cx);
             return;
         }
-        self.open(node_id, title, window, cx);
+        self.node_id = Some(node_id);
+        self.refresh_node_has_agent();
+        self.title = title.to_string();
+        self.req_collapsed = false;
+        self.con_collapsed = false;
+        self.section_collapsed.clear();
+        self.clear_inline_edit_state(window, cx);
+        self.reload(window, cx);
+        if focus {
+            self.focus_list(window, cx);
+        }
+        cx.notify();
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -413,6 +456,7 @@ impl ObligationsView {
             reqs,
             self.req_collapsed,
             &self.section_collapsed,
+            self.new_section_kind == Some(KIND_REQUIREMENT),
         );
         Self::append_kind_group(
             &mut rows,
@@ -420,6 +464,7 @@ impl ObligationsView {
             cons,
             self.con_collapsed,
             &self.section_collapsed,
+            self.new_section_kind == Some(KIND_CONSTRAINT),
         );
         rows
     }
@@ -430,6 +475,7 @@ impl ObligationsView {
         items: Vec<NodeObligation>,
         kind_collapsed: bool,
         section_collapsed: &HashSet<String>,
+        show_new_section: bool,
     ) {
         rows.push(ObligationRow::Group {
             kind,
@@ -439,6 +485,15 @@ impl ObligationsView {
         if kind_collapsed {
             return;
         }
+        if show_new_section {
+            rows.push(ObligationRow::Section {
+                kind,
+                section: String::new(),
+                collapsed: false,
+                count: 0,
+                is_new: true,
+            });
+        }
         for (section, section_items) in Self::group_by_section(items) {
             let key = section_row_key(kind, &section);
             let collapsed = section_collapsed.contains(&key);
@@ -447,6 +502,7 @@ impl ObligationsView {
                 section: section.clone(),
                 collapsed,
                 count: section_items.len(),
+                is_new: false,
             });
             if !collapsed {
                 for item in section_items {
@@ -491,8 +547,9 @@ impl ObligationsView {
         self.delegate.set_rows(rows);
         self.delegate.set_selected_index(self.selected_index);
         self.delegate.set_inline_edit(
-            self.editing_id.map(|id| id.to_string()),
+            self.delegate_editing_key(),
             self.inline_edit_input.clone(),
+            self.section_edit_input.clone(),
         );
         if let Some(ix) = selected_ix {
             if previous_index != selected_ix {
@@ -507,6 +564,9 @@ impl ObligationsView {
         if self.selected_index != Some(row_ix) {
             if self.editing_id.is_some() {
                 self.pending_abandon_edit = true;
+            }
+            if self.is_editing_section() {
+                self.pending_abandon_section_edit = true;
             }
             self.selected_index = Some(row_ix);
             self.selected_key = key;
@@ -568,19 +628,43 @@ impl ObligationsView {
         self.inline_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
+        self.new_section_kind = None;
+        self.section_edit_target = None;
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
         self.sync_delegate_editing(cx);
     }
 
     fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
         self.delegate.set_inline_edit(
-            self.editing_id.map(|id| id.to_string()),
+            self.delegate_editing_key(),
             self.inline_edit_input.clone(),
+            self.section_edit_input.clone(),
         );
         cx.notify();
     }
 
+    /// The row key currently in edit mode, for either an obligation body or a
+    /// section name (mutually exclusive).
+    fn delegate_editing_key(&self) -> Option<String> {
+        self.editing_id.map(|id| id.to_string()).or_else(|| {
+            if let Some(kind) = self.new_section_kind {
+                Some(new_section_row_key(kind))
+            } else {
+                self.section_edit_target
+                    .as_ref()
+                    .map(|(kind, section)| section_row_key(kind, section))
+            }
+        })
+    }
+
     fn is_editing(&self) -> bool {
         self.editing_id.is_some()
+    }
+
+    fn is_editing_section(&self) -> bool {
+        self.new_section_kind.is_some() || self.section_edit_target.is_some()
     }
 
     fn is_draft_edit(&self) -> bool {
@@ -705,6 +789,178 @@ impl ObligationsView {
         true
     }
 
+    fn start_section_edit(
+        &mut self,
+        kind: &'static str,
+        section: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_editing() {
+            let _ = self.commit_inline_edit(window, cx);
+        }
+        if self.new_section_kind.is_some() {
+            self.cancel_new_section(window, cx);
+        }
+        let initial = if section == NO_SECTION {
+            String::new()
+        } else {
+            section.to_string()
+        };
+        self.section_edit_target = Some((kind, section.to_string()));
+        self.selected_key = Some(section_row_key(kind, section));
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value(&initial, window, cx);
+            input.focus(window, cx);
+        });
+        self.rebuild_visible(window, cx);
+    }
+
+    fn add_section(&mut self, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            let _ = self.commit_inline_edit(window, cx);
+        }
+        if self.section_edit_target.is_some() {
+            self.abandon_section_edit(window, cx);
+        }
+        if kind == KIND_REQUIREMENT {
+            self.req_collapsed = false;
+        } else {
+            self.con_collapsed = false;
+        }
+        self.new_section_kind = Some(kind);
+        self.selected_key = Some(new_section_row_key(kind));
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        self.rebuild_visible(window, cx);
+    }
+
+    fn abandon_section_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.new_section_kind.is_some() {
+            self.cancel_new_section(window, cx);
+            return;
+        }
+        if self.section_edit_target.is_none() {
+            return;
+        }
+        self.section_edit_target = None;
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.rebuild_visible(window, cx);
+        self.focus_list(window, cx);
+    }
+
+    fn cancel_new_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_section_kind = None;
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.rebuild_visible(window, cx);
+        self.focus_list(window, cx);
+    }
+
+    fn commit_section_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let new_name = self
+            .section_edit_input
+            .read(cx)
+            .text()
+            .to_string()
+            .trim()
+            .to_string();
+
+        if let Some(kind) = self.new_section_kind {
+            if new_name.is_empty() {
+                self.cancel_new_section(window, cx);
+                return true;
+            }
+            let Some(node_id) = self.node_id else {
+                return false;
+            };
+            let obligation_id = Uuid::new_v4();
+            if let Err(err) = self
+                .fleet
+                .enqueue_outline(OutlineMutation::CreateObligation {
+                    obligation_id: Some(obligation_id),
+                    node_id,
+                    kind: kind.to_string(),
+                    after_id: None,
+                    before: false,
+                    section: Some(new_name),
+                    body: String::new(),
+                })
+            {
+                crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
+                return false;
+            }
+            if let Err(err) = self.fleet.writer().flush() {
+                crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
+                return false;
+            }
+            self.new_section_kind = None;
+            self.section_edit_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+            self.draft_id = Some(obligation_id);
+            self.reload(window, cx);
+            self.start_inline_edit(obligation_id, window, cx);
+            return true;
+        }
+
+        let Some((kind, old_section)) = self.section_edit_target.clone() else {
+            return false;
+        };
+        if new_name.is_empty() {
+            crate::ui::toast::error_toast(window, cx, "Section name cannot be empty");
+            self.section_edit_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+            return false;
+        }
+        if new_name == old_section {
+            self.abandon_section_edit(window, cx);
+            return true;
+        }
+        let Some(node_id) = self.node_id else {
+            return false;
+        };
+        let old_section_opt = if old_section == NO_SECTION {
+            None
+        } else {
+            Some(old_section.clone())
+        };
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::RenameObligationSection {
+                node_id,
+                kind: kind.to_string(),
+                old_section: old_section_opt,
+                new_section: new_name.clone(),
+            })
+        {
+            crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
+            return false;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
+            return false;
+        }
+        let old_key = section_row_key(kind, &old_section);
+        if self.section_collapsed.remove(&old_key) {
+            self.section_collapsed.insert(section_row_key(kind, &new_name));
+        }
+        self.section_edit_target = None;
+        self.section_edit_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.selected_key = Some(section_row_key(kind, &new_name));
+        self.reload(window, cx);
+        self.focus_list(window, cx);
+        true
+    }
+
     fn create_in_kind(
         &mut self,
         kind: &str,
@@ -732,6 +988,7 @@ impl ObligationsView {
                 kind: kind.to_string(),
                 after_id,
                 before,
+                section: None,
                 body: String::new(),
             })
         {
@@ -959,6 +1216,22 @@ impl ObligationsView {
                 RowAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
                 }
+                RowAction::StartSectionEdit { kind, section } => {
+                    let kind = if kind == KIND_REQUIREMENT {
+                        KIND_REQUIREMENT
+                    } else {
+                        KIND_CONSTRAINT
+                    };
+                    self.start_section_edit(kind, &section, window, cx);
+                }
+                RowAction::AddSection { kind } => {
+                    let kind = if kind == KIND_REQUIREMENT {
+                        KIND_REQUIREMENT
+                    } else {
+                        KIND_CONSTRAINT
+                    };
+                    self.add_section(kind, window, cx);
+                }
                 RowAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
                 }
@@ -969,6 +1242,10 @@ impl ObligationsView {
     fn on_close(&mut self, _: &ObligationsClose, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
+            return;
+        }
+        if self.is_editing_section() {
+            self.abandon_section_edit(window, cx);
             return;
         }
         self.close(window, cx);
@@ -1052,6 +1329,10 @@ impl ObligationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_editing_section() {
+            let _ = self.commit_section_edit(window, cx);
+            return;
+        }
         if !self.is_editing() {
             return;
         }
@@ -1178,6 +1459,10 @@ impl Render for ObligationsView {
         if self.pending_abandon_edit {
             self.pending_abandon_edit = false;
             self.abandon_inline_edit(window, cx, false);
+        }
+        if self.pending_abandon_section_edit {
+            self.pending_abandon_section_edit = false;
+            self.abandon_section_edit(window, cx);
         }
         self.drain_row_actions(window, cx);
 
@@ -1324,12 +1609,17 @@ impl Render for ObligationsView {
                             .children(rows),
                     )
                     .child(
+                        // Narrow right-edge strip, not the full row area: the
+                        // Scrollbar element installs a click-to-jump handler
+                        // across its entire bounds, which would otherwise
+                        // swallow every mouse click meant for the rows below.
                         div()
+                            .occlude()
                             .absolute()
                             .top_0()
                             .right_0()
                             .bottom_0()
-                            .left_0()
+                            .w(px(16.))
                             .child(Scrollbar::vertical(&self.scroll_handle)),
                     )
             })

@@ -49,6 +49,14 @@ pub fn including_input(surface: &str) -> &'static str {
     Box::leak(format!("{surface} > {INPUT}").into_boxed_str())
 }
 
+/// Build a surface context predicate for when a text field tagged `tag` (via
+/// `.key_context(tag)` on a wrapping element) inside that surface is focused.
+/// Use this to scope a key binding (e.g. plain Enter to commit) to one
+/// specific text field among several in the same surface.
+pub fn including_tag(surface: &str, tag: &str) -> &'static str {
+    Box::leak(format!("{surface} > {tag}").into_boxed_str())
+}
+
 /// Bind Escape to close a side panel when the panel or any of its text fields are focused.
 pub fn bind_panel_escape<A>(cx: &mut App, action: A, surface: &str)
 where

@@ -415,6 +415,7 @@ fn obligation_crud_and_counts() {
             kind: KIND_REQUIREMENT.into(),
             after_id: None,
             before: false,
+            section: None,
             body: "Req A".into(),
         })
         .unwrap();
@@ -425,6 +426,7 @@ fn obligation_crud_and_counts() {
             kind: KIND_REQUIREMENT.into(),
             after_id: Some(req_a),
             before: false,
+            section: None,
             body: "Req B".into(),
         })
         .unwrap();
@@ -435,6 +437,7 @@ fn obligation_crud_and_counts() {
             kind: KIND_CONSTRAINT.into(),
             after_id: None,
             before: false,
+            section: None,
             body: "Con 1".into(),
         })
         .unwrap();

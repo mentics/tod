@@ -175,7 +175,9 @@ impl InteractiveAgentView {
             poll_lock_misses: 0,
             focus_handle: cx.focus_handle(),
             focus_stop: InteractiveAgentStop::Prompt,
-            prompt_editing: false,
+            // Start in edit mode so the window opens with the caret already
+            // in the prompt box, ready for immediate typing.
+            prompt_editing: true,
             session_name,
             agent_session_id,
             context_prefix,
@@ -185,6 +187,13 @@ impl InteractiveAgentView {
             last_turn_count: 0,
             _poll_task,
         };
+        // Focus straight into the prompt box so the window opens ready for
+        // typing, without waiting on a click or Enter to enter edit mode.
+        cx.defer_in(window, |this, window, cx| {
+            this.prompt_input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
         view
     }
 

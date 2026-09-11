@@ -1,8 +1,8 @@
 //! gpui-specific helpers for persisted settings (core types live in `tod-store`).
 
 pub use tod_store::settings::{
-    AnswerProcessorSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB, QuestionMakerSettings,
-    TodSettings, WindowGeometry, WorktreeBackend,
+    AnswerProcessorSettings, ChatLaunchMode, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
+    QuestionMakerSettings, TodSettings, WindowGeometry, WorktreeBackend,
 };
 
 use gpui::{Bounds, Pixels, Window, WindowBounds, point, px, size};
