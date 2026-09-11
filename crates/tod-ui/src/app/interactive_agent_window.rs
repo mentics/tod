@@ -277,6 +277,7 @@ impl InteractiveAgentWindowControl {
                             workspace_cwd,
                             control,
                             initial_context,
+                            settings,
                             window,
                             cx,
                         )

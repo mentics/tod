@@ -1058,7 +1058,7 @@ impl WorkspaceView {
             for (run_id, kind) in &self.runs {
                 if let Some(state) = agent.poll_run(*run_id) {
                     match state {
-                        AgentRunState::InFlight => {}
+                        AgentRunState::InFlight(_) => {}
                         AgentRunState::Success(_) => {
                             finished.push((*run_id, kind.clone(), Ok(())));
                         }

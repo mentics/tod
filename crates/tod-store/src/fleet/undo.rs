@@ -335,6 +335,36 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 })],
             }))
         }
+        OutlineMutation::MoveObligation {
+            obligation_id,
+            target_node_id,
+        } => {
+            let old_node_id: Option<Uuid> = conn
+                .query_row(
+                    "SELECT node_id FROM node_obligations WHERE id = ?1",
+                    params![uuid_to_blob(*obligation_id)],
+                    |row| {
+                        let node_blob: Vec<u8> = row.get(0)?;
+                        blob_to_uuid_sql(&node_blob)
+                    },
+                )
+                .optional()?;
+            let Some(old_node_id) = old_node_id else {
+                return Ok(None);
+            };
+            if old_node_id == *target_node_id {
+                return Ok(None);
+            }
+            Ok(Some(CommandEntry {
+                id: Uuid::new_v4(),
+                label: "Moved obligation".into(),
+                created_at: crate::outline::uuid_blob::now_ms(),
+                inverses: vec![FleetMutation::Outline(OutlineMutation::MoveObligation {
+                    obligation_id: *obligation_id,
+                    target_node_id: old_node_id,
+                })],
+            }))
+        }
         OutlineMutation::RestoreNodeSubtree { .. } => Ok(None),
         OutlineMutation::DeleteNode { .. } => Ok(None),
         OutlineMutation::ImportDocProcess { .. }

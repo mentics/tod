@@ -37,6 +37,11 @@ pub struct ContextRequest<'a> {
     pub data_root: &'a Path,
     pub node: NodeSelection,
     pub obligation: Option<ObligationSelection>,
+    /// Purpose (Spec capability's `goal`) for the selected node and every
+    /// ancestor that has one, ordered from the root of the tree down to the
+    /// selected node — general inherited purpose first, this node's own
+    /// purpose last.
+    pub purposes: Vec<String>,
 }
 
 /// Build the full first message: static layers, then the live selection.
@@ -55,6 +60,17 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
          Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
         request.data_root.display()
     ));
+
+    if !request.purposes.is_empty() {
+        out.push_str("## Purpose\n\n");
+        out.push_str(
+            "From the top of the tree down to the selected node, most general first:\n\n",
+        );
+        for purpose in &request.purposes {
+            out.push_str(purpose);
+            out.push_str("\n\n");
+        }
+    }
 
     out.push_str("## Selected node\n\n");
     out.push_str(&format!("- **Id:** `{}`\n", request.node.id));
@@ -114,6 +130,7 @@ mod tests {
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
+            purposes: Vec::new(),
         };
         let text = render_dynamic(&req);
         assert!(text.contains("data") && text.contains("tod"));
@@ -121,6 +138,25 @@ mod tests {
         assert!(text.contains("Obligations Panel"));
         assert!(text.contains("Panel for editing direct obligations."));
         assert!(text.contains("No individual obligation is selected"));
+    }
+
+    #[test]
+    fn purposes_render_general_to_specific_before_selected_node() {
+        let req = ContextRequest {
+            key: "obligations",
+            data_root: Path::new("/data/tod"),
+            node: node(),
+            obligation: None,
+            purposes: vec!["Ship the product.".into(), "Ship this feature.".into()],
+        };
+        let text = render_dynamic(&req);
+        let purpose_idx = text.find("## Purpose").unwrap();
+        let ship_product_idx = text.find("Ship the product.").unwrap();
+        let ship_feature_idx = text.find("Ship this feature.").unwrap();
+        let node_idx = text.find("## Selected node").unwrap();
+        assert!(purpose_idx < ship_product_idx);
+        assert!(ship_product_idx < ship_feature_idx);
+        assert!(ship_feature_idx < node_idx);
     }
 
     #[test]
@@ -134,6 +170,7 @@ mod tests {
                 kind: "requirement".into(),
                 body: "Must round-trip".into(),
             }),
+            purposes: Vec::new(),
         };
         let text = render_dynamic(&req);
         assert!(text.contains(&Uuid::from_u128(7).to_string()));

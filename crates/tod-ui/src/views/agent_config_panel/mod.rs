@@ -595,7 +595,7 @@ impl AgentConfigPanelView {
                     continue;
                 };
                 match state {
-                    AgentRunState::InFlight => {}
+                    AgentRunState::InFlight(_) => {}
                     AgentRunState::Success(text) => {
                         finished.push((idx, flight.clone(), Ok(text.unwrap_or_default())));
                     }

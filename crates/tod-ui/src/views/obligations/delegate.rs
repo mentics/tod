@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::ui::drag_payload::ObligationDragPayload;
 use crate::ui::selectable_text::selectable_text;
 use gpui::{
-    AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputState};
 use gpui_component::{ActiveTheme, StyledExt, h_flex};
@@ -108,6 +110,10 @@ impl ObligationListDelegate {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let row = self.rows.get(row_ix)?.clone();
+        let drag_id = match &row {
+            ObligationRow::Item { obligation } => Some(obligation.id),
+            _ => None,
+        };
         let selected = self.selected_index == Some(row_ix);
         let theme = cx.theme();
         let border = theme.muted_foreground.opacity(0.5);
@@ -283,13 +289,38 @@ impl ObligationListDelegate {
             }
         };
 
-        Some(
-            div()
-                .id(("obligation-row", row_ix))
-                .w_full()
-                .child(content)
-                .into_any_element(),
-        )
+        let mut wrapper = div().id(("obligation-row", row_ix)).w_full().child(content);
+        if let Some(obligation_id) = drag_id {
+            wrapper = wrapper.on_drag(
+                ObligationDragPayload { obligation_id },
+                move |payload, _offset, _window, cx| {
+                    let obligation_id = payload.obligation_id;
+                    cx.new(|_| ObligationDragPreview { obligation_id })
+                },
+            );
+        }
+        Some(wrapper.into_any_element())
+    }
+}
+
+struct ObligationDragPreview {
+    #[allow(dead_code)]
+    obligation_id: uuid::Uuid,
+}
+
+impl Render for ObligationDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_sm()
+            .text_color(theme.foreground)
+            .child("Obligation")
     }
 }
 

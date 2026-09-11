@@ -29,7 +29,10 @@ pub enum AgentRunKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRunState {
-    InFlight,
+    /// Still running. The payload is a short, human-readable description of
+    /// what the agent is doing right now (a tool call, a permission request,
+    /// …), when the provider can report one.
+    InFlight(Option<String>),
     Success(Option<String>),
     Failure(String),
 }

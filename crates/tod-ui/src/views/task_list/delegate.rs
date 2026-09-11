@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::ui::drag_payload::ObligationDragPayload;
 use gpui::{
     Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
     prelude::FluentBuilder, px,
@@ -32,6 +33,7 @@ pub enum RowAction {
     LifecycleControl { task_id: String, _lifecycle: String },
     ToggleCollapsed { task_id: String },
     OpenObligations { task_id: String },
+    DropObligation { task_id: String, obligation_id: uuid::Uuid },
 }
 
 pub struct TaskListDelegate {
@@ -324,6 +326,9 @@ impl ListDelegate for TaskListDelegate {
             title_row.child(chips)
         };
 
+        let has_spec = item.has_spec;
+        let drop_task_id = item.id.clone();
+        let drop_sink = sink.clone();
         let row_content = h_flex()
             .h(TREE_ROW_HEIGHT)
             .items_center()
@@ -341,6 +346,21 @@ impl ListDelegate for TaskListDelegate {
                         .w(px(3.))
                         .bg(primary),
                 )
+            })
+            .when(has_spec, |el| {
+                el.can_drop(|any, _, _| any.downcast_ref::<ObligationDragPayload>().is_some())
+                    .on_drop::<ObligationDragPayload>(move |payload, _window, _cx| {
+                        drop_sink.borrow_mut().push(RowAction::DropObligation {
+                            task_id: drop_task_id.clone(),
+                            obligation_id: payload.obligation_id,
+                        });
+                    })
+                    .drag_over::<ObligationDragPayload>(move |style, _, _, _| {
+                        style.cursor_pointer().bg(primary.opacity(0.15))
+                    })
+            })
+            .when(!has_spec, |el| {
+                el.drag_over::<ObligationDragPayload>(|style, _, _, _| style.cursor_not_allowed())
             })
             .child(title_line);
 

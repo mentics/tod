@@ -128,6 +128,18 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("0", TaskListTag0, context),
         KeyBinding::new("tab", TaskListIndent, context),
         KeyBinding::new("shift-tab", TaskListOutdent, context),
+        // While the row being edited is a freshly created draft node, Tab/Shift-Tab
+        // still reparent it instead of being swallowed by the input's tab handling.
+        KeyBinding::new(
+            "tab",
+            TaskListIndent,
+            Some(key_context::including_input(TASK_LIST_CONTEXT)),
+        ),
+        KeyBinding::new(
+            "shift-tab",
+            TaskListOutdent,
+            Some(key_context::including_input(TASK_LIST_CONTEXT)),
+        ),
         KeyBinding::new("left", TaskListSelectParent, context),
         KeyBinding::new("right", TaskListExpand, context),
         KeyBinding::new("shift-enter", TaskListCreateChild, context),
@@ -590,6 +602,20 @@ impl TaskListView {
                 self.dismiss_compose_for_row_action(window, cx);
                 self.select_task_by_id(&task_id, window, cx);
                 self.open_obligations_panel(&task_id, window, cx);
+            }
+            RowAction::DropObligation {
+                task_id,
+                obligation_id,
+            } => {
+                let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+                    return;
+                };
+                let _ = self.fleet.enqueue_outline(OutlineMutation::MoveObligation {
+                    obligation_id,
+                    target_node_id: node_id,
+                });
+                let _ = self.fleet.writer().flush();
+                self.live_refresh(window, cx);
             }
         }
     }
@@ -1828,10 +1854,18 @@ impl TaskListView {
     }
 
     fn on_indent(&mut self, _: &TaskListIndent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() && !self.is_draft_edit() {
+            cx.propagate();
+            return;
+        }
         self.reparent_selected(1, window, cx);
     }
 
     fn on_outdent(&mut self, _: &TaskListOutdent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() && !self.is_draft_edit() {
+            cx.propagate();
+            return;
+        }
         self.reparent_selected(-1, window, cx);
     }
 

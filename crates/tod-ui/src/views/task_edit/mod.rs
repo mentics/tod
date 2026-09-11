@@ -461,6 +461,7 @@ impl TaskEditView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous_index = self.focus_index;
         if let Some(index) = self.field_stops().iter().position(|stop| *stop == field) {
             self.focus_index = index;
         }
@@ -478,7 +479,9 @@ impl TaskEditView {
             _ => {
                 self.editing = Some(field);
                 cx.notify();
-                self.ensure_focused_visible(window, cx);
+                if self.focus_index != previous_index {
+                    self.ensure_focused_visible(window, cx);
+                }
                 if let Some(input) = self.input_for_field(field) {
                     cx.on_next_frame(window, move |_, window, cx| {
                         input.update(cx, |input, cx| {

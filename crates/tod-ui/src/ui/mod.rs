@@ -1,6 +1,7 @@
 pub mod actionable;
 pub mod agent_chat;
 pub mod app_nav;
+pub mod drag_payload;
 pub mod key_context;
 pub mod list;
 pub mod pane_nav;

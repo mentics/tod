@@ -202,7 +202,9 @@ impl DeepDiveView {
             return;
         };
         match state {
-            AgentRunState::InFlight => {}
+            AgentRunState::InFlight(activity) => {
+                self.status_line = activity.unwrap_or_else(|| "Agent thinking…".to_string()).into();
+            }
             AgentRunState::Success(response) => {
                 self.active_run = None;
                 self.error_banner = None;

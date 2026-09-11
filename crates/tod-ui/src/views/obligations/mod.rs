@@ -19,7 +19,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Corner, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored, deferred, div, px,
+    StatefulInteractiveElement, Styled, Subscription, Timer, Window, actions, anchored, deferred,
+    div, px,
 };
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
@@ -39,6 +40,7 @@ use tod_store::outline::{
 use uuid::Uuid;
 
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
+const INLINE_EDIT_ROWS: usize = 2;
 
 actions!(
     obligations,
@@ -51,8 +53,7 @@ actions!(
         ObligationsMoveUp,
         ObligationsMoveDown,
         ObligationsEdit,
-        ObligationsEditNavUp,
-        ObligationsEditNavDown,
+        ObligationsCommitEdit,
         ObligationsCollapse,
         ObligationsExpand,
         ObligationsDelete,
@@ -84,15 +85,11 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("secondary-down", ObligationsMoveDown, context),
         KeyBinding::new("backspace", ObligationsDelete, context),
         KeyBinding::new("delete", ObligationsDelete, context),
-        // Inline edit: Escape closes panel; arrows leave the field and move selection.
+        // Inline edit is a multi-line text area: arrows move the cursor as usual,
+        // Escape abandons the edit, and Ctrl+Enter commits it.
         KeyBinding::new(
-            "up",
-            ObligationsEditNavUp,
-            Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
-        ),
-        KeyBinding::new(
-            "down",
-            ObligationsEditNavDown,
+            "ctrl-enter",
+            ObligationsCommitEdit,
             Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
         ),
     ]);
@@ -141,8 +138,6 @@ pub struct ObligationsView {
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
     inline_edit_input: Entity<InputState>,
-    pending_inline_commit: bool,
-    inline_enter_generation: u64,
     pending_abandon_edit: bool,
     pending_live_refresh: bool,
     selected_key: Option<String>,
@@ -158,20 +153,42 @@ pub struct ObligationsView {
 impl ObligationsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
         let action_sink = Rc::new(RefCell::new(Vec::new()));
-        let inline_edit_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Obligation text…"));
+        let inline_edit_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(INLINE_EDIT_ROWS)
+                .placeholder("Obligation text… (Ctrl+Enter to save, Esc to cancel)")
+        });
         let _inline_edit_subscription = cx.subscribe(&inline_edit_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.inline_enter_generation = this.inline_enter_generation.saturating_add(1);
-                this.pending_inline_commit = true;
-                cx.notify();
-            } else if matches!(event, InputEvent::Blur) {
+            if matches!(event, InputEvent::Blur) {
                 this.pending_abandon_edit = true;
                 cx.notify();
             }
         });
 
         let delegate = ObligationListDelegate::new(Vec::new(), action_sink.clone());
+
+        let poll_entity = cx.weak_entity();
+        let fleet_for_poll = fleet.clone();
+        cx.spawn(async move |_, cx| {
+            let mut fleet_rx = fleet_for_poll.subscribe_changes();
+            loop {
+                Timer::after(std::time::Duration::from_millis(200)).await;
+                let mut changed = false;
+                while fleet_rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                if changed {
+                    let Ok(()) = poll_entity.update(cx, |this, cx| {
+                        this.pending_live_refresh = true;
+                        cx.notify();
+                    }) else {
+                        break;
+                    };
+                }
+            }
+        })
+        .detach();
 
         Self {
             fleet,
@@ -190,8 +207,6 @@ impl ObligationsView {
             draft_id: None,
             edit_original_body: None,
             inline_edit_input,
-            pending_inline_commit: false,
-            inline_enter_generation: 0,
             pending_abandon_edit: false,
             pending_live_refresh: false,
             selected_key: None,
@@ -459,6 +474,7 @@ impl ObligationsView {
     fn rebuild_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.flat_rows();
         let selected = self.selected_key.clone();
+        let previous_index = self.selected_index;
         let selected_ix = selected
             .as_ref()
             .and_then(|key| rows.iter().position(|r| r.key() == *key))
@@ -479,7 +495,9 @@ impl ObligationsView {
             self.inline_edit_input.clone(),
         );
         if let Some(ix) = selected_ix {
-            self.scroll_handle.scroll_to_top_of_item(ix);
+            if previous_index != selected_ix {
+                self.scroll_handle.scroll_to_top_of_item(ix);
+            }
         }
         cx.notify();
     }
@@ -604,8 +622,6 @@ impl ObligationsView {
         cx: &mut Context<Self>,
         force_delete_draft: bool,
     ) {
-        self.pending_inline_commit = false;
-        self.inline_enter_generation = self.inline_enter_generation.saturating_add(1);
         let Some(editing_id) = self.editing_id else {
             return;
         };
@@ -1030,32 +1046,16 @@ impl ObligationsView {
         }
     }
 
-    fn on_edit_nav_up(
+    fn on_commit_edit(
         &mut self,
-        _: &ObligationsEditNavUp,
+        _: &ObligationsCommitEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.is_editing() {
             return;
         }
-        self.abandon_inline_edit(window, cx, false);
-        self.move_selection(-1, window, cx);
-        self.focus_list(window, cx);
-    }
-
-    fn on_edit_nav_down(
-        &mut self,
-        _: &ObligationsEditNavDown,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_editing() {
-            return;
-        }
-        self.abandon_inline_edit(window, cx, false);
-        self.move_selection(1, window, cx);
-        self.focus_list(window, cx);
+        let _ = self.commit_inline_edit(window, cx);
     }
 
     fn on_collapse(
@@ -1179,16 +1179,6 @@ impl Render for ObligationsView {
             self.pending_abandon_edit = false;
             self.abandon_inline_edit(window, cx, false);
         }
-        if self.pending_inline_commit {
-            self.pending_inline_commit = false;
-            let generation = self.inline_enter_generation;
-            cx.defer_in(window, move |this, window, cx| {
-                if this.inline_enter_generation != generation {
-                    return;
-                }
-                this.on_smart_enter(window, cx);
-            });
-        }
         self.drain_row_actions(window, cx);
 
         if !self.is_open() {
@@ -1231,8 +1221,7 @@ impl Render for ObligationsView {
             .on_action(cx.listener(Self::on_move_up))
             .on_action(cx.listener(Self::on_move_down))
             .on_action(cx.listener(Self::on_edit))
-            .on_action(cx.listener(Self::on_edit_nav_up))
-            .on_action(cx.listener(Self::on_edit_nav_down))
+            .on_action(cx.listener(Self::on_commit_edit))
             .on_action(cx.listener(Self::on_collapse))
             .on_action(cx.listener(Self::on_expand))
             .on_action(cx.listener(Self::on_delete))

@@ -420,7 +420,7 @@ impl AgentProvider for MockAgentProvider {
         self.drain_answer_completions();
         if let Some(agent_id) = self.question_maker_run_agent.get(&id).cloned() {
             if let Some(state) = self.question_maker_pool.poll_run(&agent_id, id) {
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     self.question_maker_run_agent.remove(&id);
                 }
                 return Some(state);
@@ -428,7 +428,7 @@ impl AgentProvider for MockAgentProvider {
         }
         if let Some(agent_id) = self.answer_run_agent.get(&id).cloned() {
             if let Some(state) = self.answer_pool.poll_run(&agent_id, id) {
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     self.answer_run_agent.remove(&id);
                 }
                 return Some(state);
@@ -958,7 +958,7 @@ mod tests {
     fn poll_run(mock: &mut MockAgentProvider, id: RunId) -> AgentRunState {
         for _ in 0..200 {
             if let Some(state) = mock.poll_run(id) {
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     return state;
                 }
             }

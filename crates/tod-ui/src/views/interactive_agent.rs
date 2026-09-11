@@ -7,9 +7,11 @@ use crate::ui::selectable_text::selectable_markdown;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, Styled, Timer, Window, actions, div,
+    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Timer, Window, actions,
+    div,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
@@ -19,7 +21,7 @@ use std::time::Duration;
 use tod_agent::{SessionOpening, SessionTurn};
 use tod_store::fleet::repos::transcript::TranscriptTurn;
 use tod_store::fleet::{FleetMutation, FleetStore};
-use tod_store::{AgentLaunchOptions, AgentPlatform, parse_platform, platform_storage};
+use tod_store::{AgentRole, TodSettings, parse_platform, platform_storage};
 
 const INTERACTIVE_AGENT_CONTEXT: &str = "InteractiveAgent";
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -57,6 +59,7 @@ pub struct InteractiveAgentView {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     workspace_cwd: PathBuf,
+    settings: TodSettings,
     platform: String,
     model: String,
     effort: String,
@@ -64,6 +67,10 @@ pub struct InteractiveAgentView {
     prompt_input: Entity<InputState>,
     conversation: Vec<(String, String)>,
     pending: Option<PendingRun>,
+    /// Latest human-readable activity reported by the agent for the pending
+    /// run (a tool call, a permission request, …), shown in place of the
+    /// generic "Thinking…" label while there is something more specific to say.
+    activity: Option<String>,
     status_line: String,
     error_banner: Option<String>,
     poll_lock_misses: u32,
@@ -81,6 +88,12 @@ pub struct InteractiveAgentView {
     context_prefix: Option<String>,
     /// The context panel is collapsed by default — it is rarely worth reading.
     context_expanded: bool,
+    /// Scroll position of the transcript, so new turns can be scrolled into view.
+    scroll_handle: gpui::ScrollHandle,
+    /// When set, the transcript scrolls to the bottom whenever a new turn appears.
+    auto_scroll: bool,
+    /// Turn count as of the last render, so a new turn can be detected.
+    last_turn_count: usize,
     _poll_task: gpui::Task<()>,
 }
 
@@ -94,6 +107,7 @@ impl InteractiveAgentView {
         window_control: InteractiveAgentWindowControl,
         // Assembled app context, sent once ahead of the session's first message.
         initial_context: Option<String>,
+        settings: TodSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -103,12 +117,10 @@ impl InteractiveAgentView {
             .map(|turns| conversation_from_transcript(&turns))
             .unwrap_or_default();
 
-        let launch = fleet
-            .get_agent(&config_id)
-            .ok()
-            .flatten()
-            .map(|row| row.launch_options())
-            .unwrap_or_else(|| AgentLaunchOptions::for_platform(AgentPlatform::Claude));
+        // Always the app's current "Chat with agent" default, not whatever
+        // platform/model/effort happens to be stored on the agent config row —
+        // the settings are the single source of truth for a chat session.
+        let launch = settings.launch_options_for(AgentRole::Chat);
 
         let run = fleet.get_run(&session_run_id).ok().flatten();
         let session_name = run
@@ -149,6 +161,7 @@ impl InteractiveAgentView {
             fleet,
             agent,
             workspace_cwd,
+            settings,
             platform: platform_storage(launch.platform).to_string(),
             model: launch.model,
             effort: launch.effort,
@@ -156,6 +169,7 @@ impl InteractiveAgentView {
             prompt_input,
             conversation,
             pending: None,
+            activity: None,
             status_line: "Ready".into(),
             error_banner: None,
             poll_lock_misses: 0,
@@ -166,6 +180,9 @@ impl InteractiveAgentView {
             agent_session_id,
             context_prefix,
             context_expanded: false,
+            scroll_handle: gpui::ScrollHandle::new(),
+            auto_scroll: true,
+            last_turn_count: 0,
             _poll_task,
         };
         view
@@ -303,6 +320,7 @@ impl InteractiveAgentView {
 
         self.error_banner = None;
         self.status_line = "Sending…".into();
+        self.activity = None;
         self.pending = Some(PendingRun {
             run_id: None,
             prompt_id: prompt_id.clone(),
@@ -326,19 +344,9 @@ impl InteractiveAgentView {
 
         let provider_run = match self.agent.lock() {
             Ok(mut provider) => {
-                let options = self
-                    .fleet
-                    .get_agent(&self.config_id)
-                    .ok()
-                    .flatten()
-                    .map(|row| row.launch_options())
-                    .unwrap_or_else(|| {
-                        AgentLaunchOptions::from_settings(
-                            parse_platform(&self.platform).unwrap_or(AgentPlatform::Claude),
-                            self.model.clone(),
-                            self.effort.clone(),
-                        )
-                    });
+                // Same rule as construction: always the current settings
+                // default, never a stale value from the agent config row.
+                let options = self.settings.launch_options_for(AgentRole::Chat);
                 provider.send_session_turn(SessionTurn {
                     key: session_run_id,
                     agent_config_id: self.config_id.clone(),
@@ -396,7 +404,11 @@ impl InteractiveAgentView {
         };
 
         match state {
-            AgentRunState::InFlight => {
+            AgentRunState::InFlight(activity) => {
+                self.status_line = activity
+                    .clone()
+                    .unwrap_or_else(|| "Agent thinking…".into());
+                self.activity = activity;
                 self.pending = Some(PendingRun {
                     run_id: Some(run_id),
                     prompt_id,
@@ -421,11 +433,13 @@ impl InteractiveAgentView {
                 }
                 self.status_line = "Agent replied".into();
                 self.error_banner = None;
+                self.activity = None;
                 self.record_agent_session_id(agent_session_id);
             }
             AgentRunState::Failure(message) => {
                 self.error_banner = Some(message);
                 self.status_line = "Agent run failed".into();
+                self.activity = None;
             }
         }
         cx.notify();
@@ -550,11 +564,15 @@ fn render_agent_panel(
 
 fn render_agent_thinking_panel(
     turn_ix: usize,
+    activity: Option<&str>,
     border: gpui::Hsla,
     panel_bg: gpui::Hsla,
     label_color: gpui::Hsla,
     muted: gpui::Hsla,
 ) -> impl IntoElement {
+    // One overwriting line rather than an accumulating log: only the latest
+    // activity matters to someone watching a run in progress.
+    let label = activity.unwrap_or("Thinking…").to_string();
     v_flex()
         .id(("interactive-agent-agent", turn_ix))
         .gap_1()
@@ -572,10 +590,11 @@ fn render_agent_thinking_panel(
         )
         .child(
             div()
+                .id(("interactive-agent-activity", turn_ix))
                 .text_sm()
                 .text_color(muted)
                 .italic()
-                .child("Thinking…"),
+                .child(label),
         )
 }
 
@@ -635,6 +654,13 @@ impl Render for InteractiveAgentView {
         let pending_user = self.pending.as_ref().map(|p| p.user_text.clone());
         let show_empty = conversation.is_empty() && pending_user.is_none();
         let pending_turn_ix = conversation.len();
+        let turn_count = conversation.len() + pending_user.is_some() as usize;
+        if turn_count != self.last_turn_count {
+            self.last_turn_count = turn_count;
+            if self.auto_scroll {
+                self.scroll_handle.scroll_to_bottom();
+            }
+        }
         const PROMPT_ROWS: f32 = 4.;
         let prompt_height = window.line_height() * PROMPT_ROWS;
         let list_active_border = theme.list_active_border;
@@ -788,18 +814,36 @@ impl Render for InteractiveAgentView {
                             )),
                     )
                     .child(
-                        crate::ui::selectable_text::selectable_text(
-                            "interactive-agent-info-line",
-                            format!(
-                                "{} · {}",
-                                self.session_name,
-                                self.workspace_cwd.display()
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_4()
+                            .child(
+                                crate::ui::selectable_text::selectable_text(
+                                    "interactive-agent-info-line",
+                                    format!(
+                                        "{} · {}",
+                                        self.session_name,
+                                        self.workspace_cwd.display()
+                                    ),
+                                    window,
+                                    cx,
+                                )
+                                .text_xs()
+                                .text_color(muted),
+                            )
+                            .child(
+                                Checkbox::new("interactive-agent-auto-scroll")
+                                    .label("Auto Scroll")
+                                    .checked(self.auto_scroll)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.auto_scroll = *checked;
+                                        if this.auto_scroll {
+                                            this.scroll_handle.scroll_to_bottom();
+                                        }
+                                        cx.notify();
+                                    })),
                             ),
-                            window,
-                            cx,
-                        )
-                        .text_xs()
-                        .text_color(muted),
                     ),
             )
             .when_some(self.error_banner.clone(), |el, msg| {
@@ -838,9 +882,12 @@ impl Render for InteractiveAgentView {
                     )
                     .child(
                         div()
+                            .id("interactive-agent-transcript")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scrollbar()
+                            .track_scroll(&self.scroll_handle)
+                            .vertical_scrollbar(&self.scroll_handle)
+                            .overflow_y_scroll()
                             .v_flex()
                             .gap_3()
                             .children(context_panel)
@@ -896,6 +943,7 @@ impl Render for InteractiveAgentView {
                                         ))
                                         .child(render_agent_thinking_panel(
                                             pending_turn_ix,
+                                            self.activity.as_deref(),
                                             border,
                                             panel_bg,
                                             agent_label,

@@ -67,7 +67,7 @@ impl QuestionMakerPool {
         prompt: AgentPrompt,
     ) -> Result<QuestionMakerSubmitAssignment, String> {
         if let Some(idx) = self.find_idle_slot() {
-            self.runs.insert(run_id, AgentRunState::InFlight);
+            self.runs.insert(run_id, AgentRunState::InFlight(None));
             self.slots[idx].busy = true;
             let slot_id = self.slots[idx].slot_id;
             let responses_received = self.slots[idx].responses_received;
@@ -80,7 +80,7 @@ impl QuestionMakerPool {
         if self.slots.len() < RESEARCHER_SESSION_POOL_SIZE as usize {
             let slot_id = self.create_slot();
             let idx = self.slots.len() - 1;
-            self.runs.insert(run_id, AgentRunState::InFlight);
+            self.runs.insert(run_id, AgentRunState::InFlight(None));
             self.slots[idx].busy = true;
             return Ok(QuestionMakerSubmitAssignment::Dispatch {
                 slot_id,
@@ -88,7 +88,7 @@ impl QuestionMakerPool {
             });
         }
 
-        self.runs.insert(run_id, AgentRunState::InFlight);
+        self.runs.insert(run_id, AgentRunState::InFlight(None));
         self.queue.push_back(QueuedJob {
             run_id,
             prompt: prompt.clone(),
@@ -151,7 +151,7 @@ impl QuestionMakerPool {
             self.slots[slot_idx].busy = true;
             let slot_id = self.slots[slot_idx].slot_id;
             let responses_received = self.slots[slot_idx].responses_received;
-            self.runs.insert(job.run_id, AgentRunState::InFlight);
+            self.runs.insert(job.run_id, AgentRunState::InFlight(None));
             dispatched.push((slot_id, job.run_id, job.prompt.for_slot(responses_received)));
         }
         dispatched
@@ -169,7 +169,7 @@ impl QuestionMakerPool {
     fn in_flight_count(&self) -> u32 {
         self.runs
             .values()
-            .filter(|state| matches!(state, AgentRunState::InFlight))
+            .filter(|state| matches!(state, AgentRunState::InFlight(_)))
             .count() as u32
     }
 }

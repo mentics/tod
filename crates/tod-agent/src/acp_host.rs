@@ -257,6 +257,43 @@ fn resolve_claude_acp_bin() -> Result<PathBuf> {
     )
 }
 
+/// Locate `bash.exe` from a Git for Windows install, for `CLAUDE_CODE_GIT_BASH_PATH`.
+///
+/// The `claude` CLI's Bash tool needs Git Bash on Windows and only finds it via
+/// that env var or `PATH`; a GUI-launched `tod` doesn't always inherit a `PATH`
+/// with Git's `bin`/`usr\bin` on it even when a terminal's does, so we resolve
+/// it ourselves rather than relying on inheritance.
+#[cfg(windows)]
+fn resolve_git_bash_path() -> Option<PathBuf> {
+    use std::process::Command;
+
+    let is_bash = |p: &PathBuf| p.is_file();
+
+    let mut candidates = Vec::new();
+    for base_var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Ok(base) = std::env::var(base_var) {
+            candidates.push(PathBuf::from(&base).join("Git").join("bin").join("bash.exe"));
+        }
+    }
+    candidates.push(PathBuf::from(r"C:\Git\bin\bash.exe"));
+
+    if let Ok(output) = Command::new("where").arg("git").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    // .../Git/cmd/git.exe or .../Git/mingw64/bin/git.exe: root is two levels up.
+                    if let Some(root) = Path::new(line).parent().and_then(Path::parent) {
+                        candidates.push(root.join("bin").join("bash.exe"));
+                        candidates.push(root.join("usr").join("bin").join("bash.exe"));
+                    }
+                }
+            }
+        }
+    }
+
+    candidates.into_iter().find(is_bash)
+}
+
 /// Spawn an ACP server process (Cursor/Claude `… acp`, or a standalone adapter).
 pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
@@ -291,10 +328,17 @@ pub fn spawn_acp_process(host: AcpHost, agent_bin: &Path) -> Result<std::process
         cmd
     };
 
+    #[cfg(windows)]
+    if host == AcpHost::Claude && std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").is_none() {
+        if let Some(bash) = resolve_git_bash_path() {
+            command.env("CLAUDE_CODE_GIT_BASH_PATH", bash);
+        }
+    }
+
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
 
     command.spawn().with_context(|| {
         format!(
@@ -325,6 +369,51 @@ mod tests {
             agent_platform_acp_host(AgentPlatform::Claude),
             AcpHost::Claude
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_acp_process_sets_git_bash_path_for_claude() {
+        use std::io::Read;
+
+        let Some(expected_bash) = resolve_git_bash_path() else {
+            // Nothing to verify on a machine without Git for Windows installed.
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("tod-acp-host-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named like the real npm shim so `is_standalone_acp_server` treats it as
+        // the standalone bridge (no extra `acp` subcommand arg appended).
+        let script = dir.join("claude-code-acp.cmd");
+        std::fs::write(&script, "@echo %CLAUDE_CODE_GIT_BASH_PATH%\r\n").unwrap();
+
+        let mut child = spawn_acp_process(AcpHost::Claude, &script).expect("spawn should succeed");
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(stdout.trim(), expected_bash.to_string_lossy());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_git_bash_when_installed() {
+        // Sanity check for CLAUDE_CODE_GIT_BASH_PATH resolution: only meaningful
+        // on a machine with Git for Windows installed (true for our CI/dev images).
+        if let Some(path) = resolve_git_bash_path() {
+            assert!(path.is_file(), "resolved path does not exist: {path:?}");
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("bash.exe")
+            );
+        }
     }
 
     #[test]

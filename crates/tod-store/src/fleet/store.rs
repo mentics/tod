@@ -26,7 +26,7 @@ use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
-use crate::outline::repos::{ListRepo, tree::TreeLoader};
+use crate::outline::repos::{ListRepo, OutlineRepo, tree::TreeLoader};
 use crate::outline::types::Capability;
 use crate::outline::types::{FlatNodeRow, OutlineList};
 use anyhow::Result;
@@ -498,6 +498,43 @@ impl FleetStore {
         NodeRepo::new(&guard.connection())
             .get_extra_content(node_id, content_type)
             .map_err(Into::into)
+    }
+
+    /// Purpose (`goal` extra content) for `node_id` and every ancestor with the
+    /// Spec capability enabled, ordered from the root of the tree down to
+    /// `node_id` itself. Nodes without a purpose set are skipped.
+    pub fn ancestor_purposes(&self, node_id: uuid::Uuid) -> Result<Vec<String>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        let outline = OutlineRepo::new(&conn);
+        let node_repo = NodeRepo::new(&conn);
+
+        let mut chain = vec![node_id];
+        let mut current = node_id;
+        while let Some(entry) = outline.get_entry(current)? {
+            match entry.parent_id {
+                Some(parent) => {
+                    chain.push(parent);
+                    current = parent;
+                }
+                None => break,
+            }
+        }
+        chain.reverse();
+
+        let mut purposes = Vec::new();
+        for id in chain {
+            if !node_repo.list_capabilities(id)?.contains(&Capability::Spec) {
+                continue;
+            }
+            if let Some(purpose) = node_repo.get_extra_content(id, crate::outline::EXTRA_CONTENT_GOAL)? {
+                let purpose = purpose.trim();
+                if !purpose.is_empty() {
+                    purposes.push(purpose.to_string());
+                }
+            }
+        }
+        Ok(purposes)
     }
 
     /// Build JSON archive payload before disabling a capability.

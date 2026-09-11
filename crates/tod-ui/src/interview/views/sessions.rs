@@ -583,7 +583,7 @@ impl SessionsView {
                         let mut provider = agent.lock().expect("agent lock");
                         provider
                             .poll_run(handle.id)
-                            .is_some_and(|state| !matches!(state, AgentRunState::InFlight))
+                            .is_some_and(|state| !matches!(state, AgentRunState::InFlight(_)))
                     };
                     if finished {
                         agent_finished = true;

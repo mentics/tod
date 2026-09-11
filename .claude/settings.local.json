@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tod-cli:*)",
+      "Bash(./target/debug/tod-cli.exe:*)",
+      "Bash(cargo build:*)",
+      "Bash(ls:*)",
+      "Bash(target/debug/tod-cli.exe:*)",
+      "Bash(C:/data/git/tod/target/debug/tod-cli.exe:*)",
+      "WebFetch(domain:linear.app)",
+      "WebFetch(domain:studio.apollographql.com)",
+      "Bash(./target/debug/tod-cli:*)"
+    ]
+  }
+}

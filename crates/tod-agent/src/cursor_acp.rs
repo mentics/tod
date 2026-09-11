@@ -27,6 +27,9 @@ use std::time::Duration;
 use std::os::windows::process::CommandExt;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Idle bound on a prompt turn — reset by every notification the agent sends
+/// (tool calls, permission requests, message chunks), so a turn only times
+/// out once the agent goes silent for this long, not after this long overall.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Idle time after which a conversation's agent process is released. The
 /// agent-side session survives, so the next message resumes it.
@@ -44,6 +47,9 @@ struct ActiveRun {
     state: AgentRunState,
     child: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
+    /// Latest human-readable activity reported by the agent, shared with the
+    /// `AcpClient` driving this run.
+    activity: Arc<Mutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
     receiver: Receiver<WorkerMessage>,
 }
@@ -115,6 +121,9 @@ struct LiveConversation {
     cancelled: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
+    /// Latest human-readable activity reported by the agent for the turn in
+    /// progress, if any.
+    activity: Arc<Mutex<Option<String>>>,
 }
 
 impl LiveConversation {
@@ -126,6 +135,7 @@ impl LiveConversation {
             cancelled: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(Mutex::new(resume_session_id)),
+            activity: Arc::new(Mutex::new(None)),
         };
         let conversation = Self {
             cmd_tx,
@@ -133,6 +143,7 @@ impl LiveConversation {
             cancelled: worker.cancelled.clone(),
             closed: worker.closed.clone(),
             session_id: worker.session_id.clone(),
+            activity: worker.activity.clone(),
         };
         thread::spawn(move || worker.run(cmd_rx));
         conversation
@@ -160,6 +171,7 @@ struct ConversationWorker {
     cancelled: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
+    activity: Arc<Mutex<Option<String>>>,
 }
 
 impl ConversationWorker {
@@ -234,6 +246,7 @@ impl ConversationWorker {
         run_id: RunId,
         blocks: &[String],
     ) -> Result<String> {
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if live.is_none() {
             let start = match self.current_session_id() {
                 Some(id) => SessionStart::Resume(id),
@@ -248,6 +261,7 @@ impl ConversationWorker {
                 &spec.effort,
                 self.child.clone(),
                 self.cancelled.clone(),
+                self.activity.clone(),
                 &spec.write_roots,
                 &start,
                 spec.traffic_log.clone(),
@@ -752,8 +766,10 @@ impl CursorAcpProvider {
         let host = self.host;
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let activity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let child_for_worker = child_slot.clone();
         let cancelled_for_worker = cancelled.clone();
+        let activity_for_worker = activity.clone();
 
         tracing::info!(
             event = "agent",
@@ -783,6 +799,7 @@ impl CursorAcpProvider {
                 &prompt,
                 child_for_worker,
                 cancelled_for_worker,
+                activity_for_worker,
                 traffic_log,
                 id,
                 kind,
@@ -811,9 +828,10 @@ impl CursorAcpProvider {
             id,
             ActiveRun {
                 kind,
-                state: AgentRunState::InFlight,
+                state: AgentRunState::InFlight(None),
                 child: child_slot,
                 cancelled,
+                activity,
                 worker: Some(worker),
                 receiver: rx,
             },
@@ -1022,9 +1040,10 @@ impl AgentProvider for CursorAcpProvider {
             id,
             ActiveRun {
                 kind: AgentRunKind::FleetAgent,
-                state: AgentRunState::InFlight,
+                state: AgentRunState::InFlight(None),
                 child: conversation.child.clone(),
                 cancelled: conversation.cancelled.clone(),
+                activity: conversation.activity.clone(),
                 worker: None,
                 receiver,
             },
@@ -1050,7 +1069,7 @@ impl AgentProvider for CursorAcpProvider {
 
         if let Some(ctx) = self.question_maker_run_context.get(&id).cloned() {
             if let Some(state) = self.question_maker_pool.poll_run(&ctx.agent_config_id, id) {
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     self.question_maker_run_context.remove(&id);
                 }
                 return Some(state);
@@ -1059,7 +1078,7 @@ impl AgentProvider for CursorAcpProvider {
 
         if let Some(ctx) = self.answer_run_context.get(&id).cloned() {
             if let Some(state) = self.answer_pool.poll_run(&ctx.agent_config_id, id) {
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     self.answer_run_context.remove(&id);
                 }
                 return Some(state);
@@ -1068,7 +1087,7 @@ impl AgentProvider for CursorAcpProvider {
 
         let mut completed: Option<(AgentRunKind, String)> = None;
         if let Some(run) = self.runs.get_mut(&id) {
-            if matches!(run.state, AgentRunState::InFlight) {
+            if matches!(run.state, AgentRunState::InFlight(_)) {
                 if let Ok(WorkerMessage::Completed(result)) = run.receiver.try_recv() {
                     let logged = match &result {
                         Ok(text) => text.clone(),
@@ -1081,10 +1100,18 @@ impl AgentProvider for CursorAcpProvider {
                     };
                 }
             }
-            let state = run.state.clone();
+            let state = match &run.state {
+                AgentRunState::InFlight(_) => AgentRunState::InFlight(
+                    run.activity
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                ),
+                other => other.clone(),
+            };
             if let Some((kind, logged)) = completed {
                 self.log_traffic(kind, id, TrafficDirection::Response, &logged);
-                if !matches!(state, AgentRunState::InFlight) {
+                if !matches!(state, AgentRunState::InFlight(_)) {
                     self.fleet_run_context.remove(&id);
                 }
             }
@@ -1121,7 +1148,7 @@ impl AgentProvider for CursorAcpProvider {
     fn interview_status_counts(&self) -> InterviewAgentCounts {
         let mut counts = InterviewAgentCounts::default();
         for run in self.runs.values() {
-            if !matches!(run.state, AgentRunState::InFlight) {
+            if !matches!(run.state, AgentRunState::InFlight(_)) {
                 continue;
             }
             match run.kind {
@@ -1330,6 +1357,36 @@ fn append_claude_custom_title(
     Ok(())
 }
 
+/// Drain the ACP child's stderr into the same traffic log used for its
+/// JSON-RPC stdio, so process-level errors (e.g. the ACP bridge's own
+/// "Internal error" diagnostics) end up somewhere other than an inherited
+/// terminal the user may not be watching.
+fn spawn_stderr_logger(
+    stderr: std::process::ChildStderr,
+    traffic_log: Option<SharedAgentTrafficLog>,
+    run_id: RunId,
+    kind: AgentRunKind,
+) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match &traffic_log {
+                Some(log) => log.lock().expect("traffic log mutex").record(
+                    CursorAcpProvider::kind_category(kind),
+                    CursorAcpProvider::run_id_string(run_id),
+                    format!("{} · acp", CursorAcpProvider::kind_label(kind)),
+                    TrafficDirection::Response,
+                    format!("ACP stderr\n{line}"),
+                ),
+                None => tracing::warn!(event = "agent", action = "acp_stderr", %line, "ACP stderr"),
+            }
+        }
+    });
+}
+
 fn run_acp_session(
     host: AcpHost,
     agent_bin: &Path,
@@ -1339,6 +1396,7 @@ fn run_acp_session(
     prompt: &str,
     child_slot: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
+    activity: Arc<Mutex<Option<String>>>,
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
     kind: AgentRunKind,
@@ -1347,6 +1405,8 @@ fn run_acp_session(
     let mut child = spawn_acp_process(host, agent_bin)?;
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
+    let stderr = child.stderr.take().context("agent stderr unavailable")?;
+    spawn_stderr_logger(stderr, traffic_log.clone(), run_id, kind);
     {
         let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(child);
@@ -1365,6 +1425,7 @@ fn run_acp_session(
         run_id,
         kind,
         write_roots: acp_write_roots(cwd, extra_write_roots),
+        activity,
     };
 
     let client_name = host.client_name();
@@ -1465,6 +1526,9 @@ struct AcpClient {
     run_id: RunId,
     kind: AgentRunKind,
     write_roots: Vec<PathBuf>,
+    /// Short human-readable description of what the agent is doing right now,
+    /// shared with the run's `poll_run` caller so a UI can show live status.
+    activity: Arc<Mutex<Option<String>>>,
 }
 
 impl AcpClient {
@@ -1481,6 +1545,10 @@ impl AcpClient {
         );
     }
 
+    fn set_activity(&self, activity: Option<String>) {
+        *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = activity;
+    }
+
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id;
         self.next_id += 1;
@@ -1494,8 +1562,15 @@ impl AcpClient {
         Ok(id)
     }
 
-    fn await_response(&mut self, timeout: Duration) -> Result<Value> {
-        let deadline = std::time::Instant::now() + timeout;
+    /// Wait for the response to the last request, applying `idle_timeout` as
+    /// an *idle* bound rather than a bound on the whole call: any inbound
+    /// notification (a tool call, a permission request, a message chunk — the
+    /// agent doing visible work) pushes the deadline back out. A turn with
+    /// heavy tool use can run indefinitely as long as it keeps reporting
+    /// activity; it only times out once the agent goes silent for the full
+    /// `idle_timeout`.
+    fn await_response(&mut self, idle_timeout: Duration) -> Result<Value> {
+        let mut deadline = std::time::Instant::now() + idle_timeout;
         loop {
             if self.cancelled.load(Ordering::SeqCst) {
                 bail!("ACP run cancelled");
@@ -1519,9 +1594,29 @@ impl AcpClient {
                     );
                     return Ok(result);
                 }
-                Ok(AcpRequest::ResponseError { message }) => bail!("ACP error: {message}"),
+                Ok(AcpRequest::ResponseError { message, error }) => {
+                    self.log_raw(
+                        TrafficDirection::Response,
+                        &format!(
+                            "ACP ← error\n{}",
+                            serde_json::to_string_pretty(&error)
+                                .unwrap_or_else(|_| error.to_string())
+                        ),
+                    );
+                    let code = error.get("code").and_then(Value::as_i64);
+                    let data = error.get("data");
+                    match (code, data) {
+                        (Some(code), Some(data)) => {
+                            bail!("ACP error {code}: {message} ({data})")
+                        }
+                        (Some(code), None) => bail!("ACP error {code}: {message}"),
+                        (None, Some(data)) => bail!("ACP error: {message} ({data})"),
+                        (None, None) => bail!("ACP error: {message}"),
+                    }
+                }
                 Ok(AcpRequest::Notification { method, params }) => {
                     self.handle_notification(&method, params)?;
+                    deadline = std::time::Instant::now() + idle_timeout;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1547,9 +1642,17 @@ impl AcpClient {
                         {
                             self.assistant_text.push_str(text);
                         }
+                        self.set_activity(Some("Writing reply…".to_string()));
+                    } else if kind == "agent_thought_chunk" {
+                        self.set_activity(Some("Thinking…".to_string()));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
                         let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                        self.set_activity(Some(if title.is_empty() {
+                            "Running a tool…".to_string()
+                        } else {
+                            format!("Running: {title}")
+                        }));
                         tracing::debug!(
                             event = "agent",
                             action = "acp_tool",
@@ -1576,6 +1679,11 @@ impl AcpClient {
                     .and_then(|t| t.get("title"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                self.set_activity(Some(if tool_title.is_empty() {
+                    "Requesting permission…".to_string()
+                } else {
+                    format!("Requesting permission: {tool_title}")
+                }));
                 let allowed = tool_path_allowed(tool_title, &self.write_roots);
                 if allowed {
                     tracing::info!(
@@ -1658,7 +1766,7 @@ impl AcpClient {
 #[derive(Debug)]
 enum AcpRequest {
     Response { _id: i64, result: Value },
-    ResponseError { message: String },
+    ResponseError { message: String, error: Value },
     Notification { method: String, params: Value },
 }
 
@@ -1685,6 +1793,7 @@ fn read_stdout_lines(stdout: std::process::ChildStdout, tx: Sender<AcpRequest>) 
                 .to_string();
             let _ = tx.send(AcpRequest::ResponseError {
                 message: message.clone(),
+                error: error.clone(),
             });
             // Also satisfy await_response for request/response pairs.
             let _ = tx.send(AcpRequest::Response {
@@ -1940,6 +2049,7 @@ impl PersistentAcpSession {
         effort: &str,
         child_slot: Arc<Mutex<Option<Child>>>,
         cancelled: Arc<AtomicBool>,
+        activity: Arc<Mutex<Option<String>>>,
         extra_write_roots: &[PathBuf],
         start: &SessionStart,
         traffic_log: Option<SharedAgentTrafficLog>,
@@ -1948,6 +2058,9 @@ impl PersistentAcpSession {
         let mut child = spawn_acp_process(host, agent_bin)?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
+        let stderr = child.stderr.take().context("agent stderr unavailable")?;
+        let run_id = RunId::new();
+        spawn_stderr_logger(stderr, traffic_log.clone(), run_id, kind);
         {
             let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(child);
@@ -1963,9 +2076,10 @@ impl PersistentAcpSession {
             assistant_text: String::new(),
             cancelled: cancelled.clone(),
             traffic_log,
-            run_id: RunId::new(),
+            run_id,
             kind,
             write_roots: acp_write_roots(cwd, extra_write_roots),
+            activity,
         };
 
         let client_name = host.client_name();
@@ -2122,6 +2236,7 @@ fn run_acp_pool_slot(
         effort,
         child_slot.clone(),
         cancelled.clone(),
+        Arc::new(Mutex::new(None)),
         &extra_write_roots,
         &SessionStart::New,
         None,

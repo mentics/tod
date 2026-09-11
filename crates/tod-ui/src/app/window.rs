@@ -626,6 +626,8 @@ impl Shell {
                 })
         });
 
+        let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
+
         build_first_message(
             &media,
             &ContextRequest {
@@ -638,6 +640,7 @@ impl Shell {
                     lifecycle: Some(node.lifecycle),
                 },
                 obligation,
+                purposes,
             },
         )
     }

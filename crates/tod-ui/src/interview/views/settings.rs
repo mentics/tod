@@ -5,6 +5,7 @@ use crate::interview::settings::{
 };
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
+use crate::ui::list::{ListArrowDown, ListArrowUp};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -16,7 +17,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, IndexPath, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tod_core::logging;
@@ -55,7 +56,13 @@ actions!(
 
 pub fn register_settings_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(SETTINGS_CONTEXT));
-    let input_context = Some(key_context::including_input(SETTINGS_CONTEXT));
+    // `including_input` also matches the search box inside an open agent
+    // Select's dropdown (it carries the same generic `Input` context marker).
+    // Exclude that case so Enter/Escape there reach the select's own
+    // Confirm/Cancel handling instead of our text-field commit/exit.
+    let input_context_outside_select = Some(Box::leak(
+        format!("({SETTINGS_CONTEXT} > {}) && !Select", key_context::INPUT).into_boxed_str(),
+    ) as &'static str);
     cx.bind_keys([
         KeyBinding::new("[", SettingsSectionPrev, context),
         KeyBinding::new("]", SettingsSectionNext, context),
@@ -71,9 +78,9 @@ pub fn register_settings_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", SettingsActivate, context),
         KeyBinding::new("space", SettingsActivate, context),
         // Single-line fields: Enter commits and exits edit (same as Escape).
-        KeyBinding::new("enter", SettingsEscape, input_context),
+        KeyBinding::new("enter", SettingsEscape, input_context_outside_select),
         KeyBinding::new("escape", SettingsEscape, context),
-        KeyBinding::new("escape", SettingsEscape, input_context),
+        KeyBinding::new("escape", SettingsEscape, input_context_outside_select),
     ]);
 }
 
@@ -169,12 +176,11 @@ impl SettingField {
         }
     }
 
-    fn is_text_input(self) -> bool {
-        matches!(self, Self::TerminalProgram | Self::TreehouseWorktreesRoot)
-    }
 }
 
 const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+/// Platform, model, effort — the dropdowns in one agent role row.
+const AGENT_ROW_COLUMNS: usize = 3;
 
 /// Platform / model / effort dropdowns for one agent role's settings line.
 struct AgentRoleSelects {
@@ -276,6 +282,7 @@ pub struct SettingsView {
     selected_field_index: usize,
     terminal_program_editing: bool,
     treehouse_worktrees_root_editing: bool,
+    selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
     _terminal_subscription: Subscription,
@@ -352,6 +359,7 @@ impl SettingsView {
             selected_field_index: 0,
             terminal_program_editing: false,
             treehouse_worktrees_root_editing: false,
+            selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
             _terminal_subscription,
@@ -405,13 +413,27 @@ impl SettingsView {
         self.treehouse_worktrees_root_editing = false;
         self.active_section = section;
         self.selected_field_index = 0;
+        self.selected_agent_column = 0;
         self.focus_region = SettingsFocus::Sidebar;
         self.focus_handle.focus(window);
         cx.notify();
     }
 
+    /// True when the panel is on an Agents row, where left/right move across
+    /// that row's platform/model/effort dropdowns instead of the sidebar.
+    fn on_agent_field(&self) -> bool {
+        self.focus_region == SettingsFocus::Panel
+            && self.active_section == SettingsSection::Agents
+            && matches!(self.selected_field(), SettingField::Agent(_))
+    }
+
     fn focus_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
+            return;
+        }
+        if self.on_agent_field() && self.selected_agent_column > 0 {
+            self.selected_agent_column -= 1;
+            cx.notify();
             return;
         }
         self.focus_region = SettingsFocus::Sidebar;
@@ -421,6 +443,13 @@ impl SettingsView {
 
     fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
+            return;
+        }
+        if self.on_agent_field() {
+            if self.selected_agent_column + 1 < AGENT_ROW_COLUMNS {
+                self.selected_agent_column += 1;
+                cx.notify();
+            }
             return;
         }
         self.focus_region = SettingsFocus::Panel;
@@ -522,18 +551,91 @@ impl SettingsView {
             self.focus_panel(window, cx);
             return;
         }
-        if self.selected_field().is_text_input() {
-            match self.selected_field() {
-                SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
-                SettingField::TreehouseWorktreesRoot => {
-                    self.enter_treehouse_worktrees_root_edit(window, cx)
-                }
-                _ => {}
+        match self.selected_field() {
+            SettingField::TerminalProgram => self.enter_terminal_edit(window, cx),
+            SettingField::TreehouseWorktreesRoot => {
+                self.enter_treehouse_worktrees_root_edit(window, cx)
             }
-        } else {
-            // Cycle/step fields: Enter bumps forward like `=`.
-            self.adjust_selected(1, cx);
+            SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
+            _ => {
+                // Cycle/step fields: Enter bumps forward like `=`.
+                self.adjust_selected(1, cx);
+            }
         }
+    }
+
+    /// Focus the platform/model/effort dropdown under the current column
+    /// highlight; the select's own key handling then opens it on the next
+    /// Enter/Space/arrow press.
+    ///
+    /// A synthetic follow-up "enter" keystroke (dispatched via `dispatch_keystroke`,
+    /// whether nested synchronously, via `defer_in`, or from a spawned task
+    /// tick) was tried to open the dropdown in one step, but it leaves GPUI's
+    /// focus/dispatch-tree tracking corrupted for subsequent real keystrokes
+    /// (arrow keys silently stop resolving to any binding). Only a genuine,
+    /// top-level user keystroke or mouse click reliably keeps keyboard nav
+    /// working afterward, so we settle for focusing here and let the second
+    /// Enter/Space (or a click) open it.
+    fn focus_agent_select(&mut self, role: AgentRole, window: &mut Window, cx: &mut Context<Self>) {
+        let selects = self.agent_selects(role);
+        let select = match self.selected_agent_column {
+            0 => &selects.platform,
+            1 => &selects.model,
+            _ => &selects.effort,
+        }
+        .clone();
+        select.update(cx, |select, cx| select.focus(window, cx));
+    }
+
+    /// Move the highlighted row in an open agent select dropdown and apply it
+    /// immediately. The app globally shadows gpui-component's own List
+    /// up/down handling (see `ui::list::register_list_keyboard_bindings`) so
+    /// arrow keys reach `ListArrowUp`/`ListArrowDown` here instead of the
+    /// select's internal navigation; drive the select's public API and
+    /// re-emit `Confirm` so the existing per-role subscriptions still apply
+    /// the value. Returns false (and leaves the action to propagate) when no
+    /// agent select is focused.
+    fn move_agent_select_highlight(
+        &mut self,
+        delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.on_agent_field() {
+            return false;
+        }
+        let SettingField::Agent(role) = self.selected_field() else {
+            return false;
+        };
+        let platform = self.settings.platform_for(role);
+        let items: Vec<String> = match self.selected_agent_column {
+            0 => PLATFORM_ORDER.iter().map(|p| p.label().to_string()).collect(),
+            1 => catalog_strings(models_for(platform)),
+            _ => catalog_strings(efforts_for(platform)),
+        };
+        if items.is_empty() {
+            return false;
+        }
+        let selects = self.agent_selects(role);
+        let select = match self.selected_agent_column {
+            0 => &selects.platform,
+            1 => &selects.model,
+            _ => &selects.effort,
+        }
+        .clone();
+        let current = select
+            .read(cx)
+            .selected_index(cx)
+            .map(|ix| ix.row)
+            .unwrap_or(0);
+        let len = items.len() as i32;
+        let next = ((current as i32 + delta).rem_euclid(len)) as usize;
+        let value = items[next].clone();
+        select.update(cx, |select, cx| {
+            select.set_selected_index(Some(IndexPath::default().row(next)), window, cx);
+            cx.emit(SelectEvent::Confirm(Some(value)));
+        });
+        true
     }
 
     fn enter_treehouse_worktrees_root_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -571,7 +673,12 @@ impl SettingsView {
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.text_editing() {
             self.exit_text_edit(window, cx);
+            return;
         }
+        // Reclaim focus in case an agent dropdown (focused via Enter/Space)
+        // still holds it after closing, so arrow-key navigation resumes.
+        self.focus_handle.focus(window);
+        cx.notify();
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
@@ -889,6 +996,16 @@ impl Render for SettingsView {
             .on_action(cx.listener(|this, _: &SettingsEscape, window, cx| {
                 this.handle_escape(window, cx);
                 cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &ListArrowUp, window, cx| {
+                if this.move_agent_select_highlight(-1, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ListArrowDown, window, cx| {
+                if this.move_agent_select_highlight(1, window, cx) {
+                    cx.stop_propagation();
+                }
             }))
             .child(
                 h_flex()
@@ -1291,6 +1408,7 @@ fn agent_role_row(
     theme: &gpui_component::Theme,
 ) -> impl IntoElement {
     let field = SettingField::Agent(role);
+    let row_selected = view.field_selected(field);
     let selects = view.agent_selects(role);
     h_flex()
         .w_full()
@@ -1299,11 +1417,6 @@ fn agent_role_row(
         .py_2()
         .rounded_md()
         .items_center()
-        .when(view.field_selected(field), |el| {
-            el.bg(theme.list_active)
-                .border_1()
-                .border_color(theme.list_active_border)
-        })
         .on_mouse_down(
             gpui::MouseButton::Left,
             cx.listener(select_field_listener(field)),
@@ -1321,16 +1434,22 @@ fn agent_role_row(
             &selects.platform,
             "Platform",
             AGENT_PLATFORM_SELECT_WIDTH,
+            row_selected && view.selected_agent_column == 0,
+            theme,
         ))
         .child(select_control(
             &selects.model,
             "Model",
             AGENT_LAUNCH_SELECT_WIDTH,
+            row_selected && view.selected_agent_column == 1,
+            theme,
         ))
         .child(select_control(
             &selects.effort,
             "Effort",
             AGENT_LAUNCH_SELECT_WIDTH,
+            row_selected && view.selected_agent_column == 2,
+            theme,
         ))
 }
 
@@ -1338,13 +1457,22 @@ fn select_control(
     select: &Entity<SelectState<Vec<String>>>,
     placeholder: &'static str,
     width: f32,
+    selected: bool,
+    theme: &gpui_component::Theme,
 ) -> impl IntoElement {
-    div().w(px(width)).flex_shrink_0().child(
-        Select::new(select)
-            .placeholder(placeholder)
-            .search_placeholder("Filter…")
-            .menu_width(px(width)),
-    )
+    div()
+        .w(px(width))
+        .flex_shrink_0()
+        .rounded_md()
+        .when(selected, |el| {
+            el.border_1().border_color(theme.list_active_border)
+        })
+        .child(
+            Select::new(select)
+                .placeholder(placeholder)
+                .search_placeholder("Filter…")
+                .menu_width(px(width)),
+        )
 }
 
 fn text_input_row(

@@ -487,6 +487,83 @@ fn obligation_crud_and_counts() {
         "Con updated"
     );
 
+    let other_spec_node = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(other_spec_node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Other spec node".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: other_spec_node,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let non_spec_node = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(non_spec_node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Plain node".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    assert!(
+        store
+            .enqueue_outline(OutlineMutation::MoveObligation {
+                obligation_id: req_b,
+                target_node_id: non_spec_node,
+            })
+            .and_then(|_| store.writer().flush())
+            .is_err()
+    );
+    store.reload_if_stale().ok();
+    let req_b_node = store
+        .list_obligations_for_node(node_id)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.id == req_b)
+        .unwrap()
+        .node_id;
+    assert_eq!(req_b_node, node_id, "rejected move must leave obligation in place");
+
+    store
+        .enqueue_outline(OutlineMutation::MoveObligation {
+            obligation_id: req_b,
+            target_node_id: other_spec_node,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store.reload_if_stale().ok();
+
+    let source_bodies: Vec<_> = store
+        .list_obligations_for_node(node_id)
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.kind == KIND_REQUIREMENT)
+        .map(|o| o.body)
+        .collect();
+    assert!(!source_bodies.contains(&"Req B".to_string()));
+    let target_bodies: Vec<_> = store
+        .list_obligations_for_node(other_spec_node)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.body)
+        .collect();
+    assert_eq!(target_bodies, vec!["Req B"]);
+
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

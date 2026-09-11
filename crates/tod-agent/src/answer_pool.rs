@@ -87,7 +87,7 @@ impl InterviewPool {
         prompt: AgentPrompt,
     ) -> Result<AnswerSubmitAssignment, String> {
         if let Some(idx) = self.find_idle_slot() {
-            self.runs.insert(run_id, AgentRunState::InFlight);
+            self.runs.insert(run_id, AgentRunState::InFlight(None));
             self.slots[idx].busy = true;
             let slot_id = self.slots[idx].slot_id;
             let responses_received = self.slots[idx].responses_received;
@@ -100,7 +100,7 @@ impl InterviewPool {
         if self.slots.len() < self.settings.pool_size as usize {
             let slot_id = self.create_slot();
             let idx = self.slots.len() - 1;
-            self.runs.insert(run_id, AgentRunState::InFlight);
+            self.runs.insert(run_id, AgentRunState::InFlight(None));
             self.slots[idx].busy = true;
             return Ok(AnswerSubmitAssignment::Dispatch {
                 slot_id,
@@ -108,7 +108,7 @@ impl InterviewPool {
             });
         }
 
-        self.runs.insert(run_id, AgentRunState::InFlight);
+        self.runs.insert(run_id, AgentRunState::InFlight(None));
         self.queue.push_back(QueuedJob {
             run_id,
             prompt: prompt.clone(),
@@ -173,7 +173,7 @@ impl InterviewPool {
             self.slots[slot_idx].busy = true;
             let slot_id = self.slots[slot_idx].slot_id;
             let responses_received = self.slots[slot_idx].responses_received;
-            self.runs.insert(job.run_id, AgentRunState::InFlight);
+            self.runs.insert(job.run_id, AgentRunState::InFlight(None));
             dispatched.push((slot_id, job.run_id, job.prompt.for_slot(responses_received)));
         }
         dispatched
@@ -432,7 +432,7 @@ mod tests {
         assert!(matches!(a2, AnswerSubmitAssignment::Queued { .. }));
         assert!(matches!(
             mgr.poll_run(&agent, r2),
-            Some(AgentRunState::InFlight)
+            Some(AgentRunState::InFlight(None))
         ));
     }
 }

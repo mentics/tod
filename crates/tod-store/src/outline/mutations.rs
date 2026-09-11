@@ -90,6 +90,10 @@ pub enum OutlineMutation {
     DeleteObligation {
         obligation_id: Uuid,
     },
+    MoveObligation {
+        obligation_id: Uuid,
+        target_node_id: Uuid,
+    },
     /// Remove a node and its entire subtree from the outline (archived for undo).
     DeleteNode {
         node_id: Uuid,
@@ -126,6 +130,7 @@ impl OutlineMutation {
                 | OutlineMutation::CreateObligation { .. }
                 | OutlineMutation::UpdateObligationBody { .. }
                 | OutlineMutation::DeleteObligation { .. }
+                | OutlineMutation::MoveObligation { .. }
                 | OutlineMutation::DeleteNode { .. }
                 | OutlineMutation::RestoreNodeSubtree { .. }
                 | OutlineMutation::ReorderObligation { .. }
@@ -242,6 +247,13 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteObligation { obligation_id } => {
                 ObligationRepo::new(conn).delete(*obligation_id)?;
+            }
+            OutlineMutation::MoveObligation {
+                obligation_id,
+                target_node_id,
+            } => {
+                require_spec(conn, *target_node_id)?;
+                ObligationRepo::new(conn).move_to_node(*obligation_id, *target_node_id)?;
             }
             OutlineMutation::DeleteNode { node_id } => {
                 let (archive_id, list_id) =

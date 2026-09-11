@@ -134,6 +134,29 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    /// Move an obligation to another node, appended after that node's
+    /// existing obligations of the same kind.
+    pub fn move_to_node(&self, id: Uuid, target_node_id: Uuid) -> Result<()> {
+        let row = self.get(id)?.context("obligation not found")?;
+        if row.node_id == target_node_id {
+            return Ok(());
+        }
+        self.conn.execute(
+            "DELETE FROM node_obligations WHERE id = ?1",
+            params![uuid_to_blob(id)],
+        )?;
+        self.rewrite_ordinals(row.node_id, &row.kind)?;
+        let ordinal = self.list_ids_for_kind(target_node_id, &row.kind)?.len() as i32 + 1;
+        self.insert(&NodeObligation {
+            id,
+            node_id: target_node_id,
+            kind: row.kind,
+            ordinal,
+            section: row.section,
+            body: row.body,
+        })
+    }
+
     pub fn reorder(&self, id: Uuid, delta: i32) -> Result<()> {
         let row = self.get(id)?.context("obligation not found")?;
         let mut ids = self.list_ids_for_kind(row.node_id, &row.kind)?;

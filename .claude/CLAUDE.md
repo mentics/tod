@@ -9,10 +9,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Build and run (dev, agent-socket feature enabled by default)
-cargo run -p tod
-
 # Dogfooding: use a persistent local data root instead of OS app-data dir
+# ALWAYS set this (or pass --data-root) before running tod — running it with
+# neither shows a first-run picker whose default value IS your real
+# %APPDATA%/tod install.toml, and accepting it overwrites that real file.
 export TOD_DATA_ROOT=.local/data
 cargo run -p tod
 
