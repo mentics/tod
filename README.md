@@ -16,7 +16,17 @@ From the repository root:
 cargo run
 ```
 
-This builds the `tod` binary (`crates/tod`) with the **agent-socket** feature enabled (default) and opens a desktop application window.
+This builds the `tod` binary (`crates/tod`) with the **agent-socket** feature enabled (default) and opens a desktop application window. Note that plain `cargo run` does **not** build `tod-cli`, so agents in that session will find it missing or stale.
+
+### Dev loop (`tod` + `tod-cli` together)
+
+Agents shell out to `tod-cli`, which `cargo run -p tod` alone does not build. Use `scripts/dev.sh` (or `scripts/dev.ps1` on Windows) instead, which rebuilds `tod-cli` before launching `tod` so agent chats always see a current CLI:
+
+```bash
+scripts/dev.sh --data-root .local/test/my-sandbox --agent mock --no-focus
+```
+
+Any arguments are passed straight through to `tod`. Both binaries land in the same `target/{debug,release}/` directory, so `tod-cli` is already a sibling of `tod` once built — no copy step is needed in dev.
 
 ### Cross-platform compilation
 
@@ -41,7 +51,10 @@ Use this for distributable installs. Dev builds keep `agent-socket` on by defaul
 | Component | Repo source | Installed layout |
 |-----------|-------------|------------------|
 | Application binary | `target/release/tod.exe` (or `tod`) | `{install_dir}/tod.exe` |
+| CLI binary | `target/release/tod-cli.exe` (or `tod-cli`) | `{install_dir}/tod-cli.exe` |
 | Process agent bundle | `assets/process/` | `{install_dir}/process/` |
+
+**`tod-cli`** must be built and staged as a sibling of `tod` — agents shell out to it by that convention (see `crates/tod/media/context/app.md`). In a dev checkout the two binaries already land in the same `target/{debug,release}/` directory as a side effect of Cargo's shared workspace target dir, so no copy step is needed there; only a packaged install needs `tod-cli` copied in explicitly. Use `scripts/release.sh` / `scripts/release.ps1` to build both release binaries together.
 
 **`assets/process/`** is the version-controlled source for agent behavior docs (SKILL, agents, manifest). At build time, `build.rs` copies it to `target/{debug,release}/process/` next to the binary so local runs match an install.
 
