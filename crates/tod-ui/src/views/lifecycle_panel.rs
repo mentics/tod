@@ -7,10 +7,17 @@
 //!
 //! A click on **Run gate check** sends one one-shot agent turn (mirroring
 //! `tod_core::gate`'s context/response split): the state agent for the node's
-//! *current* lifecycle evaluates its forward gate and replies with YAML front
-//! matter plus, when criteria exist for the transition, a `gate_results`
-//! section. The reply is parsed and only applied — `OutlineMutation::SetLifecycle`
-//! bundled with the gate_results write — when the agent reports `result: pass`.
+//! *current* lifecycle evaluates its forward gate and replies with one
+//! strict YAML document — `result`, plus, when criteria exist for the
+//! transition, a `gate_results` list with per-row `outcome` and `action`.
+//! When criteria are present, the reply's `gate_results` are always just
+//! recorded (never auto-advances the lifecycle, even on `result: pass`):
+//! they render as a table with a Waive button per failing row (and an Open
+//! interview button when the agent reports `action: interview`), and a
+//! separate **Advance** button — enabled only once every row reads
+//! pass/waived — makes the actual lifecycle transition. A prose-only gate
+//! (no criteria for the transition) has no table and advances directly off
+//! the agent's `result: pass`.
 //!
 //! Three manual escape hatches sit alongside the gate check, each a direct
 //! `OutlineMutation::SetLifecycle` that bypasses the gate agent entirely:
@@ -28,11 +35,12 @@ use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Timer, Window, actions,
-    div,
+    div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::spinner::Spinner;
@@ -42,14 +50,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tod_agent::{SessionOpening, SessionPurpose, SessionTurn};
 use tod_core::gate::{
-    GateCheckRequest, PlanStepWithLinks, build_gate_check_message, parse_gate_reply,
+    GateAction, GateCheckRequest, PlanStepWithLinks, build_gate_check_message,
+    build_on_entry_message, parse_gate_reply,
 };
 use tod_core::process::interview_phase_for_lifecycle;
-use tod_core::task::model::{next_lifecycle, previous_lifecycle};
+use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
 use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
+use tod_store::outline::{GateCriterion, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_HUMAN};
 
 const LIFECYCLE_PANEL_CONTEXT: &str = "LifecyclePanel";
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -90,9 +100,14 @@ enum LifecyclePanelStop {
 /// One row of per-criterion detail shown after a gate check completes.
 #[derive(Debug, Clone)]
 struct CriterionOutcome {
+    criterion_id: uuid::Uuid,
     label: String,
     outcome: String,
     detail: Option<String>,
+    /// How the user can resolve this row in-app if it's failing — reported
+    /// by the agent per row. `Interview` shows an Open interview button
+    /// alongside Waive; `None` leaves Waive as the only option.
+    action: GateAction,
 }
 
 struct PendingGateCheck {
@@ -110,6 +125,11 @@ struct GateCheckState {
     gate_status: String,
     gate_error: Option<String>,
     criteria_detail: Vec<CriterionOutcome>,
+    /// The criteria catalog fetched for the most recent gate check on this
+    /// node, kept around so criteria_detail rows can show a real label
+    /// (and so waiving one knows the full set to decide whether every
+    /// criterion is now pass/waived).
+    criteria_catalog: Vec<GateCriterion>,
     /// Set after one click on **Revert** — a second click while armed
     /// actually applies it. Keeps an accidental click from reverting a
     /// node's lifecycle without confirmation.
@@ -117,6 +137,14 @@ struct GateCheckState {
     /// Same two-click confirm as `revert_armed`, for **Force advance** —
     /// bypassing the gate criteria entirely rather than stepping back.
     force_advance_armed: bool,
+    /// Run id of an in-flight on-entry turn (see `run_on_entry`) — fired
+    /// automatically whenever this node's lifecycle actually changes, distinct
+    /// from `pending` (a gate check evaluating the *forward* gate). Tracked
+    /// separately since it can be running at the same time a fresh gate check
+    /// is kicked off for the state just entered.
+    on_entry_run: Option<RunId>,
+    /// Status line for the on-entry turn, shown alongside `gate_status`.
+    on_entry_status: String,
 }
 
 pub struct LifecyclePanelView {
@@ -147,7 +175,11 @@ impl LifecyclePanelView {
             loop {
                 Timer::after(POLL_INTERVAL).await;
                 let _ = poll_entity.update(cx, |this, cx| {
-                    if this.gate_states.values().any(|s| s.pending.is_some()) {
+                    if this
+                        .gate_states
+                        .values()
+                        .any(|s| s.pending.is_some() || s.on_entry_run.is_some())
+                    {
                         this.poll_gate_checks(cx);
                     }
                 });
@@ -293,6 +325,7 @@ impl LifecyclePanelView {
             state.gate_status = format!("Advanced to {next} (gate bypassed).");
             state.criteria_detail.clear();
         }
+        self.run_on_entry(&task_id, next, cx);
         cx.notify();
     }
 
@@ -339,6 +372,106 @@ impl LifecyclePanelView {
             state.gate_status = format!("Reverted to {prev}.");
             state.criteria_detail.clear();
         }
+        cx.notify();
+    }
+
+    /// Waive one failing gate criterion directly — the fine-grained
+    /// alternative to `force_advance` when some failures are fine to ignore
+    /// and others genuinely need fixing. Persists as `SOURCE_HUMAN` so it
+    /// reads distinctly from an agent's own outcome. This never advances the
+    /// lifecycle by itself — once every row reads pass/waived, the user
+    /// still clicks the separate Advance button (`advance_after_criteria`)
+    /// to make the transition, so a waive can never sneak a node forward
+    /// without an explicit confirming click.
+    fn waive_criterion(&mut self, criterion_id: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        let Some(state) = self.gate_states.get_mut(&task_id) else {
+            return;
+        };
+        let Some(row) = state
+            .criteria_detail
+            .iter_mut()
+            .find(|r| r.criterion_id == criterion_id)
+        else {
+            return;
+        };
+        row.outcome = OUTCOME_WAIVED.to_string();
+        row.detail = Some("Waived by user".to_string());
+
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
+            node_id,
+            results: vec![(
+                criterion_id,
+                OUTCOME_WAIVED.to_string(),
+                Some("Waived by user".to_string()),
+            )],
+            forward_state: None,
+            source: SOURCE_HUMAN.to_string(),
+        }) {
+            if let Some(state) = self.gate_states.get_mut(&task_id) {
+                state.gate_error = Some(format!("Failed to waive criterion: {err:#}"));
+            }
+            cx.notify();
+            return;
+        }
+        let _ = self.fleet.writer().flush();
+
+        if let Some(state) = self.gate_states.get_mut(&task_id) {
+            let all_clear = state
+                .criteria_detail
+                .iter()
+                .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+            state.gate_status = if all_clear {
+                "All criteria satisfied — advance when ready.".into()
+            } else {
+                "Criterion waived.".into()
+            };
+        }
+        cx.notify();
+    }
+
+    /// Advance the node to `next_lifecycle`, called only once every row in
+    /// the criteria table reads pass/waived (the button that triggers this
+    /// is disabled otherwise — see the render below). A pure lifecycle
+    /// write, no criteria results to persist since they're already recorded.
+    fn advance_after_criteria(&mut self, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        let Some(next) = next_lifecycle(&self.lifecycle) else {
+            return;
+        };
+        let next = next.to_string();
+
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
+            node_id,
+            results: Vec::new(),
+            forward_state: Some(next.clone()),
+            source: SOURCE_HUMAN.to_string(),
+        }) {
+            if let Some(state) = self.gate_states.get_mut(&task_id) {
+                state.gate_error = Some(format!("Failed to advance lifecycle: {err:#}"));
+            }
+            cx.notify();
+            return;
+        }
+        let _ = self.fleet.writer().flush();
+
+        if let Some(state) = self.gate_states.get_mut(&task_id) {
+            state.gate_status = format!("Advanced to {next}.");
+            state.criteria_detail.clear();
+        }
+        self.lifecycle = next.clone();
+        self.clamp_focus_index();
+        self.run_on_entry(&task_id, &next, cx);
         cx.notify();
     }
 
@@ -461,6 +594,7 @@ impl LifecyclePanelView {
         }
         cx.notify();
 
+        let mut criteria_catalog: Vec<GateCriterion> = Vec::new();
         let result: anyhow::Result<(SessionTurn, String)> = (|| {
             let settings = TodSettings::load(&self.paths).unwrap_or_default();
             let agent_ctx =
@@ -468,6 +602,7 @@ impl LifecyclePanelView {
             let criteria =
                 self.fleet
                     .gate_criteria_for_transition(node_id, &from_state, &to_state)?;
+            criteria_catalog = criteria.iter().map(|(c, _)| c.clone()).collect();
             let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
             let body = self
                 .fleet
@@ -534,6 +669,7 @@ impl LifecyclePanelView {
                                 pending.run_id = Some(handle.id);
                             }
                             state.gate_status = "Running gate check…".into();
+                            state.criteria_catalog = criteria_catalog;
                         }
                     }
                     Err(err) => {
@@ -552,12 +688,171 @@ impl LifecyclePanelView {
         let pending_ids: Vec<String> = self
             .gate_states
             .iter()
-            .filter(|(_, s)| s.pending.is_some())
+            .filter(|(_, s)| s.pending.is_some() || s.on_entry_run.is_some())
             .map(|(id, _)| id.clone())
             .collect();
         for task_id in pending_ids {
             self.poll_gate_check(&task_id, cx);
+            self.poll_on_entry(&task_id, cx);
         }
+    }
+
+    /// Fire the on-entry turn for `task_id`, which just landed in `lifecycle` —
+    /// the new state's own agent doing its state's "On entry" responsibilities
+    /// (e.g. `planning` drafting plan steps), per `assets/process/agents/state/base.md`.
+    /// Called automatically from every place a lifecycle transition actually
+    /// lands: an agent's own gate-check pass, the human Advance button after
+    /// waiving criteria, and Force advance. Idempotent by design (the prompt
+    /// tells the agent to add only what's missing), so it's safe to fire again
+    /// later if this node re-enters the same state. Looks up the node's own
+    /// title/repo rather than trusting `self.title` — a transition can land
+    /// while a different node is selected in the panel (see `apply_gate_reply`).
+    fn run_on_entry(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
+        if !state_has_agent(lifecycle) {
+            return;
+        }
+        if self
+            .gate_states
+            .get(task_id)
+            .is_some_and(|s| s.on_entry_run.is_some())
+        {
+            return;
+        }
+        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        let task_id = task_id.to_string();
+        let lifecycle = lifecycle.to_string();
+        let title = self
+            .fleet
+            .get_task(&task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_default();
+        let data_root = self.paths.data_root().to_path_buf();
+
+        let result: anyhow::Result<SessionTurn> = (|| {
+            let settings = TodSettings::load(&self.paths).unwrap_or_default();
+            let agent_ctx =
+                ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, &task_id)?;
+            let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
+            let body = self
+                .fleet
+                .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
+                .ok()
+                .flatten();
+            let obligations = self.fleet.resolve_obligations_for_node(node_id).unwrap_or_default();
+            let plan_steps = self
+                .fleet
+                .list_plan_steps_for_node(node_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|step| {
+                    let depends_on = self.fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
+                    let satisfies = self.fleet.list_plan_step_obligations(step.id).unwrap_or_default();
+                    PlanStepWithLinks { step, depends_on, satisfies }
+                })
+                .collect();
+            let media = tod_core::media::MediaPaths::discover()?;
+            let message = build_on_entry_message(
+                &media,
+                &GateCheckRequest {
+                    data_root: &data_root,
+                    node_id,
+                    node_title: title,
+                    node_lifecycle: lifecycle.clone(),
+                    node_body: body,
+                    purposes,
+                    obligations,
+                    plan_steps,
+                    from_state: lifecycle.clone(),
+                    to_state: lifecycle.clone(),
+                    criteria: Vec::new(),
+                },
+            )?;
+            Ok(SessionTurn {
+                key: format!("on-entry-{}", uuid::Uuid::new_v4()),
+                agent_config_id: agent_ctx.agent.id.clone(),
+                cwd: agent_ctx.cwd,
+                options: settings.launch_options_for(AgentRole::Default),
+                resume_session_id: None,
+                opening: Some(SessionOpening {
+                    title: format!("{lifecycle} on-entry"),
+                    context: None,
+                }),
+                message,
+                purpose: SessionPurpose::Chat,
+                env: Vec::new(),
+            })
+        })();
+
+        match result {
+            Ok(turn) => {
+                let sent = match self.agent.lock() {
+                    Ok(mut provider) => provider.send_session_turn(turn),
+                    Err(_) => Err(anyhow::anyhow!("Agent busy — try again shortly")),
+                };
+                let state = self.gate_states.entry(task_id).or_default();
+                match sent {
+                    Ok(handle) => {
+                        state.on_entry_run = Some(handle.id);
+                        state.on_entry_status = format!("Running {lifecycle} on-entry setup…");
+                    }
+                    Err(err) => {
+                        state.on_entry_status = format!("On-entry setup failed to launch: {err:#}");
+                    }
+                }
+            }
+            Err(err) => {
+                let state = self.gate_states.entry(task_id).or_default();
+                state.on_entry_status = format!("On-entry setup failed: {err:#}");
+            }
+        }
+        cx.notify();
+    }
+
+    fn poll_on_entry(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Some(run_id) = self.gate_states.get(task_id).and_then(|s| s.on_entry_run) else {
+            return;
+        };
+        let Ok(mut agent) = self.agent.try_lock() else {
+            return;
+        };
+        let Some(run_state) = agent.poll_run(run_id) else {
+            return;
+        };
+        drop(agent);
+
+        match run_state {
+            AgentRunState::InFlight(activity) => {
+                if let Some(state) = self.gate_states.get_mut(task_id) {
+                    state.on_entry_status = activity.unwrap_or_else(|| "Running on-entry setup…".into());
+                }
+            }
+            AgentRunState::NeedsPermission(request) => {
+                crate::ui::agent_permission::queue_permission_request(self.agent.clone(), request);
+            }
+            AgentRunState::Success(response) => {
+                if let Some(state) = self.gate_states.get_mut(task_id) {
+                    state.on_entry_run = None;
+                    let summary = response.unwrap_or_default();
+                    let summary = summary.trim();
+                    state.on_entry_status = if summary.is_empty() {
+                        "On-entry setup complete.".into()
+                    } else {
+                        format!("On-entry setup: {summary}")
+                    };
+                }
+            }
+            AgentRunState::Failure(message) => {
+                if let Some(state) = self.gate_states.get_mut(task_id) {
+                    state.on_entry_run = None;
+                    state.on_entry_status = format!("On-entry setup failed: {message}");
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn poll_gate_check(&mut self, task_id: &str, cx: &mut Context<Self>) {
@@ -616,7 +911,7 @@ impl LifecyclePanelView {
         task_id: &str,
         text: String,
         to_state: &str,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
             return;
@@ -632,22 +927,52 @@ impl LifecyclePanelView {
             }
         };
 
+        let catalog = self
+            .gate_states
+            .get(task_id)
+            .map(|s| s.criteria_catalog.clone())
+            .unwrap_or_default();
+        let label_for = |id: uuid::Uuid| {
+            catalog
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.label.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        // Whether this transition has structured criteria at all — decides
+        // whether advancing needs a separate user click on the criteria
+        // table (built below) or can follow the agent's own verdict
+        // directly, for a prose-only gate with nothing to show a table for.
+        let has_criteria = !catalog.is_empty();
+
         let results: Vec<(uuid::Uuid, String, Option<String>)> = reply
             .gate_results
             .iter()
             .map(|row| (row.criterion_id, row.outcome.clone(), row.detail.clone()))
             .collect();
-        let criteria_detail = reply
+        let criteria_detail: Vec<CriterionOutcome> = reply
             .gate_results
             .iter()
             .map(|row| CriterionOutcome {
-                label: row.criterion_id.to_string(),
+                criterion_id: row.criterion_id,
+                label: label_for(row.criterion_id),
                 outcome: row.outcome.clone(),
                 detail: row.detail.clone(),
+                action: row.action,
             })
             .collect();
 
-        let advances = reply.result.advances();
+        let all_clear = !criteria_detail.is_empty()
+            && criteria_detail
+                .iter()
+                .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+        // A gate with structured criteria always stops here and shows the
+        // table — even a `result: pass` reply only records the agent's
+        // per-row verdicts; advancing the lifecycle is a separate, explicit
+        // click on the Advance button once every row is pass/waived. Only a
+        // prose-only gate (no criteria at all) can advance directly off the
+        // agent's own result.
+        let advances = reply.result.advances() && !has_criteria;
         let forward_state = advances.then(|| to_state.to_string());
 
         if !results.is_empty() || advances {
@@ -655,6 +980,7 @@ impl LifecyclePanelView {
                 node_id,
                 results,
                 forward_state: forward_state.clone(),
+                source: SOURCE_AGENT.to_string(),
             }) {
                 let state = self.gate_states.entry(task_id.to_string()).or_default();
                 state.gate_error = Some(format!("Failed to save gate check: {err:#}"));
@@ -667,6 +993,14 @@ impl LifecyclePanelView {
         state.criteria_detail = criteria_detail;
         if let Some(new_state) = forward_state.clone() {
             state.gate_status = format!("Advanced to {new_state}.");
+        } else if has_criteria {
+            state.gate_status = if all_clear {
+                "All criteria satisfied — advance when ready.".into()
+            } else if reply.paused {
+                "Gate check: blocked — see criteria below.".into()
+            } else {
+                "Gate check did not advance the lifecycle — see criteria below.".into()
+            };
         } else {
             state.gate_status = if reply.paused {
                 "Gate check: blocked — see findings below.".into()
@@ -680,12 +1014,15 @@ impl LifecyclePanelView {
         let _ = reply.findings; // surfaced via gate_status/criteria_detail for now
 
         // Only update the live lifecycle label / focus stops when the check
-        // that just finished belongs to the node currently on screen.
+        // that just finished belongs to the node currently on screen — but
+        // fire the new state's on-entry turn regardless of selection, same as
+        // the gate check itself kept running in the background for it.
         if let Some(new_state) = forward_state {
             if self.task_id.as_deref() == Some(task_id) {
-                self.lifecycle = new_state;
+                self.lifecycle = new_state.clone();
                 self.clamp_focus_index();
             }
+            self.run_on_entry(task_id, &new_state, cx);
         }
     }
 
@@ -715,6 +1052,7 @@ impl Render for LifecyclePanelView {
         let muted = theme.muted_foreground;
         let accent = theme.primary;
         let danger = theme.danger;
+        let list_active_border = theme.list_active_border;
 
         let next_state = next_lifecycle(&self.lifecycle);
         let in_flight = self.in_flight();
@@ -723,6 +1061,8 @@ impl Render for LifecyclePanelView {
         let gate_status = gate_state.gate_status.clone();
         let gate_error = gate_state.gate_error.clone();
         let criteria_detail = gate_state.criteria_detail.clone();
+        let on_entry_running = gate_state.on_entry_run.is_some();
+        let on_entry_status = gate_state.on_entry_status.clone();
 
         let mut body = v_flex()
             .id("lifecycle-panel-body")
@@ -754,7 +1094,7 @@ impl Render for LifecyclePanelView {
                         .w_full()
                         .rounded_md()
                         .when(run_gate_check_focused, |el| {
-                            el.border_1().border_color(theme.list_active_border)
+                            el.border_1().border_color(list_active_border)
                         })
                         .child(
                             Button::new("lifecycle-panel-run-gate-check")
@@ -787,7 +1127,7 @@ impl Render for LifecyclePanelView {
                     .w_full()
                     .rounded_md()
                     .when(open_interview_focused, |el| {
-                        el.border_1().border_color(theme.list_active_border)
+                        el.border_1().border_color(list_active_border)
                     })
                     .child(
                         Button::new("lifecycle-panel-open-interview")
@@ -814,7 +1154,7 @@ impl Render for LifecyclePanelView {
                     .w_full()
                     .rounded_md()
                     .when(force_focused, |el| {
-                        el.border_1().border_color(theme.list_active_border)
+                        el.border_1().border_color(list_active_border)
                     })
                     .child(
                         Button::new("lifecycle-panel-force-advance")
@@ -840,7 +1180,7 @@ impl Render for LifecyclePanelView {
                     .w_full()
                     .rounded_md()
                     .when(revert_focused, |el| {
-                        el.border_1().border_color(theme.list_active_border)
+                        el.border_1().border_color(list_active_border)
                     })
                     .child(
                         Button::new("lifecycle-panel-revert")
@@ -865,31 +1205,240 @@ impl Render for LifecyclePanelView {
                         .gap_2()
                         .items_center()
                         .child(Spinner::new().with_size(Size::Small))
-                        .child(div().text_xs().text_color(muted).child(gate_status.clone())),
+                        .child(
+                            div().text_xs().text_color(muted).child(selectable_text(
+                                "lifecycle-panel-gate-status",
+                                gate_status.clone(),
+                                window,
+                                cx,
+                            )),
+                        ),
                 );
             } else if !gate_status.is_empty() {
-                body = body.child(div().text_xs().text_color(muted).child(gate_status.clone()));
+                body = body.child(
+                    div().text_xs().text_color(muted).child(selectable_text(
+                        "lifecycle-panel-gate-status",
+                        gate_status.clone(),
+                        window,
+                        cx,
+                    )),
+                );
             }
 
             if let Some(error) = gate_error {
-                body = body.child(div().text_xs().text_color(danger).child(error));
+                body = body.child(
+                    div().text_xs().text_color(danger).child(selectable_text(
+                        "lifecycle-panel-gate-error",
+                        error,
+                        window,
+                        cx,
+                    )),
+                );
+            }
+
+            if on_entry_running {
+                body = body.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(Spinner::new().with_size(Size::Small))
+                        .child(
+                            div().text_xs().text_color(muted).child(selectable_text(
+                                "lifecycle-panel-on-entry-status",
+                                on_entry_status.clone(),
+                                window,
+                                cx,
+                            )),
+                        ),
+                );
+            } else if !on_entry_status.is_empty() {
+                body = body.child(
+                    div().text_xs().text_color(muted).child(selectable_text(
+                        "lifecycle-panel-on-entry-status",
+                        on_entry_status.clone(),
+                        window,
+                        cx,
+                    )),
+                );
             }
 
             if !criteria_detail.is_empty() {
-                let mut list = v_flex().gap_1().w_full();
-                for row in &criteria_detail {
-                    let mut line = format!("{}: {}", row.label, row.outcome);
-                    if let Some(detail) = row.detail.as_deref() {
-                        line.push_str(&format!(" — {detail}"));
-                    }
-                    list = list.child(div().text_xs().text_color(muted).child(line));
+                // A real three-column table — Action | Criteria | Explanation
+                // — not one run-on wrapped sentence per row. Each column has
+                // its own fixed width (the last one flexes to fill what's
+                // left) and wraps independently (`whitespace_normal`), so a
+                // long criterion label or a long detail string only grows
+                // that cell's height, never bleeds into the next column or
+                // pushes a button off-panel.
+                const ACTION_COL: f32 = 84.0;
+                const CRITERION_COL: f32 = 120.0;
+
+                let header = h_flex()
+                    .gap_2()
+                    .items_start()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(ACTION_COL))
+                            .text_xs()
+                            .font_semibold()
+                            .child("Action"),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(CRITERION_COL))
+                            .text_xs()
+                            .font_semibold()
+                            .child("Criteria"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .font_semibold()
+                            .child("Explanation"),
+                    );
+
+                let mut list = v_flex().gap_2().w_full().child(header);
+                for (index, row) in criteria_detail.iter().enumerate() {
+                    let waivable = row.outcome != OUTCOME_PASS && row.outcome != OUTCOME_WAIVED;
+                    let criterion_id = row.criterion_id;
+                    let action = row.action;
+                    let outcome_color = if row.outcome == OUTCOME_PASS {
+                        muted
+                    } else if row.outcome == OUTCOME_WAIVED {
+                        accent
+                    } else {
+                        danger
+                    };
+
+                    let action_cell = if waivable {
+                        let mut buttons = v_flex().gap_1();
+                        if action == GateAction::Interview {
+                            buttons = buttons.child(
+                                Button::new(("lifecycle-panel-criterion-interview", index))
+                                    .label("Interview")
+                                    .ghost()
+                                    .compact()
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(task_id) = this.task_id.clone() {
+                                            cx.emit(LifecyclePanelEvent::OpenInterview {
+                                                task_id,
+                                                lifecycle: this.lifecycle.clone(),
+                                            });
+                                        }
+                                    })),
+                            );
+                        }
+                        buttons = buttons.child(
+                            Button::new(("lifecycle-panel-waive", index))
+                                .label("Waive")
+                                .ghost()
+                                .compact()
+                                .w_full()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.waive_criterion(criterion_id, cx);
+                                })),
+                        );
+                        div().flex_shrink_0().w(px(ACTION_COL)).child(buttons)
+                    } else {
+                        div()
+                            .flex_shrink_0()
+                            .w(px(ACTION_COL))
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(outcome_color)
+                            .whitespace_normal()
+                            .child(if row.outcome == OUTCOME_WAIVED {
+                                "Waived"
+                            } else {
+                                "Pass"
+                            })
+                    };
+
+                    let row_el = h_flex()
+                        .gap_2()
+                        .items_start()
+                        .w_full()
+                        .p_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(border)
+                        .child(action_cell)
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(CRITERION_COL))
+                                .text_xs()
+                                .whitespace_normal()
+                                .child(selectable_text(
+                                    ("lifecycle-panel-criteria-label", index),
+                                    row.label.clone(),
+                                    window,
+                                    cx,
+                                )),
+                        )
+                        .child({
+                            let mut explanation = row.detail.clone().unwrap_or_default();
+                            // The agent reports `action: none` both for "nothing to
+                            // resolve" (pass/waived, not reached here) and for "no
+                            // in-app tool exists for this yet" — a waivable row with
+                            // no resolve button and no hint would just look broken,
+                            // so make the lack of in-app support explicit rather than
+                            // leaving the human to guess why only Waive showed up.
+                            if waivable && action == GateAction::None {
+                                let note = "No in-app resolution yet — waive or resolve outside the app.";
+                                explanation = if explanation.trim().is_empty() {
+                                    note.to_string()
+                                } else {
+                                    format!("{explanation}\n\n{note}")
+                                };
+                            }
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(muted)
+                                .whitespace_normal()
+                                .child(selectable_text(
+                                    ("lifecycle-panel-criteria-detail", index),
+                                    explanation,
+                                    window,
+                                    cx,
+                                ))
+                        });
+                    list = list.child(row_el);
                 }
                 body = body.child(
                     v_flex()
                         .gap_1()
-                        .child(div().text_xs().font_semibold().child("Criteria"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_semibold()
+                                .child("Criteria — Waive lets you accept a specific failure without fixing it"),
+                        )
                         .child(list),
                 );
+
+                if let Some(next) = next_state {
+                    let all_clear = criteria_detail
+                        .iter()
+                        .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+                    body = body.child(
+                        Button::new("lifecycle-panel-advance-after-criteria")
+                            .label(format!("Advance to {next}"))
+                            .primary()
+                            .w_full()
+                            .disabled(!all_clear)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.advance_after_criteria(cx);
+                            })),
+                    );
+                }
             }
         }
 
@@ -934,7 +1483,7 @@ impl Render for LifecyclePanelView {
                         div()
                             .rounded_md()
                             .when(self.is_focused(LifecyclePanelStop::Close), |el| {
-                                el.border_1().border_color(theme.list_active_border)
+                                el.border_1().border_color(list_active_border)
                             })
                             .child(chrome_control_with_shortcut(
                                 Button::new("lifecycle-panel-close")

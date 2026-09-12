@@ -25,6 +25,9 @@ pub struct PlanStepWithLinks {
 /// Context key under `media/context/` for the gate-check static doc.
 pub const GATE_CHECK_CONTEXT_KEY: &str = "gate_check";
 
+/// Context key under `media/context/` for the on-entry static doc.
+pub const ON_ENTRY_CONTEXT_KEY: &str = "on_entry";
+
 /// Everything the gate-check turn needs to describe the node under check.
 #[derive(Debug, Clone)]
 pub struct GateCheckRequest<'a> {
@@ -61,7 +64,71 @@ pub fn build_gate_check_message(paths: &MediaPaths, request: &GateCheckRequest<'
     Ok(out)
 }
 
+/// Build the on-entry message: static layers, then the live node context with
+/// no gate-check block — this turn is about doing the state's own "On entry"
+/// work (e.g. drafting plan steps), not evaluating a forward gate.
+pub fn build_on_entry_message(paths: &MediaPaths, request: &GateCheckRequest<'_>) -> Result<String> {
+    let mut out = load_static_context(paths, ON_ENTRY_CONTEXT_KEY)?;
+    out.push_str("\n\n---\n\n");
+    out.push_str(&render_node_context(request, "on_entry"));
+    out.push_str(
+        "\nYou have just entered this lifecycle state. Perform this state's \
+         **\"On entry\"** responsibilities from your role doc now, directly \
+         via `tod-cli` (e.g. drafting or refining plan steps) — do not wait \
+         for a gate check or an interview turn to do this piecemeal. This \
+         turn may run again later as obligations or plan steps change; check \
+         what already exists first and add only what's missing, don't \
+         duplicate or discard existing work.\n\n\
+         This is **not** a gate-check turn: do not evaluate the forward \
+         gate, and do not return `result` or `gate_results` — this reply is \
+         not parsed as structured data. Reply with a short plain-text \
+         summary of what you did, or that nothing was needed.\n",
+    );
+    Ok(out)
+}
+
 fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
+    let mut out = render_node_context(request, "gate_check");
+    out.push_str("\n## Gate check\n\n");
+    out.push_str(&render_gate_check_yaml(request));
+    out.push_str(
+        "\nEvaluate your forward gate for this transition now. This is a \
+         **structured protocol response, not a chat reply**: the app parses \
+         your entire message as one YAML document and renders `gate_results` \
+         as a table with a button per row — it is not read by a human as \
+         prose. Your response must be **the YAML document and nothing else**: \
+         no narration before it (\"Let me...\", \"I'll now...\"), no \
+         explanation after it, no markdown code fence around it, no restating \
+         your reasoning outside the `findings`/`detail` fields where it \
+         belongs. Do not write to the database yourself — the app persists \
+         `gate_results` and applies the lifecycle change.\n\n\
+         Two fields look similar but are **not the same vocabulary** — do \
+         not swap them: the top-level `result` is exactly one of \
+         `pass | blocked | needs_human | no_change` (never `fail`); each \
+         row's `gate_results[].outcome` is exactly one of \
+         `pass | fail | waived`. A blocked transition is \
+         `result: blocked` with the failing row(s) marked `outcome: fail`.\n\n\
+         Set each failing row's `action` deliberately — the app renders a \
+         button directly off it, so getting it wrong means the user sees the \
+         wrong (or no) button. Use `action: interview` whenever answering \
+         that phase's interview — including any open/unanswered interview \
+         questions — would satisfy the criterion; this is the common case, \
+         don't default to `none` here. Use `action: none` only when the app \
+         genuinely has no in-app tool for it (e.g. no feature yet for \
+         recording API/data-structure specs or tracking spikes), and when \
+         you do, say so plainly in that row's `detail` (e.g. \"no in-app tool \
+         for this yet; resolve outside the app or waive\") — never leave \
+         `detail` empty on a failing row.\n",
+    );
+
+    out
+}
+
+/// Shared prefix for both message kinds: data root, purpose chain, selected
+/// node metadata (with the given `phase_purpose` value), obligations, and
+/// plan steps. `render_dynamic` appends the gate-check block after this;
+/// `build_on_entry_message` appends its own trailing instruction instead.
+fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> String {
     let mut out = String::from("# Current context\n\n");
 
     out.push_str(&format!(
@@ -86,7 +153,7 @@ fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
     out.push_str(&format!("- **Title:** {}\n", request.node_title.trim()));
     out.push_str(&format!("- **Lifecycle state:** {}\n", request.node_lifecycle));
     out.push_str("- **mode:** interactive\n");
-    out.push_str("- **phase_purpose:** gate_check\n");
+    out.push_str(&format!("- **phase_purpose:** {phase_purpose}\n"));
     match request.node_body.as_deref().map(str::trim) {
         Some(body) if !body.is_empty() => {
             out.push_str("\n**Details:**\n\n");
@@ -117,14 +184,6 @@ fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
             out.push('\n');
         }
     }
-
-    out.push_str("\n## Gate check\n\n");
-    out.push_str(&render_gate_check_yaml(request));
-    out.push_str(
-        "\nEvaluate your forward gate for this transition now and reply in the \
-         format your role doc specifies. Do not write to the database yourself \
-         — the app persists `gate_results` and applies the lifecycle change.\n",
-    );
 
     out
 }
@@ -232,5 +291,26 @@ mod tests {
         assert!(text.contains("design-planning.done-criteria-clear"));
         assert!(text.contains("outcome: pass"));
         assert!(text.contains("looks good"));
+    }
+
+    #[test]
+    fn on_entry_message_has_no_gate_block_and_right_phase_purpose() {
+        let request = GateCheckRequest {
+            data_root: Path::new("/data/tod"),
+            node_id: Uuid::nil(),
+            node_title: "Ship it".into(),
+            node_lifecycle: "planning".into(),
+            node_body: None,
+            purposes: Vec::new(),
+            obligations: Vec::new(),
+            plan_steps: Vec::new(),
+            from_state: "planning".into(),
+            to_state: "planning".into(),
+            criteria: Vec::new(),
+        };
+        let text = render_node_context(&request, "on_entry");
+        assert!(text.contains("phase_purpose:** on_entry"));
+        assert!(!text.contains("## Gate check"));
+        assert!(!text.contains("gate_check:"));
     }
 }

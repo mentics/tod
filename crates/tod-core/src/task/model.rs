@@ -205,6 +205,13 @@ pub fn previous_lifecycle(lifecycle: &str) -> Option<&'static str> {
     LIFECYCLE_STATES.get(rank - 1).copied()
 }
 
+/// Whether `lifecycle` has a state agent at all (see `assets/process/agents/state/base.md`:
+/// "States `ready` and `done` have no agent"). Gates whether an on-entry or
+/// gate-check turn should ever be fired for it.
+pub fn state_has_agent(lifecycle: &str) -> bool {
+    !matches!(lifecycle, "ready" | "done")
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;

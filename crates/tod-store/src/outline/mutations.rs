@@ -192,15 +192,18 @@ pub enum OutlineMutation {
         node_id: Uuid,
         state: String,
     },
-    /// Persist a gate-check agent's per-criterion outcomes and, when the check
-    /// passed, advance the node's lifecycle in the same mutation.
+    /// Persist per-criterion gate outcomes — from an agent's gate-check reply
+    /// or a human's manual waive/override — and, when the check passed,
+    /// advance the node's lifecycle in the same mutation.
     ApplyGateResults {
         node_id: Uuid,
-        /// `(criterion_id, outcome, detail)` — one row per criterion the agent
-        /// was asked about.
+        /// `(criterion_id, outcome, detail)` — one row per criterion.
         results: Vec<(Uuid, String, Option<String>)>,
         /// Set only when the gate check passed and lifecycle should advance.
         forward_state: Option<String>,
+        /// `SOURCE_AGENT` for a gate-check reply, `SOURCE_HUMAN` for a
+        /// manual waive (see `tod_store::outline::{SOURCE_AGENT, SOURCE_HUMAN}`).
+        source: String,
     },
 }
 
@@ -488,8 +491,9 @@ impl OutlineMutation {
                 node_id,
                 results,
                 forward_state,
+                source,
             } => {
-                GateRepo::new(conn).apply_gate_results(*node_id, results)?;
+                GateRepo::new(conn).apply_gate_results(*node_id, results, source)?;
                 if let Some(state) = forward_state {
                     NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
                 }
