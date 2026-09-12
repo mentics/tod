@@ -59,7 +59,9 @@ use tod_store::AgentRole;
 use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
-use tod_store::outline::{GateCriterion, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_HUMAN};
+use tod_store::outline::{
+    GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_HUMAN,
+};
 
 const LIFECYCLE_PANEL_CONTEXT: &str = "LifecyclePanel";
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -494,6 +496,71 @@ impl LifecyclePanelView {
         }
     }
 
+    /// Repopulate `criteria_detail` for `task_id` from the most recently
+    /// persisted gate-check evaluations for its current forward transition,
+    /// so a check run before an app restart (or before the panel was ever
+    /// opened this session) reappears without forcing the user to run it
+    /// again just to see it. Only fills in state that's still empty — an
+    /// in-flight check, or one already populated in memory this session, is
+    /// left untouched. The per-row `action` (e.g. an Open-interview button)
+    /// isn't persisted, so a reloaded row always falls back to `None`; Waive
+    /// is still available, and Open interview remains reachable from the
+    /// panel's own button.
+    fn load_persisted_gate_state(&mut self, task_id: &str) {
+        if self
+            .gate_states
+            .get(task_id)
+            .is_some_and(|s| s.pending.is_some() || !s.criteria_detail.is_empty())
+        {
+            return;
+        }
+        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        let Some(to_state) = next_lifecycle(&self.lifecycle) else {
+            return;
+        };
+        let Ok(rows) = self
+            .fleet
+            .gate_criteria_for_transition(node_id, &self.lifecycle, to_state)
+        else {
+            return;
+        };
+        if !rows.iter().any(|(_, eval)| eval.is_some()) {
+            return;
+        }
+
+        let criteria_catalog: Vec<GateCriterion> = rows.iter().map(|(c, _)| c.clone()).collect();
+        let criteria_detail: Vec<CriterionOutcome> = rows
+            .iter()
+            .filter_map(|(c, eval): &(GateCriterion, Option<NodeGateEvaluation>)| {
+                eval.as_ref().map(|e| CriterionOutcome {
+                    criterion_id: c.id,
+                    label: c.label.clone(),
+                    outcome: e.outcome.clone(),
+                    detail: e.detail.clone(),
+                    action: GateAction::None,
+                })
+            })
+            .collect();
+        if criteria_detail.is_empty() {
+            return;
+        }
+
+        let all_clear = criteria_detail
+            .iter()
+            .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.criteria_catalog = criteria_catalog;
+        state.criteria_detail = criteria_detail;
+        state.gate_status = if all_clear {
+            "All criteria satisfied — advance when ready.".into()
+        } else {
+            "Gate check (from last run) — see criteria below.".into()
+        };
+    }
+
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.task_id = Some(task_id.to_string());
         if !self.load_task(task_id) {
@@ -504,6 +571,7 @@ impl LifecyclePanelView {
             state.revert_armed = false;
             state.force_advance_armed = false;
         }
+        self.load_persisted_gate_state(task_id);
         self.focus_index = 0;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
@@ -530,6 +598,7 @@ impl LifecyclePanelView {
             state.revert_armed = false;
             state.force_advance_armed = false;
         }
+        self.load_persisted_gate_state(task_id);
         self.focus_index = 0;
         cx.notify();
     }
