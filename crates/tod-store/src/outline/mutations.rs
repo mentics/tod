@@ -1,5 +1,6 @@
 //! Outline mutations executed by the fleet writer.
 
+use crate::outline::repos::gate::GateRepo;
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
 use crate::outline::repos::tree::TreeLoader;
 use crate::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
@@ -135,6 +136,16 @@ pub enum OutlineMutation {
         node_id: Uuid,
         state: String,
     },
+    /// Persist a gate-check agent's per-criterion outcomes and, when the check
+    /// passed, advance the node's lifecycle in the same mutation.
+    ApplyGateResults {
+        node_id: Uuid,
+        /// `(criterion_id, outcome, detail)` — one row per criterion the agent
+        /// was asked about.
+        results: Vec<(Uuid, String, Option<String>)>,
+        /// Set only when the gate check passed and lifecycle should advance.
+        forward_state: Option<String>,
+    },
 }
 
 impl OutlineMutation {
@@ -161,6 +172,7 @@ impl OutlineMutation {
                 | OutlineMutation::ReorderObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
+                | OutlineMutation::ApplyGateResults { .. }
         )
     }
 
@@ -347,6 +359,16 @@ impl OutlineMutation {
             }
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
+            }
+            OutlineMutation::ApplyGateResults {
+                node_id,
+                results,
+                forward_state,
+            } => {
+                GateRepo::new(conn).apply_gate_results(*node_id, results)?;
+                if let Some(state) = forward_state {
+                    NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
+                }
             }
         }
         Ok(None)

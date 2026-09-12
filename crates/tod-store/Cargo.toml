@@ -33,4 +33,5 @@ windows = { version = "0.57", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Registry",
+    "Win32_System_Threading",
 ] }

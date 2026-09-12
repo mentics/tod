@@ -5,6 +5,7 @@
 //! Persistence lives in `tod-store`; agent transport lives in `tod-agent`.
 
 pub mod agent_context;
+pub mod gate;
 pub mod install;
 pub mod interview;
 pub mod linear_import;

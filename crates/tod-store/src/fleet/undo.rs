@@ -378,7 +378,8 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::UpdateObligationSection { .. }
         | OutlineMutation::ReorderObligation { .. }
         | OutlineMutation::SetExtraContent { .. }
-        | OutlineMutation::SetLifecycle { .. } => Ok(None),
+        | OutlineMutation::SetLifecycle { .. }
+        | OutlineMutation::ApplyGateResults { .. } => Ok(None),
     }
 }
 

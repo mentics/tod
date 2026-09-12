@@ -38,9 +38,11 @@ When criteria are present, you must return a **`gate_results`** section (see Res
 
 ## Response format
 
-Return YAML front matter the caller can parse, then a markdown findings body:
+Return YAML front matter the caller can parse, then a markdown findings body.
+Your reply must **start with the literal line `---`** — no preamble sentence
+before it, and do not wrap the reply in a markdown code fence (no ` ``` `):
 
-```yaml
+```
 ---
 result: pass | blocked | needs_human | no_change
 forward_lifecycle: {string|null}
@@ -49,6 +51,9 @@ paused: {true|false}
 
 # Findings
 ```
+
+(The block above is fenced only for this doc's own readability — your actual
+reply is plain text starting directly with `---`.)
 
 | `result` | Meaning |
 |--|--|

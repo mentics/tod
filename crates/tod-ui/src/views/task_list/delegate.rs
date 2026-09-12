@@ -409,6 +409,8 @@ fn title_label(
                 .text_sm()
                 .font_medium()
                 .text_color(foreground)
+                .overflow_hidden()
+                .text_ellipsis()
                 .child(title),
         )
         .when(selected, |el| {

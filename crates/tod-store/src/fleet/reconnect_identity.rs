@@ -26,30 +26,37 @@ pub fn verify(pid: u32, birth_token: u64) -> bool {
 }
 
 /// Best-effort check that a PID still exists (used when sysinfo cannot see MSYS/bash).
+///
+/// The Windows fallback used to shell out to `powershell.exe` per call, which costs
+/// hundreds of milliseconds to over a second just to spin up the PowerShell host — brutal
+/// when this runs once per stale agent/shell on every launch. It now uses `OpenProcess`
+/// directly, which is a plain syscall (microseconds).
 pub fn pid_exists(pid: u32) -> bool {
     if record(pid).is_some() {
         return true;
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        return std::process::Command::new("powershell.exe")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
-                ),
-            ])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        return windows_pid_exists(pid);
     }
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(windows)]
+fn windows_pid_exists(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 

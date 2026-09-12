@@ -1309,7 +1309,11 @@ fn open_fleet_store(
 ) -> Result<Arc<FleetStore>, (FleetLaunchError, PathBuf)> {
     let root = resolve_fleet_root()
         .map_err(|err| (FleetLaunchError::Other(err), PathBuf::from("<unresolved>")))?;
-    let mut store = FleetStore::open(&root).map_err(|err| (err, root.clone()))?;
+    // Skip launch-time reattach here: it walks every agent/shell with a recorded reconnect
+    // identity and probes whether its process is still alive, which does not need to finish
+    // before the window can be shown. `run_launch_hooks` runs afterward on a background
+    // thread (see the `open()` caller below) so it can never delay first paint.
+    let mut store = FleetStore::open_without_reattach(&root).map_err(|err| (err, root.clone()))?;
     store.set_traffic_log(traffic_log);
     Ok(Arc::new(store))
 }
@@ -1406,6 +1410,21 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         cx.new(|cx| Root::new(view, window, cx))
                     }
                     Ok(fleet) => {
+                        // Reconcile stale agent/shell runtime status off the main thread. This
+                        // probes OS process liveness for every reconnect-tracked row, which is
+                        // unbounded work (and, on Windows, previously shelled out to
+                        // powershell.exe per row) — none of it needs to finish before the window
+                        // is visible, so it must never sit on the path to `cx.open_window`.
+                        let reattach_fleet = fleet.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) =
+                                reattach_fleet.run_launch_hooks(&tod_store::fleet::NoopGuestLiveness)
+                            {
+                                tracing::error!(
+                                    "background launch-time reattach failed: {err:#}"
+                                );
+                            }
+                        });
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
                         // also calls, as a one-shot process, when no GUI instance is running).
@@ -1460,8 +1479,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let task_edit = cx.new(|cx| TaskEditView::new(window, cx, fleet.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
-                        let lifecycle_panel =
-                            cx.new(|cx| LifecyclePanelView::new(cx, fleet.clone()));
+                        let lifecycle_panel = cx.new(|cx| {
+                            LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
+                        });
                         let agent_panel = cx.new(|cx| {
                             AgentConfigPanelView::new(
                                 window,

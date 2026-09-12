@@ -11,7 +11,19 @@
       "WebFetch(domain:studio.apollographql.com)",
       "Bash(./target/debug/tod-cli:*)",
       "Bash(test:*)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(grep:*)",
+      "Bash(covers: [constraint-wording])",
+      "Bash(context: \"You confirmed that tod-agent is exclusively for agent code and integrations belong in tod-integration and per-integration crates. Constraint f13595ea currently reads: ''The data-source trait and all transport/API code must live in tod-agent \\(or a new leaf crate with no tod-* dependencies\\).'' The mention of tod-agent is now misleading.\")",
+      "Bash(question: \"Update constraint f13595ea to say tod-integration instead of tod-agent?\")",
+      "Bash(intent: \"Aligns constraint wording with the design decision from q-100. Option 2 keeps the current wording which technically still allows it but is confusing.\")",
+      "Bash(recommend: 1)",
+      "Bash(options:)",
+      "Bash(proposal:)",
+      "Bash(op: update)",
+      "Bash(id: f13595ea)",
+      "Bash(text: \"The data-source trait and all transport/API code must live in tod-integration \\(or a per-integration leaf crate with no tod-* dependencies\\), not in tod-agent. tod-agent is exclusively for agent transport.\")",
+      "Bash(YAML)"
     ]
   }
 }

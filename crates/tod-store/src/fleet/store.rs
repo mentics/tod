@@ -24,6 +24,7 @@ use crate::fleet::resolve_agent_config::{
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
+use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
 use crate::outline::repos::{ListRepo, OutlineRepo, tree::TreeLoader};
@@ -74,10 +75,26 @@ impl FleetStore {
     }
 
     /// Open the fleet store and run launch-time reattach with the given guest-liveness implementation.
+    ///
+    /// Reattach walks every agent/shell with a recorded reconnect identity and checks whether its
+    /// process is still alive, which can involve OS process-liveness probes per row. That's cheap
+    /// when the fleet is small but is unbounded work in the general case, so callers that need the
+    /// window on screen as fast as possible (the GUI) should use [`Self::open_without_reattach`]
+    /// and call [`Self::run_launch_hooks`] afterward on a background thread instead.
     pub fn open_with_guest_liveness(
         root: impl AsRef<Path>,
         guest: &dyn GuestLivenessCheck,
     ) -> Result<Self, FleetLaunchError> {
+        let store = Self::open_without_reattach(root)?;
+        store.run_launch_hooks(guest)?;
+        Ok(store)
+    }
+
+    /// Open the fleet store without running launch-time reattach or the legacy-interview
+    /// migration check. The store is immediately usable (reads/writes work normally); the caller
+    /// is responsible for calling [`Self::run_launch_hooks`] at some point afterward so stale
+    /// agent/shell runtime status eventually gets reconciled.
+    pub fn open_without_reattach(root: impl AsRef<Path>) -> Result<Self, FleetLaunchError> {
         let paths = FleetPaths::new(root)?;
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
@@ -99,7 +116,7 @@ impl FleetStore {
             background_shutdown.clone(),
         );
 
-        let store = Self {
+        Ok(Self {
             paths,
             _lock: lock,
             writer,
@@ -110,19 +127,25 @@ impl FleetStore {
             migration: None,
             traffic_log: None,
             background_shutdown,
-        };
+        })
+    }
 
-        store.run_launch_hooks(guest)?;
+    /// Run launch-time reattach (stale agent/shell liveness reconciliation) plus the legacy
+    /// interview-session migration check. Safe to call from a background thread after the store
+    /// is already in use — it only enqueues writes through the normal writer and reloads the
+    /// projection, both of which are already safe for concurrent readers.
+    pub fn run_launch_hooks(&self, guest: &dyn GuestLivenessCheck) -> Result<(), FleetLaunchError> {
+        self.run_reattach(guest)?;
         if let Ok(paths) = crate::paths::TodPaths::discover() {
-            let projection = store.projection.lock().expect("fleet projection mutex");
+            let projection = self.projection.lock().expect("fleet projection mutex");
             let conn = projection.connection();
             let _ =
                 crate::outline::migrate_interview::migrate_legacy_interview_sessions(&conn, &paths);
         }
-        Ok(store)
+        Ok(())
     }
 
-    fn run_launch_hooks(&self, guest: &dyn GuestLivenessCheck) -> Result<(), FleetLaunchError> {
+    fn run_reattach(&self, guest: &dyn GuestLivenessCheck) -> Result<(), FleetLaunchError> {
         let projection = self.projection.lock().expect("fleet projection mutex");
         let conn = projection.connection();
         reattach::reattach_on_launch(&conn, &self.writer, guest, reconnect_identity::verify)
@@ -281,6 +304,21 @@ impl FleetStore {
         let guard = self.projection.lock().expect("fleet projection mutex");
         let conn = guard.connection();
         TaskRepo::new(&conn).get_node(id).map_err(Into::into)
+    }
+
+    /// Gate criteria for one forward transition, paired with this node's most
+    /// recent evaluation of each (`None` when never evaluated).
+    pub fn gate_criteria_for_transition(
+        &self,
+        node_id: uuid::Uuid,
+        from_state: &str,
+        to_state: &str,
+    ) -> Result<Vec<(GateCriterion, Option<NodeGateEvaluation>)>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        GateRepo::new(&conn)
+            .list_evaluations_for_transition(node_id, from_state, to_state)
+            .map_err(Into::into)
     }
 
     /// List agent configs for a task/node from the projection.
