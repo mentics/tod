@@ -12,6 +12,7 @@ mod args;
 mod interview;
 mod obligations;
 mod plan;
+mod visual_design;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +36,7 @@ NOUNS:
     questions            Interview questions for a node
     memory               Interview memory notes for a node
     interview            Interview session state
+    visual-design        UI mockup packages for a node
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -120,8 +122,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "questions" => interview::questions(invocation),
         "memory" => interview::memory(invocation),
         "interview" => interview::interview(invocation),
+        "visual-design" => visual_design::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: obligations, content, plan, questions, memory, interview)"
+            "unknown noun `{other}` (expected: obligations, content, plan, questions, memory, interview, visual-design)"
         ),
     }
 }
@@ -228,6 +231,72 @@ mod tests {
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visual_design_save_writes_file_and_links_obligation() {
+        let (root, node, _) = data_root();
+        let node_str = node.to_string();
+
+        let html_path = root.join("mockup.html");
+        std::fs::write(&html_path, "<div style=\"display:flex\">Hello</div>").unwrap();
+
+        let saved = cli(
+            &root,
+            &[
+                "visual-design",
+                "save",
+                "--node",
+                &node_str,
+                "--title",
+                "Login screen",
+                "--html-file",
+                html_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(saved.starts_with("ok "), "{saved}");
+        let short = saved
+            .strip_prefix("ok ")
+            .and_then(|s| s.split(' ').next())
+            .unwrap()
+            .to_string();
+
+        let saved_file = root.join("visual-design").join(node_str.clone()).join("login-screen.html");
+        assert!(saved_file.is_file(), "expected {} to exist", saved_file.display());
+        assert_eq!(
+            std::fs::read_to_string(&saved_file).unwrap(),
+            "<div style=\"display:flex\">Hello</div>"
+        );
+
+        let shown = cli(&root, &["obligations", "show", &short]).unwrap();
+        assert!(shown.contains("Visual design package"), "{shown}");
+        assert!(shown.contains("login-screen.html"), "{shown}");
+        assert!(shown.contains("design/requirement"), "{shown}");
+
+        let listed = cli(&root, &["visual-design", "list", "--node", &node_str]).unwrap();
+        assert!(listed.contains("Visual design package"), "{listed}");
+
+        // A <script> tag is rejected.
+        let script_path = root.join("bad.html");
+        std::fs::write(&script_path, "<script>alert(1)</script>").unwrap();
+        let err = cli(
+            &root,
+            &[
+                "visual-design",
+                "save",
+                "--node",
+                &node_str,
+                "--title",
+                "Bad",
+                "--html-file",
+                script_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("<script>"), "{err}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 

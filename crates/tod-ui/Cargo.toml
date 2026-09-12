@@ -21,7 +21,7 @@ sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 gpui = "0.2.2"
-gpui-component = "0.5.1"
+gpui-component = { version = "0.5.1", features = ["webview"] }
 gpui-component-assets = "0.5.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 notify = "8.0"
@@ -39,6 +39,10 @@ tracing-appender = "0.2"
 tracing-rolling-file = { version = "0.1.3", features = ["non-blocking"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.0", features = ["v4"] }
+# Backs `gpui_component::webview::WebView` (feature "webview" above), used by
+# the visual-design panel to render mockup HTML. See webview_spike.rs and
+# CLAUDE.md's cross-platform CI note — untested on Linux/macOS as of writing.
+wry = { version = "0.53.3", package = "lb-wry" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.57", features = [

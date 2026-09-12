@@ -28,6 +28,9 @@ use crate::views::agent_config_panel::{AgentConfigPanelEvent, AgentConfigPanelVi
 use crate::views::database::DatabaseView;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
+use crate::views::visual_design_panel::{
+    EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
+};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
 use gpui::prelude::FluentBuilder;
@@ -93,6 +96,7 @@ pub struct Shell {
     task_edit: Entity<TaskEditView>,
     obligations: Entity<ObligationsView>,
     lifecycle_panel: Entity<LifecyclePanelView>,
+    visual_design_panel: Entity<VisualDesignPanelView>,
     agent_panel: Entity<AgentConfigPanelView>,
     sessions: Entity<SessionsView>,
     settings: Entity<SettingsView>,
@@ -121,6 +125,7 @@ pub struct Shell {
     pending_open_lifecycle_panel: Option<String>,
     pending_close_lifecycle_panel: bool,
     pending_retarget_lifecycle_panel: Option<String>,
+    pending_open_visual_design: Option<String>,
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
     pending_retarget_obligations: Option<(String, String, bool)>,
@@ -138,6 +143,7 @@ pub struct Shell {
     _task_edit_subscription: Subscription,
     _obligations_subscription: Subscription,
     _lifecycle_panel_subscription: Subscription,
+    _visual_design_panel_subscription: Subscription,
     _agent_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
     _settings_subscription: Subscription,
@@ -1024,6 +1030,7 @@ impl Render for Shell {
         self.drain_pending_obligations(window, cx);
         self.drain_pending_agent_panel(window, cx);
         self.drain_pending_lifecycle_panel(window, cx);
+        self.drain_pending_visual_design(window, cx);
         self.drain_pending_focus_drawer(window, cx);
         self.drain_pending_error_toast(window, cx);
         crate::ui::agent_permission::drain_queued_requests(window, cx);
@@ -1112,6 +1119,8 @@ impl Shell {
             self.obligations.clone().into_any_element()
         } else if self.task_edit.read(cx).is_open() {
             self.task_edit.clone().into_any_element()
+        } else if self.visual_design_panel.read(cx).is_open() {
+            self.visual_design_panel.clone().into_any_element()
         } else if self.lifecycle_panel.read(cx).is_open() {
             self.lifecycle_panel.clone().into_any_element()
         } else if self.agent_panel.read(cx).is_open() {
@@ -1173,6 +1182,10 @@ impl Shell {
             self.task_edit.update(cx, |panel, cx| {
                 panel.focus_handle(cx).focus(window);
             });
+        } else if self.visual_design_panel.read(cx).is_open() {
+            self.visual_design_panel.update(cx, |panel, cx| {
+                panel.focus_handle(cx).focus(window);
+            });
         } else if self.agent_panel.read(cx).is_open() {
             self.agent_panel.update(cx, |panel, cx| {
                 panel.focus_handle(cx).focus(window);
@@ -1196,6 +1209,114 @@ impl Shell {
         if let Some(task_id) = self.pending_open_lifecycle_panel.take() {
             self.open_lifecycle_panel(&task_id, window, cx);
         }
+    }
+
+    fn drain_pending_visual_design(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(task_id) = self.pending_open_visual_design.take() {
+            self.open_visual_design_panel(&task_id, window, cx);
+        }
+    }
+
+    /// Open the visual design panel (mockup `WebView` + embedded agent chat)
+    /// for `task_id`, from the lifecycle gate checklist's affordance on
+    /// `design-planning.visual-packages-accepted-or-waived`.
+    ///
+    /// Mirrors `open_obligations_agent_chat`, but constructs the chat
+    /// in-process via `InteractiveAgentWindowControl::create_embedded_session`
+    /// instead of opening a standalone window, so it can sit inside the panel
+    /// next to the mockup preview.
+    fn open_visual_design_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        let Some(node) = self.fleet.get_node(task_id).ok().flatten() else {
+            return;
+        };
+        let config_id = match self.create_default_agent_config(node_id, cx) {
+            Ok(id) => id,
+            Err(err) => {
+                self.queue_error_toast(err, cx);
+                return;
+            }
+        };
+        let (fleet, agent, workspace_cwd, settings, session_run_id) = match self
+            ._interactive_agent_window
+            .create_embedded_session(task_id, &config_id, Some("design/visual-design"))
+        {
+            Ok(session) => session,
+            Err(err) => {
+                self.queue_error_toast(err, cx);
+                return;
+            }
+        };
+        let initial_context = match self.build_visual_design_agent_context(node_id) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::warn!(
+                    event = "agent_chat",
+                    action = "context_unavailable",
+                    error = %err,
+                    "opening visual design chat without app context"
+                );
+                None
+            }
+        };
+
+        self.visual_design_panel.update(cx, |panel, cx| {
+            panel.open(
+                node_id,
+                &node.title,
+                EmbeddedChatParams {
+                    config_id,
+                    session_run_id,
+                    fleet,
+                    agent,
+                    workspace_cwd,
+                    settings,
+                    window_control: self._interactive_agent_window.clone(),
+                    initial_context,
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
+    /// Assemble the visual-design agent's first message: bundled context docs
+    /// plus the live node selection (see `build_obligations_agent_context`).
+    fn build_visual_design_agent_context(&self, node_id: uuid::Uuid) -> anyhow::Result<String> {
+        use tod_core::agent_context::{ContextRequest, NodeSelection, build_first_message};
+        use tod_core::media::MediaPaths;
+
+        let media = MediaPaths::discover()?;
+        let node = self
+            .fleet
+            .get_node(&node_id.to_string())
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("node {node_id} not found"))?;
+        let body = self
+            .fleet
+            .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_DETAILS)
+            .ok()
+            .flatten();
+        let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
+
+        build_first_message(
+            &media,
+            &ContextRequest {
+                key: "design/visual-design",
+                data_root: self.paths.data_root(),
+                node: NodeSelection {
+                    id: node_id,
+                    title: node.title,
+                    body,
+                    lifecycle: Some(node.lifecycle),
+                },
+                obligation: None,
+                purposes,
+            },
+        )
     }
 
     fn drain_pending_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1502,6 +1623,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let lifecycle_panel = cx.new(|cx| {
                             LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
                         });
+                        let visual_design_panel =
+                            cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
                         let agent_panel = cx.new(|cx| {
                             AgentConfigPanelView::new(
                                 window,
@@ -1737,6 +1860,23 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             Some((task_id.clone(), lifecycle.clone()));
                                         cx.notify();
                                     }
+                                    LifecyclePanelEvent::OpenVisualDesign { task_id } => {
+                                        this.pending_open_visual_design = Some(task_id.clone());
+                                        cx.notify();
+                                    }
+                                },
+                            );
+                            let _visual_design_panel_subscription = cx.subscribe(
+                                &visual_design_panel,
+                                |this: &mut Shell, _, event, cx| match event {
+                                    VisualDesignPanelEvent::Close => {
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
+                                    VisualDesignPanelEvent::FocusTaskList => {
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
                                 },
                             );
                             let _agent_panel_subscription =
@@ -1795,6 +1935,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 task_edit,
                                 obligations,
                                 lifecycle_panel,
+                                visual_design_panel,
                                 agent_panel,
                                 sessions,
                                 settings,
@@ -1820,6 +1961,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_lifecycle_panel: None,
                                 pending_close_lifecycle_panel: false,
                                 pending_retarget_lifecycle_panel: None,
+                                pending_open_visual_design: None,
                                 pending_open_obligations: None,
                                 pending_close_obligations: false,
                                 pending_retarget_obligations: None,
@@ -1837,6 +1979,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _task_edit_subscription,
                                 _obligations_subscription,
                                 _lifecycle_panel_subscription,
+                                _visual_design_panel_subscription,
                                 _agent_panel_subscription,
                                 _sessions_subscription,
                                 _settings_subscription,

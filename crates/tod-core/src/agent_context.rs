@@ -100,7 +100,7 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
             "\nThe user has this obligation selected, so an unqualified question \
              most likely refers to it.\n",
         );
-    } else {
+    } else if request.key == "obligations" {
         out.push_str(
             "\nNo individual obligation is selected — the user is looking at the \
              node's obligations as a whole.\n",
@@ -157,6 +157,19 @@ mod tests {
         assert!(purpose_idx < ship_product_idx);
         assert!(ship_product_idx < ship_feature_idx);
         assert!(ship_feature_idx < node_idx);
+    }
+
+    #[test]
+    fn non_obligations_key_omits_obligations_panel_wording() {
+        let req = ContextRequest {
+            key: "design/visual-design",
+            data_root: Path::new("/data/tod"),
+            node: node(),
+            obligation: None,
+            purposes: Vec::new(),
+        };
+        let text = render_dynamic(&req);
+        assert!(!text.contains("No individual obligation is selected"));
     }
 
     #[test]

@@ -94,6 +94,10 @@ pub struct InteractiveAgentView {
     auto_scroll: bool,
     /// Turn count as of the last render, so a new turn can be detected.
     last_turn_count: usize,
+    /// True when this view is embedded inside another panel (e.g. the visual
+    /// design panel) rather than owning its own OS window — `close()` must
+    /// then leave the window alone and let the embedding panel handle it.
+    embedded: bool,
     _poll_task: gpui::Task<()>,
 }
 
@@ -185,6 +189,7 @@ impl InteractiveAgentView {
             scroll_handle: gpui::ScrollHandle::new(),
             auto_scroll: true,
             last_turn_count: 0,
+            embedded: false,
             _poll_task,
         };
         // Focus straight into the prompt box so the window opens ready for
@@ -195,6 +200,13 @@ impl InteractiveAgentView {
             });
         });
         view
+    }
+
+    /// Mark this view as embedded inside another panel rather than owning its
+    /// own OS window (see the `embedded` field doc).
+    pub fn with_embedded(mut self, embedded: bool) -> Self {
+        self.embedded = embedded;
+        self
     }
 
     fn text_editing(&self) -> bool {
@@ -491,7 +503,9 @@ impl InteractiveAgentView {
 
     fn close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.window_control.release_session(&self.session_run_id);
-        window.remove_window();
+        if !self.embedded {
+            window.remove_window();
+        }
     }
 }
 

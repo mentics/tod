@@ -231,6 +231,72 @@ impl InteractiveAgentWindowControl {
         Ok(session_run_id)
     }
 
+    /// Create a new session (same bookkeeping as [`Self::create_and_open_session`])
+    /// without opening a standalone window — returns everything needed to
+    /// construct an embedded [`InteractiveAgentView`] directly inside a
+    /// caller's own panel. Used by panels that host the chat inline (e.g. the
+    /// visual design panel) rather than a separate OS window.
+    ///
+    /// Deliberately ignores `ChatLaunchMode::Terminal`: an embedded panel is
+    /// always embedded, regardless of the "Chat with agent" launch-mode
+    /// setting, since the whole point of embedding is one integrated view.
+    #[allow(clippy::type_complexity)]
+    pub fn create_embedded_session(
+        &self,
+        task_id: &str,
+        config_id: &str,
+        context_key: Option<&str>,
+    ) -> Result<
+        (
+            std::sync::Arc<FleetStore>,
+            SharedAgent,
+            std::path::PathBuf,
+            TodSettings,
+            String,
+        ),
+        String,
+    > {
+        let (fleet, agent, paths, bound_settings) = self.bound_resources()?;
+        let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
+        let subject = fleet
+            .get_node(task_id)
+            .ok()
+            .flatten()
+            .map(|node| node.title)
+            .unwrap_or_default();
+        let session_name =
+            tod_core::session_name::session_name(context_key, &subject, chrono::Local::now());
+
+        fleet
+            .enqueue(FleetMutation::CreateAgentRun {
+                config_id: config_id.to_string(),
+                run_kind: Some("interactive".into()),
+                session_name: Some(session_name),
+            })
+            .map_err(|err| format!("create session failed: {err}"))?;
+        fleet
+            .writer()
+            .flush()
+            .map_err(|err| format!("create session failed: {err}"))?;
+        let _ = fleet.reload_if_stale();
+        let session_run_id = fleet
+            .list_interactive_sessions_for_config(config_id)
+            .map_err(|err| format!("create session failed: {err}"))?
+            .into_iter()
+            .next()
+            .map(|run| run.id)
+            .ok_or_else(|| "create session failed: run not created".to_string())?;
+
+        let agent_row = fleet
+            .get_agent(config_id)
+            .map_err(|err| format!("load agent config: {err}"))?
+            .ok_or_else(|| format!("agent config {config_id} not found"))?;
+        let workspace_cwd = resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
+            .map_err(|err| format!("workspace: {err:#}"))?;
+
+        Ok((fleet, agent, workspace_cwd, settings, session_run_id))
+    }
+
     /// Open or focus a chat session window.
     pub fn open_session(
         &self,

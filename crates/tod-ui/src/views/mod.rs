@@ -9,3 +9,4 @@ pub mod obligations;
 pub mod plan_steps;
 pub mod task_edit;
 pub mod task_list;
+pub mod visual_design_panel;

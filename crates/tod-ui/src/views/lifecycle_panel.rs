@@ -75,6 +75,21 @@ pub enum LifecyclePanelEvent {
     /// on-demand fallback, not something the gate check does automatically.
     /// See `TaskListView::open_interview_for_task`.
     OpenInterview { task_id: String, lifecycle: String },
+    /// Clicked the visual-design affordance on the
+    /// `design-planning.visual-packages-accepted-or-waived` criterion row.
+    OpenVisualDesign { task_id: String },
+}
+
+/// The `design-planning.visual-packages-accepted-or-waived` gate criterion's
+/// id (see `tod_store::outline::GATE_CRITERIA`) — `apply_gate_reply` stores a
+/// criterion's id (not its slug) as `CriterionOutcome::label`, so this is
+/// resolved once and matched against that field to show the visual-design
+/// affordance only on that row.
+fn visual_design_criterion_id() -> Option<String> {
+    tod_store::outline::GATE_CRITERIA
+        .iter()
+        .find(|c| c.slug == "design-planning.visual-packages-accepted-or-waived")
+        .map(|c| c.id_str.to_string())
 }
 
 /// Keyboard-navigable stops within the panel, in visual order.
@@ -876,13 +891,31 @@ impl Render for LifecyclePanelView {
             }
 
             if !criteria_detail.is_empty() {
+                let visual_design_id = visual_design_criterion_id();
                 let mut list = v_flex().gap_1().w_full();
                 for row in &criteria_detail {
                     let mut line = format!("{}: {}", row.label, row.outcome);
                     if let Some(detail) = row.detail.as_deref() {
                         line.push_str(&format!(" — {detail}"));
                     }
-                    list = list.child(div().text_xs().text_color(muted).child(line));
+                    let mut item = h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().flex_1().text_xs().text_color(muted).child(line));
+                    if visual_design_id.as_deref() == Some(row.label.as_str()) {
+                        item = item.child(
+                            Button::new("lifecycle-panel-open-visual-design")
+                                .label("Visual design")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(task_id) = this.task_id.clone() {
+                                        cx.emit(LifecyclePanelEvent::OpenVisualDesign { task_id });
+                                    }
+                                })),
+                        );
+                    }
+                    list = list.child(item);
                 }
                 body = body.child(
                     v_flex()

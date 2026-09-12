@@ -137,6 +137,13 @@ impl TodPaths {
         self.data_root.join("treehouse")
     }
 
+    /// Directory holding saved visual-design mockup HTML files for one node.
+    pub fn visual_design_dir(&self, node_id: uuid::Uuid) -> PathBuf {
+        self.data_root
+            .join("visual-design")
+            .join(node_id.to_string())
+    }
+
     pub fn ensure_config_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
             .with_context(|| format!("failed to create config dir {}", self.config_dir.display()))
