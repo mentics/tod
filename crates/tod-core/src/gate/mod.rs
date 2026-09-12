@@ -11,6 +11,8 @@ pub mod context;
 pub mod response;
 pub mod routing;
 
-pub use context::{GATE_CHECK_CONTEXT_KEY, GateCheckRequest, build_gate_check_message};
+pub use context::{
+    GATE_CHECK_CONTEXT_KEY, GateCheckRequest, PlanStepWithLinks, build_gate_check_message,
+};
 pub use response::{GateCheckReply, GateOutcome, GateResultRow, parse_gate_reply};
 pub use routing::{gate_criteria_for, gate_criteria_for_with_conn};

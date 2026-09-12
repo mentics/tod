@@ -5,11 +5,22 @@
 //! `assets/process/agents/state/base.md` documents: forward state, criteria
 //! (id/slug/label), and prior evaluations, when any exist for this node.
 
+use crate::interview::context::{obligation_line, plan_step_line};
 use crate::media::{MediaPaths, load_static_context};
 use anyhow::Result;
 use std::path::Path;
-use tod_store::outline::{GateCriterion, NodeGateEvaluation};
+use tod_store::outline::{GateCriterion, NodeGateEvaluation, NodeObligation, PlanStep};
 use uuid::Uuid;
+
+/// One plan step paired with its dependency and satisfied-obligation ids,
+/// for rendering traceability (`--satisfies` / `--depends-on` links) in the
+/// gate-check message — mirrors what the planning-interview snapshot shows.
+#[derive(Debug, Clone)]
+pub struct PlanStepWithLinks {
+    pub step: PlanStep,
+    pub depends_on: Vec<Uuid>,
+    pub satisfies: Vec<Uuid>,
+}
 
 /// Context key under `media/context/` for the gate-check static doc.
 pub const GATE_CHECK_CONTEXT_KEY: &str = "gate_check";
@@ -21,10 +32,18 @@ pub struct GateCheckRequest<'a> {
     pub node_id: Uuid,
     pub node_title: String,
     pub node_lifecycle: String,
-    /// Node body/details, when the node has any (e.g. design or plan content).
+    /// Node body/details, when the node has any (the `details` extra-content
+    /// field — design decisions live as design-phase obligations, not here).
     pub node_body: Option<String>,
     /// Inherited + own purpose, most general first (see `agent_context::ContextRequest`).
     pub purposes: Vec<String>,
+    /// This node's obligations (requirements/constraints), so a `verifying`/
+    /// `review` gate check can confirm every requirement was traced without
+    /// the agent having to shell out to `tod-cli obligation list` first.
+    pub obligations: Vec<NodeObligation>,
+    /// This node's plan steps with their dependency and `--satisfies` links,
+    /// for the same traceability reason.
+    pub plan_steps: Vec<PlanStepWithLinks>,
     pub from_state: String,
     pub to_state: String,
     /// Criteria for this transition paired with the node's most recent
@@ -75,6 +94,28 @@ fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
             out.push('\n');
         }
         _ => {}
+    }
+
+    out.push_str("\n## Obligations\n\n");
+    if request.obligations.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for o in &request.obligations {
+            out.push_str("- ");
+            out.push_str(&obligation_line(o));
+            out.push('\n');
+        }
+    }
+
+    out.push_str("\n## Plan steps\n\n");
+    if request.plan_steps.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for entry in &request.plan_steps {
+            out.push_str("- ");
+            out.push_str(&plan_step_line(&entry.step, &entry.depends_on, &entry.satisfies));
+            out.push('\n');
+        }
     }
 
     out.push_str("\n## Gate check\n\n");
@@ -148,6 +189,8 @@ mod tests {
             node_lifecycle: "verifying".into(),
             node_body: None,
             purposes: Vec::new(),
+            obligations: Vec::new(),
+            plan_steps: Vec::new(),
             from_state: "verifying".into(),
             to_state: "review".into(),
             criteria: Vec::new(),
@@ -168,6 +211,8 @@ mod tests {
             node_lifecycle: "design".into(),
             node_body: None,
             purposes: Vec::new(),
+            obligations: Vec::new(),
+            plan_steps: Vec::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
             criteria: vec![(

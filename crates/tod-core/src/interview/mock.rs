@@ -99,7 +99,7 @@ fn question_maker(
             node_id: row.node_id,
             session_id: None,
             phase: None,
-            draft: mock_draft(authored + added + i + 1),
+            draft: mock_draft(&row.phase, authored + added + i + 1),
         })?;
     }
     added += wanted;
@@ -128,8 +128,12 @@ fn question_maker(
     Ok(format!("added {added} ({received})"))
 }
 
-fn mock_draft(n: usize) -> QuestionDraft {
-    if n % 2 == 1 {
+fn mock_draft(phase: &str, n: usize) -> QuestionDraft {
+    // Planning questions never carry a proposal — plan steps go through
+    // `tod-cli plan add`, and obligation changes (rare during planning) go
+    // through `tod-cli obligations` directly, outside the question/answer
+    // flow. See `normalize_proposal` in tod-store's interview command.
+    if n % 2 == 1 && phase != PHASE_PLANNING {
         QuestionDraft {
             covers: vec![format!("mock-area-{n}")],
             context: Some(format!("Mock context for question {n}.")),

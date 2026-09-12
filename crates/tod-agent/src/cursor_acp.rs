@@ -1,7 +1,7 @@
 use super::acp_host::{AcpHost, is_standalone_acp_server, spawn_acp_process};
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId, SessionPurpose,
-    SessionTurn,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, PermissionOption,
+    PermissionRequest, RunId, SessionPurpose, SessionTurn,
 };
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::agent_traffic::{
@@ -40,6 +40,15 @@ enum WorkerMessage {
     Completed(Result<String>),
 }
 
+/// A permission request awaiting the user's decision, and how to deliver it
+/// back to the blocked `AcpClient` thread.
+struct PendingPermission {
+    request: PermissionRequest,
+    reply: Sender<String>,
+}
+
+type PendingPermissionSlot = Arc<Mutex<Option<PendingPermission>>>;
+
 struct ActiveRun {
     kind: AgentRunKind,
     state: AgentRunState,
@@ -48,6 +57,8 @@ struct ActiveRun {
     /// Latest human-readable activity reported by the agent, shared with the
     /// `AcpClient` driving this run.
     activity: Arc<Mutex<Option<String>>>,
+    /// Set by the `AcpClient` while it is blocked on `session/request_permission`.
+    pending_permission: PendingPermissionSlot,
     worker: Option<JoinHandle<()>>,
     receiver: Receiver<WorkerMessage>,
 }
@@ -94,6 +105,8 @@ struct LiveConversation {
     /// Latest human-readable activity reported by the agent for the turn in
     /// progress, if any.
     activity: Arc<Mutex<Option<String>>>,
+    /// Set while the current turn is blocked on `session/request_permission`.
+    pending_permission: PendingPermissionSlot,
     purpose: SessionPurpose,
     /// Characters that entered this conversation's context (see
     /// [`AgentProvider::session_context_chars`]).
@@ -111,6 +124,7 @@ impl LiveConversation {
             closed: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(Mutex::new(resume_session_id)),
             activity: Arc::new(Mutex::new(None)),
+            pending_permission: Arc::new(Mutex::new(None)),
             context_chars: Arc::new(AtomicU64::new(0)),
         };
         let conversation = Self {
@@ -120,6 +134,7 @@ impl LiveConversation {
             closed: worker.closed.clone(),
             session_id: worker.session_id.clone(),
             activity: worker.activity.clone(),
+            pending_permission: worker.pending_permission.clone(),
             purpose,
             context_chars: worker.context_chars.clone(),
         };
@@ -150,6 +165,7 @@ struct ConversationWorker {
     closed: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
     activity: Arc<Mutex<Option<String>>>,
+    pending_permission: PendingPermissionSlot,
     context_chars: Arc<AtomicU64>,
 }
 
@@ -226,6 +242,10 @@ impl ConversationWorker {
         blocks: &[String],
     ) -> Result<String> {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .pending_permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         if live.is_none() {
             let start = match self.current_session_id() {
                 Some(id) => SessionStart::Resume(id),
@@ -241,6 +261,7 @@ impl ConversationWorker {
                 self.child.clone(),
                 self.cancelled.clone(),
                 self.activity.clone(),
+                self.pending_permission.clone(),
                 &spec.write_roots,
                 &start,
                 spec.traffic_log.clone(),
@@ -369,9 +390,11 @@ impl CursorAcpProvider {
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let activity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let pending_permission: PendingPermissionSlot = Arc::new(Mutex::new(None));
         let child_for_worker = child_slot.clone();
         let cancelled_for_worker = cancelled.clone();
         let activity_for_worker = activity.clone();
+        let pending_permission_for_worker = pending_permission.clone();
 
         tracing::info!(
             event = "agent",
@@ -402,6 +425,7 @@ impl CursorAcpProvider {
                 child_for_worker,
                 cancelled_for_worker,
                 activity_for_worker,
+                pending_permission_for_worker,
                 traffic_log,
                 id,
                 kind,
@@ -434,6 +458,7 @@ impl CursorAcpProvider {
                 child: child_slot,
                 cancelled,
                 activity,
+                pending_permission,
                 worker: Some(worker),
                 receiver: rx,
             },
@@ -558,6 +583,7 @@ impl AgentProvider for CursorAcpProvider {
                 child: conversation.child.clone(),
                 cancelled: conversation.cancelled.clone(),
                 activity: conversation.activity.clone(),
+                pending_permission: conversation.pending_permission.clone(),
                 worker: None,
                 receiver,
             },
@@ -600,12 +626,23 @@ impl AgentProvider for CursorAcpProvider {
                 }
             }
             let state = match &run.state {
-                AgentRunState::InFlight(_) => AgentRunState::InFlight(
-                    run.activity
+                AgentRunState::InFlight(_) => {
+                    let pending = run
+                        .pending_permission
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .clone(),
-                ),
+                        .as_ref()
+                        .map(|p| p.request.clone());
+                    match pending {
+                        Some(request) => AgentRunState::NeedsPermission(request),
+                        None => AgentRunState::InFlight(
+                            run.activity
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone(),
+                        ),
+                    }
+                }
                 other => other.clone(),
             };
             if let Some((kind, logged)) = completed {
@@ -617,6 +654,23 @@ impl AgentProvider for CursorAcpProvider {
             return Some(state);
         }
         None
+    }
+
+    fn respond_to_permission(&mut self, id: RunId, option_id: &str) -> Result<()> {
+        let run = self
+            .runs
+            .get(&id)
+            .context("no run with a pending permission request")?;
+        let pending = run
+            .pending_permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .context("run has no pending permission request")?;
+        pending
+            .reply
+            .send(option_id.to_string())
+            .map_err(|_| anyhow::anyhow!("agent no longer waiting on this permission request"))
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
@@ -889,6 +943,7 @@ fn run_acp_session(
     child_slot: Arc<Mutex<Option<Child>>>,
     cancelled: Arc<AtomicBool>,
     activity: Arc<Mutex<Option<String>>>,
+    pending_permission: PendingPermissionSlot,
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
     kind: AgentRunKind,
@@ -918,6 +973,7 @@ fn run_acp_session(
         kind,
         write_roots: acp_write_roots(cwd, extra_write_roots),
         activity,
+        pending_permission,
         context_chars: None,
     };
 
@@ -1022,6 +1078,9 @@ struct AcpClient {
     /// Short human-readable description of what the agent is doing right now,
     /// shared with the run's `poll_run` caller so a UI can show live status.
     activity: Arc<Mutex<Option<String>>>,
+    /// Set while this client is blocked waiting on the user's decision for a
+    /// `session/request_permission` call.
+    pending_permission: PendingPermissionSlot,
     /// Running count of characters entering the session's context, when the
     /// caller tracks it.
     context_chars: Option<Arc<AtomicU64>>,
@@ -1049,6 +1108,54 @@ impl AcpClient {
 
     fn set_activity(&self, activity: Option<String>) {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = activity;
+    }
+
+    /// Publish a permission request for `poll_run` to surface, then block
+    /// this thread until [`AgentProvider::respond_to_permission`] answers it
+    /// (or the run is cancelled). Runs on the same background thread that
+    /// drives the whole turn, so blocking here just pauses that turn.
+    fn ask_user_for_permission(&self, title: &str, options: &[Value]) -> Result<String> {
+        let options: Vec<PermissionOption> = options
+            .iter()
+            .filter_map(|option| {
+                let id = option.get("optionId").and_then(Value::as_str)?.to_string();
+                let label = option
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_string();
+                Some(PermissionOption { id, label })
+            })
+            .collect();
+        let request = PermissionRequest {
+            run: self.run_id,
+            title: title.to_string(),
+            options,
+        };
+        let (reply, response_rx) = mpsc::channel();
+        *self
+            .pending_permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(PendingPermission { request, reply });
+
+        let result = loop {
+            if self.cancelled.load(Ordering::SeqCst) {
+                break Err(anyhow::anyhow!("ACP run cancelled"));
+            }
+            match response_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(option_id) => break Ok(option_id),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(anyhow::anyhow!("permission response channel dropped"));
+                }
+            }
+        };
+
+        *self
+            .pending_permission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        result
     }
 
     fn send_request(&mut self, method: &str, params: Value) -> Result<i64> {
@@ -1217,22 +1324,28 @@ impl AcpClient {
                         );
                     }
                 } else {
-                    let deny_id = pick_deny_option_id(&options).unwrap_or("deny-once");
-                    tracing::warn!(
+                    let Some(id) = response_id else {
+                        tracing::warn!(
+                            event = "agent",
+                            action = "acp_permission_no_id",
+                            "permission request missing response id — cannot ask the user"
+                        );
+                        return Ok(());
+                    };
+                    let chosen = self.ask_user_for_permission(tool_title, &options)?;
+                    tracing::info!(
                         event = "agent",
-                        action = "acp_permission_denied",
-                        ?response_id,
-                        deny_id,
+                        action = "acp_permission_answered",
+                        response_id = id,
+                        option_id = %chosen,
                         tool_title,
-                        "denying ACP permission outside allowed write roots"
+                        "user answered ACP permission request"
                     );
-                    if let Some(id) = response_id {
-                        respond(
-                            &mut self.stdin,
-                            id,
-                            json!({ "outcome": { "outcome": "selected", "optionId": deny_id } }),
-                        )?;
-                    }
+                    respond(
+                        &mut self.stdin,
+                        id,
+                        json!({ "outcome": { "outcome": "selected", "optionId": chosen } }),
+                    )?;
                 }
             }
             "cursor/ask_question" => {
@@ -1388,26 +1501,6 @@ fn tool_path_allowed(tool_title: &str, write_roots: &[PathBuf]) -> bool {
     write_roots.iter().any(|root| path_is_under(root, &path))
 }
 
-fn pick_deny_option_id(options: &[Value]) -> Option<&str> {
-    let ids: Vec<&str> = options
-        .iter()
-        .filter_map(|o| o.get("optionId").and_then(Value::as_str))
-        .collect();
-    ids.iter()
-        .copied()
-        .find(|id| *id == "deny-once")
-        .or_else(|| {
-            ids.iter()
-                .copied()
-                .find(|id| id.to_ascii_lowercase().contains("deny"))
-        })
-        .or_else(|| {
-            ids.iter()
-                .copied()
-                .find(|id| id.to_ascii_lowercase().contains("reject"))
-        })
-}
-
 fn pick_allow_option_id(options: &[Value]) -> Option<&str> {
     let ids: Vec<&str> = options
         .iter()
@@ -1559,6 +1652,7 @@ impl PersistentAcpSession {
         child_slot: Arc<Mutex<Option<Child>>>,
         cancelled: Arc<AtomicBool>,
         activity: Arc<Mutex<Option<String>>>,
+        pending_permission: PendingPermissionSlot,
         extra_write_roots: &[PathBuf],
         start: &SessionStart,
         traffic_log: Option<SharedAgentTrafficLog>,
@@ -1591,6 +1685,7 @@ impl PersistentAcpSession {
             kind,
             write_roots: acp_write_roots(cwd, extra_write_roots),
             activity,
+            pending_permission,
             context_chars,
         };
 

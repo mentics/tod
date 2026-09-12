@@ -9,8 +9,8 @@ Some or all of the following appear in your prompt:
 | Block | When |
 |--|--|
 | Node metadata | Always — `node_id`, title, lifecycle, `mode` (interactive \| autonomous), `phase_purpose` |
-| Obligations | Always — resolved obligations (inherited + local), with source when inherited |
-| Phase content | When present — goal, design body, plan body |
+| Obligations | Always — resolved obligations (inherited + local), with source when inherited; includes design-phase obligations once the node has passed `design` |
+| Phase content | When present — goal, plan steps (dependency graph, see `tod-cli plan`) |
 | Parked items | When present — open `parked` interview memory (later-phase detail volunteered during interviews) |
 | Gate check | When `phase_purpose: gate_check` — see below |
 | Interview history | When relevant — answered interview questions and interview memory |
@@ -90,16 +90,11 @@ The app persists `gate_results` to the database and applies lifecycle changes �
 - op: create|update|delete
   kind: requirement|constraint
   node_id: {uuid}
+  phase: requirements|design
   body: "..."
----design_patch
-body: |
-  ...
----plan_patch
-body: |
-  ...
 ```
 
-Return mutations — the caller validates and persists.
+Return mutations — the caller validates and persists. Design decisions are obligations tagged `phase: design`, not a separate document — there is no design-content patch section. Plan steps are not a text patch either: change them directly with `tod-cli plan` (add/update/depend/satisfy, etc. — same vocabulary the planning interview uses), not through a structured section here.
 
 When the invocation is user-facing, add a short summary after the front matter. Silent gate checks should minimize prose.
 

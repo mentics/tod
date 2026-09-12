@@ -31,6 +31,17 @@ pub const PHASE_DESIGN: &str = "design";
 pub const PHASE_PLANNING: &str = "planning";
 pub const PHASES: [&str; 3] = [PHASE_REQUIREMENTS, PHASE_DESIGN, PHASE_PLANNING];
 
+/// Sentinel phase for obligations that predate phase-tagging (migrated rows,
+/// imported docs). Never a valid target for creating a new obligation, but a
+/// valid target for an explicit phase change.
+pub const PHASE_UNKNOWN: &str = "unknown";
+/// Valid phase values for an obligation, including the `unknown` sentinel.
+/// `planning` is deliberately excluded: obligations are a requirements/design
+/// artifact, while planning produces structured plan steps
+/// (`outline::PlanStepRepo`) instead. Historical obligations tagged `planning`
+/// from before this split still read back fine — this only gates creation.
+pub const OBLIGATION_PHASES: [&str; 3] = [PHASE_UNKNOWN, PHASE_REQUIREMENTS, PHASE_DESIGN];
+
 pub const QUESTION_MAKER_IDLE: &str = "idle";
 pub const QUESTION_MAKER_EXHAUSTED: &str = "exhausted";
 
@@ -43,6 +54,9 @@ pub const ENTITY_QUESTION: &str = "question";
 pub const ENTITY_MEMORY: &str = "memory";
 pub const ENTITY_OBLIGATION: &str = "obligation";
 pub const ENTITY_CONTENT: &str = "content";
+pub const ENTITY_PLAN_STEP: &str = "plan_step";
+pub const ENTITY_PLAN_STEP_DEP: &str = "plan_step_dep";
+pub const ENTITY_PLAN_STEP_OBLIGATION: &str = "plan_step_obligation";
 
 /// An interview agent role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

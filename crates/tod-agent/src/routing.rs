@@ -95,6 +95,13 @@ impl AgentProvider for RoutingAgentProvider {
         self.cursor.poll_run(id).or_else(|| self.claude.poll_run(id))
     }
 
+    fn respond_to_permission(&mut self, id: RunId, option_id: &str) -> Result<()> {
+        if self.cursor.respond_to_permission(id, option_id).is_ok() {
+            return Ok(());
+        }
+        self.claude.respond_to_permission(id, option_id)
+    }
+
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
         let _ = self.cursor.cancel_run(id);
         let _ = self.claude.cancel_run(id);

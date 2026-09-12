@@ -4,7 +4,7 @@ Invoked from `design` when the node has user-visible UI.
 
 ## Context
 
-- Design context — obligations, design content excerpts, constructions, constraints, platform/target surfaces
+- Design context — obligations (including design-phase), constructions, constraints, platform/target surfaces
 - User message — direction, feedback on prior mockups, or Accept/reject of a package
 
 ## Response
@@ -20,7 +20,7 @@ package_id: {optional id when mockup ready}
 # Mockup / feedback body
 ```
 
-When the human Accepts a package, return `result: accepted` with enough detail to link the artifact from design content (**required** vs **guideline**).
+When the human Accepts a package, return `result: accepted` with enough detail to link the artifact from the relevant design-phase obligation's body (**required** vs **guideline**).
 
 ## Do not
 

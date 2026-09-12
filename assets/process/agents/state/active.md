@@ -4,18 +4,19 @@
 
 ## On entry
 
-1. Read lifecycle state, resolved obligations (including inherited), design content (if any), plan content, and child nodes when relevant.
-2. If implementation already satisfies the gate (plan complete, ship-with-code tests in place) → verify upstream conformance and proceed to exit.
+1. Read lifecycle state, resolved obligations (including inherited and design-phase, if any), plan steps (`tod-cli plan list`), and child nodes when relevant.
+2. If implementation already satisfies the gate (plan steps implemented/verified, ship-with-code tests in place) → verify upstream conformance and proceed to exit.
 
 ## Responsibilities
 
 ### Implement
 
-Execute the **plan** honoring design and applicable obligations.
+Execute the **plan steps** (`tod-cli plan`) honoring design-phase and applicable obligations.
 
+- Work steps `tod-cli plan ready --node <NODE>` reports as eligible; advance a step's status (`plan update --status`) as it moves to `in_progress`, `implemented`, then `verified`.
 - Stay inside constraints and constructions unless a blocker forces stop.
 - Decide local/reversible plan detail; ask for product intent, irreversible API/schema choices, and doc conflicts.
-- Update plan as implementation learns; minor plan/design edits need not change lifecycle state. **Major** rethinks → move back to `design` or `planning`.
+- Add, split, or re-link steps (`plan add`, `plan depend`/`undepend`) as implementation learns; minor plan/obligation edits need not change lifecycle state. **Major** rethinks → move back to `design` or `planning`.
 
 ### Tests that ship
 
@@ -53,20 +54,20 @@ When the human wants to split work under this node, optional task-decomposition 
 
 ## Reconcile
 
-After a coherent change set, reconcile obligations, design, plan, and code before handback.
+After a coherent change set, reconcile obligations (including design-phase), plan, and code before handback.
 
 ## Forward gate rules (`active` → `verifying`)
 
 Apply these prose rules (no DB checklist items for this transition):
 
-- Implementation is **verified complete** against plan content, design content (if any), and applicable obligations (agent checked—not merely claimed).
+- Implementation is **verified complete** against plan steps (each `implemented`/`verified`) and applicable obligations, including design-phase ones (agent checked—not merely claimed).
 - Automated tests that **ship/merge with the code** are complete and included.
 - Runnable surfaces / requirements treated as complete in `active` were **exercised in running context** by the agent — not left for first exercise in `verifying`.
 - Extra local-only harnesses, one-off checks, and the full requirement sweep may still run in `verifying`.
 
 ## Exit
 
-When implementation is verified complete against plan, design, and obligations, ship-with-code tests are done, and runnable slices claimed complete were exercised in context, return `forward_lifecycle: verifying`.
+When implementation is verified complete against plan and obligations (including design-phase), ship-with-code tests are done, and runnable slices claimed complete were exercised in context, return `forward_lifecycle: verifying`.
 
 ## Blockers
 

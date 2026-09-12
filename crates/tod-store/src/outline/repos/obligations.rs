@@ -1,5 +1,6 @@
 //! Obligations repository.
 
+use crate::interview::PHASE_UNKNOWN;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -23,6 +24,7 @@ pub struct NodeObligation {
     pub ordinal: i32,
     pub section: Option<String>,
     pub body: String,
+    pub phase: String,
 }
 
 pub struct ObligationRepo<'a> {
@@ -37,8 +39,8 @@ impl<'a> ObligationRepo<'a> {
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -46,6 +48,7 @@ impl<'a> ObligationRepo<'a> {
                 row.ordinal,
                 row.section,
                 row.body,
+                row.phase,
                 now
             ],
         )?;
@@ -54,7 +57,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body FROM node_obligations WHERE id = ?1",
+            "SELECT id, node_id, kind, ordinal, section, body, phase FROM node_obligations WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_obligation)
@@ -64,7 +67,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase FROM node_obligations
              WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt
@@ -108,6 +111,17 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    pub fn update_phase(&self, id: Uuid, phase: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET phase = ?1, updated_at = ?2 WHERE id = ?3",
+            params![phase, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let Some(row) = self.get(id)? else {
             return Ok(None);
@@ -129,6 +143,7 @@ impl<'a> ObligationRepo<'a> {
         index: usize,
         section: Option<&str>,
         body: &str,
+        phase: &str,
     ) -> Result<()> {
         let mut ids = self.list_ids_for_kind(node_id, kind)?;
         let index = index.min(ids.len());
@@ -140,6 +155,7 @@ impl<'a> ObligationRepo<'a> {
             ordinal: temp_ordinal,
             section: section.map(str::to_string),
             body: body.to_string(),
+            phase: phase.to_string(),
         })?;
         ids.insert(index, id);
         self.write_ordinals(node_id, kind, &ids)?;
@@ -195,6 +211,7 @@ impl<'a> ObligationRepo<'a> {
             ordinal,
             section: row.section,
             body: row.body,
+            phase: row.phase,
         })
     }
 
@@ -257,6 +274,7 @@ impl<'a> ObligationRepo<'a> {
                     ordinal: row.get(3)?,
                     section: Some(row.get::<_, String>(1)?),
                     body: row.get(4)?,
+                    phase: PHASE_UNKNOWN.to_string(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -303,5 +321,6 @@ fn map_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeObligation> {
         ordinal: row.get(3)?,
         section: row.get(4)?,
         body: row.get(5)?,
+        phase: row.get(6)?,
     })
 }

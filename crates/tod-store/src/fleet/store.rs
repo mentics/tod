@@ -27,7 +27,9 @@ use crate::outline::OutlineMutation;
 use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
+use crate::outline::repos::plan_steps::PlanStepRepo;
 use crate::outline::repos::{ListRepo, OutlineRepo, tree::TreeLoader};
+use crate::outline::PlanStep;
 use crate::outline::types::Capability;
 use crate::outline::types::{FlatNodeRow, OutlineList};
 use anyhow::Result;
@@ -504,6 +506,43 @@ impl FleetStore {
         let guard = self.projection.lock().expect("fleet projection mutex");
         ObligationRepo::new(&guard.connection())
             .list_for_node(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Resolved obligations visible to `node_id` — its own plus every
+    /// Spec-capability ancestor's, root to leaf, unfiltered by phase. A gate
+    /// check must see design-phase obligations (from this node or an
+    /// ancestor) alongside requirements-phase ones, not just this node's own
+    /// rows — use this instead of `list_obligations_for_node` there.
+    pub fn resolve_obligations_for_node(&self, node_id: uuid::Uuid) -> Result<Vec<NodeObligation>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        Ok(crate::outline::resolve_obligations(&guard.connection(), node_id, None)?
+            .into_iter()
+            .map(|r| r.obligation)
+            .collect())
+    }
+
+    /// Plan steps for a node, in display order.
+    pub fn list_plan_steps_for_node(&self, node_id: uuid::Uuid) -> Result<Vec<PlanStep>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        PlanStepRepo::new(&guard.connection())
+            .list_for_node(node_id)
+            .map_err(Into::into)
+    }
+
+    /// A plan step's dependency ids (steps it depends on).
+    pub fn list_plan_step_dependencies(&self, step_id: uuid::Uuid) -> Result<Vec<uuid::Uuid>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        PlanStepRepo::new(&guard.connection())
+            .list_dependencies(step_id)
+            .map_err(Into::into)
+    }
+
+    /// The obligation ids a plan step satisfies.
+    pub fn list_plan_step_obligations(&self, step_id: uuid::Uuid) -> Result<Vec<uuid::Uuid>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        PlanStepRepo::new(&guard.connection())
+            .list_obligations(step_id)
             .map_err(Into::into)
     }
 

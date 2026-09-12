@@ -157,7 +157,7 @@ pub fn execute(
             let proposal = draft
                 .proposal
                 .clone()
-                .map(|p| normalize_proposal(&repo, p))
+                .map(|p| normalize_proposal(&repo, &phase, p))
                 .transpose()?;
             let seq = next_seq(conn, "interview_questions", *node_id)?;
             let id = Uuid::new_v4();
@@ -507,18 +507,35 @@ pub fn execute(
         InterviewCommand::Outline { mutation, target } => {
             if let Some(target) = target {
                 guard(&repo, agent.as_ref(), actor, *target, || {
-                    Ok(match ObligationRepo::new(conn).get(*target)? {
-                        Some(o) => format!(
+                    if let Some(o) = ObligationRepo::new(conn).get(*target)? {
+                        return Ok(format!(
                             "{} {}{}: {}",
                             short_id(o.id),
                             o.kind,
                             o.section.map(|s| format!(" ({s})")).unwrap_or_default(),
                             o.body
-                        ),
-                        None => format!("{} was deleted", short_id(*target)),
-                    })
+                        ));
+                    }
+                    if let Some(s) = crate::outline::repos::PlanStepRepo::new(conn).get(*target)? {
+                        return Ok(format!("{} {}: {}", short_id(s.id), s.status, s.body));
+                    }
+                    Ok(format!("{} was deleted", short_id(*target)))
                 })?;
             }
+            // An agent-driven obligation write always uses its own session's
+            // phase — it cannot claim a different one via the CLI arg.
+            let mut owned;
+            let mutation = if let (OutlineMutation::CreateObligation { .. }, Some(agent)) =
+                (mutation, agent.as_ref())
+            {
+                owned = mutation.clone();
+                if let OutlineMutation::CreateObligation { phase, .. } = &mut owned {
+                    *phase = agent.phase.clone();
+                }
+                &owned
+            } else {
+                mutation
+            };
             mutation.execute(conn, media_root)?;
             Ok(json!({}))
         }
@@ -583,7 +600,14 @@ fn next_seq(conn: &Connection, table: &str, node_id: Uuid) -> Result<i64> {
 }
 
 /// Check a proposal's shape and expand obligation id prefixes to full ids.
-fn normalize_proposal(repo: &InterviewRepo<'_>, mut p: Proposal) -> Result<Proposal> {
+fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) -> Result<Proposal> {
+    if phase == PHASE_PLANNING {
+        bail!(
+            "planning-phase questions can't carry a proposal — plan steps go through \
+             `tod-cli plan add`, and obligation changes (rare during planning) go through \
+             `tod-cli obligations` directly, outside the question/answer flow"
+        );
+    }
     let has_text = p.text.as_deref().is_some_and(|t| !t.trim().is_empty());
     match p.op {
         ProposalOp::Add => {
@@ -693,6 +717,10 @@ fn plan_proposal(
                 before: false,
                 section: p.section.clone().filter(|s| !s.trim().is_empty()),
                 body: text.to_string(),
+                // The question this proposal answers already carries the
+                // phase it was asked in — reuse it rather than trusting an
+                // unauthenticated phase from the proposal itself.
+                phase: q.phase.clone(),
             });
             ops.push(json!({ "op": "add", "id": id }));
         }
@@ -823,7 +851,15 @@ mod tests {
         let (dir, conn, node, session) = setup();
         let old = Uuid::new_v4();
         ObligationRepo::new(&conn)
-            .insert_at(old, node, KIND_REQUIREMENT, 0, None, "Notes reset each session.")
+            .insert_at(
+                old,
+                node,
+                KIND_REQUIREMENT,
+                0,
+                None,
+                "Notes reset each session.",
+                PHASE_REQUIREMENTS,
+            )
             .unwrap();
         let proposal = Proposal {
             op: ProposalOp::Add,
@@ -884,10 +920,26 @@ mod tests {
         let unrelated = Uuid::new_v4();
         let obligations = ObligationRepo::new(&conn);
         obligations
-            .insert_at(target, node, KIND_REQUIREMENT, 0, None, "Old wording.")
+            .insert_at(
+                target,
+                node,
+                KIND_REQUIREMENT,
+                0,
+                None,
+                "Old wording.",
+                PHASE_REQUIREMENTS,
+            )
             .unwrap();
         obligations
-            .insert_at(unrelated, node, KIND_REQUIREMENT, 1, None, "Still here.")
+            .insert_at(
+                unrelated,
+                node,
+                KIND_REQUIREMENT,
+                1,
+                None,
+                "Still here.",
+                PHASE_REQUIREMENTS,
+            )
             .unwrap();
         let update = |id: Uuid| Proposal {
             op: ProposalOp::Update,

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::interview::{TodPaths, interview_work_remains};
+use crate::interview::TodPaths;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
@@ -204,6 +204,12 @@ pub enum TaskListEvent {
         #[allow(dead_code)]
         lifecycle: String,
     },
+    /// The lifecycle panel is already open and the tree selection moved to a
+    /// different node — swap the panel to follow it (panel re-loads the
+    /// task itself, including whether it has the Lifecycle capability).
+    RetargetLifecycle {
+        task_id: String,
+    },
     OpenAgentDetail {
         task_id: String,
         agent_id: Option<String>,
@@ -255,6 +261,7 @@ pub struct TaskListView {
     edit_open_for: Option<String>,
     slide_edit_open: bool,
     obligations_open: bool,
+    lifecycle_panel_open: bool,
     agent_panel_open: bool,
     /// Node created for inline edit that is not yet committed with Enter.
     draft_node_id: Option<String>,
@@ -401,6 +408,7 @@ impl TaskListView {
             edit_open_for: None,
             slide_edit_open: false,
             obligations_open: false,
+            lifecycle_panel_open: false,
             agent_panel_open: false,
             draft_node_id: None,
             edit_original_title: None,
@@ -547,6 +555,11 @@ impl TaskListView {
         }
         if self.obligations_open && previous.as_deref() != Some(new_id.as_str()) {
             self.emit_open_obligations_for(&new_id, false, cx);
+        }
+        if self.lifecycle_panel_open && previous.as_deref() != Some(new_id.as_str()) {
+            cx.emit(TaskListEvent::RetargetLifecycle {
+                task_id: new_id.clone(),
+            });
         }
         self.working_set.selected_id = Some(new_id);
         self.persist_working_set();
@@ -1081,72 +1094,78 @@ impl TaskListView {
         self.handle_lifecycle_control(task_id, &lifecycle, window, cx);
     }
 
+    /// Proceed always opens the lifecycle transition panel first, whatever
+    /// the current phase — including phases with an interview. The gate
+    /// check (state agent) gets first crack at advancing the node on its
+    /// own; the interview is a fallback the panel offers only if genuine
+    /// questions remain, not a step every node is forced through. See
+    /// `open_interview_for_task` for the on-demand path the panel uses.
     fn handle_lifecycle_control(
+        &mut self,
+        task_id: &str,
+        lifecycle: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(TaskListEvent::OpenLifecycle {
+            task_id: task_id.to_string(),
+            lifecycle: lifecycle.to_string(),
+        });
+        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
+    }
+
+    /// Validate and open the implementation/design/requirements interview
+    /// for `task_id` on demand — used by the lifecycle panel's "Open
+    /// interview" affordance rather than being forced automatically.
+    pub fn open_interview_for_task(
         &mut self,
         task_id: &str,
         lifecycle: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if interview_phase_for_lifecycle(lifecycle).is_some() {
-            if let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) {
-                if task.is_work_node {
-                    let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
-                        self.show_error("Interview unavailable — invalid task id.", window, cx);
-                        return;
-                    };
-                    if interview_work_remains(node_id, lifecycle) {
-                        if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
-                            if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
-                                self.show_error(
-                                    "Set repository on task before starting interview.",
-                                    window,
-                                    cx,
-                                );
-                                return;
-                            }
-                            let repo = task_row.repo.as_deref().unwrap_or("");
-                            let branch = task_row.branch.as_deref().unwrap_or("");
-                            if let Err(err) =
-                                validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
-                            {
-                                self.show_error(
-                                    format!("Interview workspace: {err:#}"),
-                                    window,
-                                    cx,
-                                );
-                                return;
-                            }
-                        }
-                        cx.emit(TaskListEvent::OpenInterview {
-                            task_id: task_id.to_string(),
-                            node_id,
-                            lifecycle: lifecycle.to_string(),
-                            title: task.title.clone(),
-                        });
-                        self.set_status_line(format!("Opening interview for {}", task.title), cx);
-                    } else {
-                        cx.emit(TaskListEvent::OpenLifecycle {
-                            task_id: task_id.to_string(),
-                            lifecycle: lifecycle.to_string(),
-                        });
-                        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
-                    }
-                } else {
-                    self.show_error(
-                        "Interview unavailable — task is not a work node.",
-                        window,
-                        cx,
-                    );
-                }
+        if interview_phase_for_lifecycle(lifecycle).is_none() {
+            self.show_error("Interview unavailable for this lifecycle state.", window, cx);
+            return;
+        }
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        if !task.is_work_node {
+            self.show_error(
+                "Interview unavailable — task is not a work node.",
+                window,
+                cx,
+            );
+            return;
+        }
+        let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
+            self.show_error("Interview unavailable — invalid task id.", window, cx);
+            return;
+        };
+        if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
+            if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
+                self.show_error(
+                    "Set repository on task before starting interview.",
+                    window,
+                    cx,
+                );
+                return;
+            }
+            let repo = task_row.repo.as_deref().unwrap_or("");
+            let branch = task_row.branch.as_deref().unwrap_or("");
+            if let Err(err) = validate_interview_workspace(PathBuf::from(repo).as_path(), branch) {
+                self.show_error(format!("Interview workspace: {err:#}"), window, cx);
                 return;
             }
         }
-        cx.emit(TaskListEvent::OpenLifecycle {
+        cx.emit(TaskListEvent::OpenInterview {
             task_id: task_id.to_string(),
+            node_id,
             lifecycle: lifecycle.to_string(),
+            title: task.title.clone(),
         });
-        self.set_status_line(format!("Lifecycle panel: {lifecycle}"), cx);
+        self.set_status_line(format!("Opening interview for {}", task.title), cx);
     }
 
     /// Open the lifecycle transition panel for a task (bypasses interview routing).
@@ -1248,6 +1267,15 @@ impl TaskListView {
 
     pub fn set_slide_edit_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.slide_edit_open = open;
+        if !open {
+            self.set_status_line("", cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub fn set_lifecycle_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.lifecycle_panel_open = open;
         if !open {
             self.set_status_line("", cx);
         } else {

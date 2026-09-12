@@ -6,5 +6,6 @@ pub mod interactive_agent;
 pub use tod_core::linear_import;
 pub mod lifecycle_panel;
 pub mod obligations;
+pub mod plan_steps;
 pub mod task_edit;
 pub mod task_list;

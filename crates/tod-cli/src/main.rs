@@ -11,6 +11,7 @@
 mod args;
 mod interview;
 mod obligations;
+mod plan;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,7 +30,8 @@ GLOBAL OPTIONS:
 
 NOUNS:
     obligations          Requirements and constraints attached to a node
-    content              A node's goal, design, and plan
+    content              A node's goal, design, and notes
+    plan                 Structured, dependency-graph plan steps for a node
     questions            Interview questions for a node
     memory               Interview memory notes for a node
     interview            Interview session state
@@ -114,11 +116,12 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     match noun.as_str() {
         "obligations" => obligations::run(invocation),
         "content" => interview::content(invocation),
+        "plan" => plan::run(invocation),
         "questions" => interview::questions(invocation),
         "memory" => interview::memory(invocation),
         "interview" => interview::interview(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: obligations, content, questions, memory, interview)"
+            "unknown noun `{other}` (expected: obligations, content, plan, questions, memory, interview)"
         ),
     }
 }
@@ -202,7 +205,10 @@ mod tests {
         assert_eq!(short.len(), 8);
 
         let listed = cli(&root, &["obligations", "list", "--node", &node]).unwrap();
-        assert_eq!(listed, format!("[{short}] requirement (Core): Keep it simple."));
+        assert_eq!(
+            listed,
+            format!("[{short}] requirements/requirement (Core): Keep it simple.")
+        );
 
         let updated = cli(
             &root,
@@ -221,6 +227,64 @@ mod tests {
         assert_eq!(
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plan_round_trip_with_dependencies_and_obligations() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+
+        let req_added = cli(
+            &root,
+            &[
+                "obligations", "add", "--node", &node, "--kind", "req", "--body",
+                "Ship the thing.",
+            ],
+        )
+        .unwrap();
+        let req_short = req_added.strip_prefix("ok ").unwrap().to_string();
+
+        let step_a = cli(&root, &["plan", "add", "--node", &node, "--body", "Do part A"]).unwrap();
+        let step_a_short = step_a.strip_prefix("ok ").unwrap().to_string();
+        let step_b = cli(
+            &root,
+            &[
+                "plan", "add", "--node", &node, "--body", "Do part B", "--depends-on",
+                &step_a_short, "--satisfies", &req_short,
+            ],
+        )
+        .unwrap();
+        let step_b_short = step_b.strip_prefix("ok ").unwrap().to_string();
+
+        let listed = cli(&root, &["plan", "list", "--node", &node]).unwrap();
+        assert!(listed.contains(&format!("[{step_a_short}] pending: Do part A")), "{listed}");
+        assert!(
+            listed.contains(&format!(
+                "[{step_b_short}] pending deps=[{step_a_short}] satisfies=[{req_short}]: Do part B"
+            )),
+            "{listed}"
+        );
+
+        // A cycle is rejected.
+        let cycle_err = cli(&root, &["plan", "depend", &step_a_short, "--on", &step_b_short])
+            .unwrap_err();
+        assert!(cycle_err.to_string().contains("cycle"), "{cycle_err}");
+
+        // Only step A is ready until it's implemented.
+        assert_eq!(cli(&root, &["plan", "ready", "--node", &node]).unwrap(), step_a_short);
+
+        assert_eq!(
+            cli(&root, &["plan", "update", &step_a_short, "--status", "implemented"]).unwrap(),
+            format!("ok {step_a_short}")
+        );
+        // Step B auto-promotes to ready once its dependency is implemented.
+        assert_eq!(cli(&root, &["plan", "ready", "--node", &node]).unwrap(), step_b_short);
+
+        assert_eq!(
+            cli(&root, &["plan", "delete", &step_b_short]).unwrap(),
+            format!("ok {step_b_short}")
         );
         let _ = std::fs::remove_dir_all(root);
     }

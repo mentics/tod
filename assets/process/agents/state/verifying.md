@@ -4,7 +4,7 @@
 
 ## On entry
 
-1. Read lifecycle state, resolved obligations (including inherited), design and plan content, implementation, and evidence from `active`.
+1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
 
 ## Responsibilities
@@ -27,7 +27,7 @@ Re-exercise in **running context** as needed for the full sweep (prefer automate
 
 ### Traceability
 
-Results must trace upstream through plan, design (if any), and obligations.
+Results must trace upstream through plan steps (`--satisfies` links, each step `verified`) and obligations, including design-phase ones.
 
 ### Revalidate conformance
 
@@ -43,7 +43,7 @@ Complete self-review before `review`. **`review` is not where functional bugs ar
 
 Apply these prose rules in addition to checklist criteria the app sends:
 
-- Verification is complete: **every requirement** in applicable obligations (node + ancestors as bound) has been checked (success criteria when present, otherwise the measurable statement) and is **traceable** upstream through plan, design (if any), and those obligations.
+- Verification is complete: **every requirement** in applicable obligations (node + ancestors as bound, including design-phase) has been checked (success criteria when present, otherwise the measurable statement) and is **traceable** upstream through the plan steps that satisfy it (each `verified`) and those obligations.
 - Verification was **agent-executed** in the work’s running context (harness built if needed); not deferred to human look-over as the primary check.
 - Upstream conformance **revalidated** (or short-circuited only for unchanged file pairs).
 - **Self-code review** completed.

@@ -4,7 +4,7 @@
 
 ## On entry
 
-1. Read lifecycle state, obligations, design/plan content, the interview history (answered questions and interview memory), and evidence from the full lifecycle.
+1. Read lifecycle state, obligations (including design-phase) and plan steps, the interview history (answered questions and interview memory), and evidence from the full lifecycle.
 2. If a learn retrospective already ran with findings recorded → verify completeness and proceed to exit.
 
 ## Responsibilities

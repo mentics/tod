@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS node_obligations (
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     UNIQUE (node_id, kind, ordinal)
+    -- `phase` is added by the v15->v16 migration (see fleet/schema.rs) rather
+    -- than here, so it applies uniformly whether this table was created fresh
+    -- or already existed.
 );
 CREATE INDEX IF NOT EXISTS idx_obligations_node ON node_obligations(node_id, kind, ordinal);
 

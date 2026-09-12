@@ -261,6 +261,16 @@ impl<'a> InterviewRepo<'a> {
     /// Resolve an obligation id given in full or as a unique hex prefix
     /// (hyphens ignored), such as the 8-character ids shown to agents.
     pub fn resolve_obligation_id(&self, raw: &str) -> Result<Uuid> {
+        self.resolve_id_in_table(raw, "node_obligations", "obligation")
+    }
+
+    /// Resolve a plan step id given in full or as a unique hex prefix, same
+    /// convention as [`Self::resolve_obligation_id`].
+    pub fn resolve_plan_step_id(&self, raw: &str) -> Result<Uuid> {
+        self.resolve_id_in_table(raw, "node_plan_steps", "plan step")
+    }
+
+    fn resolve_id_in_table(&self, raw: &str, table: &str, noun: &str) -> Result<Uuid> {
         if let Ok(id) = Uuid::parse_str(raw.trim()) {
             return Ok(id);
         }
@@ -271,11 +281,11 @@ impl<'a> InterviewRepo<'a> {
             .collect::<String>()
             .to_ascii_uppercase();
         if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-            anyhow::bail!("`{raw}` is not an obligation id");
+            anyhow::bail!("`{raw}` is not a {noun} id");
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM node_obligations WHERE hex(id) LIKE ?1 || '%' LIMIT 2")?;
+            .prepare(&format!("SELECT id FROM {table} WHERE hex(id) LIKE ?1 || '%' LIMIT 2"))?;
         let ids = stmt
             .query_map(params![prefix], |row| {
                 let blob: Vec<u8> = row.get(0)?;
@@ -284,8 +294,8 @@ impl<'a> InterviewRepo<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         match ids.as_slice() {
             [id] => Ok(*id),
-            [] => anyhow::bail!("no obligation matches `{raw}`"),
-            _ => anyhow::bail!("`{raw}` matches more than one obligation; use more characters"),
+            [] => anyhow::bail!("no {noun} matches `{raw}`"),
+            _ => anyhow::bail!("`{raw}` matches more than one {noun}; use more characters"),
         }
     }
 }

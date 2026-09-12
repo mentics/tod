@@ -22,6 +22,8 @@ Reply with one short line, such as `added 3, withdrew 1`. The app reads the data
 
 Rank candidates by **how much the answer changes what gets built × how unsure you are of the answer**. If you can already predict the answer, don't ask it open-ended — propose the obvious default as a one-keystroke accept.
 
+The interview exists for decisions you can't reasonably make yourself. If you can determine a good answer on your own — including, in planning, how finely to slice plan steps — just do it and move on; don't manufacture a question so the user rubber-stamps a call you were already confident in.
+
 Work top-down:
 
 1. **Purpose and boundaries** — what this node is for; what is in and out.
@@ -84,7 +86,7 @@ Attach a proposal whenever you can already write the change. It folds the decisi
 | `add` | `kind`, `text`, optional `section`, optional `node` | Adds an obligation — to an ancestor when `node` is given |
 | `update` | `id`, `text`, optional `section` | Rewrites an obligation |
 | `delete` | `id` | Removes an obligation |
-| `content` | `type: goal\|design\|plan`, `text`, optional `append: true` | Sets or appends to node content |
+| `content` | `type: goal`, `text`, optional `append: true` | Sets or appends to node content |
 
 Add `replaces: [<id>, …]` to any op to delete those obligations as part of the same accept. Use it whenever the new text supersedes something, so accepting never leaves a contradiction behind.
 

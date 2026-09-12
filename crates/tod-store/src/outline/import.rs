@@ -266,6 +266,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
                     ordinal: req_ordinal,
                     section: None,
                     body: text.to_string(),
+                    phase: crate::interview::PHASE_UNKNOWN.into(),
                 })?;
             } else if in_constraints {
                 con_ordinal += 1;
@@ -276,6 +277,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
                     ordinal: con_ordinal,
                     section: None,
                     body: text.to_string(),
+                    phase: crate::interview::PHASE_UNKNOWN.into(),
                 })?;
             }
         }

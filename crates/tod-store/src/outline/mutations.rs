@@ -2,6 +2,7 @@
 
 use crate::outline::repos::gate::GateRepo;
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
+use crate::outline::repos::plan_steps::PlanStepRepo;
 use crate::outline::repos::tree::TreeLoader;
 use crate::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
 use crate::outline::types::{Capability, EXTRA_CONTENT_DETAILS, OutlineEntry};
@@ -87,6 +88,12 @@ pub enum OutlineMutation {
         #[serde(default)]
         section: Option<String>,
         body: String,
+        /// Lifecycle phase this obligation belongs to (`requirements` | `design`).
+        /// Never `unknown` — that sentinel is only for pre-existing rows
+        /// migrated before phase-tagging existed. `planning` is not a valid
+        /// obligation phase; planning work is tracked as plan steps instead
+        /// (`CreatePlanStep` etc., below).
+        phase: String,
     },
     UpdateObligationBody {
         obligation_id: Uuid,
@@ -96,6 +103,13 @@ pub enum OutlineMutation {
     UpdateObligationSection {
         obligation_id: Uuid,
         section: Option<String>,
+    },
+    /// Change which lifecycle phase an obligation is tagged with; `unknown` is
+    /// a valid target here (unlike at creation) so a migrated row can be
+    /// corrected once its origin is known, or explicitly re-marked unknown.
+    UpdateObligationPhase {
+        obligation_id: Uuid,
+        phase: String,
     },
     /// Bulk-rename every obligation in `node_id`/`kind` whose section is
     /// `old_section` (`None` meaning the implicit "no section" bucket) to
@@ -125,6 +139,48 @@ pub enum OutlineMutation {
     ReorderObligation {
         obligation_id: Uuid,
         direction: ReorderDirection,
+    },
+    CreatePlanStep {
+        step_id: Option<Uuid>,
+        node_id: Uuid,
+        /// Insert after this step in display order; `None` appends.
+        after_id: Option<Uuid>,
+        /// When true and `after_id` is set, insert before that item instead.
+        before: bool,
+        body: String,
+    },
+    UpdatePlanStepBody {
+        step_id: Uuid,
+        body: String,
+    },
+    UpdatePlanStepStatus {
+        step_id: Uuid,
+        status: String,
+    },
+    DeletePlanStep {
+        step_id: Uuid,
+    },
+    ReorderPlanStep {
+        step_id: Uuid,
+        direction: ReorderDirection,
+    },
+    /// Add a `step_id` depends-on `depends_on_step_id` edge. Rejected if it
+    /// would create a cycle.
+    AddPlanStepDependency {
+        step_id: Uuid,
+        depends_on_step_id: Uuid,
+    },
+    RemovePlanStepDependency {
+        step_id: Uuid,
+        depends_on_step_id: Uuid,
+    },
+    LinkPlanStepObligation {
+        step_id: Uuid,
+        obligation_id: Uuid,
+    },
+    UnlinkPlanStepObligation {
+        step_id: Uuid,
+        obligation_id: Uuid,
     },
     SetExtraContent {
         node_id: Uuid,
@@ -164,12 +220,22 @@ impl OutlineMutation {
                 | OutlineMutation::CreateObligation { .. }
                 | OutlineMutation::UpdateObligationBody { .. }
                 | OutlineMutation::UpdateObligationSection { .. }
+                | OutlineMutation::UpdateObligationPhase { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
                 | OutlineMutation::MoveObligation { .. }
                 | OutlineMutation::DeleteNode { .. }
                 | OutlineMutation::RestoreNodeSubtree { .. }
                 | OutlineMutation::ReorderObligation { .. }
+                | OutlineMutation::CreatePlanStep { .. }
+                | OutlineMutation::UpdatePlanStepBody { .. }
+                | OutlineMutation::UpdatePlanStepStatus { .. }
+                | OutlineMutation::DeletePlanStep { .. }
+                | OutlineMutation::ReorderPlanStep { .. }
+                | OutlineMutation::AddPlanStepDependency { .. }
+                | OutlineMutation::RemovePlanStepDependency { .. }
+                | OutlineMutation::LinkPlanStepObligation { .. }
+                | OutlineMutation::UnlinkPlanStepObligation { .. }
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
                 | OutlineMutation::ApplyGateResults { .. }
@@ -267,6 +333,7 @@ impl OutlineMutation {
                 before,
                 section,
                 body,
+                phase,
             } => {
                 create_obligation(
                     conn,
@@ -277,6 +344,7 @@ impl OutlineMutation {
                     *before,
                     section.as_deref(),
                     body,
+                    phase,
                 )?;
             }
             OutlineMutation::UpdateObligationBody {
@@ -291,6 +359,13 @@ impl OutlineMutation {
             } => {
                 let section = section.as_deref().map(str::trim).filter(|s| !s.is_empty());
                 ObligationRepo::new(conn).update_section(*obligation_id, section)?;
+            }
+            OutlineMutation::UpdateObligationPhase {
+                obligation_id,
+                phase,
+            } => {
+                let phase = parse_obligation_phase(phase, true)?;
+                ObligationRepo::new(conn).update_phase(*obligation_id, phase)?;
             }
             OutlineMutation::RenameObligationSection {
                 node_id,
@@ -346,6 +421,55 @@ impl OutlineMutation {
                 };
                 ObligationRepo::new(conn).reorder(*obligation_id, delta)?;
             }
+            OutlineMutation::CreatePlanStep {
+                step_id,
+                node_id,
+                after_id,
+                before,
+                body,
+            } => {
+                create_plan_step(conn, *step_id, *node_id, *after_id, *before, body)?;
+            }
+            OutlineMutation::UpdatePlanStepBody { step_id, body } => {
+                PlanStepRepo::new(conn).update_body(*step_id, body)?;
+            }
+            OutlineMutation::UpdatePlanStepStatus { step_id, status } => {
+                PlanStepRepo::new(conn).update_status(*step_id, status)?;
+            }
+            OutlineMutation::DeletePlanStep { step_id } => {
+                PlanStepRepo::new(conn).delete(*step_id)?;
+            }
+            OutlineMutation::ReorderPlanStep { step_id, direction } => {
+                let delta = match direction {
+                    ReorderDirection::Up => -1,
+                    ReorderDirection::Down => 1,
+                };
+                PlanStepRepo::new(conn).reorder(*step_id, delta)?;
+            }
+            OutlineMutation::AddPlanStepDependency {
+                step_id,
+                depends_on_step_id,
+            } => {
+                PlanStepRepo::new(conn).add_dependency(*step_id, *depends_on_step_id)?;
+            }
+            OutlineMutation::RemovePlanStepDependency {
+                step_id,
+                depends_on_step_id,
+            } => {
+                PlanStepRepo::new(conn).remove_dependency(*step_id, *depends_on_step_id)?;
+            }
+            OutlineMutation::LinkPlanStepObligation {
+                step_id,
+                obligation_id,
+            } => {
+                PlanStepRepo::new(conn).link_obligation(*step_id, *obligation_id)?;
+            }
+            OutlineMutation::UnlinkPlanStepObligation {
+                step_id,
+                obligation_id,
+            } => {
+                PlanStepRepo::new(conn).unlink_obligation(*step_id, *obligation_id)?;
+            }
             OutlineMutation::SetExtraContent {
                 node_id,
                 content_type,
@@ -384,9 +508,11 @@ fn create_obligation(
     before: bool,
     section: Option<&str>,
     body: &str,
+    phase: &str,
 ) -> Result<Uuid> {
     require_spec(conn, node_id)?;
     let kind = parse_obligation_kind(kind)?;
+    let phase = parse_obligation_phase(phase, false)?;
     let repo = ObligationRepo::new(conn);
     let ids = repo.list_ids_for_kind(node_id, kind)?;
     let index = match after_id {
@@ -397,7 +523,30 @@ fn create_obligation(
         }
     };
     let id = obligation_id.unwrap_or_else(Uuid::new_v4);
-    repo.insert_at(id, node_id, kind, index, section, body)?;
+    repo.insert_at(id, node_id, kind, index, section, body, phase)?;
+    Ok(id)
+}
+
+fn create_plan_step(
+    conn: &Connection,
+    step_id: Option<Uuid>,
+    node_id: Uuid,
+    after_id: Option<Uuid>,
+    before: bool,
+    body: &str,
+) -> Result<Uuid> {
+    require_spec(conn, node_id)?;
+    let repo = PlanStepRepo::new(conn);
+    let ids = repo.list_ids_for_node(node_id)?;
+    let index = match after_id {
+        None => ids.len(),
+        Some(anchor) => {
+            let pos = ids.iter().position(|id| *id == anchor).unwrap_or(ids.len());
+            if before { pos } else { pos + 1 }
+        }
+    };
+    let id = step_id.unwrap_or_else(Uuid::new_v4);
+    repo.insert_at(id, node_id, index, body)?;
     Ok(id)
 }
 
@@ -414,6 +563,20 @@ fn parse_obligation_kind(kind: &str) -> Result<&'static str> {
         KIND_REQUIREMENT => Ok(KIND_REQUIREMENT),
         KIND_CONSTRAINT => Ok(KIND_CONSTRAINT),
         _ => anyhow::bail!("invalid obligation kind: {kind}"),
+    }
+}
+
+/// Validate an obligation phase. `allow_unknown` is true only for an explicit
+/// phase change (`UpdateObligationPhase`) — creation must always name a real
+/// phase, never the `unknown` migration sentinel.
+fn parse_obligation_phase(phase: &str, allow_unknown: bool) -> Result<&'static str> {
+    use crate::interview::{OBLIGATION_PHASES, PHASE_UNKNOWN};
+    match OBLIGATION_PHASES.iter().find(|p| **p == phase) {
+        Some(p) if *p == PHASE_UNKNOWN && !allow_unknown => {
+            anyhow::bail!("a new obligation must be tagged with a real phase, not `unknown`")
+        }
+        Some(p) => Ok(*p),
+        None => anyhow::bail!("unknown phase `{phase}` (expected requirements|design)"),
     }
 }
 

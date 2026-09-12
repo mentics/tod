@@ -4,7 +4,7 @@ Optional side tool — not part of the core lifecycle protocol.
 
 ## Context
 
-- Node context — title, lifecycle, resolved obligations (inherited + local), design/plan excerpts when present, child nodes if any
+- Node context — title, lifecycle, resolved obligations (inherited + local, including design-phase) and plan step summaries when present, child nodes if any
 - User request — what kind of split or decomposition the human wants (optional)
 
 ## Response

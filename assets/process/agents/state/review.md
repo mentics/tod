@@ -4,7 +4,7 @@
 
 ## On entry
 
-1. Read lifecycle state, obligations, design/plan content, implementation, and verification evidence from `verifying`.
+1. Read lifecycle state, obligations (including design-phase) and plan steps, implementation, and verification evidence from `verifying`.
 2. Functional correctness should already be established—do not treat this state as primary QA.
 
 ## Responsibilities

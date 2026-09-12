@@ -13,7 +13,7 @@ use crate::ui::list::{
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use delegate::{
     NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, SECTION_EDIT_TAG,
-    new_section_row_key, obligation_section, section_row_key,
+    group_row_key, new_section_row_key, obligation_section, phase_row_key, section_row_key,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -33,6 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use tod_store::fleet::FleetStore;
+use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
 use tod_store::outline::types::Capability;
 use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
@@ -134,8 +135,16 @@ pub struct ObligationsView {
     node_id: Option<Uuid>,
     title: String,
     items: Vec<NodeObligation>,
-    req_collapsed: bool,
-    con_collapsed: bool,
+    /// The interview's current phase, when this panel is scoped to one — used
+    /// only to seed which phase starts expanded and as the default phase for
+    /// obligations created with no clearer phase context. `None` outside an
+    /// interview (the standalone Obligations panel), where every phase starts
+    /// expanded as before.
+    active_phase: Option<String>,
+    phase_collapsed: HashSet<String>,
+    /// Keyed by `group_row_key(phase, kind)` — a kind's collapse state is
+    /// per-phase now that phase is the outermost grouping.
+    kind_collapsed: HashSet<String>,
     section_collapsed: HashSet<String>,
     focus_handle: FocusHandle,
     delegate: ObligationListDelegate,
@@ -147,10 +156,11 @@ pub struct ObligationsView {
     edit_original_body: Option<String>,
     inline_edit_input: Entity<InputState>,
     pending_abandon_edit: bool,
-    /// Kind/original-name of the section currently being renamed.
-    section_edit_target: Option<(&'static str, String)>,
+    /// Phase/kind/original-name of the section currently being renamed.
+    section_edit_target: Option<(String, &'static str, String)>,
     /// Set while a brand-new (not yet created) section's name is being typed.
-    new_section_kind: Option<&'static str>,
+    /// `(phase, kind)`.
+    new_section_kind: Option<(String, &'static str)>,
     section_edit_input: Entity<InputState>,
     pending_abandon_section_edit: bool,
     pending_live_refresh: bool,
@@ -220,8 +230,9 @@ impl ObligationsView {
             node_id: None,
             title: String::new(),
             items: Vec::new(),
-            req_collapsed: false,
-            con_collapsed: false,
+            active_phase: None,
+            phase_collapsed: HashSet::new(),
+            kind_collapsed: HashSet::new(),
             section_collapsed: HashSet::new(),
             focus_handle: cx.focus_handle(),
             delegate,
@@ -255,15 +266,17 @@ impl ObligationsView {
         &mut self,
         node_id: Uuid,
         title: &str,
+        active_phase: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.node_id = Some(node_id);
         self.refresh_node_has_agent();
         self.title = title.to_string();
-        self.req_collapsed = false;
-        self.con_collapsed = false;
+        self.active_phase = active_phase.map(str::to_string);
+        self.kind_collapsed.clear();
         self.section_collapsed.clear();
+        self.reset_phase_collapse();
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
         self.focus_list(window, cx);
@@ -273,31 +286,50 @@ impl ObligationsView {
     /// `focus` controls whether keyboard focus moves into the panel — true
     /// for an explicit "open obligations" action, false when the panel is
     /// merely following tree selection and focus should stay put.
+    ///
+    /// `active_phase` is the interview's current phase, `None` outside an
+    /// interview — only every phase starting expanded on open is affected.
     pub fn retarget(
         &mut self,
         node_id: Uuid,
         title: &str,
+        active_phase: Option<&str>,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.node_id == Some(node_id) {
             self.title = title.to_string();
+            self.active_phase = active_phase.map(str::to_string);
             self.reload(window, cx);
             return;
         }
         self.node_id = Some(node_id);
         self.refresh_node_has_agent();
         self.title = title.to_string();
-        self.req_collapsed = false;
-        self.con_collapsed = false;
+        self.active_phase = active_phase.map(str::to_string);
+        self.kind_collapsed.clear();
         self.section_collapsed.clear();
+        self.reset_phase_collapse();
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
         if focus {
             self.focus_list(window, cx);
         }
         cx.notify();
+    }
+
+    /// Collapse every phase except `active_phase`; expand everything when
+    /// there is no active phase (outside an interview).
+    fn reset_phase_collapse(&mut self) {
+        self.phase_collapsed.clear();
+        if self.active_phase.is_some() {
+            for phase in Self::phase_order() {
+                if Some(phase) != self.active_phase.as_deref() {
+                    self.phase_collapsed.insert(phase_row_key(phase));
+                }
+            }
+        }
     }
 
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -437,49 +469,58 @@ impl ObligationsView {
         self.rebuild_visible(window, cx);
     }
 
+    /// Phases in display order: the two obligation-eligible phases, then
+    /// `unknown` last (legacy/unclassified obligations trail behind real
+    /// ones). `planning` is not a valid obligation phase — planning work is
+    /// tracked as plan steps instead — so it never appears here.
+    fn phase_order() -> [&'static str; OBLIGATION_PHASES.len()] {
+        [PHASE_REQUIREMENTS, tod_store::interview::PHASE_DESIGN, PHASE_UNKNOWN]
+    }
+
     fn flat_rows(&self) -> Vec<ObligationRow> {
         let mut rows = Vec::new();
-        let reqs: Vec<_> = self
-            .items
-            .iter()
-            .filter(|o| o.kind == KIND_REQUIREMENT)
-            .cloned()
-            .collect();
-        let cons: Vec<_> = self
-            .items
-            .iter()
-            .filter(|o| o.kind == KIND_CONSTRAINT)
-            .cloned()
-            .collect();
-
-        Self::append_kind_group(
-            &mut rows,
-            KIND_REQUIREMENT,
-            reqs,
-            self.req_collapsed,
-            &self.section_collapsed,
-            self.new_section_kind == Some(KIND_REQUIREMENT),
-        );
-        Self::append_kind_group(
-            &mut rows,
-            KIND_CONSTRAINT,
-            cons,
-            self.con_collapsed,
-            &self.section_collapsed,
-            self.new_section_kind == Some(KIND_CONSTRAINT),
-        );
+        for phase in Self::phase_order() {
+            let phase_items: Vec<_> = self.items.iter().filter(|o| o.phase == phase).collect();
+            if phase_items.is_empty() {
+                continue;
+            }
+            let phase_key = delegate::phase_row_key(phase);
+            let phase_collapsed = self.phase_collapsed.contains(&phase_key);
+            rows.push(ObligationRow::Phase {
+                phase: phase.to_string(),
+                collapsed: phase_collapsed,
+                count: phase_items.len(),
+            });
+            if phase_collapsed {
+                continue;
+            }
+            let reqs: Vec<_> = phase_items
+                .iter()
+                .filter(|o| o.kind == KIND_REQUIREMENT)
+                .map(|o| (*o).clone())
+                .collect();
+            let cons: Vec<_> = phase_items
+                .iter()
+                .filter(|o| o.kind == KIND_CONSTRAINT)
+                .map(|o| (*o).clone())
+                .collect();
+            self.append_kind_group(&mut rows, phase, KIND_REQUIREMENT, reqs);
+            self.append_kind_group(&mut rows, phase, KIND_CONSTRAINT, cons);
+        }
         rows
     }
 
     fn append_kind_group(
+        &self,
         rows: &mut Vec<ObligationRow>,
+        phase: &str,
         kind: &'static str,
         items: Vec<NodeObligation>,
-        kind_collapsed: bool,
-        section_collapsed: &HashSet<String>,
-        show_new_section: bool,
     ) {
+        let kind_key = group_row_key(phase, kind);
+        let kind_collapsed = self.kind_collapsed.contains(&kind_key);
         rows.push(ObligationRow::Group {
+            phase: phase.to_string(),
             kind,
             collapsed: kind_collapsed,
             count: items.len(),
@@ -487,8 +528,9 @@ impl ObligationsView {
         if kind_collapsed {
             return;
         }
-        if show_new_section {
+        if self.new_section_kind == Some((phase.to_string(), kind)) {
             rows.push(ObligationRow::Section {
+                phase: phase.to_string(),
                 kind,
                 section: String::new(),
                 collapsed: false,
@@ -497,9 +539,10 @@ impl ObligationsView {
             });
         }
         for (section, section_items) in Self::group_by_section(items) {
-            let key = section_row_key(kind, &section);
-            let collapsed = section_collapsed.contains(&key);
+            let key = section_row_key(phase, kind, &section);
+            let collapsed = self.section_collapsed.contains(&key);
             rows.push(ObligationRow::Section {
+                phase: phase.to_string(),
                 kind,
                 section: section.clone(),
                 collapsed,
@@ -578,36 +621,57 @@ impl ObligationsView {
         }
     }
 
-    fn select_parent_group(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_key = Some(format!("group:{kind}"));
+    fn select_parent_phase(&mut self, phase: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_key = Some(phase_row_key(phase));
+        self.rebuild_visible(window, cx);
+        self.focus_list(window, cx);
+    }
+
+    fn select_parent_group(
+        &mut self,
+        phase: &str,
+        kind: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_key = Some(group_row_key(phase, kind));
         self.rebuild_visible(window, cx);
         self.focus_list(window, cx);
     }
 
     fn select_parent_section(
         &mut self,
+        phase: &str,
         kind: &str,
         section: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.selected_key = Some(section_row_key(kind, section));
+        self.selected_key = Some(section_row_key(phase, kind, section));
         self.rebuild_visible(window, cx);
         self.focus_list(window, cx);
     }
 
-    fn first_item_in_scope(&self, kind: &str, section: Option<&str>) -> Option<Uuid> {
+    fn first_item_in_scope(&self, phase: &str, kind: &str, section: Option<&str>) -> Option<Uuid> {
         self.items
             .iter()
-            .filter(|o| o.kind == kind && section.map_or(true, |s| obligation_section(o) == s))
+            .filter(|o| {
+                o.phase == phase
+                    && o.kind == kind
+                    && section.map_or(true, |s| obligation_section(o) == s)
+            })
             .min_by_key(|o| o.ordinal)
             .map(|o| o.id)
     }
 
-    fn last_item_in_scope(&self, kind: &str, section: Option<&str>) -> Option<Uuid> {
+    fn last_item_in_scope(&self, phase: &str, kind: &str, section: Option<&str>) -> Option<Uuid> {
         self.items
             .iter()
-            .filter(|o| o.kind == kind && section.map_or(true, |s| obligation_section(o) == s))
+            .filter(|o| {
+                o.phase == phase
+                    && o.kind == kind
+                    && section.map_or(true, |s| obligation_section(o) == s)
+            })
             .max_by_key(|o| o.ordinal)
             .map(|o| o.id)
     }
@@ -651,12 +715,12 @@ impl ObligationsView {
     /// section name (mutually exclusive).
     fn delegate_editing_key(&self) -> Option<String> {
         self.editing_id.map(|id| id.to_string()).or_else(|| {
-            if let Some(kind) = self.new_section_kind {
-                Some(new_section_row_key(kind))
+            if let Some((phase, kind)) = &self.new_section_kind {
+                Some(new_section_row_key(phase, kind))
             } else {
                 self.section_edit_target
                     .as_ref()
-                    .map(|(kind, section)| section_row_key(kind, section))
+                    .map(|(phase, kind, section)| section_row_key(phase, kind, section))
             }
         })
     }
@@ -793,6 +857,7 @@ impl ObligationsView {
 
     fn start_section_edit(
         &mut self,
+        phase: &str,
         kind: &'static str,
         section: &str,
         window: &mut Window,
@@ -809,8 +874,8 @@ impl ObligationsView {
         } else {
             section.to_string()
         };
-        self.section_edit_target = Some((kind, section.to_string()));
-        self.selected_key = Some(section_row_key(kind, section));
+        self.section_edit_target = Some((phase.to_string(), kind, section.to_string()));
+        self.selected_key = Some(section_row_key(phase, kind, section));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value(&initial, window, cx);
             input.focus(window, cx);
@@ -818,20 +883,22 @@ impl ObligationsView {
         self.rebuild_visible(window, cx);
     }
 
-    fn add_section(&mut self, kind: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_section(
+        &mut self,
+        phase: &str,
+        kind: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_editing() {
             let _ = self.commit_inline_edit(window, cx);
         }
         if self.section_edit_target.is_some() {
             self.abandon_section_edit(window, cx);
         }
-        if kind == KIND_REQUIREMENT {
-            self.req_collapsed = false;
-        } else {
-            self.con_collapsed = false;
-        }
-        self.new_section_kind = Some(kind);
-        self.selected_key = Some(new_section_row_key(kind));
+        self.kind_collapsed.remove(&group_row_key(phase, kind));
+        self.new_section_kind = Some((phase.to_string(), kind));
+        self.selected_key = Some(new_section_row_key(phase, kind));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -873,7 +940,7 @@ impl ObligationsView {
             .trim()
             .to_string();
 
-        if let Some(kind) = self.new_section_kind {
+        if let Some((phase, kind)) = self.new_section_kind.clone() {
             if new_name.is_empty() {
                 self.cancel_new_section(window, cx);
                 return true;
@@ -892,6 +959,7 @@ impl ObligationsView {
                     before: false,
                     section: Some(new_name),
                     body: String::new(),
+                    phase,
                 })
             {
                 crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
@@ -911,7 +979,7 @@ impl ObligationsView {
             return true;
         }
 
-        let Some((kind, old_section)) = self.section_edit_target.clone() else {
+        let Some((phase, kind, old_section)) = self.section_edit_target.clone() else {
             return false;
         };
         if new_name.is_empty() {
@@ -933,6 +1001,9 @@ impl ObligationsView {
         } else {
             Some(old_section.clone())
         };
+        // Renaming a section spans every obligation in `node_id`/`kind` with
+        // that name, regardless of phase — sections are user-defined labels,
+        // not phase-scoped, so this intentionally isn't filtered by phase.
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::RenameObligationSection {
@@ -949,22 +1020,33 @@ impl ObligationsView {
             crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
             return false;
         }
-        let old_key = section_row_key(kind, &old_section);
+        let old_key = section_row_key(&phase, kind, &old_section);
         if self.section_collapsed.remove(&old_key) {
-            self.section_collapsed.insert(section_row_key(kind, &new_name));
+            self.section_collapsed
+                .insert(section_row_key(&phase, kind, &new_name));
         }
         self.section_edit_target = None;
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.selected_key = Some(section_row_key(kind, &new_name));
+        self.selected_key = Some(section_row_key(&phase, kind, &new_name));
         self.reload(window, cx);
         self.focus_list(window, cx);
         true
     }
 
+    /// Phase to create a new obligation in when there's no clearer context
+    /// (an empty panel, or `create_relative` with nothing selected): the
+    /// interview's active phase, or `requirements` outside an interview.
+    fn default_creation_phase(&self) -> String {
+        self.active_phase
+            .clone()
+            .unwrap_or_else(|| PHASE_REQUIREMENTS.to_string())
+    }
+
     fn create_in_kind(
         &mut self,
+        phase: &str,
         kind: &str,
         after_id: Option<Uuid>,
         before: bool,
@@ -974,13 +1056,9 @@ impl ObligationsView {
         let Some(node_id) = self.node_id else {
             return;
         };
-        if kind == KIND_REQUIREMENT {
-            self.req_collapsed = false;
-        } else {
-            self.con_collapsed = false;
-        }
+        self.kind_collapsed.remove(&group_row_key(phase, kind));
         self.section_collapsed
-            .remove(&section_row_key(kind, NO_SECTION));
+            .remove(&section_row_key(phase, kind, NO_SECTION));
         let obligation_id = Uuid::new_v4();
         if let Err(err) = self
             .fleet
@@ -992,6 +1070,7 @@ impl ObligationsView {
                 before,
                 section: None,
                 body: String::new(),
+                phase: phase.to_string(),
             })
         {
             crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
@@ -1008,35 +1087,45 @@ impl ObligationsView {
 
     fn create_relative(&mut self, before: bool, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_row() {
-            Some(ObligationRow::Group { kind, .. }) => {
+            Some(ObligationRow::Group { phase, kind, .. }) => {
                 if before {
-                    self.create_in_kind(kind, None, true, window, cx);
+                    self.create_in_kind(&phase, kind, None, true, window, cx);
                 } else {
-                    match self.first_item_in_scope(kind, None) {
-                        Some(id) => self.create_in_kind(kind, Some(id), true, window, cx),
-                        None => self.create_in_kind(kind, None, false, window, cx),
+                    match self.first_item_in_scope(&phase, kind, None) {
+                        Some(id) => self.create_in_kind(&phase, kind, Some(id), true, window, cx),
+                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
                     }
                 }
             }
-            Some(ObligationRow::Section { kind, section, .. }) => {
-                self.ensure_section_expanded(kind, &section, window, cx);
+            Some(ObligationRow::Section {
+                phase,
+                kind,
+                section,
+                ..
+            }) => {
+                self.ensure_section_expanded(&phase, kind, &section, window, cx);
                 if before {
-                    match self.first_item_in_scope(kind, Some(&section)) {
-                        Some(id) => self.create_in_kind(kind, Some(id), true, window, cx),
-                        None => self.create_in_kind(kind, None, false, window, cx),
+                    match self.first_item_in_scope(&phase, kind, Some(&section)) {
+                        Some(id) => self.create_in_kind(&phase, kind, Some(id), true, window, cx),
+                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
                     }
                 } else {
-                    match self.last_item_in_scope(kind, Some(&section)) {
-                        Some(id) => self.create_in_kind(kind, Some(id), false, window, cx),
-                        None => self.create_in_kind(kind, None, false, window, cx),
+                    match self.last_item_in_scope(&phase, kind, Some(&section)) {
+                        Some(id) => self.create_in_kind(&phase, kind, Some(id), false, window, cx),
+                        None => self.create_in_kind(&phase, kind, None, false, window, cx),
                     }
                 }
             }
             Some(ObligationRow::Item { obligation }) => {
-                self.create_in_kind(&obligation.kind, Some(obligation.id), before, window, cx);
+                let phase = obligation.phase.clone();
+                self.create_in_kind(&phase, &obligation.kind, Some(obligation.id), before, window, cx);
+            }
+            Some(ObligationRow::Phase { phase, .. }) => {
+                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
             }
             None => {
-                self.create_in_kind(KIND_REQUIREMENT, None, false, window, cx);
+                let phase = self.default_creation_phase();
+                self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
             }
         }
     }
@@ -1057,29 +1146,66 @@ impl ObligationsView {
             Some(ObligationRow::Item { obligation }) => {
                 self.start_inline_edit(obligation.id, window, cx);
             }
-            Some(ObligationRow::Group { .. }) | Some(ObligationRow::Section { .. }) | None => {
+            Some(ObligationRow::Phase { .. })
+            | Some(ObligationRow::Group { .. })
+            | Some(ObligationRow::Section { .. })
+            | None => {
                 self.create_relative(false, window, cx);
             }
         }
     }
 
-    fn toggle_group(&mut self, kind: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if kind == KIND_REQUIREMENT {
-            self.req_collapsed = !self.req_collapsed;
-        } else if kind == KIND_CONSTRAINT {
-            self.con_collapsed = !self.con_collapsed;
+    fn toggle_phase(&mut self, phase: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let key = phase_row_key(phase);
+        if self.phase_collapsed.contains(&key) {
+            self.phase_collapsed.remove(&key);
+        } else {
+            self.phase_collapsed.insert(key);
+        }
+        self.rebuild_visible(window, cx);
+    }
+
+    fn set_phase_collapsed(
+        &mut self,
+        phase: &str,
+        collapsed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = phase_row_key(phase);
+        if collapsed {
+            self.phase_collapsed.insert(key);
+        } else {
+            self.phase_collapsed.remove(&key);
+        }
+        self.rebuild_visible(window, cx);
+    }
+
+    fn toggle_group(
+        &mut self,
+        phase: &str,
+        kind: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = group_row_key(phase, kind);
+        if self.kind_collapsed.contains(&key) {
+            self.kind_collapsed.remove(&key);
+        } else {
+            self.kind_collapsed.insert(key);
         }
         self.rebuild_visible(window, cx);
     }
 
     fn toggle_section(
         &mut self,
+        phase: &str,
         kind: &str,
         section: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = section_row_key(kind, section);
+        let key = section_row_key(phase, kind, section);
         if self.section_collapsed.contains(&key) {
             self.section_collapsed.remove(&key);
         } else {
@@ -1090,28 +1216,31 @@ impl ObligationsView {
 
     fn set_group_collapsed(
         &mut self,
+        phase: &str,
         kind: &str,
         collapsed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if kind == KIND_REQUIREMENT {
-            self.req_collapsed = collapsed;
-        } else if kind == KIND_CONSTRAINT {
-            self.con_collapsed = collapsed;
+        let key = group_row_key(phase, kind);
+        if collapsed {
+            self.kind_collapsed.insert(key);
+        } else {
+            self.kind_collapsed.remove(&key);
         }
         self.rebuild_visible(window, cx);
     }
 
     fn set_section_collapsed(
         &mut self,
+        phase: &str,
         kind: &str,
         section: &str,
         collapsed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = section_row_key(kind, section);
+        let key = section_row_key(phase, kind, section);
         if collapsed {
             self.section_collapsed.insert(key);
         } else {
@@ -1122,13 +1251,15 @@ impl ObligationsView {
 
     fn ensure_section_expanded(
         &mut self,
+        phase: &str,
         kind: &str,
         section: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_group_collapsed(kind, false, window, cx);
-        self.set_section_collapsed(kind, section, false, window, cx);
+        self.set_phase_collapsed(phase, false, window, cx);
+        self.set_group_collapsed(phase, kind, false, window, cx);
+        self.set_section_collapsed(phase, kind, section, false, window, cx);
     }
 
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1136,22 +1267,28 @@ impl ObligationsView {
             return;
         };
         let id = obligation.id;
+        let phase = obligation.phase.clone();
         let kind = obligation.kind.clone();
         let section = obligation_section(&obligation).to_string();
         let next_key = self
             .items
             .iter()
-            .filter(|o| o.kind == kind && obligation_section(o) == section && o.id != id)
+            .filter(|o| o.phase == phase && o.kind == kind && obligation_section(o) == section && o.id != id)
             .find(|o| o.ordinal > obligation.ordinal)
             .map(|o| o.id.to_string())
             .or_else(|| {
                 self.items
                     .iter()
-                    .filter(|o| o.kind == kind && obligation_section(o) == section && o.id != id)
+                    .filter(|o| {
+                        o.phase == phase
+                            && o.kind == kind
+                            && obligation_section(o) == section
+                            && o.id != id
+                    })
                     .last()
                     .map(|o| o.id.to_string())
             })
-            .or_else(|| Some(section_row_key(&kind, &section)));
+            .or_else(|| Some(section_row_key(&phase, &kind, &section)));
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::DeleteObligation { obligation_id: id })
@@ -1209,30 +1346,33 @@ impl ObligationsView {
         let actions: Vec<_> = self.action_sink.borrow_mut().drain(..).collect();
         for action in actions {
             match action {
-                RowAction::ToggleGroup { kind } => {
-                    self.toggle_group(&kind, window, cx);
+                RowAction::TogglePhase { phase } => {
+                    self.toggle_phase(&phase, window, cx);
                 }
-                RowAction::ToggleSection { kind, section } => {
-                    self.toggle_section(&kind, &section, window, cx);
+                RowAction::ToggleGroup { phase, kind } => {
+                    self.toggle_group(&phase, &kind, window, cx);
+                }
+                RowAction::ToggleSection { phase, kind, section } => {
+                    self.toggle_section(&phase, &kind, &section, window, cx);
                 }
                 RowAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
                 }
-                RowAction::StartSectionEdit { kind, section } => {
+                RowAction::StartSectionEdit { phase, kind, section } => {
                     let kind = if kind == KIND_REQUIREMENT {
                         KIND_REQUIREMENT
                     } else {
                         KIND_CONSTRAINT
                     };
-                    self.start_section_edit(kind, &section, window, cx);
+                    self.start_section_edit(&phase, kind, &section, window, cx);
                 }
-                RowAction::AddSection { kind } => {
+                RowAction::AddSection { phase, kind } => {
                     let kind = if kind == KIND_REQUIREMENT {
                         KIND_REQUIREMENT
                     } else {
                         KIND_CONSTRAINT
                     };
-                    self.add_section(kind, window, cx);
+                    self.add_section(&phase, kind, window, cx);
                 }
                 RowAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
@@ -1291,15 +1431,20 @@ impl ObligationsView {
             let _ = self.commit_inline_edit(window, cx);
         }
         match self.selected_row() {
-            Some(ObligationRow::Group { kind, .. }) => {
-                self.set_group_collapsed(kind, false, window, cx);
-                self.create_in_kind(kind, None, false, window, cx);
+            Some(ObligationRow::Group { phase, kind, .. }) => {
+                self.set_group_collapsed(&phase, kind, false, window, cx);
+                self.create_in_kind(&phase, kind, None, false, window, cx);
             }
-            Some(ObligationRow::Section { kind, section, .. }) => {
-                self.ensure_section_expanded(kind, &section, window, cx);
-                match self.last_item_in_scope(kind, Some(&section)) {
-                    Some(id) => self.create_in_kind(kind, Some(id), false, window, cx),
-                    None => self.create_in_kind(kind, None, false, window, cx),
+            Some(ObligationRow::Section {
+                phase,
+                kind,
+                section,
+                ..
+            }) => {
+                self.ensure_section_expanded(&phase, kind, &section, window, cx);
+                match self.last_item_in_scope(&phase, kind, Some(&section)) {
+                    Some(id) => self.create_in_kind(&phase, kind, Some(id), false, window, cx),
+                    None => self.create_in_kind(&phase, kind, None, false, window, cx),
                 }
             }
             _ => self.create_relative(false, window, cx),
@@ -1348,24 +1493,37 @@ impl ObligationsView {
         cx: &mut Context<Self>,
     ) {
         match self.selected_row() {
-            Some(ObligationRow::Group {
-                kind, collapsed, ..
+            Some(ObligationRow::Phase {
+                phase, collapsed, ..
             }) if !collapsed => {
-                self.set_group_collapsed(kind, true, window, cx);
+                self.set_phase_collapsed(&phase, true, window, cx);
+            }
+            Some(ObligationRow::Group {
+                phase,
+                kind,
+                collapsed,
+                ..
+            }) if !collapsed => {
+                self.set_group_collapsed(&phase, kind, true, window, cx);
+            }
+            Some(ObligationRow::Group { phase, .. }) => {
+                self.select_parent_phase(&phase, window, cx);
             }
             Some(ObligationRow::Section {
+                phase,
                 kind,
                 section,
                 collapsed,
                 ..
             }) if !collapsed => {
-                self.set_section_collapsed(kind, &section, true, window, cx);
+                self.set_section_collapsed(&phase, kind, &section, true, window, cx);
             }
-            Some(ObligationRow::Section { kind, .. }) => {
-                self.select_parent_group(kind, window, cx);
+            Some(ObligationRow::Section { phase, kind, .. }) => {
+                self.select_parent_group(&phase, kind, window, cx);
             }
             Some(ObligationRow::Item { obligation }) => {
                 self.select_parent_section(
+                    &obligation.phase,
                     &obligation.kind,
                     obligation_section(&obligation),
                     window,
@@ -1378,18 +1536,27 @@ impl ObligationsView {
 
     fn on_expand(&mut self, _: &ObligationsExpand, window: &mut Window, cx: &mut Context<Self>) {
         match self.selected_row() {
-            Some(ObligationRow::Group {
-                kind, collapsed, ..
+            Some(ObligationRow::Phase {
+                phase, collapsed, ..
             }) if collapsed => {
-                self.set_group_collapsed(kind, false, window, cx);
+                self.set_phase_collapsed(&phase, false, window, cx);
+            }
+            Some(ObligationRow::Group {
+                phase,
+                kind,
+                collapsed,
+                ..
+            }) if collapsed => {
+                self.set_group_collapsed(&phase, kind, false, window, cx);
             }
             Some(ObligationRow::Section {
+                phase,
                 kind,
                 section,
                 collapsed,
                 ..
             }) if collapsed => {
-                self.set_section_collapsed(kind, &section, false, window, cx);
+                self.set_section_collapsed(&phase, kind, &section, false, window, cx);
             }
             _ => {}
         }
@@ -1415,15 +1582,17 @@ impl ObligationsView {
         if self.is_editing() {
             return;
         }
-        let kind = match self.selected_row() {
-            Some(ObligationRow::Group { kind, .. }) => kind,
-            Some(ObligationRow::Section { kind, .. }) => kind,
+        let (phase, kind) = match self.selected_row() {
+            Some(ObligationRow::Group { phase, kind, .. }) => (phase, kind),
+            Some(ObligationRow::Section { phase, kind, .. }) => (phase, kind),
             Some(ObligationRow::Item { obligation }) if obligation.kind == KIND_CONSTRAINT => {
-                KIND_CONSTRAINT
+                (obligation.phase.clone(), KIND_CONSTRAINT)
             }
-            _ => KIND_REQUIREMENT,
+            Some(ObligationRow::Item { obligation }) => (obligation.phase.clone(), KIND_REQUIREMENT),
+            Some(ObligationRow::Phase { phase, .. }) => (phase, KIND_REQUIREMENT),
+            None => (self.default_creation_phase(), KIND_REQUIREMENT),
         };
-        self.add_section(kind, window, cx);
+        self.add_section(&phase, kind, window, cx);
     }
 
     fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {

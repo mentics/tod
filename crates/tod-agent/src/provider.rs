@@ -48,12 +48,36 @@ impl SessionPurpose {
     }
 }
 
+/// One choice offered by an agent's permission request (e.g. "Allow once",
+/// "Deny").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// An agent is blocked waiting for the user to allow or deny an action. The
+/// run stays `NeedsPermission` until [`AgentProvider::respond_to_permission`]
+/// is called with one of `options`' ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub run: RunId,
+    /// Human-readable description of the action the agent wants to take.
+    pub title: String,
+    pub options: Vec<PermissionOption>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRunState {
     /// Still running. The payload is a short, human-readable description of
     /// what the agent is doing right now (a tool call, a permission request,
     /// …), when the provider can report one.
     InFlight(Option<String>),
+    /// The agent is paused waiting on a permission decision. Callers should
+    /// surface `request` to the user and answer it with
+    /// [`AgentProvider::respond_to_permission`]; the run stays in this state
+    /// (or reports a fresh request) until then.
+    NeedsPermission(PermissionRequest),
     Success(Option<String>),
     Failure(String),
 }
@@ -142,6 +166,11 @@ pub trait AgentProvider {
     fn close_session(&mut self, key: &str);
 
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState>;
+
+    /// Answer a pending [`AgentRunState::NeedsPermission`] for `id` by
+    /// selecting one of its options. Errors if the run has no pending
+    /// permission request.
+    fn respond_to_permission(&mut self, id: RunId, option_id: &str) -> anyhow::Result<()>;
 
     fn cancel_run(&mut self, id: RunId) -> anyhow::Result<()>;
 

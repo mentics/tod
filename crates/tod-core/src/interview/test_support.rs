@@ -130,6 +130,12 @@ impl Fixture {
 
     /// Add a requirement on the fixture node; returns its id.
     pub fn obligation(&self, body: &str) -> Uuid {
+        self.obligation_with_phase(body, PHASE_REQUIREMENTS)
+    }
+
+    /// Add an obligation on the fixture node tagged with an explicit phase
+    /// (e.g. `PHASE_DESIGN`); returns its id.
+    pub fn obligation_with_phase(&self, body: &str, phase: &str) -> Uuid {
         let id = Uuid::new_v4();
         self.outline(OutlineMutation::CreateObligation {
             obligation_id: Some(id),
@@ -139,6 +145,7 @@ impl Fixture {
             before: false,
             section: None,
             body: body.into(),
+            phase: phase.into(),
         });
         id
     }

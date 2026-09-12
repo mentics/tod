@@ -7,10 +7,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt::Write as _;
 use std::path::Path;
 use tod_store::interview::*;
-use tod_store::outline::repos::{NodeRepo, ObligationRepo};
+use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ancestor_chain,
-    resolve_obligations, uuid_to_blob,
+    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, PlanStep,
+    ancestor_chain, phase_visible, resolve_obligations, uuid_to_blob,
 };
 use uuid::Uuid;
 
@@ -31,13 +31,40 @@ pub fn estimate_tokens(text: &str) -> i64 {
     (text.len() / 4) as i64
 }
 
-/// Content types part of a phase's context.
-fn phase_content_types(phase: &str) -> &'static [&'static str] {
-    match phase {
-        PHASE_PLANNING => &["goal", "design", "plan"],
-        PHASE_DESIGN => &["goal", "design"],
-        _ => &["goal"],
-    }
+/// Content types part of a phase's context. Design decisions live as
+/// design-phase obligations now (see `resolve_obligations`), not as an extra
+/// content blob, so every phase only ever needs `goal` here.
+fn phase_content_types(_phase: &str) -> &'static [&'static str] {
+    &["goal"]
+}
+
+pub(crate) fn plan_step_line(step: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
+    let deps = if deps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " deps=[{}]",
+            deps.iter().map(|id| short_id(*id)).collect::<Vec<_>>().join(",")
+        )
+    };
+    let satisfies = if obligations.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " satisfies=[{}]",
+            obligations
+                .iter()
+                .map(|id| short_id(*id))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    format!(
+        "[{}] {}{deps}{satisfies}: {}",
+        short_id(step.id),
+        step.status,
+        one_line(&step.body)
+    )
 }
 
 fn one_line(text: &str) -> String {
@@ -52,7 +79,7 @@ fn indent(text: &str, prefix: &str) -> String {
         .join("\n")
 }
 
-fn obligation_line(o: &NodeObligation) -> String {
+pub(crate) fn obligation_line(o: &NodeObligation) -> String {
     let section = o
         .section
         .as_deref()
@@ -115,7 +142,11 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     }
 
     out.push_str("\n## Obligations\n");
-    let local = ObligationRepo::new(conn).list_for_node(scope.node_id)?;
+    let local: Vec<NodeObligation> = ObligationRepo::new(conn)
+        .list_for_node(scope.node_id)?
+        .into_iter()
+        .filter(|o| phase_visible(&o.phase, scope.phase))
+        .collect();
     if local.is_empty() {
         out.push_str("\n(none yet)\n");
     }
@@ -142,7 +173,7 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
         }
     }
 
-    let inherited: Vec<_> = resolve_obligations(conn, scope.node_id)
+    let inherited: Vec<_> = resolve_obligations(conn, scope.node_id, Some(scope.phase))
         .unwrap_or_default()
         .into_iter()
         .filter(|r| r.source_node_id != scope.node_id)
@@ -156,6 +187,20 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
                 writeln!(out, "\n### From \"{}\"", node_title(&nodes, item.source_node_id))?;
             }
             writeln!(out, "- {}", obligation_line(&item.obligation))?;
+        }
+    }
+
+    if scope.phase == PHASE_PLANNING {
+        let plan_repo = PlanStepRepo::new(conn);
+        let steps = plan_repo.list_for_node(scope.node_id)?;
+        out.push_str("\n## Plan steps\n");
+        if steps.is_empty() {
+            out.push_str("\n(none yet)\n");
+        }
+        for step in &steps {
+            let deps = plan_repo.list_dependencies(step.id)?;
+            let obligations = plan_repo.list_obligations(step.id)?;
+            writeln!(out, "- {}", plan_step_line(step, &deps, &obligations))?;
         }
     }
 
@@ -284,6 +329,8 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
     let mut content_lines = String::new();
     let mut question_lines = String::new();
     let mut memory_lines = String::new();
+    let mut plan_step_lines = String::new();
+    let plan_steps = PlanStepRepo::new(conn);
 
     for (entity, id) in order {
         let ops = ops_for(&entity, id);
@@ -292,6 +339,7 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
             ENTITY_OBLIGATION => match obligations.get(id)? {
                 None if inserted => {}
                 None => writeln!(obligation_lines, "- [{}]", short_id(id))?,
+                Some(o) if !phase_visible(&o.phase, scope.phase) => {}
                 Some(o) => {
                     let from = if o.node_id != scope.node_id {
                         format!(" (from \"{}\")", node_title(&nodes, o.node_id))
@@ -415,6 +463,32 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
                     writeln!(memory_lines, "~ {}: {}", note.label(), one_line(&note.body))?;
                 }
             }
+            ENTITY_PLAN_STEP if scope.phase == PHASE_PLANNING => match plan_steps.get(id)? {
+                None if inserted => {}
+                None => writeln!(plan_step_lines, "- [{}] deleted", short_id(id))?,
+                Some(step) => {
+                    let deps = plan_steps.list_dependencies(step.id)?;
+                    let obligations = plan_steps.list_obligations(step.id)?;
+                    let mark = if inserted { '+' } else { '~' };
+                    writeln!(
+                        plan_step_lines,
+                        "{mark} {}",
+                        plan_step_line(&step, &deps, &obligations)
+                    )?;
+                }
+            },
+            ENTITY_PLAN_STEP_DEP | ENTITY_PLAN_STEP_OBLIGATION if scope.phase == PHASE_PLANNING => {
+                let Some(step) = plan_steps.get(id)? else {
+                    continue;
+                };
+                let deps = plan_steps.list_dependencies(step.id)?;
+                let obligations = plan_steps.list_obligations(step.id)?;
+                writeln!(
+                    plan_step_lines,
+                    "~ {}",
+                    plan_step_line(&step, &deps, &obligations)
+                )?;
+            }
             _ => {}
         }
     }
@@ -423,6 +497,7 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
     for (heading, body) in [
         ("Obligations", obligation_lines),
         ("Content", content_lines),
+        ("Plan steps", plan_step_lines),
         ("Questions", question_lines),
         ("Memory", memory_lines),
     ] {
@@ -691,7 +766,7 @@ mod tests {
         let set = |body: &str| {
             fx.outline(OutlineMutation::SetExtraContent {
                 node_id: fx.node,
-                content_type: "design".into(),
+                content_type: "goal".into(),
                 body: body.into(),
             })
         };
@@ -699,12 +774,41 @@ mod tests {
         let base = fx.head();
         set("First decision.\n\nSecond decision.");
 
-        let changes = fx.delta(Role::AnswerProcessor, PHASE_DESIGN, base, AGENT);
-        assert!(changes.contains("+ design (appended):"), "{changes}");
+        let changes = fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT);
+        assert!(changes.contains("+ goal (appended):"), "{changes}");
         assert!(changes.contains("Second decision."), "{changes}");
         assert!(!changes.contains("First decision."), "{changes}");
-        // Requirements-phase sessions don't carry design content at all.
-        assert_eq!(fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT), "");
+    }
+
+    #[test]
+    fn planning_snapshot_carries_both_requirements_and_design_obligations() {
+        let fx = fixture();
+        let req = fx.obligation_with_phase("Must support offline mode.", PHASE_REQUIREMENTS);
+        let design = fx.obligation_with_phase("Use SQLite for local cache.", PHASE_DESIGN);
+
+        let planning = fx.snapshot(Role::AnswerProcessor, PHASE_PLANNING);
+        assert!(planning.contains(&short_id(req)), "{planning}");
+        assert!(planning.contains(&short_id(design)), "{planning}");
+        assert!(planning.contains("Must support offline mode."), "{planning}");
+        assert!(planning.contains("Use SQLite for local cache."), "{planning}");
+    }
+
+    #[test]
+    fn design_phase_obligations_reach_design_and_planning_not_requirements() {
+        let fx = fixture();
+        let base = fx.head();
+        let decision = fx.obligation_with_phase("Use Postgres for storage.", PHASE_DESIGN);
+
+        let design_changes = fx.delta(Role::AnswerProcessor, PHASE_DESIGN, base, AGENT);
+        assert!(design_changes.contains("Use Postgres for storage."), "{design_changes}");
+
+        let planning_changes = fx.delta(Role::AnswerProcessor, PHASE_PLANNING, base, AGENT);
+        assert!(planning_changes.contains("Use Postgres for storage."), "{planning_changes}");
+
+        // A design-phase obligation is not visible back in the requirements phase.
+        let requirements_changes = fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT);
+        assert!(!requirements_changes.contains("Use Postgres for storage."), "{requirements_changes}");
+        let _ = decision;
     }
 
     #[test]

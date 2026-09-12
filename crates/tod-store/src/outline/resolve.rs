@@ -1,5 +1,6 @@
 //! Runtime obligation resolution (root → leaf, additive).
 
+use crate::interview::{PHASES, PHASE_UNKNOWN};
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::{Capability, NodeKind};
@@ -15,7 +16,33 @@ pub struct ResolvedObligation {
     pub source_node_id: Uuid,
 }
 
-pub fn resolve_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<ResolvedObligation>> {
+/// True when `phase` should be visible to a caller scoped to `max_phase`
+/// (using `PHASES` ordering: requirements < design < planning). An
+/// obligation still tagged `PHASE_UNKNOWN` (pre-dates phase-tagging) is
+/// always visible — filtering it out would silently drop legacy
+/// requirements/constraints from agent context.
+pub fn phase_visible(phase: &str, max_phase: &str) -> bool {
+    if phase == PHASE_UNKNOWN {
+        return true;
+    }
+    let phase_rank = PHASES.iter().position(|p| *p == phase);
+    let max_rank = PHASES.iter().position(|p| *p == max_phase);
+    match (phase_rank, max_rank) {
+        (Some(p), Some(m)) => p <= m,
+        _ => true,
+    }
+}
+
+/// Resolve the obligations visible to `node_id`: global-adopted obligations,
+/// then every ancestor's (root → leaf, inclusive) obligations that carry the
+/// `Spec` capability. When `max_phase` is `Some`, only obligations at or
+/// before that phase (plus any still-`unknown`-phase ones) are included —
+/// pass `None` to see everything regardless of phase, as the UI does.
+pub fn resolve_obligations(
+    conn: &Connection,
+    node_id: Uuid,
+    max_phase: Option<&str>,
+) -> Result<Vec<ResolvedObligation>> {
     let outline = OutlineRepo::new(conn);
     let entry = outline.get_entry(node_id)?.context("node not in outline")?;
     let loader = crate::outline::repos::tree::TreeLoader::new(conn);
@@ -46,6 +73,10 @@ pub fn resolve_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<Resol
             &mut visited_refs,
             &mut out,
         )?;
+    }
+
+    if let Some(max_phase) = max_phase {
+        out.retain(|r| phase_visible(&r.obligation.phase, max_phase));
     }
 
     Ok(out)
@@ -133,6 +164,7 @@ pub fn copy_capabilities(conn: &Connection, source_id: Uuid, target_id: Uuid) ->
             ordinal: ob.ordinal,
             section: ob.section,
             body: ob.body,
+            phase: ob.phase,
         };
         obl_repo.insert(&copy)?;
     }

@@ -22,22 +22,52 @@ pub fn obligation_section(ob: &NodeObligation) -> &str {
     ob.section.as_deref().unwrap_or(NO_SECTION)
 }
 
-pub fn section_row_key(kind: &str, section: &str) -> String {
-    format!("section:{kind}:{section}")
+pub fn phase_row_key(phase: &str) -> String {
+    format!("phase:{phase}")
 }
 
-pub fn new_section_row_key(kind: &str) -> String {
-    format!("new-section:{kind}")
+pub fn group_row_key(phase: &str, kind: &str) -> String {
+    format!("group:{phase}:{kind}")
+}
+
+pub fn section_row_key(phase: &str, kind: &str, section: &str) -> String {
+    format!("section:{phase}:{kind}:{section}")
+}
+
+pub fn new_section_row_key(phase: &str, kind: &str) -> String {
+    format!("new-section:{phase}:{kind}")
+}
+
+/// Human label for a phase, `Unknown` for the pre-phase-tagging sentinel.
+/// `planning` is no longer a valid obligation phase (planning work is tracked
+/// as plan steps instead) but a legacy row tagged that way before the split
+/// still renders sensibly here.
+pub fn phase_label(phase: &str) -> &str {
+    use tod_store::interview::{PHASE_DESIGN, PHASE_PLANNING, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
+    match phase {
+        PHASE_REQUIREMENTS => "Requirements phase",
+        PHASE_DESIGN => "Design phase",
+        PHASE_PLANNING => "Planning phase (legacy)",
+        PHASE_UNKNOWN => "Unknown phase",
+        other => other,
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum ObligationRow {
+    Phase {
+        phase: String,
+        collapsed: bool,
+        count: usize,
+    },
     Group {
+        phase: String,
         kind: &'static str,
         collapsed: bool,
         count: usize,
     },
     Section {
+        phase: String,
         kind: &'static str,
         section: String,
         collapsed: bool,
@@ -53,17 +83,19 @@ pub enum ObligationRow {
 impl ObligationRow {
     pub fn key(&self) -> String {
         match self {
-            Self::Group { kind, .. } => format!("group:{kind}"),
+            Self::Phase { phase, .. } => phase_row_key(phase),
+            Self::Group { phase, kind, .. } => group_row_key(phase, kind),
             Self::Section {
+                phase,
                 kind,
                 section,
                 is_new,
                 ..
             } => {
                 if *is_new {
-                    new_section_row_key(kind)
+                    new_section_row_key(phase, kind)
                 } else {
-                    section_row_key(kind, section)
+                    section_row_key(phase, kind, section)
                 }
             }
             Self::Item { obligation } => obligation.id.to_string(),
@@ -73,11 +105,12 @@ impl ObligationRow {
 
 #[derive(Debug, Clone)]
 pub enum RowAction {
-    ToggleGroup { kind: String },
-    ToggleSection { kind: String, section: String },
+    TogglePhase { phase: String },
+    ToggleGroup { phase: String, kind: String },
+    ToggleSection { phase: String, kind: String, section: String },
     StartEdit { obligation_id: uuid::Uuid },
-    StartSectionEdit { kind: String, section: String },
-    AddSection { kind: String },
+    StartSectionEdit { phase: String, kind: String, section: String },
+    AddSection { phase: String, kind: String },
     Select { row_ix: usize },
 }
 
@@ -158,7 +191,56 @@ impl ObligationListDelegate {
         let view = self.view.clone();
 
         let content = match row {
+            ObligationRow::Phase {
+                phase,
+                collapsed,
+                count,
+            } => {
+                let phase_owned = phase.clone();
+                let select_sink = sink.clone();
+                let toggle_sink = sink.clone();
+                let select_view = view.clone();
+                let toggle_view = view.clone();
+                h_flex()
+                    .h(GROUP_ROW_HEIGHT)
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(theme.secondary.opacity(0.5))
+                    .when(selected, |el| el.bg(theme.muted))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        select_sink.borrow_mut().push(RowAction::Select { row_ix });
+                        notify(&select_view, cx);
+                    })
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                toggle_sink.borrow_mut().push(RowAction::TogglePhase {
+                                    phase: phase_owned.clone(),
+                                });
+                                notify(&toggle_view, cx);
+                                cx.stop_propagation();
+                            })
+                            .child(if collapsed { "▸" } else { "▾" }),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_bold()
+                            .child(format!("{} ({count})", phase_label(&phase))),
+                    )
+            }
             ObligationRow::Group {
+                phase,
                 kind,
                 collapsed,
                 count,
@@ -168,7 +250,9 @@ impl ObligationListDelegate {
                     KIND_CONSTRAINT => "Constraints",
                     other => other,
                 };
+                let phase_owned = phase.clone();
                 let kind_owned = kind.to_string();
+                let add_section_phase = phase.clone();
                 let add_section_kind = kind.to_string();
                 let select_sink = sink.clone();
                 let toggle_sink = sink.clone();
@@ -182,6 +266,7 @@ impl ObligationListDelegate {
                     .items_center()
                     .gap_1()
                     .px_2()
+                    .pl_5()
                     .border_b_1()
                     .border_color(border)
                     .when(selected, |el| el.bg(theme.muted))
@@ -199,6 +284,7 @@ impl ObligationListDelegate {
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 toggle_sink.borrow_mut().push(RowAction::ToggleGroup {
+                                    phase: phase_owned.clone(),
                                     kind: kind_owned.clone(),
                                 });
                                 notify(&toggle_view, cx);
@@ -221,6 +307,7 @@ impl ObligationListDelegate {
                             .px_1()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 add_sink.borrow_mut().push(RowAction::AddSection {
+                                    phase: add_section_phase.clone(),
                                     kind: add_section_kind.clone(),
                                 });
                                 notify(&add_view, cx);
@@ -230,12 +317,14 @@ impl ObligationListDelegate {
                     )
             }
             ObligationRow::Section {
+                phase,
                 kind,
                 section,
                 collapsed,
                 count,
                 is_new,
             } => {
+                let phase_owned = phase.clone();
                 let kind_owned = kind.to_string();
                 let section_owned = section.clone();
                 let select_sink = sink.clone();
@@ -268,6 +357,7 @@ impl ObligationListDelegate {
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                                 toggle_sink.borrow_mut().push(RowAction::ToggleSection {
+                                    phase: phase_owned.clone(),
                                     kind: kind_owned.clone(),
                                     section: section_owned.clone(),
                                 });
@@ -288,6 +378,7 @@ impl ObligationListDelegate {
                         );
                     }
                 } else {
+                    let phase_owned2 = phase.clone();
                     let kind_owned2 = kind.to_string();
                     let section_owned2 = section.clone();
                     let edit_sink = self.action_sink.clone();
@@ -302,6 +393,7 @@ impl ObligationListDelegate {
                                 el.on_mouse_down(MouseButton::Left, move |event, _, cx| {
                                     if event.click_count >= 2 {
                                         edit_sink.borrow_mut().push(RowAction::StartSectionEdit {
+                                            phase: phase_owned2.clone(),
                                             kind: kind_owned2.clone(),
                                             section: section_owned2.clone(),
                                         });

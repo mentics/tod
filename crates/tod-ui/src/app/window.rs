@@ -109,6 +109,10 @@ pub struct Shell {
     paths: TodPaths,
     migration_notice_dismissed: bool,
     pending_open_interview: Option<PendingOpenInterview>,
+    /// (task_id, lifecycle) — from the lifecycle panel's on-demand
+    /// "Open interview" affordance, validated and routed through
+    /// `TaskListView::open_interview_for_task` once `window` is available.
+    pending_open_interview_for_task: Option<(String, String)>,
     pending_open_lifecycle: Option<PendingOpenLifecycle>,
     pending_return_to_tasks: bool,
     pending_open_task_edit: Option<String>,
@@ -238,6 +242,15 @@ impl Shell {
         };
         self.task_list.update(cx, |list, cx| {
             list.open_lifecycle_panel(&pending.task_id, &pending.lifecycle, cx);
+        });
+    }
+
+    fn drain_pending_open_interview_for_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((task_id, lifecycle)) = self.pending_open_interview_for_task.take() else {
+            return;
+        };
+        self.task_list.update(cx, |list, cx| {
+            list.open_interview_for_task(&task_id, &lifecycle, window, cx);
         });
     }
 
@@ -391,11 +404,15 @@ impl Shell {
             self.close_task_edit(window, cx);
         }
         self.lifecycle_panel.update(cx, |panel, cx| {
-            panel.open(task_id, cx);
+            panel.open(task_id, window, cx);
         });
         if !self.lifecycle_panel.read(cx).is_open() {
             self.task_list.update(cx, |list, cx| {
                 list.show_error("Could not open lifecycle panel", window, cx);
+            });
+        } else {
+            self.task_list.update(cx, |list, cx| {
+                list.set_lifecycle_panel_open(true, cx);
             });
         }
         cx.notify();
@@ -406,6 +423,7 @@ impl Shell {
             panel.close(cx);
         });
         self.task_list.update(cx, |list, cx| {
+            list.set_lifecycle_panel_open(false, cx);
             list.restore_focus(window, cx);
         });
         cx.notify();
@@ -438,7 +456,7 @@ impl Shell {
             self.close_lifecycle_panel(window, cx);
         }
         self.obligations.update(cx, |panel, cx| {
-            panel.open(node_id, title, window, cx);
+            panel.open(node_id, title, None, window, cx);
         });
         self.task_list.update(cx, |list, cx| {
             list.set_obligations_open(true, cx);
@@ -472,7 +490,7 @@ impl Shell {
             return;
         };
         self.obligations.update(cx, |panel, cx| {
-            panel.retarget(node_id, title, focus, window, cx);
+            panel.retarget(node_id, title, None, focus, window, cx);
         });
         cx.notify();
     }
@@ -999,6 +1017,7 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending_open_interview(window, cx);
+        self.drain_pending_open_interview_for_task(window, cx);
         self.drain_pending_return_to_tasks(window, cx);
         self.drain_pending_open_lifecycle(cx);
         self.drain_pending_task_edit(window, cx);
@@ -1007,6 +1026,7 @@ impl Render for Shell {
         self.drain_pending_lifecycle_panel(window, cx);
         self.drain_pending_focus_drawer(window, cx);
         self.drain_pending_error_toast(window, cx);
+        crate::ui::agent_permission::drain_queued_requests(window, cx);
 
         div()
             .v_flex()
@@ -1562,6 +1582,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             }
                                             cx.notify();
                                         }
+                                        TaskListEvent::RetargetLifecycle { task_id } => {
+                                            this.pending_retarget_lifecycle_panel =
+                                                Some(task_id.clone());
+                                            cx.notify();
+                                        }
                                         TaskListEvent::OpenAgentDetail { task_id, agent_id } => {
                                             if this.agent_panel.read(cx).is_open() {
                                                 if let Some(agent_id) = agent_id.clone() {
@@ -1707,6 +1732,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         this.pending_refocus_task_list = true;
                                         cx.notify();
                                     }
+                                    LifecyclePanelEvent::OpenInterview { task_id, lifecycle } => {
+                                        this.pending_open_interview_for_task =
+                                            Some((task_id.clone(), lifecycle.clone()));
+                                        cx.notify();
+                                    }
                                 },
                             );
                             let _agent_panel_subscription =
@@ -1781,6 +1811,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 paths: paths.clone(),
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
+                                pending_open_interview_for_task: None,
                                 pending_open_lifecycle: None,
                                 pending_return_to_tasks: false,
                                 pending_open_task_edit: None,

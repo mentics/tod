@@ -1,6 +1,7 @@
 //! Outline integration tests.
 
 use crate::fleet::store::FleetStore;
+use crate::interview::PHASE_REQUIREMENTS;
 use crate::outline::types::Capability;
 use crate::outline::{CreatePosition, OutlineMutation, resolve_obligations};
 use crate::paths::{clear_data_root_override, set_data_root};
@@ -77,9 +78,111 @@ fn import_and_resolve_obligations_round_trip() {
         let projection = store.projection();
         let guard = projection.lock().unwrap();
         let conn = guard.connection();
-        let resolved = resolve_obligations(&conn, row.node.id).unwrap();
+        let resolved = resolve_obligations(&conn, row.node.id, None).unwrap();
         assert!(resolved.is_empty() || !resolved[0].obligation.body.is_empty());
     }
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resolve_obligations_for_node_includes_ancestor_and_design_phase() {
+    use crate::interview::PHASE_DESIGN;
+    use crate::outline::KIND_REQUIREMENT;
+
+    let root = std::env::temp_dir().join(format!("tod-resolve-node-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "resolve".into(),
+            title: "Resolve".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+
+    let parent_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(parent_id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Parent".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: parent_id,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let child_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(child_id),
+            list_id,
+            parent_id: Some(parent_id),
+            anchor_id: None,
+            position: CreatePosition::Child,
+            title: "Child".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: child_id,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::CreateObligation {
+            obligation_id: Some(Uuid::new_v4()),
+            node_id: parent_id,
+            kind: KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "Ancestor requirement.".into(),
+            phase: PHASE_REQUIREMENTS.into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateObligation {
+            obligation_id: Some(Uuid::new_v4()),
+            node_id: child_id,
+            kind: KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "Child design decision.".into(),
+            phase: PHASE_DESIGN.into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store.reload_if_stale().ok();
+
+    // The local-only accessor sees just the child's own obligation — this is
+    // what a gate check must NOT rely on for traceability.
+    let local = store.list_obligations_for_node(child_id).unwrap();
+    assert_eq!(local.len(), 1);
+    assert_eq!(local[0].body, "Child design decision.");
+
+    // The resolved accessor a gate check should use sees both, regardless of
+    // phase — the ancestor's requirements-phase obligation and the node's
+    // own design-phase obligation.
+    let resolved = store.resolve_obligations_for_node(child_id).unwrap();
+    let bodies: Vec<&str> = resolved.iter().map(|o| o.body.as_str()).collect();
+    assert!(bodies.contains(&"Ancestor requirement."), "{bodies:?}");
+    assert!(bodies.contains(&"Child design decision."), "{bodies:?}");
+
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
@@ -417,6 +520,7 @@ fn obligation_crud_and_counts() {
             before: false,
             section: None,
             body: "Req A".into(),
+            phase: PHASE_REQUIREMENTS.into(),
         })
         .unwrap();
     store
@@ -428,6 +532,7 @@ fn obligation_crud_and_counts() {
             before: false,
             section: None,
             body: "Req B".into(),
+            phase: PHASE_REQUIREMENTS.into(),
         })
         .unwrap();
     store
@@ -439,6 +544,7 @@ fn obligation_crud_and_counts() {
             before: false,
             section: None,
             body: "Con 1".into(),
+            phase: PHASE_REQUIREMENTS.into(),
         })
         .unwrap();
     store.writer().flush().unwrap();
@@ -714,5 +820,130 @@ fn gate_criteria_seed_on_migration() {
         design_planning.len() + planning_ready.len() + verifying_review.len(),
         GATE_CRITERIA.len()
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_step_dependency_graph_and_obligation_links() {
+    use crate::outline::repos::PlanStepRepo;
+
+    let root = std::env::temp_dir().join(format!("tod-plan-step-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "plan".into(),
+            title: "Plan".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    let node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Spec node".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let req = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateObligation {
+            obligation_id: Some(req),
+            node_id,
+            kind: crate::outline::KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "Req".into(),
+            phase: PHASE_REQUIREMENTS.into(),
+        })
+        .unwrap();
+
+    let step_a = Uuid::new_v4();
+    let step_b = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreatePlanStep {
+            step_id: Some(step_a),
+            node_id,
+            after_id: None,
+            before: false,
+            body: "Step A".into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreatePlanStep {
+            step_id: Some(step_b),
+            node_id,
+            after_id: Some(step_a),
+            before: false,
+            body: "Step B".into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::AddPlanStepDependency {
+            step_id: step_b,
+            depends_on_step_id: step_a,
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+            step_id: step_a,
+            obligation_id: req,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+
+            // A cycle is rejected.
+            assert!(repo.add_dependency(step_a, step_b).is_err());
+
+            // step_b is blocked on step_a until step_a is implemented.
+            assert_eq!(repo.ready_steps(node_id).unwrap(), vec![step_a]);
+
+            assert_eq!(repo.list_obligations(step_a).unwrap(), vec![req]);
+            assert_eq!(repo.list_steps_for_obligation(req).unwrap(), vec![step_a]);
+            Ok(())
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+            step_id: step_a,
+            status: "implemented".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+            // step_b is now unblocked (auto-promoted to ready).
+            let mut ready = repo.ready_steps(node_id).unwrap();
+            ready.sort();
+            let mut expected = vec![step_b];
+            expected.sort();
+            assert_eq!(ready, expected);
+            assert_eq!(repo.get(step_b).unwrap().unwrap().status, "ready");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
     let _ = fs::remove_dir_all(root);
 }

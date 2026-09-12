@@ -427,6 +427,19 @@ impl InteractiveAgentView {
                     user_text,
                 });
             }
+            AgentRunState::NeedsPermission(request) => {
+                self.status_line = "Waiting for permission…".into();
+                crate::ui::agent_permission::queue_permission_request(
+                    self.agent.clone(),
+                    request,
+                );
+                self.pending = Some(PendingRun {
+                    run_id: Some(run_id),
+                    prompt_id,
+                    response_id,
+                    user_text,
+                });
+            }
             AgentRunState::Success(response) => {
                 let assistant = response.unwrap_or_default();
                 self.conversation

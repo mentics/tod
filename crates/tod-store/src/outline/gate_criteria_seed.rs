@@ -50,7 +50,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "design",
         to_state: "planning",
         slug: "design-planning.constructions-by-name",
-        label: "If design content exists, do constructions appear by name (not slogans), conforming to applicable obligations?",
+        label: "If design-phase obligations exist, do constructions appear by name (not slogans), conforming to applicable requirements-phase obligations?",
         sort_order: 4,
     },
     GateCriterionSeed {
@@ -82,7 +82,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "design",
         to_state: "planning",
         slug: "design-planning.obligations-design-reconcile",
-        label: "Reconciliation: obligations and design content (if any) agree?",
+        label: "Reconciliation: requirements-phase and design-phase obligations (if any) agree?",
         sort_order: 8,
     },
     GateCriterionSeed {
@@ -98,7 +98,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "design",
         to_state: "planning",
         slug: "design-planning.visual-packages-accepted-or-waived",
-        label: "If the node has user-visible UI: needed visual packages accepted and linked from design content, or visual design explicitly waived in transcript?",
+        label: "If the node has user-visible UI: needed visual packages accepted and linked from a design-phase obligation, or visual design explicitly waived in transcript?",
         sort_order: 10,
     },
     GateCriterionSeed {
@@ -139,7 +139,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "planning",
         to_state: "ready",
         slug: "planning-ready.plan-conforms",
-        label: "Plan conforms to design content (if any) and applicable obligations?",
+        label: "Plan conforms to design-phase obligations (if any) and applicable requirements-phase obligations?",
         sort_order: 4,
     },
     GateCriterionSeed {

@@ -195,6 +195,16 @@ pub fn next_lifecycle(lifecycle: &str) -> Option<&'static str> {
     LIFECYCLE_STATES.get(rank + 1).copied()
 }
 
+/// The state one step behind `lifecycle` in `LIFECYCLE_STATES`, if any.
+/// Returns `None` for the first state or an unrecognized one.
+pub fn previous_lifecycle(lifecycle: &str) -> Option<&'static str> {
+    let rank = lifecycle_rank(lifecycle);
+    if rank == 0 || rank >= LIFECYCLE_STATES.len() {
+        return None;
+    }
+    LIFECYCLE_STATES.get(rank - 1).copied()
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -209,6 +219,18 @@ mod lifecycle_tests {
     fn next_lifecycle_none_at_end_or_unknown() {
         assert_eq!(next_lifecycle("done"), None);
         assert_eq!(next_lifecycle("bogus"), None);
+    }
+
+    #[test]
+    fn previous_lifecycle_steps_back_through_known_states() {
+        assert_eq!(previous_lifecycle("planning"), Some("design"));
+        assert_eq!(previous_lifecycle("done"), Some("learn"));
+    }
+
+    #[test]
+    fn previous_lifecycle_none_at_start_or_unknown() {
+        assert_eq!(previous_lifecycle("proposed"), None);
+        assert_eq!(previous_lifecycle("bogus"), None);
     }
 }
 

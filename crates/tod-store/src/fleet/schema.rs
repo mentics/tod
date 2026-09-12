@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 15;
+pub const CURRENT_USER_VERSION: i32 = 17;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -166,6 +166,167 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v14_to_v15(conn)?;
         conn.pragma_update(None, "user_version", 15)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 16 {
+        migrate_v15_to_v16(conn)?;
+        conn.pragma_update(None, "user_version", 16)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 17 {
+        migrate_v16_to_v17(conn)?;
+        conn.pragma_update(None, "user_version", 17)?;
+    }
+    Ok(())
+}
+
+/// Structured plan steps for the `planning` phase: an ordered-for-display set
+/// of steps per node, a dependency DAG between them (execution order and
+/// parallelism are derived from this, never from `ordinal`), and a
+/// many-to-many link to the obligation(s) each step satisfies.
+fn migrate_v16_to_v17(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS node_plan_steps (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            ordinal      INTEGER NOT NULL,
+            body         TEXT NOT NULL,
+            status       TEXT NOT NULL CHECK (status IN
+                             ('pending','ready','in_progress','implemented','verified','blocked')),
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            UNIQUE (node_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_plan_steps_node ON node_plan_steps(node_id, ordinal);
+
+        CREATE TABLE IF NOT EXISTS node_plan_step_deps (
+            step_id            BLOB NOT NULL REFERENCES node_plan_steps(id) ON DELETE CASCADE,
+            depends_on_step_id BLOB NOT NULL REFERENCES node_plan_steps(id) ON DELETE CASCADE,
+            PRIMARY KEY (step_id, depends_on_step_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_plan_step_deps_depends_on
+            ON node_plan_step_deps(depends_on_step_id);
+
+        CREATE TABLE IF NOT EXISTS node_plan_step_obligations (
+            step_id       BLOB NOT NULL REFERENCES node_plan_steps(id) ON DELETE CASCADE,
+            obligation_id BLOB NOT NULL REFERENCES node_obligations(id) ON DELETE CASCADE,
+            PRIMARY KEY (step_id, obligation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_plan_step_obligations_obligation
+            ON node_plan_step_obligations(obligation_id);
+        ",
+    )?;
+
+    // interview_changes.entity is a closed CHECK-constrained set; SQLite can't
+    // ALTER a CHECK, so rebuild the table with plan-step entities added.
+    tx.execute_batch(
+        "
+        CREATE TABLE interview_changes_v17 (
+            rev        INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id    BLOB NOT NULL,
+            entity     TEXT NOT NULL CHECK (entity IN
+                           ('question', 'memory', 'obligation', 'content',
+                            'plan_step', 'plan_step_dep', 'plan_step_obligation')),
+            entity_id  BLOB NOT NULL,
+            op         TEXT NOT NULL CHECK (op IN ('insert', 'update', 'delete')),
+            fields     TEXT,
+            actor      TEXT NOT NULL,
+            at         INTEGER NOT NULL
+        );
+        ",
+    )?;
+    tx.execute_batch(
+        "INSERT INTO interview_changes_v17 (rev, node_id, entity, entity_id, op, fields, actor, at)
+            SELECT rev, node_id, entity, entity_id, op, fields, actor, at FROM interview_changes;",
+    )?;
+    tx.execute_batch("DROP TABLE interview_changes;")?;
+    // Plain `ALTER TABLE RENAME` makes SQLite rewrite every trigger/view body
+    // that references the renamed table, which here transiently reparses
+    // triggers on OTHER tables that already reference the destination name
+    // (`interview_changes`) against a schema where neither name resolves yet
+    // — surfacing as a bogus "no such table: interview_changes" from an
+    // unrelated trigger. `legacy_alter_table` skips that rewrite pass; safe
+    // here since nothing needs the rewrite (only the table itself moves).
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE interview_changes_v17 RENAME TO interview_changes;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_interview_changes_node ON interview_changes(node_id, rev);
+        CREATE INDEX IF NOT EXISTS idx_interview_changes_entity ON interview_changes(entity_id, rev);
+        ",
+    )?;
+
+    let triggers = format!(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_insert AFTER INSERT ON node_plan_steps BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'plan_step', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_update AFTER UPDATE ON node_plan_steps
+        WHEN OLD.body IS NOT NEW.body OR OLD.status IS NOT NEW.status
+        BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'plan_step', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
+                    || CASE WHEN OLD.status IS NOT NEW.status THEN 'status,' ELSE '' END, ','),
+                {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_delete AFTER DELETE ON node_plan_steps BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'plan_step', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_dep_insert AFTER INSERT ON node_plan_step_deps BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            SELECT node_id, 'plan_step_dep', NEW.step_id, 'insert',
+                   hex(NEW.step_id) || ':' || hex(NEW.depends_on_step_id), {ACTOR}, {NOW}
+            FROM node_plan_steps WHERE id = NEW.step_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_dep_delete AFTER DELETE ON node_plan_step_deps BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            SELECT node_id, 'plan_step_dep', OLD.step_id, 'delete',
+                   hex(OLD.step_id) || ':' || hex(OLD.depends_on_step_id), {ACTOR}, {NOW}
+            FROM node_plan_steps WHERE id = OLD.step_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_obligation_insert AFTER INSERT ON node_plan_step_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            SELECT node_id, 'plan_step_obligation', NEW.step_id, 'insert',
+                   hex(NEW.step_id) || ':' || hex(NEW.obligation_id), {ACTOR}, {NOW}
+            FROM node_plan_steps WHERE id = NEW.step_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_plan_step_obligation_delete AFTER DELETE ON node_plan_step_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            SELECT node_id, 'plan_step_obligation', OLD.step_id, 'delete',
+                   hex(OLD.step_id) || ':' || hex(OLD.obligation_id), {ACTOR}, {NOW}
+            FROM node_plan_steps WHERE id = OLD.step_id;
+        END;
+        "
+    );
+    tx.execute_batch(&triggers)?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '17')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Tag obligations with the lifecycle phase (requirements/design/planning)
+/// that created them. Rows that predate this column default to `unknown`
+/// (not folded into `requirements`) so they stay visibly distinct from
+/// obligations a real phase actually produced.
+fn migrate_v15_to_v16(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE node_obligations ADD COLUMN phase TEXT NOT NULL DEFAULT 'unknown';",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1103,6 +1264,89 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_USER_VERSION);
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod plan_step_migration_tests {
+    use super::*;
+    use crate::outline::repos::PlanStepRepo;
+    use crate::outline::uuid_blob::uuid_to_blob;
+    use std::fs;
+
+    fn temp_db() -> (std::path::PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("tod-plan-step-schema-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tod.db");
+        let conn = open_writer_connection(&path).unwrap();
+        (dir, conn)
+    }
+
+    /// Regression test for a real SQLite quirk: rebuilding `interview_changes`
+    /// (dropping it and renaming a replacement into place, to add plan-step
+    /// entities to its CHECK constraint) makes ALTER TABLE RENAME rewrite
+    /// every trigger body referencing the table, which transiently reparses
+    /// unrelated triggers (e.g. `trg_ic_obligation_insert`) against a schema
+    /// where neither the old nor new name resolves yet — surfacing as a bogus
+    /// "no such table: interview_changes". `PRAGMA legacy_alter_table=ON`
+    /// around the rename avoids the rewrite pass entirely.
+    #[test]
+    fn plan_step_tables_and_triggers_survive_fresh_bootstrap() {
+        let (dir, conn) = temp_db();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in [
+            "node_plan_steps",
+            "node_plan_step_deps",
+            "node_plan_step_obligations",
+            "interview_changes",
+        ] {
+            assert!(tables.contains(&expected.to_string()), "missing table {expected}");
+        }
+
+        // An obligation insert (the trigger that broke during development)
+        // must still record an interview_changes row after the rebuild.
+        let node_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 'normal', NULL, 0, 0, 0)",
+            rusqlite::params![uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, created_at, updated_at)
+             VALUES (?1, ?2, 'requirement', 1, NULL, 'x', 'requirements', 0, 0)",
+            rusqlite::params![uuid_to_blob(uuid::Uuid::new_v4()), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        let changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interview_changes WHERE entity = 'obligation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(changes, 1);
+
+        // A plan step insert must also record an interview_changes row.
+        let repo = PlanStepRepo::new(&conn);
+        let step_id = uuid::Uuid::new_v4();
+        repo.insert_at(step_id, node_id, 0, "do the thing").unwrap();
+        let plan_changes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interview_changes WHERE entity = 'plan_step'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_changes, 1);
+
         let _ = fs::remove_dir_all(dir);
     }
 }

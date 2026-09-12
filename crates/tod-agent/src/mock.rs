@@ -251,6 +251,10 @@ impl AgentProvider for MockAgentProvider {
         self.runs.get(&id).cloned()
     }
 
+    fn respond_to_permission(&mut self, _id: RunId, _option_id: &str) -> Result<()> {
+        anyhow::bail!("mock agent never requests permission")
+    }
+
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
         self.pending.remove(&id);
         self.runs.remove(&id);

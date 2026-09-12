@@ -299,9 +299,9 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
             }))
         }
         OutlineMutation::DeleteObligation { obligation_id } => {
-            let row: Option<(Uuid, String, String, i32, Option<String>, i64, i64)> = conn
+            let row: Option<(Uuid, String, String, i32, Option<String>, String, i64, i64)> = conn
                 .query_row(
-                    "SELECT node_id, kind, body, ordinal, section, created_at, updated_at
+                    "SELECT node_id, kind, body, ordinal, section, phase, created_at, updated_at
                      FROM node_obligations WHERE id = ?1",
                     params![uuid_to_blob(*obligation_id)],
                     |row| {
@@ -314,11 +314,12 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                             row.get(4)?,
                             row.get(5)?,
                             row.get(6)?,
+                            row.get(7)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((node_id, kind, body, _ord, section, _, _)) = row else {
+            let Some((node_id, kind, body, _ord, section, phase, _, _)) = row else {
                 return Ok(None);
             };
             Ok(Some(CommandEntry {
@@ -333,6 +334,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                     before: false,
                     section,
                     body,
+                    phase,
                 })],
             }))
         }
@@ -376,7 +378,17 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::CreateObligation { .. }
         | OutlineMutation::RenameObligationSection { .. }
         | OutlineMutation::UpdateObligationSection { .. }
+        | OutlineMutation::UpdateObligationPhase { .. }
         | OutlineMutation::ReorderObligation { .. }
+        | OutlineMutation::CreatePlanStep { .. }
+        | OutlineMutation::UpdatePlanStepBody { .. }
+        | OutlineMutation::UpdatePlanStepStatus { .. }
+        | OutlineMutation::DeletePlanStep { .. }
+        | OutlineMutation::ReorderPlanStep { .. }
+        | OutlineMutation::AddPlanStepDependency { .. }
+        | OutlineMutation::RemovePlanStepDependency { .. }
+        | OutlineMutation::LinkPlanStepObligation { .. }
+        | OutlineMutation::UnlinkPlanStepObligation { .. }
         | OutlineMutation::SetExtraContent { .. }
         | OutlineMutation::SetLifecycle { .. }
         | OutlineMutation::ApplyGateResults { .. } => Ok(None),

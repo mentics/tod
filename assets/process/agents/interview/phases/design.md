@@ -4,8 +4,8 @@ Leads to **planning**. Settle how the requirements will be met, deeply enough th
 
 ## Produces
 
-- **Design content** — decisions and their reasons, appended to the node's design (`content` type `design`, `append: true`). One decision per addition, stated so a planner can act on it.
-- **Obligation changes** when a design decision binds or reveals requirements.
+- **Design-phase obligations** (`tod-cli obligations add --kind requirement|constraint`, tagged phase `design` automatically) — one decision per obligation, stated so a planner can act on it, with `--section` naming the area it belongs to. Never restate a requirements-phase obligation that already covers it; design only adds or narrows what requirements left open.
+- **Obligation changes** when a design decision binds or reveals a requirements-phase obligation — edit it in place (`obligations update`) rather than adding a duplicate.
 
 Step-by-step implementation detail is **parked** for planning.
 

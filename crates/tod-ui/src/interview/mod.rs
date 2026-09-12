@@ -11,7 +11,7 @@ pub mod views;
 
 pub use tod_core::interview::{bootstrap, paths, question_feedback};
 
-pub use tod_core::interview::{TaskListProceedContext, interview_work_remains};
+pub use tod_core::interview::TaskListProceedContext;
 
 pub use settings::TodSettings;
 pub use tod_core::interview::{

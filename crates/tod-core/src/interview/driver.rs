@@ -186,6 +186,9 @@ impl InterviewDriver {
         for (index, turn) in self.turns.iter().enumerate() {
             match agent.poll_run(turn.run) {
                 Some(AgentRunState::InFlight(_)) => {}
+                // Interview agents don't run with write access that would trigger a
+                // permission prompt; treat one as still-running rather than surfacing it.
+                Some(AgentRunState::NeedsPermission(_)) => {}
                 Some(AgentRunState::Success(_)) => finished.push((index, None)),
                 Some(AgentRunState::Failure(message)) => finished.push((index, Some(message))),
                 None => finished.push((index, Some("agent run was lost".to_string()))),
@@ -681,6 +684,10 @@ mod tests {
 
         fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
             self.runs.get(&id).cloned()
+        }
+
+        fn respond_to_permission(&mut self, _: RunId, _: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
         }
 
         fn cancel_run(&mut self, _: RunId) -> anyhow::Result<()> {

@@ -27,8 +27,8 @@ pub use mock::{
     MockAgentProvider, MockInterviewHandler, MockInterviewTurn, set_mock_interview_handler,
 };
 pub use provider::{
-    AgentProvider, AgentRunHandle, AgentRunState, RunId, SessionOpening, SessionPurpose,
-    SessionTurn,
+    AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, RunId,
+    SessionOpening, SessionPurpose, SessionTurn,
 };
 pub use routing::RoutingAgentProvider;
 

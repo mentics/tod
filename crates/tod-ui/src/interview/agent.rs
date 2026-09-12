@@ -7,5 +7,6 @@
 #[allow(unused_imports)] // transitional facade; removed in the tod-ui split
 pub use tod_agent::{
     AcpHost, AgentBackend, AgentLaunchOptions, AgentPlatform, AgentProvider, AgentRunState,
-    CursorAcpProvider, MockAgentProvider, RoutingAgentProvider, RunId, SharedAgent,
+    CursorAcpProvider, MockAgentProvider, PermissionOption, PermissionRequest,
+    RoutingAgentProvider, RunId, SharedAgent,
 };

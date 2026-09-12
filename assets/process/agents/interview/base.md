@@ -1,6 +1,6 @@
 # Interview
 
-An interview turns a conversation with the user into the obligations — and, in later phases, the design and plan — of one **node**. Two agents cooperate through the database while the user answers questions in the app at their own pace.
+An interview turns a conversation with the user into the obligations — refined further in the design phase, then turned into a plan — of one **node**. Two agents cooperate through the database while the user answers questions in the app at their own pace.
 
 | Actor | Does |
 |--|--|
@@ -41,6 +41,16 @@ Whoever drafts obligation text — as a proposal or a direct write — holds it 
 - **Right phase.** Requirements say *what*, not *how*. Vendors, tools, and implementation belong in design or planning — park them (see Memory).
 - **No meta-obligations** such as "follows the parent's requirements" — inheritance already does that.
 
+## Plan steps
+
+In the `planning` phase, the deliverable is a set of **plan steps** (`tod-cli plan`), not a text document. Each step is a discrete unit of work with a `body` and a `status` (`pending` → `ready` → `in_progress` → `implemented` → `verified`, or `blocked`).
+
+- Steps form a dependency **graph**, not a single order: link one to what must land first with `--depends-on` (on `add`) or `plan depend` afterward. Leave independent steps unlinked — that's what lets them be worked in parallel, in separate agents or worktrees. `plan ready --node <NODE>` lists the steps eligible to start now (status `ready`, or `pending` with every dependency `implemented`/`verified`): the set dispatchable at once.
+- Link each step to the obligation(s) it satisfies with `--satisfies` (on `add`) or `plan satisfy`/`plan unsatisfy` afterward. One obligation can be satisfied by several steps — a requirement that touches several places in the codebase becomes several linked steps. This is the traceability mechanism: a requirement is traceable once it maps through a `--satisfies` link to a step, and that step reaches `verified`.
+- `implemented` and `verified` are separate milestones on the same step: `implemented` unblocks dependents, `verified` is the step's final completion state.
+
+Obligations can no longer be tagged phase `planning` — they stay a requirements/design artifact. When planning uncovers a missing or wrong requirement, that's still an obligation edit (`tod-cli obligations`), just never tagged phase `planning`.
+
 ## Memory
 
 Interview memory — the notes you read and write with `tod-cli memory` — is how the interview keeps what isn't an obligation, and how the two agents pass context to each other. It is the only memory here: don't use any memory feature of your own agent platform (memory files, saved notes). Nothing written there reaches the app, the other agent, or a fresh session. Keep every note short and specific: one fact or request per note. Update or close an existing note rather than adding a near-duplicate.
@@ -64,8 +74,19 @@ obligations add       --node <NODE> --kind requirement|constraint --body <TEXT> 
 obligations update    <ID> [--body <TEXT>] [--section <NAME>]
 obligations delete    <ID>
 
-content get           --node <NODE> --type goal|design|plan
-content set           --node <NODE> --type goal|design|plan --body <TEXT> [--append]
+content get           --node <NODE> --type goal
+content set           --node <NODE> --type goal --body <TEXT> [--append]
+
+plan list             --node <NODE>
+plan show             <ID>
+plan add              --node <NODE> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION>]
+plan update           <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|blocked]
+plan delete           <ID>
+plan depend           <ID> --on <ID>
+plan undepend         <ID> --on <ID>
+plan satisfy          <ID> --obligation <OBLIGATION>
+plan unsatisfy        <ID> --obligation <OBLIGATION>
+plan ready            --node <NODE>
 
 questions list        --node <NODE> [--status open|answered|deferred|withdrawn]
 questions show        --node <NODE> <Q>

@@ -20,6 +20,7 @@ use crate::views::database::register_database_keyboard_bindings;
 use crate::views::interactive_agent::register_interactive_agent_keyboard_bindings;
 use crate::views::lifecycle_panel::register_lifecycle_panel_keyboard_bindings;
 use crate::views::obligations::register_obligations_keyboard_bindings;
+use crate::views::plan_steps::register_plan_steps_keyboard_bindings;
 use crate::views::task_edit::register_task_edit_keyboard_bindings;
 use crate::views::task_list::register_task_list_keyboard_bindings;
 use gpui::*;
@@ -35,6 +36,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_command_history_keyboard_bindings(cx);
     register_task_edit_keyboard_bindings(cx);
     register_obligations_keyboard_bindings(cx);
+    register_plan_steps_keyboard_bindings(cx);
     register_lifecycle_panel_keyboard_bindings(cx);
     register_agent_config_keyboard_bindings(cx);
     register_sessions_keyboard_bindings(cx);

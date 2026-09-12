@@ -8,6 +8,7 @@ use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggl
 use crate::ui::list::{ListArrowDown, ListArrowUp};
 use crate::ui::selectable_text::selectable_text;
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
+use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, ClipboardItem, Context, Corner, DismissEvent, Entity, FocusHandle, Focusable,
@@ -31,8 +32,8 @@ use tod_core::interview::interview_complete;
 use tod_core::process::lifecycle_for_interview_phase;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{
-    ACTOR_USER, InterviewCommand, InterviewQuestion, InterviewRepo, Proposal, ProposalOp,
-    STATUS_ANSWERED, STATUS_OPEN, phase_for_session_key,
+    ACTOR_USER, InterviewCommand, InterviewQuestion, InterviewRepo, PHASE_PLANNING, Proposal,
+    ProposalOp, STATUS_ANSWERED, STATUS_OPEN, phase_for_session_key,
 };
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use uuid::Uuid;
@@ -148,6 +149,10 @@ pub struct WorkspaceView {
     /// Keeps the embedded obligations panel alive; "closed" is not a valid state
     /// for this column, so a Close event is reversed immediately.
     _obligations_subscription: Subscription,
+    plan_steps: Entity<PlanStepsView>,
+    /// Keeps the embedded plan-steps panel alive; "closed" is not a valid state
+    /// for this column, so a Close event is reversed immediately.
+    _plan_steps_subscription: Subscription,
     /// Question seq whose proposal text is currently loaded into `proposed_input`.
     proposed_loaded_for: Option<i64>,
     /// Response fields were reset without a Window; clear their text on the next render.
@@ -225,8 +230,15 @@ impl WorkspaceView {
             textarea("Anything to tell the interview directly (Ctrl+Enter to submit)", window, cx);
 
         let obligations = cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
+        let obligations_phase = phase_for_session_key(&session.phase);
         obligations.update(cx, |panel, cx| {
-            panel.open(session.node_id, &session.display_name, window, cx);
+            panel.open(
+                session.node_id,
+                &session.display_name,
+                Some(obligations_phase),
+                window,
+                cx,
+            );
         });
         let obligations_node_id = session.node_id;
         let obligations_title = session.display_name.clone();
@@ -236,7 +248,14 @@ impl WorkspaceView {
             move |this, panel, event, window, cx| match event {
                 ObligationsEvent::Close => {
                     panel.update(cx, |panel, cx| {
-                        panel.retarget(obligations_node_id, &obligations_title, true, window, cx);
+                        panel.retarget(
+                            obligations_node_id,
+                            &obligations_title,
+                            Some(obligations_phase),
+                            true,
+                            window,
+                            cx,
+                        );
                     });
                 }
                 // Ctrl+Left out of the third column lands on the response column.
@@ -244,6 +263,27 @@ impl WorkspaceView {
                 ObligationsEvent::DeleteSelectedTask
                 | ObligationsEvent::OpenAgentChat { .. }
                 | ObligationsEvent::OpenAgentConfig { .. } => {}
+            },
+        );
+
+        let plan_steps = cx.new(|cx| PlanStepsView::new(window, cx, fleet.clone()));
+        plan_steps.update(cx, |panel, cx| {
+            panel.open(session.node_id, &session.display_name, window, cx);
+        });
+        let plan_steps_node_id = session.node_id;
+        let plan_steps_title = session.display_name.clone();
+        let _plan_steps_subscription = cx.subscribe_in(
+            &plan_steps,
+            window,
+            move |this, panel, event, window, cx| match event {
+                PlanStepsEvent::Close => {
+                    panel.update(cx, |panel, cx| {
+                        panel.retarget(plan_steps_node_id, &plan_steps_title, true, window, cx);
+                    });
+                }
+                // Ctrl+Left out of the third column lands on the response column.
+                PlanStepsEvent::FocusTaskList => this.focus_response_right(window, cx),
+                PlanStepsEvent::DeleteSelectedTask => {}
             },
         );
 
@@ -297,6 +337,8 @@ impl WorkspaceView {
             freeform_input,
             obligations,
             _obligations_subscription,
+            plan_steps,
+            _plan_steps_subscription,
             proposed_loaded_for: None,
             notes_pending_clear: false,
             driver_status: DriverStatus::default(),
@@ -1124,12 +1166,16 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// Focus the third (obligations) column.
+    /// Focus the third (obligations, or plan steps during planning) column.
     fn focus_obligations_right(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.response_text_editing() {
             return;
         }
-        self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+        if self.phase == PHASE_PLANNING {
+            self.plan_steps.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+        } else {
+            self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+        }
         cx.notify();
     }
 
@@ -1385,7 +1431,11 @@ impl Render for WorkspaceView {
             self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.sync_proposed_input(window, cx);
-        self.obligations.update(cx, |panel, cx| panel.reload(window, cx));
+        if self.phase == PHASE_PLANNING {
+            self.plan_steps.update(cx, |panel, cx| panel.reload(window, cx));
+        } else {
+            self.obligations.update(cx, |panel, cx| panel.reload(window, cx));
+        }
 
         let background = cx.theme().background;
         let border = cx.theme().border;
@@ -1577,7 +1627,11 @@ impl Render for WorkspaceView {
                                 resizable_panel()
                                     .size(px(OBLIGATIONS_COLUMN_WIDTH))
                                     .size_range(px(OBLIGATIONS_COLUMN_MIN)..Pixels::MAX)
-                                    .child(self.obligations.clone()),
+                                    .child(if self.phase == PHASE_PLANNING {
+                                        self.plan_steps.clone().into_any_element()
+                                    } else {
+                                        self.obligations.clone().into_any_element()
+                                    }),
                             ),
                     ),
             )

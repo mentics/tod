@@ -23,7 +23,18 @@
       "Bash(op: update)",
       "Bash(id: f13595ea)",
       "Bash(text: \"The data-source trait and all transport/API code must live in tod-integration \\(or a per-integration leaf crate with no tod-* dependencies\\), not in tod-agent. tod-agent is exclusively for agent transport.\")",
-      "Bash(YAML)"
+      "Bash(YAML)",
+      "Bash(python3:*)",
+      "Bash(for q in 195 197 198 199 200 201 202)",
+      "Bash(do ./target/debug/tod-cli.exe --data-root .local/data questions show --node 7face44b-8d41-4597-9936-639c20600b6e q-$q)",
+      "Bash(covers: [reconciliation, refresh, managed-nodes])",
+      "Bash(context: \"On refresh, the generator must reconcile the subtree with new results: creating nodes for new items, removing nodes for items no longer matching, and updating fields on existing matches. The requirements allow either updating in place or deleting and recreating \\(e9671145\\).\")",
+      "Bash(question: \"Should refresh reconciliation update existing managed nodes in place \\(matching by external identifier\\) rather than deleting all managed children and recreating from scratch?\")",
+      "Bash(intent: \"Option 1 updates existing nodes by external-id match — preserves node UUIDs across refreshes, so greyed-out tracking, detail-view history, and any future per-node state survive. More code but stable identities. Option 2 deletes all managed children then recreates — simpler logic, but node IDs change every refresh, breaking any bookmarks or cross-references to managed nodes. If option 1, record update-in-place with external-id matching. If option 2, record delete-and-recreate.\")",
+      "Bash(op:*)",
+      "Bash(kind: constraint)",
+      "Bash(section: Reconciliation)",
+      "Bash(text: \"Refresh reconciliation updates existing managed nodes in place, matching by external identifier. New items are created; items no longer matching are removed. Node identities \\(UUIDs\\) are stable across refreshes.\")"
     ]
   }
 }

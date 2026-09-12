@@ -588,6 +588,7 @@ impl AgentConfigPanelView {
             return;
         }
         let mut finished = Vec::new();
+        let mut permission_requests = Vec::new();
         {
             let mut agent = self.agent.lock().expect("agent mutex");
             for (idx, flight) in self.in_flight.iter().enumerate() {
@@ -596,6 +597,7 @@ impl AgentConfigPanelView {
                 };
                 match state {
                     AgentRunState::InFlight(_) => {}
+                    AgentRunState::NeedsPermission(request) => permission_requests.push(request),
                     AgentRunState::Success(text) => {
                         finished.push((idx, flight.clone(), Ok(text.unwrap_or_default())));
                     }
@@ -604,6 +606,9 @@ impl AgentConfigPanelView {
                     }
                 }
             }
+        }
+        for request in permission_requests {
+            crate::ui::agent_permission::queue_permission_request(self.agent.clone(), request);
         }
         if finished.is_empty() {
             return;
