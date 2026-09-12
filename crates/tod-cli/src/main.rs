@@ -36,7 +36,7 @@ NOUNS:
     questions            Interview questions for a node
     memory               Interview memory notes for a node
     interview            Interview session state
-    visual-design        UI mockup packages for a node
+    visual-design        the UI mockup associated with one obligation
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -239,6 +239,30 @@ mod tests {
         let (root, node, _) = data_root();
         let node_str = node.to_string();
 
+        let created = cli(
+            &root,
+            &[
+                "obligations",
+                "add",
+                "--node",
+                &node_str,
+                "--kind",
+                "requirement",
+                "--phase",
+                "design",
+                "--body",
+                "Login screen mockup",
+            ],
+        )
+        .unwrap();
+        let short = created
+            .strip_prefix("ok ")
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+
         let html_path = root.join("mockup.html");
         std::fs::write(&html_path, "<div style=\"display:flex\">Hello</div>").unwrap();
 
@@ -247,36 +271,45 @@ mod tests {
             &[
                 "visual-design",
                 "save",
-                "--node",
-                &node_str,
-                "--title",
-                "Login screen",
+                "--obligation",
+                &short,
                 "--html-file",
                 html_path.to_str().unwrap(),
             ],
         )
         .unwrap();
         assert!(saved.starts_with("ok "), "{saved}");
-        let short = saved
-            .strip_prefix("ok ")
-            .and_then(|s| s.split(' ').next())
-            .unwrap()
-            .to_string();
 
-        let saved_file = root.join("visual-design").join(node_str.clone()).join("login-screen.html");
-        assert!(saved_file.is_file(), "expected {} to exist", saved_file.display());
+        let saved_file = root.join("visual-design").join(&node_str);
+        let entries: Vec<_> = std::fs::read_dir(&saved_file).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one saved mockup file");
+        let saved_file = entries.into_iter().next().unwrap().unwrap().path();
         assert_eq!(
             std::fs::read_to_string(&saved_file).unwrap(),
             "<div style=\"display:flex\">Hello</div>"
         );
 
-        let shown = cli(&root, &["obligations", "show", &short]).unwrap();
-        assert!(shown.contains("Visual design package"), "{shown}");
-        assert!(shown.contains("login-screen.html"), "{shown}");
-        assert!(shown.contains("design/requirement"), "{shown}");
+        let shown = cli(&root, &["visual-design", "show", "--obligation", &short]).unwrap();
+        assert!(shown.contains("mockup.html") || saved_file.display().to_string() == shown, "{shown}");
 
-        let listed = cli(&root, &["visual-design", "list", "--node", &node_str]).unwrap();
-        assert!(listed.contains("Visual design package"), "{listed}");
+        // Saving again overwrites rather than creating a second file.
+        let saved2 = cli(
+            &root,
+            &[
+                "visual-design",
+                "save",
+                "--obligation",
+                &short,
+                "--html-file",
+                html_path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(saved2.starts_with("ok "), "{saved2}");
+        let entries: Vec<_> = std::fs::read_dir(root.join("visual-design").join(&node_str))
+            .unwrap()
+            .collect();
+        assert_eq!(entries.len(), 1, "expected the mockup file to be overwritten, not duplicated");
 
         // A <script> tag is rejected.
         let script_path = root.join("bad.html");
@@ -286,16 +319,20 @@ mod tests {
             &[
                 "visual-design",
                 "save",
-                "--node",
-                &node_str,
-                "--title",
-                "Bad",
+                "--obligation",
+                &short,
                 "--html-file",
                 script_path.to_str().unwrap(),
             ],
         )
         .unwrap_err();
         assert!(err.to_string().contains("<script>"), "{err}");
+
+        // Clearing removes the link.
+        let cleared = cli(&root, &["visual-design", "clear", "--obligation", &short]).unwrap();
+        assert!(cleared.starts_with("ok "), "{cleared}");
+        let shown = cli(&root, &["visual-design", "show", "--obligation", &short]).unwrap();
+        assert_eq!(shown, "(none)");
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -27,6 +27,10 @@ pub struct ObligationSelection {
     pub id: Uuid,
     pub kind: String,
     pub body: String,
+    /// Path of the obligation's currently-linked visual-design mockup, when
+    /// one exists (see `tod-cli visual-design`). `None` if this obligation
+    /// has no mockup yet.
+    pub visual_design_path: Option<String>,
 }
 
 /// Everything the dynamic half of the first message describes.
@@ -96,6 +100,17 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
         out.push_str("\n**Body:**\n\n");
         out.push_str(obligation.body.trim());
         out.push('\n');
+        match obligation.visual_design_path.as_deref() {
+            Some(path) => {
+                out.push_str(&format!(
+                    "\n**Visual design:** already has a mockup linked at `{path}` — saving \
+                     again with `tod-cli visual-design save` replaces it.\n"
+                ));
+            }
+            None => {
+                out.push_str("\n**Visual design:** no mockup linked yet.\n");
+            }
+        }
         out.push_str(
             "\nThe user has this obligation selected, so an unqualified question \
              most likely refers to it.\n",
@@ -182,6 +197,7 @@ mod tests {
                 id: Uuid::from_u128(7),
                 kind: "requirement".into(),
                 body: "Must round-trip".into(),
+                visual_design_path: None,
             }),
             purposes: Vec::new(),
         };

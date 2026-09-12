@@ -267,6 +267,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
                     section: None,
                     body: text.to_string(),
                     phase: crate::interview::PHASE_UNKNOWN.into(),
+                    visual_design_path: None,
                 })?;
             } else if in_constraints {
                 con_ordinal += 1;
@@ -278,6 +279,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
                     section: None,
                     body: text.to_string(),
                     phase: crate::interview::PHASE_UNKNOWN.into(),
+                    visual_design_path: None,
                 })?;
             }
         }

@@ -262,7 +262,8 @@ impl WorkspaceView {
                 ObligationsEvent::FocusTaskList => this.focus_response_right(window, cx),
                 ObligationsEvent::DeleteSelectedTask
                 | ObligationsEvent::OpenAgentChat { .. }
-                | ObligationsEvent::OpenAgentConfig { .. } => {}
+                | ObligationsEvent::OpenAgentConfig { .. }
+                | ObligationsEvent::OpenVisualDesign { .. } => {}
             },
         );
 

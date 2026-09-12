@@ -85,7 +85,17 @@ pub(crate) fn obligation_line(o: &NodeObligation) -> String {
         .as_deref()
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
-    format!("[{}] {}{section}: {}", short_id(o.id), o.kind, one_line(&o.body))
+    let visual_design = if o.visual_design_path.is_some() {
+        " [visual design attached]"
+    } else {
+        ""
+    };
+    format!(
+        "[{}] {}{section}: {}{visual_design}",
+        short_id(o.id),
+        o.kind,
+        one_line(&o.body)
+    )
 }
 
 fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {

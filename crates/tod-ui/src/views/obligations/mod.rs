@@ -128,6 +128,12 @@ pub enum ObligationsEvent {
     OpenAgentConfig {
         node_id: Uuid,
     },
+    /// Clicked the "Design"/"+ Design" affordance on a design-phase
+    /// obligation row — create or open its associated visual-design mockup.
+    OpenVisualDesign {
+        node_id: Uuid,
+        obligation_id: Uuid,
+    },
 }
 
 pub struct ObligationsView {
@@ -1376,6 +1382,14 @@ impl ObligationsView {
                 }
                 RowAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
+                }
+                RowAction::OpenVisualDesign { obligation_id } => {
+                    if let Some(node_id) = self.node_id {
+                        cx.emit(ObligationsEvent::OpenVisualDesign {
+                            node_id,
+                            obligation_id,
+                        });
+                    }
                 }
             }
         }

@@ -1,6 +1,8 @@
 //! Visual design panel — a mockup `WebView` (left) next to an embedded agent
-//! chat (right), opened from the `design` lifecycle state's gate checklist
-//! (`design-planning.visual-packages-accepted-or-waived`).
+//! chat (right), opened from the "Design"/"+ Design" affordance on a
+//! design-phase obligation's row in the Obligations panel. Each panel
+//! session is scoped to exactly one obligation — the mockup shown and saved
+//! here is that obligation's, and only that obligation's.
 //!
 //! Unlike a normal agent chat (which owns its own OS window, see
 //! `app::InteractiveAgentWindowControl`), the chat here is constructed
@@ -9,10 +11,10 @@
 //! `ObligationsView`/`LifecyclePanelView` drawer convention (see CLAUDE.md's
 //! GPUI keyboard-focus section).
 //!
-//! The mockup preview polls for the node's most recent "Visual design
-//! package" obligation (written by `tod-cli visual-design save`) the same
-//! way `ObligationsView` polls `fleet.subscribe_changes()` for live updates,
-//! and reloads the `WebView` when a new package appears.
+//! The mockup preview polls the obligation's `visual_design_path` column
+//! (written by `tod-cli visual-design save`) the same way `ObligationsView`
+//! polls `fleet.subscribe_changes()` for live updates, and reloads the
+//! `WebView` when the path changes.
 
 use crate::app::InteractiveAgentWindowControl;
 use crate::interview::agent::SharedAgent;
@@ -36,10 +38,6 @@ use uuid::Uuid;
 
 const VISUAL_DESIGN_PANEL_CONTEXT: &str = "VisualDesignPanel";
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
-
-/// Marker in an obligation body left by `tod-cli visual-design save` (see
-/// `crates/tod-cli/src/visual_design.rs`).
-const PACKAGE_MARKER: &str = "Visual design package:";
 
 actions!(visual_design_panel, [VisualDesignPanelClose]);
 
@@ -77,17 +75,20 @@ pub fn register_visual_design_panel_keyboard_bindings(cx: &mut App) {
 pub struct VisualDesignPanelView {
     fleet: Arc<FleetStore>,
     node_id: Option<Uuid>,
+    /// The obligation this panel session is scoped to — its mockup, and only
+    /// its mockup, is shown and saved here.
+    obligation_id: Option<Uuid>,
     title: String,
     split: Entity<PanelSplitState>,
     webview: Option<Entity<WebView>>,
     /// A URL waiting to become a `WebView` — deferred because building one
-    /// needs a real `Window`, which the poll task that discovers a new
-    /// package does not have.
+    /// needs a real `Window`, which the poll task that discovers a path
+    /// change does not have.
     pending_webview_url: Option<String>,
     chat: Option<Entity<InteractiveAgentView>>,
-    /// Id of the obligation whose mockup is currently loaded, so a newer
-    /// package can be detected without re-parsing every poll tick.
-    loaded_obligation_id: Option<Uuid>,
+    /// The `visual_design_path` currently loaded, so a change can be
+    /// detected without re-querying the obligation on every poll tick.
+    loaded_path: Option<String>,
     focus_handle: FocusHandle,
     _poll_task: gpui::Task<()>,
 }
@@ -107,8 +108,7 @@ impl VisualDesignPanelView {
                 if !changed {
                     continue;
                 }
-                let Ok(()) = poll_entity.update(cx, |this, cx| this.reload_if_new_package(cx))
-                else {
+                let Ok(()) = poll_entity.update(cx, |this, cx| this.reload_if_changed(cx)) else {
                     break;
                 };
             }
@@ -117,35 +117,38 @@ impl VisualDesignPanelView {
         Self {
             fleet,
             node_id: None,
+            obligation_id: None,
             title: String::new(),
             split: cx.new(|_| PanelSplitState::centered()),
             webview: None,
             pending_webview_url: None,
             chat: None,
-            loaded_obligation_id: None,
+            loaded_path: None,
             focus_handle: cx.focus_handle(),
             _poll_task,
         }
     }
 
     pub fn is_open(&self) -> bool {
-        self.node_id.is_some()
+        self.obligation_id.is_some()
     }
 
-    /// Open the panel for `node_id`, constructing the embedded chat fresh —
-    /// sessions are never reused, mirroring every other agent-chat entry
-    /// point in the app.
+    /// Open the panel scoped to `obligation_id` on `node_id`, constructing
+    /// the embedded chat fresh — sessions are never reused, mirroring every
+    /// other agent-chat entry point in the app.
     pub fn open(
         &mut self,
         node_id: Uuid,
+        obligation_id: Uuid,
         title: &str,
         chat: EmbeddedChatParams,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.node_id = Some(node_id);
+        self.obligation_id = Some(obligation_id);
         self.title = title.to_string();
-        self.loaded_obligation_id = None;
+        self.loaded_path = None;
         self.webview = None;
         self.pending_webview_url = None;
 
@@ -166,21 +169,22 @@ impl VisualDesignPanelView {
         });
         self.chat = Some(view);
 
-        self.reload_if_new_package(cx);
+        self.reload_if_changed(cx);
         self.focus_handle.focus(window);
         cx.notify();
     }
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.node_id.is_none() {
+        if self.obligation_id.is_none() {
             return;
         }
         self.node_id = None;
+        self.obligation_id = None;
         self.title.clear();
         self.chat = None;
         self.webview = None;
         self.pending_webview_url = None;
-        self.loaded_obligation_id = None;
+        self.loaded_path = None;
         cx.emit(VisualDesignPanelEvent::Close);
         cx.notify();
     }
@@ -194,19 +198,26 @@ impl VisualDesignPanelView {
         self.close(cx);
     }
 
-    /// Look up the node's most recent "Visual design package" obligation and,
-    /// if it's newer than what's loaded, (re)create the webview pointed at
-    /// its file.
-    fn reload_if_new_package(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.node_id else { return };
-        let Some((obligation_id, path)) = latest_package(&self.fleet, node_id) else {
+    /// Look up this panel's obligation's `visual_design_path` and, if it
+    /// changed, (re)create the webview pointed at the new file.
+    fn reload_if_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(obligation_id) = self.obligation_id else {
             return;
         };
-        if Some(obligation_id) == self.loaded_obligation_id {
+        let Some(path) = self
+            .fleet
+            .get_obligation(obligation_id)
+            .ok()
+            .flatten()
+            .and_then(|o| o.visual_design_path)
+        else {
+            return;
+        };
+        if Some(&path) == self.loaded_path.as_ref() {
             return;
         }
-        self.loaded_obligation_id = Some(obligation_id);
-        let url = path_to_file_url(&path);
+        self.loaded_path = Some(path.clone());
+        let url = path_to_file_url(Path::new(&path));
         match &self.webview {
             Some(webview) => {
                 webview.update(cx, |webview, _| webview.load_url(&url));
@@ -305,25 +316,6 @@ impl Render for VisualDesignPanelView {
     }
 }
 
-/// Find the file path linked from the most recently created "Visual design
-/// package" obligation on `node_id` (see `tod-cli visual-design save`).
-fn latest_package(fleet: &FleetStore, node_id: Uuid) -> Option<(Uuid, PathBuf)> {
-    let rows = fleet.list_obligations_for_node(node_id).ok()?;
-    let row = rows
-        .iter()
-        .filter(|o| o.body.contains(PACKAGE_MARKER))
-        .max_by_key(|o| o.ordinal)?;
-    let path = extract_link_path(&row.body)?;
-    Some((row.id, path))
-}
-
-/// Pull the path out of a trailing markdown link `[title](path)`.
-fn extract_link_path(body: &str) -> Option<PathBuf> {
-    let start = body.rfind("](")? + 2;
-    let end = body[start..].find(')')? + start;
-    Some(PathBuf::from(&body[start..end]))
-}
-
 fn path_to_file_url(path: &Path) -> String {
     let mut normalized = path.to_string_lossy().replace('\\', "/");
     if !normalized.starts_with('/') {
@@ -335,15 +327,6 @@ fn path_to_file_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_link_path_reads_trailing_markdown_link() {
-        let body = "Visual design package: **Login**\n\n[Login](/data/visual-design/n/login.html)";
-        assert_eq!(
-            extract_link_path(body),
-            Some(PathBuf::from("/data/visual-design/n/login.html"))
-        );
-    }
 
     #[test]
     fn path_to_file_url_produces_a_leading_slash() {

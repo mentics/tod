@@ -8,8 +8,10 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
     div, prelude::FluentBuilder, px,
 };
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::{ActiveTheme, StyledExt, h_flex};
+use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
+use tod_store::interview::PHASE_DESIGN;
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
 
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
@@ -112,6 +114,9 @@ pub enum RowAction {
     StartSectionEdit { phase: String, kind: String, section: String },
     AddSection { phase: String, kind: String },
     Select { row_ix: usize },
+    /// Clicked the design-phase obligation's "Design" affordance — create or
+    /// open its associated visual-design mockup.
+    OpenVisualDesign { obligation_id: uuid::Uuid },
 }
 
 pub struct ObligationListDelegate {
@@ -483,6 +488,24 @@ impl ObligationListDelegate {
                             })
                             .child(obligation_body(row_ix, &body, color, window, cx)),
                     );
+                    if obligation.phase == PHASE_DESIGN {
+                        let has_design = obligation.visual_design_path.is_some();
+                        let design_sink = self.action_sink.clone();
+                        let design_view = view.clone();
+                        row_el = row_el.child(
+                            Button::new(("obligation-visual-design", row_ix))
+                                .label(if has_design { "Design" } else { "+ Design" })
+                                .ghost()
+                                .xsmall()
+                                .flex_shrink_0()
+                                .on_click(move |_, _, cx| {
+                                    design_sink
+                                        .borrow_mut()
+                                        .push(RowAction::OpenVisualDesign { obligation_id: id });
+                                    notify(&design_view, cx);
+                                }),
+                        );
+                    }
                 }
                 row_el
             }

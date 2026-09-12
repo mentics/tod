@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 17;
+pub const CURRENT_USER_VERSION: i32 = 18;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -176,6 +176,25 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v16_to_v17(conn)?;
         conn.pragma_update(None, "user_version", 17)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 18 {
+        migrate_v17_to_v18(conn)?;
+        conn.pragma_update(None, "user_version", 18)?;
+    }
+    Ok(())
+}
+
+/// One visual-design mockup (an HTML file path, relative to the data root)
+/// per obligation — `NULL` means none. A structured column rather than the
+/// earlier convention of scanning obligation bodies for marker text, so the
+/// association is enforced (one column, one value) instead of a soft
+/// string-matching convention.
+fn migrate_v17_to_v18(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE node_obligations ADD COLUMN visual_design_path TEXT;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

@@ -125,7 +125,7 @@ pub struct Shell {
     pending_open_lifecycle_panel: Option<String>,
     pending_close_lifecycle_panel: bool,
     pending_retarget_lifecycle_panel: Option<String>,
-    pending_open_visual_design: Option<String>,
+    pending_open_visual_design: Option<(uuid::Uuid, uuid::Uuid)>,
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
     pending_retarget_obligations: Option<(String, String, bool)>,
@@ -698,6 +698,7 @@ impl Shell {
                     id: o.id,
                     kind: o.kind,
                     body: o.body,
+                    visual_design_path: o.visual_design_path,
                 })
         });
 
@@ -1212,24 +1213,28 @@ impl Shell {
     }
 
     fn drain_pending_visual_design(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(task_id) = self.pending_open_visual_design.take() {
-            self.open_visual_design_panel(&task_id, window, cx);
+        if let Some((node_id, obligation_id)) = self.pending_open_visual_design.take() {
+            self.open_visual_design_panel(node_id, obligation_id, window, cx);
         }
     }
 
     /// Open the visual design panel (mockup `WebView` + embedded agent chat)
-    /// for `task_id`, from the lifecycle gate checklist's affordance on
-    /// `design-planning.visual-packages-accepted-or-waived`.
+    /// for one design-phase obligation, from the "Design"/"+ Design"
+    /// affordance on its row in the Obligations panel.
     ///
     /// Mirrors `open_obligations_agent_chat`, but constructs the chat
     /// in-process via `InteractiveAgentWindowControl::create_embedded_session`
     /// instead of opening a standalone window, so it can sit inside the panel
     /// next to the mockup preview.
-    fn open_visual_design_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Ok(node_id) = uuid::Uuid::parse_str(task_id) else {
-            return;
-        };
-        let Some(node) = self.fleet.get_node(task_id).ok().flatten() else {
+    fn open_visual_design_panel(
+        &mut self,
+        node_id: uuid::Uuid,
+        obligation_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task_id = node_id.to_string();
+        let Some(obligation) = self.fleet.get_obligation(obligation_id).ok().flatten() else {
             return;
         };
         let config_id = match self.create_default_agent_config(node_id, cx) {
@@ -1241,7 +1246,7 @@ impl Shell {
         };
         let (fleet, agent, workspace_cwd, settings, session_run_id) = match self
             ._interactive_agent_window
-            .create_embedded_session(task_id, &config_id, Some("design/visual-design"))
+            .create_embedded_session(&task_id, &config_id, Some("design/visual-design"))
         {
             Ok(session) => session,
             Err(err) => {
@@ -1249,7 +1254,8 @@ impl Shell {
                 return;
             }
         };
-        let initial_context = match self.build_visual_design_agent_context(node_id) {
+        let initial_context = match self.build_visual_design_agent_context(node_id, obligation_id)
+        {
             Ok(text) => Some(text),
             Err(err) => {
                 tracing::warn!(
@@ -1262,10 +1268,19 @@ impl Shell {
             }
         };
 
+        let title = obligation
+            .body
+            .lines()
+            .next()
+            .filter(|line| !line.is_empty())
+            .unwrap_or("Visual design")
+            .to_string();
+
         self.visual_design_panel.update(cx, |panel, cx| {
             panel.open(
                 node_id,
-                &node.title,
+                obligation_id,
+                &title,
                 EmbeddedChatParams {
                     config_id,
                     session_run_id,
@@ -1283,9 +1298,15 @@ impl Shell {
     }
 
     /// Assemble the visual-design agent's first message: bundled context docs
-    /// plus the live node selection (see `build_obligations_agent_context`).
-    fn build_visual_design_agent_context(&self, node_id: uuid::Uuid) -> anyhow::Result<String> {
-        use tod_core::agent_context::{ContextRequest, NodeSelection, build_first_message};
+    /// plus the live obligation selection (see `build_obligations_agent_context`).
+    fn build_visual_design_agent_context(
+        &self,
+        node_id: uuid::Uuid,
+        obligation_id: uuid::Uuid,
+    ) -> anyhow::Result<String> {
+        use tod_core::agent_context::{
+            ContextRequest, NodeSelection, ObligationSelection, build_first_message,
+        };
         use tod_core::media::MediaPaths;
 
         let media = MediaPaths::discover()?;
@@ -1300,6 +1321,12 @@ impl Shell {
             .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_DETAILS)
             .ok()
             .flatten();
+        let obligation = self
+            .fleet
+            .get_obligation(obligation_id)
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("obligation {obligation_id} not found"))?;
         let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
 
         build_first_message(
@@ -1313,7 +1340,12 @@ impl Shell {
                     body,
                     lifecycle: Some(node.lifecycle),
                 },
-                obligation: None,
+                obligation: Some(ObligationSelection {
+                    id: obligation.id,
+                    kind: obligation.kind,
+                    body: obligation.body,
+                    visual_design_path: obligation.visual_design_path,
+                }),
                 purposes,
             },
         )
@@ -1839,6 +1871,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             });
                                             cx.notify();
                                         }
+                                        ObligationsEvent::OpenVisualDesign {
+                                            node_id,
+                                            obligation_id,
+                                        } => {
+                                            this.pending_open_visual_design =
+                                                Some((*node_id, *obligation_id));
+                                            cx.notify();
+                                        }
                                     }
                                 });
                             let _lifecycle_panel_subscription = cx.subscribe(
@@ -1858,10 +1898,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     LifecyclePanelEvent::OpenInterview { task_id, lifecycle } => {
                                         this.pending_open_interview_for_task =
                                             Some((task_id.clone(), lifecycle.clone()));
-                                        cx.notify();
-                                    }
-                                    LifecyclePanelEvent::OpenVisualDesign { task_id } => {
-                                        this.pending_open_visual_design = Some(task_id.clone());
                                         cx.notify();
                                     }
                                 },

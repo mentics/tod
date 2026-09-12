@@ -298,6 +298,30 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 )],
             }))
         }
+        OutlineMutation::UpdateObligationVisualDesign { obligation_id, path } => {
+            let old: Option<String> = conn
+                .query_row(
+                    "SELECT visual_design_path FROM node_obligations WHERE id = ?1",
+                    params![uuid_to_blob(*obligation_id)],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if old == *path {
+                return Ok(None);
+            }
+            Ok(Some(CommandEntry {
+                id: Uuid::new_v4(),
+                label: "Updated visual design".into(),
+                created_at: crate::outline::uuid_blob::now_ms(),
+                inverses: vec![FleetMutation::Outline(
+                    OutlineMutation::UpdateObligationVisualDesign {
+                        obligation_id: *obligation_id,
+                        path: old,
+                    },
+                )],
+            }))
+        }
         OutlineMutation::DeleteObligation { obligation_id } => {
             let row: Option<(Uuid, String, String, i32, Option<String>, String, i64, i64)> = conn
                 .query_row(

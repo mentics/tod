@@ -99,6 +99,13 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         body: String,
     },
+    /// Set (or clear, with `None`) the obligation's associated visual-design
+    /// mockup file path. At most one per obligation — this overwrites
+    /// whatever was there before rather than adding another.
+    UpdateObligationVisualDesign {
+        obligation_id: Uuid,
+        path: Option<String>,
+    },
     /// Move one obligation into `section` (`None` = the "no section" bucket).
     UpdateObligationSection {
         obligation_id: Uuid,
@@ -222,6 +229,7 @@ impl OutlineMutation {
                 | OutlineMutation::SetNodeCollapsed { .. }
                 | OutlineMutation::CreateObligation { .. }
                 | OutlineMutation::UpdateObligationBody { .. }
+                | OutlineMutation::UpdateObligationVisualDesign { .. }
                 | OutlineMutation::UpdateObligationSection { .. }
                 | OutlineMutation::UpdateObligationPhase { .. }
                 | OutlineMutation::RenameObligationSection { .. }
@@ -355,6 +363,13 @@ impl OutlineMutation {
                 body,
             } => {
                 ObligationRepo::new(conn).update_body(*obligation_id, body)?;
+            }
+            OutlineMutation::UpdateObligationVisualDesign {
+                obligation_id,
+                path,
+            } => {
+                ObligationRepo::new(conn)
+                    .update_visual_design_path(*obligation_id, path.as_deref())?;
             }
             OutlineMutation::UpdateObligationSection {
                 obligation_id,

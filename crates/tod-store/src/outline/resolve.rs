@@ -165,6 +165,7 @@ pub fn copy_capabilities(conn: &Connection, source_id: Uuid, target_id: Uuid) ->
             section: ob.section,
             body: ob.body,
             phase: ob.phase,
+            visual_design_path: None,
         };
         obl_repo.insert(&copy)?;
     }

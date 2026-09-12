@@ -509,6 +509,14 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// A single obligation by id.
+    pub fn get_obligation(&self, obligation_id: uuid::Uuid) -> Result<Option<NodeObligation>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ObligationRepo::new(&guard.connection())
+            .get(obligation_id)
+            .map_err(Into::into)
+    }
+
     /// Resolved obligations visible to `node_id` — its own plus every
     /// Spec-capability ancestor's, root to leaf, unfiltered by phase. A gate
     /// check must see design-phase obligations (from this node or an

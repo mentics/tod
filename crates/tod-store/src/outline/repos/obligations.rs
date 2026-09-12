@@ -25,6 +25,10 @@ pub struct NodeObligation {
     pub section: Option<String>,
     pub body: String,
     pub phase: String,
+    /// Path (relative to the data root) of the associated visual-design
+    /// mockup HTML file, when one has been saved. At most one per
+    /// obligation — saving again overwrites this rather than adding another.
+    pub visual_design_path: Option<String>,
 }
 
 pub struct ObligationRepo<'a> {
@@ -39,8 +43,8 @@ impl<'a> ObligationRepo<'a> {
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, visual_design_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -49,6 +53,7 @@ impl<'a> ObligationRepo<'a> {
                 row.section,
                 row.body,
                 row.phase,
+                row.visual_design_path,
                 now
             ],
         )?;
@@ -57,7 +62,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase FROM node_obligations WHERE id = ?1",
+            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_obligation)
@@ -67,7 +72,7 @@ impl<'a> ObligationRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<NodeObligation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, kind, ordinal, section, body, phase FROM node_obligations
+            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations
              WHERE node_id = ?1 ORDER BY kind, ordinal",
         )?;
         let rows = stmt
@@ -122,6 +127,19 @@ impl<'a> ObligationRepo<'a> {
         Ok(())
     }
 
+    /// Set (or clear, with `None`) the associated visual-design mockup path.
+    /// Overwrites any previous value — an obligation has at most one.
+    pub fn update_visual_design_path(&self, id: Uuid, path: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE node_obligations SET visual_design_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path, now_ms(), uuid_to_blob(id)],
+        )?;
+        if n == 0 {
+            anyhow::bail!("obligation not found");
+        }
+        Ok(())
+    }
+
     pub fn delete(&self, id: Uuid) -> Result<Option<NodeObligation>> {
         let Some(row) = self.get(id)? else {
             return Ok(None);
@@ -156,6 +174,7 @@ impl<'a> ObligationRepo<'a> {
             section: section.map(str::to_string),
             body: body.to_string(),
             phase: phase.to_string(),
+            visual_design_path: None,
         })?;
         ids.insert(index, id);
         self.write_ordinals(node_id, kind, &ids)?;
@@ -212,6 +231,7 @@ impl<'a> ObligationRepo<'a> {
             section: row.section,
             body: row.body,
             phase: row.phase,
+            visual_design_path: row.visual_design_path,
         })
     }
 
@@ -275,6 +295,7 @@ impl<'a> ObligationRepo<'a> {
                     section: Some(row.get::<_, String>(1)?),
                     body: row.get(4)?,
                     phase: PHASE_UNKNOWN.to_string(),
+                    visual_design_path: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -322,5 +343,6 @@ fn map_obligation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeObligation> {
         section: row.get(4)?,
         body: row.get(5)?,
         phase: row.get(6)?,
+        visual_design_path: row.get(7)?,
     })
 }
