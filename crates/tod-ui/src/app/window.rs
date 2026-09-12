@@ -125,6 +125,7 @@ pub struct Shell {
     pending_open_lifecycle_panel: Option<String>,
     pending_close_lifecycle_panel: bool,
     pending_retarget_lifecycle_panel: Option<String>,
+    pending_focus_lifecycle_panel: bool,
     pending_open_visual_design: Option<(uuid::Uuid, uuid::Uuid)>,
     pending_open_obligations: Option<(String, String)>,
     pending_close_obligations: bool,
@@ -147,6 +148,42 @@ pub struct Shell {
     _agent_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
     _settings_subscription: Subscription,
+}
+
+/// Human-readable summary of background work that would be lost if the
+/// window closed right now: agents mid-run and gate checks in flight.
+fn collect_running_work(
+    fleet: &FleetStore,
+    lifecycle_panel: &Entity<LifecyclePanelView>,
+    cx: &App,
+) -> Vec<SharedString> {
+    let mut items = Vec::new();
+    if let Ok(agents) = fleet.list_all_agents() {
+        for agent in agents {
+            if matches!(
+                agent.runtime_status.as_str(),
+                "starting" | "processing" | "waiting" | "blocked"
+            ) {
+                let title = fleet
+                    .get_task(&agent.node_id)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.title)
+                    .unwrap_or_else(|| agent.node_id.clone());
+                items.push(SharedString::from(format!("Agent running: {title}")));
+            }
+        }
+    }
+    for task_id in lifecycle_panel.read(cx).running_gate_check_task_ids() {
+        let title = fleet
+            .get_task(&task_id)
+            .ok()
+            .flatten()
+            .map(|t| t.title)
+            .unwrap_or_else(|| task_id.clone());
+        items.push(SharedString::from(format!("Gate check running: {title}")));
+    }
+    items
 }
 
 impl Shell {
@@ -1210,6 +1247,14 @@ impl Shell {
         if let Some(task_id) = self.pending_open_lifecycle_panel.take() {
             self.open_lifecycle_panel(&task_id, window, cx);
         }
+        if self.pending_focus_lifecycle_panel {
+            self.pending_focus_lifecycle_panel = false;
+            if self.lifecycle_panel.read(cx).is_open() {
+                self.lifecycle_panel.update(cx, |panel, cx| {
+                    panel.focus(window, cx);
+                });
+            }
+        }
     }
 
     fn drain_pending_visual_design(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1569,15 +1614,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                 let transcript_for_close = transcript_window.clone();
                 let history_for_close = history_window.clone();
                 let interactive_for_close = interactive_agent_window.clone();
-                window.on_window_should_close(cx, move |window, cx| {
-                    persist_window_geometry(window, &paths_for_geometry);
-                    let _ = transcript_for_close.close(cx);
-                    history_for_close.close(cx);
-                    interactive_for_close.close_all(cx);
-                    true
-                });
                 match fleet_open {
                     Err((error, resolved_root)) => {
+                        window.on_window_should_close(cx, move |window, cx| {
+                            persist_window_geometry(window, &paths_for_geometry);
+                            let _ = transcript_for_close.close(cx);
+                            history_for_close.close(cx);
+                            interactive_for_close.close_all(cx);
+                            true
+                        });
                         let view =
                             cx.new(|cx| FleetBlockedView::new(error, resolved_root, window, cx));
                         cx.new(|cx| Root::new(view, window, cx))
@@ -1731,6 +1776,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             if this.lifecycle_panel.read(cx).is_open() {
                                                 this.pending_retarget_lifecycle_panel =
                                                     Some(task_id.clone());
+                                                this.pending_focus_lifecycle_panel = true;
                                             } else {
                                                 this.pending_open_lifecycle_panel =
                                                     Some(task_id.clone());
@@ -1997,6 +2043,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_lifecycle_panel: None,
                                 pending_close_lifecycle_panel: false,
                                 pending_retarget_lifecycle_panel: None,
+                                pending_focus_lifecycle_panel: false,
                                 pending_open_visual_design: None,
                                 pending_open_obligations: None,
                                 pending_close_obligations: false,
@@ -2037,6 +2084,40 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 }
                             }
                             shell
+                        });
+                        let fleet_for_close = fleet.clone();
+                        let lifecycle_panel_for_close = view.read(cx).lifecycle_panel.clone();
+                        window.on_window_should_close(cx, move |window, cx| {
+                            let running = collect_running_work(
+                                &fleet_for_close,
+                                &lifecycle_panel_for_close,
+                                cx,
+                            );
+                            if running.is_empty() {
+                                persist_window_geometry(window, &paths_for_geometry);
+                                let _ = transcript_for_close.close(cx);
+                                history_for_close.close(cx);
+                                interactive_for_close.close_all(cx);
+                                true
+                            } else {
+                                let paths_for_force = paths_for_geometry.clone();
+                                let transcript_for_force = transcript_for_close.clone();
+                                let history_for_force = history_for_close.clone();
+                                let interactive_for_force = interactive_for_close.clone();
+                                crate::ui::toast::close_guard_toast(
+                                    window,
+                                    cx,
+                                    running,
+                                    move |window, cx| {
+                                        persist_window_geometry(window, &paths_for_force);
+                                        let _ = transcript_for_force.close(cx);
+                                        history_for_force.close(cx);
+                                        interactive_for_force.close_all(cx);
+                                        window.remove_window();
+                                    },
+                                );
+                                false
+                            }
                         });
                         cx.new(|cx| Root::new(view, window, cx))
                     }

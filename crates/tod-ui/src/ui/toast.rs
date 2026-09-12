@@ -11,6 +11,7 @@ use crate::ui::selectable_text::selectable_text;
 
 struct ConfirmToast;
 struct ErrorBannerNotification;
+struct CloseGuardToast;
 
 /// Overlay for queued notifications (error banners, confirm toasts).
 pub fn notification_overlay(window: &mut Window, cx: &mut App) -> Option<impl IntoElement + use<>> {
@@ -121,6 +122,74 @@ pub fn confirm_toast(
                                     }
                                 }),
                             )),
+                    )
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
+
+/// Warns that background work (agent runs, gate checks, etc.) is still
+/// active before letting the window close. `on_force_exit` performs the
+/// actual close, bypassing whatever guard raised this toast.
+pub fn close_guard_toast(
+    window: &mut Window,
+    cx: &mut App,
+    running: Vec<SharedString>,
+    on_force_exit: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let on_force_exit = Rc::new(on_force_exit);
+
+    window.push_notification(
+        Notification::new()
+            .icon(IconName::TriangleAlert)
+            .autohide(false)
+            .id::<CloseGuardToast>()
+            .content(move |_note, window, cx| {
+                let on_force_exit = on_force_exit.clone();
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        selectable_text(
+                            "close-guard-title",
+                            "Background work is still running",
+                            window,
+                            cx,
+                        )
+                        .text_sm()
+                        .font_semibold(),
+                    )
+                    .child(gpui::div().flex().flex_col().gap_0p5().children(
+                        running.iter().enumerate().map(|(i, item)| {
+                            selectable_text(
+                                SharedString::from(format!("close-guard-item-{i}")),
+                                item.clone(),
+                                window,
+                                cx,
+                            )
+                            .text_xs()
+                        }),
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .mt_2()
+                            .child(Button::new("close-guard-cancel").label("Cancel").on_click(
+                                cx.listener(|note, _, window, cx| {
+                                    note.dismiss(window, cx);
+                                }),
+                            ))
+                            .child(
+                                Button::new("close-guard-force")
+                                    .label("Exit anyway")
+                                    .primary()
+                                    .on_click(cx.listener(move |note, _, window, cx| {
+                                        note.dismiss(window, cx);
+                                        on_force_exit(window, cx);
+                                    })),
+                            ),
                     )
                     .into_any_element()
             }),

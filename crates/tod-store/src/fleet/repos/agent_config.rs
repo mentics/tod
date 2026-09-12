@@ -48,6 +48,8 @@ pub struct AgentConfigRow {
     pub runtime_status: String,
     pub active_run_id: Option<String>,
     pub reconnect: Option<ReconnectIdentity>,
+    /// Timestamp (ms) of the most recent run activity (started/ended), if any run exists.
+    pub last_activity_ms: Option<i64>,
 }
 
 impl AgentConfigRow {
@@ -133,7 +135,8 @@ impl<'a> AgentConfigRepo<'a> {
     const SELECT_ROW: &'static str = "
         SELECT c.id, c.node_id, c.env_type, c.mode, c.work_directory, c.use_worktree, c.worktree_path,
                c.worktree_lease_id, c.worktree_lease_holder, c.platform, c.model, c.effort,
-               COALESCE(r.runtime_status, 'not_running'), r.id, r.reconnect_pid, r.reconnect_birth_token
+               COALESCE(r.runtime_status, 'not_running'), r.id, r.reconnect_pid, r.reconnect_birth_token,
+               COALESCE(r.ended_at, r.started_at)
         FROM agent_configs c
         LEFT JOIN agent_runs r ON r.id = (
             SELECT id FROM agent_runs
@@ -476,6 +479,7 @@ fn row_to_config_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentConfigRow
         runtime_status: row.get(12)?,
         active_run_id: row.get(13)?,
         reconnect,
+        last_activity_ms: row.get(16)?,
     })
 }
 

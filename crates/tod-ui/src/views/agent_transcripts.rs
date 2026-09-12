@@ -3,6 +3,7 @@ use crate::ui::actionable::{
     chrome_control_with_shortcut, render_label_badge, render_shortcut_pill,
 };
 use crate::ui::selectable_text::selectable_text;
+use chrono::{Local, TimeZone};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton,
@@ -14,10 +15,26 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tod_store::agent_traffic::{
-    AgentCategory, AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
-};
+use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
 use tod_store::fleet::{FleetStore, TranscriptTurn};
+
+/// A single row in the agent picker list, unified across fleet configs and
+/// traffic-log-only agents (question maker / answer processor).
+#[derive(Debug, Clone)]
+struct AgentRow {
+    id: String,
+    label: String,
+    entry_count: usize,
+    last_activity_ms: Option<i64>,
+    active: bool,
+}
+
+fn format_timestamp_ms(ms: i64) -> String {
+    match Local.timestamp_millis_opt(ms).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
 
 const AGENT_TRANSCRIPTS_CONTEXT: &str = "AgentTranscripts";
 const AGENTS_LIST_WIDTH: f32 = 320.0;
@@ -68,7 +85,8 @@ pub struct AgentTranscriptsView {
     traffic_log: SharedAgentTrafficLog,
     window_control: TranscriptWindowControl,
     focus_handle: FocusHandle,
-    grouped_agents: BTreeMap<AgentCategory, Vec<AgentSummary>>,
+    active_agents: Vec<AgentRow>,
+    past_agents: Vec<AgentRow>,
     selected_agent_id: Option<String>,
     turns: Vec<TurnRow>,
     header: SharedString,
@@ -95,7 +113,8 @@ impl AgentTranscriptsView {
             traffic_log,
             window_control,
             focus_handle: cx.focus_handle(),
-            grouped_agents: BTreeMap::new(),
+            active_agents: Vec::new(),
+            past_agents: Vec::new(),
             selected_agent_id: None,
             turns: Vec::new(),
             header: "Agent transcripts".into(),
@@ -121,49 +140,59 @@ impl AgentTranscriptsView {
     }
 
     fn first_agent_id(&self) -> Option<String> {
-        self.grouped_agents
-            .values()
-            .flat_map(|agents| agents.iter())
+        self.active_agents
+            .iter()
+            .chain(self.past_agents.iter())
             .next()
             .map(|a| a.id.clone())
     }
 
     fn reload_agents(&mut self) {
-        let mut grouped: BTreeMap<AgentCategory, Vec<AgentSummary>> = BTreeMap::new();
-
-        if let Ok(log) = self.traffic_log.lock() {
-            for (category, summaries) in log.agents_grouped() {
-                grouped.entry(category).or_default().extend(summaries);
-            }
-        }
+        let mut rows: Vec<AgentRow> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if let Ok(fleet_agents) = self.fleet.list_all_agents() {
-            let mut fleet_summaries: Vec<AgentSummary> = fleet_agents
-                .into_iter()
-                .map(|agent| {
-                    let turn_count = self
-                        .fleet
-                        .list_transcript_for_agent(&agent.id)
-                        .map(|t| t.len())
-                        .unwrap_or(0);
-                    AgentSummary {
+            for agent in fleet_agents {
+                let turn_count = self
+                    .fleet
+                    .list_transcript_for_agent(&agent.id)
+                    .map(|t| t.len())
+                    .unwrap_or(0);
+                if seen.insert(agent.id.clone()) {
+                    rows.push(AgentRow {
                         id: agent.id.clone(),
                         label: format!("{} · {} · {}", agent.id, agent.env_type, agent.mode),
-                        category: AgentCategory::Fleet,
                         entry_count: turn_count,
-                    }
-                })
-                .collect();
-            fleet_summaries.sort_by(|a, b| a.label.cmp(&b.label));
-            let slot = grouped.entry(AgentCategory::Fleet).or_default();
-            for summary in fleet_summaries {
-                if !slot.iter().any(|existing| existing.id == summary.id) {
-                    slot.push(summary);
+                        last_activity_ms: agent.last_activity_ms,
+                        active: agent.runtime_status != "not_running",
+                    });
                 }
             }
         }
 
-        self.grouped_agents = grouped;
+        if let Ok(log) = self.traffic_log.lock() {
+            for summary in log.agent_summaries() {
+                if seen.insert(summary.id.clone()) {
+                    rows.push(agent_row_from_summary(summary));
+                }
+            }
+        }
+
+        let (mut active, mut past): (Vec<AgentRow>, Vec<AgentRow>) =
+            rows.into_iter().partition(|row| row.active);
+        active.sort_by(|a, b| {
+            b.last_activity_ms
+                .cmp(&a.last_activity_ms)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+        past.sort_by(|a, b| {
+            b.last_activity_ms
+                .cmp(&a.last_activity_ms)
+                .then_with(|| a.label.cmp(&b.label))
+        });
+
+        self.active_agents = active;
+        self.past_agents = past;
     }
 
     fn select_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
@@ -213,9 +242,10 @@ impl AgentTranscriptsView {
     }
 
     fn flat_agent_ids(&self) -> Vec<String> {
-        self.grouped_agents
-            .values()
-            .flat_map(|agents| agents.iter().map(|agent| agent.id.clone()))
+        self.active_agents
+            .iter()
+            .chain(self.past_agents.iter())
+            .map(|agent| agent.id.clone())
             .collect()
     }
 
@@ -248,6 +278,115 @@ impl AgentTranscriptsView {
             badges.insert(id, (index + 1).to_string());
         }
         badges
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_agent_section(
+    title: &'static str,
+    rows: &[AgentRow],
+    index_offset: usize,
+    selected_agent_id: &Option<String>,
+    pick_badges: &BTreeMap<String, String>,
+    window: &mut Window,
+    cx: &mut Context<AgentTranscriptsView>,
+    border: gpui::Hsla,
+    muted: gpui::Hsla,
+    muted_bg: gpui::Hsla,
+    foreground: gpui::Hsla,
+    accent: gpui::Hsla,
+) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .px_2()
+                .text_xs()
+                .font_semibold()
+                .text_color(muted)
+                .child(title),
+        )
+        .children(rows.iter().enumerate().map(|(ix, agent)| {
+            let selected = selected_agent_id.as_deref() == Some(agent.id.as_str());
+            let badge = pick_badges.get(&agent.id).cloned();
+            let subtitle = match agent.last_activity_ms {
+                Some(ms) => format!("{} turns · {}", agent.entry_count, format_timestamp_ms(ms)),
+                None => format!("{} turns", agent.entry_count),
+            };
+            div()
+                .id(("agent-pick", index_offset + ix))
+                .relative()
+                .px_2()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .border_1()
+                .border_color(if selected { accent } else { border })
+                .bg(if selected {
+                    accent.opacity(0.12)
+                } else {
+                    muted_bg
+                })
+                .hover(|s| s.bg(border.opacity(0.35)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener({
+                        let id = agent.id.clone();
+                        move |this, _, _, cx| {
+                            this.select_agent(id.clone(), cx);
+                        }
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .gap_0p5()
+                        .pr(if badge.is_some() { px(18.) } else { px(0.) })
+                        .child(
+                            selectable_text(
+                                gpui::SharedString::from(format!(
+                                    "agent-pick-label-{}",
+                                    agent.id
+                                )),
+                                agent.label.clone(),
+                                window,
+                                cx,
+                            )
+                            .text_sm()
+                            .text_color(foreground),
+                        )
+                        .child(
+                            selectable_text(
+                                gpui::SharedString::from(format!(
+                                    "agent-pick-turns-{}",
+                                    agent.id
+                                )),
+                                subtitle,
+                                window,
+                                cx,
+                            )
+                            .text_xs()
+                            .text_color(muted),
+                        ),
+                )
+                .when_some(badge, |row, label| {
+                    row.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .right_0()
+                            .child(render_label_badge(label, cx)),
+                    )
+                })
+        }))
+}
+
+fn agent_row_from_summary(summary: AgentSummary) -> AgentRow {
+    AgentRow {
+        id: summary.id,
+        label: summary.label,
+        entry_count: summary.entry_count,
+        last_activity_ms: Some(summary.last_timestamp_ms),
+        active: false,
     }
 }
 
@@ -430,108 +569,51 @@ impl Render for AgentTranscriptsView {
                                             .p_2()
                                             .v_flex()
                                             .gap_2()
-                                            .when(self.grouped_agents.is_empty(), |el| {
-                                                el.child(
-                                                    div()
-                                                        .px_2()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .child("No agent traffic logged yet."),
-                                                )
-                                            })
-                                            .children(self.grouped_agents.iter().map(
-                                                |(category, agents)| {
-                                                    v_flex()
-                                                        .gap_1()
-                                                        .child(
-                                                            div()
-                                                                .px_2()
-                                                                .text_xs()
-                                                                .font_semibold()
-                                                                .text_color(muted)
-                                                                .child(category.label()),
-                                                        )
-                                                        .children(agents.iter().enumerate().map(
-                                                            |(ix, agent)| {
-                                                                let selected = self
-                                                                    .selected_agent_id
-                                                                    .as_deref()
-                                                                    == Some(agent.id.as_str());
-                                                                let badge = pick_badges
-                                                                    .get(&agent.id)
-                                                                    .cloned();
-                                                                div()
-                                            .id(("agent-pick", ix))
-                                            .relative()
-                                            .px_2()
-                                            .py_1p5()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .border_1()
-                                            .border_color(if selected { accent } else { border })
-                                            .bg(if selected {
-                                                accent.opacity(0.12)
-                                            } else {
-                                                muted_bg
-                                            })
-                                            .hover(|s| s.bg(border.opacity(0.35)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener({
-                                                    let id = agent.id.clone();
-                                                    move |this, _, _, cx| {
-                                                        this.select_agent(id.clone(), cx);
-                                                    }
-                                                }),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .gap_0p5()
-                                                    .pr(if badge.is_some() {
-                                                        px(18.)
-                                                    } else {
-                                                        px(0.)
-                                                    })
-                                                    .child(
-                                                        selectable_text(
-                                                            gpui::SharedString::from(format!(
-                                                                "agent-pick-label-{}",
-                                                                agent.id
-                                                            )),
-                                                            agent.label.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .text_sm()
-                                                        .text_color(foreground),
+                                            .when(
+                                                self.active_agents.is_empty()
+                                                    && self.past_agents.is_empty(),
+                                                |el| {
+                                                    el.child(
+                                                        div()
+                                                            .px_2()
+                                                            .text_xs()
+                                                            .text_color(muted)
+                                                            .child("No agent traffic logged yet."),
                                                     )
-                                                    .child(
-                                                        selectable_text(
-                                                            gpui::SharedString::from(format!(
-                                                                "agent-pick-turns-{}",
-                                                                agent.id
-                                                            )),
-                                                            format!("{} turns", agent.entry_count),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .text_xs()
-                                                        .text_color(muted),
-                                                    ),
-                                            )
-                                            .when_some(badge, |row, label| {
-                                                row.child(
-                                                    div()
-                                                        .absolute()
-                                                        .bottom_0()
-                                                        .right_0()
-                                                        .child(render_label_badge(label, cx)),
-                                                )
-                                            })
-                                                            },
-                                                        ))
                                                 },
-                                            )),
+                                            )
+                                            .when(!self.active_agents.is_empty(), |el| {
+                                                el.child(render_agent_section(
+                                                    "Currently active",
+                                                    &self.active_agents,
+                                                    0,
+                                                    &self.selected_agent_id,
+                                                    &pick_badges,
+                                                    window,
+                                                    cx,
+                                                    border,
+                                                    muted,
+                                                    muted_bg,
+                                                    foreground,
+                                                    accent,
+                                                ))
+                                            })
+                                            .when(!self.past_agents.is_empty(), |el| {
+                                                el.child(render_agent_section(
+                                                    "Past transcripts",
+                                                    &self.past_agents,
+                                                    self.active_agents.len(),
+                                                    &self.selected_agent_id,
+                                                    &pick_badges,
+                                                    window,
+                                                    cx,
+                                                    border,
+                                                    muted,
+                                                    muted_bg,
+                                                    foreground,
+                                                    accent,
+                                                ))
+                                            }),
                                     ),
                             ),
                     )

@@ -55,6 +55,8 @@ pub struct AgentSummary {
     pub label: String,
     pub category: AgentCategory,
     pub entry_count: usize,
+    /// Timestamp (ms) of the most recent traffic entry for this agent.
+    pub last_timestamp_ms: i64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -152,26 +154,32 @@ impl AgentTrafficLog {
     }
 
     pub fn agent_summaries(&self) -> Vec<AgentSummary> {
-        let mut counts: HashMap<(AgentCategory, String), (String, usize)> = HashMap::new();
+        let mut counts: HashMap<(AgentCategory, String), (String, usize, i64)> = HashMap::new();
         for entry in &self.entries {
             let key = (entry.category, entry.agent_id.clone());
             counts
                 .entry(key)
-                .and_modify(|(_, n)| *n += 1)
-                .or_insert((entry.agent_label.clone(), 1));
+                .and_modify(|(_, n, last)| {
+                    *n += 1;
+                    *last = (*last).max(entry.timestamp_ms);
+                })
+                .or_insert((entry.agent_label.clone(), 1, entry.timestamp_ms));
         }
         let mut summaries: Vec<_> = counts
             .into_iter()
-            .map(|((category, id), (label, entry_count))| AgentSummary {
-                id,
-                label,
-                category,
-                entry_count,
-            })
+            .map(
+                |((category, id), (label, entry_count, last_timestamp_ms))| AgentSummary {
+                    id,
+                    label,
+                    category,
+                    entry_count,
+                    last_timestamp_ms,
+                },
+            )
             .collect();
         summaries.sort_by(|a, b| {
-            a.category
-                .cmp(&b.category)
+            b.last_timestamp_ms
+                .cmp(&a.last_timestamp_ms)
                 .then_with(|| a.label.cmp(&b.label))
         });
         summaries

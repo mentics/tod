@@ -202,6 +202,17 @@ impl LifecyclePanelView {
         }
     }
 
+    /// Task ids with a gate check (or on-entry run) currently in flight,
+    /// independent of which task is selected — used by the app shell to
+    /// warn before closing the window while one is still running.
+    pub fn running_gate_check_task_ids(&self) -> Vec<String> {
+        self.gate_states
+            .iter()
+            .filter(|(_, state)| state.pending.is_some() || state.on_entry_run.is_some())
+            .map(|(task_id, _)| task_id.clone())
+            .collect()
+    }
+
     fn stops(&self) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
         if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
@@ -574,6 +585,17 @@ impl LifecyclePanelView {
         self.load_persisted_gate_state(task_id);
         self.focus_index = 0;
         cx.notify();
+        cx.on_next_frame(window, |this, window, cx| {
+            this.focus_handle.focus(window);
+            cx.notify();
+        });
+    }
+
+    /// Move keyboard focus onto the panel without changing what it targets.
+    /// Used when the panel is already open and the user asks to open it
+    /// again (e.g. pressing `L` from the node tree) — that should move
+    /// focus over, not no-op.
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.on_next_frame(window, |this, window, cx| {
             this.focus_handle.focus(window);
             cx.notify();
