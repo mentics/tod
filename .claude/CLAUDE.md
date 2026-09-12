@@ -156,6 +156,10 @@ Multi-line and single-line text fields must not trap keyboard navigation. The es
 - Disabled inputs must be removed from the GPUI tab order via `set_input_tab_stop` (see `crates/tod-ui/src/ui/key_context.rs`), or Tab will focus them with a cursor while typing is silently blocked.
 - Use `key_context::excluding_input` / `NOT_INPUT` for surface-level shortcuts and `key_context::including_input` for handlers (Escape, Enter-to-commit) that must still fire while an `Input` has focus.
 
+### Dynamic text must be selectable
+
+Any text whose content is data rather than fixed UI chrome (error messages, status strings, agent replies, transcripts, query results, criteria/detail rows, etc.) must be rendered with `crate::ui::selectable_text::selectable_text` (or `selectable_markdown` for markdown) instead of a plain `div().child(string)`, so the user can drag-select and copy it everywhere in the app. Static chrome — button labels, section headings, fixed captions — may stay plain `div` text. See `crates/tod-ui/src/ui/selectable_text.rs` and its existing call sites (e.g. `agent_transcripts.rs`, `lifecycle_panel.rs`) for the pattern.
+
 ### Cross-panel keyboard navigation
 
 Any multi-column view moves the focused panel with Left/Right. Where those keys already act on a panel's own content (the task tree collapses/expands and selects the parent with them), the panel binds **Ctrl+Left / Ctrl+Right** instead. `crates/tod-ui/src/ui/pane_nav.rs` owns the shared `PaneFocusLeft` / `PaneFocusRight` actions: `bind_pane_nav(cx, surface)` registers plain *and* Ctrl arrows, `bind_modified_pane_nav(cx, surface)` registers Ctrl only. Ctrl+arrows are registered on every multi-column surface, so the same chord crosses panels everywhere.

@@ -325,14 +325,13 @@ fn mock_gate_check_reply(message: &str) -> String {
         .collect();
 
     let mut reply = format!(
-        "---\nresult: pass\nforward_lifecycle: {forward_state}\npaused: false\n---\n\n\
-         Mock gate check: pass.\n"
+        "result: pass\nforward_lifecycle: {forward_state}\npaused: false\nfindings: \"Mock gate check: pass.\"\n"
     );
     if !criterion_ids.is_empty() {
-        reply.push_str("\n---gate_results\n");
+        reply.push_str("gate_results:\n");
         for id in criterion_ids {
             reply.push_str(&format!(
-                "- criterion_id: {id}\n  outcome: pass\n  detail: \"mock pass\"\n"
+                "  - criterion_id: {id}\n    outcome: pass\n    detail: \"mock pass\"\n    action: none\n"
             ));
         }
     }
@@ -443,7 +442,7 @@ mod tests {
         let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, run.id) else {
             panic!("gate check turn failed");
         };
-        assert!(reply.starts_with("---\nresult: pass"), "{reply}");
+        assert!(reply.starts_with("result: pass"), "{reply}");
         assert!(reply.contains("forward_lifecycle: planning"), "{reply}");
         assert!(
             reply.contains("criterion_id: a1000001-0001-4001-8001-000000000001"),

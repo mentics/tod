@@ -124,6 +124,7 @@ impl<'a> GateRepo<'a> {
         &self,
         node_id: Uuid,
         results: &[(Uuid, String, Option<String>)],
+        source: &str,
     ) -> Result<()> {
         let now = now_ms();
         for (criterion_id, outcome, detail) in results {
@@ -132,7 +133,7 @@ impl<'a> GateRepo<'a> {
                 criterion_id: *criterion_id,
                 outcome: outcome.clone(),
                 detail: detail.clone(),
-                source: SOURCE_AGENT.to_string(),
+                source: source.to_string(),
                 evaluated_at: now,
             })?;
         }
