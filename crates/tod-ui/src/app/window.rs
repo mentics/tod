@@ -1698,7 +1698,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
-                            LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
+                            LifecyclePanelView::new(
+                                cx,
+                                fleet.clone(),
+                                agent.clone(),
+                                paths.clone(),
+                                interactive_agent_window.clone(),
+                            )
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));

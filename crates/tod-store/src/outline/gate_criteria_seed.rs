@@ -206,6 +206,15 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Would a mid-active question only arise from a bug/code surprise—not from missing intent?",
         sort_order: 12,
     },
+    // ready → active
+    GateCriterionSeed {
+        id_str: "a1000005-0005-4005-8005-000000000001",
+        from_state: "ready",
+        to_state: "active",
+        slug: "ready-active.action-config-configured",
+        label: "Does the node have at least one action config configured to do the implementation work?",
+        sort_order: 1,
+    },
     // verifying → review
     GateCriterionSeed {
         id_str: "a1000003-0003-4003-8003-000000000001",

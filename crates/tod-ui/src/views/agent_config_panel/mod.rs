@@ -416,11 +416,25 @@ impl AgentConfigPanelView {
     }
 
     fn reload_chat_sessions(&mut self) {
-        self.chat_sessions = self
-            .config_id
-            .as_ref()
-            .and_then(|id| self.fleet.list_interactive_sessions_for_config(id).ok())
+        let Some(config_id) = self.config_id.as_ref() else {
+            self.chat_sessions = Vec::new();
+            return;
+        };
+        // Implementation sessions (launched from the lifecycle panel's Active
+        // "Implement" button) show up alongside ordinary interactive chat
+        // sessions here — same config, same session list, just a distinct
+        // `run_kind` under the hood (see `tod_store::fleet::AgentRun`).
+        let mut sessions = self
+            .fleet
+            .list_interactive_sessions_for_config(config_id)
             .unwrap_or_default();
+        sessions.extend(
+            self.fleet
+                .list_implementation_sessions_for_config(config_id)
+                .unwrap_or_default(),
+        );
+        sessions.sort_by(|a, b| b.run_number.cmp(&a.run_number));
+        self.chat_sessions = sessions;
     }
 
     fn reload_terminal_agents(&mut self) {

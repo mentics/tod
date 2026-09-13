@@ -814,10 +814,12 @@ fn gate_criteria_seed_on_migration() {
     assert_eq!(design_planning.len(), 11);
     let planning_ready = repo.list_for_transition("planning", "ready").unwrap();
     assert_eq!(planning_ready.len(), 12);
+    let ready_active = repo.list_for_transition("ready", "active").unwrap();
+    assert_eq!(ready_active.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
     assert_eq!(verifying_review.len(), 9);
     assert_eq!(
-        design_planning.len() + planning_ready.len() + verifying_review.len(),
+        design_planning.len() + planning_ready.len() + ready_active.len() + verifying_review.len(),
         GATE_CRITERIA.len()
     );
     let _ = fs::remove_dir_all(root);
