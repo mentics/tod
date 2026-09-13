@@ -2,7 +2,7 @@
 
 use crate::outline::types::{Capability, Node, NodeKind};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, ms_to_datetime, now_ms, uuid_to_blob};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
@@ -140,9 +140,37 @@ impl<'a> NodeRepo<'a> {
     }
 
     pub fn enable_capability(&self, node_id: Uuid, cap: Capability) -> Result<()> {
+        let blob = uuid_to_blob(node_id);
+
+        // Check mutual exclusion: reject enabling one when a conflicting capability is active.
+        let existing_caps = self.list_capabilities(node_id)?;
+        for excluded in cap.mutually_exclusive() {
+            if existing_caps.contains(excluded) {
+                bail!(
+                    "Cannot enable {} while {} is enabled",
+                    cap.label(),
+                    excluded.label()
+                );
+            }
+        }
+
+        // Generator cannot be enabled on a node that already has children.
+        if cap == Capability::Generator {
+            let has_children: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM outline_entries WHERE parent_id = ?1)",
+                    params![&blob],
+                    |row| row.get(0),
+                )?;
+            if has_children {
+                bail!("Cannot enable Generator on a node that already has children");
+            }
+        }
+
         self.conn.execute(
             "INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, ?2, ?3)",
-            params![uuid_to_blob(node_id), cap.as_str(), now_ms()],
+            params![&blob, cap.as_str(), now_ms()],
         )?;
         match cap {
             Capability::Lifecycle => {
@@ -155,7 +183,7 @@ impl<'a> NodeRepo<'a> {
                     .conn
                     .query_row(
                         "SELECT 1 FROM node_fields WHERE node_id = ?1",
-                        params![uuid_to_blob(node_id)],
+                        params![&blob],
                         |_| Ok(()),
                     )
                     .optional()?
@@ -165,6 +193,10 @@ impl<'a> NodeRepo<'a> {
                 }
             }
             Capability::Spec => {}
+            Capability::Generator => {
+                // No additional initialization needed at enable time.
+                // Configuration is saved separately via SetGeneratorConfig mutation.
+            }
         }
         Ok(())
     }
@@ -355,6 +387,12 @@ impl<'a> NodeRepo<'a> {
             Capability::Agent => {
                 self.conn
                     .execute("DELETE FROM node_fields WHERE node_id = ?1", params![blob])?;
+            }
+            Capability::Generator => {
+                let gen_repo = crate::outline::repos::GeneratorRepo::new(self.conn);
+                gen_repo.delete_managed_children(node_id)?;
+                gen_repo.clear_links_for_generator(node_id)?;
+                gen_repo.delete_config(node_id)?;
             }
         }
         Ok(())

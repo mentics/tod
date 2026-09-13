@@ -947,3 +947,344 @@ fn plan_step_dependency_graph_and_obligation_links() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+// ── Generator capability tests ──────────────────────────────────────────
+
+fn setup_store_with_list() -> (FleetStore, PathBuf, Uuid) {
+    let root = std::env::temp_dir().join(format!("tod-gen-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "gen-test".into(),
+            title: "Gen Test".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    (store, root, list_id)
+}
+
+fn create_node_in(store: &FleetStore, list_id: Uuid, parent_id: Option<Uuid>, title: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(id),
+            list_id,
+            parent_id,
+            anchor_id: parent_id,
+            position: if parent_id.is_some() {
+                CreatePosition::Child
+            } else {
+                CreatePosition::Below
+            },
+            title: title.into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    id
+}
+
+#[test]
+fn generator_capability_on_empty_node_succeeds() {
+    let (store, root, list_id) = setup_store_with_list();
+    let node_id = create_node_in(&store, list_id, None, "Generator Node");
+
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    let flush_result = store.writer().flush();
+    assert!(
+        flush_result.is_ok(),
+        "flush should succeed for Generator on empty node: {:?}",
+        flush_result.err()
+    );
+    store.projection().lock().unwrap().reload().unwrap();
+
+    // Direct check: open a fresh connection and query capabilities
+    let db_path = root.join("tod.db");
+    let fresh_conn = crate::fleet::schema::open_read_connection(&db_path).unwrap();
+    let caps = crate::outline::repos::NodeRepo::new(&fresh_conn).list_capabilities(node_id).unwrap();
+    assert!(
+        caps.contains(&Capability::Generator),
+        "expected Generator in capabilities, got: {:?}",
+        caps
+    );
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generator_capability_on_node_with_children_fails() {
+    let (store, root, list_id) = setup_store_with_list();
+    let parent_id = create_node_in(&store, list_id, None, "Parent");
+    let _child_id = create_node_in(&store, list_id, Some(parent_id), "Child");
+
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: parent_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    let result = store.writer().flush();
+    // The flush may succeed (if mutations are individually swallowed) or fail.
+    // Either way, the capability should not be enabled.
+    if result.is_ok() {
+        store
+            .read(|conn| {
+                let caps =
+                    crate::outline::repos::NodeRepo::new(conn).list_capabilities(parent_id)?;
+                assert!(
+                    !caps.contains(&Capability::Generator),
+                    "Generator should not be enabled on a node with children"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    // If flush failed, the error message should be about children.
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generator_and_lifecycle_are_mutually_exclusive() {
+    let (store, root, list_id) = setup_store_with_list();
+
+    // Test 1: Enable Lifecycle first, then Generator should fail.
+    let node1 = create_node_in(&store, list_id, None, "Lifecycle-first");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node1,
+            capabilities: vec![Capability::Lifecycle],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node1,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    let result = store.writer().flush();
+    if result.is_ok() {
+        store
+            .read(|conn| {
+                let caps =
+                    crate::outline::repos::NodeRepo::new(conn).list_capabilities(node1)?;
+                assert!(
+                    !caps.contains(&Capability::Generator),
+                    "Generator should not coexist with Lifecycle"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    // Test 2: Enable Generator first, then Lifecycle should fail.
+    let node2 = create_node_in(&store, list_id, None, "Generator-first");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node2,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node2,
+            capabilities: vec![Capability::Lifecycle],
+        })
+        .unwrap();
+    let result = store.writer().flush();
+    if result.is_ok() {
+        store
+            .read(|conn| {
+                let caps =
+                    crate::outline::repos::NodeRepo::new(conn).list_capabilities(node2)?;
+                assert!(
+                    !caps.contains(&Capability::Lifecycle),
+                    "Lifecycle should not coexist with Generator"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+// ── Generator lifecycle cleanup ──────────────────────────────────────────
+
+fn create_managed_node_for_test(
+    store: &FleetStore,
+    list_id: Uuid,
+    parent_id: Uuid,
+    generator_node_id: Uuid,
+    external_id: &str,
+    title: &str,
+) -> Uuid {
+    let node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateManagedNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id,
+            title: title.into(),
+            external_id: external_id.into(),
+            source_type: "mock".into(),
+            generator_node_id,
+            tags: vec![],
+            body: String::new(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    node_id
+}
+
+#[test]
+fn disabling_generator_deletes_managed_children_and_config() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let managed_id =
+        create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Item");
+
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability {
+            node_id: generator_id,
+            capability: Capability::Generator,
+            archive_payload: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(gen_repo.get_config(generator_id).unwrap().is_none());
+            assert!(gen_repo.get_link(managed_id).unwrap().is_none());
+            let node = crate::outline::repos::NodeRepo::new(conn).get(managed_id).unwrap();
+            assert!(node.is_none(), "managed node should be deleted on disable");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn deleting_generator_node_cascades_managed_cleanup() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let managed_id =
+        create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Item");
+
+    store
+        .enqueue_outline(OutlineMutation::DeleteNode { node_id: generator_id })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+            assert!(node_repo.get(generator_id).unwrap().is_none());
+            assert!(node_repo.get(managed_id).unwrap().is_none());
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(gen_repo.get_config(generator_id).unwrap().is_none());
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn re_enabling_generator_after_disable_starts_with_no_config() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: r#"{"query":"old"}"#.into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability {
+            node_id: generator_id,
+            capability: Capability::Generator,
+            archive_payload: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let config = crate::outline::repos::GeneratorRepo::new(conn)
+                .get_config(generator_id)
+                .unwrap();
+            assert!(config.is_none(), "re-enabled generator must not retain old config");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

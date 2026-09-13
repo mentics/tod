@@ -191,20 +191,12 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         sort_order: 10,
     },
     GateCriterionSeed {
-        id_str: "a1000002-0002-4002-8002-00000000000b",
-        from_state: "planning",
-        to_state: "ready",
-        slug: "planning-ready.human-lookover",
-        label: "Interactive mode: human look-over done or waived? Autonomous: look-over waived by mode?",
-        sort_order: 11,
-    },
-    GateCriterionSeed {
         id_str: "a1000002-0002-4002-8002-00000000000c",
         from_state: "planning",
         to_state: "ready",
         slug: "planning-ready.no-missing-intent-for-active",
         label: "Would a mid-active question only arise from a bug/code surprise—not from missing intent?",
-        sort_order: 12,
+        sort_order: 11,
     },
     // verifying → review
     GateCriterionSeed {
@@ -330,5 +322,9 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
             ],
         )?;
     }
+    conn.execute(
+        "UPDATE gate_criteria SET active = 0, updated_at = ?1 WHERE slug = 'planning-ready.human-lookover' AND active = 1",
+        params![now],
+    )?;
     Ok(())
 }

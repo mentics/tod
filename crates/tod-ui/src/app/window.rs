@@ -155,6 +155,7 @@ pub struct Shell {
 fn collect_running_work(
     fleet: &FleetStore,
     lifecycle_panel: &Entity<LifecyclePanelView>,
+    sessions: &Entity<SessionsView>,
     cx: &App,
 ) -> Vec<SharedString> {
     let mut items = Vec::new();
@@ -170,7 +171,17 @@ fn collect_running_work(
                     .flatten()
                     .map(|t| t.title)
                     .unwrap_or_else(|| agent.node_id.clone());
-                items.push(SharedString::from(format!("Agent running: {title}")));
+                let platform = agent.platform.as_str();
+                let platform_label = match platform {
+                    "claude" => "Claude",
+                    "cursor" => "Cursor",
+                    "mock" => "Mock",
+                    other if !other.is_empty() => other,
+                    _ => "Coding",
+                };
+                items.push(SharedString::from(format!(
+                    "{platform_label} agent running: {title}"
+                )));
             }
         }
     }
@@ -182,6 +193,9 @@ fn collect_running_work(
             .map(|t| t.title)
             .unwrap_or_else(|| task_id.clone());
         items.push(SharedString::from(format!("Gate check running: {title}")));
+    }
+    for item in sessions.read(cx).running_interview_work() {
+        items.push(SharedString::from(item));
     }
     items
 }
@@ -353,6 +367,10 @@ impl Shell {
             self.agent_status_text = text.into();
             cx.notify();
         }
+        let gate_activity = self.lifecycle_panel.read(cx).in_flight_activity();
+        self.task_list.update(cx, |list, cx| {
+            list.set_agent_activity(gate_activity, cx);
+        });
     }
 
     fn replace_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
@@ -2087,10 +2105,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let fleet_for_close = fleet.clone();
                         let lifecycle_panel_for_close = view.read(cx).lifecycle_panel.clone();
+                        let sessions_for_close = view.read(cx).sessions.clone();
                         window.on_window_should_close(cx, move |window, cx| {
                             let running = collect_running_work(
                                 &fleet_for_close,
                                 &lifecycle_panel_for_close,
+                                &sessions_for_close,
                                 cx,
                             );
                             if running.is_empty() {

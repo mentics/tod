@@ -140,12 +140,19 @@ impl SessionTurn {
 /// Swappable agent backend boundary (`--agent mock|cursor|claude`).
 pub trait AgentProvider {
     /// Start an autonomous fleet agent run for a saved agent config.
+    ///
+    /// `session_title` names the agent-side session the same way
+    /// [`SessionOpening::title`] does for chat turns — callers build both with
+    /// the same naming convention so a session looks the same no matter how it
+    /// was started; empty means don't name it. Platforms that expose no rename
+    /// mechanism (Cursor) ignore it.
     fn start_fleet_agent(
         &mut self,
         agent_config_id: &str,
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
+        session_title: String,
     ) -> anyhow::Result<AgentRunHandle>;
 
     /// Send one message in the long-lived conversation `turn.key`, starting or

@@ -31,6 +31,28 @@ pub fn interview_session_prefix(
     ))
 }
 
+/// The state agent's role doc for `lifecycle`: shared state-agent conventions
+/// (`agents/state/base.md`) plus that lifecycle's own doc, when bundled. This
+/// is the doc every state-agent turn needs — gate checks, on-entry work, and
+/// autonomous fleet runs alike — so every caller shares this one assembly.
+pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
+    let base_path = manifest.state_base_doc();
+    let base = read_doc(&base_path)
+        .with_context(|| format!("read bundled state agent base doc {}", base_path.display()))?;
+    let state_body = manifest
+        .state_doc(lifecycle)
+        .map(|path| read_doc(&path))
+        .transpose()?
+        .unwrap_or_else(|| {
+            format!("(No bundled state agent doc for lifecycle `{lifecycle}` — apply general task work.)")
+        });
+    Ok(format!(
+        "## State agent conventions\n\n{}\n\n## Lifecycle state: {lifecycle}\n\n{}",
+        base.trim(),
+        state_body.trim(),
+    ))
+}
+
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
 pub fn build_fleet_agent_prompt(
     manifest: &ProcessManifest,
@@ -38,19 +60,7 @@ pub fn build_fleet_agent_prompt(
     config_id: &str,
     cwd: &Path,
 ) -> Result<String> {
-    let base_path = manifest.state_base_doc();
-    let base = read_doc(&base_path)
-        .with_context(|| format!("read bundled state agent base doc {}", base_path.display()))?;
-    let state_body = manifest
-        .state_doc(&task.lifecycle)
-        .map(|path| read_doc(&path))
-        .transpose()?
-        .unwrap_or_else(|| {
-            format!(
-                "(No bundled state agent doc for lifecycle `{}` — apply general task work.)",
-                task.lifecycle
-            )
-        });
+    let role = state_role_doc(manifest, &task.lifecycle)?;
     let repo = task.repo.as_deref().unwrap_or("(not set)");
     let branch = task.branch.as_deref().unwrap_or("(default)");
     let notes = if task.notes.is_empty() {
@@ -63,10 +73,7 @@ pub fn build_fleet_agent_prompt(
             .join("\n")
     };
     Ok(format!(
-        "## State agent conventions\n\n\
-         {base}\n\n\
-         ## Lifecycle state: {lifecycle}\n\n\
-         {state_body}\n\n\
+        "{role}\n\n\
          ## Task\n\n\
          Config id: {config_id}\n\
          Node id: {node_id}\n\

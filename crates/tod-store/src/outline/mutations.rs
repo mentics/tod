@@ -1,6 +1,7 @@
 //! Outline mutations executed by the fleet writer.
 
 use crate::outline::repos::gate::GateRepo;
+use crate::outline::repos::generator::GeneratorRepo;
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
 use crate::outline::repos::plan_steps::PlanStepRepo;
 use crate::outline::repos::tree::TreeLoader;
@@ -8,7 +9,7 @@ use crate::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
 use crate::outline::types::{Capability, EXTRA_CONTENT_DETAILS, OutlineEntry};
 use crate::outline::uuid_blob::now_ms;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -212,6 +213,64 @@ pub enum OutlineMutation {
         /// manual waive (see `tod_store::outline::{SOURCE_AGENT, SOURCE_HUMAN}`).
         source: String,
     },
+
+    // ── Generator mutations ─────────────────────────────────────────────
+
+    /// Save or update the generator configuration for a node.
+    SetGeneratorConfig {
+        node_id: Uuid,
+        data_source_type: String,
+        config_json: String,
+    },
+    /// Delete the generator configuration (cleanup on disable).
+    DeleteGeneratorConfig {
+        node_id: Uuid,
+    },
+    /// Create a managed node under a generator parent with a data-source link.
+    CreateManagedNode {
+        node_id: Option<Uuid>,
+        list_id: Uuid,
+        parent_id: Uuid,
+        title: String,
+        external_id: String,
+        source_type: String,
+        generator_node_id: Uuid,
+        tags: Vec<String>,
+        body: String,
+    },
+    /// Update a managed node's fields from data source (title, tags, body).
+    UpdateManagedNode {
+        node_id: Uuid,
+        title: String,
+        tags: Vec<String>,
+        body: String,
+    },
+    /// Bulk-delete managed child nodes under a generator (reconciliation or disable).
+    DeleteManagedNodes {
+        generator_node_id: Uuid,
+    },
+    /// Delete a single managed node and its managed descendants (reconciliation
+    /// removal of an item no longer returned by the data source).
+    DeleteManagedNode {
+        node_id: Uuid,
+    },
+    /// Create or update a data-source link on a copied-out node.
+    SetManagedNodeLink {
+        node_id: Uuid,
+        generator_node_id: Uuid,
+        external_id: String,
+        source_type: String,
+    },
+    /// Clear all data-source links originating from a generator (on generator delete).
+    ClearManagedNodeLinks {
+        generator_node_id: Uuid,
+    },
+    /// Update the refresh status on a generator node.
+    SetRefreshStatus {
+        node_id: Uuid,
+        status: String,
+        error: Option<String>,
+    },
 }
 
 impl OutlineMutation {
@@ -250,6 +309,15 @@ impl OutlineMutation {
                 | OutlineMutation::SetExtraContent { .. }
                 | OutlineMutation::SetLifecycle { .. }
                 | OutlineMutation::ApplyGateResults { .. }
+                | OutlineMutation::SetGeneratorConfig { .. }
+                | OutlineMutation::DeleteGeneratorConfig { .. }
+                | OutlineMutation::CreateManagedNode { .. }
+                | OutlineMutation::UpdateManagedNode { .. }
+                | OutlineMutation::DeleteManagedNodes { .. }
+                | OutlineMutation::DeleteManagedNode { .. }
+                | OutlineMutation::SetManagedNodeLink { .. }
+                | OutlineMutation::ClearManagedNodeLinks { .. }
+                | OutlineMutation::SetRefreshStatus { .. }
         )
     }
 
@@ -270,11 +338,13 @@ impl OutlineMutation {
                 position,
                 title,
             } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
                 create_text_node(
                     conn, *list_id, *parent_id, *anchor_id, *position, title, *node_id,
                 )?;
             }
             OutlineMutation::UpdateNodeTitle { node_id, title } => {
+                guard_not_managed(conn, *node_id)?;
                 let repo = NodeRepo::new(conn);
                 repo.update_title(*node_id, title)?;
                 repo.sync_auto_slug(*node_id)?;
@@ -287,6 +357,7 @@ impl OutlineMutation {
                 parent_id,
                 ordinal,
             } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
                 let list_id = outline_list_for_node(conn, *node_id)?;
                 bump_ordinals_after(conn, list_id, *parent_id, *ordinal)?;
                 OutlineRepo::new(conn).set_parent(*node_id, *parent_id, *ordinal)?;
@@ -299,6 +370,7 @@ impl OutlineMutation {
                 node_id,
                 capabilities,
             } => {
+                guard_not_managed(conn, *node_id)?;
                 NodeRepo::new(conn).enable_capabilities(*node_id, capabilities)?;
             }
             OutlineMutation::DisableCapability {
@@ -318,6 +390,7 @@ impl OutlineMutation {
                 title,
                 ref_target_id,
             } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
                 let slug = format!("ref-{}", Uuid::new_v4().simple());
                 let node = NodeRepo::new(conn).create_reference(&slug, title, *ref_target_id)?;
                 let outline = OutlineRepo::new(conn);
@@ -346,6 +419,7 @@ impl OutlineMutation {
                 body,
                 phase,
             } => {
+                guard_not_managed(conn, *node_id)?;
                 create_obligation(
                     conn,
                     *obligation_id,
@@ -415,6 +489,7 @@ impl OutlineMutation {
                 ObligationRepo::new(conn).move_to_node(*obligation_id, *target_node_id)?;
             }
             OutlineMutation::DeleteNode { node_id } => {
+                guard_not_managed(conn, *node_id)?;
                 let (archive_id, list_id) =
                     crate::outline::archive::delete_subtree_archived(conn, *node_id)?;
                 refresh_loop_health(conn, list_id)?;
@@ -513,9 +588,107 @@ impl OutlineMutation {
                     NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
                 }
             }
+
+            // ── Generator mutations ─────────────────────────────────────
+
+            OutlineMutation::SetGeneratorConfig {
+                node_id,
+                data_source_type,
+                config_json,
+            } => {
+                GeneratorRepo::new(conn).set_config(*node_id, data_source_type, config_json)?;
+            }
+            OutlineMutation::DeleteGeneratorConfig { node_id } => {
+                GeneratorRepo::new(conn).delete_config(*node_id)?;
+            }
+            OutlineMutation::CreateManagedNode {
+                node_id,
+                list_id,
+                parent_id,
+                title,
+                external_id,
+                source_type,
+                generator_node_id,
+                tags,
+                body,
+            } => {
+                let node_id = create_managed_node(
+                    conn,
+                    *node_id,
+                    *list_id,
+                    *parent_id,
+                    title,
+                    external_id,
+                    source_type,
+                    *generator_node_id,
+                    tags,
+                    body,
+                )?;
+                let _ = node_id;
+            }
+            OutlineMutation::UpdateManagedNode {
+                node_id,
+                title,
+                tags,
+                body,
+            } => {
+                update_managed_node(conn, *node_id, title, tags, body)?;
+            }
+            OutlineMutation::DeleteManagedNodes { generator_node_id } => {
+                GeneratorRepo::new(conn).delete_managed_children(*generator_node_id)?;
+            }
+            OutlineMutation::DeleteManagedNode { node_id } => {
+                GeneratorRepo::new(conn).delete_managed_node(*node_id)?;
+            }
+            OutlineMutation::SetManagedNodeLink {
+                node_id,
+                generator_node_id,
+                external_id,
+                source_type,
+            } => {
+                GeneratorRepo::new(conn).set_link(
+                    *node_id,
+                    *generator_node_id,
+                    external_id,
+                    source_type,
+                )?;
+            }
+            OutlineMutation::ClearManagedNodeLinks { generator_node_id } => {
+                GeneratorRepo::new(conn).clear_links_for_generator(*generator_node_id)?;
+            }
+            OutlineMutation::SetRefreshStatus {
+                node_id,
+                status,
+                error,
+            } => {
+                GeneratorRepo::new(conn).set_refresh_status(
+                    *node_id,
+                    status,
+                    error.as_deref(),
+                )?;
+            }
         }
         Ok(None)
     }
+}
+
+/// Guard: reject if the target parent is inside a generator subtree.
+/// Only generator refresh mutations (CreateManagedNode) may add children there.
+fn guard_not_in_generator_subtree(conn: &Connection, parent_id: Option<Uuid>) -> Result<()> {
+    if let Some(pid) = parent_id {
+        if GeneratorRepo::new(conn).is_in_generator_subtree(pid)? {
+            anyhow::bail!("cannot manually create or move nodes into a generator subtree");
+        }
+    }
+    Ok(())
+}
+
+/// Guard: reject if the node is managed (produced by a generator).
+fn guard_not_managed(conn: &Connection, node_id: Uuid) -> Result<()> {
+    if GeneratorRepo::new(conn).is_managed(node_id)? {
+        anyhow::bail!("cannot modify a managed node — it is owned by its generator");
+    }
+    Ok(())
 }
 
 fn create_obligation(
@@ -811,6 +984,95 @@ fn outline_list_for_node(conn: &Connection, node_id: Uuid) -> Result<Uuid> {
         },
     )
     .map_err(Into::into)
+}
+
+fn create_managed_node(
+    conn: &Connection,
+    node_id: Option<Uuid>,
+    list_id: Uuid,
+    parent_id: Uuid,
+    title: &str,
+    external_id: &str,
+    source_type: &str,
+    generator_node_id: Uuid,
+    tags: &[String],
+    body: &str,
+) -> Result<Uuid> {
+    let node_repo = NodeRepo::new(conn);
+    let outline = OutlineRepo::new(conn);
+    let gen_repo = GeneratorRepo::new(conn);
+
+    let node_id = node_id.unwrap_or_else(Uuid::new_v4);
+    let base = crate::outline::slug::derive_node_slug(title, None);
+    let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(node_id))?;
+    let node = node_repo.create_with_id(node_id, &slug, title)?;
+
+    // Mark as managed.
+    gen_repo.set_managed(node.id, true)?;
+
+    // Place in outline under the parent.
+    let ordinal = outline.next_ordinal(list_id, Some(parent_id))?;
+    outline.insert(&OutlineEntry {
+        node_id: node.id,
+        list_id,
+        parent_id: Some(parent_id),
+        ordinal,
+        collapsed: false,
+    })?;
+
+    // Create data-source link.
+    gen_repo.set_link(node.id, generator_node_id, external_id, source_type)?;
+
+    // Store body as extra content (details).
+    if !body.is_empty() {
+        node_repo.set_extra_content(node.id, EXTRA_CONTENT_DETAILS, body)?;
+    }
+
+    // Store tags on node_fields if non-empty.
+    if !tags.is_empty() {
+        let tags_json = serde_json::to_string(tags)?;
+        conn.execute(
+            "INSERT INTO node_fields (node_id, tags, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
+            params![
+                crate::outline::uuid_blob::uuid_to_blob(node.id),
+                tags_json,
+                now_ms(),
+            ],
+        )?;
+    }
+
+    Ok(node.id)
+}
+
+fn update_managed_node(
+    conn: &Connection,
+    node_id: Uuid,
+    title: &str,
+    tags: &[String],
+    body: &str,
+) -> Result<()> {
+    let node_repo = NodeRepo::new(conn);
+    node_repo.update_title(node_id, title)?;
+
+    if !body.is_empty() {
+        node_repo.set_extra_content(node_id, EXTRA_CONTENT_DETAILS, body)?;
+    }
+
+    let tags_json = serde_json::to_string(tags)?;
+    conn.execute(
+        "INSERT INTO node_fields (node_id, tags, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
+        params![
+            crate::outline::uuid_blob::uuid_to_blob(node_id),
+            tags_json,
+            now_ms(),
+        ],
+    )?;
+
+    Ok(())
 }
 
 fn refresh_loop_health(conn: &Connection, list_id: Uuid) -> Result<()> {

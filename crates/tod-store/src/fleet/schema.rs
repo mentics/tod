@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 18;
+pub const CURRENT_USER_VERSION: i32 = 19;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -181,6 +181,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v17_to_v18(conn)?;
         conn.pragma_update(None, "user_version", 18)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 19 {
+        migrate_v18_to_v19(conn)?;
+        conn.pragma_update(None, "user_version", 19)?;
+    }
     Ok(())
 }
 
@@ -193,6 +198,90 @@ fn migrate_v17_to_v18(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
         "ALTER TABLE node_obligations ADD COLUMN visual_design_path TEXT;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Generator tables: configuration per generator node, a managed/normal flag on
+/// nodes, and data-source links for nodes copied out of a generator subtree.
+///
+/// Also rebuilds `node_capabilities` and `capability_archives` to expand their
+/// CHECK constraints to include the new 'generator' capability value.
+fn migrate_v18_to_v19(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    // ── 1. Rebuild node_capabilities with expanded CHECK ───────────────
+    tx.execute_batch(
+        "
+        CREATE TABLE node_capabilities_v19 (
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
+            enabled_at  INTEGER NOT NULL,
+            PRIMARY KEY (node_id, capability)
+        );
+        INSERT INTO node_capabilities_v19 SELECT node_id, capability, enabled_at FROM node_capabilities;
+        DROP TABLE node_capabilities;
+        ",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE node_capabilities_v19 RENAME TO node_capabilities;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+
+    // ── 2. Rebuild capability_archives with expanded CHECK ─────────────
+    tx.execute_batch(
+        "
+        CREATE TABLE capability_archives_v19 (
+            id              BLOB PRIMARY KEY NOT NULL,
+            node_id         BLOB NOT NULL,
+            capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
+            archived_at     INTEGER NOT NULL,
+            payload         TEXT NOT NULL
+        );
+        INSERT INTO capability_archives_v19 SELECT id, node_id, capability, archived_at, payload FROM capability_archives;
+        DROP INDEX IF EXISTS idx_capability_archives_node;
+        DROP TABLE capability_archives;
+        ",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE capability_archives_v19 RENAME TO capability_archives;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_capability_archives_node ON capability_archives(node_id, archived_at);",
+    )?;
+
+    // ── 3. Generator-specific tables ───────────────────────────────────
+    tx.execute_batch(
+        "
+        -- Generator configuration: one row per generator-capable node.
+        CREATE TABLE IF NOT EXISTS node_generator_config (
+            node_id          BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            data_source_type TEXT NOT NULL,
+            config_json      TEXT NOT NULL DEFAULT '{}',
+            last_refresh_status TEXT CHECK (last_refresh_status IN ('success', 'error', 'in_progress')),
+            last_refresh_error  TEXT,
+            last_refresh_at     INTEGER
+        );
+
+        -- Flag to distinguish managed nodes (produced by a generator) from normal ones.
+        -- 0 = normal, 1 = managed.
+        ALTER TABLE nodes ADD COLUMN managed INTEGER NOT NULL DEFAULT 0;
+
+        -- Data-source links for managed nodes and for nodes copied out of a generator subtree.
+        -- Tracks which external item the node corresponds to, and which fields the user
+        -- has modified (so refresh won't overwrite them).
+        CREATE TABLE IF NOT EXISTS managed_node_links (
+            node_id           BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            generator_node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            external_id       TEXT NOT NULL,
+            source_type       TEXT NOT NULL,
+            user_modified_fields TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS idx_managed_node_links_generator
+            ON managed_node_links(generator_node_id);
+        CREATE INDEX IF NOT EXISTS idx_managed_node_links_external_id
+            ON managed_node_links(external_id);
+        ",
     )?;
     tx.commit()?;
     Ok(())

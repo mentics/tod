@@ -373,6 +373,10 @@ pub fn build_capability_disable_payload(
                 .optional()?;
             serde_json::json!({ "fields": fields })
         }
+        Capability::Generator => {
+            // Generator config archival will be implemented with the generator schema tables.
+            serde_json::json!({ "generator": {} })
+        }
     };
     serde_json::to_string(&payload).context("serialize capability archive")
 }

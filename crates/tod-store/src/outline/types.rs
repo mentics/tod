@@ -31,6 +31,7 @@ pub enum Capability {
     Spec,
     Lifecycle,
     Agent,
+    Generator,
 }
 
 impl Capability {
@@ -39,6 +40,7 @@ impl Capability {
             Self::Spec => "spec",
             Self::Lifecycle => "lifecycle",
             Self::Agent => "agent",
+            Self::Generator => "generator",
         }
     }
 
@@ -47,17 +49,19 @@ impl Capability {
             "spec" => Some(Self::Spec),
             "lifecycle" => Some(Self::Lifecycle),
             "agent" => Some(Self::Agent),
+            "generator" => Some(Self::Generator),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 3] = [Self::Spec, Self::Lifecycle, Self::Agent];
+    pub const ALL: [Self; 4] = [Self::Spec, Self::Lifecycle, Self::Agent, Self::Generator];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Spec => "Spec",
             Self::Lifecycle => "Lifecycle",
             Self::Agent => "Agent",
+            Self::Generator => "Generator",
         }
     }
 
@@ -66,6 +70,7 @@ impl Capability {
             Self::Spec => "Requirements, constraints, and interview artifacts",
             Self::Lifecycle => "Process state and lifecycle transitions",
             Self::Agent => "Repository, tags, links, and agent workspace",
+            Self::Generator => "Automatically produce and manage descendant nodes from an external data source",
         }
     }
 
@@ -78,6 +83,18 @@ impl Capability {
             Self::Agent => {
                 "Disabling Agent will remove repository settings, tags, links, and notes stored on this node."
             }
+            Self::Generator => {
+                "Disabling Generator will permanently delete all managed child nodes under this node."
+            }
+        }
+    }
+
+    /// Capabilities that are mutually exclusive with this one.
+    pub fn mutually_exclusive(self) -> &'static [Self] {
+        match self {
+            Self::Generator => &[Self::Lifecycle],
+            Self::Lifecycle => &[Self::Generator],
+            _ => &[],
         }
     }
 }
@@ -134,4 +151,14 @@ pub struct FlatNodeRow {
     pub tree_ordinal: usize,
     pub collapsed: bool,
     pub has_children: bool,
+    /// True when this node was produced/is owned by a generator ancestor.
+    pub managed: bool,
+    /// The data-source external id, for managed nodes.
+    pub external_id: Option<String>,
+    /// Direct managed child count, for nodes with the Generator capability.
+    pub managed_count: Option<usize>,
+    /// `last_refresh_status` ("in_progress" | "success" | "error"), for generator nodes.
+    pub generator_status: Option<String>,
+    /// `last_refresh_error`, for generator nodes whose last refresh failed.
+    pub generator_error: Option<String>,
 }

@@ -8798,6 +8798,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.20",
  "tod-agent",
+ "tod-integration",
  "tod-store",
  "toml 0.8.23",
  "tracing",
@@ -8805,6 +8806,17 @@ dependencies = [
  "tracing-rolling-file",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "tod-integration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ureq",
 ]
 
 [[package]]

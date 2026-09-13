@@ -55,20 +55,41 @@ pub struct GateCheckRequest<'a> {
     pub criteria: Vec<(GateCriterion, Option<NodeGateEvaluation>)>,
 }
 
-/// Build the full gate-check message: static layers, then the live node and
-/// structured gate-check block.
-pub fn build_gate_check_message(paths: &MediaPaths, request: &GateCheckRequest<'_>) -> Result<String> {
+/// Build the full gate-check message: static layers, the state agent's own
+/// role doc (forward-gate prose rules, response format, the "no Q&A in this
+/// session" rule), then the live node and structured gate-check block.
+///
+/// `role_doc` is `process_bundle::state_role_doc(manifest, from_state)` —
+/// callers assemble it (it needs the bundled process root) and pass it in so
+/// this module stays free of `TodInstallPaths`/`ProcessManifest` concerns.
+/// Without it the agent has only the generic `gate_check.md` instructions and
+/// none of the transition-specific rules it needs, which is what pushes it
+/// into extra exploratory tool calls instead of a quick single-turn verdict.
+pub fn build_gate_check_message(
+    paths: &MediaPaths,
+    request: &GateCheckRequest<'_>,
+    role_doc: &str,
+) -> Result<String> {
     let mut out = load_static_context(paths, GATE_CHECK_CONTEXT_KEY)?;
+    out.push_str("\n\n---\n\n");
+    out.push_str(role_doc.trim());
     out.push_str("\n\n---\n\n");
     out.push_str(&render_dynamic(request));
     Ok(out)
 }
 
-/// Build the on-entry message: static layers, then the live node context with
-/// no gate-check block — this turn is about doing the state's own "On entry"
-/// work (e.g. drafting plan steps), not evaluating a forward gate.
-pub fn build_on_entry_message(paths: &MediaPaths, request: &GateCheckRequest<'_>) -> Result<String> {
+/// Build the on-entry message: static layers, the state agent's own role doc,
+/// then the live node context with no gate-check block — this turn is about
+/// doing the state's own "On entry" work (e.g. drafting plan steps), not
+/// evaluating a forward gate.
+pub fn build_on_entry_message(
+    paths: &MediaPaths,
+    request: &GateCheckRequest<'_>,
+    role_doc: &str,
+) -> Result<String> {
     let mut out = load_static_context(paths, ON_ENTRY_CONTEXT_KEY)?;
+    out.push_str("\n\n---\n\n");
+    out.push_str(role_doc.trim());
     out.push_str("\n\n---\n\n");
     out.push_str(&render_node_context(request, "on_entry"));
     out.push_str(
@@ -312,5 +333,53 @@ mod tests {
         assert!(text.contains("phase_purpose:** on_entry"));
         assert!(!text.contains("## Gate check"));
         assert!(!text.contains("gate_check:"));
+    }
+
+    #[test]
+    fn gate_check_message_includes_the_state_role_doc() {
+        let paths = MediaPaths::discover().unwrap();
+        let request = GateCheckRequest {
+            data_root: Path::new("/data/tod"),
+            node_id: Uuid::nil(),
+            node_title: "Ship it".into(),
+            node_lifecycle: "design".into(),
+            node_body: None,
+            purposes: Vec::new(),
+            obligations: Vec::new(),
+            plan_steps: Vec::new(),
+            from_state: "design".into(),
+            to_state: "planning".into(),
+            criteria: Vec::new(),
+        };
+        let message =
+            build_gate_check_message(&paths, &request, "## State agent conventions\n\nDo not conduct sequential Q&A in this session.")
+                .unwrap();
+        assert!(
+            message.contains("Do not conduct sequential Q&A in this session."),
+            "gate-check message must carry the state role doc so the agent has its \
+             forward-gate rules and the no-Q&A rule without extra exploration"
+        );
+    }
+
+    #[test]
+    fn on_entry_message_includes_the_state_role_doc() {
+        let paths = MediaPaths::discover().unwrap();
+        let request = GateCheckRequest {
+            data_root: Path::new("/data/tod"),
+            node_id: Uuid::nil(),
+            node_title: "Ship it".into(),
+            node_lifecycle: "planning".into(),
+            node_body: None,
+            purposes: Vec::new(),
+            obligations: Vec::new(),
+            plan_steps: Vec::new(),
+            from_state: "planning".into(),
+            to_state: "planning".into(),
+            criteria: Vec::new(),
+        };
+        let message =
+            build_on_entry_message(&paths, &request, "## State agent conventions\n\nOn-entry marker text.")
+                .unwrap();
+        assert!(message.contains("On-entry marker text."));
     }
 }

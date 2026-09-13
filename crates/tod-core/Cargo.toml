@@ -21,6 +21,7 @@ serde_yaml = "0.9"
 thiserror = "2.0"
 toml = "0.8"
 tod-agent = { path = "../tod-agent" }
+tod-integration = { path = "../tod-integration" }
 tod-store = { path = "../tod-store" }
 tracing = "0.1"
 tracing-appender = "0.2"

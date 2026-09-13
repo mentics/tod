@@ -13,6 +13,7 @@ pub use model::SortKey;
 pub use model::TaskItem;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -238,6 +239,13 @@ pub enum TaskListEvent {
 
 pub struct TaskListView {
     all_tasks: Vec<TaskItem>,
+    /// Node id -> short status text for an in-flight gate-check/on-entry
+    /// turn, pushed in from `LifecyclePanelView::in_flight_activity` by the
+    /// app shell's periodic poll (see `set_agent_activity`). These turns run
+    /// against an interview-mode agent config that's kept out of the
+    /// regular `agents` list (`fixtures::load_tasks_from_store`), so without
+    /// this a running gate check has no visible trace in the task list.
+    agent_activity: HashMap<String, String>,
     working_set: WorkingSet,
     search_query: String,
     list_state: Entity<ListState<TaskListDelegate>>,
@@ -385,6 +393,7 @@ impl TaskListView {
 
         let view = Self {
             all_tasks,
+            agent_activity: HashMap::new(),
             working_set,
             search_query: String::new(),
             list_state,
@@ -1374,7 +1383,7 @@ impl TaskListView {
 
         let visible_before =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
-        let selected = self.working_set.selected_id.as_deref();
+        let selected = self.working_set.selected_id.clone();
         if self.slide_edit_open {
             cx.emit(TaskListEvent::CloseTaskEdit);
         }
@@ -1388,10 +1397,15 @@ impl TaskListView {
             self.edit_open_for = None;
         }
         self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
+        self.apply_agent_activity();
         let visible_after =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
-        self.working_set.selected_id =
-            model::selection_after_delete(&visible_before, &visible_after, selected, task_id);
+        self.working_set.selected_id = model::selection_after_delete(
+            &visible_before,
+            &visible_after,
+            selected.as_deref(),
+            task_id,
+        );
         self.rebuild_visible_list(window, cx);
     }
 
@@ -1411,6 +1425,7 @@ impl TaskListView {
                 .or_else(|| self.outline_lists.first().map(|l| l.id));
         }
         self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
+        self.apply_agent_activity();
         if let Some(sel) = selected.clone() {
             if !self.all_tasks.iter().any(|t| t.id == sel) {
                 let visible_after =
@@ -1430,6 +1445,32 @@ impl TaskListView {
 
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.live_refresh(window, cx);
+    }
+
+    /// Push the current set of in-flight gate-check/on-entry statuses (see
+    /// `LifecyclePanelView::in_flight_activity`) so rows can show a "running"
+    /// badge. Called from the app shell's periodic poll — cheap no-op when
+    /// nothing changed, and deliberately doesn't touch selection or scroll
+    /// (unlike `rebuild_visible_list`) so it's safe to call without a
+    /// `Window`.
+    pub fn set_agent_activity(&mut self, activity: HashMap<String, String>, cx: &mut Context<Self>) {
+        if self.agent_activity == activity {
+            return;
+        }
+        self.agent_activity = activity;
+        self.apply_agent_activity();
+        let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
+        self.list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(visible);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn apply_agent_activity(&mut self) {
+        for task in &mut self.all_tasks {
+            task.in_flight_activity = self.agent_activity.get(&task.id).cloned();
+        }
     }
 
     pub fn set_status_message(&mut self, message: String, cx: &mut Context<Self>) {

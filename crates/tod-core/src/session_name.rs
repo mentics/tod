@@ -9,22 +9,53 @@ use chrono::{DateTime, Local};
 /// Longest subject kept in a name before it is cut with an ellipsis.
 const MAX_SUBJECT_CHARS: usize = 48;
 
+/// Hard cap on the whole name. Every caller — chat windows, fleet runs,
+/// anything else that names an agent session — must stay under this so the
+/// name renders cleanly in the platform's own session picker.
+const MAX_TOTAL_CHARS: usize = 100;
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see
-/// [`crate::agent_context`]), or `None` for a plain chat.
+/// [`crate::agent_context`]), or `None` for a plain chat. Used for every
+/// surface that launches or talks to an agent (chat windows, fleet runs,
+/// interview sessions, …) so names are consistent no matter how the session
+/// was started. The result is always at most [`MAX_TOTAL_CHARS`] characters.
 pub fn session_name(
     context_key: Option<&str>,
     subject: &str,
     started_at: DateTime<Local>,
 ) -> String {
-    let mut parts = vec![surface_label(context_key)];
-    let subject = shorten(subject);
+    let surface = surface_label(context_key);
+    let timestamp = started_at.format("%b %-d, %-I:%M %p").to_string();
+    let subject = shorten(subject, MAX_SUBJECT_CHARS);
+
+    let fixed_len = surface.chars().count()
+        + " · ".chars().count()
+        + timestamp.chars().count()
+        + if subject.is_empty() { 0 } else { " · ".chars().count() };
+    let subject = if fixed_len + subject.chars().count() > MAX_TOTAL_CHARS {
+        let budget = MAX_TOTAL_CHARS.saturating_sub(fixed_len);
+        shorten(&subject, budget)
+    } else {
+        subject
+    };
+
+    let mut parts = vec![surface];
     if !subject.is_empty() {
         parts.push(subject);
     }
-    parts.push(started_at.format("%b %-d, %-I:%M %p").to_string());
-    parts.join(" · ")
+    parts.push(timestamp);
+    let name = parts.join(" · ");
+    truncate_chars(&name, MAX_TOTAL_CHARS)
+}
+
+/// Last-resort truncation if the fixed parts alone somehow exceed the cap.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
 }
 
 /// `obligations` → `Obligations`, `tasks/edit` → `Tasks edit`.
@@ -44,12 +75,15 @@ fn surface_label(context_key: Option<&str>) -> String {
 }
 
 /// Collapse whitespace, and cut a long subject at a word boundary.
-fn shorten(subject: &str) -> String {
+fn shorten(subject: &str, max_chars: usize) -> String {
     let collapsed = subject.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_SUBJECT_CHARS {
+    if collapsed.chars().count() <= max_chars {
         return collapsed;
     }
-    let cut: String = collapsed.chars().take(MAX_SUBJECT_CHARS).collect();
+    if max_chars == 0 {
+        return String::new();
+    }
+    let cut: String = collapsed.chars().take(max_chars).collect();
     let cut = match cut.rfind(' ') {
         Some(space) if space > cut.len() / 2 => &cut[..space],
         _ => cut.as_str(),
@@ -95,6 +129,16 @@ mod tests {
         );
         let subject = name.split(" · ").nth(1).expect("subject part");
         assert_eq!(subject, "Make the agent chat window keep its session…");
+    }
+
+    #[test]
+    fn name_never_exceeds_the_hard_cap() {
+        let long_surface_key = "a-very-long-nested-surface-key-that-eats-into-the-budget";
+        let long_subject =
+            "An extremely long task title that on its own would already blow the character budget for a session name";
+        let name = session_name(Some(long_surface_key), long_subject, at(9, 5));
+        assert!(name.chars().count() <= MAX_TOTAL_CHARS, "{name:?} ({} chars)", name.chars().count());
+        assert!(name.ends_with("Sep 10, 9:05 AM"));
     }
 
     #[test]

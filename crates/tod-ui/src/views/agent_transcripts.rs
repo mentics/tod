@@ -12,7 +12,7 @@ use gpui::{
 use gpui_component::button::Button;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
@@ -225,6 +225,17 @@ impl AgentTranscriptsView {
 
         rows.sort_by_key(|row| row.sequence);
         rows
+    }
+
+    fn copy_transcript(&mut self, cx: &mut Context<Self>) {
+        let mut text = String::new();
+        for turn in &self.turns {
+            text.push_str(&turn.label);
+            text.push('\n');
+            text.push_str(&turn.content);
+            text.push_str("\n\n");
+        }
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -642,6 +653,16 @@ impl Render for AgentTranscriptsView {
                                                 .text_sm()
                                                 .font_semibold()
                                                 .text_color(foreground),
+                                            )
+                                            .child(
+                                                Button::new("copy-transcript")
+                                                    .label("Copy transcript")
+                                                    .outline()
+                                                    .compact()
+                                                    .disabled(self.turns.is_empty())
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.copy_transcript(cx);
+                                                    })),
                                             ),
                                     )
                                     .child(

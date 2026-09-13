@@ -207,6 +207,27 @@ impl SessionsView {
         best
     }
 
+    /// Descriptions of interview agent turns currently in flight (question
+    /// maker and/or answer processor), across every driver kept alive by this
+    /// view — not just the one for the session currently open — used by the
+    /// app shell to warn before closing the window while one is still
+    /// running.
+    pub fn running_interview_work(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        for driver in self.drivers.values() {
+            let Ok(driver) = driver.lock() else { continue };
+            let status = driver.status();
+            let node_title = &driver.config().node_title;
+            if status.question_maker_running {
+                items.push(format!("Question maker running: {node_title}"));
+            }
+            if status.answer_lanes_busy > 0 {
+                items.push(format!("Answer processor running: {node_title}"));
+            }
+        }
+        items
+    }
+
     fn driver_for(&mut self, session: &InterviewSession) -> Result<Arc<Mutex<InterviewDriver>>, String> {
         if let Some(driver) = self.drivers.get(&session.id) {
             return Ok(driver.clone());

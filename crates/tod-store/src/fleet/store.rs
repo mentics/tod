@@ -28,7 +28,7 @@ use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
 use crate::outline::repos::plan_steps::PlanStepRepo;
-use crate::outline::repos::{ListRepo, OutlineRepo, tree::TreeLoader};
+use crate::outline::repos::{GeneratorConfig, GeneratorRepo, ListRepo, OutlineRepo, tree::TreeLoader};
 use crate::outline::PlanStep;
 use crate::outline::types::Capability;
 use crate::outline::types::{FlatNodeRow, OutlineList};
@@ -499,6 +499,26 @@ impl FleetStore {
         TreeLoader::new(&guard.connection())
             .flatten_visible(list_id)
             .map_err(Into::into)
+    }
+
+    /// Generator configuration for a node, if it has one.
+    pub fn get_generator_config(&self, node_id: uuid::Uuid) -> Result<Option<GeneratorConfig>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        GeneratorRepo::new(&guard.connection())
+            .get_config(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Whether a node has at least one outline child.
+    pub fn node_has_children(&self, node_id: uuid::Uuid) -> Result<bool> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let conn = guard.connection();
+        let has_children: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outline_entries WHERE parent_id = ?1)",
+            rusqlite::params![crate::outline::uuid_to_blob(node_id)],
+            |row| row.get(0),
+        )?;
+        Ok(has_children)
     }
 
     /// Direct (non-inherited) obligation rows for a node.

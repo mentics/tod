@@ -31,7 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_ref_target ON nodes(ref_target_id);
 
 CREATE TABLE IF NOT EXISTS node_capabilities (
     node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent')),
+    capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
     enabled_at  INTEGER NOT NULL,
     PRIMARY KEY (node_id, capability)
 );
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS node_capabilities (
 CREATE TABLE IF NOT EXISTS capability_archives (
     id              BLOB PRIMARY KEY NOT NULL,
     node_id         BLOB NOT NULL,
-    capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent')),
+    capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
     archived_at     INTEGER NOT NULL,
     payload         TEXT NOT NULL
 );

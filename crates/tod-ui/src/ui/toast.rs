@@ -142,24 +142,54 @@ pub fn close_guard_toast(
 
     window.push_notification(
         Notification::new()
-            .icon(IconName::TriangleAlert)
             .autohide(false)
             .id::<CloseGuardToast>()
+            .bg(gpui::hsla(0., 0., 0., 0.))
+            .border_0()
+            .shadow_none()
+            .p_0()
             .content(move |_note, window, cx| {
                 let on_force_exit = on_force_exit.clone();
                 gpui::div()
+                    .id("close-guard-toast")
+                    .max_w(px(360.))
+                    .min_w(px(280.))
+                    .px_4()
+                    .py_3()
+                    .gap_1()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    // Dim reddish-gray so the warning reads clearly without
+                    // the alarm of a full red banner.
+                    .bg(gpui::rgb(0x3a2c2c))
+                    .rounded_lg()
+                    .shadow_lg()
+                    // Interacting with anything else means the user isn't
+                    // trying to exit after all — clear the warning instead
+                    // of leaving it stuck on screen.
+                    .on_mouse_down_out(|_, window, cx| {
+                        window.remove_notification::<CloseGuardToast>(cx);
+                    })
                     .child(
-                        selectable_text(
-                            "close-guard-title",
-                            "Background work is still running",
-                            window,
-                            cx,
-                        )
-                        .text_sm()
-                        .font_semibold(),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                gpui_component::Icon::new(IconName::TriangleAlert)
+                                    .text_color(gpui::rgb(0xf0a0a0))
+                                    .small(),
+                            )
+                            .child(
+                                selectable_text(
+                                    "close-guard-title",
+                                    "Background work is still running",
+                                    window,
+                                    cx,
+                                )
+                                .text_sm()
+                                .font_semibold()
+                                .text_color(gpui::white()),
+                            ),
                     )
                     .child(gpui::div().flex().flex_col().gap_0p5().children(
                         running.iter().enumerate().map(|(i, item)| {
@@ -170,6 +200,7 @@ pub fn close_guard_toast(
                                 cx,
                             )
                             .text_xs()
+                            .text_color(gpui::hsla(0., 0., 0.85, 1.))
                         }),
                     ))
                     .child(

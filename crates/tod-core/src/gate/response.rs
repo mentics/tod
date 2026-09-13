@@ -166,24 +166,62 @@ fn extract_yaml_document(text: &str) -> &str {
     if text.trim_start().starts_with("result:") {
         return text;
     }
-    // Tolerate a preamble sentence before the document actually starts.
-    match text.find("\nresult:") {
+    // Tolerate a preamble sentence before the document actually starts. Use
+    // the *last* occurrence: the prompt itself hands the model example
+    // `result:`-shaped text (the response-format template in
+    // `assets/process/agents/state/base.md`), so a model that quotes or
+    // paraphrases that guidance before answering can put a spurious
+    // `result:`-looking line earlier in the message than its real answer.
+    match text.rfind("\nresult:") {
         Some(offset) => &text[offset + 1..],
         None => text,
     }
 }
 
-/// Find the first markdown code fence (```` ``` ```` or ```` ```yaml ````)
-/// anywhere in `text` and return its inner content, ignoring anything
-/// before the opening fence or after the closing one — covers both a fence
-/// wrapping the whole reply and a fence preceded by narration.
+/// Find every markdown code fence (```` ``` ```` or ```` ```yaml ````) in
+/// `text` and return the inner content of the one that looks like the real
+/// reply, ignoring anything before the first opening fence or after the last
+/// closing one.
+///
+/// The gate-check prompt itself contains fenced YAML the model can end up
+/// echoing before its real answer: the app's own `gate_check:` request block
+/// (`gate::context::render_gate_check_yaml`) and the response-format
+/// template in `assets/process/agents/state/base.md` (`result: pass |
+/// blocked | ...`, a literal placeholder, not real data). Neither has a
+/// top-level `result:` field the way an actual reply does, so when more than
+/// one fence is present, prefer the last one that has one — falling back to
+/// the last fence outright only when none do, since that's still the model's
+/// final word.
 fn extract_fenced_block(text: &str) -> Option<&str> {
-    let start = text.find("```")?;
-    let after_open = &text[start + 3..];
-    let after_open = after_open.trim_start_matches(|c: char| c.is_alphanumeric());
-    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
-    let end = after_open.find("```")?;
-    Some(after_open[..end].trim_end())
+    let blocks = find_fenced_blocks(text);
+    blocks
+        .iter()
+        .rev()
+        .find(|block| has_top_level_result_field(block))
+        .or_else(|| blocks.last())
+        .copied()
+}
+
+fn has_top_level_result_field(block: &str) -> bool {
+    block.lines().any(|line| line.starts_with("result:"))
+}
+
+fn find_fenced_blocks(text: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel_start) = text[search_from..].find("```") {
+        let open_at = search_from + rel_start;
+        let after_open = &text[open_at + 3..];
+        let after_open = after_open.trim_start_matches(|c: char| c.is_alphanumeric());
+        let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
+        let content_start = text.len() - after_open.len();
+        let Some(rel_end) = after_open.find("```") else {
+            break;
+        };
+        blocks.push(after_open[..rel_end].trim_end());
+        search_from = content_start + rel_end + 3;
+    }
+    blocks
 }
 
 #[cfg(test)]
@@ -310,6 +348,25 @@ gate_results:
         assert!(reply.findings.contains("Multi-line summary text."));
         assert_eq!(reply.gate_results.len(), 1);
         assert_eq!(reply.gate_results[0].action, GateAction::Interview);
+    }
+
+    #[test]
+    fn picks_the_real_reply_when_an_earlier_fence_echoes_the_request() {
+        // Reproduces the observed "missing field `result`" bug: the model
+        // quotes the app's own gate_check request block (no `result` field)
+        // before giving its real, fenced verdict later in the same message.
+        let text = "Here's the gate_check block I'm evaluating:\n\n```yaml\ngate_check:\n  forward_state: planning\n  criteria: []\n```\n\nAnd here is my verdict:\n\n```yaml\nresult: pass\nforward_lifecycle: planning\npaused: false\nfindings: \"All good.\"\n```";
+        let reply = parse_gate_reply(text).unwrap();
+        assert!(reply.result.advances());
+        assert_eq!(reply.forward_lifecycle.as_deref(), Some("planning"));
+    }
+
+    #[test]
+    fn falls_back_to_the_last_fence_when_none_have_a_result_field() {
+        let text = "```yaml\ngate_check:\n  forward_state: planning\n```\n\n```yaml\nunrelated: true\n```";
+        // Neither fence has `result:` — falls back to the last fence, which
+        // then fails to deserialize (missing required field), same as today.
+        assert!(parse_gate_reply(text).is_err());
     }
 
     #[test]

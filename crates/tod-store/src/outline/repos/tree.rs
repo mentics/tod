@@ -1,7 +1,8 @@
 //! Load flattened visible tree rows for UI.
 
+use crate::outline::repos::generator::GeneratorRepo;
 use crate::outline::repos::{NodeRepo, OutlineRepo};
-use crate::outline::types::{FlatNodeRow, OutlineEntry};
+use crate::outline::types::{Capability, FlatNodeRow, OutlineEntry};
 use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -44,6 +45,7 @@ impl<'a> TreeLoader<'a> {
         };
         let mut children = children.clone();
         children.sort_by_key(|e| e.ordinal);
+        let gen_repo = GeneratorRepo::new(self.conn);
 
         for entry in children {
             let Some(node) = node_repo.get(entry.node_id)? else {
@@ -57,6 +59,24 @@ impl<'a> TreeLoader<'a> {
                 .get(&Some(entry.node_id))
                 .map(|c| !c.is_empty())
                 .unwrap_or(false);
+            let managed = gen_repo.is_managed(entry.node_id)?;
+            let external_id = if managed {
+                gen_repo.get_link(entry.node_id)?.map(|l| l.external_id)
+            } else {
+                None
+            };
+            let (managed_count, generator_status, generator_error) =
+                if capabilities.contains(&Capability::Generator) {
+                    let count = gen_repo.links_for_generator(entry.node_id)?.len();
+                    let config = gen_repo.get_config(entry.node_id)?;
+                    (
+                        Some(count),
+                        config.as_ref().and_then(|c| c.last_refresh_status.clone()),
+                        config.and_then(|c| c.last_refresh_error),
+                    )
+                } else {
+                    (None, None, None)
+                };
             out.push(FlatNodeRow {
                 node,
                 depth,
@@ -68,6 +88,11 @@ impl<'a> TreeLoader<'a> {
                 tree_ordinal: out.len(),
                 collapsed: entry.collapsed,
                 has_children,
+                managed,
+                external_id,
+                managed_count,
+                generator_status,
+                generator_error,
             });
             if !entry.collapsed {
                 self.walk(by_parent, node_repo, Some(entry.node_id), depth + 1, out)?;

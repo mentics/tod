@@ -20,6 +20,7 @@ use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use std::sync::Arc;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, build_fleet_agent_prompt};
+use tod_core::session_name::session_name;
 use tod_store::fleet::provision::{describe_agent_workspace, resolve_agent_workspace};
 use tod_store::fleet::repos::shell::ShellSession;
 use tod_store::fleet::terminal::{
@@ -781,8 +782,9 @@ impl AgentConfigPanelView {
                 .flatten()
                 .map(|row| row.launch_options())
                 .unwrap_or_else(|| agent_row.launch_options());
+            let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
             let mut agent = self.agent.lock().expect("agent mutex");
-            agent.start_fleet_agent(&config_id, cwd.clone(), prompt, options)
+            agent.start_fleet_agent(&config_id, cwd.clone(), prompt, options, title)
         };
         match provider_run {
             Ok(handle) => {

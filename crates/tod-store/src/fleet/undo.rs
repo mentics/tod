@@ -415,7 +415,16 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::UnlinkPlanStepObligation { .. }
         | OutlineMutation::SetExtraContent { .. }
         | OutlineMutation::SetLifecycle { .. }
-        | OutlineMutation::ApplyGateResults { .. } => Ok(None),
+        | OutlineMutation::ApplyGateResults { .. }
+        | OutlineMutation::SetGeneratorConfig { .. }
+        | OutlineMutation::DeleteGeneratorConfig { .. }
+        | OutlineMutation::CreateManagedNode { .. }
+        | OutlineMutation::UpdateManagedNode { .. }
+        | OutlineMutation::DeleteManagedNodes { .. }
+        | OutlineMutation::DeleteManagedNode { .. }
+        | OutlineMutation::SetManagedNodeLink { .. }
+        | OutlineMutation::ClearManagedNodeLinks { .. }
+        | OutlineMutation::SetRefreshStatus { .. } => Ok(None),
     }
 }
 

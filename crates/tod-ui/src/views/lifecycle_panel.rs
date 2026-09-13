@@ -54,6 +54,7 @@ use tod_core::gate::{
     build_on_entry_message, parse_gate_reply,
 };
 use tod_core::process::interview_phase_for_lifecycle;
+use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
 use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
@@ -210,6 +211,28 @@ impl LifecyclePanelView {
             .iter()
             .filter(|(_, state)| state.pending.is_some() || state.on_entry_run.is_some())
             .map(|(task_id, _)| task_id.clone())
+            .collect()
+    }
+
+    /// Task ids with a gate check or on-entry run currently in flight, paired
+    /// with a short human-readable status — for the task list to show a
+    /// "running" badge on the row even though these turns run against an
+    /// interview-mode agent config that `task_list::fixtures` deliberately
+    /// keeps out of the regular `agents` chip (see its comment there).
+    /// Without this, a gate check would leave no visible trace anywhere in
+    /// the task list while it runs.
+    pub fn in_flight_activity(&self) -> HashMap<String, String> {
+        self.gate_states
+            .iter()
+            .filter_map(|(task_id, state)| {
+                if state.pending.is_some() {
+                    Some((task_id.clone(), state.gate_status.clone()))
+                } else if state.on_entry_run.is_some() {
+                    Some((task_id.clone(), state.on_entry_status.clone()))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -713,12 +736,16 @@ impl LifecyclePanelView {
                 })
                 .collect();
             let media = tod_core::media::MediaPaths::discover()?;
+            let install = TodInstallPaths::discover()?;
+            let manifest = ProcessManifest::load(&install)?;
+            let role_doc = state_role_doc(&manifest, &from_state)?;
+            let node_title = self.title.clone();
             let message = build_gate_check_message(
                 &media,
                 &GateCheckRequest {
                     data_root: self.paths.data_root(),
                     node_id,
-                    node_title: self.title.clone(),
+                    node_title: node_title.clone(),
                     node_lifecycle: from_state.clone(),
                     node_body: body,
                     purposes,
@@ -728,8 +755,10 @@ impl LifecyclePanelView {
                     to_state: to_state.clone(),
                     criteria,
                 },
+                &role_doc,
             )?;
-            let session_title = format!("{from_state}-to-{to_state} gate");
+            let session_title =
+                format!("Gate check: {node_title} ({from_state} \u{2192} {to_state})");
             let turn = SessionTurn {
                 key: format!("gate-check-{}", uuid::Uuid::new_v4()),
                 agent_config_id: agent_ctx.agent.id.clone(),
@@ -846,12 +875,15 @@ impl LifecyclePanelView {
                 })
                 .collect();
             let media = tod_core::media::MediaPaths::discover()?;
+            let install = TodInstallPaths::discover()?;
+            let manifest = ProcessManifest::load(&install)?;
+            let role_doc = state_role_doc(&manifest, &lifecycle)?;
             let message = build_on_entry_message(
                 &media,
                 &GateCheckRequest {
                     data_root: &data_root,
                     node_id,
-                    node_title: title,
+                    node_title: title.clone(),
                     node_lifecycle: lifecycle.clone(),
                     node_body: body,
                     purposes,
@@ -861,6 +893,7 @@ impl LifecyclePanelView {
                     to_state: lifecycle.clone(),
                     criteria: Vec::new(),
                 },
+                &role_doc,
             )?;
             Ok(SessionTurn {
                 key: format!("on-entry-{}", uuid::Uuid::new_v4()),
@@ -869,7 +902,7 @@ impl LifecyclePanelView {
                 options: settings.launch_options_for(AgentRole::Default),
                 resume_session_id: None,
                 opening: Some(SessionOpening {
-                    title: format!("{lifecycle} on-entry"),
+                    title: format!("On entry: {title} ({lifecycle})"),
                     context: None,
                 }),
                 message,

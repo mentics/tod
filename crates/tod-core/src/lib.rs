@@ -6,6 +6,7 @@
 
 pub mod agent_context;
 pub mod gate;
+pub mod generator;
 pub mod install;
 pub mod interview;
 pub mod linear_import;

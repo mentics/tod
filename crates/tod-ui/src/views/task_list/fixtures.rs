@@ -114,6 +114,12 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 requirement_count: counts.requirements,
                 constraint_count: counts.constraints,
                 has_children: row.has_children,
+                in_flight_activity: None,
+                managed: row.managed,
+                external_id: row.external_id,
+                managed_count: row.managed_count,
+                generator_status: row.generator_status,
+                generator_error: row.generator_error,
             }
         })
         .collect()
@@ -169,6 +175,12 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             requirement_count: 0,
             constraint_count: 0,
             has_children: false,
+            in_flight_activity: None,
+            managed: false,
+            external_id: None,
+            managed_count: None,
+            generator_status: None,
+            generator_error: None,
         })
         .collect()
 }

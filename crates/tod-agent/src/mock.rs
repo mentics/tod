@@ -44,6 +44,8 @@ pub struct MockAgentProvider {
     traffic_log: Option<SharedAgentTrafficLog>,
     /// Last options passed to [`Self::start_fleet_agent`] (tests / diagnostics).
     pub last_fleet_options: Option<AgentLaunchOptions>,
+    /// Last session title passed to [`Self::start_fleet_agent`] (tests / diagnostics).
+    pub last_fleet_session_title: Option<String>,
 }
 
 /// A conversation the mock is "holding": an id and how much it took in.
@@ -63,6 +65,7 @@ impl MockAgentProvider {
             sessions: HashMap::new(),
             traffic_log: None,
             last_fleet_options: None,
+            last_fleet_session_title: None,
         }
     }
 
@@ -157,8 +160,10 @@ impl AgentProvider for MockAgentProvider {
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
+        session_title: String,
     ) -> Result<AgentRunHandle> {
         self.last_fleet_options = Some(options);
+        self.last_fleet_session_title = Some(session_title);
         let preview: String = prompt.chars().take(200).collect();
         let reply = format!(
             "Fleet agent run complete (mock).\n\n\

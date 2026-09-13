@@ -5,5 +5,5 @@ mod launch;
 mod manifest;
 
 pub use install::TodInstallPaths;
-pub use launch::{build_fleet_agent_prompt, interview_session_prefix};
+pub use launch::{build_fleet_agent_prompt, interview_session_prefix, state_role_doc};
 pub use manifest::ProcessManifest;

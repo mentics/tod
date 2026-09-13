@@ -382,6 +382,7 @@ impl CursorAcpProvider {
         prompt: String,
         model: String,
         effort: String,
+        session_title: String,
     ) -> Result<AgentRunHandle> {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
@@ -430,6 +431,7 @@ impl CursorAcpProvider {
                 id,
                 kind,
                 &write_roots,
+                &session_title,
             );
             match &result {
                 Ok(text) => tracing::info!(
@@ -503,6 +505,7 @@ impl AgentProvider for CursorAcpProvider {
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
+        session_title: String,
     ) -> Result<AgentRunHandle> {
         let handle = self.spawn_run(
             AgentRunKind::FleetAgent,
@@ -510,6 +513,7 @@ impl AgentProvider for CursorAcpProvider {
             prompt,
             options.model,
             options.effort,
+            session_title,
         )?;
         self.fleet_run_context
             .insert(handle.id, agent_config_id.to_string());
@@ -948,6 +952,7 @@ fn run_acp_session(
     run_id: RunId,
     kind: AgentRunKind,
     extra_write_roots: &[PathBuf],
+    session_title: &str,
 ) -> Result<String> {
     let mut child = spawn_acp_process(host, agent_bin, &[])?;
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
@@ -1022,6 +1027,10 @@ fn run_acp_session(
             .get("sessionId")
             .and_then(Value::as_str)
             .context("session/new missing sessionId")?;
+
+        if !session_title.trim().is_empty() {
+            name_session(host, session_id, session_title);
+        }
 
         apply_session_config_options(
             &mut session,

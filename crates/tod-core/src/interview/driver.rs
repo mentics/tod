@@ -653,6 +653,7 @@ mod tests {
             _: PathBuf,
             _: String,
             _: AgentLaunchOptions,
+            _: String,
         ) -> anyhow::Result<AgentRunHandle> {
             anyhow::bail!("not used")
         }

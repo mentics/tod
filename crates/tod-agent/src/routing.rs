@@ -64,9 +64,10 @@ impl AgentProvider for RoutingAgentProvider {
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
+        session_title: String,
     ) -> Result<AgentRunHandle> {
         self.for_platform(options.platform)
-            .start_fleet_agent(agent_config_id, cwd, prompt, options)
+            .start_fleet_agent(agent_config_id, cwd, prompt, options, session_title)
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {

@@ -43,6 +43,23 @@ pub struct TaskItem {
     pub requirement_count: usize,
     pub constraint_count: usize,
     pub has_children: bool,
+    /// Short status text when a gate-check or on-entry agent turn is
+    /// currently running against this node (e.g. "Running gate check…").
+    /// Sourced from `LifecyclePanelView::in_flight_activity` — these turns
+    /// run against an interview-mode agent config kept out of `agents`
+    /// (see `task_list::fixtures::load_tasks_from_store`), so without this
+    /// they'd be invisible in the task list while running.
+    pub in_flight_activity: Option<String>,
+    /// True when this node was produced/is owned by a generator ancestor.
+    pub managed: bool,
+    /// The data-source external id, for managed nodes.
+    pub external_id: Option<String>,
+    /// Direct/nested managed node count, for nodes with the Generator capability.
+    pub managed_count: Option<usize>,
+    /// `last_refresh_status` ("in_progress" | "success" | "error"), for generator nodes.
+    pub generator_status: Option<String>,
+    /// `last_refresh_error`, for generator nodes whose last refresh failed.
+    pub generator_error: Option<String>,
 }
 
 impl TaskItem {
@@ -475,6 +492,12 @@ mod tests {
             requirement_count: 0,
             constraint_count: 0,
             has_children: false,
+            in_flight_activity: None,
+            managed: false,
+            external_id: None,
+            managed_count: None,
+            generator_status: None,
+            generator_error: None,
         }
     }
 

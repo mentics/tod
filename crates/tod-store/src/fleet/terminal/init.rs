@@ -128,6 +128,8 @@ pub fn windows_launch_args(
     let mut args = vec![
         "-NoExit".into(),
         "-NoLogo".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
         "-File".into(),
         init_script.display().to_string(),
         "-TodShellId".into(),

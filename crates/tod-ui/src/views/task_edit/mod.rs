@@ -48,6 +48,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Spec) => "task-edit-field-cap-spec",
         TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
+        TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
     }
 }
 
@@ -149,6 +150,12 @@ pub struct TaskEditView {
     linear_fetch_generation: u64,
     pending_linear_ticket: Option<String>,
     pending_linear_apply: Option<PendingLinearApply>,
+    generator_config_input: Entity<InputState>,
+    generator_data_source_type: Option<String>,
+    generator_pending_source_type: Option<String>,
+    generator_last_status: Option<String>,
+    generator_last_error: Option<String>,
+    generator_config_error: Option<String>,
     _title_subscription: Subscription,
     _slug_subscription: Subscription,
     _linear_subscription: Subscription,
@@ -159,6 +166,7 @@ pub struct TaskEditView {
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
     _note_edit_subscription: Subscription,
+    _generator_config_subscription: Subscription,
 }
 
 impl TaskEditView {
@@ -196,6 +204,12 @@ impl TaskEditView {
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
+        let generator_config_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(6)
+                .placeholder("Enter to edit · Configuration JSON…")
+        });
         let body_scroll_handle = ScrollHandle::new();
         let scroll_anchor = ScrollAnchor::for_handle(body_scroll_handle.clone());
 
@@ -249,6 +263,12 @@ impl TaskEditView {
                 this.commit_tag_draft(cx);
             }
         });
+        let _generator_config_subscription =
+            cx.subscribe(&generator_config_input, |this, _, event, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.save_generator_config(cx);
+                }
+            });
 
         Self {
             fleet,
@@ -264,6 +284,12 @@ impl TaskEditView {
             details_input,
             tag_draft_input,
             note_edit_input,
+            generator_config_input,
+            generator_data_source_type: None,
+            generator_pending_source_type: None,
+            generator_last_status: None,
+            generator_last_error: None,
+            generator_config_error: None,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -304,6 +330,7 @@ impl TaskEditView {
             _details_subscription,
             _tag_draft_subscription,
             _note_edit_subscription,
+            _generator_config_subscription,
         }
     }
 
@@ -649,6 +676,7 @@ impl TaskEditView {
         self.tags = task.tags.clone();
         self.capabilities = self.load_capabilities(&task_id).into_iter().collect();
         self.load_obligation_counts(&task_id);
+        self.load_generator_config(window, cx);
         let linear = task.linked_issues.first().cloned().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
@@ -754,11 +782,118 @@ impl TaskEditView {
         cx.notify();
     }
 
+    fn load_generator_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.generator_pending_source_type = None;
+        self.generator_config_error = None;
+        let config = self.node_uuid().and_then(|node_id| {
+            self.fleet.get_generator_config(node_id).ok().flatten()
+        });
+        match config {
+            Some(config) => {
+                self.generator_data_source_type = Some(config.data_source_type);
+                self.generator_last_status = config.last_refresh_status;
+                self.generator_last_error = config.last_refresh_error;
+                self.generator_config_input.update(cx, |input, cx| {
+                    input.set_value(config.config_json, window, cx);
+                });
+            }
+            None => {
+                self.generator_data_source_type = None;
+                self.generator_last_status = None;
+                self.generator_last_error = None;
+                self.generator_config_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+            }
+        }
+    }
+
+    fn select_generator_data_source(
+        &mut self,
+        data_source_type: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generator_data_source_type.is_some() {
+            return;
+        }
+        self.generator_pending_source_type = Some(data_source_type);
+        self.generator_config_error = None;
+        self.generator_config_input.update(cx, |input, cx| {
+            input.set_value("{}", window, cx);
+        });
+        cx.notify();
+    }
+
+    fn save_generator_config(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        let Some(data_source_type) = self
+            .generator_data_source_type
+            .clone()
+            .or_else(|| self.generator_pending_source_type.clone())
+        else {
+            return;
+        };
+        let config_json = input_text(&self.generator_config_input, cx).trim().to_string();
+        let config_json = if config_json.is_empty() {
+            "{}".to_string()
+        } else {
+            config_json
+        };
+        match tod_core::generator::set_generator_config(&self.fleet, node_id, &data_source_type, &config_json) {
+            Ok(()) => {
+                self.generator_config_error = None;
+                self.generator_data_source_type = Some(data_source_type);
+                self.generator_pending_source_type = None;
+                let _ = self.fleet.reload_if_stale();
+                if let Some(config) = self.fleet.get_generator_config(node_id).ok().flatten() {
+                    self.generator_last_status = config.last_refresh_status;
+                    self.generator_last_error = config.last_refresh_error;
+                }
+                self.notify_changed(cx);
+            }
+            Err(err) => {
+                self.generator_config_error = Some(err);
+                cx.notify();
+            }
+        }
+    }
+
     fn enable_capability(&mut self, cap: Capability, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
         if self.capabilities.contains(&cap) {
+            return;
+        }
+        if cap == Capability::Generator {
+            if self.capabilities.contains(&Capability::Lifecycle) {
+                self.pending_toast =
+                    Some("Generator cannot be enabled while Lifecycle is enabled".into());
+                cx.notify();
+                return;
+            }
+            match self.fleet.node_has_children(node_id) {
+                Ok(true) => {
+                    self.pending_toast =
+                        Some("Generator cannot be enabled on a node with children".into());
+                    cx.notify();
+                    return;
+                }
+                Err(err) => {
+                    self.pending_toast = Some(format!("Failed to check children: {err}"));
+                    cx.notify();
+                    return;
+                }
+                Ok(false) => {}
+            }
+        }
+        if cap == Capability::Lifecycle && self.capabilities.contains(&Capability::Generator) {
+            self.pending_toast =
+                Some("Lifecycle cannot be enabled while Generator is enabled".into());
+            cx.notify();
             return;
         }
         if cap == Capability::Agent && self.loaded_repo.is_empty() {
@@ -793,6 +928,9 @@ impl TaskEditView {
                 self.loaded_lifecycle = task.lifecycle.clone();
             }
             self.load_obligation_counts(&task_id);
+        }
+        if cap == Capability::Generator {
+            self.load_generator_config(window, cx);
         }
         self.notify_changed(cx);
     }
@@ -890,6 +1028,9 @@ impl TaskEditView {
                     self.github_pr_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
+                }
+                if cap == Capability::Generator {
+                    self.load_generator_config(window, cx);
                 }
             }
             self.load_obligation_counts(&task_id);
@@ -1974,6 +2115,15 @@ impl TaskEditView {
             Capability::Agent => self
                 .render_agent_section(cap_index, background, border, window, cx)
                 .into_any_element(),
+            Capability::Generator => {
+                // Generator configuration UI will be implemented in step e45d4026.
+                // For now, render a placeholder section.
+                div()
+                    .px_3()
+                    .py_2()
+                    .child("Generator configuration — coming soon")
+                    .into_any_element()
+            }
         }
     }
 
