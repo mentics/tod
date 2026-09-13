@@ -205,8 +205,12 @@ pub enum OutlineMutation {
     /// advance the node's lifecycle in the same mutation.
     ApplyGateResults {
         node_id: Uuid,
-        /// `(criterion_id, outcome, detail)` — one row per criterion.
-        results: Vec<(Uuid, String, Option<String>)>,
+        /// `(criterion_id, outcome, detail, action)` — one row per criterion.
+        /// `action` is `"none"` or `"interview"` (see
+        /// `tod_store::outline::repos::gate::ACTION_INTERVIEW`), persisted so
+        /// a failing row's "interview would resolve this" fact survives past
+        /// the reply that reported it.
+        results: Vec<(Uuid, String, Option<String>, String)>,
         /// Set only when the gate check passed and lifecycle should advance.
         forward_state: Option<String>,
         /// `SOURCE_AGENT` for a gate-check reply, `SOURCE_HUMAN` for a

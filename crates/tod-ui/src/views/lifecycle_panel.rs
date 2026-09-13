@@ -453,6 +453,7 @@ impl LifecyclePanelView {
                 criterion_id,
                 OUTCOME_WAIVED.to_string(),
                 Some("Waived by user".to_string()),
+                tod_store::outline::repos::gate::ACTION_NONE.to_string(),
             )],
             forward_state: None,
             source: SOURCE_HUMAN.to_string(),
@@ -1208,10 +1209,22 @@ impl LifecyclePanelView {
         // directly, for a prose-only gate with nothing to show a table for.
         let has_criteria = !catalog.is_empty();
 
-        let results: Vec<(uuid::Uuid, String, Option<String>)> = reply
+        let results: Vec<(uuid::Uuid, String, Option<String>, String)> = reply
             .gate_results
             .iter()
-            .map(|row| (row.criterion_id, row.outcome.clone(), row.detail.clone()))
+            .map(|row| {
+                let action = if row.action == GateAction::Interview {
+                    tod_store::outline::repos::gate::ACTION_INTERVIEW
+                } else {
+                    tod_store::outline::repos::gate::ACTION_NONE
+                };
+                (
+                    row.criterion_id,
+                    row.outcome.clone(),
+                    row.detail.clone(),
+                    action.to_string(),
+                )
+            })
             .collect();
         let criteria_detail: Vec<CriterionOutcome> = reply
             .gate_results
@@ -1652,7 +1665,7 @@ impl Render for LifecyclePanelView {
                                     .ghost()
                                     .compact()
                                     .w_full()
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(task_id) = this.task_id.clone() {
                                             cx.emit(LifecyclePanelEvent::OpenInterview {
                                                 task_id,

@@ -23,3 +23,22 @@ confirmation and without listing them in your reply. After creating them,
 reply with a very short summary of how many of each type were created (e.g. "Added 3 requirements and 1 constraint.").
 
 Similarly for modifications or deletions, make the changes immediately upon request without asking for any confirmation. Then reply with a summary of the actions taken.
+
+## Following through on changes
+
+Obligations don't stand alone — once a node reaches the `planning` phase, its
+requirements and constraints get broken into plan steps (see the `plan` noun
+above), and each step can be linked to the obligation it satisfies. If you
+add, change, or delete an obligation on a node that already has plan steps:
+
+- Run `tod-cli plan list --node <NODE_UUID>` to see whether any step links to
+  the obligation you touched (`satisfies=[...]` in the listing).
+- For a changed obligation, check whether the linked step's body still
+  matches — update it if not.
+- For a new requirement/constraint, consider whether it needs a new plan step,
+  and add one with `--satisfies <OBLIGATION_ID>` if so.
+- For a deleted obligation, unlink it from any step that referenced it
+  (`plan unsatisfy`) rather than leaving a dangling link.
+
+Mention what you found and did, but don't block on asking permission — treat
+this the same as the obligation edit itself: do it, then summarize.

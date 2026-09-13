@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 19;
+pub const CURRENT_USER_VERSION: i32 = 21;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -186,6 +186,86 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v18_to_v19(conn)?;
         conn.pragma_update(None, "user_version", 19)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 20 {
+        migrate_v19_to_v20(conn)?;
+        conn.pragma_update(None, "user_version", 20)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 21 {
+        migrate_v20_to_v21(conn)?;
+        conn.pragma_update(None, "user_version", 21)?;
+    }
+    // Idempotent and cheap — keeps the gate criteria catalog's wording in
+    // sync with the source on every startup, not just the migration that
+    // first seeded it (`INSERT OR IGNORE` alone would never update labels
+    // on an install that already ran that migration long ago).
+    crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// A failing gate row can carry `action: interview`, meaning the phase's
+/// interview would resolve it — persist that alongside outcome/detail so any
+/// consumer (not just the UI that rendered the reply) can tell a criterion
+/// still needs an interview without re-parsing an agent reply.
+fn migrate_v20_to_v21(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE node_gate_evaluations ADD COLUMN action TEXT NOT NULL DEFAULT 'none'
+            CHECK(action IN ('none', 'interview'));",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '21')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Allow 'implementation' as a `run_kind` — the special, plan+obligation
+/// seeded session launched only from the lifecycle panel's Active-phase
+/// Implement button, one live at a time per config.
+fn migrate_v19_to_v20(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE agent_runs_v20 (
+            id TEXT PRIMARY KEY NOT NULL,
+            agent_config_id TEXT NOT NULL REFERENCES agent_configs(id) ON DELETE RESTRICT,
+            run_number INTEGER NOT NULL,
+            runtime_status TEXT NOT NULL CHECK(runtime_status IN (
+                'starting', 'processing', 'waiting', 'blocked', 'not_running'
+            )),
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            reconnect_pid INTEGER,
+            reconnect_birth_token INTEGER,
+            run_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(run_kind IN ('auto', 'interactive', 'terminal', 'implementation')),
+            session_name TEXT,
+            agent_session_id TEXT,
+            UNIQUE(agent_config_id, run_number)
+        );
+        INSERT INTO agent_runs_v20 (
+            id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id
+        )
+        SELECT
+            id, agent_config_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id
+        FROM agent_runs;
+        DROP TABLE agent_runs;
+        ALTER TABLE agent_runs_v20 RENAME TO agent_runs;
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_config_id ON agent_runs(agent_config_id);
+        PRAGMA foreign_keys=ON;
+        ",
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '20')",
+        [],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 

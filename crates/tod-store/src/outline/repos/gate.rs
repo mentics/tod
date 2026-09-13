@@ -14,6 +14,9 @@ pub const SOURCE_AGENT: &str = "agent";
 pub const SOURCE_HUMAN: &str = "human";
 pub const SOURCE_DERIVED: &str = "derived";
 
+pub const ACTION_NONE: &str = "none";
+pub const ACTION_INTERVIEW: &str = "interview";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCriterion {
     pub id: Uuid,
@@ -33,6 +36,10 @@ pub struct NodeGateEvaluation {
     pub detail: Option<String>,
     pub source: String,
     pub evaluated_at: i64,
+    /// `ACTION_INTERVIEW` when the phase's interview would resolve this row
+    /// (persisted so it survives past the reply that reported it, not just
+    /// held in the ephemeral UI state that rendered it).
+    pub action: String,
 }
 
 pub struct GateRepo<'a> {
@@ -72,11 +79,38 @@ impl<'a> GateRepo<'a> {
 
     pub fn list_evaluations_for_node(&self, node_id: Uuid) -> Result<Vec<NodeGateEvaluation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT node_id, criterion_id, outcome, detail, source, evaluated_at
+            "SELECT node_id, criterion_id, outcome, detail, source, evaluated_at, action
              FROM node_gate_evaluations WHERE node_id = ?1",
         )?;
         let rows = stmt
             .query_map(params![uuid_to_blob(node_id)], map_evaluation)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Currently-failing criteria for `node_id`'s transition out of
+    /// `from_state` whose `action` says the phase's interview would resolve
+    /// them — the durable signal an interview driver can poll for, so it
+    /// doesn't matter which UI path (or none) led the user to the interview.
+    pub fn list_open_interview_failures(
+        &self,
+        node_id: Uuid,
+        from_state: &str,
+    ) -> Result<Vec<(GateCriterion, NodeGateEvaluation)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ge.node_id, ge.criterion_id, ge.outcome, ge.detail, ge.source, ge.evaluated_at, ge.action,
+                    gc.id, gc.from_state, gc.to_state, gc.slug, gc.label, gc.sort_order, gc.active
+             FROM node_gate_evaluations ge
+             JOIN gate_criteria gc ON gc.id = ge.criterion_id
+             WHERE ge.node_id = ?1 AND gc.from_state = ?2
+               AND ge.outcome = 'fail' AND ge.action = 'interview'",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id), from_state], |row| {
+                let eval = map_evaluation(row)?;
+                let criterion = map_criterion_offset(row, 7)?;
+                Ok((criterion, eval))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -101,13 +135,14 @@ impl<'a> GateRepo<'a> {
     pub fn upsert_evaluation(&self, row: &NodeGateEvaluation) -> Result<()> {
         self.conn.execute(
             "INSERT INTO node_gate_evaluations
-                (node_id, criterion_id, outcome, detail, source, evaluated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                (node_id, criterion_id, outcome, detail, source, evaluated_at, action)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(node_id, criterion_id) DO UPDATE SET
                 outcome = excluded.outcome,
                 detail = excluded.detail,
                 source = excluded.source,
-                evaluated_at = excluded.evaluated_at",
+                evaluated_at = excluded.evaluated_at,
+                action = excluded.action",
             params![
                 uuid_to_blob(row.node_id),
                 uuid_to_blob(row.criterion_id),
@@ -115,6 +150,7 @@ impl<'a> GateRepo<'a> {
                 row.detail,
                 row.source,
                 row.evaluated_at,
+                row.action,
             ],
         )?;
         Ok(())
@@ -123,11 +159,11 @@ impl<'a> GateRepo<'a> {
     pub fn apply_gate_results(
         &self,
         node_id: Uuid,
-        results: &[(Uuid, String, Option<String>)],
+        results: &[(Uuid, String, Option<String>, String)],
         source: &str,
     ) -> Result<()> {
         let now = now_ms();
-        for (criterion_id, outcome, detail) in results {
+        for (criterion_id, outcome, detail, action) in results {
             self.upsert_evaluation(&NodeGateEvaluation {
                 node_id,
                 criterion_id: *criterion_id,
@@ -135,6 +171,7 @@ impl<'a> GateRepo<'a> {
                 detail: detail.clone(),
                 source: source.to_string(),
                 evaluated_at: now,
+                action: action.clone(),
             })?;
         }
         Ok(())
@@ -164,5 +201,21 @@ fn map_evaluation(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeGateEvaluatio
         detail: row.get(3)?,
         source: row.get(4)?,
         evaluated_at: row.get(5)?,
+        action: row.get(6)?,
+    })
+}
+
+/// Same shape as [`map_criterion`], but reading columns starting at `offset`
+/// — for queries that join `gate_criteria` alongside other selected columns.
+fn map_criterion_offset(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<GateCriterion> {
+    let id_blob: Vec<u8> = row.get(offset)?;
+    Ok(GateCriterion {
+        id: blob_to_uuid_sql(&id_blob)?,
+        from_state: row.get(offset + 1)?,
+        to_state: row.get(offset + 2)?,
+        slug: row.get(offset + 3)?,
+        label: row.get(offset + 4)?,
+        sort_order: row.get(offset + 5)?,
+        active: row.get::<_, i32>(offset + 6)? != 0,
     })
 }

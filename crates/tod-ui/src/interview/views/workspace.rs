@@ -496,7 +496,9 @@ impl WorkspaceView {
     }
 
     fn question_maker_waiting(&self) -> bool {
-        self.questions.is_empty() && self.driver_status.question_maker_running
+        self.questions.is_empty()
+            && (self.driver_status.question_maker_running
+                || self.driver_status.answers_in_flight > 0)
     }
 
     fn agent_status_text(&self) -> SharedString {
@@ -1451,6 +1453,8 @@ impl Render for WorkspaceView {
                 .wait_started
                 .map(|t| ((t.elapsed().as_millis() / 500) % 4) as usize)
                 .unwrap_or(0),
+            processing_answers: !self.driver_status.question_maker_running
+                && self.driver_status.answers_in_flight > 0,
         });
         let selected = self.selected_question().cloned();
         let summary = selected
@@ -1655,6 +1659,7 @@ struct QuestionMakerWaitUi {
     target: usize,
     elapsed_secs: u64,
     animate_dots: usize,
+    processing_answers: bool,
 }
 
 fn archived_banner(border: gpui::Hsla, muted: gpui::Hsla) -> impl IntoElement {
@@ -2245,12 +2250,17 @@ fn question_maker_waiting_body(
     muted: gpui::Hsla,
 ) -> impl IntoElement {
     let dots = ".".repeat(wait.animate_dots.max(1));
+    let label = if wait.processing_answers {
+        "Processing your answer"
+    } else {
+        "Question maker is preparing questions"
+    };
     let mut col = v_flex().w_full().min_w_0().gap_3().child(
         div()
             .text_sm()
             .font_semibold()
             .text_color(foreground)
-            .child(format!("Question maker is preparing questions{dots}")),
+            .child(format!("{label}{dots}")),
     );
     if wait.elapsed_secs >= 3 {
         col = col.child(
@@ -2260,7 +2270,7 @@ fn question_maker_waiting_body(
                 .child(format!("Elapsed {}", format_elapsed(wait.elapsed_secs))),
         );
     }
-    if wait.target > 0 {
+    if wait.target > 0 && !wait.processing_answers {
         let pct = (wait.open as f32 / wait.target as f32).clamp(0., 1.);
         col = col.child(
             v_flex()

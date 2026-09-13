@@ -50,7 +50,7 @@ Reconcile obligations (requirements- and design-phase) and plan before exit.
 
 Apply these prose rules in addition to checklist criteria the app sends for this transition:
 
-- Implementation interview done, or not needed (nothing left that required the user's judgment) — either is a pass; only an interview left genuinely incomplete blocks the gate.
+- Implementation interview done, or not needed (nothing left that required the user's judgment) — either is a pass; only an interview left genuinely incomplete blocks the gate. Trust the question maker's own `interview exhausted` declaration (check current status via `tod-cli`) as strong evidence of completeness — it applies this same bar. Fail this criterion only when you can point to a specific, concrete decision it missed; a general sense that more discussion is possible is not grounds to fail a completed interview.
 - Plan steps exist and the graph is **actionable**: each step is well-scoped and buildable from, and dependencies (`plan depend`) are well-formed — no step blocked on one that can never complete, no artificial chain where steps could run in parallel instead.
 - Plan steps conform to design-phase and applicable requirements-phase obligations (node + ancestors).
 - Requirements are **traceable**: each maps to one or more plan steps via `--satisfies`, and those steps' `verified` status stands in for their verifiable checks (success criteria when present, otherwise the measurable statement).

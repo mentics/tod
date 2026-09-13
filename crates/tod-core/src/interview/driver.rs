@@ -315,8 +315,92 @@ impl InterviewDriver {
         Ok(failed)
     }
 
+    /// Prefix tagging a handoff note as one derived from a failing gate row,
+    /// so it can be found again later to dedupe or close it. Kept in sync
+    /// with the app-side equivalent used when a human waives a row directly.
+    const GATE_HANDOFF_PREFIX: &'static str = "Gate check failed: ";
+
+    /// The lifecycle name a failing gate row's `from_state` uses for this
+    /// driver's interview phase — distinct from the phase key itself,
+    /// since the `requirements` phase gates on the `proposed` → `design`
+    /// transition, not a `requirements` lifecycle state.
+    fn gate_from_state(&self) -> &'static str {
+        match self.phase {
+            PHASE_DESIGN => "design",
+            PHASE_PLANNING => "planning",
+            _ => "proposed",
+        }
+    }
+
+    /// Mirror any currently-failing gate criterion that names this phase's
+    /// interview as its resolution into an open handoff note, and close any
+    /// such note whose criterion has since stopped failing — purely from
+    /// persisted `node_gate_evaluations` state, so it doesn't matter which
+    /// entry point (or none) led the user to open this interview.
+    fn sync_gate_failures(&self, fleet: &FleetStore) -> Result<bool> {
+        use tod_store::outline::repos::gate::{ACTION_INTERVIEW, GateRepo};
+
+        let node = self.config.node_id;
+        let from_state = self.gate_from_state();
+        let (failing, open_gate_handoffs) = fleet.read(|conn| {
+            let failing = GateRepo::new(conn).list_open_interview_failures(node, from_state)?;
+            let open_gate_handoffs = InterviewRepo::new(conn)
+                .list_memory(node, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?
+                .into_iter()
+                .filter(|m| m.body.starts_with(Self::GATE_HANDOFF_PREFIX))
+                .collect::<Vec<_>>();
+            Ok((failing, open_gate_handoffs))
+        })?;
+
+        let mut wrote_new = false;
+        for (criterion, eval) in &failing {
+            debug_assert_eq!(eval.action, ACTION_INTERVIEW);
+            let tag = format!("{}{}", Self::GATE_HANDOFF_PREFIX, criterion.label);
+            if open_gate_handoffs.iter().any(|m| m.body.starts_with(&tag)) {
+                continue;
+            }
+            let body = match eval.detail.as_deref() {
+                Some(detail) if !detail.trim().is_empty() => format!("{tag} — {detail}"),
+                _ => tag,
+            };
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::AddMemory {
+                    node_id: node,
+                    kind: MEMORY_HANDOFF.into(),
+                    phase: Some(self.phase.to_string()),
+                    body,
+                    question_seq: None,
+                },
+            )?;
+            wrote_new = true;
+        }
+
+        for handoff in &open_gate_handoffs {
+            let still_failing = failing.iter().any(|(criterion, _)| {
+                handoff
+                    .body
+                    .starts_with(&format!("{}{}", Self::GATE_HANDOFF_PREFIX, criterion.label))
+            });
+            if !still_failing {
+                fleet.interview(
+                    ACTOR_USER,
+                    InterviewCommand::UpdateMemory {
+                        node_id: node,
+                        seq: handoff.seq,
+                        body: None,
+                        status: Some(MEMORY_DONE.to_string()),
+                    },
+                )?;
+            }
+        }
+
+        Ok(wrote_new)
+    }
+
     fn schedule(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
         let node = self.config.node_id;
+        let gate_handoff = self.sync_gate_failures(fleet).unwrap_or(false);
         let (mut open, unprocessed, state, new_handoff, stale) = fleet.read(|conn| {
             let repo = InterviewRepo::new(conn);
             let handoffs = repo.list_memory(node, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
@@ -355,7 +439,7 @@ impl InterviewDriver {
         // A question whose proposal targets a removed obligation can't be
         // accepted; the answer processor should have withdrawn it, so the app
         // does it as a backstop and asks for a replacement.
-        let mut wake_question_maker = new_handoff;
+        let mut wake_question_maker = new_handoff || gate_handoff;
         if !stale.is_empty() {
             fleet.interview(
                 ACTOR_USER,

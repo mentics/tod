@@ -304,6 +304,7 @@ mod tests {
                     detail: Some("looks good".into()),
                     source: SOURCE_AGENT.to_string(),
                     evaluated_at: 0,
+                    action: tod_store::outline::repos::gate::ACTION_NONE.to_string(),
                 }),
             )],
         };

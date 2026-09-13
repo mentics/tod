@@ -26,7 +26,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "design",
         to_state: "planning",
         slug: "design-planning.done-criteria-clear",
-        label: "Do I know exactly what \"done\" looks like for this node, including commands or observable checks?",
+        label: "Does each requirement have a concrete, checkable way to verify it's done (a command, a test, or an observable behavior)?",
         sort_order: 1,
     },
     GateCriterionSeed {
@@ -42,7 +42,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "design",
         to_state: "planning",
         slug: "design-planning.irreversible-choices-locked",
-        label: "Are irreversible design choices locked (or explicitly deferred with a decision tree)?",
+        label: "Are costly-to-reverse design choices (data shapes, protocols, schemas, public interfaces) locked, or explicitly deferred with a decision tree?",
         sort_order: 3,
     },
     GateCriterionSeed {
@@ -305,6 +305,7 @@ CREATE TABLE IF NOT EXISTS node_gate_evaluations (
     detail          TEXT,
     source          TEXT NOT NULL CHECK (source IN ('agent', 'human', 'derived')),
     evaluated_at    INTEGER NOT NULL,
+    action          TEXT NOT NULL DEFAULT 'none' CHECK (action IN ('none', 'interview')),
     PRIMARY KEY (node_id, criterion_id)
 );
 CREATE INDEX IF NOT EXISTS idx_node_gate_evaluations_node
@@ -329,6 +330,14 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
                 row.sort_order,
                 now,
             ],
+        )?;
+        // `INSERT OR IGNORE` leaves an already-seeded row's `label` alone —
+        // keep wording edits to this catalog in sync on existing installs
+        // too, rather than only affecting brand-new databases.
+        conn.execute(
+            "UPDATE gate_criteria SET label = ?2, updated_at = ?3
+             WHERE id = ?1 AND label != ?2",
+            params![uuid_to_blob(id), row.label, now],
         )?;
     }
     conn.execute(

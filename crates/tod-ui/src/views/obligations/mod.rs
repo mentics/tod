@@ -3,7 +3,7 @@
 mod delegate;
 
 use crate::ui::actionable::{
-    chrome_control_with_shortcut, chrome_control_with_shortcut_in_context,
+    chrome_control_with_shortcut, chrome_control_with_shortcut_in_context, render_shortcut_pill,
 };
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::key_context;
@@ -24,7 +24,7 @@ use gpui::{
 };
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
@@ -59,6 +59,7 @@ actions!(
         ObligationsExpand,
         ObligationsDelete,
         ObligationsAddSection,
+        ObligationsFocusSearch,
     ]
 );
 
@@ -88,6 +89,7 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("backspace", ObligationsDelete, context),
         KeyBinding::new("delete", ObligationsDelete, context),
         KeyBinding::new("s", ObligationsAddSection, context),
+        KeyBinding::new("ctrl-f", ObligationsFocusSearch, context),
         // Inline edit is a multi-line text area: arrows move the cursor as usual,
         // Escape abandons the edit, and Ctrl+Enter commits it.
         KeyBinding::new(
@@ -141,6 +143,8 @@ pub struct ObligationsView {
     node_id: Option<Uuid>,
     title: String,
     items: Vec<NodeObligation>,
+    search_query: String,
+    search_input: Entity<InputState>,
     /// The interview's current phase, when this panel is scoped to one — used
     /// only to seed which phase starts expanded and as the default phase for
     /// obligations created with no clearer phase context. `None` outside an
@@ -207,6 +211,9 @@ impl ObligationsView {
                 }
             });
 
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search obligations…"));
+
         let delegate = ObligationListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
 
         let poll_entity = cx.weak_entity();
@@ -236,6 +243,8 @@ impl ObligationsView {
             node_id: None,
             title: String::new(),
             items: Vec::new(),
+            search_query: String::new(),
+            search_input,
             active_phase: None,
             phase_collapsed: HashSet::new(),
             kind_collapsed: HashSet::new(),
@@ -349,6 +358,10 @@ impl ObligationsView {
         self.title.clear();
         self.items.clear();
         self.selected_key = None;
+        self.search_query.clear();
+        self.search_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
         cx.emit(ObligationsEvent::Close);
         cx.notify();
     }
@@ -483,10 +496,27 @@ impl ObligationsView {
         [PHASE_REQUIREMENTS, tod_store::interview::PHASE_DESIGN, PHASE_UNKNOWN]
     }
 
+    /// Items matching the current search query (body or section text),
+    /// case-insensitive substring match. Empty query matches everything.
+    fn search_matches(&self) -> Vec<&NodeObligation> {
+        let query = self.search_query.trim().to_lowercase();
+        self.items
+            .iter()
+            .filter(|o| {
+                query.is_empty()
+                    || o.body.to_lowercase().contains(&query)
+                    || o.section
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
     fn flat_rows(&self) -> Vec<ObligationRow> {
         let mut rows = Vec::new();
+        let matching = self.search_matches();
         for phase in Self::phase_order() {
-            let phase_items: Vec<_> = self.items.iter().filter(|o| o.phase == phase).collect();
+            let phase_items: Vec<_> = matching.iter().filter(|o| o.phase == phase).copied().collect();
             if phase_items.is_empty() {
                 continue;
             }
@@ -1609,6 +1639,25 @@ impl ObligationsView {
         self.add_section(&phase, kind, window, cx);
     }
 
+    fn sync_search_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_input.read(cx).text().to_string();
+        if query != self.search_query {
+            self.search_query = query;
+            self.rebuild_visible(window, cx);
+        }
+    }
+
+    fn on_focus_search(
+        &mut self,
+        _: &ObligationsFocusSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_input.update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    }
+
     fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
@@ -1657,6 +1706,7 @@ impl Focusable for ObligationsView {
 
 impl Render for ObligationsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_search_from_input(window, cx);
         if self.pending_live_refresh {
             self.pending_live_refresh = false;
             self.reload(window, cx);
@@ -1716,6 +1766,7 @@ impl Render for ObligationsView {
             .on_action(cx.listener(Self::on_expand))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_add_section))
+            .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))
@@ -1749,6 +1800,19 @@ impl Render for ObligationsView {
                                 ),
                             ),
                     )
+                    .child({
+                        let mut search =
+                            Input::new(&self.search_input).cleanable(true).w(px(220.));
+                        if let Some(pill) = render_shortcut_pill(
+                            window,
+                            &ObligationsFocusSearch,
+                            OBLIGATIONS_CONTEXT,
+                            cx,
+                        ) {
+                            search = search.suffix(pill);
+                        }
+                        search
+                    })
                     .when(self.node_has_agent, |row| {
                         row.child(div().relative().when_some(
                             self.agent_menu.clone(),

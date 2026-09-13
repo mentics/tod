@@ -12,8 +12,8 @@ Step-by-step implementation detail is **parked** for planning.
 ## Ask about, roughly in order
 
 1. **Parked detail** for design — the user already volunteered it, so confirm it rather than asking again.
-2. **Irreversible or expensive choices** — data shapes, storage, protocols, public interfaces, named constructions.
-3. **What "done" looks like** — the observable behavior or checks that prove each requirement.
+2. **Costly-to-reverse choices** — data shapes, storage, protocols, public interfaces, named constructions. Nothing here is truly irreversible, but locking it in design is far cheaper than unwinding it after planning or implementation has built on top of it.
+3. **A concrete, checkable way to verify each requirement** — a command, a test, or an observable behavior that proves it's done.
 4. **Appearance and layout** of anything the user will see. The user must accept these; don't infer them.
 5. **Open unknowns** — resolve each, or record it as a deliberate spike with a decision tree: *if we find X, we do Y*.
 
@@ -21,7 +21,7 @@ When external references matter, say whether each one is **required** or only a 
 
 ## Done when
 
-- Every irreversible choice is decided or has a decision tree.
-- Each requirement has an observable way to be verified.
+- Every costly-to-reverse choice is decided or has a decision tree.
+- Each requirement has a concrete, checkable way to be verified.
 - User-visible appearance is accepted, or the user has waived it.
 - No open memory is parked for design.

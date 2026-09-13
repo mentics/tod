@@ -15,7 +15,7 @@ Run a **design interview** via the app unless waived at the `proposed` → `desi
 
 - Probe until design-phase information is sufficient; prefer principles/clusters; do not re-ask settled obligations.
 - Consume parked interview memory tagged `design`; promote it into a design-phase obligation (`tod-cli obligations add --phase design`) or discuss with the human; mark it done when consumed.
-- Probe: what “done” looks like (commands/checks), irreversible choices, named **constructions**, open design questions.
+- Probe: a concrete, checkable way to verify each requirement (a command, a test, an observable behavior), costly-to-reverse choices, named **constructions**, open design questions.
 - Do **not** probe for optional metadata (Links, non-goals) unless the human volunteers.
 - Record waivers in interview memory.
 

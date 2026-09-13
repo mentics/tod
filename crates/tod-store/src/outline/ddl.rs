@@ -186,6 +186,7 @@ CREATE TABLE IF NOT EXISTS node_gate_evaluations (
     detail          TEXT,
     source          TEXT NOT NULL CHECK (source IN ('agent', 'human', 'derived')),
     evaluated_at    INTEGER NOT NULL,
+    action          TEXT NOT NULL DEFAULT 'none' CHECK (action IN ('none', 'interview')),
     PRIMARY KEY (node_id, criterion_id)
 );
 CREATE INDEX IF NOT EXISTS idx_node_gate_evaluations_node
