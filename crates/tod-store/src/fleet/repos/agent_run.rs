@@ -147,6 +147,41 @@ impl<'a> AgentRunRepo<'a> {
         Ok(rows)
     }
 
+    /// Implementation runs (launched from the lifecycle panel's Active-phase
+    /// "Implement" button) for a config, newest first. Distinct from
+    /// `run_kind = 'interactive'` sessions launched directly from the
+    /// action-config panel — see `has_live_implementation_run`.
+    pub fn list_implementation_for_config(
+        &self,
+        config_id: &str,
+    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE agent_config_id = ?1 AND run_kind = 'implementation'
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![config_id], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Whether an `implementation`-kind run is still alive for this config —
+    /// the one-at-a-time lock backing the lifecycle panel's Implement button.
+    /// Live means not yet ended; this intentionally ignores other run kinds
+    /// on the same config, which are unrelated and allowed to run alongside.
+    pub fn has_live_implementation_run(
+        &self,
+        config_id: &str,
+    ) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        Ok(self
+            .list_implementation_for_config(config_id)?
+            .into_iter()
+            .find(|run| run.ended_at.is_none() && run.runtime_status != "not_running"))
+    }
+
     pub fn latest_auto_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
         let sql = format!(
             "{RUN_SELECT}

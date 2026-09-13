@@ -6,9 +6,12 @@
 //! currently has selected. Both ids and text are included: the agent can work
 //! with the text directly and only needs `tod-cli` for what it was not given.
 
+use crate::gate::PlanStepWithLinks;
+use crate::interview::context::{obligation_line, plan_step_line};
 use crate::media::{MediaPaths, load_static_context};
 use anyhow::Result;
 use std::path::Path;
+use tod_store::outline::NodeObligation;
 use uuid::Uuid;
 
 /// The node an agent chat was opened against.
@@ -120,6 +123,105 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
             "\nNo individual obligation is selected — the user is looking at the \
              node's obligations as a whole.\n",
         );
+    }
+
+    out
+}
+
+/// Context key under `media/context/` for an implementation session, launched
+/// from the lifecycle panel's Active-phase "Implement" button (see
+/// `crate::gate` for the transition gate that requires an action config
+/// before a node can reach `active` at all).
+pub const IMPLEMENT_CONTEXT_KEY: &str = "active/implement";
+
+/// One node's own obligations, paired with its title, for rendering the full
+/// ancestor-to-node obligation hierarchy an implementation session gets
+/// up front.
+#[derive(Debug, Clone)]
+pub struct ImplementNodeObligations {
+    pub node_title: String,
+    pub obligations: Vec<NodeObligation>,
+}
+
+/// Everything an implementation session's first-turn context describes.
+#[derive(Debug, Clone)]
+pub struct ImplementRequest<'a> {
+    pub data_root: &'a Path,
+    pub node: NodeSelection,
+    /// This node's plan steps with their dependency and `--satisfies` links.
+    pub plan_steps: Vec<PlanStepWithLinks>,
+    /// Obligations for this node and every ancestor, most general (root)
+    /// first, ending with the node itself.
+    pub obligation_hierarchy: Vec<ImplementNodeObligations>,
+}
+
+/// Build the full implementation-session first message: static layers (app.md
+/// then active.md then active/implement.md, per the usual context layering),
+/// then the inlined plan and obligation hierarchy.
+pub fn build_implement_message(paths: &MediaPaths, request: &ImplementRequest<'_>) -> Result<String> {
+    let mut out = load_static_context(paths, IMPLEMENT_CONTEXT_KEY)?;
+    out.push_str("\n\n---\n\n");
+    out.push_str(&render_implement_dynamic(request));
+    Ok(out)
+}
+
+fn render_implement_dynamic(request: &ImplementRequest<'_>) -> String {
+    let mut out = String::from("# Current context\n\n");
+
+    out.push_str(&format!(
+        "**Data root:** `{}`\n\n\
+         Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
+        request.data_root.display()
+    ));
+
+    out.push_str("## Node\n\n");
+    out.push_str(&format!("- **Id:** `{}`\n", request.node.id));
+    out.push_str(&format!("- **Title:** {}\n", request.node.title.trim()));
+    if let Some(lifecycle) = request.node.lifecycle.as_deref() {
+        if !lifecycle.trim().is_empty() {
+            out.push_str(&format!("- **Lifecycle state:** {}\n", lifecycle.trim()));
+        }
+    }
+    match request.node.body.as_deref().map(str::trim) {
+        Some(body) if !body.is_empty() => {
+            out.push_str("\n**Details:**\n\n");
+            out.push_str(body);
+            out.push('\n');
+        }
+        _ => {}
+    }
+
+    out.push_str("\n## Plan\n\n");
+    if request.plan_steps.is_empty() {
+        out.push_str("(no plan steps)\n");
+    } else {
+        for entry in &request.plan_steps {
+            out.push_str("- ");
+            out.push_str(&plan_step_line(&entry.step, &entry.depends_on, &entry.satisfies));
+            out.push('\n');
+        }
+    }
+
+    out.push_str(
+        "\n## Obligation hierarchy\n\n\
+         From the root of the tree down to this node, most general first:\n\n",
+    );
+    if request.obligation_hierarchy.is_empty() {
+        out.push_str("(none)\n");
+    } else {
+        for level in &request.obligation_hierarchy {
+            out.push_str(&format!("### {}\n\n", level.node_title.trim()));
+            if level.obligations.is_empty() {
+                out.push_str("(none)\n\n");
+                continue;
+            }
+            for o in &level.obligations {
+                out.push_str("- ");
+                out.push_str(&obligation_line(o));
+                out.push('\n');
+            }
+            out.push('\n');
+        }
     }
 
     out

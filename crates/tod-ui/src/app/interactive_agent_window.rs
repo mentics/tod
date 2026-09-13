@@ -231,6 +231,64 @@ impl InteractiveAgentWindowControl {
         Ok(session_run_id)
     }
 
+    /// Create and open a special `implementation`-kind session for the given
+    /// action config — launched only from the lifecycle panel's Active-phase
+    /// "Implement" button, never reused, and distinguishable from ordinary
+    /// `interactive` sessions on the same config via `run_kind`. Ignores the
+    /// terminal chat-launch-mode setting: an implementation run always needs
+    /// the in-window first-turn path so `initial_context` goes out with the
+    /// first message (see CLAUDE.md's "Agent chat context").
+    pub fn create_and_open_implementation_session(
+        &self,
+        task_id: &str,
+        config_id: &str,
+        context_key: &str,
+        initial_context: String,
+        cx: &mut App,
+    ) -> Result<String, String> {
+        let (fleet, _, _paths, _settings) = self.bound_resources()?;
+        let subject = fleet
+            .get_node(task_id)
+            .ok()
+            .flatten()
+            .map(|node| node.title)
+            .unwrap_or_default();
+        let session_name = tod_core::session_name::session_name(
+            Some(context_key),
+            &subject,
+            chrono::Local::now(),
+        );
+
+        fleet
+            .enqueue(FleetMutation::CreateAgentRun {
+                config_id: config_id.to_string(),
+                run_kind: Some("implementation".into()),
+                session_name: Some(session_name),
+            })
+            .map_err(|err| format!("create implementation session failed: {err}"))?;
+        fleet
+            .writer()
+            .flush()
+            .map_err(|err| format!("create implementation session failed: {err}"))?;
+        let _ = fleet.reload_if_stale();
+        let session_run_id = fleet
+            .list_implementation_sessions_for_config(config_id)
+            .map_err(|err| format!("create implementation session failed: {err}"))?
+            .into_iter()
+            .next()
+            .map(|run| run.id)
+            .ok_or_else(|| "create implementation session failed: run not created".to_string())?;
+        self.open_session(
+            InteractiveAgentOpenParams {
+                config_id: config_id.to_string(),
+                session_run_id: session_run_id.clone(),
+                initial_context: Some(initial_context),
+            },
+            cx,
+        )?;
+        Ok(session_run_id)
+    }
+
     /// Create a new session (same bookkeeping as [`Self::create_and_open_session`])
     /// without opening a standalone window — returns everything needed to
     /// construct an embedded [`InteractiveAgentView`] directly inside a
