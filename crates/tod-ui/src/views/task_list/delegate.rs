@@ -34,6 +34,10 @@ pub enum RowAction {
     ToggleCollapsed { task_id: String },
     OpenObligations { task_id: String },
     DropObligation { task_id: String, obligation_id: uuid::Uuid },
+    RefreshGenerator { task_id: String },
+    OpenExternal { task_id: String },
+    CycleGeneratorSort { task_id: String },
+    ToggleGeneratorFilter { task_id: String },
 }
 
 pub struct TaskListDelegate {
@@ -45,6 +49,7 @@ pub struct TaskListDelegate {
     inline_edit_input: Option<Entity<InputState>>,
     open_row_menu: Option<(RowMenuKind, String)>,
     row_menu: Option<Entity<PopupMenu>>,
+    recently_updated: std::collections::HashSet<String>,
 }
 
 impl TaskListDelegate {
@@ -58,7 +63,12 @@ impl TaskListDelegate {
             inline_edit_input: None,
             open_row_menu: None,
             row_menu: None,
+            recently_updated: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn set_recently_updated(&mut self, recently_updated: std::collections::HashSet<String>) {
+        self.recently_updated = recently_updated;
     }
 
     pub fn set_row_menu(
@@ -162,6 +172,41 @@ impl ListDelegate for TaskListDelegate {
             });
 
         let mut chips = h_flex().gap_1().items_center().ml_auto();
+        if managed && self.recently_updated.contains(&item.id) {
+            chips = chips.child(
+                div()
+                    .size(px(6.0))
+                    .rounded_full()
+                    .bg(link_color)
+                    .flex_shrink_0(),
+            );
+        }
+        if let (true, Some("linear"), Some(_)) = (
+            managed,
+            item.source_type.as_deref(),
+            item.external_id.as_ref(),
+        ) {
+            let task_id_open = item.id.clone();
+            chips = chips.child(action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                "↗".to_string(),
+                selected,
+                if selected { Some("X") } else { None },
+                {
+                    let sink = sink.clone();
+                    move || {
+                        sink.borrow_mut().push(RowAction::OpenExternal {
+                            task_id: task_id_open.clone(),
+                        });
+                    }
+                },
+            ));
+        }
         if item.has_spec {
             let obl_label = format!(
                 "{} req · {} con",
@@ -201,6 +246,69 @@ impl ListDelegate for TaskListDelegate {
                     .text_color(muted_foreground)
                     .child(format!("⚙ {count}")),
             );
+            let refreshing = item.generator_status.as_deref() == Some("in_progress");
+            if !refreshing {
+                let task_id_refresh = item.id.clone();
+                chips = chips.child(action_chip(
+                    cx,
+                    border,
+                    primary,
+                    secondary,
+                    background,
+                    foreground,
+                    "⟳".to_string(),
+                    selected,
+                    if selected { Some("R") } else { None },
+                    {
+                        let sink = sink.clone();
+                        move || {
+                            sink.borrow_mut().push(RowAction::RefreshGenerator {
+                                task_id: task_id_refresh.clone(),
+                            });
+                        }
+                    },
+                ));
+            }
+            let task_id_sort = item.id.clone();
+            chips = chips.child(action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                "⇅".to_string(),
+                selected,
+                if selected { Some("S") } else { None },
+                {
+                    let sink = sink.clone();
+                    move || {
+                        sink.borrow_mut().push(RowAction::CycleGeneratorSort {
+                            task_id: task_id_sort.clone(),
+                        });
+                    }
+                },
+            ));
+            let task_id_filter = item.id.clone();
+            chips = chips.child(action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                "🔎".to_string(),
+                selected,
+                if selected { Some("F") } else { None },
+                {
+                    let sink = sink.clone();
+                    move || {
+                        sink.borrow_mut().push(RowAction::ToggleGeneratorFilter {
+                            task_id: task_id_filter.clone(),
+                        });
+                    }
+                },
+            ));
             match item.generator_status.as_deref() {
                 Some("in_progress") => {
                     chips = chips.child(

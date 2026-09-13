@@ -265,6 +265,32 @@ pub enum OutlineMutation {
     ClearManagedNodeLinks {
         generator_node_id: Uuid,
     },
+    /// Clear the link on any copied-out node still referencing an external
+    /// item a refresh determined no longer exists (stale link). The node
+    /// keeps its title/content and becomes a plain normal node.
+    ClearStaleCopyLinks {
+        generator_node_id: Uuid,
+        external_id: String,
+    },
+    /// Refresh already-copied-out (linked, non-managed) nodes with fresh
+    /// source data. Each field is `None` when the user has locally modified
+    /// it and refresh must leave it alone.
+    RefreshLinkedCopy {
+        node_id: Uuid,
+        title: Option<String>,
+        tags: Option<Vec<String>>,
+        body: Option<String>,
+    },
+    /// Deep-copy a managed node (and its managed descendants) out of a generator
+    /// subtree into a plain, editable subtree elsewhere in the outline. Each
+    /// copied node keeps a data-source link (for future refresh updates) but is
+    /// no longer `managed` — title/tags/body become user-editable.
+    PasteManagedNodeCopy {
+        source_node_id: Uuid,
+        list_id: Uuid,
+        parent_id: Option<Uuid>,
+        ordinal: i32,
+    },
     /// Update the refresh status on a generator node.
     SetRefreshStatus {
         node_id: Uuid,
@@ -317,6 +343,9 @@ impl OutlineMutation {
                 | OutlineMutation::DeleteManagedNode { .. }
                 | OutlineMutation::SetManagedNodeLink { .. }
                 | OutlineMutation::ClearManagedNodeLinks { .. }
+                | OutlineMutation::ClearStaleCopyLinks { .. }
+                | OutlineMutation::RefreshLinkedCopy { .. }
+                | OutlineMutation::PasteManagedNodeCopy { .. }
                 | OutlineMutation::SetRefreshStatus { .. }
         )
     }
@@ -348,6 +377,7 @@ impl OutlineMutation {
                 let repo = NodeRepo::new(conn);
                 repo.update_title(*node_id, title)?;
                 repo.sync_auto_slug(*node_id)?;
+                GeneratorRepo::new(conn).mark_field_modified(*node_id, "title")?;
             }
             OutlineMutation::SetNodeCollapsed { node_id, collapsed } => {
                 OutlineRepo::new(conn).set_collapsed(*node_id, *collapsed)?;
@@ -490,6 +520,12 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteNode { node_id } => {
                 guard_not_managed(conn, *node_id)?;
+                // If this node is a generator, its copied-out nodes (living outside
+                // the subtree being deleted) lose their data-source link and become
+                // plain normal nodes — they keep their title/content, just no more
+                // refresh updates. Managed descendants are removed by the archive
+                // below along with their own links (FK cascade).
+                GeneratorRepo::new(conn).clear_links_for_generator(*node_id)?;
                 let (archive_id, list_id) =
                     crate::outline::archive::delete_subtree_archived(conn, *node_id)?;
                 refresh_loop_health(conn, list_id)?;
@@ -573,6 +609,9 @@ impl OutlineMutation {
                     require_spec(conn, *node_id)?;
                 }
                 NodeRepo::new(conn).set_extra_content(*node_id, content_type, body)?;
+                if content_type == EXTRA_CONTENT_DETAILS {
+                    GeneratorRepo::new(conn).mark_field_modified(*node_id, "body")?;
+                }
             }
             OutlineMutation::SetLifecycle { node_id, state } => {
                 NodeRepo::new(conn).set_lifecycle(*node_id, state)?;
@@ -655,6 +694,49 @@ impl OutlineMutation {
             }
             OutlineMutation::ClearManagedNodeLinks { generator_node_id } => {
                 GeneratorRepo::new(conn).clear_links_for_generator(*generator_node_id)?;
+            }
+            OutlineMutation::ClearStaleCopyLinks {
+                generator_node_id,
+                external_id,
+            } => {
+                GeneratorRepo::new(conn).clear_stale_copy_links(*generator_node_id, external_id)?;
+            }
+            OutlineMutation::RefreshLinkedCopy {
+                node_id,
+                title,
+                tags,
+                body,
+            } => {
+                let node_repo = NodeRepo::new(conn);
+                if let Some(title) = title {
+                    node_repo.update_title(*node_id, title)?;
+                    node_repo.sync_auto_slug(*node_id)?;
+                }
+                if let Some(body) = body {
+                    node_repo.set_extra_content(*node_id, EXTRA_CONTENT_DETAILS, body)?;
+                }
+                if let Some(tags) = tags {
+                    let tags_json = serde_json::to_string(tags)?;
+                    conn.execute(
+                        "INSERT INTO node_fields (node_id, tags, updated_at)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
+                        params![
+                            crate::outline::uuid_blob::uuid_to_blob(*node_id),
+                            tags_json,
+                            now_ms(),
+                        ],
+                    )?;
+                }
+            }
+            OutlineMutation::PasteManagedNodeCopy {
+                source_node_id,
+                list_id,
+                parent_id,
+                ordinal,
+            } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
+                paste_managed_node_copy(conn, *source_node_id, *list_id, *parent_id, *ordinal)?;
             }
             OutlineMutation::SetRefreshStatus {
                 node_id,
@@ -1073,6 +1155,116 @@ fn update_managed_node(
     )?;
 
     Ok(())
+}
+
+fn paste_managed_node_copy(
+    conn: &Connection,
+    source_node_id: Uuid,
+    list_id: Uuid,
+    parent_id: Option<Uuid>,
+    ordinal: i32,
+) -> Result<Uuid> {
+    let gen_repo = GeneratorRepo::new(conn);
+    let link = gen_repo
+        .get_link(source_node_id)?
+        .context("source node has no data-source link — not a managed node")?;
+
+    bump_ordinals_after(conn, list_id, parent_id, ordinal)?;
+    let new_root_id =
+        copy_managed_node_recursive(conn, source_node_id, &link, list_id, parent_id, Some(ordinal))?;
+
+    Ok(new_root_id)
+}
+
+fn copy_managed_node_recursive(
+    conn: &Connection,
+    source_node_id: Uuid,
+    link: &crate::outline::repos::generator::ManagedNodeLink,
+    list_id: Uuid,
+    parent_id: Option<Uuid>,
+    ordinal: Option<i32>,
+) -> Result<Uuid> {
+    let node_repo = NodeRepo::new(conn);
+    let outline = OutlineRepo::new(conn);
+    let gen_repo = GeneratorRepo::new(conn);
+
+    let source = node_repo
+        .get(source_node_id)?
+        .context("source node not found")?;
+    let tags = node_repo.get_tags(source_node_id)?;
+    let body = node_repo
+        .get_extra_content(source_node_id, EXTRA_CONTENT_DETAILS)?
+        .unwrap_or_default();
+
+    let title = format!("{}: {}", link.external_id, source.title);
+    let new_id = Uuid::new_v4();
+    let base = crate::outline::slug::derive_node_slug(&title, None);
+    let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(new_id))?;
+    let new_node = node_repo.create_with_id(new_id, &slug, &title)?;
+
+    let ordinal = match ordinal {
+        Some(o) => o,
+        None => outline.next_ordinal(list_id, parent_id)?,
+    };
+    outline.insert(&OutlineEntry {
+        node_id: new_node.id,
+        list_id,
+        parent_id,
+        ordinal,
+        collapsed: false,
+    })?;
+
+    if !body.is_empty() {
+        node_repo.set_extra_content(new_node.id, EXTRA_CONTENT_DETAILS, &body)?;
+    }
+    if !tags.is_empty() {
+        let tags_json = serde_json::to_string(&tags)?;
+        conn.execute(
+            "INSERT INTO node_fields (node_id, tags, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
+            params![
+                crate::outline::uuid_blob::uuid_to_blob(new_node.id),
+                tags_json,
+                now_ms(),
+            ],
+        )?;
+    }
+
+    gen_repo.set_link(
+        new_node.id,
+        link.generator_node_id,
+        &link.external_id,
+        &link.source_type,
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT e.node_id FROM outline_entries e
+         JOIN nodes n ON n.id = e.node_id
+         WHERE e.parent_id = ?1 AND n.managed = 1",
+    )?;
+    let child_ids: Vec<Uuid> = stmt
+        .query_map(
+            params![crate::outline::uuid_blob::uuid_to_blob(source_node_id)],
+            |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                Ok(blob)
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|b| crate::outline::uuid_blob::blob_to_uuid_sql(&b))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for child_id in child_ids {
+        let child_link = gen_repo
+            .get_link(child_id)?
+            .context("managed child has no data-source link")?;
+        copy_managed_node_recursive(conn, child_id, &child_link, list_id, Some(new_node.id), None)?;
+    }
+
+    Ok(new_node.id)
 }
 
 fn refresh_loop_health(conn: &Connection, list_id: Uuid) -> Result<()> {

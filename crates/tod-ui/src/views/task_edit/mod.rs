@@ -1,6 +1,7 @@
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_pane_nav};
+use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::toast::{confirm_toast, error_toast};
 use crate::views::linear_import::parse_ticket_reference;
 use crate::views::linear_import::{apply_linear_fields_to_node, tags_with_linear};
@@ -13,7 +14,8 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
-use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
+use gpui_component::tag::Tag;
+use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tod_store::fleet::{FleetMutation, FleetStore, NoteItem, validate_interview_workspace};
@@ -156,6 +158,8 @@ pub struct TaskEditView {
     generator_last_status: Option<String>,
     generator_last_error: Option<String>,
     generator_config_error: Option<String>,
+    managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
+    managed_source_type: Option<String>,
     _title_subscription: Subscription,
     _slug_subscription: Subscription,
     _linear_subscription: Subscription,
@@ -290,6 +294,8 @@ impl TaskEditView {
             generator_last_status: None,
             generator_last_error: None,
             generator_config_error: None,
+            managed_link: None,
+            managed_source_type: None,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -677,6 +683,7 @@ impl TaskEditView {
         self.capabilities = self.load_capabilities(&task_id).into_iter().collect();
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
+        self.load_managed_link();
         let linear = task.linked_issues.first().cloned().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
@@ -780,6 +787,33 @@ impl TaskEditView {
     fn notify_changed(&mut self, cx: &mut Context<Self>) {
         cx.emit(TaskEditEvent::Changed);
         cx.notify();
+    }
+
+    fn load_managed_link(&mut self) {
+        self.managed_link = self
+            .node_uuid()
+            .and_then(|node_id| self.fleet.get_managed_link(node_id).ok().flatten());
+        self.managed_source_type = self.managed_link.as_ref().and_then(|link| {
+            self.fleet
+                .get_generator_config(link.generator_node_id)
+                .ok()
+                .flatten()
+                .map(|config| config.data_source_type)
+        });
+    }
+
+    fn is_managed(&self) -> bool {
+        self.managed_link.is_some()
+    }
+
+    fn managed_external_url(&self) -> Option<String> {
+        let link = self.managed_link.as_ref()?;
+        match self.managed_source_type.as_deref() {
+            Some(tod_core::generator::DATA_SOURCE_LINEAR) => {
+                Some(format!("https://linear.app/issue/{}", link.external_id))
+            }
+            _ => None,
+        }
     }
 
     fn load_generator_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2095,6 +2129,293 @@ impl TaskEditView {
         Self::render_legend_border_section(border, legend, body)
     }
 
+    fn render_generator_section(
+        &self,
+        cap_index: usize,
+        background: gpui::Hsla,
+        border: gpui::Hsla,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cap = Capability::Generator;
+        let body: Option<gpui::AnyElement> = if self.capability_enabled(cap) {
+            Some(self.render_generator_body(background, muted, window, cx).into_any_element())
+        } else {
+            None
+        };
+        let legend = self
+            .render_section_legend(cap, cap_index, background, cx)
+            .into_any_element();
+        Self::render_legend_border_section(border, legend, body)
+    }
+
+    fn render_generator_body(
+        &self,
+        background: gpui::Hsla,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut col = v_flex().gap_2().px_3().pb_3();
+
+        match &self.generator_data_source_type {
+            None => {
+                let selected = self.generator_pending_source_type.clone();
+                col = col.child(Self::render_field_label("Data source", cx)).child(
+                    h_flex().gap_1p5().flex_wrap().children(
+                        tod_core::generator::available_data_sources()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, (key, name, description))| {
+                                let is_selected = selected.as_deref() == Some(key);
+                                let key_owned = key.to_string();
+                                Button::new(("task-edit-gen-source", idx))
+                                    .label(name)
+                                    .compact()
+                                    .selected(is_selected)
+                                    .tooltip(description)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_generator_data_source(
+                                            key_owned.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            }),
+                    ),
+                );
+                if selected.is_none() {
+                    return col;
+                }
+            }
+            Some(data_source_type) => {
+                col = col.child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .child(Self::render_field_label("Data source", cx))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(data_source_type.clone()),
+                        ),
+                );
+            }
+        }
+
+        col = col.child(Self::render_field_label("Configuration (JSON)", cx)).child(
+            div()
+                .w_full()
+                .rounded_md()
+                .cursor_text()
+                .bg(background)
+                .child(
+                    Input::new(&self.generator_config_input)
+                        .w_full()
+                        .h(window.line_height() * 6.),
+                ),
+        );
+
+        if let Some(schema_hint) = self
+            .generator_data_source_type
+            .clone()
+            .or_else(|| self.generator_pending_source_type.clone())
+            .and_then(|key| tod_core::generator::data_source_for_type(&key))
+            .map(|ds| {
+                ds.configuration_schema()
+                    .fields
+                    .iter()
+                    .map(|f| format!("{} ({}){}", f.name, f.help, if f.required { " *" } else { "" }))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+        {
+            col = col.child(
+                div().text_xs().text_color(muted).child(selectable_text(
+                    "task-edit-gen-schema-hint",
+                    schema_hint,
+                    window,
+                    cx,
+                )),
+            );
+        }
+
+        let danger = cx.theme().danger;
+        if let Some(err) = &self.generator_config_error {
+            col = col.child(
+                div().text_xs().text_color(danger).child(selectable_text(
+                    "task-edit-gen-config-error",
+                    err.clone(),
+                    window,
+                    cx,
+                )),
+            );
+        }
+
+        if let Some(status) = &self.generator_last_status {
+            col = col.child(
+                div().text_xs().text_color(muted).child(selectable_text(
+                    "task-edit-gen-status",
+                    format!("last refresh: {status}"),
+                    window,
+                    cx,
+                )),
+            );
+        }
+
+        if let Some(error) = &self.generator_last_error {
+            col = col.child(
+                div().text_xs().text_color(danger).child(selectable_text(
+                    "task-edit-gen-refresh-error",
+                    error.clone(),
+                    window,
+                    cx,
+                )),
+            );
+        }
+
+        col
+    }
+
+    fn render_managed_detail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let border = theme.border;
+        let accent = theme.primary;
+        let background = theme.background;
+        let secondary = theme.secondary;
+        let muted = theme.muted_foreground;
+        let link = self.managed_link.clone();
+        let source_type = self.managed_source_type.clone();
+        let external_url = self.managed_external_url();
+
+        let mut body = v_flex().gap_3().p_3().w_full();
+        body = body.child(
+            div()
+                .text_lg()
+                .font_semibold()
+                .child(selectable_text(
+                    "task-edit-managed-title",
+                    self.loaded_title.clone(),
+                    window,
+                    cx,
+                )),
+        );
+        if !self.tags.is_empty() {
+            body = body.child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(self.tags.iter().map(|tag| {
+                        Tag::secondary().small().outline().child(tag.clone())
+                    })),
+            );
+        }
+        body = body.child(
+            v_flex().gap_1().child(Self::render_field_label("Origin", cx)).child(
+                selectable_text(
+                    "task-edit-managed-origin",
+                    match (&source_type, &link) {
+                        (Some(source_type), Some(link)) => {
+                            format!("{source_type} · {}", link.external_id)
+                        }
+                        (None, Some(link)) => link.external_id.clone(),
+                        _ => String::new(),
+                    },
+                    window,
+                    cx,
+                ),
+            ),
+        );
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Body", cx))
+                .child(selectable_markdown(
+                    "task-edit-managed-body",
+                    self.loaded_details.clone(),
+                    window,
+                    cx,
+                )),
+        );
+        if let Some(url) = external_url.clone() {
+            body = body.child(
+                Button::new("task-edit-managed-open-external")
+                    .label("Open in browser")
+                    .ghost()
+                    .compact()
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.open_url(&url);
+                    })),
+            );
+        }
+
+        v_flex()
+            .key_context(TASK_EDIT_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .h_full()
+            .bg(background)
+            .border_l_2()
+            .border_color(accent)
+            .on_action(cx.listener(Self::on_close))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary)
+                    .child(div().text_sm().font_semibold().child("Managed item (read-only)"))
+                    .child(div().flex_1())
+                    .child(chrome_control_with_shortcut(
+                        Button::new("task-edit-managed-close")
+                            .label("Close")
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close(cx);
+                            })),
+                        window,
+                        &TaskEditClose,
+                        TASK_EDIT_CONTEXT,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .id("task-edit-managed-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Read-only · sourced from an external data source"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_capability_section(
         &self,
         cap: Capability,
@@ -2115,15 +2436,9 @@ impl TaskEditView {
             Capability::Agent => self
                 .render_agent_section(cap_index, background, border, window, cx)
                 .into_any_element(),
-            Capability::Generator => {
-                // Generator configuration UI will be implemented in step e45d4026.
-                // For now, render a placeholder section.
-                div()
-                    .px_3()
-                    .py_2()
-                    .child("Generator configuration — coming soon")
-                    .into_any_element()
-            }
+            Capability::Generator => self
+                .render_generator_section(cap_index, background, border, muted, window, cx)
+                .into_any_element(),
         }
     }
 
@@ -2146,6 +2461,10 @@ impl Render for TaskEditView {
 
         if !self.is_open() {
             return div().size_full().into_any_element();
+        }
+
+        if self.is_managed() {
+            return self.render_managed_detail(window, cx);
         }
 
         self.sync_input_tab_stops(cx);

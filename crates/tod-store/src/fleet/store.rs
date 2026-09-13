@@ -28,7 +28,9 @@ use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
 use crate::outline::repos::plan_steps::PlanStepRepo;
-use crate::outline::repos::{GeneratorConfig, GeneratorRepo, ListRepo, OutlineRepo, tree::TreeLoader};
+use crate::outline::repos::{
+    GeneratorConfig, GeneratorRepo, ListRepo, ManagedNodeLink, OutlineRepo, tree::TreeLoader,
+};
 use crate::outline::PlanStep;
 use crate::outline::types::Capability;
 use crate::outline::types::{FlatNodeRow, OutlineList};
@@ -506,6 +508,14 @@ impl FleetStore {
         let guard = self.projection.lock().expect("fleet projection mutex");
         GeneratorRepo::new(&guard.connection())
             .get_config(node_id)
+            .map_err(Into::into)
+    }
+
+    /// Managed-node data-source link for a node, if it has one.
+    pub fn get_managed_link(&self, node_id: uuid::Uuid) -> Result<Option<ManagedNodeLink>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        GeneratorRepo::new(&guard.connection())
+            .get_link(node_id)
             .map_err(Into::into)
     }
 

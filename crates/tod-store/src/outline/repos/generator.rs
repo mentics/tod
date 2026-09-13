@@ -249,6 +249,38 @@ impl<'a> GeneratorRepo<'a> {
         Ok(())
     }
 
+    /// List links on copied-out (non-managed) nodes matching a generator and
+    /// external id — the set of copies a refresh should push field updates to.
+    pub fn copy_links_for(&self, generator_node_id: Uuid, external_id: &str) -> Result<Vec<ManagedNodeLink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.node_id, l.generator_node_id, l.external_id, l.source_type, l.user_modified_fields
+             FROM managed_node_links l
+             JOIN nodes n ON n.id = l.node_id
+             WHERE l.generator_node_id = ?1 AND l.external_id = ?2 AND n.managed = 0",
+        )?;
+        let links = stmt
+            .query_map(
+                params![uuid_to_blob(generator_node_id), external_id],
+                row_to_link,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(links)
+    }
+
+    /// Clear the data-source link on any copied-out node (not the managed node
+    /// itself, which reconciliation deletes separately) still referencing an
+    /// external item that a generator's refresh determined no longer exists.
+    /// The node keeps its title and content but stops receiving updates.
+    pub fn clear_stale_copy_links(&self, generator_node_id: Uuid, external_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM managed_node_links
+             WHERE generator_node_id = ?1 AND external_id = ?2
+               AND node_id IN (SELECT id FROM nodes WHERE managed = 0)",
+            params![uuid_to_blob(generator_node_id), external_id],
+        )?;
+        Ok(())
+    }
+
     /// List all links for managed nodes under a generator.
     pub fn links_for_generator(&self, generator_node_id: Uuid) -> Result<Vec<ManagedNodeLink>> {
         let mut stmt = self.conn.prepare(
@@ -345,6 +377,41 @@ impl<'a> GeneratorRepo<'a> {
             params![uuid_to_blob(node_id), json],
         )?;
         Ok(())
+    }
+
+    /// A managed node is greyed out when a copy of the same external item
+    /// exists outside any generator subtree (i.e. another link with the same
+    /// `external_id` points at a non-managed node). Computed live from the
+    /// links table, so it clears immediately when the last copy is deleted
+    /// and survives config-change rebuilds (which preserve node ids for
+    /// external ids that keep matching).
+    pub fn is_greyed_out(&self, node_id: Uuid) -> Result<bool> {
+        if !self.is_managed(node_id)? {
+            return Ok(false);
+        }
+        let Some(link) = self.get_link(node_id)? else {
+            return Ok(false);
+        };
+        for other in self.links_for_external_id(&link.external_id)? {
+            if other.node_id != node_id && !self.is_managed(other.node_id)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mark a single field as user-modified on a linked node, if it has a
+    /// data-source link. No-op if the node has no link (e.g. a plain node).
+    pub fn mark_field_modified(&self, node_id: Uuid, field: &str) -> Result<()> {
+        let Some(link) = self.get_link(node_id)? else {
+            return Ok(());
+        };
+        if link.user_modified_fields.iter().any(|f| f == field) {
+            return Ok(());
+        }
+        let mut fields = link.user_modified_fields;
+        fields.push(field.to_string());
+        self.update_user_modified_fields(node_id, &fields)
     }
 }
 

@@ -155,6 +155,8 @@ pub struct FlatNodeRow {
     pub managed: bool,
     /// The data-source external id, for managed nodes.
     pub external_id: Option<String>,
+    /// The data-source type (e.g. "linear"), for managed nodes.
+    pub source_type: Option<String>,
     /// Direct managed child count, for nodes with the Generator capability.
     pub managed_count: Option<usize>,
     /// `last_refresh_status` ("in_progress" | "success" | "error"), for generator nodes.

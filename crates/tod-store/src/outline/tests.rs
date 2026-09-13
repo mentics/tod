@@ -1288,3 +1288,516 @@ fn re_enabling_generator_after_disable_starts_with_no_config() {
     drop(store);
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn flatten_visible_reports_managed_and_generator_status() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let managed_id =
+        create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Item");
+    store
+        .enqueue_outline(OutlineMutation::SetRefreshStatus {
+            node_id: generator_id,
+            status: "error".into(),
+            error: Some("boom".into()),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let rows = store.flatten_outline(list_id).unwrap();
+    let generator_row = rows.iter().find(|r| r.node.id == generator_id).unwrap();
+    assert!(!generator_row.managed);
+    assert_eq!(generator_row.managed_count, Some(1));
+    assert_eq!(generator_row.generator_status.as_deref(), Some("error"));
+    assert_eq!(generator_row.generator_error.as_deref(), Some("boom"));
+
+    let managed_row = rows.iter().find(|r| r.node.id == managed_id).unwrap();
+    assert!(managed_row.managed);
+    assert_eq!(managed_row.external_id.as_deref(), Some("EXT-1"));
+    assert_eq!(managed_row.managed_count, None);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn editing_title_on_linked_node_marks_it_dirty() {
+    let (store, root, list_id) = setup_store_with_list();
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+    let node_id = create_node_in(&store, list_id, Some(outside_parent), "Original title");
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::SetManagedNodeLink {
+            node_id,
+            generator_node_id: generator_id,
+            external_id: "EXT-9".into(),
+            source_type: "mock".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            node_id,
+            title: "Edited title".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let link = crate::outline::repos::GeneratorRepo::new(conn)
+                .get_link(node_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(link.user_modified_fields, vec!["title".to_string()]);
+            Ok(())
+        })
+        .unwrap();
+
+    // Editing again does not duplicate the entry.
+    store
+        .enqueue_outline(OutlineMutation::UpdateNodeTitle {
+            node_id,
+            title: "Edited again".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            let link = crate::outline::repos::GeneratorRepo::new(conn)
+                .get_link(node_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(link.user_modified_fields, vec!["title".to_string()]);
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn editing_body_on_linked_node_marks_it_dirty_independently_of_title() {
+    let (store, root, list_id) = setup_store_with_list();
+    let node_id = create_node_in(&store, list_id, None, "Node");
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::SetManagedNodeLink {
+            node_id,
+            generator_node_id: generator_id,
+            external_id: "EXT-10".into(),
+            source_type: "mock".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::SetExtraContent {
+            node_id,
+            content_type: crate::outline::types::EXTRA_CONTENT_DETAILS.into(),
+            body: "user-written body".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let link = crate::outline::repos::GeneratorRepo::new(conn)
+                .get_link(node_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(link.user_modified_fields, vec!["body".to_string()]);
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (_generator_id, managed_id, _child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(!gen_repo.is_greyed_out(managed_id).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: managed_id,
+            list_id,
+            parent_id: Some(outside_parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let copy_id = store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(gen_repo.is_greyed_out(managed_id).unwrap(), "original should grey out once a copy exists");
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+            let copy_id = outline
+                .list_for_list(list_id)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.parent_id == Some(outside_parent))
+                .unwrap()
+                .node_id;
+            Ok(copy_id)
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::DeleteNode { node_id: copy_id })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(
+                !gen_repo.is_greyed_out(managed_id).unwrap(),
+                "greyed-out state should clear immediately once the last copy is deleted"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
+    let (store, root, list_id) = setup_store_with_list();
+    let gen_a = create_node_in(&store, list_id, None, "Generator A");
+    let gen_b = create_node_in(&store, list_id, None, "Generator B");
+    let managed_a = create_managed_node_for_test(&store, list_id, gen_a, gen_a, "SHARED-1", "Item A");
+    let managed_b = create_managed_node_for_test(&store, list_id, gen_b, gen_b, "SHARED-1", "Item B");
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: managed_a,
+            list_id,
+            parent_id: Some(outside_parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let copy_id = store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(gen_repo.is_greyed_out(managed_a).unwrap());
+            assert!(gen_repo.is_greyed_out(managed_b).unwrap(), "sibling generator sharing the external id also greys out");
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+            let copy_id = outline
+                .list_for_list(list_id)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.parent_id == Some(outside_parent))
+                .unwrap()
+                .node_id;
+            Ok(copy_id)
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::DeleteNode { node_id: copy_id })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(!gen_repo.is_greyed_out(managed_a).unwrap());
+            assert!(!gen_repo.is_greyed_out(managed_b).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, managed_id, _child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: managed_id,
+            list_id,
+            parent_id: Some(outside_parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let copy_id = store
+        .read(|conn| {
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+            Ok(outline
+                .list_for_list(list_id)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.parent_id == Some(outside_parent))
+                .unwrap()
+                .node_id)
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::DeleteNode { node_id: generator_id })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+            assert!(gen_repo.get_link(copy_id).unwrap().is_none(), "copy must lose its data-source link");
+            let copy_node = node_repo.get(copy_id).unwrap().unwrap();
+            assert_eq!(copy_node.title, "EXT-1: Fix the bug", "copy retains its title");
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn generator_state_survives_store_restart() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, managed_id, child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: managed_id,
+            list_id,
+            parent_id: Some(outside_parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let copy_id = store
+        .read(|conn| {
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+            Ok(outline
+                .list_for_list(list_id)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.parent_id == Some(outside_parent))
+                .unwrap()
+                .node_id)
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetRefreshStatus {
+            node_id: generator_id,
+            status: "error".into(),
+            error: Some("network unreachable".into()),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    // Simulate an app restart: drop the store and reopen against the same data root.
+    drop(store);
+    let store = FleetStore::open(&root).unwrap();
+
+    store
+        .read(|conn| {
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+
+            let config = gen_repo.get_config(generator_id).unwrap().unwrap();
+            assert_eq!(config.data_source_type, "mock");
+            assert_eq!(config.last_refresh_status.as_deref(), Some("error"));
+            assert_eq!(config.last_refresh_error.as_deref(), Some("network unreachable"));
+
+            assert!(gen_repo.is_managed(managed_id).unwrap(), "managed node persists across restart");
+            assert!(gen_repo.is_managed(child_id).unwrap());
+            assert!(node_repo.get(managed_id).unwrap().is_some());
+
+            let copy_link = gen_repo.get_link(copy_id).unwrap().unwrap();
+            assert_eq!(copy_link.external_id, "EXT-1", "copied-out node's data-source link persists");
+            assert!(!gen_repo.is_managed(copy_id).unwrap());
+
+            assert!(
+                gen_repo.is_greyed_out(managed_id).unwrap(),
+                "greyed-out state must be recomputed correctly on startup from persisted links"
+            );
+
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+fn setup_generator_with_managed_tree(store: &FleetStore, list_id: Uuid) -> (Uuid, Uuid, Uuid) {
+    let generator_id = create_node_in(store, list_id, None, "Generator");
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: generator_id,
+            capabilities: vec![Capability::Generator],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorConfig {
+            node_id: generator_id,
+            data_source_type: "mock".into(),
+            config_json: "{}".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let parent_id = create_managed_node_for_test(
+        store, list_id, generator_id, generator_id, "EXT-1", "Fix the bug",
+    );
+    let child_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::CreateManagedNode {
+            node_id: Some(child_id),
+            list_id,
+            parent_id,
+            title: "Sub item".into(),
+            external_id: "EXT-2".into(),
+            source_type: "mock".into(),
+            generator_node_id: generator_id,
+            tags: vec!["urgent".into()],
+            body: "child body".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    (generator_id, parent_id, child_id)
+}
+
+#[test]
+fn paste_managed_node_copy_deep_copies_and_converts_to_normal() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, managed_id, managed_child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    let outside_parent = create_node_in(&store, list_id, None, "Outside");
+
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: managed_id,
+            list_id,
+            parent_id: Some(outside_parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+
+            let all_entries = outline.list_for_list(list_id).unwrap();
+            let entries: Vec<_> = all_entries
+                .iter()
+                .filter(|e| e.parent_id == Some(outside_parent))
+                .collect();
+            assert_eq!(entries.len(), 1, "copy should be placed under the target parent");
+            let copy_id = entries[0].node_id;
+            assert_ne!(copy_id, managed_id, "copy must be a new node, not the original");
+
+            let copy_node = node_repo.get(copy_id).unwrap().unwrap();
+            assert_eq!(copy_node.title, "EXT-1: Fix the bug");
+            assert!(!gen_repo.is_managed(copy_id).unwrap(), "copy must be a normal editable node");
+            let link = gen_repo.get_link(copy_id).unwrap().unwrap();
+            assert_eq!(link.external_id, "EXT-1");
+            assert_eq!(link.generator_node_id, generator_id);
+            assert!(link.user_modified_fields.is_empty());
+
+            let original = node_repo.get(managed_id).unwrap().unwrap();
+            assert!(gen_repo.is_managed(managed_id).unwrap(), "original stays managed");
+            let _ = original;
+
+            let copy_children: Vec<_> = all_entries
+                .iter()
+                .filter(|e| e.parent_id == Some(copy_id))
+                .collect();
+            assert_eq!(copy_children.len(), 1, "managed descendants must be deep-copied");
+            let copy_child_id = copy_children[0].node_id;
+            assert_ne!(copy_child_id, managed_child_id);
+            assert!(!gen_repo.is_managed(copy_child_id).unwrap());
+            let child_copy = node_repo.get(copy_child_id).unwrap().unwrap();
+            assert_eq!(child_copy.title, "EXT-2: Sub item");
+            assert_eq!(node_repo.get_tags(copy_child_id).unwrap(), vec!["urgent".to_string()]);
+            assert_eq!(
+                node_repo
+                    .get_extra_content(copy_child_id, crate::outline::types::EXTRA_CONTENT_DETAILS)
+                    .unwrap()
+                    .as_deref(),
+                Some("child body")
+            );
+
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn paste_managed_node_copy_blocked_inside_generator_subtree() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (_generator_id, managed_id, _managed_child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+
+    let result = store.enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+        source_node_id: managed_id,
+        list_id,
+        parent_id: Some(managed_id),
+        ordinal: 0,
+    });
+    if result.is_ok() {
+        assert!(
+            store.writer().flush().is_err(),
+            "paste inside a generator subtree must be rejected"
+        );
+    }
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}

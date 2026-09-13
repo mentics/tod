@@ -424,6 +424,9 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::DeleteManagedNode { .. }
         | OutlineMutation::SetManagedNodeLink { .. }
         | OutlineMutation::ClearManagedNodeLinks { .. }
+        | OutlineMutation::ClearStaleCopyLinks { .. }
+        | OutlineMutation::RefreshLinkedCopy { .. }
+        | OutlineMutation::PasteManagedNodeCopy { .. }
         | OutlineMutation::SetRefreshStatus { .. } => Ok(None),
     }
 }

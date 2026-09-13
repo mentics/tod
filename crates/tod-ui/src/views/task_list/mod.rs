@@ -90,6 +90,10 @@ actions!(
         TaskListEditNavUp,
         TaskListEditNavDown,
         TaskListDelete,
+        TaskListRefreshGenerator,
+        TaskListOpenExternal,
+        TaskListCopy,
+        TaskListPaste,
     ]
 );
 
@@ -114,6 +118,8 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("t", TaskListRowShells, context),
         KeyBinding::new("c", TaskListOpenCode, context),
         KeyBinding::new("f", TaskListActionConfigs, context),
+        KeyBinding::new("r", TaskListRefreshGenerator, context),
+        KeyBinding::new("x", TaskListOpenExternal, context),
         KeyBinding::new("o", TaskListOpenObligations, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
@@ -157,6 +163,8 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("secondary-down", TaskListMoveDown, context),
         KeyBinding::new("delete", TaskListDelete, context),
         KeyBinding::new("backspace", TaskListDelete, context),
+        KeyBinding::new("ctrl-c", TaskListCopy, context),
+        KeyBinding::new("ctrl-v", TaskListPaste, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
             "up",
@@ -294,6 +302,15 @@ pub struct TaskListView {
     active_list_id: Option<uuid::Uuid>,
     outline_lists: Vec<tod_store::outline::types::OutlineList>,
     app_nav: AppNavMenu,
+    /// Generator node id whose sort/filter popover is open, if any.
+    generator_filter_open: Option<String>,
+    generator_filter_input: Entity<InputState>,
+    /// Managed node id copied via Ctrl+C, pending a Ctrl+V paste-out.
+    copied_managed_node_id: Option<uuid::Uuid>,
+    /// Copied-out (linked) node ids that received a field update from the
+    /// most recent refresh — session-only, cleared on restart or once the
+    /// node is selected.
+    recently_updated_copy_ids: std::collections::HashSet<String>,
     _list_subscription: Subscription,
     _compose_subscription: Subscription,
     _credential_subscription: Subscription,
@@ -345,6 +362,9 @@ impl TaskListView {
                 cx.notify();
             }
         });
+
+        let generator_filter_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter title or tags…"));
 
         let action_sink = Rc::new(RefCell::new(Vec::new()));
         let visible = Self::visible_tasks(&all_tasks, "", &working_set);
@@ -438,6 +458,10 @@ impl TaskListView {
             active_list_id,
             outline_lists,
             app_nav: AppNavMenu::default(),
+            generator_filter_open: None,
+            generator_filter_input,
+            copied_managed_node_id: None,
+            recently_updated_copy_ids: std::collections::HashSet::new(),
             _list_subscription,
             _compose_subscription,
             _credential_subscription,
@@ -537,6 +561,9 @@ impl TaskListView {
             state
                 .delegate_mut()
                 .set_row_menu(self.open_row_menu.clone(), self.row_menu.clone());
+            state
+                .delegate_mut()
+                .set_recently_updated(self.recently_updated_copy_ids.clone());
             state.set_selected_index(selected_ix, window, cx);
             if selected_ix.is_some() {
                 state.scroll_to_selected_item(window, cx);
@@ -570,6 +597,7 @@ impl TaskListView {
                 task_id: new_id.clone(),
             });
         }
+        self.recently_updated_copy_ids.remove(&new_id);
         self.working_set.selected_id = Some(new_id);
         self.persist_working_set();
         cx.notify();
@@ -648,7 +676,131 @@ impl TaskListView {
                 let _ = self.fleet.writer().flush();
                 self.live_refresh(window, cx);
             }
+            RowAction::RefreshGenerator { task_id } => {
+                self.refresh_generator_for(&task_id, window, cx);
+            }
+            RowAction::OpenExternal { task_id } => {
+                self.open_external_for(&task_id, cx);
+            }
+            RowAction::CycleGeneratorSort { task_id } => {
+                self.cycle_generator_sort(&task_id, window, cx);
+            }
+            RowAction::ToggleGeneratorFilter { task_id } => {
+                self.toggle_generator_filter(&task_id, window, cx);
+            }
         }
+    }
+
+    fn cycle_generator_sort(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(generator_id) = self.generator_ancestor_id(task_id) else {
+            return;
+        };
+        let entry = self.working_set.generator_sorts.entry(generator_id).or_default();
+        if entry.sort_key == tod_core::task::model::SortKey::TicketId {
+            entry.sort_key = tod_core::task::model::SortKey::TreeOrder;
+            entry.sort_direction = WorkingSet::initial_direction_for_key(entry.sort_key);
+        } else {
+            let next = entry.sort_key.cycle();
+            entry.sort_key = next;
+            entry.sort_direction = WorkingSet::initial_direction_for_key(next);
+        }
+        self.persist_working_set();
+        self.rebuild_visible_list(window, cx);
+    }
+
+    fn toggle_generator_filter(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(generator_id) = self.generator_ancestor_id(task_id) else {
+            return;
+        };
+        if self.generator_filter_open.as_deref() == Some(generator_id.as_str()) {
+            self.generator_filter_open = None;
+        } else {
+            let current = self
+                .working_set
+                .generator_sorts
+                .get(&generator_id)
+                .map(|g| g.filter_query.clone())
+                .unwrap_or_default();
+            self.generator_filter_input.update(cx, |input, cx| {
+                input.set_value(current, window, cx);
+                input.focus(window, cx);
+            });
+            self.generator_filter_open = Some(generator_id);
+        }
+        cx.notify();
+    }
+
+    fn sync_generator_filter_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(generator_id) = self.generator_filter_open.clone() else {
+            return;
+        };
+        let query = self.generator_filter_input.read(cx).text().to_string();
+        let changed = self
+            .working_set
+            .generator_sorts
+            .get(&generator_id)
+            .map(|g| g.filter_query != query)
+            .unwrap_or(!query.is_empty());
+        if changed {
+            self.working_set
+                .generator_sorts
+                .entry(generator_id)
+                .or_default()
+                .filter_query = query;
+            self.persist_working_set();
+            cx.defer_in(window, |this, window, cx| {
+                this.rebuild_visible_list(window, cx);
+            });
+        }
+    }
+
+    fn open_external_for(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return;
+        };
+        if task.source_type.as_deref() != Some("linear") {
+            return;
+        }
+        let Some(external_id) = &task.external_id else {
+            return;
+        };
+        cx.open_url(&format!("https://linear.app/issue/{external_id}"));
+    }
+
+    /// Walk up from `task_id` to the nearest ancestor (or itself) that owns
+    /// the Generator capability, so the refresh shortcut/chip works from
+    /// anywhere in a generator's managed subtree.
+    fn generator_ancestor_id(&self, task_id: &str) -> Option<String> {
+        let mut current = self.all_tasks.iter().find(|t| t.id == task_id)?;
+        loop {
+            if current.managed_count.is_some() {
+                return Some(current.id.clone());
+            }
+            let parent_id = current.parent_id.as_deref()?;
+            current = self.all_tasks.iter().find(|t| t.id == parent_id)?;
+        }
+    }
+
+    fn refresh_generator_for(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(generator_id) = self.generator_ancestor_id(task_id) else {
+            return;
+        };
+        let Ok(node_id) = uuid::Uuid::parse_str(&generator_id) else {
+            return;
+        };
+        match tod_core::generator::refresh_generator(&self.fleet, node_id) {
+            Ok(updated_ids) => {
+                self.recently_updated_copy_ids
+                    .extend(updated_ids.into_iter().map(|id| id.to_string()));
+            }
+            Err(err) => self.show_error(format!("Refresh failed: {err}"), window, cx),
+        }
+        self.live_refresh(window, cx);
     }
 
     fn set_collapsed(
@@ -1202,6 +1354,7 @@ impl TaskListView {
         if let Some(row) = visible.iter().position(|t| t.id == task_id) {
             let ix = IndexPath::new(row);
             self.last_selected = Some(ix);
+            self.recently_updated_copy_ids.remove(task_id);
             self.working_set.selected_id = Some(task_id.to_string());
             self.list_state.update(cx, |state, cx| {
                 state.set_selected_index(Some(ix), window, cx);
@@ -1797,6 +1950,97 @@ impl TaskListView {
         );
     }
 
+    fn on_refresh_generator(
+        &mut self,
+        _: &TaskListRefreshGenerator,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.refresh_generator_for(&task_id, window, cx);
+    }
+
+    fn on_open_external(
+        &mut self,
+        _: &TaskListOpenExternal,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.open_external_for(&task_id, cx);
+    }
+
+    fn on_copy(&mut self, _: &TaskListCopy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            return;
+        }
+        let Some(task) = self.selected_task(cx) else {
+            return;
+        };
+        if !task.managed {
+            return;
+        }
+        let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
+            return;
+        };
+        self.copied_managed_node_id = Some(node_id);
+        self.set_status_line(format!("Copied {}", task.title), cx);
+        let _ = window;
+    }
+
+    fn on_paste(&mut self, _: &TaskListPaste, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_editing() {
+            return;
+        }
+        let Some(source_node_id) = self.copied_managed_node_id else {
+            return;
+        };
+        let Some(task) = self.selected_task(cx) else {
+            crate::ui::toast::error_toast(window, cx, "Select a location to paste");
+            return;
+        };
+        let Some(list_id) = self.active_list_id else {
+            return;
+        };
+        if self.generator_ancestor_id(&task.id).is_some() {
+            self.show_error(
+                "Cannot paste inside a generator subtree",
+                window,
+                cx,
+            );
+            return;
+        }
+        let parent_id = uuid::Uuid::parse_str(&task.id).ok();
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id,
+            list_id,
+            parent_id,
+            ordinal: 0,
+        }) {
+            self.show_error(format!("Paste failed: {err}"), window, cx);
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.show_error(format!("Paste failed: {err}"), window, cx);
+            return;
+        }
+        self.live_refresh(window, cx);
+    }
+
     fn on_tag_digit(&mut self, digit: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = self.selected_task(cx) else {
             return;
@@ -2043,6 +2287,14 @@ impl TaskListView {
             crate::ui::toast::error_toast(window, cx, "Select a task to delete");
             return;
         };
+        if task.managed {
+            self.show_error(
+                "Cannot delete a managed node — it is owned by its generator",
+                window,
+                cx,
+            );
+            return;
+        }
         self.remove_outline_node(&task.id, window, cx);
     }
 
@@ -2335,6 +2587,54 @@ impl TaskListView {
         )
     }
 
+    fn render_generator_filter_overlay(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<impl gpui::IntoElement> {
+        let generator_id = self.generator_filter_open.clone()?;
+        let theme = cx.theme();
+        Some(
+            div()
+                .absolute()
+                .top_10()
+                .right_3()
+                .min_w_48()
+                .p_2()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .shadow_lg()
+                .rounded_md()
+                .v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Filter this generator's items"),
+                )
+                .child(Input::new(&self.generator_filter_input))
+                .child(
+                    Button::new("generator-filter-clear")
+                        .label("Clear")
+                        .ghost()
+                        .w_full()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.generator_filter_input.update(cx, |input, cx| {
+                                input.set_value("", window, cx);
+                            });
+                            this.working_set
+                                .generator_sorts
+                                .entry(generator_id.clone())
+                                .or_default()
+                                .filter_query = String::new();
+                            this.persist_working_set();
+                            this.rebuild_visible_list(window, cx);
+                        })),
+                ),
+        )
+    }
+
     fn body_state(&self, cx: &Context<Self>) -> BodyState {
         let total = self.all_tasks.len();
         let visible_count = self.list_state.read(cx).delegate().items_count();
@@ -2379,6 +2679,7 @@ impl gpui::EventEmitter<TaskListEvent> for TaskListView {}
 impl Render for TaskListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         self.sync_search_from_input(window, cx);
+        self.sync_generator_filter_from_input(window, cx);
         if self.pending_live_refresh {
             self.pending_live_refresh = false;
             self.live_refresh(window, cx);
@@ -2485,6 +2786,8 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_open_code))
             .on_action(cx.listener(Self::on_action_configs))
             .on_action(cx.listener(Self::on_row_lifecycle))
+            .on_action(cx.listener(Self::on_refresh_generator))
+            .on_action(cx.listener(Self::on_open_external))
             .on_action(cx.listener(Self::on_row_edit))
             .on_action(cx.listener(Self::on_open_edit_panel))
             .on_action(cx.listener(Self::on_open_obligations))
@@ -2514,10 +2817,15 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_create_child))
             .on_action(cx.listener(Self::on_create_above))
             .on_action(cx.listener(Self::on_delete))
+            .on_action(cx.listener(Self::on_copy))
+            .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
+            .when_some(self.render_generator_filter_overlay(cx), |el, menu| {
+                el.child(menu)
+            })
             .when(self.credential_prompt_open, |el| {
                 el.child(self.render_credential_prompt_overlay(cx))
             });

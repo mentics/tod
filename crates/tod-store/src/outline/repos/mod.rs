@@ -12,7 +12,7 @@ pub mod plan_steps;
 pub mod tree;
 
 pub use gate::GateRepo;
-pub use generator::{GeneratorConfig, GeneratorRepo};
+pub use generator::{GeneratorConfig, GeneratorRepo, ManagedNodeLink};
 pub use list::ListRepo;
 pub use node::NodeRepo;
 pub use obligations::ObligationRepo;

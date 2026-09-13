@@ -60,11 +60,13 @@ impl<'a> TreeLoader<'a> {
                 .map(|c| !c.is_empty())
                 .unwrap_or(false);
             let managed = gen_repo.is_managed(entry.node_id)?;
-            let external_id = if managed {
-                gen_repo.get_link(entry.node_id)?.map(|l| l.external_id)
+            let link = if managed {
+                gen_repo.get_link(entry.node_id)?
             } else {
                 None
             };
+            let external_id = link.as_ref().map(|l| l.external_id.clone());
+            let source_type = link.map(|l| l.source_type);
             let (managed_count, generator_status, generator_error) =
                 if capabilities.contains(&Capability::Generator) {
                     let count = gen_repo.links_for_generator(entry.node_id)?.len();
@@ -90,6 +92,7 @@ impl<'a> TreeLoader<'a> {
                 has_children,
                 managed,
                 external_id,
+                source_type,
                 managed_count,
                 generator_status,
                 generator_error,

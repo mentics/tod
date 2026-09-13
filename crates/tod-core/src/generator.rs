@@ -142,7 +142,7 @@ pub fn missing_credentials(
 /// for it (reusing the same credential-prompt entry point the Linear ticket
 /// import flow already uses, see `tod-ui`'s `views::task_list::from_ticket`)
 /// and retry once it's supplied.
-pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<(), String> {
+pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>, String> {
     let config = {
         let node_id = node_id;
         fleet
@@ -189,7 +189,7 @@ pub fn refresh_generator_with(
     node_id: Uuid,
     data_source: &dyn DataSource,
     credentials: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Vec<Uuid>, String> {
     let loaded = fleet
         .read(move |conn| {
             let gen_repo = GeneratorRepo::new(conn);
@@ -206,6 +206,12 @@ pub fn refresh_generator_with(
             let links = gen_repo.links_for_generator(node_id)?;
             let mut existing = HashMap::new();
             for link in links {
+                if !gen_repo.is_managed(link.node_id)? {
+                    // Copied-out nodes share the generator_node_id/external_id of
+                    // their source but are no longer part of the managed tree —
+                    // reconciliation must not treat them as managed items.
+                    continue;
+                }
                 let Some(node) = node_repo.get(link.node_id)? else {
                     continue;
                 };
@@ -231,7 +237,7 @@ pub fn refresh_generator_with(
     let Some((config, list_id, existing)) = loaded else {
         // No config, no outline entry, or a refresh is already in progress —
         // nothing to do.
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     fleet
@@ -278,8 +284,17 @@ pub fn refresh_generator_with(
             mutations.push(OutlineMutation::DeleteManagedNode {
                 node_id: existing_item.node_id,
             });
+            // The external item is gone from the source — any copies of it
+            // living outside the generator subtree become stale; they keep
+            // their title/content but stop receiving refresh updates.
+            mutations.push(OutlineMutation::ClearStaleCopyLinks {
+                generator_node_id: node_id,
+                external_id: external_id.clone(),
+            });
         }
     }
+    let updated_copy_ids = collect_linked_copy_updates(fleet, node_id, &items, &mut mutations)?;
+
     mutations.push(OutlineMutation::SetRefreshStatus {
         node_id,
         status: REFRESH_SUCCESS.into(),
@@ -290,7 +305,48 @@ pub fn refresh_generator_with(
         fleet.enqueue_outline(mutation).map_err(|err| err.to_string())?;
     }
     fleet.writer().flush().map_err(|err| err.to_string())?;
-    Ok(())
+    Ok(updated_copy_ids)
+}
+
+/// Push field updates for every already-copied-out (non-managed, linked) node
+/// whose external item is still present in this refresh's results. Each
+/// copy's individual `user_modified_fields` are respected — locally edited
+/// fields are left untouched, descendant linked nodes are updated
+/// independently of their ancestor.
+fn collect_linked_copy_updates(
+    fleet: &FleetStore,
+    generator_node_id: Uuid,
+    items: &[DataSourceItem],
+    mutations: &mut Vec<OutlineMutation>,
+) -> Result<Vec<Uuid>, String> {
+    let mut updated = Vec::new();
+    for item in items {
+        let links = fleet
+            .read(|conn| GeneratorRepo::new(conn).copy_links_for(generator_node_id, &item.external_id))
+            .map_err(|err| err.to_string())?;
+        for link in links {
+            let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
+            let title = (!dirty("title")).then(|| format!("{}: {}", link.external_id, item.title));
+            let tags = (!dirty("tags")).then(|| item.tags.clone());
+            let body = (!dirty("body")).then(|| item.body.clone());
+            if title.is_some() || tags.is_some() || body.is_some() {
+                mutations.push(OutlineMutation::RefreshLinkedCopy {
+                    node_id: link.node_id,
+                    title,
+                    tags,
+                    body,
+                });
+                updated.push(link.node_id);
+            }
+        }
+        updated.extend(collect_linked_copy_updates(
+            fleet,
+            generator_node_id,
+            &item.children,
+            mutations,
+        )?);
+    }
+    Ok(updated)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -621,6 +677,366 @@ mod tests {
 
         let children = managed_children(&fleet, list_id, node_id);
         assert_eq!(children[0].1, "Original", "user-edited title must survive refresh");
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn greyed_out_state_survives_a_config_change_refresh() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+
+        let outside_parent = tod_store::outline::OutlineMutation::CreateNode {
+            node_id: None,
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Below,
+            title: "Outside".into(),
+        };
+        fleet.enqueue_outline(outside_parent).unwrap();
+        fleet.writer().flush().unwrap();
+        let outside_id = fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id.is_none() && e.node_id != node_id)
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap();
+
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::PasteManagedNodeCopy {
+                source_node_id: managed_id,
+                list_id,
+                parent_id: Some(outside_id),
+                ordinal: 0,
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        fleet
+            .read(|conn| {
+                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
+                assert!(gen_repo.is_greyed_out(managed_id).unwrap());
+                Ok(())
+            })
+            .unwrap();
+
+        // Config change / rebuild: same external_id still returned, same node id reused.
+        ds.set_items(vec![item("EXT-1", "Updated from source", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        fleet
+            .read(|conn| {
+                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
+                assert!(
+                    gen_repo.is_greyed_out(managed_id).unwrap(),
+                    "greyed-out state must survive a config-change rebuild that still returns the same external id"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_clears_link_on_copy_when_external_item_is_removed_from_source() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "Outside".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        let outside_id = fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id.is_none() && e.node_id != node_id)
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap();
+
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::PasteManagedNodeCopy {
+                source_node_id: managed_id,
+                list_id,
+                parent_id: Some(outside_id),
+                ordinal: 0,
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        let copy_id = fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id == Some(outside_id))
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap();
+
+        fleet
+            .read(|conn| {
+                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
+                assert!(gen_repo.get_link(copy_id).unwrap().is_some());
+                Ok(())
+            })
+            .unwrap();
+
+        ds.set_items(vec![]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        fleet
+            .read(|conn| {
+                let gen_repo = tod_store::outline::repos::GeneratorRepo::new(conn);
+                let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
+                assert!(
+                    gen_repo.get_link(copy_id).unwrap().is_none(),
+                    "copy should lose its link once the external item is gone from the source"
+                );
+                assert!(
+                    node_repo.get(copy_id).unwrap().is_some(),
+                    "copy remains as a plain normal node"
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn make_copy(fleet: &FleetStore, list_id: Uuid, source_node_id: Uuid, target_parent_id: Uuid) -> Uuid {
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::PasteManagedNodeCopy {
+                source_node_id,
+                list_id,
+                parent_id: Some(target_parent_id),
+                ordinal: 0,
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id == Some(target_parent_id))
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap()
+    }
+
+    fn make_outside_parent(fleet: &FleetStore, list_id: Uuid, exclude: &[Uuid]) -> Uuid {
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::CreateNode {
+                node_id: None,
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "Outside".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+        fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id.is_none() && !exclude.contains(&e.node_id))
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn refresh_returns_ids_of_updated_copies_for_session_badge() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        let ids = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert!(ids.is_empty(), "no copies yet, nothing to badge");
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+
+        let outside_id = make_outside_parent(&fleet, list_id, &[node_id]);
+        let copy_id = make_copy(&fleet, list_id, managed_id, outside_id);
+
+        ds.set_items(vec![item("EXT-1", "Updated", vec![])]);
+        let ids = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert_eq!(ids, vec![copy_id]);
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_updates_unmodified_fields_on_copied_out_node() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+
+        let outside_id = make_outside_parent(&fleet, list_id, &[node_id]);
+        let copy_id = make_copy(&fleet, list_id, managed_id, outside_id);
+
+        ds.set_items(vec![item("EXT-1", "Updated from source", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        fleet
+            .read(|conn| {
+                let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
+                let copy = node_repo.get(copy_id).unwrap().unwrap();
+                assert_eq!(copy.title, "EXT-1: Updated from source");
+                Ok(())
+            })
+            .unwrap();
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_preserves_dirty_field_on_copied_out_node_but_updates_others() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Original", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+
+        let outside_id = make_outside_parent(&fleet, list_id, &[node_id]);
+        let copy_id = make_copy(&fleet, list_id, managed_id, outside_id);
+
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::UpdateNodeTitle {
+                node_id: copy_id,
+                title: "User-edited title".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        ds.set_items(vec![item("EXT-1", "Updated from source", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        fleet
+            .read(|conn| {
+                let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
+                let copy = node_repo.get(copy_id).unwrap().unwrap();
+                assert_eq!(copy.title, "User-edited title", "dirty title must not be overwritten");
+                Ok(())
+            })
+            .unwrap();
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refresh_updates_descendant_linked_copies_independently() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new()
+            .with_items(vec![item("EXT-1", "Parent", vec![item("EXT-2", "Child", vec![])])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        let parent_managed_id = managed_children(&fleet, list_id, node_id)[0].0;
+        let child_managed_id = managed_children(&fleet, list_id, parent_managed_id)[0].0;
+
+        let outside_id = make_outside_parent(&fleet, list_id, &[node_id]);
+        let parent_copy_id = make_copy(&fleet, list_id, parent_managed_id, outside_id);
+        let child_copy_id = fleet
+            .read(|conn| {
+                let outline = tod_store::outline::repos::OutlineRepo::new(conn);
+                Ok(outline
+                    .list_for_list(list_id)
+                    .unwrap()
+                    .into_iter()
+                    .find(|e| e.parent_id == Some(parent_copy_id))
+                    .unwrap()
+                    .node_id)
+            })
+            .unwrap();
+        let _ = child_managed_id;
+
+        fleet
+            .enqueue_outline(tod_store::outline::OutlineMutation::UpdateNodeTitle {
+                node_id: parent_copy_id,
+                title: "User-edited parent".into(),
+            })
+            .unwrap();
+        fleet.writer().flush().unwrap();
+
+        ds.set_items(vec![item(
+            "EXT-1",
+            "Updated parent",
+            vec![item("EXT-2", "Updated child", vec![])],
+        )]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        fleet
+            .read(|conn| {
+                let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
+                let parent_copy = node_repo.get(parent_copy_id).unwrap().unwrap();
+                let child_copy = node_repo.get(child_copy_id).unwrap().unwrap();
+                assert_eq!(parent_copy.title, "User-edited parent", "parent's dirty title stays put");
+                assert_eq!(child_copy.title, "EXT-2: Updated child", "child updates independently of its dirty parent");
+                Ok(())
+            })
+            .unwrap();
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);

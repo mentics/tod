@@ -54,6 +54,8 @@ pub struct TaskItem {
     pub managed: bool,
     /// The data-source external id, for managed nodes.
     pub external_id: Option<String>,
+    /// The data-source type (e.g. "linear"), for managed nodes.
+    pub source_type: Option<String>,
     /// Direct/nested managed node count, for nodes with the Generator capability.
     pub managed_count: Option<usize>,
     /// `last_refresh_status` ("in_progress" | "success" | "error"), for generator nodes.
@@ -142,6 +144,25 @@ impl Default for SortDirection {
     }
 }
 
+/// Independent sort/filter state for a single generator node's managed subtree.
+/// Operates only on already-fetched managed nodes — never touches the data-source query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratorSubtreeSort {
+    pub sort_key: SortKey,
+    pub sort_direction: SortDirection,
+    pub filter_query: String,
+}
+
+impl Default for GeneratorSubtreeSort {
+    fn default() -> Self {
+        Self {
+            sort_key: SortKey::TreeOrder,
+            sort_direction: SortDirection::Asc,
+            filter_query: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListWorkingSet {
     pub sort_key: SortKey,
@@ -149,6 +170,8 @@ pub struct ListWorkingSet {
     pub tag_filter: Option<String>,
     pub selected_id: Option<String>,
     pub active_list_id: Option<String>,
+    /// Per-generator-node sort/filter overrides, keyed by the generator node's id.
+    pub generator_sorts: HashMap<String, GeneratorSubtreeSort>,
 }
 
 impl ListWorkingSet {
@@ -159,6 +182,7 @@ impl ListWorkingSet {
             tag_filter: None,
             selected_id: None,
             active_list_id: None,
+            generator_sorts: HashMap::new(),
         }
     }
 
@@ -349,13 +373,60 @@ fn build_children_map(
     children
 }
 
+/// Walks up from `start_id` (inclusive) to find the nearest node with the Generator
+/// capability, returning its id. `start_id` itself counts if it is a generator.
+fn owning_generator_id(by_id: &HashMap<&str, &TaskItem>, start_id: &str) -> Option<String> {
+    let mut current = *by_id.get(start_id)?;
+    if current.managed_count.is_some() {
+        return Some(current.id.clone());
+    }
+    while let Some(parent_id) = &current.parent_id {
+        let parent = *by_id.get(parent_id.as_str())?;
+        if parent.managed_count.is_some() {
+            return Some(parent.id.clone());
+        }
+        current = parent;
+    }
+    None
+}
+
+fn task_matches_generator_filter(
+    task: &TaskItem,
+    by_id: &HashMap<&str, &TaskItem>,
+    working_set: &ListWorkingSet,
+) -> bool {
+    if working_set.generator_sorts.is_empty() || !task.managed {
+        return true;
+    }
+    let Some(generator_id) = owning_generator_id(by_id, &task.id) else {
+        return true;
+    };
+    let Some(sort) = working_set.generator_sorts.get(&generator_id) else {
+        return true;
+    };
+    if sort.filter_query.trim().is_empty() {
+        return true;
+    }
+    fuzzy_matches(&sort.filter_query, &task.title)
+        || task
+            .tags
+            .iter()
+            .any(|tag| fuzzy_matches(&sort.filter_query, tag))
+}
+
 fn sort_sibling_groups(
     children: &mut HashMap<Option<String>, Vec<usize>>,
     tasks: &[TaskItem],
-    key: SortKey,
-    dir: SortDirection,
+    by_id: &HashMap<&str, &TaskItem>,
+    working_set: &ListWorkingSet,
 ) {
-    for indices in children.values_mut() {
+    for (parent_key, indices) in children.iter_mut() {
+        let (key, dir) = parent_key
+            .as_deref()
+            .and_then(|pid| owning_generator_id(by_id, pid))
+            .and_then(|generator_id| working_set.generator_sorts.get(&generator_id))
+            .map(|sort| (sort.sort_key, sort.sort_direction))
+            .unwrap_or((working_set.sort_key, working_set.sort_direction));
         indices.sort_by(|&a, &b| compare_tasks(&tasks[a], &tasks[b], key, dir));
     }
 }
@@ -383,25 +454,24 @@ pub fn filter_and_sort_tasks(
     search_query: &str,
     working_set: &ListWorkingSet,
 ) -> Vec<TaskItem> {
+    let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
             task_matches_tag_filter(t, working_set.tag_filter.as_deref())
                 && task_matches_search(t, search_query)
+                && task_matches_generator_filter(t, &by_id, working_set)
         })
         .cloned()
         .collect();
-    if working_set.sort_key == SortKey::TreeOrder {
+    if working_set.sort_key == SortKey::TreeOrder && working_set.generator_sorts.is_empty() {
         return filtered;
     }
     let visible_ids: HashSet<&str> = filtered.iter().map(|t| t.id.as_str()).collect();
+    let filtered_by_id: HashMap<&str, &TaskItem> =
+        filtered.iter().map(|t| (t.id.as_str(), t)).collect();
     let mut children = build_children_map(&filtered, &visible_ids);
-    sort_sibling_groups(
-        &mut children,
-        &filtered,
-        working_set.sort_key,
-        working_set.sort_direction,
-    );
+    sort_sibling_groups(&mut children, &filtered, &filtered_by_id, working_set);
     let mut visible = Vec::new();
     flatten_sorted_tree(&children, &filtered, None, &mut visible);
     visible
@@ -450,6 +520,7 @@ pub fn nearest_visible_id(
             sort_direction: working_set.sort_direction,
             selected_id: None,
             active_list_id: working_set.active_list_id.clone(),
+            generator_sorts: working_set.generator_sorts.clone(),
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
@@ -495,6 +566,7 @@ mod tests {
             in_flight_activity: None,
             managed: false,
             external_id: None,
+            source_type: None,
             managed_count: None,
             generator_status: None,
             generator_error: None,
@@ -520,6 +592,34 @@ mod tests {
         let visible = filter_and_sort_tasks(&tasks, "alp", &ws);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn main_tree_search_matches_managed_node_title() {
+        let mut managed = managed_sample("m1", "Fix login bug", "gen", 1);
+        managed.tags = vec!["backend".into()];
+        let tasks = vec![generator_sample("gen", "Generator"), managed];
+        let ws = ListWorkingSet::default_sort();
+        let visible = filter_and_sort_tasks(&tasks, "login", &ws);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "m1");
+    }
+
+    #[test]
+    fn main_tree_tag_filter_includes_matching_managed_nodes() {
+        let mut matching = managed_sample("m1", "Fix login bug", "gen", 1);
+        matching.tags = vec!["backend".into()];
+        let mut other = managed_sample("m2", "Add dark mode", "gen", 2);
+        other.tags = vec!["ui".into()];
+        let tasks = vec![generator_sample("gen", "Generator"), matching, other];
+        let ws = ListWorkingSet {
+            tag_filter: Some("backend".into()),
+            ..ListWorkingSet::default_sort()
+        };
+        let visible = filter_and_sort_tasks(&tasks, "", &ws);
+        let ids: Vec<&str> = visible.iter().map(|t| t.id.as_str()).collect();
+        assert!(ids.contains(&"m1"));
+        assert!(!ids.contains(&"m2"));
     }
 
     #[test]
@@ -549,5 +649,98 @@ mod tests {
         assert_eq!(visible[3].title, "Zeta root");
         assert_eq!(visible[1].depth, 1);
         assert_eq!(visible[1].parent_id.as_deref(), Some("parent-id"));
+    }
+
+    fn managed_sample(id: &str, title: &str, parent_id: &str, tree_ordinal: usize) -> TaskItem {
+        let mut t = sample(id, title, "", &[]);
+        t.managed = true;
+        t.parent_id = Some(parent_id.into());
+        t.depth = 1;
+        t.tree_ordinal = tree_ordinal;
+        t
+    }
+
+    fn generator_sample(id: &str, title: &str) -> TaskItem {
+        let mut t = sample(id, title, "", &[]);
+        t.managed_count = Some(2);
+        t
+    }
+
+    #[test]
+    fn generator_local_sort_does_not_affect_main_tree_order() {
+        let tasks = vec![
+            generator_sample("gen", "Generator"),
+            managed_sample("m2", "Zeta", "gen", 1),
+            managed_sample("m1", "Alpha", "gen", 2),
+        ];
+        let mut ws = ListWorkingSet::default_sort();
+        ws.generator_sorts.insert(
+            "gen".into(),
+            GeneratorSubtreeSort {
+                sort_key: SortKey::Title,
+                sort_direction: SortDirection::Asc,
+                filter_query: String::new(),
+            },
+        );
+        let visible = filter_and_sort_tasks(&tasks, "", &ws);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].id, "gen");
+        assert_eq!(visible[1].title, "Alpha");
+        assert_eq!(visible[2].title, "Zeta");
+    }
+
+    #[test]
+    fn generator_local_filter_hides_non_matching_managed_nodes_only() {
+        let tasks = vec![
+            generator_sample("gen", "Generator"),
+            managed_sample("m1", "Fix login bug", "gen", 1),
+            managed_sample("m2", "Add dark mode", "gen", 2),
+        ];
+        let mut ws = ListWorkingSet::default_sort();
+        ws.generator_sorts.insert(
+            "gen".into(),
+            GeneratorSubtreeSort {
+                sort_key: SortKey::TreeOrder,
+                sort_direction: SortDirection::Asc,
+                filter_query: "login".into(),
+            },
+        );
+        let visible = filter_and_sort_tasks(&tasks, "", &ws);
+        let ids: Vec<&str> = visible.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["gen", "m1"]);
+    }
+
+    #[test]
+    fn generator_local_sort_is_independent_across_generators() {
+        let tasks = vec![
+            generator_sample("gen-a", "Gen A"),
+            managed_sample("a2", "Zeta", "gen-a", 1),
+            managed_sample("a1", "Alpha", "gen-a", 2),
+            generator_sample("gen-b", "Gen B"),
+            managed_sample("b1", "One", "gen-b", 1),
+            managed_sample("b2", "Two", "gen-b", 2),
+        ];
+        let mut ws = ListWorkingSet::default_sort();
+        ws.generator_sorts.insert(
+            "gen-a".into(),
+            GeneratorSubtreeSort {
+                sort_key: SortKey::Title,
+                sort_direction: SortDirection::Asc,
+                filter_query: String::new(),
+            },
+        );
+        let visible = filter_and_sort_tasks(&tasks, "", &ws);
+        let a_children: Vec<&str> = visible
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some("gen-a"))
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(a_children, vec!["Alpha", "Zeta"]);
+        let b_children: Vec<&str> = visible
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some("gen-b"))
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(b_children, vec!["One", "Two"]);
     }
 }

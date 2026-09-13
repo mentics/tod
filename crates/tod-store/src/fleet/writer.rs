@@ -292,6 +292,10 @@ impl FleetMutation {
             }
             FleetMutation::UpdateTaskTags { id, tags } => {
                 TaskRepo::new(conn).update_tags(id, tags)?;
+                if let Ok(node_id) = uuid::Uuid::parse_str(id) {
+                    crate::outline::repos::GeneratorRepo::new(conn)
+                        .mark_field_modified(node_id, "tags")?;
+                }
             }
             FleetMutation::UpdateTaskLinkedIssues { id, linked_issues } => {
                 TaskRepo::new(conn).update_linked_issues(id, linked_issues)?;
