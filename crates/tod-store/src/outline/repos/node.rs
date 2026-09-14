@@ -18,15 +18,14 @@ impl<'a> NodeRepo<'a> {
     pub fn insert(&self, node: &Node) -> Result<()> {
         let ref_blob = node.ref_target_id.map(uuid_to_blob);
         self.conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 uuid_to_blob(node.id),
                 node.slug,
                 node.title,
                 node.kind.as_str(),
                 ref_blob,
-                i32::from(node.slug_manual),
                 node.created_at.timestamp_millis(),
                 node.updated_at.timestamp_millis(),
             ],
@@ -37,7 +36,7 @@ impl<'a> NodeRepo<'a> {
     pub fn get(&self, id: Uuid) -> Result<Option<Node>> {
         self.conn
             .query_row(
-                "SELECT id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at
+                "SELECT id, slug, title, kind, ref_target_id, created_at, updated_at
                  FROM nodes WHERE id = ?1",
                 params![uuid_to_blob(id)],
                 row_to_node,
@@ -49,7 +48,7 @@ impl<'a> NodeRepo<'a> {
     pub fn get_by_slug(&self, slug: &str) -> Result<Option<Node>> {
         self.conn
             .query_row(
-                "SELECT id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at
+                "SELECT id, slug, title, kind, ref_target_id, created_at, updated_at
                  FROM nodes WHERE lower(slug) = lower(?1)",
                 params![slug],
                 row_to_node,
@@ -70,7 +69,6 @@ impl<'a> NodeRepo<'a> {
             title: title.to_string(),
             kind: NodeKind::Normal,
             ref_target_id: None,
-            slug_manual: false,
             created_at: ms_to_datetime(now),
             updated_at: ms_to_datetime(now),
         };
@@ -86,7 +84,6 @@ impl<'a> NodeRepo<'a> {
             title: title.to_string(),
             kind: NodeKind::Reference,
             ref_target_id: Some(target),
-            slug_manual: false,
             created_at: ms_to_datetime(now),
             updated_at: ms_to_datetime(now),
         };
@@ -101,29 +98,6 @@ impl<'a> NodeRepo<'a> {
             params![uuid_to_blob(id), title, now],
         )?;
         Ok(())
-    }
-
-    /// Regenerate slug from title / linked issue when the user has not set one manually.
-    pub fn sync_auto_slug(&self, node_id: Uuid) -> Result<Option<String>> {
-        let Some(node) = self.get(node_id)? else {
-            return Ok(None);
-        };
-        if node.slug_manual {
-            return Ok(None);
-        }
-        let ticket_id = self.get_ticket_id(node_id)?;
-        let ticket = ticket_id.as_deref();
-        let base = crate::outline::slug::derive_node_slug(&node.title, ticket);
-        let slug = crate::outline::slug::allocate_unique_slug(self.conn, &base, Some(node_id))?;
-        if slug == node.slug {
-            return Ok(None);
-        }
-        let now = now_ms();
-        self.conn.execute(
-            "UPDATE nodes SET slug = ?2, updated_at = ?3 WHERE id = ?1",
-            params![uuid_to_blob(node_id), slug, now],
-        )?;
-        Ok(Some(slug))
     }
 
     pub fn list_capabilities(&self, node_id: Uuid) -> Result<Vec<Capability>> {
@@ -189,7 +163,21 @@ impl<'a> NodeRepo<'a> {
                     .optional()?
                     .is_some();
                 if !has_fields {
-                    self.set_fields(node_id, None, None, None, &[], &[], &[])?;
+                    self.set_fields(node_id, None, None, None, &[], &[])?;
+                }
+            }
+            Capability::Tags => {
+                let has_tags = self
+                    .conn
+                    .query_row(
+                        "SELECT 1 FROM node_tags WHERE node_id = ?1",
+                        params![&blob],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !has_tags {
+                    self.set_tags(node_id, &[])?;
                 }
             }
             Capability::Spec => {}
@@ -235,27 +223,24 @@ impl<'a> NodeRepo<'a> {
         repo: Option<&str>,
         branch: Option<&str>,
         notes: Option<&str>,
-        tags: &[String],
         linked_issues: &[String],
         linked_prs: &[String],
     ) -> Result<()> {
         let now = now_ms();
-        let tags_json = serde_json::to_string(tags)?;
         let issues_json = serde_json::to_string(linked_issues)?;
         let prs_json = serde_json::to_string(linked_prs)?;
         self.conn.execute(
-            "INSERT INTO node_fields (node_id, repo, branch, notes, tags, linked_issues, linked_prs, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(node_id) DO UPDATE SET
                repo = excluded.repo, branch = excluded.branch, notes = excluded.notes,
-               tags = excluded.tags, linked_issues = excluded.linked_issues,
+               linked_issues = excluded.linked_issues,
                linked_prs = excluded.linked_prs, updated_at = excluded.updated_at",
             params![
                 uuid_to_blob(node_id),
                 repo,
                 branch,
                 notes,
-                tags_json,
                 issues_json,
                 prs_json,
                 now
@@ -264,11 +249,22 @@ impl<'a> NodeRepo<'a> {
         Ok(())
     }
 
+    pub fn set_tags(&self, node_id: Uuid, tags: &[String]) -> Result<()> {
+        let now = now_ms();
+        let tags_json = serde_json::to_string(tags)?;
+        self.conn.execute(
+            "INSERT INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
+            params![uuid_to_blob(node_id), tags_json, now],
+        )?;
+        Ok(())
+    }
+
     pub fn get_tags(&self, node_id: Uuid) -> Result<Vec<String>> {
         let raw: Option<String> = self
             .conn
             .query_row(
-                "SELECT tags FROM node_fields WHERE node_id = ?1",
+                "SELECT tags FROM node_tags WHERE node_id = ?1",
                 params![uuid_to_blob(node_id)],
                 |row| row.get(0),
             )
@@ -388,6 +384,10 @@ impl<'a> NodeRepo<'a> {
                 self.conn
                     .execute("DELETE FROM node_fields WHERE node_id = ?1", params![blob])?;
             }
+            Capability::Tags => {
+                self.conn
+                    .execute("DELETE FROM node_tags WHERE node_id = ?1", params![blob])?;
+            }
             Capability::Generator => {
                 let gen_repo = crate::outline::repos::GeneratorRepo::new(self.conn);
                 gen_repo.delete_managed_children(node_id)?;
@@ -408,8 +408,7 @@ fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
         title: row.get(2)?,
         kind: NodeKind::parse(row.get::<_, String>(3)?.as_str()).unwrap_or(NodeKind::Normal),
         ref_target_id: ref_blob.as_deref().map(blob_to_uuid_sql).transpose()?,
-        slug_manual: row.get::<_, i32>(5)? != 0,
-        created_at: ms_to_datetime(row.get(6)?),
-        updated_at: ms_to_datetime(row.get(7)?),
+        created_at: ms_to_datetime(row.get(5)?),
+        updated_at: ms_to_datetime(row.get(6)?),
     })
 }

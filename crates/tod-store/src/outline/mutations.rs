@@ -380,7 +380,6 @@ impl OutlineMutation {
                 guard_not_managed(conn, *node_id)?;
                 let repo = NodeRepo::new(conn);
                 repo.update_title(*node_id, title)?;
-                repo.sync_auto_slug(*node_id)?;
                 GeneratorRepo::new(conn).mark_field_modified(*node_id, "title")?;
             }
             OutlineMutation::SetNodeCollapsed { node_id, collapsed } => {
@@ -714,23 +713,12 @@ impl OutlineMutation {
                 let node_repo = NodeRepo::new(conn);
                 if let Some(title) = title {
                     node_repo.update_title(*node_id, title)?;
-                    node_repo.sync_auto_slug(*node_id)?;
                 }
                 if let Some(body) = body {
                     node_repo.set_extra_content(*node_id, EXTRA_CONTENT_DETAILS, body)?;
                 }
                 if let Some(tags) = tags {
-                    let tags_json = serde_json::to_string(tags)?;
-                    conn.execute(
-                        "INSERT INTO node_fields (node_id, tags, updated_at)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
-                        params![
-                            crate::outline::uuid_blob::uuid_to_blob(*node_id),
-                            tags_json,
-                            now_ms(),
-                        ],
-                    )?;
+                    write_managed_tags(&node_repo, *node_id, tags)?;
                 }
             }
             OutlineMutation::PasteManagedNodeCopy {
@@ -1114,22 +1102,21 @@ fn create_managed_node(
         node_repo.set_extra_content(node.id, EXTRA_CONTENT_DETAILS, body)?;
     }
 
-    // Store tags on node_fields if non-empty.
+    // Store tags on the Tags capability if non-empty.
     if !tags.is_empty() {
-        let tags_json = serde_json::to_string(tags)?;
-        conn.execute(
-            "INSERT INTO node_fields (node_id, tags, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
-            params![
-                crate::outline::uuid_blob::uuid_to_blob(node.id),
-                tags_json,
-                now_ms(),
-            ],
-        )?;
+        write_managed_tags(&node_repo, node.id, tags)?;
     }
 
     Ok(node.id)
+}
+
+/// Persist tags for a generator-managed node, enabling the Tags capability
+/// on first write since Tags is independent of Agent/Generator.
+fn write_managed_tags(node_repo: &NodeRepo<'_>, node_id: Uuid, tags: &[String]) -> Result<()> {
+    if !tags.is_empty() && !node_repo.list_capabilities(node_id)?.contains(&Capability::Tags) {
+        node_repo.enable_capability(node_id, Capability::Tags)?;
+    }
+    node_repo.set_tags(node_id, tags)
 }
 
 fn update_managed_node(
@@ -1146,17 +1133,7 @@ fn update_managed_node(
         node_repo.set_extra_content(node_id, EXTRA_CONTENT_DETAILS, body)?;
     }
 
-    let tags_json = serde_json::to_string(tags)?;
-    conn.execute(
-        "INSERT INTO node_fields (node_id, tags, updated_at)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
-        params![
-            crate::outline::uuid_blob::uuid_to_blob(node_id),
-            tags_json,
-            now_ms(),
-        ],
-    )?;
+    write_managed_tags(&node_repo, node_id, tags)?;
 
     Ok(())
 }
@@ -1222,17 +1199,7 @@ fn copy_managed_node_recursive(
         node_repo.set_extra_content(new_node.id, EXTRA_CONTENT_DETAILS, &body)?;
     }
     if !tags.is_empty() {
-        let tags_json = serde_json::to_string(&tags)?;
-        conn.execute(
-            "INSERT INTO node_fields (node_id, tags, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
-            params![
-                crate::outline::uuid_blob::uuid_to_blob(new_node.id),
-                tags_json,
-                now_ms(),
-            ],
-        )?;
+        write_managed_tags(&node_repo, new_node.id, &tags)?;
     }
 
     gen_repo.set_link(

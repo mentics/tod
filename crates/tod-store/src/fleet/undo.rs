@@ -35,21 +35,6 @@ pub fn capture_inverse_before(
                 }],
             }))
         }
-        FleetMutation::UpdateTaskSlug { id, slug } => {
-            let old = task_field(conn, id, |t| t.slug.clone())?;
-            if old.as_deref() == Some(slug.as_str()) {
-                return Ok(None);
-            }
-            Ok(Some(CommandEntry {
-                id: Uuid::new_v4(),
-                label: format!("Changed slug to \"{slug}\""),
-                created_at: crate::outline::uuid_blob::now_ms(),
-                inverses: vec![FleetMutation::UpdateTaskSlug {
-                    id: id.clone(),
-                    slug: old.unwrap_or_default(),
-                }],
-            }))
-        }
         FleetMutation::UpdateTaskNotes { id, notes } => {
             let old = TaskRepo::new(conn)
                 .get(id)?
