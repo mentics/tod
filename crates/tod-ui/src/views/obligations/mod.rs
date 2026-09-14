@@ -60,6 +60,7 @@ actions!(
         ObligationsDelete,
         ObligationsAddSection,
         ObligationsFocusSearch,
+        ObligationsSearchSpace,
     ]
 );
 
@@ -90,6 +91,13 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("delete", ObligationsDelete, context),
         KeyBinding::new("s", ObligationsAddSection, context),
         KeyBinding::new("ctrl-f", ObligationsFocusSearch, context),
+        // Space must type a literal space in the search field rather than being
+        // swallowed as a shortcut — bind it explicitly while the field is focused.
+        KeyBinding::new(
+            "space",
+            ObligationsSearchSpace,
+            Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
+        ),
         // Inline edit is a multi-line text area: arrows move the cursor as usual,
         // Escape abandons the edit, and Ctrl+Enter commits it.
         KeyBinding::new(
@@ -136,6 +144,13 @@ pub enum ObligationsEvent {
         node_id: Uuid,
         obligation_id: Uuid,
     },
+}
+
+/// Menu label for one action config in the Ctrl+J picker: platform/mode plus
+/// an inherited marker, since raw config ids aren't meaningful to a user.
+fn agent_config_menu_label(config: &tod_store::fleet::AgentConfigRow, inherited: bool) -> String {
+    let base = format!("{} · {}", config.platform, config.mode);
+    if inherited { format!("↑ {base} (from parent)") } else { base }
 }
 
 pub struct ObligationsView {
@@ -396,9 +411,10 @@ impl ObligationsView {
             self.close_agent_menu(cx);
             return;
         }
-        let configs = self
+        let (configs, inherited) = self
             .fleet
-            .list_agent_configs_for_task(&node_id.to_string())
+            .resolve_agents_for_node(&node_id.to_string())
+            .map(|resolved| (resolved.configs, resolved.inherited))
             .unwrap_or_default();
         match configs.len() {
             // No configs yet: the shell creates a default from app settings
@@ -409,7 +425,7 @@ impl ObligationsView {
                 self.emit_agent_chat(node_id, Some(config_id), cx);
             }
             // Several: pick one, same as the node tree does.
-            _ => self.open_agent_menu(node_id, configs, window, cx),
+            _ => self.open_agent_menu(node_id, configs, inherited, window, cx),
         }
     }
 
@@ -430,6 +446,7 @@ impl ObligationsView {
         &mut self,
         node_id: Uuid,
         configs: Vec<tod_store::fleet::AgentConfigRow>,
+        inherited: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -440,7 +457,7 @@ impl ObligationsView {
             for config in &configs {
                 let view = view.clone();
                 let config_id = config.id.clone();
-                let label = config.id.clone();
+                let label = agent_config_menu_label(config, inherited);
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
                     let config_id = config_id.clone();
                     let _ = view.update(cx, |this, cx| {
@@ -465,6 +482,24 @@ impl ObligationsView {
             }));
         self.agent_menu = Some(menu);
         cx.notify();
+        cx.on_next_frame(window, |this, window, cx| {
+            if let Some(menu) = this.agent_menu.clone() {
+                menu.update(cx, |menu, cx| {
+                    menu.focus_handle(cx).focus(window);
+                });
+                if let Ok(ks) = gpui::Keystroke::parse("down") {
+                    // `dispatch_keystroke` triggers a synchronous full-window
+                    // redraw, which would re-enter this entity's lease if run
+                    // directly inside this on_next_frame callback (itself an
+                    // `Entity::update` on self). Deferring runs it once that
+                    // lease has been returned to the app.
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_keystroke(ks, cx);
+                    });
+                }
+            }
+            cx.notify();
+        });
     }
 
     fn close_agent_menu(&mut self, cx: &mut Context<Self>) {
@@ -473,6 +508,7 @@ impl ObligationsView {
             cx.notify();
         }
     }
+
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node_id) = self.node_id else {
@@ -497,17 +533,24 @@ impl ObligationsView {
     }
 
     /// Items matching the current search query (body or section text),
-    /// case-insensitive substring match. Empty query matches everything.
+    /// case-insensitive fuzzy match. Space-separated terms are ANDed together:
+    /// each term must fuzzily match some word in the item's text (typo-tolerant),
+    /// but every term must match for the item to be included. Empty query
+    /// matches everything.
     fn search_matches(&self) -> Vec<&NodeObligation> {
-        let query = self.search_query.trim().to_lowercase();
+        let terms: Vec<String> =
+            self.search_query.split_whitespace().map(|t| t.to_lowercase()).collect();
+        if terms.is_empty() {
+            return self.items.iter().collect();
+        }
         self.items
             .iter()
             .filter(|o| {
-                query.is_empty()
-                    || o.body.to_lowercase().contains(&query)
-                    || o.section
-                        .as_deref()
-                        .is_some_and(|s| s.to_lowercase().contains(&query))
+                let body = o.body.to_lowercase();
+                let section = o.section.as_deref().unwrap_or("").to_lowercase();
+                let words: Vec<&str> =
+                    body.split_whitespace().chain(section.split_whitespace()).collect();
+                terms.iter().all(|term| fuzzy_term_matches(term, &words))
             })
             .collect()
     }
@@ -1658,6 +1701,17 @@ impl ObligationsView {
         });
     }
 
+    fn on_search_space(
+        &mut self,
+        _: &ObligationsSearchSpace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_input.update(cx, |input, cx| {
+            input.insert(" ", window, cx);
+        });
+    }
+
     fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
@@ -1694,6 +1748,88 @@ impl ObligationsView {
         self.select_row(last, cx);
         self.scroll_handle.scroll_to_top_of_item(last);
     }
+}
+
+/// True if `term` fuzzily matches any word in `words` (typo-tolerant).
+fn fuzzy_term_matches(term: &str, words: &[&str]) -> bool {
+    if term.is_empty() {
+        return true;
+    }
+    words.iter().any(|word| fuzzy_word_match(term, word))
+}
+
+/// A term matches a word if it's a substring, or within a small edit-distance
+/// budget that grows with the term's length (so short terms require an exact
+/// substring match, avoiding false positives).
+fn fuzzy_word_match(term: &str, word: &str) -> bool {
+    if word.contains(term) {
+        return true;
+    }
+    let max_dist = match term.chars().count() {
+        0..=3 => 0,
+        4..=6 => 1,
+        _ => 2,
+    };
+    if max_dist == 0 {
+        return false;
+    }
+    bounded_edit_distance_substring(term, word, max_dist)
+}
+
+/// True if some contiguous run of words in `word` (a single word here, but
+/// kept general) is within `max_dist` edits of `term` — checked by sliding a
+/// window sized close to `term`'s length across `word` and taking the best
+/// Levenshtein distance among windows, so a typo'd word of similar length
+/// still matches without requiring the lengths to be identical.
+fn bounded_edit_distance_substring(term: &str, word: &str, max_dist: usize) -> bool {
+    let term_len = term.chars().count();
+    let word_len = word.chars().count();
+    if word_len == 0 {
+        return false;
+    }
+    // Whole-word compare is enough for our use case (single tokens, not
+    // phrases): try the full word plus a couple of length-adjusted windows.
+    if levenshtein_within(term, word, max_dist) {
+        return true;
+    }
+    if word_len <= term_len {
+        return false;
+    }
+    let word_chars: Vec<char> = word.chars().collect();
+    for start in 0..=(word_len - term_len) {
+        let end = (start + term_len + max_dist).min(word_len);
+        let window: String = word_chars[start..end].iter().collect();
+        if levenshtein_within(term, &window, max_dist) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Levenshtein distance between `a` and `b`, short-circuiting once it's
+/// certain the distance exceeds `max_dist`.
+fn levenshtein_within(a: &str, b: &str, max_dist: usize) -> bool {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max_dist {
+        return false;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        let mut row_min = curr[0];
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(curr[j]);
+        }
+        if row_min > max_dist {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()] <= max_dist
 }
 
 impl EventEmitter<ObligationsEvent> for ObligationsView {}
@@ -1753,6 +1889,7 @@ impl Render for ObligationsView {
                 this.open_agent_chat(window, cx);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(Self::on_search_space))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_create_below))
@@ -1814,35 +1951,36 @@ impl Render for ObligationsView {
                         search
                     })
                     .when(self.node_has_agent, |row| {
-                        row.child(div().relative().when_some(
-                            self.agent_menu.clone(),
-                            |el, menu| {
-                                el.child(
-                                    deferred(
-                                        anchored()
-                                            .anchor(Corner::TopRight)
-                                            .snap_to_window_with_margin(px(8.))
-                                            .child(div().occlude().mt_1().child(menu)),
+                        row.child(
+                            div()
+                                .relative()
+                                .child(chrome_control_with_shortcut_in_context(
+                                    Button::new("obligations-agent-chat")
+                                        .icon(IconName::Bot)
+                                        .label("Chat")
+                                        .outline()
+                                        .compact()
+                                        .tooltip("Chat with an agent about these obligations")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.open_agent_chat(window, cx);
+                                        })),
+                                    window,
+                                    &OpenAgentChat,
+                                    None,
+                                    cx,
+                                ))
+                                .when_some(self.agent_menu.clone(), |el, menu| {
+                                    el.child(
+                                        deferred(
+                                            anchored()
+                                                .anchor(Corner::TopLeft)
+                                                .snap_to_window_with_margin(px(8.))
+                                                .child(div().occlude().mt_1().child(menu)),
+                                        )
+                                        .with_priority(1),
                                     )
-                                    .with_priority(1),
-                                )
-                            },
-                        ))
-                        .child(chrome_control_with_shortcut_in_context(
-                            Button::new("obligations-agent-chat")
-                                .icon(IconName::Bot)
-                                .label("Chat")
-                                .outline()
-                                .compact()
-                                .tooltip("Chat with an agent about these obligations")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_agent_chat(window, cx);
-                                })),
-                            window,
-                            &OpenAgentChat,
-                            None,
-                            cx,
-                        ))
+                                }),
+                        )
                     })
                     .child(chrome_control_with_shortcut(
                         Button::new("obligations-close")

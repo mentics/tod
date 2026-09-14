@@ -8,7 +8,7 @@ use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 use crate::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT};
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -38,6 +38,13 @@ pub enum InterviewCommand {
     /// obligation that no longer exists.
     WithdrawStaleProposals {
         node_id: Uuid,
+    },
+    /// Withdraw every open/deferred question on a node and clear question-maker
+    /// exhaustion, so the question maker starts fresh next turn.
+    ResetQuestions {
+        node_id: Uuid,
+        #[serde(default)]
+        session_id: Option<Uuid>,
     },
     /// Record the user's answer; option 1 on a question with a proposal
     /// applies that proposal in the same transaction.
@@ -231,6 +238,27 @@ pub fn execute(
             Ok(json!({ "withdrawn": labels }))
         }
 
+        InterviewCommand::ResetQuestions { node_id, session_id } => {
+            let open = repo.list_questions(*node_id, &[STATUS_OPEN, STATUS_DEFERRED])?;
+            for q in &open {
+                conn.execute(
+                    "UPDATE interview_questions
+                     SET status = 'withdrawn', withdrawn_by = NULL, withdrawn_reason = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![RESET_QUESTIONS_REASON, now, uuid_to_blob(q.id)],
+                )?;
+            }
+            if let Some(session_id) = session_id {
+                conn.execute(
+                    "UPDATE interview_sessions
+                     SET question_maker_state = ?1, exhausted_reason = NULL, updated_at = ?2 WHERE id = ?3",
+                    params![QUESTION_MAKER_IDLE, now, uuid_to_blob(*session_id)],
+                )?;
+            }
+            let labels: Vec<String> = open.iter().map(|q| q.label()).collect();
+            Ok(json!({ "withdrawn": labels }))
+        }
+
         InterviewCommand::AnswerQuestion {
             node_id,
             seq,
@@ -411,6 +439,32 @@ pub fn execute(
             } else {
                 QUESTION_MAKER_IDLE
             };
+            // Enforced structurally, not just by the question-maker prompt's own
+            // "no open handoffs" rule — an agent turn that skips the "close
+            // handoffs" step and declares exhaustion anyway would otherwise
+            // strand a gate-check failure with nothing left to wake the
+            // question maker again, regardless of how carefully the prompt
+            // says not to.
+            if reason.is_some() {
+                let node_id: Option<Vec<u8>> = conn
+                    .query_row(
+                        "SELECT node_id FROM interview_sessions WHERE id = ?1",
+                        params![uuid_to_blob(*session_id)],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(node_blob) = node_id {
+                    let node_id = crate::outline::uuid_blob::blob_to_uuid_sql(&node_blob)?;
+                    let open_handoffs =
+                        InterviewRepo::new(conn).list_memory(node_id, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
+                    if !open_handoffs.is_empty() {
+                        bail!(
+                            "cannot declare exhaustion with {} open handoff note(s) — close them first with `memory update --status done`, or address what they ask for",
+                            open_handoffs.len()
+                        );
+                    }
+                }
+            }
             let n = conn.execute(
                 "UPDATE interview_sessions
                  SET question_maker_state = ?1, exhausted_reason = ?2, updated_at = ?3 WHERE id = ?4",

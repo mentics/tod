@@ -50,6 +50,9 @@ pub const QUESTION_MAKER_EXHAUSTED: &str = "exhausted";
 pub const STALE_PROPOSAL_REASON: &str =
     "Its proposal refers to an obligation that no longer exists.";
 
+/// Reason recorded when the user resets the question queue (`withdrawn_by` is NULL).
+pub const RESET_QUESTIONS_REASON: &str = "The user reset all questions.";
+
 pub const ENTITY_QUESTION: &str = "question";
 pub const ENTITY_MEMORY: &str = "memory";
 pub const ENTITY_OBLIGATION: &str = "obligation";

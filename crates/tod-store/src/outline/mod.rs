@@ -27,7 +27,8 @@ pub use repos::plan_steps::{PLAN_STEP_STATUSES, PlanStep, PlanStepRepo};
 pub use resolve::{ancestor_chain, phase_visible, resolve_obligations};
 pub use slug::{SLUG_MAX_LEN, allocate_unique_slug, derive_node_slug, slugify};
 pub use types::{
-    Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, EXTRA_CONTENT_TYPES, FlatNodeRow, Node,
+    Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, EXTRA_CONTENT_SUMMARY,
+    EXTRA_CONTENT_TYPES, FlatNodeRow, Node,
     NodeKind, OutlineEntry, OutlineList,
 };
 pub use uuid_blob::{blob_to_uuid, ms_to_datetime, now_ms, uuid_to_blob};

@@ -131,6 +131,7 @@ pub struct TaskEditView {
     loaded_lifecycle: String,
     loaded_purpose: String,
     loaded_details: String,
+    loaded_summary: String,
     notes: Vec<NoteItem>,
     details_collapsed: bool,
     notes_collapsed: bool,
@@ -305,6 +306,7 @@ impl TaskEditView {
             loaded_lifecycle: String::new(),
             loaded_purpose: String::new(),
             loaded_details: String::new(),
+            loaded_summary: String::new(),
             notes: Vec::new(),
             details_collapsed: false,
             notes_collapsed: false,
@@ -710,6 +712,15 @@ impl TaskEditView {
             })
             .unwrap_or_default();
         self.loaded_details = details.clone();
+        self.loaded_summary = self
+            .node_uuid()
+            .and_then(|node_id| {
+                self.fleet
+                    .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_SUMMARY)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
 
         self.title_input.update(cx, |input, cx| {
             input.set_value(task.title, window, cx);
@@ -2010,7 +2021,7 @@ impl TaskEditView {
         background: gpui::Hsla,
         border: gpui::Hsla,
         muted: gpui::Hsla,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let cap = Capability::Spec;
@@ -2042,6 +2053,22 @@ impl TaskEditView {
                                 )),
                         ),
                     )
+                    .children(if self.loaded_summary.trim().is_empty() {
+                        None
+                    } else {
+                        Some(
+                            v_flex()
+                                .gap_1()
+                                .w_full()
+                                .child(Self::render_field_label("Generated summary", cx))
+                                .child(selectable_markdown(
+                                    "task-edit-summary",
+                                    self.loaded_summary.clone(),
+                                    window,
+                                    cx,
+                                )),
+                        )
+                    })
                     .child(
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Obligations,

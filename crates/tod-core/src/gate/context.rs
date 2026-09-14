@@ -40,10 +40,18 @@ pub struct GateCheckRequest<'a> {
     pub node_body: Option<String>,
     /// Inherited + own purpose, most general first (see `agent_context::ContextRequest`).
     pub purposes: Vec<String>,
-    /// This node's obligations (requirements/constraints), so a `verifying`/
-    /// `review` gate check can confirm every requirement was traced without
-    /// the agent having to shell out to `tod-cli obligation list` first.
+    /// This node's own obligations (requirements/constraints) — not
+    /// ancestors' — so a `verifying`/`review` gate check can confirm every
+    /// requirement was traced without shelling out to `tod-cli obligations
+    /// list` first, and so criteria about "does this node have obligations"
+    /// aren't confused by ancestor obligations mixed into the same list.
     pub obligations: Vec<NodeObligation>,
+    /// Rendered ancestor context — see
+    /// `tod_core::interview::context::render_inherited_context`: each
+    /// ancestor's title, generated summary, and constraints, not its full
+    /// requirements. Callers build this from a live connection since
+    /// `GateCheckRequest` itself carries no DB handle.
+    pub ancestor_context: String,
     /// This node's plan steps with their dependency and `--satisfies` links,
     /// for the same traceability reason.
     pub plan_steps: Vec<PlanStepWithLinks>,
@@ -185,6 +193,10 @@ fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> S
     }
 
     out.push_str("\n## Obligations\n\n");
+    out.push_str(
+        "This node's own — evaluate the gate and probe questions against \
+         these, not against ancestor obligations below.\n\n",
+    );
     if request.obligations.is_empty() {
         out.push_str("(none)\n");
     } else {
@@ -193,6 +205,10 @@ fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> S
             out.push_str(&obligation_line(o));
             out.push('\n');
         }
+    }
+
+    if !request.ancestor_context.is_empty() {
+        out.push_str(&request.ancestor_context);
     }
 
     out.push_str("\n## Plan steps\n\n");
@@ -270,6 +286,7 @@ mod tests {
             node_body: None,
             purposes: Vec::new(),
             obligations: Vec::new(),
+            ancestor_context: String::new(),
             plan_steps: Vec::new(),
             from_state: "verifying".into(),
             to_state: "review".into(),
@@ -292,6 +309,7 @@ mod tests {
             node_body: None,
             purposes: Vec::new(),
             obligations: Vec::new(),
+            ancestor_context: String::new(),
             plan_steps: Vec::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
@@ -325,6 +343,7 @@ mod tests {
             node_body: None,
             purposes: Vec::new(),
             obligations: Vec::new(),
+            ancestor_context: String::new(),
             plan_steps: Vec::new(),
             from_state: "planning".into(),
             to_state: "planning".into(),
@@ -347,6 +366,7 @@ mod tests {
             node_body: None,
             purposes: Vec::new(),
             obligations: Vec::new(),
+            ancestor_context: String::new(),
             plan_steps: Vec::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
@@ -373,6 +393,7 @@ mod tests {
             node_body: None,
             purposes: Vec::new(),
             obligations: Vec::new(),
+            ancestor_context: String::new(),
             plan_steps: Vec::new(),
             from_state: "planning".into(),
             to_state: "planning".into(),

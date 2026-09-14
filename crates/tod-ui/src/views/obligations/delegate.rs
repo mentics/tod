@@ -343,7 +343,7 @@ impl ObligationListDelegate {
                     .items_center()
                     .gap_1()
                     .px_2()
-                    .pl_5()
+                    .pl_9()
                     .border_b_1()
                     .border_color(border)
                     .when(selected, |el| el.bg(theme.muted))
@@ -429,7 +429,7 @@ impl ObligationListDelegate {
                     .gap_2()
                     .px_2()
                     .py_1p5()
-                    .pl_9()
+                    .pl_12()
                     .border_b_1()
                     .border_color(border)
                     .when(selected, |el| {

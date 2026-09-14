@@ -5,7 +5,8 @@
 ## On entry
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase), plan steps (if any), open parked interview memory, and the interview history.
-2. If design is complete (or explicitly waived) and gate checklist passes → verify upstream conformance and proceed to exit.
+2. Regenerate the node's summary from its now-settled requirements-phase obligations: `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append — this is the only place a requirements-based summary is written). Ancestor nodes use this to give this node's descendants a short scope statement in place of a full obligations dump.
+3. If design is complete (or explicitly waived) and gate checklist passes → verify upstream conformance and proceed to exit.
 
 ## Responsibilities
 
@@ -15,7 +16,7 @@ Run a **design interview** via the app unless waived at the `proposed` → `desi
 
 - Probe until design-phase information is sufficient; prefer principles/clusters; do not re-ask settled obligations.
 - Consume parked interview memory tagged `design`; promote it into a design-phase obligation (`tod-cli obligations add --phase design`) or discuss with the human; mark it done when consumed.
-- Probe: a concrete, checkable way to verify each requirement (a command, a test, an observable behavior), costly-to-reverse choices, named **constructions**, open design questions.
+- Probe: costly-to-reverse choices, named **constructions**, open design questions.
 - Do **not** probe for optional metadata (Links, non-goals) unless the human volunteers.
 - Record waivers in interview memory.
 

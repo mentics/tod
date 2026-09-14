@@ -78,8 +78,7 @@ const LIST_COLUMN_MIN: f32 = 120.;
 const BODY_COLUMN_WIDTH: f32 = 250.;
 const BODY_COLUMN_MIN: f32 = 160.;
 const RESPONSE_COLUMN_MIN: f32 = 200.;
-const OBLIGATIONS_COLUMN_WIDTH: f32 = 280.;
-const OBLIGATIONS_COLUMN_MIN: f32 = 220.;
+const OBLIGATIONS_COLUMN_MIN: f32 = 200.;
 /// `InputState` has no character-column API, so all multi-line fields (notes,
 /// proposed text, question feedback, freeform submission) share one row count
 /// and pixel height instead of a literal 40-column width.
@@ -94,12 +93,18 @@ enum WorkspaceFocus {
     Response(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum WorkspaceEvent {
     NavigateBack,
     SessionComplete,
     /// User chose **Proceed** on the in-place Complete state (task-list origin).
     ProceedToLifecycle,
+    /// Forwarded from the embedded obligations panel's chat icon.
+    OpenAgentChat {
+        node_id: Uuid,
+        obligation_id: Option<Uuid>,
+        config_id: Option<String>,
+    },
 }
 
 /// Options the user can pick for `q`: its own, or a lone Accept for a
@@ -260,8 +265,18 @@ impl WorkspaceView {
                 }
                 // Ctrl+Left out of the third column lands on the response column.
                 ObligationsEvent::FocusTaskList => this.focus_response_right(window, cx),
+                ObligationsEvent::OpenAgentChat {
+                    node_id,
+                    obligation_id,
+                    config_id,
+                } => {
+                    cx.emit(WorkspaceEvent::OpenAgentChat {
+                        node_id: *node_id,
+                        obligation_id: *obligation_id,
+                        config_id: config_id.clone(),
+                    });
+                }
                 ObligationsEvent::DeleteSelectedTask
-                | ObligationsEvent::OpenAgentChat { .. }
                 | ObligationsEvent::OpenAgentConfig { .. }
                 | ObligationsEvent::OpenVisualDesign { .. } => {}
             },
@@ -556,6 +571,13 @@ impl WorkspaceView {
         self.notes_editing || self.proposed_editing || self.feedback_editing || self.freeform_editing
     }
 
+    /// True when GPUI focus is anywhere inside the obligations panel (e.g. its
+    /// search field) — workspace-wide shortcuts like the MC digit keys must not
+    /// fire while it holds focus.
+    fn obligations_focused(&self, window: &Window, cx: &App) -> bool {
+        self.obligations.read(cx).focus_handle(cx).contains_focused(window, cx)
+    }
+
     fn has_proposed_editor(&self) -> bool {
         self.selected_question()
             .and_then(proposal_text)
@@ -577,6 +599,29 @@ impl WorkspaceView {
             driver.retry();
         }
         self.error_banner = None;
+        cx.notify();
+    }
+
+    fn reset_questions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_mutate() {
+            return;
+        }
+        let command = InterviewCommand::ResetQuestions {
+            node_id: self.session.node_id,
+            session_id: Some(self.session.id),
+        };
+        if self.interview(command).is_none() {
+            cx.notify();
+            return;
+        }
+        if let Ok(mut driver) = self.driver.lock() {
+            driver.wake_question_maker();
+        }
+        self.error_banner = None;
+        self.status_line = "Reset all questions".into();
+        self.questions.clear();
+        self.select_next_question(-1, Some(window), cx);
+        self.reload(cx);
         cx.notify();
     }
 
@@ -912,6 +957,12 @@ impl WorkspaceView {
     fn on_digit_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         // Text edit mode suppresses digit MC submit — not mere focus.
         if self.response_text_editing() {
+            cx.propagate();
+            return;
+        }
+        // Focus inside the obligations panel (e.g. its search field) owns the
+        // keyboard entirely — no workspace-wide shortcuts should fire.
+        if self.obligations_focused(window, cx) {
             cx.propagate();
             return;
         }
@@ -1434,10 +1485,21 @@ impl Render for WorkspaceView {
             self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.sync_proposed_input(window, cx);
+        // `window.defer`, not a direct call: render can run reentrantly while
+        // the obligations/plan-steps panel is itself mid-update (e.g. its own
+        // click handler forced this render before returning), and updating it
+        // again here would try to lease it a second time. Deferring runs this
+        // once the current effect cycle — and that lease — has flushed.
         if self.phase == PHASE_PLANNING {
-            self.plan_steps.update(cx, |panel, cx| panel.reload(window, cx));
+            let plan_steps = self.plan_steps.clone();
+            window.defer(cx, move |window, cx| {
+                plan_steps.update(cx, |panel, cx| panel.reload(window, cx));
+            });
         } else {
-            self.obligations.update(cx, |panel, cx| panel.reload(window, cx));
+            let obligations = self.obligations.clone();
+            window.defer(cx, move |window, cx| {
+                obligations.update(cx, |panel, cx| panel.reload(window, cx));
+            });
         }
 
         let background = cx.theme().background;
@@ -1493,7 +1555,10 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &McDigit8, window, cx| this.on_digit_key("8", window, cx)))
             .on_action(cx.listener(|this, _: &McDigit9, window, cx| this.on_digit_key("9", window, cx)))
             .on_action(cx.listener(|this, _: &QuestionMoveUp, window, cx| {
-                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
+                if this.actions_menu_focused(window, cx)
+                    || this.response_text_editing()
+                    || this.obligations_focused(window, cx)
+                {
                     cx.propagate();
                     return;
                 }
@@ -1504,7 +1569,10 @@ impl Render for WorkspaceView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &QuestionMoveDown, window, cx| {
-                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
+                if this.actions_menu_focused(window, cx)
+                    || this.response_text_editing()
+                    || this.obligations_focused(window, cx)
+                {
                     cx.propagate();
                     return;
                 }
@@ -1515,19 +1583,27 @@ impl Render for WorkspaceView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &ListArrowUp, window, cx| {
+                if this.obligations_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 if this.workspace_focus == WorkspaceFocus::QuestionList {
                     this.move_question_list_by(-1, window, cx);
                     cx.stop_propagation();
                 }
             }))
             .on_action(cx.listener(|this, _: &ListArrowDown, window, cx| {
+                if this.obligations_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 if this.workspace_focus == WorkspaceFocus::QuestionList {
                     this.move_question_list_by(1, window, cx);
                     cx.stop_propagation();
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
-                if this.response_text_editing() {
+                if this.response_text_editing() || this.obligations_focused(window, cx) {
                     cx.propagate();
                     return;
                 }
@@ -1538,7 +1614,7 @@ impl Render for WorkspaceView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
-                if this.response_text_editing() {
+                if this.response_text_editing() || this.obligations_focused(window, cx) {
                     cx.propagate();
                     return;
                 }
@@ -1548,7 +1624,10 @@ impl Render for WorkspaceView {
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivateFocused, window, cx| {
-                if this.actions_menu_focused(window, cx) || this.response_text_editing() {
+                if this.actions_menu_focused(window, cx)
+                    || this.response_text_editing()
+                    || this.obligations_focused(window, cx)
+                {
                     cx.propagate();
                     return;
                 }
@@ -1585,7 +1664,12 @@ impl Render for WorkspaceView {
                                 resizable_panel()
                                     .size(px(LIST_COLUMN_WIDTH))
                                     .size_range(px(LIST_COLUMN_MIN)..Pixels::MAX)
-                                    .child(question_list_column(&self.question_list_state, muted)),
+                                    .child(question_list_column(
+                                        cx,
+                                        &self.question_list_state,
+                                        self.can_mutate(),
+                                        muted,
+                                    )),
                             )
                             .child(
                                 resizable_panel()
@@ -1630,7 +1714,6 @@ impl Render for WorkspaceView {
                             )
                             .child(
                                 resizable_panel()
-                                    .size(px(OBLIGATIONS_COLUMN_WIDTH))
                                     .size_range(px(OBLIGATIONS_COLUMN_MIN)..Pixels::MAX)
                                     .child(if self.phase == PHASE_PLANNING {
                                         self.plan_steps.clone().into_any_element()
@@ -1693,7 +1776,9 @@ fn error_banner(
 }
 
 fn question_list_column(
+    cx: &mut Context<WorkspaceView>,
     list_state: &Entity<ListState<QuestionListDelegate>>,
+    can_mutate: bool,
     muted: gpui::Hsla,
 ) -> impl IntoElement {
     v_flex()
@@ -1714,6 +1799,15 @@ fn question_list_column(
                 .min_h_0()
                 .size_full()
                 .child(List::new(list_state).size_full()),
+        )
+        .child(
+            div().flex_none().p_2().child(
+                Button::new("reset-questions")
+                    .label("Reset questions")
+                    .compact()
+                    .disabled(!can_mutate)
+                    .on_click(cx.listener(|this, _, window, cx| this.reset_questions(window, cx))),
+            ),
         )
 }
 

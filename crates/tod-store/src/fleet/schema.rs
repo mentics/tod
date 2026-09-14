@@ -210,10 +210,18 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
 /// still needs an interview without re-parsing an agent reply.
 fn migrate_v20_to_v21(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE node_gate_evaluations ADD COLUMN action TEXT NOT NULL DEFAULT 'none'
-            CHECK(action IN ('none', 'interview'));",
-    )?;
+    // On a brand-new database, migrate_v2_to_v3 already created
+    // node_gate_evaluations from the current OUTLINE_DDL, which bakes in the
+    // `action` column — so this ALTER would be a duplicate-column error.
+    let has_action: bool = tx
+        .prepare("SELECT 1 FROM pragma_table_info('node_gate_evaluations') WHERE name = 'action'")?
+        .exists([])?;
+    if !has_action {
+        tx.execute_batch(
+            "ALTER TABLE node_gate_evaluations ADD COLUMN action TEXT NOT NULL DEFAULT 'none'
+                CHECK(action IN ('none', 'interview'));",
+        )?;
+    }
     tx.execute(
         "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '21')",
         [],

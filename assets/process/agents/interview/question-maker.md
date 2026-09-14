@@ -11,10 +11,11 @@ The turn gives the number of open questions the app wants (the **target**). Then
 1. **Absorb** what's new. Start with open **handoff** notes — follow-ups the answer processor found. Note what the user deferred or sent back, and why.
 2. **Prune.** Withdraw open questions that are no longer worth asking: settled elsewhere, superseded, or made pointless by a newer answer.
 3. **Choose** the most valuable questions not already open (see *Choosing questions*).
-4. **Write, best first.** Add each question as soon as it is ready — the user may be waiting. Stop at the target, or sooner if nothing else is worth asking.
-5. **Close handoffs** you acted on, or that turned out to need no question: `memory update … --status done`.
-6. **Save your plan** with `memory add --kind plan`: what is settled, what remains, what you will ask next and why, and what you are holding back until an open question is answered.
-7. **Declare exhaustion** with `interview exhausted` when nothing is left worth asking in this phase: no gaps, no open handoffs, no open parked items still needing the user's judgment, and the phase's done-when is met or waits only on open questions. This is the same bar the gate check applies afterward — don't declare exhaustion while a decision remains that only the user could make; if you're unsure whether something is worth asking, treat that uncertainty as the answer. The app wakes you if that changes.
+4. **Check before writing.** For each candidate, scan the `## Obligations` and `## Inherited obligations` sections in your context for that specific topic before drafting it — as the obligation list grows past a hundred-plus entries, a near-duplicate is easy to miss by memory alone. If an obligation already answers it (even with different wording), it's settled: don't ask it again.
+5. **Write, best first.** Add each question as soon as it is ready — the user may be waiting. Stop at the target, or sooner if nothing else is worth asking.
+6. **Close handoffs** you acted on, or that turned out to need no question: `memory update … --status done`.
+7. **Save your plan** with `memory add --kind plan`: what is settled, what remains, what you will ask next and why, and what you are holding back until an open question is answered.
+8. **Declare exhaustion** with `interview exhausted` when nothing is left worth asking in this phase: no gaps, no open handoffs, no open parked items still needing the user's judgment, and the phase's done-when is met or waits only on open questions. This is the same bar the gate check applies afterward — don't declare exhaustion while a decision remains that only the user could make; if you're unsure whether something is worth asking, treat that uncertainty as the answer. The app wakes you if that changes.
 
 Reply with one short line, such as `added 3, withdrew 1`. The app reads the database, not your reply.
 
@@ -42,6 +43,7 @@ Never ask:
 - for optional material — non-goals, links, inspirations;
 - for a negative rule when nothing suggests the behavior would happen;
 - a deferred question again, unless the phase cannot finish without it — and then say so in `context`.
+- about a decision that belongs to an ancestor's own scope. Inherited context shows an ancestor's title, summary, and constraints, not its full requirements — a gap you notice there is that ancestor's business, not this node's; don't manufacture a question to fill it. Stay inside the scope of the current node.
 
 ## Keep the queue independent
 

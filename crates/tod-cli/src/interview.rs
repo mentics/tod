@@ -9,11 +9,15 @@ use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
 
 const CONTENT_USAGE: &str = "\
-tod-cli content — a node's goal, design, and plan
+tod-cli content — a node's goal, design, plan, and generated summary
 
 COMMANDS:
-    get --node <UUID> --type goal|design|plan
-    set --node <UUID> --type goal|design|plan --body <TEXT> [--append]
+    get --node <UUID> --type goal|design|plan|summary
+    set --node <UUID> --type goal|design|plan|summary --body <TEXT> [--append]
+
+`summary` is regenerated (overwritten, not appended) once on entering
+`design` and once on entering `planning` — see the design/planning state
+docs' On-entry steps.
 ";
 
 const QUESTIONS_USAGE: &str = "\
@@ -75,8 +79,8 @@ pub fn content(inv: Invocation) -> anyhow::Result<String> {
     };
     let node = args.node()?;
     let ty = args.require("--type")?;
-    if !["goal", "design", "plan"].contains(&ty) {
-        anyhow::bail!("--type must be goal|design|plan");
+    if !["goal", "design", "plan", "summary"].contains(&ty) {
+        anyhow::bail!("--type must be goal|design|plan|summary");
     }
     let client = inv.client();
     let current = || client.read(|conn| NodeRepo::new(conn).get_extra_content(node, ty));

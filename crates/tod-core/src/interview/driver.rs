@@ -401,7 +401,7 @@ impl InterviewDriver {
     fn schedule(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
         let node = self.config.node_id;
         let gate_handoff = self.sync_gate_failures(fleet).unwrap_or(false);
-        let (mut open, unprocessed, state, new_handoff, stale) = fleet.read(|conn| {
+        let (mut open, unprocessed, state, new_handoff, handoffs_open, stale) = fleet.read(|conn| {
             let repo = InterviewRepo::new(conn);
             let handoffs = repo.list_memory(node, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
             // A handoff is new to the question maker when it was written after that
@@ -432,6 +432,7 @@ impl InterviewDriver {
                     .map(|s| s.0)
                     .unwrap_or_default(),
                 new_handoff,
+                !handoffs.is_empty(),
                 repo.stale_proposal_questions(node)?,
             ))
         })?;
@@ -439,7 +440,15 @@ impl InterviewDriver {
         // A question whose proposal targets a removed obligation can't be
         // accepted; the answer processor should have withdrawn it, so the app
         // does it as a backstop and asks for a replacement.
-        let mut wake_question_maker = new_handoff || gate_handoff;
+        //
+        // `state == exhausted && handoffs_open` on its own (not just `new_handoff`,
+        // which only fires the tick a handoff first appears) re-triggers a turn on
+        // every subsequent poll too — needed because `SetExhausted` now refuses to
+        // apply while handoffs are open, but a turn can still end exhausted in the
+        // store if it declared exhaustion before that guard existed, or before this
+        // fix landed, leaving a stale state on disk with nothing else to wake it.
+        let mut wake_question_maker =
+            new_handoff || gate_handoff || (state == QUESTION_MAKER_EXHAUSTED && handoffs_open);
         if !stale.is_empty() {
             fleet.interview(
                 ACTOR_USER,

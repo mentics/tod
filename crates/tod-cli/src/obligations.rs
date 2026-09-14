@@ -15,7 +15,7 @@ tod-cli obligations — requirements and constraints on a node
 Obligation ids may be given in full or as the 8-character prefix shown in listings.
 
 COMMANDS:
-    list   --node <UUID> [--kind requirement|constraint] [--inherited]
+    list   --node <UUID> [--kind requirement|constraint] [--inherited] [--search <TEXT>]
     show   <ID>
     add    --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--section <NAME>] [--after <ID>] [--before]
     update <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown]      (--section \"\" clears it)
@@ -77,9 +77,43 @@ fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
         .read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw))
 }
 
+/// Case-insensitive fuzzy match: `query`'s characters must appear as a
+/// subsequence of `text`. Returns a score (higher is a better match) or
+/// `None` when it doesn't match at all — an exact substring scores highest,
+/// then tighter (less gappy) subsequence matches beat looser ones.
+fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
+    let text_l = text.to_lowercase();
+    let query_l = query.trim().to_lowercase();
+    if query_l.is_empty() {
+        return Some(0);
+    }
+    if text_l.contains(&query_l) {
+        return Some(10_000 - text_l.len() as i32);
+    }
+    let mut query_chars = query_l.chars();
+    let mut want = query_chars.next();
+    let mut last_match: Option<i32> = None;
+    let mut penalty = 0i32;
+    for (pos, c) in text_l.chars().enumerate() {
+        let Some(qc) = want else { break };
+        if c == qc {
+            if let Some(last) = last_match {
+                penalty += pos as i32 - last - 1;
+            }
+            last_match = Some(pos as i32);
+            want = query_chars.next();
+        }
+    }
+    if want.is_some() {
+        return None;
+    }
+    Some(-penalty)
+}
+
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = args.node()?;
     let kind = args.get("--kind").map(normalize_kind).transpose()?;
+    let search = args.get("--search");
     let rows: Vec<(NodeObligation, Option<String>)> = inv.client().read(|conn| {
         let nodes = NodeRepo::new(conn);
         let rows = if args.has("--inherited") {
@@ -110,10 +144,21 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         };
         Ok(rows)
     })?;
-    let rows: Vec<_> = rows
+    let mut rows: Vec<_> = rows
         .into_iter()
         .filter(|(o, _)| kind.is_none_or(|k| o.kind == k))
         .collect();
+    if let Some(query) = search {
+        let mut scored: Vec<(i32, (NodeObligation, Option<String>))> = rows
+            .into_iter()
+            .filter_map(|row| {
+                let haystack = format!("{} {}", row.0.section.as_deref().unwrap_or(""), row.0.body);
+                fuzzy_score(&haystack, query).map(|score| (score, row))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        rows = scored.into_iter().map(|(_, row)| row).collect();
+    }
     if inv.json {
         let items: Vec<serde_json::Value> = rows
             .iter()

@@ -698,11 +698,10 @@ impl Shell {
                     node_id: node_id.to_string(),
                     env_type: "local".into(),
                     mode: "agent".into(),
-                    // Default to the data root rather than a code repo: this
-                    // conversation is about tod's own data, which is what the
-                    // context tells the agent to work on via `tod-cli`. Without
-                    // it, `resolve_agent_workspace` requires a repo on the node.
-                    work_directory: Some(tod_store::path_for_storage(self.paths.data_root())),
+                    // Leave the workspace unset so `resolve_agent_workspace`
+                    // resolves it the same way fleet-launched agents do: the
+                    // node's worktree if configured, otherwise its repo root.
+                    work_directory: None,
                     use_worktree: false,
                     platform: tod_agent::agent_launch::platform_storage(launch.platform)
                         .to_string(),
@@ -1956,6 +1955,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 |this: &mut Shell, _, event, cx| match event {
                                     LifecyclePanelEvent::Close => {
                                         this.task_list.update(cx, |list, cx| {
+                                            list.set_lifecycle_panel_open(false, cx);
                                             list.request_live_refresh(cx);
                                         });
                                         this.pending_refocus_task_list = true;
@@ -2021,6 +2021,34 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         });
                                         this.pending_return_to_tasks = true;
                                         cx.notify();
+                                    }
+                                    SessionsEvent::OpenAgentChat {
+                                        node_id,
+                                        obligation_id,
+                                        config_id,
+                                    } => {
+                                        // `cx.defer`, not a direct call: this event
+                                        // arrives synchronously through several nested
+                                        // entity updates still on the stack (obligations
+                                        // -> workspace -> sessions -> shell), and opening
+                                        // the chat window here would try to lease those
+                                        // same entities again before they're returned to
+                                        // the app. Deferring runs this once the current
+                                        // effect cycle (and all those leases) has flushed.
+                                        let node_id = *node_id;
+                                        let obligation_id = *obligation_id;
+                                        let config_id = config_id.clone();
+                                        let weak = cx.weak_entity();
+                                        cx.defer(move |cx| {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.open_obligations_agent_chat(
+                                                    node_id,
+                                                    obligation_id,
+                                                    config_id,
+                                                    cx,
+                                                );
+                                            });
+                                        });
                                     }
                                 },
                             );

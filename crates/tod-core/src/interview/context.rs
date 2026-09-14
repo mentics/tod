@@ -9,8 +9,8 @@ use std::path::Path;
 use tod_store::interview::*;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, PlanStep,
-    ancestor_chain, phase_visible, resolve_obligations, uuid_to_blob,
+    EXTRA_CONTENT_GOAL, EXTRA_CONTENT_SUMMARY, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation,
+    PlanStep, ancestor_chain, phase_visible, resolve_obligations, uuid_to_blob,
 };
 use uuid::Uuid;
 
@@ -110,6 +110,92 @@ fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {
         .unwrap_or_else(|| short_id(id))
 }
 
+/// Renders `node_id`'s ancestor (and global) obligations for interview and
+/// gate-check context. An ancestor with a generated summary
+/// (`EXTRA_CONTENT_SUMMARY`, regenerated once on entering `design` and once
+/// on entering `planning`, see the state docs' On-entry steps) contributes
+/// just its title, that summary, and its constraint-kind obligations in
+/// full — its requirements are what the summary exists to stand in for, so
+/// they aren't repeated. An ancestor with obligations but no summary yet
+/// falls back to showing everything, so nothing already-settled is ever
+/// silently hidden — with a note flagging the missing summary. Global
+/// (no owning node) obligations always show in full; there is nothing to
+/// summarize about them.
+pub fn render_inherited_context(
+    conn: &Connection,
+    nodes: &NodeRepo<'_>,
+    node_id: Uuid,
+    max_phase: Option<&str>,
+) -> Result<String> {
+    let inherited: Vec<_> = resolve_obligations(conn, node_id, max_phase)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.source_node_id != node_id)
+        .collect();
+    if inherited.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut groups: std::collections::HashMap<Uuid, Vec<NodeObligation>> =
+        std::collections::HashMap::new();
+    for item in inherited {
+        if !order.contains(&item.source_node_id) {
+            order.push(item.source_node_id);
+        }
+        groups.entry(item.source_node_id).or_default().push(item.obligation);
+    }
+
+    let mut out = String::new();
+    out.push_str("\n## Inherited context (ancestors)\n\n");
+    out.push_str(
+        "Each ancestor below is summarized, not fully restated — its scope \
+         is settled and out of bounds here. Only decide what belongs to \
+         *this* node; a gap in an ancestor's own scope belongs on that \
+         ancestor, not as a question or obligation on this node.\n",
+    );
+
+    for source_id in order {
+        let items = groups.remove(&source_id).unwrap_or_default();
+        if source_id.is_nil() {
+            out.push_str("\n### Global\n");
+            for o in &items {
+                writeln!(out, "- {}", obligation_line(o))?;
+            }
+            continue;
+        }
+        let title = node_title(nodes, source_id);
+        writeln!(out, "\n### From \"{title}\"")?;
+        let summary = nodes
+            .get_extra_content(source_id, EXTRA_CONTENT_SUMMARY)
+            .ok()
+            .flatten()
+            .filter(|s| !s.trim().is_empty());
+        let constraints: Vec<&NodeObligation> =
+            items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
+        match summary {
+            Some(summary) => writeln!(out, "{}", one_line(&summary))?,
+            None => {
+                writeln!(
+                    out,
+                    "⚠ no generated summary yet for this node — showing its full obligations below."
+                )?;
+                for o in &items {
+                    writeln!(out, "- {}", obligation_line(o))?;
+                }
+                continue;
+            }
+        }
+        if !constraints.is_empty() {
+            out.push_str("\nConstraints:\n");
+            for o in constraints {
+                writeln!(out, "- {}", obligation_line(o))?;
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     let nodes = NodeRepo::new(conn);
     let repo = InterviewRepo::new(conn);
@@ -183,22 +269,7 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
         }
     }
 
-    let inherited: Vec<_> = resolve_obligations(conn, scope.node_id, Some(scope.phase))
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.source_node_id != scope.node_id)
-        .collect();
-    if !inherited.is_empty() {
-        out.push_str("\n## Inherited obligations\n");
-        let mut current: Option<Uuid> = None;
-        for item in inherited {
-            if current != Some(item.source_node_id) {
-                current = Some(item.source_node_id);
-                writeln!(out, "\n### From \"{}\"", node_title(&nodes, item.source_node_id))?;
-            }
-            writeln!(out, "- {}", obligation_line(&item.obligation))?;
-        }
-    }
+    out.push_str(&render_inherited_context(conn, &nodes, scope.node_id, Some(scope.phase))?);
 
     if scope.phase == PHASE_PLANNING {
         let plan_repo = PlanStepRepo::new(conn);
@@ -350,6 +421,12 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
                 None if inserted => {}
                 None => writeln!(obligation_lines, "- [{}]", short_id(id))?,
                 Some(o) if !phase_visible(&o.phase, scope.phase) => {}
+                // An ancestor's requirement obligations are spoken for by its
+                // generated summary (see `render_inherited_context`) — surfacing
+                // a live edit to one here would restate exactly what the
+                // summary already exists to replace. Its constraints still
+                // matter in full, and this node's own obligations always do.
+                Some(o) if o.node_id != scope.node_id && o.kind != KIND_CONSTRAINT => {}
                 Some(o) => {
                     let from = if o.node_id != scope.node_id {
                         format!(" (from \"{}\")", node_title(&nodes, o.node_id))

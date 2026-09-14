@@ -61,6 +61,7 @@ use tod_store::AgentRole;
 use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
+use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::{
     GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_HUMAN,
 };
@@ -863,7 +864,18 @@ impl LifecyclePanelView {
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
                 .ok()
                 .flatten();
-            let obligations = self.fleet.resolve_obligations_for_node(node_id).unwrap_or_default();
+            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let ancestor_context = self
+                .fleet
+                .read(|conn| {
+                    tod_core::interview::context::render_inherited_context(
+                        conn,
+                        &NodeRepo::new(conn),
+                        node_id,
+                        None,
+                    )
+                })
+                .unwrap_or_default();
             let plan_steps = self
                 .fleet
                 .list_plan_steps_for_node(node_id)
@@ -890,6 +902,7 @@ impl LifecyclePanelView {
                     node_body: body,
                     purposes,
                     obligations,
+                    ancestor_context,
                     plan_steps,
                     from_state: from_state.clone(),
                     to_state: to_state.clone(),
@@ -1002,7 +1015,18 @@ impl LifecyclePanelView {
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
                 .ok()
                 .flatten();
-            let obligations = self.fleet.resolve_obligations_for_node(node_id).unwrap_or_default();
+            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let ancestor_context = self
+                .fleet
+                .read(|conn| {
+                    tod_core::interview::context::render_inherited_context(
+                        conn,
+                        &NodeRepo::new(conn),
+                        node_id,
+                        None,
+                    )
+                })
+                .unwrap_or_default();
             let plan_steps = self
                 .fleet
                 .list_plan_steps_for_node(node_id)
@@ -1028,6 +1052,7 @@ impl LifecyclePanelView {
                     node_body: body,
                     purposes,
                     obligations,
+                    ancestor_context,
                     plan_steps,
                     from_state: lifecycle.clone(),
                     to_state: lifecycle.clone(),

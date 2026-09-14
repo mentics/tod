@@ -33,6 +33,12 @@ pub fn register_sessions_keyboard_bindings(_cx: &mut App) {
 pub enum SessionsEvent {
     ReturnToTaskList,
     ProceedToLifecycle { task_id: String, lifecycle: String },
+    /// Forwarded from the embedded obligations panel's chat icon.
+    OpenAgentChat {
+        node_id: Uuid,
+        obligation_id: Option<Uuid>,
+        config_id: Option<String>,
+    },
 }
 
 /// Hosts the single active interview [`WorkspaceView`] for the shell's Interview
@@ -324,6 +330,17 @@ impl SessionsView {
                 }
             }
             WorkspaceEvent::SessionComplete => cx.notify(),
+            WorkspaceEvent::OpenAgentChat {
+                node_id,
+                obligation_id,
+                config_id,
+            } => {
+                cx.emit(SessionsEvent::OpenAgentChat {
+                    node_id: *node_id,
+                    obligation_id: *obligation_id,
+                    config_id: config_id.clone(),
+                });
+            }
         });
         self.workspace = Some(workspace.clone());
         self._workspace_subscription = Some(subscription);

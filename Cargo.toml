@@ -15,3 +15,55 @@ opt-level = 1
 
 [profile.dev.build-override]
 opt-level = 3
+
+# `dev-fast`: use for day-to-day `cargo run` when you want GPUI running at real
+# release performance. This profile *inherits from release*, so build scripts
+# (including gpui's, which gates fxc.exe shader precompilation on
+# PROFILE=release) see PROFILE=release and dependencies are fully optimized —
+# opt-level/codegen-units cannot fake that on their own, since PROFILE is fixed
+# per build graph, not per package. Our own workspace crates are then dialed
+# back down for fast incremental rebuilds.
+# Usage: cargo run --profile dev-fast -p tod
+[profile.dev-fast]
+inherits = "release"
+incremental = true
+
+[profile.dev-fast.package.tod]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-ui]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-core]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-store]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-agent]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-cli]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.tod-integration]
+opt-level = 0
+debug = 1
+codegen-units = 256
+
+[profile.dev-fast.package.nov-viz]
+opt-level = 0
+debug = 1
+codegen-units = 256
