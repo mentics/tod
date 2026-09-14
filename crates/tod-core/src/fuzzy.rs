@@ -1,31 +1,46 @@
 //! Shared fuzzy text matching, used by the obligations list search, the
-//! node tree search box, and `tod-cli nodes search`.
+//! node tree search box, and `tod-cli node search`.
 
-/// Case-insensitive fuzzy match: `query`'s characters must appear as a
-/// subsequence of `text`. Returns a score (higher is a better match) or
-/// `None` when it doesn't match at all — an exact substring scores highest,
-/// then tighter (less gappy) subsequence matches beat looser ones.
+/// Case-insensitive, word-order-independent fuzzy match: `query` is split on
+/// whitespace, and every word must independently match somewhere in `text`
+/// (as a substring, or as an in-order subsequence for typo tolerance).
+/// Returns a summed score (higher is a better match) or `None` when any word
+/// doesn't match at all. Splitting by word means "login reusable" still
+/// matches "Reusable Login Component" even though the words are reversed —
+/// only each word's own characters need to stay in order.
 pub fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
     let text_l = text.to_lowercase();
     let query_l = query.trim().to_lowercase();
     if query_l.is_empty() {
         return Some(0);
     }
-    if text_l.contains(&query_l) {
+    let mut total = 0i32;
+    for word in query_l.split_whitespace() {
+        total += word_score(&text_l, word)?;
+    }
+    Some(total)
+}
+
+/// Score a single word (no whitespace) against the full text: an exact
+/// substring scores highest, then tighter (less gappy) subsequence matches
+/// beat looser ones. `None` when the word's characters don't appear in order
+/// at all.
+fn word_score(text_l: &str, word: &str) -> Option<i32> {
+    if text_l.contains(word) {
         return Some(10_000 - text_l.len() as i32);
     }
-    let mut query_chars = query_l.chars();
-    let mut want = query_chars.next();
+    let mut word_chars = word.chars();
+    let mut want = word_chars.next();
     let mut last_match: Option<i32> = None;
     let mut penalty = 0i32;
     for (pos, c) in text_l.chars().enumerate() {
-        let Some(qc) = want else { break };
-        if c == qc {
+        let Some(wc) = want else { break };
+        if c == wc {
             if let Some(last) = last_match {
                 penalty += pos as i32 - last - 1;
             }
             last_match = Some(pos as i32);
-            want = query_chars.next();
+            want = word_chars.next();
         }
     }
     if want.is_some() {
@@ -69,5 +84,27 @@ mod tests {
         let tight = fuzzy_score("abXcd", "abcd").unwrap();
         let loose = fuzzy_score("aXbXcXd", "abcd").unwrap();
         assert!(tight > loose);
+    }
+
+    #[test]
+    fn words_match_regardless_of_order() {
+        assert!(fuzzy_matches(
+            "login reusable",
+            "Reusable Login Component"
+        ));
+    }
+
+    #[test]
+    fn every_word_must_match_something() {
+        // "xyz" doesn't appear anywhere, so the whole query fails even
+        // though "login" does match.
+        assert!(!fuzzy_matches("login xyz", "Reusable Login Component"));
+    }
+
+    #[test]
+    fn each_word_still_tolerates_typos() {
+        // "logn" (missing 'i') and "reusabel" (transposed) both still
+        // subsequence-match their targets, out of order.
+        assert!(fuzzy_matches("reusabel logn", "Reusable Login Component"));
     }
 }
