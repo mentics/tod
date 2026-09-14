@@ -88,11 +88,15 @@ impl<'a> TaskRepo<'a> {
         let now = now_ms();
         let blob = uuid_to_blob(node_id);
         self.conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
             params![blob, task.slug, task.title, now],
         )?;
-        for cap in [Capability::Agent, Capability::Lifecycle] {
+        let mut caps = vec![Capability::Agent, Capability::Lifecycle];
+        if !task.tags.is_empty() {
+            caps.push(Capability::Tags);
+        }
+        for cap in caps {
             self.conn.execute(
                 "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, ?2, ?3)",
                 params![blob, cap.as_str(), now],
@@ -103,18 +107,21 @@ impl<'a> TaskRepo<'a> {
             params![blob, task.lifecycle, now],
         )?;
         self.conn.execute(
-            "INSERT INTO node_fields (node_id, repo, branch, notes, tags, linked_issues, linked_prs, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 blob,
                 task.repo,
                 task.branch,
                 json_notes(&task.notes)?,
-                json_array(&task.tags)?,
                 json_array(&task.linked_issues)?,
                 json_array(&task.linked_prs)?,
                 now
             ],
+        )?;
+        self.conn.execute(
+            "INSERT INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)",
+            params![blob, json_array(&task.tags)?, now],
         )?;
         Ok(())
     }
@@ -122,17 +129,6 @@ impl<'a> TaskRepo<'a> {
     pub fn update_title(&self, id: &str, title: &str) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
         NodeRepo::new(self.conn).update_title(node_id, title)?;
-        NodeRepo::new(self.conn).sync_auto_slug(node_id)?;
-        Ok(())
-    }
-
-    pub fn update_slug(&self, id: &str, slug: &str) -> Result<(), TaskRepoError> {
-        let node_id = Self::parse_node_id(id)?;
-        let now = now_ms();
-        self.conn.execute(
-            "UPDATE nodes SET slug = ?2, slug_manual = 1, updated_at = ?3 WHERE id = ?1",
-            params![uuid_to_blob(node_id), slug, now],
-        )?;
         Ok(())
     }
 
@@ -179,9 +175,15 @@ impl<'a> TaskRepo<'a> {
 
     pub fn update_tags(&self, id: &str, tags: &[String]) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
-        self.ensure_fields_row(node_id)?;
+        if !tags.is_empty() {
+            let caps = NodeRepo::new(self.conn).list_capabilities(node_id)?;
+            if !caps.contains(&Capability::Tags) {
+                NodeRepo::new(self.conn).enable_capability(node_id, Capability::Tags)?;
+            }
+        }
         self.conn.execute(
-            "UPDATE node_fields SET tags = ?2, updated_at = ?3 WHERE node_id = ?1",
+            "INSERT INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(node_id) DO UPDATE SET tags = excluded.tags, updated_at = excluded.updated_at",
             params![uuid_to_blob(node_id), json_array(tags)?, now_ms()],
         )?;
         Ok(())
@@ -198,7 +200,6 @@ impl<'a> TaskRepo<'a> {
             "UPDATE node_fields SET linked_issues = ?2, updated_at = ?3 WHERE node_id = ?1",
             params![uuid_to_blob(node_id), json_array(linked_issues)?, now_ms()],
         )?;
-        NodeRepo::new(self.conn).sync_auto_slug(node_id)?;
         Ok(())
     }
 
@@ -218,11 +219,12 @@ impl<'a> TaskRepo<'a> {
             .query_row(
                 "SELECT n.id, n.title, n.slug,
                         COALESCE(l.state, 'proposed'),
-                        f.repo, f.branch, f.notes, f.tags, f.linked_issues, f.linked_prs
+                        f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
                  FROM nodes n
                  INNER JOIN node_capabilities c ON c.node_id = n.id AND c.capability = 'agent'
                  LEFT JOIN node_lifecycle l ON l.node_id = n.id
                  LEFT JOIN node_fields f ON f.node_id = n.id
+                 LEFT JOIN node_tags t ON t.node_id = n.id
                  WHERE n.id = ?1",
                 params![uuid_to_blob(node_id)],
                 row_to_task,
@@ -238,10 +240,11 @@ impl<'a> TaskRepo<'a> {
             .query_row(
                 "SELECT n.id, n.title, n.slug,
                         COALESCE(l.state, 'proposed'),
-                        f.repo, f.branch, f.notes, f.tags, f.linked_issues, f.linked_prs
+                        f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
                  FROM nodes n
                  LEFT JOIN node_lifecycle l ON l.node_id = n.id
                  LEFT JOIN node_fields f ON f.node_id = n.id
+                 LEFT JOIN node_tags t ON t.node_id = n.id
                  WHERE n.id = ?1",
                 params![uuid_to_blob(node_id)],
                 row_to_task,
@@ -254,11 +257,12 @@ impl<'a> TaskRepo<'a> {
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.title, n.slug,
                     COALESCE(l.state, 'proposed'),
-                    f.repo, f.branch, f.notes, f.tags, f.linked_issues, f.linked_prs
+                    f.repo, f.branch, f.notes, t.tags, f.linked_issues, f.linked_prs
              FROM nodes n
              INNER JOIN node_capabilities c ON c.node_id = n.id AND c.capability = 'agent'
              LEFT JOIN node_lifecycle l ON l.node_id = n.id
              LEFT JOIN node_fields f ON f.node_id = n.id
+             LEFT JOIN node_tags t ON t.node_id = n.id
              ORDER BY lower(n.title)",
         )?;
         let rows = stmt
@@ -292,8 +296,8 @@ impl<'a> TaskRepo<'a> {
     fn ensure_fields_row(&self, node_id: Uuid) -> Result<(), TaskRepoError> {
         let now = now_ms();
         self.conn.execute(
-            "INSERT OR IGNORE INTO node_fields (node_id, tags, linked_issues, linked_prs, updated_at)
-             VALUES (?1, '[]', '[]', '[]', ?2)",
+            "INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
+             VALUES (?1, '[]', '[]', ?2)",
             params![uuid_to_blob(node_id), now],
         )?;
         Ok(())

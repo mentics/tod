@@ -30,13 +30,14 @@ pub struct ArchivedNode {
     pub title: String,
     pub kind: String,
     pub ref_target_id: Option<Uuid>,
-    pub slug_manual: bool,
     pub created_at: i64,
     pub updated_at: i64,
     pub outline: ArchivedOutlineEntry,
     pub capabilities: Vec<String>,
     pub lifecycle: Option<String>,
     pub fields: Option<ArchivedFields>,
+    #[serde(default)]
+    pub tags: Option<ArchivedTags>,
     pub obligations: Vec<ArchivedObligation>,
     pub capability_archives: Vec<ArchivedCapabilityArchive>,
 }
@@ -54,9 +55,14 @@ pub struct ArchivedFields {
     pub repo: Option<String>,
     pub branch: Option<String>,
     pub notes: Option<String>,
-    pub tags: String,
     pub linked_issues: String,
     pub linked_prs: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedTags {
+    pub tags: String,
     pub updated_at: i64,
 }
 
@@ -251,7 +257,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         .optional()?;
     let fields = conn
         .query_row(
-            "SELECT repo, branch, notes, tags, linked_issues, linked_prs, updated_at
+            "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
              FROM node_fields WHERE node_id = ?1",
             params![uuid_to_blob(node_id)],
             |row| {
@@ -259,10 +265,21 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
                     repo: row.get(0)?,
                     branch: row.get(1)?,
                     notes: row.get(2)?,
-                    tags: row.get(3)?,
-                    linked_issues: row.get(4)?,
-                    linked_prs: row.get(5)?,
-                    updated_at: row.get(6)?,
+                    linked_issues: row.get(3)?,
+                    linked_prs: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    let tags = conn
+        .query_row(
+            "SELECT tags, updated_at FROM node_tags WHERE node_id = ?1",
+            params![uuid_to_blob(node_id)],
+            |row| {
+                Ok(ArchivedTags {
+                    tags: row.get(0)?,
+                    updated_at: row.get(1)?,
                 })
             },
         )
@@ -314,7 +331,6 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         title: node.title,
         kind: node.kind.as_str().to_string(),
         ref_target_id: node.ref_target_id,
-        slug_manual: node.slug_manual,
         created_at: node.created_at.timestamp_millis(),
         updated_at: node.updated_at.timestamp_millis(),
         outline: ArchivedOutlineEntry {
@@ -326,6 +342,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         capabilities,
         lifecycle,
         fields,
+        tags,
         obligations,
         capability_archives,
     })
@@ -355,7 +372,7 @@ pub fn build_capability_disable_payload(
         Capability::Agent => {
             let fields = conn
                 .query_row(
-                    "SELECT repo, branch, notes, tags, linked_issues, linked_prs, updated_at
+                    "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
                      FROM node_fields WHERE node_id = ?1",
                     params![uuid_to_blob(node_id)],
                     |row| {
@@ -363,15 +380,29 @@ pub fn build_capability_disable_payload(
                             repo: row.get(0)?,
                             branch: row.get(1)?,
                             notes: row.get(2)?,
-                            tags: row.get(3)?,
-                            linked_issues: row.get(4)?,
-                            linked_prs: row.get(5)?,
-                            updated_at: row.get(6)?,
+                            linked_issues: row.get(3)?,
+                            linked_prs: row.get(4)?,
+                            updated_at: row.get(5)?,
                         })
                     },
                 )
                 .optional()?;
             serde_json::json!({ "fields": fields })
+        }
+        Capability::Tags => {
+            let tags = conn
+                .query_row(
+                    "SELECT tags, updated_at FROM node_tags WHERE node_id = ?1",
+                    params![uuid_to_blob(node_id)],
+                    |row| {
+                        Ok(ArchivedTags {
+                            tags: row.get(0)?,
+                            updated_at: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?;
+            serde_json::json!({ "tags": tags })
         }
         Capability::Generator => {
             // Generator config archival will be implemented with the generator schema tables.
@@ -410,15 +441,14 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     let blob = uuid_to_blob(archived.id);
     let ref_blob = archived.ref_target_id.map(uuid_to_blob);
     conn.execute(
-        "INSERT OR IGNORE INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR IGNORE INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             blob,
             archived.slug,
             archived.title,
             archived.kind,
             ref_blob,
-            i32::from(archived.slug_manual),
             archived.created_at,
             archived.updated_at,
         ],
@@ -450,18 +480,23 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     }
     if let Some(fields) = &archived.fields {
         conn.execute(
-            "INSERT OR IGNORE INTO node_fields (node_id, repo, branch, notes, tags, linked_issues, linked_prs, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 blob,
                 fields.repo,
                 fields.branch,
                 fields.notes,
-                fields.tags,
                 fields.linked_issues,
                 fields.linked_prs,
                 fields.updated_at,
             ],
+        )?;
+    }
+    if let Some(tags) = &archived.tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)",
+            params![blob, tags.tags, tags.updated_at],
         )?;
     }
     for obl in &archived.obligations {

@@ -24,7 +24,6 @@ use tod_store::{CredentialStore, resolve_linear_api_key};
 
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
-const SLUG_MAX_LEN: usize = 120;
 const MAX_TAGS: usize = 10;
 const MULTI_LINE_ROWS: f32 = 4.;
 const DETAILS_ROWS: f32 = 6.;
@@ -40,7 +39,6 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Title => "task-edit-field-title",
         TaskEditField::LinearLink => "task-edit-field-linear-link",
         TaskEditField::GithubPr => "task-edit-field-github-pr",
-        TaskEditField::Slug => "task-edit-field-slug",
         TaskEditField::Tags => "task-edit-field-tags",
         TaskEditField::Repo => "task-edit-field-repo",
         TaskEditField::Branch => "task-edit-field-branch",
@@ -51,6 +49,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Spec) => "task-edit-field-cap-spec",
         TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
         TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
+        TaskEditField::Capability(Capability::Tags) => "task-edit-field-cap-tags",
     }
 }
 
@@ -72,7 +71,6 @@ enum TaskEditField {
     Title,
     LinearLink,
     GithubPr,
-    Slug,
     Tags,
     Repo,
     Branch,
@@ -113,7 +111,6 @@ pub struct TaskEditView {
     task_id: Option<String>,
     focus_handle: FocusHandle,
     title_input: Entity<InputState>,
-    slug_input: Entity<InputState>,
     linear_input: Entity<InputState>,
     github_pr_input: Entity<InputState>,
     repo_input: Entity<InputState>,
@@ -141,8 +138,6 @@ pub struct TaskEditView {
     obligation_constraints: usize,
     pending_toast: Option<String>,
     pending_title_revert: bool,
-    pending_slug_revert: bool,
-    pending_slug_update: Option<String>,
     pending_repo_revert: bool,
     pending_branch_revert: bool,
     pending_clear_tag_draft: bool,
@@ -162,7 +157,6 @@ pub struct TaskEditView {
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
     _title_subscription: Subscription,
-    _slug_subscription: Subscription,
     _linear_subscription: Subscription,
     _github_subscription: Subscription,
     _repo_subscription: Subscription,
@@ -178,8 +172,6 @@ impl TaskEditView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
         let title_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Task title"));
-        let slug_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · slug"));
         let linear_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · TOD-142 or URL"));
         let github_pr_input =
@@ -221,11 +213,6 @@ impl TaskEditView {
         let _title_subscription = cx.subscribe(&title_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                 this.persist_title(cx);
-            }
-        });
-        let _slug_subscription = cx.subscribe(&slug_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.persist_slug(cx);
             }
         });
         let _linear_subscription = cx.subscribe(&linear_input, |this, _, event, cx| {
@@ -280,7 +267,6 @@ impl TaskEditView {
             task_id: None,
             focus_handle: cx.focus_handle(),
             title_input,
-            slug_input,
             linear_input,
             github_pr_input,
             repo_input,
@@ -316,8 +302,6 @@ impl TaskEditView {
             obligation_constraints: 0,
             pending_toast: None,
             pending_title_revert: false,
-            pending_slug_revert: false,
-            pending_slug_update: None,
             pending_repo_revert: false,
             pending_branch_revert: false,
             pending_clear_tag_draft: false,
@@ -329,7 +313,6 @@ impl TaskEditView {
             pending_linear_ticket: None,
             pending_linear_apply: None,
             _title_subscription,
-            _slug_subscription,
             _linear_subscription,
             _github_subscription,
             _repo_subscription,
@@ -404,11 +387,12 @@ impl TaskEditView {
             stops.extend([
                 TaskEditField::LinearLink,
                 TaskEditField::GithubPr,
-                TaskEditField::Slug,
-                TaskEditField::Tags,
                 TaskEditField::Repo,
                 TaskEditField::Branch,
             ]);
+        }
+        if self.capability_enabled(Capability::Tags) {
+            stops.push(TaskEditField::Tags);
         }
         if self.capability_enabled(Capability::Spec) {
             stops.push(TaskEditField::Purpose);
@@ -480,7 +464,6 @@ impl TaskEditView {
             TaskEditField::Title => self.title_input.clone(),
             TaskEditField::LinearLink => self.linear_input.clone(),
             TaskEditField::GithubPr => self.github_pr_input.clone(),
-            TaskEditField::Slug => self.slug_input.clone(),
             TaskEditField::Tags => self.tag_draft_input.clone(),
             TaskEditField::Repo => self.repo_input.clone(),
             TaskEditField::Branch => self.branch_input.clone(),
@@ -560,11 +543,10 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 8] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
-            (TaskEditField::Slug, self.slug_input.clone()),
             (TaskEditField::Tags, self.tag_draft_input.clone()),
             (TaskEditField::Repo, self.repo_input.clone()),
             (TaskEditField::Branch, self.branch_input.clone()),
@@ -580,11 +562,10 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, Entity<InputState>); 9] = [
+        let inputs: [(TaskEditField, Entity<InputState>); 8] = [
             (TaskEditField::Title, self.title_input.clone()),
             (TaskEditField::LinearLink, self.linear_input.clone()),
             (TaskEditField::GithubPr, self.github_pr_input.clone()),
-            (TaskEditField::Slug, self.slug_input.clone()),
             (TaskEditField::Tags, self.tag_draft_input.clone()),
             (TaskEditField::Repo, self.repo_input.clone()),
             (TaskEditField::Branch, self.branch_input.clone()),
@@ -619,18 +600,6 @@ impl TaskEditView {
                 input.set_value(title, window, cx);
             });
         }
-        if self.pending_slug_revert {
-            self.pending_slug_revert = false;
-            let slug = self.loaded_slug.clone();
-            self.slug_input.update(cx, |input, cx| {
-                input.set_value(slug, window, cx);
-            });
-        }
-        if let Some(slug) = self.pending_slug_update.take() {
-            self.slug_input.update(cx, |input, cx| {
-                input.set_value(slug, window, cx);
-            });
-        }
         if self.pending_repo_revert {
             self.pending_repo_revert = false;
             let repo = self.loaded_repo.clone();
@@ -658,23 +627,10 @@ impl TaskEditView {
             return false;
         };
         let _ = self.fleet.reload_if_stale();
-        let mut task = match self.fleet.get_node(&task_id) {
+        let task = match self.fleet.get_node(&task_id) {
             Ok(Some(task)) => task,
             _ => return false,
         };
-
-        if task.slug.starts_with("node-") {
-            let id = task_id.clone();
-            let title = task.title.clone();
-            let _ = self
-                .fleet
-                .enqueue(FleetMutation::UpdateTaskTitle { id, title });
-            let _ = self.fleet.writer().flush();
-            let _ = self.fleet.reload_if_stale();
-            if let Ok(Some(updated)) = self.fleet.get_node(&task_id) {
-                task = updated;
-            }
-        }
 
         self.loaded_title = task.title.clone();
         self.loaded_slug = task.slug.clone();
@@ -724,9 +680,6 @@ impl TaskEditView {
 
         self.title_input.update(cx, |input, cx| {
             input.set_value(task.title, window, cx);
-        });
-        self.slug_input.update(cx, |input, cx| {
-            input.set_value(task.slug, window, cx);
         });
         self.linear_input.update(cx, |input, cx| {
             input.set_value(linear, window, cx);
@@ -1060,7 +1013,6 @@ impl TaskEditView {
                 if cap == Capability::Agent {
                     self.loaded_repo.clear();
                     self.loaded_branch.clear();
-                    self.tags.clear();
                     self.repo_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
@@ -1073,6 +1025,9 @@ impl TaskEditView {
                     self.github_pr_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
+                }
+                if cap == Capability::Tags {
+                    self.tags.clear();
                 }
                 if cap == Capability::Generator {
                     self.load_generator_config(window, cx);
@@ -1129,65 +1084,6 @@ impl TaskEditView {
             return;
         }
         self.loaded_title = title;
-        self.refresh_auto_slug(cx);
-    }
-
-    /// Flush pending writes and sync the slug field when auto-slug regeneration ran.
-    fn refresh_auto_slug(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.task_id() else {
-            return;
-        };
-        if self.fleet.writer().flush().is_err() {
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
-        let Ok(Some(task)) = self.fleet.get_node(&id) else {
-            return;
-        };
-        if task.slug == self.loaded_slug {
-            return;
-        }
-        self.loaded_slug = task.slug.clone();
-        self.pending_slug_update = Some(task.slug);
-        cx.notify();
-    }
-
-    fn persist_slug(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.task_id() else {
-            return;
-        };
-        let slug = input_text(&self.slug_input, cx).trim().to_string();
-        if slug.is_empty() {
-            self.pending_toast = Some("Slug cannot be empty".into());
-            self.pending_slug_revert = true;
-            cx.notify();
-            return;
-        }
-        if slug.len() > SLUG_MAX_LEN {
-            self.pending_toast = Some("Slug is too long (max 120 characters)".into());
-            self.pending_slug_revert = true;
-            cx.notify();
-            return;
-        }
-        if slug == self.loaded_slug {
-            return;
-        }
-        if self.slug_collides(&id, &slug) {
-            self.pending_toast = Some("Another task already has this slug".into());
-            self.pending_slug_revert = true;
-            cx.notify();
-            return;
-        }
-        if let Err(err) = self.fleet.enqueue(FleetMutation::UpdateTaskSlug {
-            id,
-            slug: slug.clone(),
-        }) {
-            self.pending_toast = Some(format!("Failed to save slug: {err}"));
-            self.pending_slug_revert = true;
-            cx.notify();
-            return;
-        }
-        self.loaded_slug = slug;
     }
 
     fn queue_linear_import(&mut self, cx: &mut Context<Self>) {
@@ -1209,7 +1105,6 @@ impl TaskEditView {
                 id,
                 linked_issues: Vec::new(),
             });
-            self.refresh_auto_slug(cx);
             return;
         }
         let Some(ticket) = parse_ticket_reference(raw_ticket) else {
@@ -1217,7 +1112,6 @@ impl TaskEditView {
                 id,
                 linked_issues: vec![raw_ticket.to_string()],
             });
-            self.refresh_auto_slug(cx);
             return;
         };
         let store = CredentialStore::from_data_root(self.fleet.paths().root());
@@ -1226,7 +1120,6 @@ impl TaskEditView {
                 id,
                 linked_issues: vec![ticket.clone()],
             });
-            self.refresh_auto_slug(cx);
             self.pending_toast = Some(
                 "Linear API key not configured — linked ticket only; purpose not imported".into(),
             );
@@ -1304,7 +1197,6 @@ impl TaskEditView {
                 self.linear_input.update(cx, |input, cx| {
                     input.set_value(issue.identifier, window, cx);
                 });
-                self.refresh_auto_slug(cx);
             }
             Err(err) => {
                 let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
@@ -1538,14 +1430,6 @@ impl TaskEditView {
             tasks
                 .iter()
                 .any(|t| t.id != id && t.title.eq_ignore_ascii_case(title))
-        })
-    }
-
-    fn slug_collides(&self, id: &str, slug: &str) -> bool {
-        self.fleet.list_tasks().ok().is_some_and(|tasks| {
-            tasks
-                .iter()
-                .any(|t| t.id != id && t.slug.eq_ignore_ascii_case(slug))
         })
     }
 
@@ -1794,7 +1678,7 @@ impl TaskEditView {
         }
     }
 
-    fn render_agent_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_agent_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_2()
             .px_3()
@@ -1821,40 +1705,19 @@ impl TaskEditView {
                         cx,
                     ))
                     .child(
-                        self.apply_focus_scroll_anchor(
-                            TaskEditField::Slug,
-                            v_flex()
-                                .id(field_anchor_id(TaskEditField::Slug))
-                                .gap_1()
-                                .w(px(180.))
-                                .flex_shrink_0()
-                                .child(Self::render_field_label("Slug", cx))
-                                .child(self.render_nav_input(
-                                    TaskEditField::Slug,
-                                    &self.slug_input,
-                                    None,
-                                    window,
-                                    cx,
-                                )),
-                        ),
+                        v_flex()
+                            .id("task-edit-field-slug")
+                            .gap_1()
+                            .w(px(180.))
+                            .flex_shrink_0()
+                            .child(Self::render_field_label("Slug", cx))
+                            .child(selectable_text(
+                                "task-edit-slug-value",
+                                self.loaded_slug.clone(),
+                                window,
+                                cx,
+                            )),
                     ),
-            )
-            .child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::Tags,
-                    v_flex()
-                        .id(field_anchor_id(TaskEditField::Tags))
-                        .gap_1()
-                        .w_full()
-                        .rounded_md()
-                        .when(self.field_nav_focused(TaskEditField::Tags), |el| {
-                            el.bg(cx.theme().list_active)
-                                .border_1()
-                                .border_color(cx.theme().list_active_border)
-                        })
-                        .child(Self::render_field_label("Tags", cx))
-                        .child(self.render_tags(window, cx)),
-                ),
             )
             .child(
                 h_flex()
@@ -2141,12 +2004,56 @@ impl TaskEditView {
         cap_index: usize,
         background: gpui::Hsla,
         border: gpui::Hsla,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let cap = Capability::Agent;
         let body: Option<gpui::AnyElement> = if self.capability_enabled(cap) {
             Some(self.render_agent_body(window, cx).into_any_element())
+        } else {
+            None
+        };
+        let legend = self
+            .render_section_legend(cap, cap_index, background, cx)
+            .into_any_element();
+        Self::render_legend_border_section(border, legend, body)
+    }
+
+    fn render_tags_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .px_3()
+            .pb_3()
+            .child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::Tags,
+                    v_flex()
+                        .id(field_anchor_id(TaskEditField::Tags))
+                        .gap_1()
+                        .w_full()
+                        .rounded_md()
+                        .when(self.field_nav_focused(TaskEditField::Tags), |el| {
+                            el.bg(cx.theme().list_active)
+                                .border_1()
+                                .border_color(cx.theme().list_active_border)
+                        })
+                        .child(Self::render_field_label("Tags", cx))
+                        .child(self.render_tags(window, cx)),
+                ),
+            )
+    }
+
+    fn render_tags_section(
+        &self,
+        cap_index: usize,
+        background: gpui::Hsla,
+        border: gpui::Hsla,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let cap = Capability::Tags;
+        let body: Option<gpui::AnyElement> = if self.capability_enabled(cap) {
+            Some(self.render_tags_body(window, cx).into_any_element())
         } else {
             None
         };
@@ -2465,6 +2372,9 @@ impl TaskEditView {
                 .into_any_element(),
             Capability::Generator => self
                 .render_generator_section(cap_index, background, border, muted, window, cx)
+                .into_any_element(),
+            Capability::Tags => self
+                .render_tags_section(cap_index, background, border, window, cx)
                 .into_any_element(),
         }
     }

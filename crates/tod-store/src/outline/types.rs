@@ -32,6 +32,7 @@ pub enum Capability {
     Lifecycle,
     Agent,
     Generator,
+    Tags,
 }
 
 impl Capability {
@@ -41,6 +42,7 @@ impl Capability {
             Self::Lifecycle => "lifecycle",
             Self::Agent => "agent",
             Self::Generator => "generator",
+            Self::Tags => "tags",
         }
     }
 
@@ -50,11 +52,18 @@ impl Capability {
             "lifecycle" => Some(Self::Lifecycle),
             "agent" => Some(Self::Agent),
             "generator" => Some(Self::Generator),
+            "tags" => Some(Self::Tags),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 4] = [Self::Spec, Self::Lifecycle, Self::Agent, Self::Generator];
+    pub const ALL: [Self; 5] = [
+        Self::Spec,
+        Self::Lifecycle,
+        Self::Agent,
+        Self::Generator,
+        Self::Tags,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -62,6 +71,7 @@ impl Capability {
             Self::Lifecycle => "Lifecycle",
             Self::Agent => "Agent",
             Self::Generator => "Generator",
+            Self::Tags => "Tags",
         }
     }
 
@@ -69,8 +79,9 @@ impl Capability {
         match self {
             Self::Spec => "Requirements, constraints, and interview artifacts",
             Self::Lifecycle => "Process state and lifecycle transitions",
-            Self::Agent => "Repository, tags, links, and agent workspace",
+            Self::Agent => "Repository, links, and agent workspace",
             Self::Generator => "Automatically produce and manage descendant nodes from an external data source",
+            Self::Tags => "Freeform labels for organizing and filtering nodes",
         }
     }
 
@@ -81,11 +92,12 @@ impl Capability {
             }
             Self::Lifecycle => "Disabling Lifecycle will remove this node's lifecycle state.",
             Self::Agent => {
-                "Disabling Agent will remove repository settings, tags, links, and notes stored on this node."
+                "Disabling Agent will remove repository settings, links, and notes stored on this node."
             }
             Self::Generator => {
                 "Disabling Generator will permanently delete all managed child nodes under this node."
             }
+            Self::Tags => "Disabling Tags will remove this node's tags.",
         }
     }
 
@@ -131,7 +143,6 @@ pub struct Node {
     pub title: String,
     pub kind: NodeKind,
     pub ref_target_id: Option<Uuid>,
-    pub slug_manual: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
