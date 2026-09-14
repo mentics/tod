@@ -32,10 +32,6 @@ pub enum FleetMutation {
         id: String,
         title: String,
     },
-    UpdateTaskSlug {
-        id: String,
-        slug: String,
-    },
     UpdateTaskNotes {
         id: String,
         notes: Vec<crate::fleet::repos::task::NoteItem>,
@@ -274,9 +270,6 @@ impl FleetMutation {
         match self {
             FleetMutation::UpdateTaskTitle { id, title } => {
                 TaskRepo::new(conn).update_title(id, title)?;
-            }
-            FleetMutation::UpdateTaskSlug { id, slug } => {
-                TaskRepo::new(conn).update_slug(id, slug)?;
             }
             FleetMutation::UpdateTaskNotes { id, notes } => {
                 TaskRepo::new(conn).update_notes(id, notes)?;

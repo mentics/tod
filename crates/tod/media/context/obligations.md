@@ -31,8 +31,9 @@ requirements and constraints get broken into plan steps (see the `plan` noun
 above), and each step can be linked to the obligation it satisfies. If you
 add, change, or delete an obligation on a node that already has plan steps:
 
-- Run `tod-cli plan list --node <NODE_UUID>` to see whether any step links to
-  the obligation you touched (`satisfies=[...]` in the listing).
+- Run `plan list` (see the shared command reference loaded earlier in this
+  context) to see whether any step links to the obligation you touched
+  (`satisfies=[...]` in the listing).
 - For a changed obligation, check whether the linked step's body still
   matches — update it if not.
 - For a new requirement/constraint, consider whether it needs a new plan step,

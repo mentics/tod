@@ -32,10 +32,8 @@ hierarchy above — check there first. Reach for `tod-cli` only when:
 - you need to re-check current state, since obligations can change after this
   session started and the inlined copy will not reflect that.
 
-```
-tod-cli --data-root <DATA_ROOT> obligations show <OBLIGATION_UUID> --node <NODE_UUID>
-tod-cli --data-root <DATA_ROOT> obligations list --node <NODE_UUID> [--kind requirement|constraint]
-```
+Use `obligations show`/`obligations list` — see the shared command reference
+loaded earlier in this context for exact syntax.
 
 `obligations list --kind constraint` is the way to re-verify every constraint
 still holds before you consider a plan step done — don't rely on memory of the

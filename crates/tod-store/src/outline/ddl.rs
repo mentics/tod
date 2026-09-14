@@ -18,7 +18,6 @@ CREATE TABLE IF NOT EXISTS nodes (
     kind            TEXT NOT NULL DEFAULT 'normal'
                     CHECK (kind IN ('normal', 'reference')),
     ref_target_id   BLOB REFERENCES nodes(id) ON DELETE RESTRICT,
-    slug_manual     INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     CHECK (
@@ -31,7 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_nodes_ref_target ON nodes(ref_target_id);
 
 CREATE TABLE IF NOT EXISTS node_capabilities (
     node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
+    capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags')),
     enabled_at  INTEGER NOT NULL,
     PRIMARY KEY (node_id, capability)
 );
@@ -39,7 +38,7 @@ CREATE TABLE IF NOT EXISTS node_capabilities (
 CREATE TABLE IF NOT EXISTS capability_archives (
     id              BLOB PRIMARY KEY NOT NULL,
     node_id         BLOB NOT NULL,
-    capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator')),
+    capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags')),
     archived_at     INTEGER NOT NULL,
     payload         TEXT NOT NULL
 );
@@ -117,10 +116,15 @@ CREATE TABLE IF NOT EXISTS node_fields (
     repo            TEXT,
     branch          TEXT,
     notes           TEXT,
-    tags            TEXT NOT NULL DEFAULT '[]',
     linked_issues   TEXT NOT NULL DEFAULT '[]',
     linked_prs      TEXT NOT NULL DEFAULT '[]',
     updated_at      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS node_tags (
+    node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    tags        TEXT NOT NULL DEFAULT '[]',
+    updated_at  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS media_assets (

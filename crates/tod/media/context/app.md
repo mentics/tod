@@ -36,19 +36,33 @@ tod-cli --data-root <DATA_ROOT> <noun> <command> [options]
 Add `--json` to any read command when you want to parse the result rather than
 read it.
 
-### nodes
+### node
 
-Use this to find another node when you only have an approximate title — e.g.
-the user says "base this on that reusable login component over there" and
-you need its id to reference or inspect it. The match is fuzzy (typo- and
-skipped-letter-tolerant), not exact.
+Every node has a stable, unique **slug**, shown alongside its title. Nodes may
+be addressed by slug or by full UUID everywhere a `<SLUG_OR_UUID>` argument is
+expected below — prefer the slug once you know it, since it stays valid even
+if the node is renamed.
 
 ```
-tod-cli --data-root <DATA_ROOT> nodes search --query <TEXT> [--limit N]
+tod-cli --data-root <DATA_ROOT> node list   [--parent <SLUG_OR_UUID>]
+tod-cli --data-root <DATA_ROOT> node show   <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node search --query <TEXT> [--limit N]
+tod-cli --data-root <DATA_ROOT> node create --title <TEXT> (--parent <SLUG_OR_UUID> | --list <SLUG_OR_UUID>) [--after <SLUG_OR_UUID>] [--before]
+tod-cli --data-root <DATA_ROOT> node rename <SLUG_OR_UUID> --title <TEXT>
+tod-cli --data-root <DATA_ROOT> node move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
+tod-cli --data-root <DATA_ROOT> node delete <SLUG_OR_UUID>
 ```
 
-Returns up to `--limit` (default 10) results, best match first, one per line
-as `<NODE_UUID> <slug> — <title>`.
+`delete` removes the node and its entire subtree (archived for undo, same as
+the app). A node's slug may change on rename if it was auto-derived from the
+title — address it by id in scripts that rename and then reuse the reference.
+
+Use `search` to find another node when you only have an approximate title —
+e.g. the user says "base this on that reusable login component over there"
+and you need its id or slug to reference or inspect it. The match is fuzzy
+(typo- and skipped-letter-tolerant), not exact; it returns up to `--limit`
+(default 10) results across every list, best match first, one per line as
+`<NODE_UUID> <slug> <title>`.
 
 ### obligations
 

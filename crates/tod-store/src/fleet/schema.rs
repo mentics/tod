@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 21;
+pub const CURRENT_USER_VERSION: i32 = 23;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -196,11 +196,163 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v20_to_v21(conn)?;
         conn.pragma_update(None, "user_version", 21)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 22 {
+        migrate_v21_to_v22(conn)?;
+        conn.pragma_update(None, "user_version", 22)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 23 {
+        migrate_v22_to_v23(conn)?;
+        conn.pragma_update(None, "user_version", 23)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Slugs are now permanently immutable (assigned once at creation and never
+/// regenerated on title/ticket changes, nor editable by the user), so the
+/// `slug_manual` flag that used to distinguish "auto-derived" from
+/// "user-overridden" slugs no longer means anything — drop the column.
+fn migrate_v22_to_v23(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let has_slug_manual: bool = tx
+        .prepare("SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'slug_manual'")?
+        .exists([])?;
+    if has_slug_manual {
+        tx.execute_batch(
+            "
+            CREATE TABLE nodes_v23 (
+                id              BLOB PRIMARY KEY NOT NULL,
+                slug            TEXT NOT NULL UNIQUE CHECK (length(slug) <= 40),
+                title           TEXT NOT NULL,
+                kind            TEXT NOT NULL DEFAULT 'normal'
+                                CHECK (kind IN ('normal', 'reference')),
+                ref_target_id   BLOB REFERENCES nodes(id) ON DELETE RESTRICT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                CHECK (
+                    (kind = 'reference' AND ref_target_id IS NOT NULL)
+                    OR (kind = 'normal' AND ref_target_id IS NULL)
+                )
+            );
+            INSERT INTO nodes_v23 (id, slug, title, kind, ref_target_id, created_at, updated_at)
+                SELECT id, slug, title, kind, ref_target_id, created_at, updated_at FROM nodes;
+            DROP INDEX IF EXISTS idx_nodes_slug_folded;
+            DROP INDEX IF EXISTS idx_nodes_ref_target;
+            DROP TABLE nodes;
+            ",
+        )?;
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch("ALTER TABLE nodes_v23 RENAME TO nodes;")?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        tx.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_slug_folded ON nodes(lower(slug));
+            CREATE INDEX IF NOT EXISTS idx_nodes_ref_target ON nodes(ref_target_id);
+            ",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Move tags off the Agent capability's `node_fields` table onto their own
+/// `node_tags` table, gated by a new standalone `Tags` capability — so a node
+/// can carry tags independently of Agent. Nodes with non-empty tags today
+/// get the Tags capability enabled so their tags stay visible after the move.
+fn migrate_v21_to_v22(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    // ── 1. Rebuild node_capabilities / capability_archives CHECK to allow 'tags' ──
+    tx.execute_batch(
+        "
+        CREATE TABLE node_capabilities_v22 (
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags')),
+            enabled_at  INTEGER NOT NULL,
+            PRIMARY KEY (node_id, capability)
+        );
+        INSERT INTO node_capabilities_v22 SELECT node_id, capability, enabled_at FROM node_capabilities;
+        DROP TABLE node_capabilities;
+        ",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE node_capabilities_v22 RENAME TO node_capabilities;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+
+    tx.execute_batch(
+        "
+        CREATE TABLE capability_archives_v22 (
+            id              BLOB PRIMARY KEY NOT NULL,
+            node_id         BLOB NOT NULL,
+            capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags')),
+            archived_at     INTEGER NOT NULL,
+            payload         TEXT NOT NULL
+        );
+        INSERT INTO capability_archives_v22 SELECT id, node_id, capability, archived_at, payload FROM capability_archives;
+        DROP INDEX IF EXISTS idx_capability_archives_node;
+        DROP TABLE capability_archives;
+        ",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE capability_archives_v22 RENAME TO capability_archives;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_capability_archives_node ON capability_archives(node_id, archived_at);",
+    )?;
+
+    // ── 2. Create node_tags and migrate data out of node_fields.tags ──
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS node_tags (
+            node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            tags        TEXT NOT NULL DEFAULT '[]',
+            updated_at  INTEGER NOT NULL
+        );
+        ",
+    )?;
+    let has_tags_column: bool = tx
+        .prepare("SELECT 1 FROM pragma_table_info('node_fields') WHERE name = 'tags'")?
+        .exists([])?;
+    if has_tags_column {
+        tx.execute_batch(
+            "INSERT INTO node_tags (node_id, tags, updated_at)
+             SELECT node_id, tags, updated_at FROM node_fields;",
+        )?;
+        // Enable the Tags capability for every node whose migrated tags are non-empty.
+        tx.execute_batch(
+            "INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
+             SELECT node_id, 'tags', updated_at FROM node_tags WHERE tags != '[]';",
+        )?;
+
+        // Rebuild node_fields without the tags column.
+        tx.execute_batch(
+            "
+            CREATE TABLE node_fields_v22 (
+                node_id         BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                repo            TEXT,
+                branch          TEXT,
+                notes           TEXT,
+                linked_issues   TEXT NOT NULL DEFAULT '[]',
+                linked_prs      TEXT NOT NULL DEFAULT '[]',
+                updated_at      INTEGER NOT NULL
+            );
+            INSERT INTO node_fields_v22 (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+                SELECT node_id, repo, branch, notes, linked_issues, linked_prs, updated_at FROM node_fields;
+            DROP TABLE node_fields;
+            ",
+        )?;
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch("ALTER TABLE node_fields_v22 RENAME TO node_fields;")?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -805,8 +957,8 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
             let node_id = Uuid::new_v4();
             let blob = uuid_to_blob(node_id);
             tx.execute(
-                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
                 params![blob, slug, title, now],
             )?;
             tx.execute(
@@ -822,10 +974,20 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
                 params![blob, lifecycle, now],
             )?;
             tx.execute(
-                "INSERT INTO node_fields (node_id, repo, branch, notes, tags, linked_issues, linked_prs, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![blob, repo, branch, notes, tags, linked_issues, linked_prs, now],
+                "INSERT INTO node_fields (node_id, repo, branch, notes, linked_issues, linked_prs, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![blob, repo, branch, notes, linked_issues, linked_prs, now],
             )?;
+            tx.execute(
+                "INSERT INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)",
+                params![blob, tags, now],
+            )?;
+            if tags != "[]" {
+                tx.execute(
+                    "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'tags', ?2)",
+                    params![blob, now],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO _legacy_task_node_map (legacy_task_id, node_id) VALUES (?1, ?2)",
                 params![legacy_id, blob],
@@ -1421,14 +1583,14 @@ mod tests {
         let id1 = uuid::Uuid::new_v4();
         let id2 = uuid::Uuid::new_v4();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
             params![id1.as_bytes().as_slice(), "alpha", "Alpha", now],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, 0, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
             params![id2.as_bytes().as_slice(), "alpha-2", "alpha", now],
         )
         .unwrap();
@@ -1443,8 +1605,8 @@ mod tests {
         let read = open_read_connection(&path).unwrap();
         let err = read
             .execute(
-                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-                 VALUES (X'00', 'x', 'x', 'normal', NULL, 0, 0, 0)",
+                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+                 VALUES (X'00', 'x', 'x', 'normal', NULL, 0, 0)",
                 [],
             )
             .unwrap_err();
@@ -1510,8 +1672,8 @@ mod plan_step_migration_tests {
         // must still record an interview_changes row after the rebuild.
         let node_id = uuid::Uuid::new_v4();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at)
-             VALUES (?1, 'x', 'x', 'normal', NULL, 0, 0, 0)",
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 'normal', NULL, 0, 0)",
             rusqlite::params![uuid_to_blob(node_id)],
         )
         .unwrap();
