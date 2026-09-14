@@ -2,6 +2,7 @@
 
 use crate::Invocation;
 use crate::args::Args;
+use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, PHASE_REQUIREMENTS, short_id};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use tod_store::outline::{
@@ -75,39 +76,6 @@ fn normalize_creation_phase(raw: &str) -> anyhow::Result<&'static str> {
 fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
     inv.client()
         .read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw))
-}
-
-/// Case-insensitive fuzzy match: `query`'s characters must appear as a
-/// subsequence of `text`. Returns a score (higher is a better match) or
-/// `None` when it doesn't match at all — an exact substring scores highest,
-/// then tighter (less gappy) subsequence matches beat looser ones.
-fn fuzzy_score(text: &str, query: &str) -> Option<i32> {
-    let text_l = text.to_lowercase();
-    let query_l = query.trim().to_lowercase();
-    if query_l.is_empty() {
-        return Some(0);
-    }
-    if text_l.contains(&query_l) {
-        return Some(10_000 - text_l.len() as i32);
-    }
-    let mut query_chars = query_l.chars();
-    let mut want = query_chars.next();
-    let mut last_match: Option<i32> = None;
-    let mut penalty = 0i32;
-    for (pos, c) in text_l.chars().enumerate() {
-        let Some(qc) = want else { break };
-        if c == qc {
-            if let Some(last) = last_match {
-                penalty += pos as i32 - last - 1;
-            }
-            last_match = Some(pos as i32);
-            want = query_chars.next();
-        }
-    }
-    if want.is_some() {
-        return None;
-    }
-    Some(-penalty)
 }
 
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {

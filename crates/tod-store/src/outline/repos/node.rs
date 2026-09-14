@@ -46,6 +46,17 @@ impl<'a> NodeRepo<'a> {
             .map_err(Into::into)
     }
 
+    pub fn list_all(&self) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, title, kind, ref_target_id, slug_manual, created_at, updated_at
+             FROM nodes ORDER BY lower(title)",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_node)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn get_by_slug(&self, slug: &str) -> Result<Option<Node>> {
         self.conn
             .query_row(

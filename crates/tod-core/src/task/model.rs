@@ -282,25 +282,11 @@ mod lifecycle_tests {
     }
 }
 
-/// Simple fuzzy match: query chars must appear in order in text (case-insensitive).
+/// Fuzzy match used by the node tree search box: delegates to the shared
+/// implementation also used by `obligations list --search` and
+/// `tod-cli nodes search`.
 pub fn fuzzy_matches(query: &str, text: &str) -> bool {
-    let query = query.trim();
-    if query.is_empty() {
-        return true;
-    }
-    let q = query.to_lowercase();
-    let t = text.to_lowercase();
-    let mut qi = q.chars();
-    let mut current = qi.next();
-    for ch in t.chars() {
-        if Some(ch) == current {
-            current = qi.next();
-            if current.is_none() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::fuzzy::fuzzy_matches(query, text)
 }
 
 pub fn task_matches_search(task: &TaskItem, query: &str) -> bool {

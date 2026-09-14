@@ -10,6 +10,7 @@
 
 mod args;
 mod interview;
+mod nodes;
 mod obligations;
 mod plan;
 mod visual_design;
@@ -30,6 +31,7 @@ GLOBAL OPTIONS:
     -h, --help           Show this help
 
 NOUNS:
+    nodes                 Look up a node by an approximate title
     obligations          Requirements and constraints attached to a node
     content              A node's goal, design, and notes
     plan                 Structured, dependency-graph plan steps for a node
@@ -116,6 +118,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     };
 
     match noun.as_str() {
+        "nodes" => nodes::run(invocation),
         "obligations" => obligations::run(invocation),
         "content" => interview::content(invocation),
         "plan" => plan::run(invocation),
@@ -124,7 +127,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: obligations, content, plan, questions, memory, interview, visual-design)"
+            "unknown noun `{other}` (expected: nodes, obligations, content, plan, questions, memory, interview, visual-design)"
         ),
     }
 }
@@ -190,6 +193,38 @@ mod tests {
         let mut full = vec!["--data-root".to_string(), root.display().to_string()];
         full.extend(args.iter().map(|a| a.to_string()));
         run(&full)
+    }
+
+    #[test]
+    fn nodes_search_finds_by_fuzzy_title() {
+        let (root, node, _) = data_root();
+
+        // `data_root()` already created a node titled "Node"; add a second,
+        // more distinctively titled node to search for.
+        let fleet = Arc::new(FleetStore::open(&root).unwrap());
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let login = Uuid::new_v4();
+        fleet
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(login),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Reusable Login Component".into(),
+            })
+            .unwrap();
+        drop(fleet);
+
+        // Missing a letter ("logn" for "login") should still match via the
+        // subsequence fallback.
+        let results = cli(&root, &["nodes", "search", "--query", "logn"]).unwrap();
+        let first_line = results.lines().next().unwrap();
+        assert!(first_line.contains(&login.to_string()), "{results}");
+        assert!(first_line.contains("Reusable Login Component"), "{results}");
+        assert!(!results.contains(&node.to_string()), "{results}");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
