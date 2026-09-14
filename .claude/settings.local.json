@@ -132,7 +132,9 @@
       "Bash(cargo check:*)",
       "Bash(C:\\\\data\\\\git\\\\tod\\\\target\\\\debug\\\\tod-cli.exe:*)",
       "Bash(/c/data/git/tod/target/debug/tod-cli.exe:*)",
-      "Bash(C:datagittodtargetdebugtod-cli.exe obligations delete 41a44925 --data-root C:datagittod.localdata)"
+      "Bash(C:datagittodtargetdebugtod-cli.exe obligations delete 41a44925 --data-root C:datagittod.localdata)",
+      "Bash(C:\\\\data\\\\git\\\\tod\\\\target\\\\dev-fast\\\\tod-cli.exe questions withdraw:*)",
+      "Bash(\"/c/data/git/tod/target/dev-fast/tod-cli.exe\":*)"
     ]
   }
 }

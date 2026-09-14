@@ -10,6 +10,7 @@
 
 mod args;
 mod interview;
+mod node;
 mod obligations;
 mod plan;
 mod visual_design;
@@ -30,13 +31,14 @@ GLOBAL OPTIONS:
     -h, --help           Show this help
 
 NOUNS:
-    obligations          Requirements and constraints attached to a node
-    content              A node's goal, design, and notes
-    plan                 Structured, dependency-graph plan steps for a node
-    questions            Interview questions for a node
-    memory               Interview memory notes for a node
-    interview            Interview session state
-    visual-design        the UI mockup associated with one obligation
+    node                  Outline nodes: create, inspect, move, delete
+    obligations           Requirements and constraints attached to a node
+    content               A node's goal, design, and notes
+    plan                  Structured, dependency-graph plan steps for a node
+    questions             Interview questions for a node
+    memory                Interview memory notes for a node
+    interview             Interview session state
+    visual-design         the UI mockup associated with one obligation
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -116,6 +118,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     };
 
     match noun.as_str() {
+        "node" => node::run(invocation),
         "obligations" => obligations::run(invocation),
         "content" => interview::content(invocation),
         "plan" => plan::run(invocation),
@@ -124,7 +127,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: obligations, content, plan, questions, memory, interview, visual-design)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design)"
         ),
     }
 }
@@ -230,6 +233,54 @@ mod tests {
         assert_eq!(
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn node_round_trip_with_slugs() {
+        let (root, node, _) = data_root();
+        let node_str = node.to_string();
+        let node_slug = {
+            let output = cli(&root, &["--json", "node", "show", &node_str]).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+            json["slug"].as_str().unwrap().to_string()
+        };
+
+        let created = cli(
+            &root,
+            &[
+                "--json", "node", "create", "--parent", &node_slug, "--title", "Child One",
+            ],
+        )
+        .unwrap();
+        let created_json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let child_id = created_json["id"].as_str().unwrap().to_string();
+        let child_slug = created_json["slug"].as_str().unwrap().to_string();
+
+        let listed = cli(&root, &["node", "list", "--parent", &node_slug]).unwrap();
+        assert_eq!(listed, format!("{child_slug}  Child One"));
+
+        // Addressable by id as well as by slug.
+        let shown = cli(&root, &["node", "show", &child_id]).unwrap();
+        assert!(shown.contains("Child One"), "{shown}");
+        assert!(shown.contains(&node_str), "{shown}");
+
+        // Renaming may resync the (non-manual) slug, so keep addressing by id.
+        let renamed = cli(&root, &["node", "rename", &child_id, "--title", "Child Renamed"])
+            .unwrap();
+        assert!(renamed.starts_with("ok "), "{renamed}");
+
+        // Move it to be a top-level (root) node in the same list.
+        let moved = cli(&root, &["node", "move", &child_id, "--parent", "root"]).unwrap();
+        assert!(moved.starts_with("ok "), "{moved}");
+        let listed = cli(&root, &["node", "list", "--parent", &node_slug]).unwrap();
+        assert_eq!(listed, "(none)");
+
+        assert!(
+            cli(&root, &["node", "delete", &child_id])
+                .unwrap()
+                .starts_with("ok "),
         );
         let _ = std::fs::remove_dir_all(root);
     }

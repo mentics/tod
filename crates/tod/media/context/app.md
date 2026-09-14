@@ -36,6 +36,26 @@ tod-cli --data-root <DATA_ROOT> <noun> <command> [options]
 Add `--json` to any read command when you want to parse the result rather than
 read it.
 
+### node
+
+Every node has a stable, unique **slug**, shown alongside its title. Nodes may
+be addressed by slug or by full UUID everywhere a `<SLUG_OR_UUID>` argument is
+expected below — prefer the slug once you know it, since it stays valid even
+if the node is renamed.
+
+```
+tod-cli --data-root <DATA_ROOT> node list   [--parent <SLUG_OR_UUID>]
+tod-cli --data-root <DATA_ROOT> node show   <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node create --title <TEXT> (--parent <SLUG_OR_UUID> | --list <SLUG_OR_UUID>) [--after <SLUG_OR_UUID>] [--before]
+tod-cli --data-root <DATA_ROOT> node rename <SLUG_OR_UUID> --title <TEXT>
+tod-cli --data-root <DATA_ROOT> node move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
+tod-cli --data-root <DATA_ROOT> node delete <SLUG_OR_UUID>
+```
+
+`delete` removes the node and its entire subtree (archived for undo, same as
+the app). A node's slug may change on rename if it was auto-derived from the
+title — address it by id in scripts that rename and then reuse the reference.
+
 ### obligations
 
 ```

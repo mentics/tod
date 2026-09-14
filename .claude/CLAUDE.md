@@ -126,10 +126,15 @@ Agents do not get raw database access; they get `tod-cli`, installed next to the
 `tod` executable and documented for them in `media/context/app.md`. Every
 mutation goes through `tod_store`'s `OutlineMutation` queue — the same path the
 GUI uses — so invariants cannot be bypassed and the agent never sees the schema.
+The `node` noun (list/show/create/rename/move/delete) is CRUD on outline nodes
+themselves, addressed by the node's stable slug or full UUID; every other noun
+(`obligations`, `plan`, etc.) acts on a node that already exists.
 
 Adding a command means adding a noun/verb that wraps an existing mutation, not
 new SQL. Keep `tod-cli`'s dependencies minimal: agents shell out to it
-repeatedly, so startup cost is a feature.
+repeatedly, so startup cost is a feature. `media/context/app.md` is the one
+canonical place `tod-cli` command syntax is documented for agents — a new noun
+gets a section there instead of being re-explained inline wherever it's used.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 
