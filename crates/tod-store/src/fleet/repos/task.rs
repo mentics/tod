@@ -88,8 +88,8 @@ impl<'a> TaskRepo<'a> {
         let now = now_ms();
         let blob = uuid_to_blob(node_id);
         self.conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
             params![blob, task.slug, task.title, now],
         )?;
         let mut caps = vec![Capability::Agent, Capability::Lifecycle];

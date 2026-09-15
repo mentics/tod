@@ -1,6 +1,6 @@
 //! Node repository — nodes, capabilities, lifecycle, fields.
 
-use crate::outline::types::{Capability, Node, NodeKind};
+use crate::outline::types::{Capability, Node};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, ms_to_datetime, now_ms, uuid_to_blob};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -16,16 +16,13 @@ impl<'a> NodeRepo<'a> {
     }
 
     pub fn insert(&self, node: &Node) -> Result<()> {
-        let ref_blob = node.ref_target_id.map(uuid_to_blob);
         self.conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 uuid_to_blob(node.id),
                 node.slug,
                 node.title,
-                node.kind.as_str(),
-                ref_blob,
                 node.created_at.timestamp_millis(),
                 node.updated_at.timestamp_millis(),
             ],
@@ -36,7 +33,7 @@ impl<'a> NodeRepo<'a> {
     pub fn get(&self, id: Uuid) -> Result<Option<Node>> {
         self.conn
             .query_row(
-                "SELECT id, slug, title, kind, ref_target_id, created_at, updated_at
+                "SELECT id, slug, title, created_at, updated_at
                  FROM nodes WHERE id = ?1",
                 params![uuid_to_blob(id)],
                 row_to_node,
@@ -47,7 +44,7 @@ impl<'a> NodeRepo<'a> {
 
     pub fn list_all(&self) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, slug, title, kind, ref_target_id, created_at, updated_at
+            "SELECT id, slug, title, created_at, updated_at
              FROM nodes ORDER BY lower(title)",
         )?;
         let rows = stmt
@@ -59,7 +56,7 @@ impl<'a> NodeRepo<'a> {
     pub fn get_by_slug(&self, slug: &str) -> Result<Option<Node>> {
         self.conn
             .query_row(
-                "SELECT id, slug, title, kind, ref_target_id, created_at, updated_at
+                "SELECT id, slug, title, created_at, updated_at
                  FROM nodes WHERE lower(slug) = lower(?1)",
                 params![slug],
                 row_to_node,
@@ -78,23 +75,6 @@ impl<'a> NodeRepo<'a> {
             id,
             slug: slug.to_string(),
             title: title.to_string(),
-            kind: NodeKind::Normal,
-            ref_target_id: None,
-            created_at: ms_to_datetime(now),
-            updated_at: ms_to_datetime(now),
-        };
-        self.insert(&node)?;
-        Ok(node)
-    }
-
-    pub fn create_reference(&self, slug: &str, title: &str, target: Uuid) -> Result<Node> {
-        let now = now_ms();
-        let node = Node {
-            id: Uuid::new_v4(),
-            slug: slug.to_string(),
-            title: title.to_string(),
-            kind: NodeKind::Reference,
-            ref_target_id: Some(target),
             created_at: ms_to_datetime(now),
             updated_at: ms_to_datetime(now),
         };
@@ -412,14 +392,11 @@ impl<'a> NodeRepo<'a> {
 
 fn row_to_node(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     let id_blob: Vec<u8> = row.get(0)?;
-    let ref_blob: Option<Vec<u8>> = row.get(4)?;
     Ok(Node {
         id: blob_to_uuid_sql(&id_blob)?,
         slug: row.get(1)?,
         title: row.get(2)?,
-        kind: NodeKind::parse(row.get::<_, String>(3)?.as_str()).unwrap_or(NodeKind::Normal),
-        ref_target_id: ref_blob.as_deref().map(blob_to_uuid_sql).transpose()?,
-        created_at: ms_to_datetime(row.get(5)?),
-        updated_at: ms_to_datetime(row.get(6)?),
+        created_at: ms_to_datetime(row.get(3)?),
+        updated_at: ms_to_datetime(row.get(4)?),
     })
 }

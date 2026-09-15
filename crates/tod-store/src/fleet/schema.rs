@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 25;
+pub const CURRENT_USER_VERSION: i32 = 26;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -216,11 +216,94 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v24_to_v25(conn)?;
         conn.pragma_update(None, "user_version", 25)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 26 {
+        migrate_v25_to_v26(conn)?;
+        conn.pragma_update(None, "user_version", 26)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Columns `nodes` carries at v25. `migrate_v25_to_v26` refuses to rebuild the
+/// table if it finds anything else, rather than silently dropping it the way
+/// the original `migrate_v22_to_v23` dropped `managed`.
+const NODES_V25_COLUMNS: [&str; 8] = [
+    "id",
+    "slug",
+    "title",
+    "kind",
+    "ref_target_id",
+    "created_at",
+    "updated_at",
+    "managed",
+];
+
+/// Reference nodes are gone — a node now points at another by writing
+/// `[[slug]]` inline in obligation text, which needs no schema. Rebuilds
+/// `nodes` without `kind` / `ref_target_id`: any existing reference node
+/// simply becomes a normal node (same id, so its title, slug, children, and
+/// every other row keyed on it are kept). `list_health_issues` only ever
+/// recorded reference loops, so it goes too.
+fn migrate_v25_to_v26(conn: &Connection) -> Result<()> {
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('nodes')")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let has_kind = columns.iter().any(|c| c == "kind");
+    if has_kind {
+        if let Some(unknown) = columns
+            .iter()
+            .find(|c| !NODES_V25_COLUMNS.contains(&c.as_str()))
+        {
+            anyhow::bail!(
+                "nodes has unexpected column `{unknown}`; refusing to rebuild it and drop that data"
+            );
+        }
+        // Same FK constraint as migrate_v22_to_v23: `nodes` is referenced by
+        // many tables, and the pragma is a no-op inside a transaction.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    }
+    let tx = conn.unchecked_transaction()?;
+    if has_kind {
+        tx.execute_batch(
+            "
+            CREATE TABLE nodes_v26 (
+                id              BLOB PRIMARY KEY NOT NULL,
+                slug            TEXT NOT NULL UNIQUE CHECK (length(slug) <= 40),
+                title           TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                managed         INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO nodes_v26 (id, slug, title, created_at, updated_at, managed)
+                SELECT id, slug, title, created_at, updated_at, managed FROM nodes;
+            DROP INDEX IF EXISTS idx_nodes_slug_folded;
+            DROP INDEX IF EXISTS idx_nodes_ref_target;
+            DROP TABLE nodes;
+            ",
+        )?;
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch("ALTER TABLE nodes_v26 RENAME TO nodes;")?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_slug_folded ON nodes(lower(slug));",
+        )?;
+    }
+    tx.execute_batch(
+        "
+        DROP INDEX IF EXISTS idx_list_health_open;
+        DROP TABLE IF EXISTS list_health_issues;
+        ",
+    )?;
+    tx.commit()?;
+    if has_kind {
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    }
     Ok(())
 }
 
@@ -1136,8 +1219,8 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
             let node_id = Uuid::new_v4();
             let blob = uuid_to_blob(node_id);
             tx.execute(
-                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
+                "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
                 params![blob, slug, title, now],
             )?;
             tx.execute(
@@ -1727,6 +1810,193 @@ mod tests {
         (dir, conn)
     }
 
+    /// Put `nodes` (and `list_health_issues`) back in their pre-v26 shape,
+    /// with `kind` / `ref_target_id`. A fresh store bootstraps without them
+    /// now, but every real store older than v26 has them, and the migrations
+    /// that ran against those stores read them. `extra_columns` is spliced
+    /// into the column list (e.g. `", slug_manual INTEGER NOT NULL DEFAULT 0"`).
+    fn install_legacy_nodes_table(conn: &Connection, extra_columns: &str) {
+        conn.execute_batch(&format!(
+            "
+            PRAGMA foreign_keys=OFF;
+            DROP INDEX IF EXISTS idx_nodes_slug_folded;
+            DROP TABLE nodes;
+            CREATE TABLE nodes (
+                id              BLOB PRIMARY KEY NOT NULL,
+                slug            TEXT NOT NULL UNIQUE CHECK (length(slug) <= 40),
+                title           TEXT NOT NULL,
+                kind            TEXT NOT NULL DEFAULT 'normal'
+                                CHECK (kind IN ('normal', 'reference')),
+                ref_target_id   BLOB REFERENCES nodes(id) ON DELETE RESTRICT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                managed         INTEGER NOT NULL DEFAULT 0{extra_columns},
+                CHECK (
+                    (kind = 'reference' AND ref_target_id IS NOT NULL)
+                    OR (kind = 'normal' AND ref_target_id IS NULL)
+                )
+            );
+            CREATE UNIQUE INDEX idx_nodes_slug_folded ON nodes(lower(slug));
+            CREATE INDEX idx_nodes_ref_target ON nodes(ref_target_id);
+            CREATE TABLE IF NOT EXISTS list_health_issues (
+                id          BLOB PRIMARY KEY NOT NULL,
+                list_id     BLOB NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+                issue_type  TEXT NOT NULL CHECK (issue_type IN ('reference_loop')),
+                detail      TEXT NOT NULL,
+                detected_at INTEGER NOT NULL,
+                cleared_at  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_list_health_open
+                ON list_health_issues(list_id) WHERE cleared_at IS NULL;
+            PRAGMA foreign_keys=ON;
+            "
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_v25_to_v26_turns_reference_nodes_into_normal_nodes() {
+        // A v25 store holding a reference node that has a child, a capability
+        // row, and an open reference-loop health issue. After the migration
+        // the node must be an ordinary node with its id, slug, title, child,
+        // and capability intact — and `managed` must survive the rebuild.
+        let (dir, conn) = temp_db();
+        install_legacy_nodes_table(&conn, "");
+        let list_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let target_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let ref_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let child_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO lists (id, slug, title, created_at, updated_at) VALUES (?1, 'l', 'L', 0, 0)",
+            params![list_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+             VALUES (?1, 'target', 'Target', 'normal', NULL, 1, 2, 1)",
+            params![target_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+             VALUES (?1, 'ref-node', 'Ref Node', 'reference', ?2, 3, 4, 0)",
+            params![ref_id, target_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+             VALUES (?1, 'child', 'Child', 'normal', NULL, 0, 0, 0)",
+            params![child_id],
+        )
+        .unwrap();
+        for (node, parent, ordinal) in [
+            (&target_id, None, 0),
+            (&ref_id, None, 1),
+            (&child_id, Some(&ref_id), 0),
+        ] {
+            conn.execute(
+                "INSERT INTO outline_entries (node_id, list_id, parent_id, ordinal) VALUES (?1, ?2, ?3, ?4)",
+                params![node, list_id, parent, ordinal],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'spec', 0)",
+            params![ref_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO list_health_issues (id, list_id, issue_type, detail, detected_at)
+             VALUES (?1, ?2, 'reference_loop', '[]', 0)",
+            params![uuid::Uuid::new_v4().as_bytes().to_vec(), list_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 25).unwrap();
+        drop(conn);
+
+        let path = dir.join("tod.db");
+        let conn = open_writer_connection(&path).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('nodes')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            ["id", "slug", "title", "created_at", "updated_at", "managed"]
+        );
+        let (slug, title, created_at, updated_at): (String, String, i64, i64) = conn
+            .query_row(
+                "SELECT slug, title, created_at, updated_at FROM nodes WHERE id = ?1",
+                params![ref_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((slug.as_str(), title.as_str(), created_at, updated_at), ("ref-node", "Ref Node", 3, 4));
+        let child_parent: Vec<u8> = conn
+            .query_row(
+                "SELECT parent_id FROM outline_entries WHERE node_id = ?1",
+                params![child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parent, ref_id);
+        let caps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_capabilities WHERE node_id = ?1",
+                params![ref_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(caps, 1);
+        let managed: i64 = conn
+            .query_row("SELECT managed FROM nodes WHERE slug = 'target'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(managed, 1);
+        let health_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('list_health_issues', 'idx_list_health_open', 'idx_nodes_ref_target')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(health_tables, 0);
+        let fk_on: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1);
+        let fk_violations = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!fk_violations);
+        let node = crate::outline::repos::NodeRepo::new(&conn)
+            .get_by_slug("ref-node")
+            .unwrap()
+            .expect("reference node survives as a normal node");
+        assert_eq!(node.title, "Ref Node");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrate_v25_to_v26_refuses_to_drop_unknown_nodes_column() {
+        let (dir, conn) = temp_db();
+        install_legacy_nodes_table(&conn, ", surprise TEXT");
+        conn.pragma_update(None, "user_version", 25).unwrap();
+        let err = apply_migrations(&conn).unwrap_err();
+        assert!(err.to_string().contains("surprise"), "{err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn migrate_v22_to_v23_with_referencing_child_rows() {
         // Reproduces a v22 store with real data: a node carrying a
@@ -1736,8 +2006,7 @@ mod tests {
         // when another table (node_capabilities) still references it.
         let (dir, conn) = temp_db();
         let id = uuid::Uuid::new_v4().as_bytes().to_vec();
-        conn.execute_batch("ALTER TABLE nodes ADD COLUMN slug_manual INTEGER NOT NULL DEFAULT 0;")
-            .unwrap();
+        install_legacy_nodes_table(&conn, ", slug_manual INTEGER NOT NULL DEFAULT 0");
         conn.execute(
             "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, slug_manual)
              VALUES (?1, 'a-node', 'A Node', 'normal', NULL, 0, 0, 1)",
@@ -1794,14 +2063,14 @@ mod tests {
         let node_id = uuid::Uuid::new_v4().as_bytes().to_vec();
         let generator_id = uuid::Uuid::new_v4().as_bytes().to_vec();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
-             VALUES (?1, 'managed-node', 'Managed Node', 'normal', NULL, 0, 0, 1)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at, managed)
+             VALUES (?1, 'managed-node', 'Managed Node', 0, 0, 1)",
             params![node_id],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
-             VALUES (?1, 'gen', 'Gen', 'normal', NULL, 0, 0, 0)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at, managed)
+             VALUES (?1, 'gen', 'Gen', 0, 0, 0)",
             params![generator_id],
         )
         .unwrap();
@@ -1827,7 +2096,7 @@ mod tests {
                 updated_at INTEGER NOT NULL
             );
             INSERT INTO nodes_damaged (id, slug, title, kind, ref_target_id, created_at, updated_at)
-                SELECT id, slug, title, kind, ref_target_id, created_at, updated_at FROM nodes;
+                SELECT id, slug, title, 'normal', NULL, created_at, updated_at FROM nodes;
             DROP TABLE nodes;
             ALTER TABLE nodes_damaged RENAME TO nodes;
             PRAGMA foreign_keys=ON;
@@ -1895,14 +2164,14 @@ mod tests {
         let id1 = uuid::Uuid::new_v4();
         let id2 = uuid::Uuid::new_v4();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
             params![id1.as_bytes().as_slice(), "alpha", "Alpha", now],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
             params![id2.as_bytes().as_slice(), "alpha-2", "alpha", now],
         )
         .unwrap();
@@ -1917,8 +2186,8 @@ mod tests {
         let read = open_read_connection(&path).unwrap();
         let err = read
             .execute(
-                "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-                 VALUES (X'00', 'x', 'x', 'normal', NULL, 0, 0)",
+                "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+                 VALUES (X'00', 'x', 'x', 0, 0)",
                 [],
             )
             .unwrap_err();
@@ -1984,8 +2253,8 @@ mod plan_step_migration_tests {
         // must still record an interview_changes row after the rebuild.
         let node_id = uuid::Uuid::new_v4();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, 'x', 'x', 'normal', NULL, 0, 0)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 0, 0)",
             rusqlite::params![uuid_to_blob(node_id)],
         )
         .unwrap();
