@@ -80,6 +80,10 @@ tod-cli --data-root <DATA_ROOT> obligations check-refs [--node <NODE_UUID>]
 it after a specific obligation, and add `--before` to place it before that one
 instead.
 
+Any text flag (`--body`, `--why`, `--detail`) takes `-` to read its text from
+stdin, for long or multi-line text passed with a heredoc. Only one flag per
+command can read stdin. Obligation text with no words is refused.
+
 Every obligation has a **provenance**. What you write through `tod-cli` is
 `agent`: in effect, but not confirmed by the user, and listed with a
 `<agent, attention: reason>` mark. Only the user, in the app, makes one `user`.

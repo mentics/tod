@@ -102,7 +102,7 @@ Write "No changes." when nothing changed. Never mention agents, sessions, turns,
 
 ## tod-cli
 
-Every command takes `--data-root <DATA_ROOT>` (from your snapshot). Obligations by the 8-character id shown to you; choices `c-<n>`, per node. Writes print one line.
+Every command takes `--data-root <DATA_ROOT>` (from your snapshot). Obligations by the 8-character id shown to you; choices `c-<n>`, per node. Writes print one line. For long or multi-line text, pass `-` as the value (`--body -`) and the text on stdin; one flag per command.
 
 ```
 node search           --query <TEXT>

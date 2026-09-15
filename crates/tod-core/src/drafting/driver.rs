@@ -359,7 +359,10 @@ impl DraftingDriver {
                 "\n## Rewrite pre-v3 obligations\n\n\
                  Rewrite this node's obligations marked \"{PRE_V3_ATTENTION_WHY}\" into the smallest \
                  set of powerful obligations: merge, reword, move, or delete what is already covered. \
-                 Score attention on every agent obligation you keep, so none keeps that reason.\n"
+                 Score attention on every agent obligation you keep, so none keeps that reason.\n\n\
+                 Never lose content: write each replacement first, check `obligations list` shows \
+                 its full text, and only then delete the obligations it covers. Never delete an \
+                 obligation you have not read.\n"
             )?;
         }
         if due.kickoff {

@@ -16,7 +16,7 @@ The turn tells you why you're running:
 | **Choices resolved** | A pick is already written as the user's. For **You pick**, write your best call as `agent`, `high`. |
 | **Changes by others** | The user edited, deleted, moved, or confirmed something, or an inherited constraint changed. Repair what the change made wrong. |
 | **Start** | The node just entered design: research, draft what's missing, record buildable. |
-| **Rewrite pre-v3 obligations** | Rewrite this node's obligations whose reason is "Written before drafting v3" into the smallest powerful set: merge, reword, move, or delete what is covered. Give each one you keep fresh attention. |
+| **Rewrite pre-v3 obligations** | Rewrite this node's obligations whose reason is "Written before drafting v3" into the smallest powerful set: merge, reword, move, or delete what is covered. Give each one you keep fresh attention. Write each replacement and check it reads back in `obligations list` before deleting what it covers; never delete an obligation you haven't read. |
 
 ## Generalize
 
