@@ -116,6 +116,8 @@ obligations add       --node <NODE> --kind requirement|constraint --body <TEXT> 
 obligations update    <ID> [--body <TEXT>] [--section <NAME>] [--attention low|medium|high --why <TEXT>]
 obligations move      <ID> --node <NODE>
 obligations delete    <ID>
+obligations deleted   --node <NODE>                 # restorable deletions, as r-<n>
+obligations restore   <r-N>...                      # undo a deletion or an edit
 obligations check-refs [--node <NODE>]
 
 content set           --node <NODE> --type goal --body <TEXT>

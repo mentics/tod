@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 26;
+pub const CURRENT_USER_VERSION: i32 = 27;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -221,11 +221,63 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v25_to_v26(conn)?;
         conn.pragma_update(None, "user_version", 26)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 27 {
+        migrate_v26_to_v27(conn)?;
+        conn.pragma_update(None, "user_version", 27)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Obligation deletes and edits keep the row they replaced: `interview_changes`
+/// gains `prior`, the old row as JSON (everything but the ids, which the change
+/// row already carries), so a deleted or reworded obligation can be restored
+/// through `OutlineMutation::RestoreObligation`. Change-log trimming keeps these
+/// rows for `OBLIGATION_SNAPSHOT_RETENTION_MS` (see `interview::trim_changes`).
+fn migrate_v26_to_v27(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    const PRIOR: &str = "json_object(
+                'kind', OLD.kind, 'ordinal', OLD.ordinal, 'section', OLD.section,
+                'body', OLD.body, 'phase', OLD.phase, 'provenance', OLD.provenance,
+                'attention', OLD.attention, 'attention_why', OLD.attention_why,
+                'visual_design_path', OLD.visual_design_path,
+                'created_at', OLD.created_at, 'updated_at', OLD.updated_at)";
+    let has_prior: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('interview_changes') WHERE name = 'prior'")?
+        .exists([])?;
+    let tx = conn.unchecked_transaction()?;
+    if !has_prior {
+        tx.execute_batch("ALTER TABLE interview_changes ADD COLUMN prior TEXT;")?;
+    }
+    let triggers = format!(
+        "
+        DROP TRIGGER IF EXISTS trg_ic_obligation_update;
+        DROP TRIGGER IF EXISTS trg_ic_obligation_delete;
+        CREATE TRIGGER trg_ic_obligation_update AFTER UPDATE ON node_obligations
+        WHEN OLD.node_id = NEW.node_id
+            AND (OLD.body IS NOT NEW.body OR OLD.section IS NOT NEW.section OR OLD.kind IS NOT NEW.kind)
+        BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at, prior)
+            VALUES (NEW.node_id, 'obligation', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
+                    || CASE WHEN OLD.section IS NOT NEW.section THEN 'section,' ELSE '' END
+                    || CASE WHEN OLD.kind IS NOT NEW.kind THEN 'kind,' ELSE '' END, ','),
+                {ACTOR}, {NOW}, {PRIOR});
+        END;
+        CREATE TRIGGER trg_ic_obligation_delete AFTER DELETE ON node_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at, prior)
+            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW}, {PRIOR});
+        END;
+        "
+    );
+    tx.execute_batch(&triggers)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2286,6 +2338,69 @@ mod plan_step_migration_tests {
             .unwrap();
         assert_eq!(plan_changes, 1);
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A v26 store — no `prior` column, the original obligation triggers —
+    /// upgrades so deletes and edits keep the old row.
+    #[test]
+    fn v27_upgrade_keeps_prior_obligation_rows() {
+        let (dir, conn) = temp_db();
+        conn.execute_batch(
+            "
+            DROP TRIGGER trg_ic_obligation_update;
+            DROP TRIGGER trg_ic_obligation_delete;
+            ALTER TABLE interview_changes DROP COLUMN prior;
+            CREATE TRIGGER trg_ic_obligation_delete AFTER DELETE ON node_obligations BEGIN
+                INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+                VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, 'user', 0);
+            END;
+            PRAGMA user_version = 26;
+            ",
+        )
+        .unwrap();
+        apply_migrations(&conn).unwrap();
+        // Running the step again (as under a renumbered version) is harmless.
+        migrate_v26_to_v27(&conn).unwrap();
+
+        let node_id = uuid::Uuid::new_v4();
+        let obligation_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 0, 0)",
+            rusqlite::params![uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, created_at, updated_at)
+             VALUES (?1, ?2, 'constraint', 1, 'S', 'before', 'design', 0, 0)",
+            rusqlite::params![uuid_to_blob(obligation_id), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE node_obligations SET body = 'after' WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(obligation_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM node_obligations WHERE id = ?1",
+            rusqlite::params![uuid_to_blob(obligation_id)],
+        )
+        .unwrap();
+        let priors: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT op, json_extract(prior, '$.body') FROM interview_changes
+                 WHERE entity = 'obligation' AND prior IS NOT NULL ORDER BY rev",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            priors,
+            vec![("update".into(), "before".into()), ("delete".into(), "after".into())]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

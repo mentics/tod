@@ -238,6 +238,40 @@ pub struct AgentSessionRow {
     pub last_turn_at: Option<i64>,
 }
 
+/// How long a change-log row holding an obligation's prior row (a delete or
+/// an edit) survives trimming, regardless of agent watermarks.
+pub const OBLIGATION_SNAPSHOT_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// An obligation row as it was before a delete or an edit, kept in
+/// `interview_changes.prior` by the obligation triggers.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ObligationPrior {
+    pub kind: String,
+    pub ordinal: i64,
+    pub section: Option<String>,
+    pub body: String,
+    pub phase: String,
+    pub provenance: String,
+    pub attention: Option<String>,
+    pub attention_why: Option<String>,
+    pub visual_design_path: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// A change-log row that kept an obligation's prior row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObligationSnapshot {
+    pub rev: i64,
+    pub node_id: Uuid,
+    pub obligation_id: Uuid,
+    /// `delete` or `update`.
+    pub op: String,
+    pub actor: String,
+    pub at: i64,
+    pub prior: ObligationPrior,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRow {
     pub rev: i64,

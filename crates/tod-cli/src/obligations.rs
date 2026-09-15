@@ -2,9 +2,12 @@
 
 use crate::Invocation;
 use crate::args::Args;
+use anyhow::Context as _;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::drafting::{ATTENTION_LEVELS, DraftingRepo, ObligationMark};
-use tod_store::interview::{InterviewCommand, InterviewRepo, PHASE_REQUIREMENTS, short_id};
+use tod_store::interview::{
+    InterviewCommand, InterviewRepo, ObligationSnapshot, PHASE_REQUIREMENTS, short_id,
+};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, resolve_obligations,
@@ -23,7 +26,16 @@ COMMANDS:
     update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--attention low|medium|high --why <TEXT>]      (--section \"\" clears it)
     move       <ID> --node <UUID>
     delete     <ID>
+    deleted    --node <UUID> [--by user|agent|<SESSION>]      deleted obligations that can still be restored, newest first
+    history    <ID>                                           earlier versions of an obligation (its edits and deletion)
+    restore    <r-N>... | --node <UUID> --by user|agent|<SESSION>
     check-refs [--node <UUID>]      obligations whose [[slug]] names no node
+
+`deleted` and `history` list changes as r-<n>. `restore r-<n>` puts back the
+obligation as it was before that change — a deleted one with its id, position,
+and marks; an edited one with its earlier wording. With --node and --by it
+restores every listed deletion by that party. Deletions and edits stay
+restorable for 30 days.
 
 Listings mark obligations nobody has confirmed as <agent, attention: reason>.
 Inside an interview, an agent's `add` always writes its own session's phase —
@@ -44,6 +56,9 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "update" => update(&inv, &args),
         "move" => move_to(&inv, &args),
         "delete" => delete(&inv, &args),
+        "deleted" => deleted(&inv, &args),
+        "history" => history(&inv, &args),
+        "restore" => restore(&inv, &args),
         "check-refs" => check_refs(&inv, &args),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
@@ -384,6 +399,182 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         target: Some(id),
     })?;
     Ok(ack(id, inv.json))
+}
+
+fn deleted(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let node = args.node()?;
+    let by = args.get("--by");
+    let rows: Vec<ObligationSnapshot> = inv
+        .client()
+        .read(|conn| InterviewRepo::new(conn).deleted_obligations(node))?
+        .into_iter()
+        .filter(|s| by.is_none_or(|by| actor_matches(&s.actor, by)))
+        .collect();
+    Ok(render_snapshots(&rows, inv.json))
+}
+
+fn history(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let raw = args.target("an obligation id")?;
+    let rows = inv.client().read(|conn| {
+        let repo = InterviewRepo::new(conn);
+        let id = repo.resolve_obligation_id_with_history(raw)?;
+        repo.obligation_history(id)
+    })?;
+    Ok(render_snapshots(&rows, inv.json))
+}
+
+fn restore(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let client = inv.client();
+    let mut snapshots: Vec<ObligationSnapshot> = if args.positional.is_empty() {
+        let (Some(node), Some(by)) = (args.uuid("--node")?, args.get("--by")) else {
+            anyhow::bail!("give change ids (r-<n>), or --node <UUID> --by user|agent|<SESSION>");
+        };
+        client
+            .read(|conn| InterviewRepo::new(conn).deleted_obligations(node))?
+            .into_iter()
+            .filter(|s| actor_matches(&s.actor, by))
+            .collect()
+    } else {
+        let revs = args
+            .positional
+            .iter()
+            .map(|raw| parse_rev(raw))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        client.read(|conn| {
+            let repo = InterviewRepo::new(conn);
+            revs.iter()
+                .map(|rev| {
+                    repo.obligation_snapshot(*rev)?.with_context(|| {
+                        format!("r-{rev} kept no obligation to restore (or it is past retention)")
+                    })
+                })
+                .collect()
+        })?
+    };
+    // Newest first: undoing changes in reverse puts each obligation back at
+    // the position it had when it was deleted.
+    snapshots.sort_by(|a, b| b.rev.cmp(&a.rev));
+    snapshots.dedup_by_key(|s| s.rev);
+    let mut restored: Vec<&ObligationSnapshot> = Vec::new();
+    for snapshot in &snapshots {
+        let result = client.interview(InterviewCommand::Outline {
+            mutation: OutlineMutation::RestoreObligation { rev: snapshot.rev },
+            target: Some(snapshot.obligation_id),
+        });
+        if let Err(err) = result {
+            let done = restored
+                .iter()
+                .map(|s| format!("r-{}", s.rev))
+                .collect::<Vec<_>>();
+            if done.is_empty() {
+                anyhow::bail!("r-{}: {err}", snapshot.rev);
+            }
+            anyhow::bail!("r-{}: {err}\n(already restored: {})", snapshot.rev, done.join(", "));
+        }
+        restored.push(snapshot);
+    }
+    if inv.json {
+        let items: Vec<serde_json::Value> = restored
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.obligation_id.to_string(),
+                    "rev": s.rev,
+                    "status": "ok",
+                })
+            })
+            .collect();
+        return Ok(serde_json::Value::Array(items).to_string());
+    }
+    if restored.is_empty() {
+        return Ok("(nothing to restore)".to_string());
+    }
+    Ok(restored
+        .iter()
+        .map(|s| format!("ok {} (r-{})", short_id(s.obligation_id), s.rev))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// `r-14` or a bare number.
+fn parse_rev(raw: &str) -> anyhow::Result<i64> {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("r-")
+        .unwrap_or(trimmed)
+        .parse()
+        .map_err(|_| anyhow::anyhow!("`{raw}` is not a change id (r-<n>)"))
+}
+
+/// `user`, `agent` (any agent session), or an agent session id or prefix.
+fn actor_matches(actor: &str, by: &str) -> bool {
+    let by = by.trim();
+    match Uuid::parse_str(actor) {
+        Ok(session) => {
+            by == "agent" || {
+                let prefix = by.replace('-', "").to_ascii_lowercase();
+                !prefix.is_empty() && session.simple().to_string().starts_with(&prefix)
+            }
+        }
+        Err(_) => actor == by,
+    }
+}
+
+fn actor_label(actor: &str) -> String {
+    match Uuid::parse_str(actor) {
+        Ok(session) => format!("agent {}", short_id(session)),
+        Err(_) => actor.to_string(),
+    }
+}
+
+fn render_snapshots(rows: &[ObligationSnapshot], json: bool) -> String {
+    if json {
+        let items: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "rev": s.rev,
+                    "op": s.op,
+                    "id": s.obligation_id.to_string(),
+                    "node_id": s.node_id.to_string(),
+                    "actor": s.actor,
+                    "at": s.at,
+                    "kind": s.prior.kind,
+                    "section": s.prior.section,
+                    "body": s.prior.body,
+                    "phase": s.prior.phase,
+                    "provenance": s.prior.provenance,
+                    "attention": s.prior.attention,
+                    "attention_why": s.prior.attention_why,
+                })
+            })
+            .collect();
+        return serde_json::Value::Array(items).to_string();
+    }
+    if rows.is_empty() {
+        return "(none)".to_string();
+    }
+    rows.iter()
+        .map(|s| {
+            let section = s
+                .prior
+                .section
+                .as_deref()
+                .map(|x| format!(" ({x})"))
+                .unwrap_or_default();
+            format!(
+                "r-{} [{}] {} by {}, was {}/{}{section}: {}",
+                s.rev,
+                short_id(s.obligation_id),
+                if s.op == "delete" { "deleted" } else { "edited" },
+                actor_label(&s.actor),
+                s.prior.phase,
+                s.prior.kind,
+                s.prior.body
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn check_refs(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
