@@ -224,7 +224,7 @@ impl DraftingDriver {
                     ACTOR_USER,
                     InterviewCommand::RecordDraftingTurn {
                         node_id: self.config.node_id,
-                        summary: reply.map(|r| r.trim().to_string()).filter(|r| !r.is_empty()),
+                        summary: reply.as_deref().and_then(change_summary),
                         dump_seqs: turn.dumps.clone(),
                         choice_seqs: turn.choices.clone(),
                     },
@@ -376,7 +376,7 @@ impl DraftingDriver {
                  repair what they made wrong, and record buildable again.\n",
             );
         }
-        out.push_str("\nEnd the turn with the change summary.");
+        write!(out, "\nEnd the turn with the change summary inside {SUMMARY_OPEN} tags.")?;
         Ok(out.trim_start().to_string())
     }
 
@@ -530,6 +530,31 @@ impl DraftingDriver {
 
 fn session_key(id: Uuid) -> String {
     format!("drafting-{id}")
+}
+
+/// Delimits the change summary in a drafter's reply (see `drafting/base.md`).
+pub(crate) const SUMMARY_OPEN: &str = "<change-summary>";
+pub(crate) const SUMMARY_CLOSE: &str = "</change-summary>";
+
+/// The change summary out of a turn's whole reply. A provider hands back every
+/// message of the turn run together, narration between tool calls included, so
+/// only the last delimited block counts. An unclosed block runs to the end; a
+/// reply with no block falls back to its last paragraph.
+fn change_summary(reply: &str) -> Option<String> {
+    let body = match reply.rfind(SUMMARY_OPEN) {
+        Some(start) => {
+            let rest = &reply[start + SUMMARY_OPEN.len()..];
+            rest.find(SUMMARY_CLOSE).map_or(rest, |end| &rest[..end])
+        }
+        None => reply.trim().rsplit("\n\n").next().unwrap_or_default(),
+    };
+    let mut body = body.trim();
+    // The docs show the summary fenced; a drafter may fence it inside the tags too.
+    if let Some(fenced) = body.strip_prefix("```") {
+        body = fenced.split_once('\n').map_or("", |(_, rest)| rest);
+        body = body.trim_end().strip_suffix("```").unwrap_or(body).trim();
+    }
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 #[cfg(test)]
@@ -687,7 +712,38 @@ mod tests {
             .unwrap();
         assert!(unrouted.is_empty());
         assert!(summaries[0].body.contains("Not mentioned yet"), "{}", summaries[0].body);
+        assert!(!summaries[0].body.contains("Mock:"), "narration is dropped: {}", summaries[0].body);
+        assert!(!summaries[0].body.contains(SUMMARY_OPEN), "{}", summaries[0].body);
         assert_eq!(agent.turns.len(), 1, "nothing else is due");
+    }
+
+    #[test]
+    fn only_the_change_summary_is_kept_from_a_narrated_reply() {
+        let reply = "Let me verify the current state of obligations:Excellent - both are in.\
+                     Let me check the drafting state more directly:\
+                     <change-summary>\nSettings panel   + 2 requirements\n1 choice waiting on Settings panel\n</change-summary>";
+        assert_eq!(
+            change_summary(reply).as_deref(),
+            Some("Settings panel   + 2 requirements\n1 choice waiting on Settings panel")
+        );
+        // An earlier block (e.g. a draft) loses to the last one; text after it is dropped.
+        assert_eq!(
+            change_summary("<change-summary>draft</change-summary> more work <change-summary>No changes.</change-summary> done").as_deref(),
+            Some("No changes.")
+        );
+        assert_eq!(
+            change_summary("Checking:<change-summary>\n```text\nApp  + constraint\n```\n</change-summary>").as_deref(),
+            Some("App  + constraint"),
+            "a fence inside the tags is unwrapped"
+        );
+        assert_eq!(change_summary("Checking:<change-summary>\nApp  + constraint").as_deref(), Some("App  + constraint"));
+        assert_eq!(
+            change_summary("Let me look around.\n\nSettings panel  + 1 requirement\n").as_deref(),
+            Some("Settings panel  + 1 requirement"),
+            "without tags, the last paragraph"
+        );
+        assert_eq!(change_summary("Narration:<change-summary> </change-summary>"), None);
+        assert_eq!(change_summary("  \n"), None);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! `tod-cli` gives a real drafter, so a mock run exercises the same writes,
 //! attribution, provenance, and guards.
 
+use crate::drafting::driver::{SUMMARY_CLOSE, SUMMARY_OPEN};
 use crate::interview::client::InterviewClient;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -274,7 +275,11 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
     if summary.is_empty() {
         summary.push("No changes.".into());
     }
-    Ok(summary.join("\n"))
+    // Narrate before the summary, as a real drafter does, so the driver has to pick it out.
+    Ok(format!(
+        "Mock: worked through the turn.\n{SUMMARY_OPEN}\n{}\n{SUMMARY_CLOSE}",
+        summary.join("\n")
+    ))
 }
 
 #[cfg(test)]

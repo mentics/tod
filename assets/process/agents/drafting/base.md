@@ -89,16 +89,18 @@ options:
 
 ## The change summary
 
-Your **last message of every turn is the change summary** the user reads. One line per node you touched, plain language, no ids, then waiting choices:
+End **every turn with the change summary** the user reads, inside `<change-summary>` tags. Only what is inside the tags is shown; anything else you write during the turn is not. One line per node you touched, plain language, no ids, then waiting choices:
 
 ```text
+<change-summary>
 App (root)       + constraint  Every destructive action can be undone          high
 Settings panel   + 2 requirements, 1 reworded, mockup updated
 New: Account picker  created; referenced from Settings panel
 1 choice waiting on Settings panel
+</change-summary>
 ```
 
-Write "No changes." when nothing changed. Never mention agents, sessions, turns, or ids.
+Write "No changes." inside the tags when nothing changed. Never mention agents, sessions, turns, or ids.
 
 ## tod-cli
 
