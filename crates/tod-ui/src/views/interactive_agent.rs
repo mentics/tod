@@ -7,12 +7,12 @@ use crate::ui::selectable_text::selectable_markdown;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Timer, Window, actions,
+    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions,
     div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ pub struct InteractiveAgentView {
     model: String,
     effort: String,
     window_control: InteractiveAgentWindowControl,
-    prompt_input: Entity<InputState>,
+    prompt_input: Entity<TextareaState>,
     conversation: Vec<(String, String)>,
     pending: Option<PendingRun>,
     /// Latest human-readable activity reported by the agent for the pending
@@ -134,8 +134,7 @@ impl InteractiveAgentView {
         let agent_session_id = run.and_then(|run| run.agent_session_id);
 
         let prompt_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(4)
                 .placeholder("Enter to edit · Ctrl+Enter to submit")
         });
@@ -143,7 +142,7 @@ impl InteractiveAgentView {
         let poll_entity = cx.weak_entity();
         let _poll_task = cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(POLL_INTERVAL).await;
+                cx.background_executor().timer(POLL_INTERVAL).await;
                 let _ = poll_entity.update(cx, |this, cx| {
                     if this.pending.is_some() {
                         this.poll_agent(cx);
@@ -241,7 +240,7 @@ impl InteractiveAgentView {
             .unwrap_or(0) as i32;
         let next = ((idx + delta).rem_euclid(stops.len() as i32)) as usize;
         self.focus_stop = stops[next];
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -266,7 +265,7 @@ impl InteractiveAgentView {
         }
         self.prompt_editing = false;
         self.focus_stop = InteractiveAgentStop::Prompt;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1020,9 +1019,8 @@ impl Render for InteractiveAgentView {
                                 }),
                             )
                             .child(
-                                Input::new(&self.prompt_input)
+                                Textarea::new(&self.prompt_input)
                                     .disabled(in_flight || !self.prompt_editing)
-                                    .focus_bordered(self.prompt_editing)
                                     .w_full()
                                     .h(prompt_height),
                             ),

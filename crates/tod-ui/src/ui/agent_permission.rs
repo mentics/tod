@@ -81,12 +81,12 @@ fn open_permission_dialog(
             .keyboard(false)
             .close_button(false)
             .child(div().text_sm().child(message))
-            .footer(move |_ok, _cancel, _window, _cx| {
-                let agent = agent.clone();
-                options
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, option)| {
+            .footer(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .children(options.iter().enumerate().map(|(idx, option)| {
                         let agent = agent.clone();
                         let option_id = option.id.clone();
                         let is_allow = option.id.to_ascii_lowercase().contains("allow");
@@ -102,8 +102,7 @@ fn open_permission_dialog(
                             }
                             window.close_dialog(cx);
                         })
-                    })
-                    .collect::<Vec<_>>()
-            })
+                    })),
+            )
     });
 }

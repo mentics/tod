@@ -2,13 +2,13 @@ use crate::ui::actionable::chrome_control_with_shortcut_in_context;
 use crate::ui::key_context::NOT_INPUT;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Corner, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext, Context, Anchor, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored,
     deferred, div, px, rems,
 };
 use gpui_component::button::Button;
-use gpui_component::{ActiveTheme, IconName, Selectable, StyledExt, v_flex};
+use gpui_component::{ActiveTheme, IconName, Selectable, ThemeStyled, v_flex};
 
 actions!(
     app_nav,
@@ -79,14 +79,14 @@ impl AppNavPopup {
             1 => Box::new(ShellGoSettings),
             _ => Box::new(ShellGoDatabase),
         };
-        self.action_context.focus(window);
+        self.action_context.focus(window, cx);
         window.dispatch_action(action, cx);
         cx.emit(DismissEvent);
     }
 
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
-        self.action_context.focus(window);
+        self.action_context.focus(window, cx);
     }
 
     fn select_up(&mut self, _: &AppNavSelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -239,20 +239,20 @@ impl AppNavMenu {
     pub fn focus_menu(&self, window: &mut Window, cx: &mut App) {
         if let Some(menu) = self.menu.clone() {
             menu.update(cx, |menu, cx| {
-                menu.focus_handle(cx).focus(window);
+                menu.focus_handle(cx).focus(window, cx);
             });
         }
     }
 
-    pub fn dismiss_menu(&mut self, window: &mut Window) {
-        self.restore_return_focus(window);
+    pub fn dismiss_menu(&mut self, window: &mut Window, cx: &mut App) {
+        self.restore_return_focus(window, cx);
         self.close();
     }
 
     /// Return keyboard focus to the handle stored when the menu was opened.
-    pub fn restore_return_focus(&mut self, window: &mut Window) {
+    pub fn restore_return_focus(&mut self, window: &mut Window, cx: &mut App) {
         if let Some(focus) = self.return_focus.take() {
-            window.focus(&focus);
+            window.focus(&focus, cx);
         }
     }
 }
@@ -289,7 +289,7 @@ pub trait HasAppNav {
         if !self.app_nav_mut().is_open() {
             return;
         }
-        self.app_nav_mut().dismiss_menu(window);
+        self.app_nav_mut().dismiss_menu(window, cx);
         cx.notify();
     }
 
@@ -341,7 +341,7 @@ pub trait HasAppNav {
                     el.child(
                         deferred(
                             anchored()
-                                .anchor(Corner::TopLeft)
+                                .anchor(Anchor::TopLeft)
                                 .snap_to_window_with_margin(px(8.))
                                 .child(div().occlude().mt_1().child(menu)),
                         )

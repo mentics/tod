@@ -9,7 +9,7 @@ use gpui::{
     div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
 use tod_store::interview::PHASE_DESIGN;
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
@@ -129,7 +129,7 @@ pub struct ObligationListDelegate {
     /// this to force one immediately after queuing an action.
     view: WeakEntity<super::ObligationsView>,
     editing_id: Option<String>,
-    inline_edit_input: Option<Entity<InputState>>,
+    inline_edit_input: Option<Entity<TextareaState>>,
     section_edit_input: Option<Entity<InputState>>,
     /// Provenance by obligation id; `agent` rows get a subtle marker.
     marks: std::collections::HashMap<uuid::Uuid, tod_store::drafting::ObligationMark>,
@@ -179,7 +179,7 @@ impl ObligationListDelegate {
     pub fn set_inline_edit(
         &mut self,
         editing_id: Option<String>,
-        inline_edit_input: Entity<InputState>,
+        inline_edit_input: Entity<TextareaState>,
         section_edit_input: Entity<InputState>,
     ) {
         self.editing_id = editing_id;
@@ -471,7 +471,7 @@ impl ObligationListDelegate {
                 if editing {
                     if let Some(input) = &self.inline_edit_input {
                         row_el = row_el
-                            .child(div().flex_1().min_w_0().child(Input::new(input).w_full()));
+                            .child(div().flex_1().min_w_0().child(Textarea::new(input).w_full()));
                     }
                 } else {
                     let id = obligation.id;

@@ -2,10 +2,22 @@
 //!
 //! Use for any non-input surface showing data the user may need to copy while troubleshooting.
 //! Static chrome (button labels, section headings) may stay plain `div` text.
+//!
+//! Copying is gpui-component's: a drag-selection focuses the text view, whose
+//! own Ctrl/Cmd+C binding copies it. The right-click menu added here copies the
+//! same window-wide selection.
 
-use gpui::{App, ElementId, SharedString, StyleRefinement, Styled, Window, px, rems};
+use gpui::{
+    App, ClipboardItem, Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful,
+    StyleRefinement, Styled, Window, div, px, rems,
+};
+use gpui_base::TextSelection;
 use gpui_component::ActiveTheme;
+use gpui_component::menu::{ContextMenu, ContextMenuExt, PopupMenuItem};
 use gpui_component::text::{TextView, TextViewStyle};
+
+/// A selectable text view with a right-click Copy menu.
+pub type SelectableText = ContextMenu<Stateful<Div>>;
 
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
@@ -36,32 +48,51 @@ fn plain_text_html(text: &str) -> SharedString {
     SharedString::from(body)
 }
 
-/// Plain data text the user can drag-select and copy (Ctrl/Cmd+C).
+/// Wrap `view` so right-clicking it offers Copy for the current selection.
+///
+/// The context menu needs a parent element to hang off, and `TextView` is not
+/// one; the wrapper carries `id` so each menu keeps its own state.
+fn with_copy_menu(id: ElementId, view: TextView) -> SelectableText {
+    div().id(id).child(view).context_menu(|menu, window, cx| {
+        let has_selection = TextSelection::has_selection(window, cx);
+        menu.item(
+            PopupMenuItem::new("Copy")
+                .disabled(!has_selection)
+                .on_click(|_, window, cx| {
+                    let text = TextSelection::selected_text(window, cx);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                    }
+                }),
+        )
+    })
+}
+
+/// Plain data text the user can drag-select and copy (Ctrl/Cmd+C or right-click).
 pub fn selectable_text(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
-    window: &mut Window,
-    cx: &mut App,
-) -> TextView {
+    _window: &mut Window,
+    _cx: &mut App,
+) -> SelectableText {
+    let id = id.into();
     let text = text.into();
-    TextView::html(id, plain_text_html(&text), window, cx)
+    let view = TextView::html(id.clone(), plain_text_html(&text))
         .selectable(true)
-        .style(TextViewStyle::default().paragraph_gap(rems(0.)))
+        .style(TextViewStyle::default().paragraph_gap(rems(0.)));
+    with_copy_menu(id, view)
 }
 
-/// Markdown text the user can drag-select and copy (Ctrl/Cmd+C).
+/// Markdown text the user can drag-select and copy (Ctrl/Cmd+C or right-click).
 pub fn selectable_markdown(
     id: impl Into<ElementId>,
     markdown: impl Into<SharedString>,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut App,
-) -> TextView {
-    // `paragraph_gap` has no effect on a non-scrollable `TextView` in
-    // gpui-component 0.5.1: `render_root` marks the root `is_last`, and
-    // `Node::Root` hands that same flag to every child, so each block skips its
-    // bottom padding. Blocks are separated by their own styling (heading size,
-    // list markers, code-block background) until that is fixed upstream.
-    TextView::markdown(id, markdown, window, cx)
+) -> SelectableText {
+    let id = id.into();
+    let view = TextView::markdown(id.clone(), markdown)
         .style(
             TextViewStyle::default()
                 .paragraph_gap(rems(0.5))
@@ -80,5 +111,64 @@ pub fn selectable_markdown(
                         .text_size(px(12.)),
                 ),
         )
-        .selectable(true)
+        .selectable(true);
+    with_copy_menu(id, view)
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{
+        AppContext as _, Context, IntoElement, Modifiers, MouseButton, ParentElement as _, Render,
+        Styled as _, TestAppContext, VisualTestContext, Window, div, point, px,
+    };
+    use gpui_base::TextSelection;
+    use gpui_component::Root;
+
+    use super::selectable_text;
+
+    struct TextHost;
+
+    impl Render for TextHost {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(240.))
+                .child(selectable_text("copy-test", "alpha beta", window, cx))
+        }
+    }
+
+    fn drag_select(cx: &mut TestAppContext) -> &mut VisualTestContext {
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let host = cx.new(|_| TextHost);
+            Root::new(host, window, cx)
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (start, end) = (point(px(1.), px(8.)), point(px(230.), px(8.)));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        cx
+    }
+
+    #[gpui::test]
+    fn copy_shortcut_copies_a_drag_selection(cx: &mut TestAppContext) {
+        let cx = drag_select(cx);
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" });
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("alpha beta"));
+    }
+
+    #[gpui::test]
+    fn right_click_keeps_the_selection_for_the_copy_menu(cx: &mut TestAppContext) {
+        let cx = drag_select(cx);
+        cx.simulate_mouse_down(point(px(20.), px(8.)), MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(point(px(20.), px(8.)), MouseButton::Right, Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            // The menu's Copy trims, as the selection ends with the paragraph break.
+            assert_eq!(TextSelection::selected_text(window, cx).trim(), "alpha beta");
+        });
+    }
 }

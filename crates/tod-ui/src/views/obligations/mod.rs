@@ -17,14 +17,14 @@ use delegate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Corner, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext, Context, Anchor, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Timer, Window, actions, anchored, deferred,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored, deferred,
     div, px,
 };
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
@@ -184,7 +184,7 @@ pub struct ObligationsView {
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
-    inline_edit_input: Entity<InputState>,
+    inline_edit_input: Entity<TextareaState>,
     pending_abandon_edit: bool,
     /// Phase/kind/original-name of the section currently being renamed.
     section_edit_target: Option<(String, &'static str, String)>,
@@ -211,7 +211,7 @@ impl ObligationsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
         let action_sink = Rc::new(RefCell::new(Vec::new()));
         let inline_edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(INLINE_EDIT_ROWS, INLINE_EDIT_ROWS)
                 .placeholder("Obligation text… (Ctrl+Enter to save, Esc to cancel)")
         });
@@ -243,7 +243,7 @@ impl ObligationsView {
         cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             loop {
-                Timer::after(std::time::Duration::from_millis(200)).await;
+                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -390,7 +390,7 @@ impl ObligationsView {
     }
 
     fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -493,7 +493,7 @@ impl ObligationsView {
         cx.on_next_frame(window, |this, window, cx| {
             if let Some(menu) = this.agent_menu.clone() {
                 menu.update(cx, |menu, cx| {
-                    menu.focus_handle(cx).focus(window);
+                    menu.focus_handle(cx).focus(window, cx);
                 });
                 if let Ok(ks) = gpui::Keystroke::parse("down") {
                     // `dispatch_keystroke` triggers a synchronous full-window
@@ -2002,7 +2002,7 @@ impl Render for ObligationsView {
                                     el.child(
                                         deferred(
                                             anchored()
-                                                .anchor(Corner::TopLeft)
+                                                .anchor(Anchor::TopLeft)
                                                 .snap_to_window_with_margin(px(8.))
                                                 .child(div().occlude().mt_1().child(menu)),
                                         )

@@ -6,7 +6,7 @@ use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
     SharedString, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
 use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
@@ -43,7 +43,7 @@ pub struct PlanStepListDelegate {
     /// this to force one immediately after queuing an action.
     view: WeakEntity<super::PlanStepsView>,
     editing_id: Option<String>,
-    inline_edit_input: Option<Entity<InputState>>,
+    inline_edit_input: Option<Entity<TextareaState>>,
 }
 
 impl PlanStepListDelegate {
@@ -78,7 +78,7 @@ impl PlanStepListDelegate {
         self.selected_index.and_then(|ix| self.rows.get(ix))
     }
 
-    pub fn set_inline_edit(&mut self, editing_id: Option<String>, inline_edit_input: Entity<InputState>) {
+    pub fn set_inline_edit(&mut self, editing_id: Option<String>, inline_edit_input: Entity<TextareaState>) {
         self.editing_id = editing_id;
         self.inline_edit_input = Some(inline_edit_input);
     }
@@ -146,7 +146,7 @@ impl PlanStepListDelegate {
 
         if editing {
             if let Some(input) = &self.inline_edit_input {
-                row_el = row_el.child(div().w_full().child(Input::new(input).w_full()));
+                row_el = row_el.child(div().w_full().child(Textarea::new(input).w_full()));
             }
         } else {
             let is_empty = row.step.body.is_empty();

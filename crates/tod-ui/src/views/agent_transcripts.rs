@@ -124,14 +124,14 @@ impl AgentTranscriptsView {
             this.select_agent(first, cx);
         }
         let focus = this.focus_handle.clone();
-        cx.defer_in(window, move |_, window, _| {
-            focus.focus(window);
+        cx.defer_in(window, move |_, window, cx| {
+            focus.focus(window, cx);
         });
         this
     }
 
-    fn focus(&mut self, window: &mut Window) {
-        self.focus_handle.focus(window);
+    fn focus(&mut self, window: &mut Window, cx: &mut gpui::App) {
+        self.focus_handle.focus(window, cx);
     }
 
     fn close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
@@ -718,8 +718,8 @@ impl Render for AgentTranscriptsView {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, _| {
-                    this.focus(window);
+                cx.listener(|this, _, window, cx| {
+                    this.focus(window, cx);
                 }),
             )
     }

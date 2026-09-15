@@ -40,7 +40,7 @@ impl TaskListView {
             input.set_value("", window, cx);
         });
         self.status_line.clear();
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 

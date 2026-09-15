@@ -12,7 +12,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_base::input::{InputBaseState, InputModeKind};
+use gpui_component::input::{AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
@@ -30,7 +31,7 @@ const DETAILS_ROWS: f32 = 6.;
 /// Max visible height of the notes list, in equivalent text lines, before it scrolls.
 const NOTES_MAX_LINES: f32 = 16.;
 
-fn input_text(input: &Entity<InputState>, cx: &App) -> String {
+fn input_text<M: InputModeKind>(input: &Entity<InputBaseState<M>>, cx: &App) -> String {
     input.read(cx).text().to_string()
 }
 
@@ -115,10 +116,10 @@ pub struct TaskEditView {
     github_pr_input: Entity<InputState>,
     repo_input: Entity<InputState>,
     branch_input: Entity<InputState>,
-    purpose_input: Entity<InputState>,
-    details_input: Entity<InputState>,
+    purpose_input: Entity<TextareaState>,
+    details_input: Entity<TextareaState>,
     tag_draft_input: Entity<InputState>,
-    note_edit_input: Entity<InputState>,
+    note_edit_input: Entity<TextareaState>,
     tags: Vec<String>,
     capabilities: HashSet<Capability>,
     loaded_title: String,
@@ -148,7 +149,7 @@ pub struct TaskEditView {
     linear_fetch_generation: u64,
     pending_linear_ticket: Option<String>,
     pending_linear_apply: Option<PendingLinearApply>,
-    generator_config_input: Entity<InputState>,
+    generator_config_input: Entity<TextareaState>,
     generator_data_source_type: Option<String>,
     generator_pending_source_type: Option<String>,
     generator_last_status: Option<String>,
@@ -182,28 +183,24 @@ impl TaskEditView {
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
         let note_edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(2)
                 .placeholder("Note…")
         });
         let purpose_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(4)
                 .placeholder("Enter to edit · Goal, context, or problem statement…")
         });
         let details_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(6)
                 .placeholder("Enter to edit · Imported ticket description or freeform details…")
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
         let generator_config_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(6)
                 .placeholder("Enter to edit · Configuration JSON…")
         });
@@ -347,7 +344,7 @@ impl TaskEditView {
         self.focus_index = 0;
         self.editing = None;
         cx.on_next_frame(window, |this, window, cx| {
-            this.focus_handle.focus(window);
+            this.focus_handle.focus(window, cx);
             cx.notify();
         });
     }
@@ -454,21 +451,21 @@ impl TaskEditView {
         }
         let len = stops.len() as i32;
         self.focus_index = ((self.focus_index as i32 + delta).rem_euclid(len)) as usize;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
         self.ensure_focused_visible(window, cx);
     }
 
-    fn input_for_field(&self, field: TaskEditField) -> Option<Entity<InputState>> {
+    fn input_for_field(&self, field: TaskEditField) -> Option<AnyInputState> {
         Some(match field {
-            TaskEditField::Title => self.title_input.clone(),
-            TaskEditField::LinearLink => self.linear_input.clone(),
-            TaskEditField::GithubPr => self.github_pr_input.clone(),
-            TaskEditField::Tags => self.tag_draft_input.clone(),
-            TaskEditField::Repo => self.repo_input.clone(),
-            TaskEditField::Branch => self.branch_input.clone(),
-            TaskEditField::Purpose => self.purpose_input.clone(),
-            TaskEditField::Details => self.details_input.clone(),
+            TaskEditField::Title => self.title_input.clone().into(),
+            TaskEditField::LinearLink => self.linear_input.clone().into(),
+            TaskEditField::GithubPr => self.github_pr_input.clone().into(),
+            TaskEditField::Tags => self.tag_draft_input.clone().into(),
+            TaskEditField::Repo => self.repo_input.clone().into(),
+            TaskEditField::Branch => self.branch_input.clone().into(),
+            TaskEditField::Purpose => self.purpose_input.clone().into(),
+            TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::Obligations | TaskEditField::Capability(_) => return None,
         })
     }
@@ -501,10 +498,10 @@ impl TaskEditView {
                     self.ensure_focused_visible(window, cx);
                 }
                 if let Some(input) = self.input_for_field(field) {
-                    cx.on_next_frame(window, move |_, window, cx| {
-                        input.update(cx, |input, cx| {
-                            input.focus(window, cx);
-                        });
+                    cx.on_next_frame(window, move |_, window, cx| match &input {
+                        AnyInputState::Input(input) => input.update(cx, |input, cx| input.focus(window, cx)),
+                        AnyInputState::Textarea(input) => input.update(cx, |input, cx| input.focus(window, cx)),
+                        _ => {}
                     });
                 }
             }
@@ -520,7 +517,7 @@ impl TaskEditView {
         if leaving == Some(TaskEditField::LinearLink) {
             self.queue_linear_import(cx);
         }
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -543,18 +540,18 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, Entity<InputState>); 8] = [
-            (TaskEditField::Title, self.title_input.clone()),
-            (TaskEditField::LinearLink, self.linear_input.clone()),
-            (TaskEditField::GithubPr, self.github_pr_input.clone()),
-            (TaskEditField::Tags, self.tag_draft_input.clone()),
-            (TaskEditField::Repo, self.repo_input.clone()),
-            (TaskEditField::Branch, self.branch_input.clone()),
-            (TaskEditField::Purpose, self.purpose_input.clone()),
-            (TaskEditField::Details, self.details_input.clone()),
+        let inputs: [(TaskEditField, AnyInputState); 8] = [
+            (TaskEditField::Title, self.title_input.clone().into()),
+            (TaskEditField::LinearLink, self.linear_input.clone().into()),
+            (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
+            (TaskEditField::Tags, self.tag_draft_input.clone().into()),
+            (TaskEditField::Repo, self.repo_input.clone().into()),
+            (TaskEditField::Branch, self.branch_input.clone().into()),
+            (TaskEditField::Purpose, self.purpose_input.clone().into()),
+            (TaskEditField::Details, self.details_input.clone().into()),
         ];
         for (field, input) in inputs {
-            key_context::set_input_tab_stop(&input, self.field_editing(field), cx);
+            key_context::set_any_input_tab_stop(&input, self.field_editing(field), cx);
         }
     }
 
@@ -562,18 +559,18 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, Entity<InputState>); 8] = [
-            (TaskEditField::Title, self.title_input.clone()),
-            (TaskEditField::LinearLink, self.linear_input.clone()),
-            (TaskEditField::GithubPr, self.github_pr_input.clone()),
-            (TaskEditField::Tags, self.tag_draft_input.clone()),
-            (TaskEditField::Repo, self.repo_input.clone()),
-            (TaskEditField::Branch, self.branch_input.clone()),
-            (TaskEditField::Purpose, self.purpose_input.clone()),
-            (TaskEditField::Details, self.details_input.clone()),
+        let inputs: [(TaskEditField, AnyInputState); 8] = [
+            (TaskEditField::Title, self.title_input.clone().into()),
+            (TaskEditField::LinearLink, self.linear_input.clone().into()),
+            (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
+            (TaskEditField::Tags, self.tag_draft_input.clone().into()),
+            (TaskEditField::Repo, self.repo_input.clone().into()),
+            (TaskEditField::Branch, self.branch_input.clone().into()),
+            (TaskEditField::Purpose, self.purpose_input.clone().into()),
+            (TaskEditField::Details, self.details_input.clone().into()),
         ];
         for (field, input) in inputs {
-            if input.read(cx).focus_handle(cx).is_focused(window) {
+            if input.focus_handle(cx).is_focused(window) {
                 if let Some(index) = self.field_stops().iter().position(|stop| *stop == field) {
                     self.focus_index = index;
                 }
@@ -1492,19 +1489,28 @@ impl TaskEditView {
     fn render_nav_input(
         &self,
         field: TaskEditField,
-        input: &Entity<InputState>,
+        input: impl Into<AnyInputState>,
         multiline_rows: Option<f32>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let mut input_el = Input::new(input)
-            .disabled(!self.field_editing(field))
-            .focus_bordered(self.field_editing(field))
-            .w_full();
-        if let Some(rows) = multiline_rows {
-            input_el = input_el.h(window.line_height() * rows);
-        }
+        let editing = self.field_editing(field);
+        let height = multiline_rows.map(|rows| window.line_height() * rows);
+        let input_el = match input.into() {
+            AnyInputState::Input(input) => Input::new(&input)
+                .disabled(!editing)
+                .focus_bordered(editing)
+                .w_full()
+                .when_some(height, |el, height| el.h(height))
+                .into_any_element(),
+            AnyInputState::Textarea(input) => Textarea::new(&input)
+                .disabled(!editing)
+                .w_full()
+                .when_some(height, |el, height| el.h(height))
+                .into_any_element(),
+            _ => unreachable!("task edit fields are single- or multi-line inputs"),
+        };
         div()
             .w_full()
             .rounded_md()
@@ -1542,7 +1548,7 @@ impl TaskEditView {
                 .w(px(width))
                 .flex_shrink_0()
                 .child(Self::render_field_label(label, cx))
-                .child(self.render_nav_input(field, input, None, window, cx)),
+                .child(self.render_nav_input(field, input.clone(), None, window, cx)),
         )
     }
 
@@ -1578,7 +1584,7 @@ impl TaskEditView {
 
         row.child(div().flex_1().min_w(px(80.)).child(self.render_nav_input(
             TaskEditField::Tags,
-            &self.tag_draft_input,
+            self.tag_draft_input.clone(),
             None,
             window,
             cx,
@@ -1735,7 +1741,7 @@ impl TaskEditView {
                                 .child(Self::render_field_label("Repository root", cx))
                                 .child(self.render_nav_input(
                                     TaskEditField::Repo,
-                                    &self.repo_input,
+                                    self.repo_input.clone(),
                                     None,
                                     window,
                                     cx,
@@ -1753,7 +1759,7 @@ impl TaskEditView {
                                 .child(Self::render_field_label("Branch", cx))
                                 .child(self.render_nav_input(
                                     TaskEditField::Branch,
-                                    &self.branch_input,
+                                    self.branch_input.clone(),
                                     None,
                                     window,
                                     cx,
@@ -1848,7 +1854,7 @@ impl TaskEditView {
                 .bg(theme.list_active)
                 .border_1()
                 .border_color(theme.list_active_border)
-                .child(Input::new(&self.note_edit_input).w_full())
+                .child(Textarea::new(&self.note_edit_input).w_full())
                 .into_any_element();
         }
 
@@ -1909,7 +1915,7 @@ impl TaskEditView {
                                 .child(Self::render_field_label("Purpose", cx))
                                 .child(self.render_nav_input(
                                     TaskEditField::Purpose,
-                                    &self.purpose_input,
+                                    self.purpose_input.clone(),
                                     Some(MULTI_LINE_ROWS),
                                     window,
                                     cx,
@@ -2146,7 +2152,7 @@ impl TaskEditView {
                 .cursor_text()
                 .bg(background)
                 .child(
-                    Input::new(&self.generator_config_input)
+                    Textarea::new(&self.generator_config_input)
                         .w_full()
                         .h(window.line_height() * 6.),
                 ),
@@ -2425,7 +2431,7 @@ impl Render for TaskEditView {
                     .child(Self::render_field_label("Title", cx))
                     .child(self.render_nav_input(
                         TaskEditField::Title,
-                        &self.title_input,
+                        self.title_input.clone(),
                         None,
                         window,
                         cx,
@@ -2451,7 +2457,7 @@ impl Render for TaskEditView {
                     .when(!self.details_collapsed, |el| {
                         el.child(self.render_nav_input(
                             TaskEditField::Details,
-                            &self.details_input,
+                            self.details_input.clone(),
                             Some(DETAILS_ROWS),
                             window,
                             cx,

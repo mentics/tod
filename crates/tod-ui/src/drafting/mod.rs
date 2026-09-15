@@ -14,11 +14,11 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Timer, Window, actions,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, actions,
     div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex, v_flex};
@@ -201,9 +201,9 @@ pub struct DraftingView {
     /// The user moved the selection themselves; stop following the queue's top.
     user_selected: bool,
     pane: Pane,
-    dump_input: Entity<InputState>,
+    dump_input: Entity<TextareaState>,
     dump_editing: bool,
-    edit_input: Entity<InputState>,
+    edit_input: Entity<TextareaState>,
     editing: Option<Uuid>,
     picker: Option<Picker>,
     error: Option<SharedString>,
@@ -225,14 +225,12 @@ impl DraftingView {
     ) -> Self {
         let paths = TodPaths::discover().expect("failed to resolve tod paths");
         let dump_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(5)
                 .placeholder("Dump anything — Enter to write, Ctrl+Enter to send")
         });
         let edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(3)
                 .placeholder("Obligation text (Ctrl+Enter to save, Esc to cancel)")
         });
@@ -268,7 +266,7 @@ impl DraftingView {
         );
         let poll_task = cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(POLL_INTERVAL).await;
+                cx.background_executor().timer(POLL_INTERVAL).await;
                 let Ok(()) = this.update(cx, |this, cx| {
                     if this.poll() {
                         cx.notify();
@@ -359,7 +357,7 @@ impl DraftingView {
         }
         self.reload();
         self.pane = Pane::Review;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -642,7 +640,7 @@ impl DraftingView {
         self.user_selected = true;
         self.pane = Pane::Review;
         if !self.text_editing() {
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
         cx.notify();
     }
@@ -711,14 +709,14 @@ impl DraftingView {
         }) {
             self.editing = None;
             self.status_line = "Saved".into();
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
         self.after_write(window, cx);
     }
 
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -805,14 +803,14 @@ impl DraftingView {
         }) {
             self.picker = None;
             self.status_line = format!("Sent to {}", target.title).into();
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
         self.after_write(window, cx);
     }
 
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.picker = None;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -862,7 +860,7 @@ impl DraftingView {
 
     fn exit_dump_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dump_editing = false;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -889,13 +887,13 @@ impl DraftingView {
 
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         self.pane = pane;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
     fn focus_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.obligations
-            .update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+            .update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
         cx.notify();
     }
 
@@ -1401,7 +1399,7 @@ impl DraftingView {
                         .child(div().text_color(muted).child(kind)),
                 );
                 if self.editing == Some(m.obligation.id) {
-                    row = row.child(Input::new(&self.edit_input).w_full()).child(
+                    row = row.child(Textarea::new(&self.edit_input).w_full()).child(
                         h_flex()
                             .gap_1()
                             .child(
@@ -1576,7 +1574,7 @@ impl DraftingView {
                     .overflow_hidden()
                     .on_click(cx.listener(|this, _, window, cx| this.enter_dump_edit(window, cx)))
                     .child(
-                        Input::new(&self.dump_input)
+                        Textarea::new(&self.dump_input)
                             .disabled(!self.dump_editing)
                             .w_full()
                             .h(px(DUMP_HEIGHT - 4.)),

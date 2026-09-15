@@ -248,7 +248,7 @@ impl TaskListView {
             input.set_value("", window, cx);
         });
         self.sync_delegate_editing(cx);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
     }
 
     fn find_by_ticket_id(&self, ticket: &str) -> Option<&super::TaskItem> {

@@ -1,13 +1,13 @@
-//! Spike: does gpui_component::webview::WebView compile/link on this platform?
+//! Spike: does gpui_wry::WebView compile/link on this platform?
 //!
 //! Run with: cargo check -p tod-ui --example webview_spike
 //! (build/run requires a display; check is sufficient signal for the spike)
 
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
-use gpui_component::webview::WebView;
+use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_wry::WebView;
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(600.0), px(400.0)), cx);
         cx.open_window(
             WindowOptions {

@@ -23,7 +23,7 @@ pub mod commands;
 
 use crate::app::transcript_window::{TranscriptWindowControl, TranscriptWindowStatus};
 use commands::{AgentPlatformSocketCommand, Command, TranscriptsCommand, parse_line};
-use gpui::{AnyWindowHandle, AsyncApp, Keystroke, Timer};
+use gpui::{AnyWindowHandle, AsyncApp, Keystroke};
 use gpui_component::WindowExt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -203,7 +203,7 @@ async fn drain_loop(
 ) {
     while let Ok(pending) = rx.recv().await {
         let result = if matches!(pending.request, UiRequest::Sync) {
-            Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor().timer(Duration::from_millis(16)).await;
             Ok("ok".into())
         } else {
             handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
@@ -212,7 +212,7 @@ async fn drain_loop(
 
         while let Ok(pending) = rx.try_recv() {
             let result = if matches!(pending.request, UiRequest::Sync) {
-                Timer::after(Duration::from_millis(16)).await;
+                cx.background_executor().timer(Duration::from_millis(16)).await;
                 Ok("ok".into())
             } else {
                 handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
@@ -264,7 +264,6 @@ fn apply_transcripts(
             TranscriptWindowStatus::Closed => "ok closed".into(),
         }),
     })
-    .map_err(|err| format!("app update failed: {err}"))?
 }
 
 fn apply_key(cx: &mut AsyncApp, window: AnyWindowHandle, keystroke: String) -> Result<(), String> {
@@ -281,12 +280,19 @@ fn apply_key(cx: &mut AsyncApp, window: AnyWindowHandle, keystroke: String) -> R
 fn apply_text(cx: &mut AsyncApp, window: AnyWindowHandle, text: String) -> Result<(), String> {
     window
         .update(cx, |_root, window, cx| {
-            // Prefer direct insert into gpui-component focused InputState when available.
-            if let Some(input) = window.focused_input(cx) {
-                input.update(cx, |state, cx| {
-                    state.insert(text.clone(), window, cx);
-                });
-                return Ok(());
+            // Prefer direct insert into gpui-component's focused input when available.
+            use gpui_component::input::AnyInputState;
+            match window.focused_input(cx) {
+                Some(AnyInputState::Input(input)) => {
+                    input.update(cx, |state, cx| state.insert(text.clone(), window, cx));
+                    return Ok(());
+                }
+                Some(AnyInputState::Textarea(input)) => {
+                    input.update(cx, |state, cx| state.insert(text.clone(), window, cx));
+                    return Ok(());
+                }
+                Some(_) => return Err("focused input does not accept inserted text".into()),
+                None => {}
             }
             Err(
                 "no focused input — click the field (or key ctrl-shift-n for Notes) then sync"

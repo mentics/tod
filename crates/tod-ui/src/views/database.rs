@@ -8,7 +8,7 @@ use gpui::{
     px,
 };
 use gpui_component::button::Button;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
@@ -46,7 +46,7 @@ pub struct DatabaseView {
     app_nav: AppNavMenu,
     tables: Vec<String>,
     table_select: Entity<SelectState<Vec<String>>>,
-    sql_input: Entity<InputState>,
+    sql_input: Entity<TextareaState>,
     result: explore::QueryRows,
     status_line: SharedString,
     error: Option<String>,
@@ -61,8 +61,7 @@ impl DatabaseView {
         let table_select =
             cx.new(|cx| SelectState::new(tables.clone(), None, window, cx).searchable(true));
         let sql_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(SQL_INPUT_ROWS)
                 .placeholder("Enter to edit · SQL query (read-only)")
         });
@@ -119,7 +118,7 @@ impl DatabaseView {
         let len = DATABASE_STOPS.len() as i32;
         let next = ((idx + delta).rem_euclid(len)) as usize;
         self.focus_stop = DATABASE_STOPS[next];
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -141,7 +140,7 @@ impl DatabaseView {
         }
         self.sql_editing = false;
         self.focus_stop = DatabaseStop::Sql;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -235,7 +234,7 @@ impl DatabaseView {
             }
         }
         cx.notify();
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
     }
 }
 
@@ -372,9 +371,8 @@ impl Render for DatabaseView {
                                     )
                                     .child(div().text_sm().text_color(foreground).child("SQL"))
                                     .child(
-                                        Input::new(&self.sql_input)
+                                        Textarea::new(&self.sql_input)
                                             .disabled(!self.sql_editing)
-                                            .focus_bordered(self.sql_editing)
                                             .w_full(),
                                     ),
                             )

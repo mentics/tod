@@ -31,7 +31,7 @@ use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, KeyBinding,
-    ParentElement, Render, SharedString, Styled, Subscription, Timer, Window, actions, div,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
@@ -476,7 +476,7 @@ impl TaskListView {
                 }
                 state.focus(window, cx);
             });
-            this.focus_handle.focus(window);
+            this.focus_handle.focus(window, cx);
         });
 
         let poll_entity = cx.weak_entity();
@@ -485,7 +485,7 @@ impl TaskListView {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             let mut ticks = 0u32;
             loop {
-                Timer::after(std::time::Duration::from_millis(500)).await;
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -1351,7 +1351,7 @@ impl TaskListView {
         self.list_state.update(cx, |state, cx| {
             state.focus(window, cx);
         });
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
     }
 
     fn select_task_by_id(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -2709,7 +2709,7 @@ impl Render for TaskListView {
         if self.pending_refocus_list {
             self.pending_refocus_list = false;
             if !self.is_editing() {
-                self.focus_handle.focus(window);
+                self.focus_handle.focus(window, cx);
             }
         }
         if let Some(pending) = self.pending_ticket_import.take() {

@@ -14,10 +14,10 @@ use delegate::{PlanStepListDelegate, PlanStepRow, RowAction};
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, Subscription, Timer, Window, actions, div,
+    Styled, Subscription, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{InputEvent, TextareaState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::cell::RefCell;
@@ -100,7 +100,7 @@ pub struct PlanStepsView {
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
-    inline_edit_input: Entity<InputState>,
+    inline_edit_input: Entity<TextareaState>,
     pending_abandon_edit: bool,
     pending_live_refresh: bool,
     selected_key: Option<String>,
@@ -111,7 +111,7 @@ impl PlanStepsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
         let action_sink = Rc::new(RefCell::new(Vec::new()));
         let inline_edit_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(INLINE_EDIT_ROWS, INLINE_EDIT_ROWS)
                 .placeholder("Plan step text… (Ctrl+Enter to save, Esc to cancel)")
         });
@@ -129,7 +129,7 @@ impl PlanStepsView {
         cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             loop {
-                Timer::after(std::time::Duration::from_millis(200)).await;
+                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -220,7 +220,7 @@ impl PlanStepsView {
     }
 
     fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 

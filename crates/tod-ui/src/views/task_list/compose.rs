@@ -23,11 +23,11 @@ impl TaskListView {
                 self.select_task_by_id(&id, window, cx);
             } else {
                 self.rebuild_visible_list(window, cx);
-                self.focus_handle.focus(window);
+                self.focus_handle.focus(window, cx);
             }
         } else {
             self.rebuild_visible_list(window, cx);
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
         cx.notify();
     }
@@ -58,7 +58,7 @@ impl TaskListView {
                 self.compose_title_input.update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
-                self.focus_handle.focus(window);
+                self.focus_handle.focus(window, cx);
                 cx.notify();
             }
             TicketImportResult::Completed(false) => {

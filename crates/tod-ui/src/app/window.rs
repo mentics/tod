@@ -240,24 +240,24 @@ impl Shell {
                     list.refresh(window, cx);
                 });
                 let focus = self.task_list.read(cx).focus_handle(cx);
-                focus.focus(window);
+                focus.focus(window, cx);
             }
             ShellView::Interview => {
-                self.sessions.update(cx, |sessions, _| {
-                    sessions.focus(window);
+                self.sessions.update(cx, |sessions, cx| {
+                    sessions.focus(window, cx);
                 });
             }
             ShellView::Drafting => {
                 let focus = self.drafting.read(cx).focus_handle(cx);
-                focus.focus(window);
+                focus.focus(window, cx);
             }
             ShellView::Settings => {
                 let focus = self.settings.read(cx).focus_handle(cx);
-                focus.focus(window);
+                focus.focus(window, cx);
             }
             ShellView::Database => {
                 let focus = self.database.read(cx).focus_handle(cx);
-                focus.focus(window);
+                focus.focus(window, cx);
             }
         }
         cx.notify();
@@ -1293,23 +1293,23 @@ impl Shell {
         self.pending_focus_drawer = false;
         if self.obligations.read(cx).is_open() {
             self.obligations.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window);
+                panel.focus_handle(cx).focus(window, cx);
             });
         } else if self.task_edit.read(cx).is_open() {
             self.task_edit.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window);
+                panel.focus_handle(cx).focus(window, cx);
             });
         } else if self.visual_design_panel.read(cx).is_open() {
             self.visual_design_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window);
+                panel.focus_handle(cx).focus(window, cx);
             });
         } else if self.agent_panel.read(cx).is_open() {
             self.agent_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window);
+                panel.focus_handle(cx).focus(window, cx);
             });
         } else if self.lifecycle_panel.read(cx).is_open() {
             self.lifecycle_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window);
+                panel.focus_handle(cx).focus(window, cx);
             });
         }
         cx.notify();
@@ -2234,7 +2234,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let poll_entity = cx.weak_entity();
                             cx.spawn(async move |_, cx| {
                                 loop {
-                                    Timer::after(std::time::Duration::from_millis(500)).await;
+                                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
                                     let _ = poll_entity.update(cx, |shell, cx| {
                                         shell.refresh_agent_status(cx);
                                     });

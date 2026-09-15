@@ -64,7 +64,7 @@ pub struct App;
 
 /// Quit the GPUI event loop when the last window closes (required on Windows).
 fn register_app_lifecycle(cx: &mut gpui::App) {
-    cx.on_window_closed(|cx| {
+    cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
             tracing::info!(
                 event = "lifecycle",
@@ -81,7 +81,7 @@ fn register_app_lifecycle(cx: &mut gpui::App) {
 
 impl App {
     pub fn run(opts: LaunchOptions, needs_data_root_setup: bool) {
-        let app = Application::new().with_assets(gpui_component_assets::Assets);
+        let app = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
 
         app.run(move |cx| {
             gpui_component::init(cx);
@@ -90,12 +90,12 @@ impl App {
             // ListItem hover-selected chrome on #0a0a0a. Align with list_active
             // border so menu ↑/↓ selection is clearly visible (req 20).
             {
-                use gpui_component::{Theme, scroll::ScrollbarShow};
+                use gpui_component::{Theme, scroll::ScrollbarMode};
                 let theme = Theme::global_mut(cx);
                 let border = theme.list_active_border;
                 theme.accent = border.opacity(0.55);
                 theme.accent_foreground = theme.foreground;
-                theme.scrollbar_show = ScrollbarShow::Always;
+                theme.scrollbar_mode = ScrollbarMode::Always;
             }
             if !needs_data_root_setup {
                 register_main_keyboard_bindings(cx);

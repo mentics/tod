@@ -21,17 +21,21 @@ pub const INPUT: &str = "Input";
 /// Predicate for app-wide shortcuts that must not fire while a text field is focused.
 pub const NOT_INPUT: &str = "!Input";
 
-/// Include or exclude an [`InputState`] from GPUI tab order.
+/// Include or exclude an input (an `InputState` or `TextareaState`) from GPUI tab order.
 ///
 /// Disabled inputs still render with `track_focus` and would otherwise receive Tab
 /// focus (showing a cursor without accepting typing). Call while not in edit mode.
-pub fn set_input_tab_stop(
-    input: &gpui::Entity<gpui_component::input::InputState>,
+pub fn set_input_tab_stop<T: gpui::Focusable>(
+    input: &gpui::Entity<T>,
     tab_stop: bool,
     cx: &gpui::App,
 ) {
-    use gpui::Focusable;
     let _ = input.read(cx).focus_handle(cx).tab_stop(tab_stop);
+}
+
+/// [`set_input_tab_stop`] for a field held as either kind of input state.
+pub fn set_any_input_tab_stop(input: &gpui_component::input::AnyInputState, tab_stop: bool, cx: &gpui::App) {
+    let _ = input.focus_handle(cx).tab_stop(tab_stop);
 }
 
 /// Build a surface context predicate that excludes text input focus.

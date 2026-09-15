@@ -37,7 +37,7 @@ impl TaskListView {
         if self.edit_open_for.is_some() {
             // Return focus to the task list surface (not the nested list input) so Enter
             // keeps creating siblings instead of list Confirm re-selecting the row.
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
         self.edit_open_for = None;
         self.draft_node_id = None;

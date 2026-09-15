@@ -11,14 +11,14 @@ use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Corner, DismissEvent, Entity, FocusHandle, Focusable,
+    App, AppContext, ClipboardItem, Context, Anchor, DismissEvent, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Timer, WeakEntity,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
     Window, actions, anchored, deferred, div, px,
 };
 use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::list::{List, ListEvent, ListItem, ListState};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -146,10 +146,10 @@ pub struct WorkspaceView {
     proposal_summaries: HashMap<i64, String>,
     selected_seq: Option<i64>,
     selected_mc: Option<String>,
-    notes_input: Entity<InputState>,
-    proposed_input: Entity<InputState>,
-    feedback_input: Entity<InputState>,
-    freeform_input: Entity<InputState>,
+    notes_input: Entity<TextareaState>,
+    proposed_input: Entity<TextareaState>,
+    feedback_input: Entity<TextareaState>,
+    freeform_input: Entity<TextareaState>,
     obligations: Entity<ObligationsView>,
     /// Keeps the embedded obligations panel alive; "closed" is not a valid state
     /// for this column, so a Close event is reversed immediately.
@@ -221,8 +221,7 @@ impl WorkspaceView {
             .unwrap_or(8);
         let textarea = |placeholder: &'static str, window: &mut Window, cx: &mut App| {
             cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line(true)
+                TextareaState::new(window, cx)
                     .rows(TEXTAREA_ROWS)
                     .placeholder(placeholder)
             })
@@ -306,7 +305,7 @@ impl WorkspaceView {
 
         let poll_task = cx.spawn(async move |this, cx| {
             loop {
-                Timer::after(POLL_INTERVAL).await;
+                cx.background_executor().timer(POLL_INTERVAL).await;
                 let Ok(()) = this.update(cx, |this, cx| {
                     if this.poll(cx) {
                         cx.notify();
@@ -737,7 +736,7 @@ impl WorkspaceView {
             self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
             self.sync_proposed_input(window, cx);
             if should_unfocus {
-                self.focus_handle.focus(window);
+                self.focus_handle.focus(window, cx);
             }
         } else {
             // Cleared on the next render, which has a Window.
@@ -1068,7 +1067,7 @@ impl WorkspaceView {
 
     fn focus_actions_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(menu) = self.actions_menu.clone() {
-            menu.update(cx, |menu, cx| menu.focus_handle(cx).focus(window));
+            menu.update(cx, |menu, cx| menu.focus_handle(cx).focus(window, cx));
         }
     }
 
@@ -1092,7 +1091,7 @@ impl WorkspaceView {
         }
         if self.actions_menu_open {
             self.set_actions_menu_open(false, cx);
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
             return;
         }
         self.ensure_actions_menu(window, cx);
@@ -1107,7 +1106,7 @@ impl WorkspaceView {
     fn close_actions_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.actions_menu_open {
             self.set_actions_menu_open(false, cx);
-            self.focus_handle.focus(window);
+            self.focus_handle.focus(window, cx);
         }
     }
 
@@ -1131,7 +1130,7 @@ impl WorkspaceView {
         }
         self.notes_editing = false;
         self.workspace_focus = WorkspaceFocus::Response(self.notes_stop_index());
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1159,7 +1158,7 @@ impl WorkspaceView {
         if let Some(idx) = self.proposed_stop_index() {
             self.workspace_focus = WorkspaceFocus::Response(idx);
         }
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1183,7 +1182,7 @@ impl WorkspaceView {
         }
         self.feedback_editing = false;
         self.workspace_focus = WorkspaceFocus::Response(self.feedback_stop_index());
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1208,7 +1207,7 @@ impl WorkspaceView {
         }
         self.freeform_editing = false;
         self.workspace_focus = WorkspaceFocus::Response(self.freeform_stop_index());
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1217,7 +1216,7 @@ impl WorkspaceView {
             return;
         }
         self.workspace_focus = WorkspaceFocus::Response(0);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1227,9 +1226,9 @@ impl WorkspaceView {
             return;
         }
         if self.phase == PHASE_PLANNING {
-            self.plan_steps.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+            self.plan_steps.update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
         } else {
-            self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window));
+            self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
         }
         cx.notify();
     }
@@ -1258,7 +1257,7 @@ impl WorkspaceView {
             (current + delta as usize).min(count - 1)
         };
         self.workspace_focus = WorkspaceFocus::Response(new_idx);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -1937,10 +1936,10 @@ fn response_column(
     cx: &mut Context<WorkspaceView>,
     question: Option<&InterviewQuestion>,
     selected_mc: &Option<String>,
-    proposed_input: &Entity<InputState>,
-    notes_input: &Entity<InputState>,
-    feedback_input: &Entity<InputState>,
-    freeform_input: &Entity<InputState>,
+    proposed_input: &Entity<TextareaState>,
+    notes_input: &Entity<TextareaState>,
+    feedback_input: &Entity<TextareaState>,
+    freeform_input: &Entity<TextareaState>,
     can_mutate: bool,
     show_proposed: bool,
     workspace_focus: WorkspaceFocus,
@@ -2025,7 +2024,7 @@ fn response_column(
                         proposed_view.update(app, |this, cx| this.enter_proposed_edit(window, cx));
                     })
                     .child(
-                        Input::new(proposed_input)
+                        Textarea::new(proposed_input)
                             .disabled(proposed_input_disabled)
                             .w_full()
                             .h(px(TEXTAREA_HEIGHT)),
@@ -2043,7 +2042,7 @@ fn response_column(
                     notes_view.update(app, |this, cx| this.enter_notes_edit(window, cx));
                 })
                 .child(
-                    Input::new(notes_input)
+                    Textarea::new(notes_input)
                         .disabled(notes_input_disabled)
                         .w_full()
                         .h(px(TEXTAREA_HEIGHT)),
@@ -2102,7 +2101,7 @@ fn response_column(
                     feedback_view.update(app, |this, cx| this.enter_feedback_edit(window, cx));
                 })
                 .child(
-                    Input::new(feedback_input)
+                    Textarea::new(feedback_input)
                         .disabled(feedback_input_disabled)
                         .w_full()
                         .h(px(TEXTAREA_HEIGHT)),
@@ -2147,7 +2146,7 @@ fn response_column(
                     freeform_view.update(app, |this, cx| this.enter_freeform_edit(window, cx));
                 })
                 .child(
-                    Input::new(freeform_input)
+                    Textarea::new(freeform_input)
                         .disabled(freeform_input_disabled)
                         .w_full()
                         .h(px(TEXTAREA_HEIGHT)),
@@ -2235,7 +2234,7 @@ fn action_dropdown(
                 el.child(
                     deferred(
                         anchored()
-                            .anchor(Corner::TopLeft)
+                            .anchor(Anchor::TopLeft)
                             .snap_to_window_with_margin(px(8.))
                             .child(div().occlude().mt_1().child(menu)),
                     )

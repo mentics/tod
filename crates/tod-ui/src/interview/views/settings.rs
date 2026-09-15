@@ -10,7 +10,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
-    Timer, Window, actions, div, px,
+    Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -400,7 +400,7 @@ impl SettingsView {
         if self.treehouse_worktrees_root_editing {
             self.treehouse_worktrees_root_editing = false;
         }
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -416,7 +416,7 @@ impl SettingsView {
         self.selected_field_index = 0;
         self.selected_agent_column = 0;
         self.focus_region = SettingsFocus::Sidebar;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -438,7 +438,7 @@ impl SettingsView {
             return;
         }
         self.focus_region = SettingsFocus::Sidebar;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -454,7 +454,7 @@ impl SettingsView {
             return;
         }
         self.focus_region = SettingsFocus::Panel;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -473,7 +473,7 @@ impl SettingsView {
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         self.focus_region = SettingsFocus::Sidebar;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -489,7 +489,7 @@ impl SettingsView {
         self.selected_field_index =
             ((self.selected_field_index as i32 + delta).rem_euclid(len)) as usize;
         self.focus_region = SettingsFocus::Panel;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -678,7 +678,7 @@ impl SettingsView {
         }
         // Reclaim focus in case an agent dropdown (focused via Enter/Space)
         // still holds it after closing, so arrow-key navigation resumes.
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -687,7 +687,7 @@ impl SettingsView {
         let generation = self.save_generation;
         let entity = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            Timer::after(SAVE_DEBOUNCE).await;
+            cx.background_executor().timer(SAVE_DEBOUNCE).await;
             let _ = entity.update(cx, |this, cx| {
                 if this.save_generation == generation {
                     this.flush_save(cx);
@@ -1063,8 +1063,8 @@ impl Render for SettingsView {
             )
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, window, _| {
-                    this.focus_handle.focus(window);
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
                 }),
             );
 
@@ -1299,7 +1299,7 @@ fn select_field_listener(
             this.selected_field_index = index;
         }
         this.focus_region = SettingsFocus::Panel;
-        this.focus_handle.focus(window);
+        this.focus_handle.focus(window, cx);
         cx.notify();
     }
 }
@@ -1369,7 +1369,7 @@ fn stepper_row(
                         .tab_stop(false)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.focus_region = SettingsFocus::Panel;
-                            this.focus_handle.focus(window);
+                            this.focus_handle.focus(window, cx);
                             on_dec(this, window, cx);
                         })),
                 )
@@ -1392,7 +1392,7 @@ fn stepper_row(
                         .tab_stop(false)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.focus_region = SettingsFocus::Panel;
-                            this.focus_handle.focus(window);
+                            this.focus_handle.focus(window, cx);
                             on_inc(this, window, cx);
                         })),
                 ),

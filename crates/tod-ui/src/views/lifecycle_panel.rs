@@ -40,7 +40,7 @@ use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Timer, Window, actions,
+    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions,
     div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -183,7 +183,7 @@ impl LifecyclePanelView {
         let poll_entity = cx.weak_entity();
         let _poll_task = cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(POLL_INTERVAL).await;
+                cx.background_executor().timer(POLL_INTERVAL).await;
                 let _ = poll_entity.update(cx, |this, cx| {
                     if this
                         .gate_states
@@ -300,7 +300,7 @@ impl LifecyclePanelView {
         }
         let len = stops.len() as i32;
         self.focus_index = ((self.focus_index as i32 + delta).rem_euclid(len)) as usize;
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -750,7 +750,7 @@ impl LifecyclePanelView {
         self.focus_index = 0;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.focus_handle.focus(window);
+            this.focus_handle.focus(window, cx);
             cx.notify();
         });
     }
@@ -761,7 +761,7 @@ impl LifecyclePanelView {
     /// focus over, not no-op.
     pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.on_next_frame(window, |this, window, cx| {
-            this.focus_handle.focus(window);
+            this.focus_handle.focus(window, cx);
             cx.notify();
         });
     }

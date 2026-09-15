@@ -92,8 +92,8 @@ impl SessionsView {
         }
     }
 
-    pub fn focus(&self, window: &mut Window) {
-        self.focus_handle.focus(window);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus_handle.focus(window, cx);
     }
 
     pub fn close_app_nav(&mut self, cx: &mut App) {

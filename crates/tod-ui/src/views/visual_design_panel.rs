@@ -24,10 +24,10 @@ use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::views::interactive_agent::InteractiveAgentView;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Timer, Window, actions, div, px,
+    IntoElement, ParentElement, Render, Styled, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::webview::WebView;
+use gpui_wry::WebView;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,7 +100,7 @@ impl VisualDesignPanelView {
         let _poll_task = cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             loop {
-                Timer::after(POLL_INTERVAL).await;
+                cx.background_executor().timer(POLL_INTERVAL).await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -170,7 +170,7 @@ impl VisualDesignPanelView {
         self.chat = Some(view);
 
         self.reload_if_changed(cx);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 

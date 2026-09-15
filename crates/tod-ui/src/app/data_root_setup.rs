@@ -121,7 +121,7 @@ impl Render for DataRootSetupView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.input_focused {
             self.input_focused = true;
-            self.root_input.read(cx).focus_handle(cx).focus(window);
+            self.root_input.read(cx).focus_handle(cx).focus(window, cx);
         }
         if self.pending_continue {
             self.pending_continue = false;

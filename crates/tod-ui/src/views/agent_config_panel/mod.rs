@@ -12,7 +12,7 @@ use crate::ui::toast::error_toast;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Subscription, Timer, Window, actions, div, px,
+    IntoElement, ParentElement, Render, Styled, Subscription, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::ScrollableElement;
@@ -302,7 +302,7 @@ impl AgentConfigPanelView {
         self.sync_launch_selects(window, cx);
         self.refresh_workspace_label();
         self.start_shell_liveness_poll(cx);
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -364,7 +364,7 @@ impl AgentConfigPanelView {
         let fleet = self.fleet.clone();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(std::time::Duration::from_secs(5)).await;
+                cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
                 let should_continue = weak
                     .update(cx, |this, cx| {
                         if !this.is_open() || this.shell_poll_generation != generation {

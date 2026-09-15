@@ -1,6 +1,6 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, Corner, DismissEvent, Entity, Focusable, InteractiveElement, IntoElement,
+    App, Context, Anchor, DismissEvent, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, Styled, Window, anchored, deferred, div, px,
 };
 
@@ -28,7 +28,7 @@ pub(super) fn row_menu_anchor(
         el.child(
             deferred(
                 anchored()
-                    .anchor(Corner::TopLeft)
+                    .anchor(Anchor::TopLeft)
                     .snap_to_window_with_margin(px(8.))
                     .child(div().occlude().mt_1().child(menu)),
             )
@@ -163,7 +163,7 @@ impl TaskListView {
     fn focus_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(menu) = self.row_menu.clone() {
             menu.update(cx, |menu, cx| {
-                menu.focus_handle(cx).focus(window);
+                menu.focus_handle(cx).focus(window, cx);
             });
         }
     }
