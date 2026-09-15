@@ -8,9 +8,11 @@
 //! waits for the reply, and parses it with [`response::parse_gate_reply`].
 
 pub mod context;
+pub mod derived;
 pub mod response;
 pub mod routing;
 
+pub use derived::{DerivedOutcome, evaluate_derived_criterion, node_action_configs};
 pub use context::{
     GATE_CHECK_CONTEXT_KEY, GateCheckRequest, ON_ENTRY_CONTEXT_KEY, PlanStepWithLinks,
     build_gate_check_message, build_on_entry_message,

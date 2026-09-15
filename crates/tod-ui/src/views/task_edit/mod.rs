@@ -356,7 +356,10 @@ impl TaskEditView {
         let previous = self.task_id.clone();
         self.task_id = Some(task_id.to_string());
         if !self.load_task(window, cx) {
+            // Never keep showing a node that is no longer selected.
             self.task_id = previous;
+            self.close(cx);
+            return;
         }
         cx.notify();
     }
@@ -1709,21 +1712,7 @@ impl TaskEditView {
                         &self.github_pr_input,
                         window,
                         cx,
-                    ))
-                    .child(
-                        v_flex()
-                            .id("task-edit-field-slug")
-                            .gap_1()
-                            .w(px(180.))
-                            .flex_shrink_0()
-                            .child(Self::render_field_label("Slug", cx))
-                            .child(selectable_text(
-                                "task-edit-slug-value",
-                                self.loaded_slug.clone(),
-                                window,
-                                cx,
-                            )),
-                    ),
+                    )),
             )
             .child(
                 h_flex()
@@ -2527,8 +2516,40 @@ impl Render for TaskEditView {
                     .border_b_1()
                     .border_color(border)
                     .bg(secondary)
-                    .child(div().text_sm().font_semibold().child("Edit task"))
-                    .child(div().flex_1())
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child("Edit"),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(self.loaded_title.clone()),
+                            )
+                            .child(
+                                selectable_text(
+                                    "task-edit-slug-value",
+                                    self.loaded_slug.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(muted),
+                            ),
+                    )
                     .child(chrome_control_with_shortcut(
                         Button::new("task-edit-close")
                             .label("Close")

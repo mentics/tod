@@ -207,12 +207,12 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Would a mid-active question only arise from a bug/code surprise—not from missing intent?",
         sort_order: 11,
     },
-    // ready → active
+    // ready → active — evaluated by the app, not an agent (`tod_core::gate::derived`)
     GateCriterionSeed {
         id_str: "a1000005-0005-4005-8005-000000000001",
         from_state: "ready",
         to_state: "active",
-        slug: "ready-active.action-config-configured",
+        slug: crate::outline::repos::gate::READY_ACTIVE_ACTION_CONFIG_SLUG,
         label: "Does the node have at least one action config configured to do the implementation work?",
         sort_order: 1,
     },

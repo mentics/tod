@@ -133,6 +133,11 @@ impl VisualDesignPanelView {
         self.obligation_id.is_some()
     }
 
+    /// The node whose obligation this panel session is scoped to.
+    pub fn node_id(&self) -> Option<Uuid> {
+        self.node_id
+    }
+
     /// Open the panel scoped to `obligation_id` on `node_id`, constructing
     /// the embedded chat fresh — sessions are never reused, mirroring every
     /// other agent-chat entry point in the app.

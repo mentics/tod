@@ -46,11 +46,6 @@ impl TaskListView {
 
         if let Some(existing) = self.find_by_ticket_id(ticket) {
             let id = existing.id.clone();
-            if let Some(draft_id) = draft_node_id {
-                if draft_id != id {
-                    self.remove_outline_node(draft_id, window, cx);
-                }
-            }
             self.finish_ticket_import(window, cx);
             self.select_created_task(&id, window, cx);
             self.status_line = format!("Selected existing task for {ticket}");
@@ -80,22 +75,12 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = self.create_tree_node(CreatePosition::Below, window, cx) else {
+        let Some(id) = self.create_tree_node(CreatePosition::Below, title, window, cx) else {
             return;
         };
         let Ok(node_id) = Uuid::parse_str(&id) else {
             return;
         };
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::UpdateNodeTitle {
-                node_id,
-                title: title.to_string(),
-            })
-        {
-            self.show_error(format!("Failed to create task: {err}"), window, cx);
-            return;
-        }
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::EnableCapabilities {
@@ -169,27 +154,23 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let node_id = match draft_node_id {
-            Some(id) => match Uuid::parse_str(id) {
-                Ok(uuid) => uuid,
-                Err(_) => {
-                    self.fail_ticket_import(ticket, "Invalid draft node id".into(), window, cx);
-                    return;
+        // The node is created only now, titled from the ticket, so its slug is too.
+        let draft = draft_node_id
+            .filter(|id| self.is_draft_id(id))
+            .and_then(|_| self.draft.take());
+        let created = match draft {
+            Some(draft) => {
+                let created = self.create_node_at(&draft, title, window, cx);
+                if created.is_none() {
+                    self.draft = Some(draft);
                 }
-            },
-            None => match self.create_tree_node(CreatePosition::Below, window, cx) {
-                Some(id) => match Uuid::parse_str(&id) {
-                    Ok(uuid) => uuid,
-                    Err(_) => {
-                        self.fail_ticket_import(ticket, "Failed to create node".into(), window, cx);
-                        return;
-                    }
-                },
-                None => {
-                    self.fail_ticket_import(ticket, "Failed to create node".into(), window, cx);
-                    return;
-                }
-            },
+                created
+            }
+            None => self.create_tree_node(CreatePosition::Below, title, window, cx),
+        };
+        let Some(node_id) = created.and_then(|id| Uuid::parse_str(&id).ok()) else {
+            self.fail_ticket_import(ticket, "Failed to create node".into(), window, cx);
+            return;
         };
 
         if let Err(err) = self.apply_ticket_to_node(node_id, ticket, title, description) {
@@ -241,13 +222,14 @@ impl TaskListView {
     }
 
     fn finish_ticket_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.draft_node_id = None;
+        self.draft = None;
         self.edit_open_for = None;
         self.edit_original_title = None;
         self.inline_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
         self.sync_delegate_editing(cx);
+        self.reload_all_tasks();
         self.focus_handle.focus(window, cx);
     }
 

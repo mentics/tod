@@ -1,7 +1,7 @@
 doc
 
 # Rust / Cargo
-/target/
+target/
 **/*.rs.bk
 *.pdb
 

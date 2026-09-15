@@ -218,7 +218,7 @@ impl AgentConfigPanelView {
     }
 
     pub fn open_new(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_inner(task_id, None, window, cx);
+        self.open_inner(task_id, None, true, window, cx);
     }
 
     pub fn open_edit(
@@ -228,9 +228,11 @@ impl AgentConfigPanelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_inner(task_id, Some(config_id.to_string()), window, cx);
+        self.open_inner(task_id, Some(config_id.to_string()), true, window, cx);
     }
 
+    /// Follow the tree selection to another node's config, leaving keyboard
+    /// focus where it is. A no-op when already showing that config.
     pub fn retarget(
         &mut self,
         task_id: &str,
@@ -238,13 +240,17 @@ impl AgentConfigPanelView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_inner(task_id, config_id.map(str::to_string), window, cx);
+        if self.task_id.as_deref() == Some(task_id) && self.config_id.as_deref() == config_id {
+            return;
+        }
+        self.open_inner(task_id, config_id.map(str::to_string), false, window, cx);
     }
 
     fn open_inner(
         &mut self,
         task_id: &str,
         config_id: Option<String>,
+        focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -302,7 +308,9 @@ impl AgentConfigPanelView {
         self.sync_launch_selects(window, cx);
         self.refresh_workspace_label();
         self.start_shell_liveness_poll(cx);
-        self.focus_handle.focus(window, cx);
+        if focus {
+            self.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 

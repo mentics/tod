@@ -19,6 +19,12 @@
 //! (no criteria for the transition) has no table and advances directly off
 //! the agent's `result: pass`.
 //!
+//! Criteria the app can answer from its own data
+//! (`tod_core::gate::evaluate_derived_criterion` — e.g. `ready` → `active`'s
+//! "has an action config") are evaluated directly and saved as `derived`; they
+//! are never sent to the agent, and a transition with only such criteria runs
+//! no agent turn at all.
+//!
 //! Three manual escape hatches sit alongside the gate check, each a direct
 //! `OutlineMutation::SetLifecycle` that bypasses the gate agent entirely:
 //! **Open interview** (jump into that phase's conversational interview even
@@ -52,7 +58,7 @@ use std::time::Duration;
 use tod_agent::{SessionOpening, SessionPurpose, SessionTurn};
 use tod_core::gate::{
     GateAction, GateCheckRequest, PlanStepWithLinks, build_gate_check_message,
-    build_on_entry_message, parse_gate_reply,
+    build_on_entry_message, evaluate_derived_criterion, node_action_configs, parse_gate_reply,
 };
 use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
@@ -63,7 +69,8 @@ use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::{
-    GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_HUMAN,
+    GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_DERIVED,
+    SOURCE_HUMAN,
 };
 
 const LIFECYCLE_PANEL_CONTEXT: &str = "LifecyclePanel";
@@ -135,6 +142,10 @@ struct GateCheckState {
     /// (and so waiving one knows the full set to decide whether every
     /// criterion is now pass/waived).
     criteria_catalog: Vec<GateCriterion>,
+    /// Rows the app evaluated itself (`tod_core::gate::evaluate_derived_criterion`)
+    /// while an agent turn evaluates the rest — merged into `criteria_detail`
+    /// when that reply lands.
+    derived_detail: Vec<CriterionOutcome>,
     /// Set after one click on **Revert** — a second click while armed
     /// actually applies it. Keeps an accidental click from reverting a
     /// node's lifecycle without confirmation.
@@ -522,9 +533,8 @@ impl LifecyclePanelView {
     }
 
     /// Action configs available to launch implementation against, when the
-    /// current node is in the `active` lifecycle state — mirrors
-    /// `task_list::fixtures::load_tasks_from_store`'s filtering (interview
-    /// configs are not user-facing action configs).
+    /// current node is in the `active` lifecycle state — the same set the
+    /// `ready` → `active` gate requires (`tod_core::gate::node_action_configs`).
     fn active_action_configs(&self) -> Vec<tod_store::fleet::AgentConfigRow> {
         let Some(task_id) = self.task_id.as_ref() else {
             return Vec::new();
@@ -533,14 +543,7 @@ impl LifecyclePanelView {
             return Vec::new();
         }
         self.fleet
-            .resolve_agents_for_node(task_id)
-            .map(|resolved| {
-                resolved
-                    .configs
-                    .into_iter()
-                    .filter(|c| c.mode != "interview")
-                    .collect()
-            })
+            .read(|conn| node_action_configs(conn, task_id))
             .unwrap_or_default()
     }
 
@@ -657,7 +660,9 @@ impl LifecyclePanelView {
     }
 
     fn load_task(&mut self, task_id: &str) -> bool {
-        match self.fleet.get_task(task_id) {
+        // `get_node`, not `get_task`: the panel follows the tree onto nodes
+        // without the Agent capability too, and says when one has no lifecycle.
+        match self.fleet.get_node(task_id) {
             Ok(Some(task)) => {
                 self.title = task.title;
                 self.lifecycle = task.lifecycle;
@@ -777,7 +782,9 @@ impl LifecyclePanelView {
         let previous = self.task_id.clone();
         self.task_id = Some(task_id.to_string());
         if !self.load_task(task_id) {
+            // Never keep showing a node that is no longer selected.
             self.task_id = previous;
+            self.close(cx);
             return;
         }
         if let Some(state) = self.gate_states.get_mut(task_id) {
@@ -849,15 +856,84 @@ impl LifecyclePanelView {
         }
         cx.notify();
 
-        let mut criteria_catalog: Vec<GateCriterion> = Vec::new();
+        let criteria = match self
+            .fleet
+            .gate_criteria_for_transition(node_id, &from_state, &to_state)
+        {
+            Ok(criteria) => criteria,
+            Err(err) => return self.fail_gate_check(&task_id, format!("{err:#}"), cx),
+        };
+        let criteria_catalog: Vec<GateCriterion> = criteria.iter().map(|(c, _)| c.clone()).collect();
+
+        // Criteria the app can answer from its own data never reach the
+        // agent: it isn't shown that data, so it could only guess.
+        let mut derived_detail = Vec::new();
+        let mut agent_criteria = Vec::new();
+        for (criterion, eval) in criteria {
+            match self
+                .fleet
+                .read(|conn| evaluate_derived_criterion(conn, node_id, &criterion))
+            {
+                Ok(Some(derived)) => derived_detail.push(CriterionOutcome {
+                    criterion_id: criterion.id,
+                    label: criterion.label.clone(),
+                    outcome: derived.outcome.to_string(),
+                    detail: Some(derived.detail),
+                    action: GateAction::None,
+                }),
+                Ok(None) => agent_criteria.push((criterion, eval)),
+                Err(err) => return self.fail_gate_check(&task_id, format!("{err:#}"), cx),
+            }
+        }
+        if !derived_detail.is_empty() {
+            let results = derived_detail
+                .iter()
+                .map(|row| {
+                    (
+                        row.criterion_id,
+                        row.outcome.clone(),
+                        row.detail.clone(),
+                        tod_store::outline::repos::gate::ACTION_NONE.to_string(),
+                    )
+                })
+                .collect();
+            if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
+                node_id,
+                results,
+                forward_state: None,
+                source: SOURCE_DERIVED.to_string(),
+            }) {
+                return self.fail_gate_check(&task_id, format!("Failed to save gate check: {err:#}"), cx);
+            }
+            let _ = self.fleet.writer().flush();
+
+            // Nothing left for an agent to judge — the table is complete.
+            if agent_criteria.is_empty() {
+                let all_clear = derived_detail
+                    .iter()
+                    .all(|r| r.outcome == OUTCOME_PASS || r.outcome == OUTCOME_WAIVED);
+                let state = self.gate_states.entry(task_id).or_default();
+                state.pending = None;
+                state.criteria_catalog = criteria_catalog;
+                state.derived_detail.clear();
+                state.criteria_detail = derived_detail;
+                state.gate_status = if all_clear {
+                    "All criteria satisfied — advance when ready.".into()
+                } else {
+                    "Gate check: blocked — see criteria below.".into()
+                };
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(state) = self.gate_states.get_mut(&task_id) {
+            state.derived_detail = derived_detail;
+        }
+
         let result: anyhow::Result<(SessionTurn, String)> = (|| {
             let settings = TodSettings::load(&self.paths).unwrap_or_default();
             let agent_ctx =
                 ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, &task_id)?;
-            let criteria =
-                self.fleet
-                    .gate_criteria_for_transition(node_id, &from_state, &to_state)?;
-            criteria_catalog = criteria.iter().map(|(c, _)| c.clone()).collect();
             let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
             let body = self
                 .fleet
@@ -906,7 +982,7 @@ impl LifecyclePanelView {
                     plan_steps,
                     from_state: from_state.clone(),
                     to_state: to_state.clone(),
-                    criteria,
+                    criteria: agent_criteria,
                 },
                 &role_doc,
             )?;
@@ -1251,17 +1327,24 @@ impl LifecyclePanelView {
                 )
             })
             .collect();
-        let criteria_detail: Vec<CriterionOutcome> = reply
-            .gate_results
-            .iter()
-            .map(|row| CriterionOutcome {
+        // Rows the app evaluated itself (already saved when the check began)
+        // join the agent's rows, back in catalog order.
+        let derived_detail = self
+            .gate_states
+            .get_mut(task_id)
+            .map(|s| std::mem::take(&mut s.derived_detail))
+            .unwrap_or_default();
+        let mut criteria_detail: Vec<CriterionOutcome> = derived_detail
+            .into_iter()
+            .chain(reply.gate_results.iter().map(|row| CriterionOutcome {
                 criterion_id: row.criterion_id,
                 label: label_for(row.criterion_id),
                 outcome: row.outcome.clone(),
                 detail: row.detail.clone(),
                 action: row.action,
-            })
+            }))
             .collect();
+        criteria_detail.sort_by_key(|r| catalog.iter().position(|c| c.id == r.criterion_id));
 
         let all_clear = !criteria_detail.is_empty()
             && criteria_detail

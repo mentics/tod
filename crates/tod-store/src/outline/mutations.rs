@@ -1034,6 +1034,8 @@ fn create_text_node(
     title: &str,
     node_id: Option<Uuid>,
 ) -> Result<Uuid> {
+    // The slug is fixed at creation, so it must come from a real title.
+    anyhow::ensure!(!title.trim().is_empty(), "a node needs a title before it can be created");
     let node_repo = NodeRepo::new(conn);
     let outline = OutlineRepo::new(conn);
     let node_id = node_id.unwrap_or_else(Uuid::new_v4);

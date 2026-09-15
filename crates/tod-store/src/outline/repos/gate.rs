@@ -17,6 +17,10 @@ pub const SOURCE_DERIVED: &str = "derived";
 pub const ACTION_NONE: &str = "none";
 pub const ACTION_INTERVIEW: &str = "interview";
 
+/// `ready` → `active`: the node has an action config to implement with. The app
+/// answers this one itself (`tod_core::gate::derived`); it never goes to an agent.
+pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-configured";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCriterion {
     pub id: Uuid,
