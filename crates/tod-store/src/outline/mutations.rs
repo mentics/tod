@@ -131,6 +131,12 @@ pub enum OutlineMutation {
     DeleteObligation {
         obligation_id: Uuid,
     },
+    /// Put back the obligation row change-log entry `rev` kept: a deleted
+    /// obligation returns with its id, position, and marks; an edited one gets
+    /// its earlier wording, section, and marks back.
+    RestoreObligation {
+        rev: i64,
+    },
     MoveObligation {
         obligation_id: Uuid,
         target_node_id: Uuid,
@@ -323,6 +329,7 @@ impl OutlineMutation {
                 | OutlineMutation::UpdateObligationPhase { .. }
                 | OutlineMutation::RenameObligationSection { .. }
                 | OutlineMutation::DeleteObligation { .. }
+                | OutlineMutation::RestoreObligation { .. }
                 | OutlineMutation::MoveObligation { .. }
                 | OutlineMutation::DeleteNode { .. }
                 | OutlineMutation::RestoreNodeSubtree { .. }
@@ -513,6 +520,9 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteObligation { obligation_id } => {
                 ObligationRepo::new(conn).delete(*obligation_id)?;
+            }
+            OutlineMutation::RestoreObligation { rev } => {
+                restore_obligation(conn, *rev)?;
             }
             OutlineMutation::MoveObligation {
                 obligation_id,
@@ -790,6 +800,84 @@ fn create_obligation(
     };
     let id = obligation_id.unwrap_or_else(Uuid::new_v4);
     repo.insert_at(id, node_id, kind, index, section, body, phase)?;
+    Ok(id)
+}
+
+/// See [`OutlineMutation::RestoreObligation`]. The row goes back exactly as it
+/// was, provenance included — restoring undoes a change, it asserts nothing new.
+fn restore_obligation(conn: &Connection, rev: i64) -> Result<Uuid> {
+    use crate::interview::{InterviewRepo, short_id};
+    use crate::outline::uuid_blob::uuid_to_blob;
+
+    let snapshot = InterviewRepo::new(conn).obligation_snapshot(rev)?.with_context(|| {
+        format!("change r-{rev} kept no obligation to restore (or it is past retention)")
+    })?;
+    let id = snapshot.obligation_id;
+    let prior = &snapshot.prior;
+    let repo = ObligationRepo::new(conn);
+    let current = repo.get(id)?;
+    match snapshot.op.as_str() {
+        "delete" => {
+            if let Some(current) = current {
+                anyhow::bail!(
+                    "obligation {} already exists (on node {})",
+                    short_id(id),
+                    current.node_id
+                );
+            }
+            NodeRepo::new(conn)
+                .get(snapshot.node_id)?
+                .with_context(|| format!("node {} no longer exists", snapshot.node_id))?;
+            guard_not_managed(conn, snapshot.node_id)?;
+            require_spec(conn, snapshot.node_id)?;
+            let kind = parse_obligation_kind(&prior.kind)?;
+            let index = usize::try_from(prior.ordinal - 1).unwrap_or(0);
+            repo.insert_at(
+                id,
+                snapshot.node_id,
+                kind,
+                index,
+                prior.section.as_deref(),
+                &prior.body,
+                &prior.phase,
+            )?;
+            conn.execute(
+                "UPDATE node_obligations SET provenance = ?1, attention = ?2, attention_why = ?3,
+                        visual_design_path = ?4, created_at = ?5
+                 WHERE id = ?6",
+                params![
+                    prior.provenance,
+                    prior.attention,
+                    prior.attention_why,
+                    prior.visual_design_path,
+                    prior.created_at,
+                    uuid_to_blob(id)
+                ],
+            )?;
+        }
+        _ => {
+            if current.is_none() {
+                anyhow::bail!(
+                    "obligation {} no longer exists — restore its deletion first",
+                    short_id(id)
+                );
+            }
+            conn.execute(
+                "UPDATE node_obligations SET body = ?1, section = ?2, provenance = ?3,
+                        attention = ?4, attention_why = ?5, updated_at = ?6
+                 WHERE id = ?7",
+                params![
+                    prior.body,
+                    prior.section,
+                    prior.provenance,
+                    prior.attention,
+                    prior.attention_why,
+                    now_ms(),
+                    uuid_to_blob(id)
+                ],
+            )?;
+        }
+    }
     Ok(id)
 }
 

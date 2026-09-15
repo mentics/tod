@@ -583,12 +583,7 @@ pub fn execute(
             if synced_rev.is_some() {
                 // Advancing a watermark can free rows too; don't wait for a
                 // session to retire before shrinking the log.
-                conn.execute(
-                    "DELETE FROM interview_changes WHERE rev <= COALESCE(
-                        (SELECT MIN(synced_rev) FROM interview_agent_sessions WHERE state = 'live'),
-                        (SELECT COALESCE(MAX(rev), 0) FROM interview_changes))",
-                    [],
-                )?;
+                trim_changes(conn, now)?;
             }
             Ok(json!({}))
         }
@@ -598,13 +593,7 @@ pub fn execute(
                 "UPDATE interview_agent_sessions SET state = 'retired' WHERE id = ?1",
                 params![uuid_to_blob(*id)],
             )?;
-            // Nothing live can need changes older than the oldest live watermark.
-            conn.execute(
-                "DELETE FROM interview_changes WHERE rev <= COALESCE(
-                    (SELECT MIN(synced_rev) FROM interview_agent_sessions WHERE state = 'live'),
-                    (SELECT COALESCE(MAX(rev), 0) FROM interview_changes))",
-                [],
-            )?;
+            trim_changes(conn, now)?;
             Ok(json!({}))
         }
 
@@ -695,6 +684,21 @@ pub fn execute(
             choice_seqs,
         ),
     }
+}
+
+/// Drop change-log rows no live agent session can still need — everything at
+/// or below the oldest live watermark — except rows holding an obligation's
+/// prior row, which stay restorable for [`OBLIGATION_SNAPSHOT_RETENTION_MS`].
+pub fn trim_changes(conn: &Connection, now: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM interview_changes
+         WHERE rev <= COALESCE(
+                (SELECT MIN(synced_rev) FROM interview_agent_sessions WHERE state = 'live'),
+                (SELECT COALESCE(MAX(rev), 0) FROM interview_changes))
+           AND (prior IS NULL OR at < ?1)",
+        params![now - OBLIGATION_SNAPSHOT_RETENTION_MS],
+    )?;
+    Ok(())
 }
 
 fn question(repo: &InterviewRepo<'_>, node_id: Uuid, seq: i64) -> Result<InterviewQuestion> {
@@ -1065,6 +1069,179 @@ mod tests {
         let changes = repo.changes_since(&[node], 0, "nobody").unwrap();
         assert!(changes.iter().any(|c| c.entity == ENTITY_OBLIGATION && c.op == "delete"));
         assert!(changes.iter().any(|c| c.entity == ENTITY_QUESTION && c.fields.contains(&"status".to_string())));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn agent_session(conn: &Connection, node: Uuid, session: Uuid) -> Uuid {
+        let agent = Uuid::new_v4();
+        let head = InterviewRepo::new(conn).head_rev().unwrap();
+        run(
+            conn,
+            ACTOR_USER,
+            InterviewCommand::CreateAgentSession {
+                id: agent,
+                node_id: node,
+                interview_session_id: Some(session),
+                phase: PHASE_DESIGN.into(),
+                role: Role::Drafter,
+                lane: 0,
+                synced_rev: head,
+                snapshot_tokens: 0,
+            },
+        )
+        .unwrap();
+        agent
+    }
+
+    fn restore(conn: &Connection, rev: i64) -> Result<Value> {
+        run(
+            conn,
+            ACTOR_USER,
+            InterviewCommand::Outline {
+                mutation: OutlineMutation::RestoreObligation { rev },
+                target: None,
+            },
+        )
+    }
+
+    #[test]
+    fn deleted_obligations_survive_trimming_and_restore_in_place_with_their_marks() {
+        let (dir, conn, node, session) = setup();
+        let ids: Vec<Uuid> = ["First.", "Second.", "Third."]
+            .iter()
+            .enumerate()
+            .map(|(i, body)| {
+                let id = Uuid::new_v4();
+                ObligationRepo::new(&conn)
+                    .insert_at(id, node, KIND_REQUIREMENT, i, Some("Core"), body, PHASE_DESIGN)
+                    .unwrap();
+                id
+            })
+            .collect();
+        conn.execute(
+            "UPDATE node_obligations SET provenance = 'agent', attention = 'high', attention_why = 'a guess'
+             WHERE id = ?1",
+            [uuid_to_blob(ids[1])],
+        )
+        .unwrap();
+
+        // An agent deletes the first two, top-down.
+        let agent = agent_session(&conn, node, session);
+        for id in &ids[..2] {
+            run(
+                &conn,
+                &agent.to_string(),
+                InterviewCommand::Outline {
+                    mutation: OutlineMutation::DeleteObligation { obligation_id: *id },
+                    target: Some(*id),
+                },
+            )
+            .unwrap();
+        }
+        let repo = InterviewRepo::new(&conn);
+        let deleted = repo.deleted_obligations(node).unwrap();
+        assert_eq!(
+            deleted.iter().map(|s| s.obligation_id).collect::<Vec<_>>(),
+            vec![ids[1], ids[0]]
+        );
+        assert_eq!(deleted[0].actor, agent.to_string());
+        assert_eq!(deleted[0].prior.body, "Second.");
+        assert_eq!(deleted[0].prior.attention.as_deref(), Some("high"));
+
+        // Retiring the agent trims the log, but not the deleted rows.
+        run(&conn, ACTOR_USER, InterviewCommand::RetireAgentSession { id: agent }).unwrap();
+        let plain: i64 = conn
+            .query_row("SELECT COUNT(*) FROM interview_changes WHERE prior IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(plain, 0);
+        assert_eq!(repo.deleted_obligations(node).unwrap(), deleted);
+
+        // Newest first puts them back in their original order.
+        for snapshot in &deleted {
+            restore(&conn, snapshot.rev).unwrap();
+        }
+        let rows = ObligationRepo::new(&conn).list_for_node(node).unwrap();
+        assert_eq!(rows.iter().map(|o| o.id).collect::<Vec<_>>(), ids);
+        assert_eq!(rows[1].body, "Second.");
+        assert_eq!(rows[1].section.as_deref(), Some("Core"));
+        assert_eq!(rows[1].phase, PHASE_DESIGN);
+        let mark = crate::drafting::DraftingRepo::new(&conn)
+            .mark(ids[1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(mark.provenance, "agent");
+        assert_eq!(mark.attention.as_deref(), Some("high"));
+        assert_eq!(mark.attention_why.as_deref(), Some("a guess"));
+        assert!(repo.deleted_obligations(node).unwrap().is_empty());
+
+        let err = restore(&conn, deleted[0].rev).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_edit_restores_the_earlier_wording_and_the_restore_is_itself_restorable() {
+        let (dir, conn, node, session) = setup();
+        let id = Uuid::new_v4();
+        ObligationRepo::new(&conn)
+            .insert_at(id, node, KIND_CONSTRAINT, 0, None, "The user's wording.", PHASE_REQUIREMENTS)
+            .unwrap();
+        let agent = agent_session(&conn, node, session);
+        run(
+            &conn,
+            &agent.to_string(),
+            InterviewCommand::Outline {
+                mutation: OutlineMutation::UpdateObligationBody {
+                    obligation_id: id,
+                    body: "The agent's wording.".into(),
+                },
+                target: Some(id),
+            },
+        )
+        .unwrap();
+        let repo = InterviewRepo::new(&conn);
+        let history = repo.obligation_history(id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].op, "update");
+        assert_eq!(history[0].prior.body, "The user's wording.");
+        assert_eq!(history[0].prior.provenance, "user");
+
+        restore(&conn, history[0].rev).unwrap();
+        let row = ObligationRepo::new(&conn).get(id).unwrap().unwrap();
+        assert_eq!(row.body, "The user's wording.");
+        let mark = crate::drafting::DraftingRepo::new(&conn).mark(id).unwrap().unwrap();
+        assert_eq!(mark.provenance, "user");
+
+        let history = repo.obligation_history(id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].prior.body, "The agent's wording.");
+
+        // An edit can't be restored onto an obligation that is gone.
+        ObligationRepo::new(&conn).delete(id).unwrap();
+        let err = restore(&conn, history[1].rev).unwrap_err();
+        assert!(err.to_string().contains("restore its deletion first"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleted_obligations_past_retention_are_trimmed() {
+        let (dir, conn, node, _session) = setup();
+        let id = Uuid::new_v4();
+        let obligations = ObligationRepo::new(&conn);
+        obligations
+            .insert_at(id, node, KIND_REQUIREMENT, 0, None, "Old.", PHASE_REQUIREMENTS)
+            .unwrap();
+        obligations.delete(id).unwrap();
+        let repo = InterviewRepo::new(&conn);
+        let rev = repo.deleted_obligations(node).unwrap()[0].rev;
+
+        trim_changes(&conn, now_ms()).unwrap();
+        assert!(repo.obligation_snapshot(rev).unwrap().is_some());
+
+        trim_changes(&conn, now_ms() + OBLIGATION_SNAPSHOT_RETENTION_MS + 1).unwrap();
+        assert!(repo.obligation_snapshot(rev).unwrap().is_none());
+        let err = restore(&conn, rev).unwrap_err();
+        assert!(err.to_string().contains("past retention"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
