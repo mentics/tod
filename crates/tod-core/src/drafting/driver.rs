@@ -6,9 +6,13 @@
 //! changed what the drafter works from and then paused. Sessions follow the
 //! interview's rules: docs and a snapshot once, then only changes; rotate
 //! when over budget or cold.
+//!
+//! Before a turn, the driver has every ancestor summary the drafter's context
+//! needs written (`drafting::summary`); the turn waits for them.
 
 use crate::drafting::DraftingMode;
 use crate::drafting::context::snapshot;
+use crate::drafting::summary;
 use crate::interview::context::{ContextScope, delta, estimate_tokens};
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
@@ -21,7 +25,7 @@ use tod_agent::{
 use tod_store::drafting::*;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::*;
-use tod_store::outline::{OUTCOME_PENDING, ancestor_chain};
+use tod_store::outline::{EXTRA_CONTENT_SUMMARY, OUTCOME_PENDING, OutlineMutation, ancestor_chain};
 use tod_store::settings::InterviewContextSettings;
 use uuid::Uuid;
 
@@ -58,6 +62,14 @@ struct Turn {
     rewrite: bool,
 }
 
+/// An agent writing one ancestor's summary.
+struct SummaryRun {
+    run: RunId,
+    node_id: Uuid,
+    title: String,
+    key: String,
+}
+
 #[derive(Default)]
 struct Backoff {
     failures: u32,
@@ -83,10 +95,19 @@ impl Backoff {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DraftingStatus {
     pub running: bool,
+    /// Titles of the ancestors whose summaries are being written for the next turn.
+    pub summarizing: Vec<String>,
     pub rewrite_pending: bool,
     pub last_error: Option<String>,
     /// Turns failed repeatedly; the driver waits for [`DraftingDriver::retry`].
     pub manual_required: bool,
+}
+
+impl DraftingStatus {
+    /// A turn or the summaries it waits on are in flight.
+    pub fn busy(&self) -> bool {
+        self.running || !self.summarizing.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +126,7 @@ struct Due {
 pub struct DraftingDriver {
     config: DraftingConfig,
     turn: Option<Turn>,
+    summaries: Vec<SummaryRun>,
     backoff: Backoff,
     rewrite_requested: bool,
     kickoff_checked: bool,
@@ -119,6 +141,7 @@ impl DraftingDriver {
         Self {
             config,
             turn: None,
+            summaries: Vec::new(),
             backoff: Backoff::default(),
             rewrite_requested: false,
             kickoff_checked: false,
@@ -135,6 +158,7 @@ impl DraftingDriver {
     pub fn status(&self) -> DraftingStatus {
         DraftingStatus {
             running: self.turn.is_some(),
+            summarizing: self.summaries.iter().map(|s| s.title.clone()).collect(),
             rewrite_pending: self.rewrite_requested,
             last_error: self.last_error.clone(),
             manual_required: self.manual_required,
@@ -153,22 +177,79 @@ impl DraftingDriver {
         self.rewrite_requested = true;
     }
 
-    /// Stop the turn in flight, if any.
+    /// Stop the turn in flight, and any summaries it waits on.
     pub fn cancel(&mut self, agent: &mut dyn AgentProvider) {
         if let Some(turn) = self.turn.take() {
             let _ = agent.cancel_run(turn.run);
+        }
+        for run in self.summaries.drain(..) {
+            let _ = agent.cancel_run(run.run);
+            agent.close_session(&run.key);
+            summary::release(run.node_id);
         }
     }
 
     /// Advance: collect a finished turn, then start one if it is due.
     pub fn tick(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Vec<DraftingEvent> {
         let mut events = Vec::new();
+        self.poll_summaries(fleet, agent, &mut events);
         self.poll(fleet, agent, &mut events);
         if let Err(err) = self.schedule(fleet, agent) {
             self.backoff.fail();
             self.last_error = Some(format!("{err:#}"));
         }
         events
+    }
+
+    /// Store each finished summary. A failure counts like a failed turn, since
+    /// the turn cannot start without it.
+    fn poll_summaries(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        events: &mut Vec<DraftingEvent>,
+    ) {
+        let mut i = 0;
+        while i < self.summaries.len() {
+            let outcome = match agent.poll_run(self.summaries[i].run) {
+                Some(AgentRunState::InFlight(_)) | Some(AgentRunState::NeedsPermission(_)) => {
+                    i += 1;
+                    continue;
+                }
+                Some(AgentRunState::Success(reply)) => reply
+                    .as_deref()
+                    .and_then(summary::parse)
+                    .ok_or_else(|| anyhow::anyhow!("the reply had no summary")),
+                Some(AgentRunState::Failure(message)) => Err(anyhow::anyhow!(message)),
+                None => Err(anyhow::anyhow!("agent run was lost")),
+            };
+            let run = self.summaries.remove(i);
+            agent.close_session(&run.key);
+            let stored = outcome.and_then(|body| {
+                fleet.interview(
+                    ACTOR_AGENT,
+                    InterviewCommand::Outline {
+                        mutation: OutlineMutation::SetExtraContent {
+                            node_id: run.node_id,
+                            content_type: EXTRA_CONTENT_SUMMARY.into(),
+                            body,
+                        },
+                        target: None,
+                    },
+                )?;
+                Ok(())
+            });
+            summary::release(run.node_id);
+            if let Err(err) = stored {
+                self.backoff.fail();
+                if self.backoff.failures >= MAX_FAILURES {
+                    self.manual_required = true;
+                }
+                let error = format!("Summarizing \"{}\" failed: {err:#}", run.title);
+                self.last_error = Some(error.clone());
+                events.push(DraftingEvent::TurnFinished { error: Some(error) });
+            }
+        }
     }
 
     fn poll(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider, events: &mut Vec<DraftingEvent>) {
@@ -246,7 +327,11 @@ impl DraftingDriver {
     }
 
     fn schedule(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
-        if self.turn.is_some() || self.manual_required || !self.backoff.ready() {
+        if self.turn.is_some()
+            || !self.summaries.is_empty()
+            || self.manual_required
+            || !self.backoff.ready()
+        {
             return Ok(());
         }
         let node = self.config.node_id;
@@ -295,7 +380,6 @@ impl DraftingDriver {
                 None => true,
                 Some(eval) => session.is_none() && eval.outcome == OUTCOME_PENDING,
             };
-        self.kickoff_checked = true;
 
         let due = Due {
             dumps,
@@ -304,10 +388,67 @@ impl DraftingDriver {
             kickoff,
         };
         if due.dumps.is_empty() && due.choices.is_empty() && !due.rewrite && !due.kickoff && !quiet_changes {
+            self.kickoff_checked = true;
             return Ok(());
         }
+        // Ancestors' requirements reach the drafter only as their summaries, so
+        // the turn waits until every one it needs is written. Nothing is taken
+        // off the due list meanwhile: the next tick finds the same work.
+        let missing = fleet.read(|conn| summary::missing(conn, node, Some(phase)))?;
+        if !missing.is_empty() {
+            return self.start_summaries(fleet, agent, missing);
+        }
+        self.kickoff_checked = true;
         self.pending_changes = None;
         self.start_turn(fleet, agent, due)
+    }
+
+    /// Ask an agent for each missing summary no other driver is already writing.
+    fn start_summaries(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        missing: Vec<Uuid>,
+    ) -> Result<()> {
+        let cwd = self.scratch_dir()?;
+        for node_id in missing {
+            if !summary::claim(node_id) {
+                continue;
+            }
+            let started = fleet
+                .read(|conn| summary::request(conn, node_id))
+                .and_then(|(title, message)| {
+                    let key = format!("summary-{node_id}-{}", Uuid::new_v4());
+                    let handle = agent.send_session_turn(SessionTurn {
+                        key: key.clone(),
+                        agent_config_id: self.config.agent_config_id.clone(),
+                        cwd: cwd.clone(),
+                        options: self.config.launch.clone(),
+                        resume_session_id: None,
+                        opening: Some(SessionOpening {
+                            title: format!("{title} · summary"),
+                            context: None,
+                        }),
+                        message,
+                        purpose: SessionPurpose::Summarizer,
+                        env: Vec::new(),
+                    })?;
+                    Ok(SummaryRun {
+                        run: handle.id,
+                        node_id,
+                        title,
+                        key,
+                    })
+                });
+            match started {
+                Ok(run) => self.summaries.push(run),
+                Err(err) => {
+                    summary::release(node_id);
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn instruction(&self, due: &Due) -> Result<String> {
@@ -520,11 +661,16 @@ impl DraftingDriver {
     /// repository's instructions it has no use for; drafting runs in the repo.
     fn cwd(&self) -> Result<PathBuf> {
         if self.config.mode == DraftingMode::Capture {
-            let dir = self.config.data_root.join("agent").join("drafting");
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-            return Ok(dir);
+            return self.scratch_dir();
         }
         Ok(self.config.repo_cwd.clone())
+    }
+
+    /// An empty directory for agents that need nothing from a repository.
+    fn scratch_dir(&self) -> Result<PathBuf> {
+        let dir = self.config.data_root.join("agent").join("drafting");
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(dir)
     }
 }
 
@@ -536,15 +682,20 @@ fn session_key(id: Uuid) -> String {
 pub(crate) const SUMMARY_OPEN: &str = "<change-summary>";
 pub(crate) const SUMMARY_CLOSE: &str = "</change-summary>";
 
-/// The change summary out of a turn's whole reply. A provider hands back every
-/// message of the turn run together, narration between tool calls included, so
-/// only the last delimited block counts. An unclosed block runs to the end; a
-/// reply with no block falls back to its last paragraph.
+/// The change summary out of a turn's whole reply.
 fn change_summary(reply: &str) -> Option<String> {
-    let body = match reply.rfind(SUMMARY_OPEN) {
+    tagged_block(reply, SUMMARY_OPEN, SUMMARY_CLOSE)
+}
+
+/// The text between `open` and `close` in an agent's whole reply. A provider
+/// hands back every message of the turn run together, narration between tool
+/// calls included, so only the last delimited block counts. An unclosed block
+/// runs to the end; a reply with no block falls back to its last paragraph.
+pub(crate) fn tagged_block(reply: &str, open: &str, close: &str) -> Option<String> {
+    let body = match reply.rfind(open) {
         Some(start) => {
-            let rest = &reply[start + SUMMARY_OPEN.len()..];
-            rest.find(SUMMARY_CLOSE).map_or(rest, |end| &rest[..end])
+            let rest = &reply[start + open.len()..];
+            rest.find(close).map_or(rest, |end| &rest[..end])
         }
         None => reply.trim().rsplit("\n\n").next().unwrap_or_default(),
     };
@@ -591,6 +742,12 @@ mod tests {
 
         fn send_session_turn(&mut self, turn: SessionTurn) -> anyhow::Result<AgentRunHandle> {
             let id = RunId::new();
+            if turn.purpose == SessionPurpose::Summarizer {
+                let reply = summary::mock_summarizer(&turn.message)?;
+                self.runs.insert(id, AgentRunState::Success(Some(reply)));
+                self.turns.push(turn);
+                return Ok(AgentRunHandle { id });
+            }
             let actor = turn
                 .env
                 .iter()
@@ -823,6 +980,58 @@ mod tests {
         driver.tick(&fx.fleet, &mut agent);
         assert_eq!(agent.turns.len(), 2, "the resolved choice goes back to the drafter");
         assert!(agent.turns[1].message.contains("the user picked 1"), "{}", agent.turns[1].message);
+    }
+
+    #[test]
+    fn missing_ancestor_summaries_are_written_before_the_turn() {
+        let fx = fixture();
+        fx.obligation("Ancestor requirement nobody below should see in full.");
+        let child = Uuid::new_v4();
+        fx.outline(OutlineMutation::CreateNode {
+            node_id: Some(child),
+            list_id: fx.fleet.list_outline_lists().unwrap()[0].id,
+            parent_id: Some(fx.node),
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Child,
+            title: "Child".into(),
+        });
+        let inherited = |fx: &Fixture| {
+            fx.fleet
+                .read(|conn| {
+                    crate::interview::context::render_inherited_context(
+                        conn,
+                        &tod_store::outline::repos::NodeRepo::new(conn),
+                        child,
+                        None,
+                    )
+                })
+                .unwrap()
+        };
+        let before = inherited(&fx);
+        assert!(!before.contains("nobody below"), "requirements are never listed: {before}");
+        assert!(before.contains("No summary yet"), "{before}");
+
+        let (mut driver, mut agent) = driver(&fx, DraftingMode::Capture);
+        driver.config.node_id = child;
+        fx.user(InterviewCommand::AddDump {
+            node_id: Some(child),
+            body: "Children list their parent.".into(),
+        });
+        driver.tick(&fx.fleet, &mut agent);
+        assert_eq!(agent.turns.len(), 1);
+        assert_eq!(agent.turns[0].purpose, SessionPurpose::Summarizer);
+        assert!(agent.turns[0].message.contains("nobody below"), "{}", agent.turns[0].message);
+        assert_eq!(driver.status().summarizing, ["Interview node"]);
+
+        // The summary lands, then the turn it waited on starts.
+        assert!(driver.tick(&fx.fleet, &mut agent).is_empty());
+        assert_eq!(agent.turns.len(), 2);
+        assert_eq!(agent.turns[1].purpose, SessionPurpose::Drafter);
+        let context = agent.turns[1].opening.as_ref().unwrap().context.as_deref().unwrap();
+        assert!(context.contains("Mock summary of Interview node"), "{context}");
+        assert!(!context.contains("nobody below"), "{context}");
+        assert!(!context.contains("No summary yet"), "{context}");
+        assert!(driver.status().summarizing.is_empty());
     }
 
     #[test]

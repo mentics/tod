@@ -5,7 +5,7 @@
 ## On entry
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase), open choices, the buildable evaluation, and plan steps (if any).
-2. Regenerate the node's summary from its now-settled requirements-phase obligations: `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append — this is the only place a requirements-based summary is written). Ancestor nodes use this to give this node's descendants a short scope statement in place of a full obligations dump.
+2. Regenerate the node's summary from its now-settled requirements-phase obligations: `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append). Ancestor nodes use this to give this node's descendants a short scope statement in place of their requirements.
 3. If the node is buildable and the gate checklist passes → verify upstream conformance and proceed to exit.
 
 ## Responsibilities

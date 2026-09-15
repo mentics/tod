@@ -8,6 +8,7 @@
 pub mod context;
 pub mod driver;
 pub mod mock;
+pub mod summary;
 
 use tod_store::interview::{PHASE_DESIGN, PHASE_REQUIREMENTS};
 

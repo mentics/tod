@@ -111,16 +111,15 @@ fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {
 }
 
 /// Renders `node_id`'s ancestor (and global) obligations for interview and
-/// gate-check context. An ancestor with a generated summary
-/// (`EXTRA_CONTENT_SUMMARY`, regenerated once on entering `design` and once
-/// on entering `planning`, see the state docs' On-entry steps) contributes
-/// just its title, that summary, and its constraint-kind obligations in
-/// full — its requirements are what the summary exists to stand in for, so
-/// they aren't repeated. An ancestor with obligations but no summary yet
-/// falls back to showing everything, so nothing already-settled is ever
-/// silently hidden — with a note flagging the missing summary. Global
-/// (no owning node) obligations always show in full; there is nothing to
-/// summarize about them.
+/// gate-check context. Each ancestor contributes its title, its generated
+/// summary (`EXTRA_CONTENT_SUMMARY`), and its constraint-kind obligations in
+/// full. Its requirements are never listed: the summary stands in for them,
+/// and a deep tree would otherwise put hundreds into every context. The
+/// drafting driver writes missing summaries before a turn
+/// (`crate::drafting::summary`); anywhere else, an ancestor still without
+/// one gets a pointer to `tod-cli` instead. Global (no owning node)
+/// obligations always show in full; there is nothing to summarize about
+/// them.
 pub fn render_inherited_context(
     conn: &Connection,
     nodes: &NodeRepo<'_>,
@@ -175,16 +174,11 @@ pub fn render_inherited_context(
             items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
         match summary {
             Some(summary) => writeln!(out, "{}", one_line(&summary))?,
-            None => {
-                writeln!(
-                    out,
-                    "⚠ no generated summary yet for this node — showing its full obligations below."
-                )?;
-                for o in &items {
-                    writeln!(out, "- {}", obligation_line(o))?;
-                }
-                continue;
-            }
+            None if constraints.len() < items.len() => writeln!(
+                out,
+                "(No summary yet. Its requirements, if you need them: `obligations list --node {source_id}`.)"
+            )?,
+            None => {}
         }
         if !constraints.is_empty() {
             out.push_str("\nConstraints:\n");

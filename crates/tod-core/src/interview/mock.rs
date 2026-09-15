@@ -20,6 +20,10 @@ pub fn install_mock_interview_handler(data_root: PathBuf) {
 }
 
 fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
+    // A summarizer only replies; it has no session row or actor.
+    if turn.purpose == SessionPurpose::Summarizer {
+        return crate::drafting::summary::mock_summarizer(&turn.blocks.join("\n\n"));
+    }
     let actor = turn
         .env
         .iter()
@@ -44,7 +48,7 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
         SessionPurpose::QuestionMaker => question_maker(&client, &row, &text, &received),
         SessionPurpose::AnswerProcessor => answer_processor(&client, &row, &text, &received),
         SessionPurpose::Drafter => crate::drafting::mock::drafter(&client, &row, &text),
-        SessionPurpose::Chat => bail!("not an interview turn"),
+        SessionPurpose::Chat | SessionPurpose::Summarizer => bail!("not an interview turn"),
     }
 }
 

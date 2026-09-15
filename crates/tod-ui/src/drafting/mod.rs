@@ -370,7 +370,7 @@ impl DraftingView {
             .filter_map(|d| {
                 let d = d.lock().ok()?;
                 d.status()
-                    .running
+                    .busy()
                     .then(|| format!("Drafter running: {}", d.config().node_title))
             })
             .collect()
@@ -395,7 +395,7 @@ impl DraftingView {
         if let Some(existing) = self.drivers.get(&node_id) {
             let keep = existing.lock().map_or(true, |d| {
                 let config = d.config();
-                d.status().running || (config.mode == mode && config.kickoff == kickoff)
+                d.status().busy() || (config.mode == mode && config.kickoff == kickoff)
             });
             if keep {
                 return Ok(existing.clone());
@@ -1135,6 +1135,11 @@ impl DraftingView {
         let title = self.node.as_ref().map(|n| n.title.clone()).unwrap_or_default();
         let agent = if self.status.running {
             "Drafter working…".to_string()
+        } else if !self.status.summarizing.is_empty() {
+            format!(
+                "Summarizing {} for the drafter…",
+                self.status.summarizing.join(", ")
+            )
         } else if self.status.rewrite_pending {
             "Rewrite queued".to_string()
         } else if self.status.manual_required {
@@ -1261,7 +1266,7 @@ impl DraftingView {
         let items = self.data.review.clone();
         let mut list = v_flex().w_full();
         if items.is_empty() {
-            let empty = if self.status.running {
+            let empty = if self.status.busy() {
                 "The drafter is working…"
             } else {
                 "Nothing needs your attention."

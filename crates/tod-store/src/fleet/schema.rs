@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 27;
+pub const CURRENT_USER_VERSION: i32 = 28;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -226,11 +226,62 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v26_to_v27(conn)?;
         conn.pragma_update(None, "user_version", 27)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 28 {
+        migrate_v27_to_v28(conn)?;
+        conn.pragma_update(None, "user_version", 28)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Allow 'summary' as a `node_extra_content.content_type`. `tod-cli content set
+/// --type summary` always accepted it, but the table refused every write, so no
+/// node ever had one. Rebuilding the table drops its change-log triggers; they
+/// are recreated as `migrate_v14_to_v15` defined them.
+fn migrate_v27_to_v28(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "
+        CREATE TABLE node_extra_content_v28 (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details', 'summary')),
+            body         TEXT NOT NULL DEFAULT '',
+            updated_at   INTEGER NOT NULL,
+            UNIQUE (node_id, content_type)
+        );
+        INSERT INTO node_extra_content_v28 (id, node_id, content_type, body, updated_at)
+        SELECT id, node_id, content_type, body, updated_at FROM node_extra_content;
+        DROP TABLE node_extra_content;
+        ALTER TABLE node_extra_content_v28 RENAME TO node_extra_content;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_insert AFTER INSERT ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_update AFTER UPDATE ON node_extra_content
+        WHEN OLD.body IS NOT NEW.body BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'update',
+                CASE WHEN length(NEW.body) > length(OLD.body)
+                        AND substr(NEW.body, 1, length(OLD.body)) = OLD.body
+                    THEN 'append:' || length(CAST(OLD.body AS BLOB)) ELSE 'body' END,
+                {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_delete AFTER DELETE ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'content', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+        END;
+        "
+    ))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2244,6 +2295,33 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("readonly") || err.to_string().contains("query_only"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_summary_can_be_stored_and_its_change_is_logged() {
+        let (dir, conn) = temp_db();
+        let now = chrono::Utc::now().timestamp_millis();
+        let node = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at) VALUES (?1, 'n', 'N', ?2, ?2)",
+            params![node.as_bytes().as_slice(), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+             VALUES (?1, ?2, 'summary', 'What N covers.', ?3)",
+            params![uuid::Uuid::new_v4().as_bytes().as_slice(), node.as_bytes().as_slice(), now],
+        )
+        .unwrap();
+        let logged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interview_changes WHERE entity = 'content' AND op = 'insert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1, "the rebuilt table keeps its change-log triggers");
         let _ = fs::remove_dir_all(dir);
     }
 

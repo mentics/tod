@@ -94,12 +94,11 @@ pub const EXTRA_CONTENT_GOAL: &str = "goal";
 /// `node_extra_content.content_type` value for the node's imported/freeform details.
 pub const EXTRA_CONTENT_DETAILS: &str = "details";
 
-/// `node_extra_content.content_type` value for the node's generated summary —
-/// regenerated once on entering `design` (summarizing the settled
-/// requirements) and once on entering `planning` (summarizing the settled
-/// design), overwriting the previous value each time. Ancestor context for
-/// interviews and gate checks shows this plus constraints in place of a full
-/// requirements dump. See `crate::interview::PHASE_DESIGN`/`PHASE_PLANNING`.
+/// `node_extra_content.content_type` value for the node's generated summary.
+/// Ancestor context shows this plus constraints in place of the ancestor's
+/// requirements. The drafting driver writes a missing one before a
+/// descendant's turn (`tod_core::drafting::summary`); the state docs
+/// regenerate it on entering `design` and `planning`.
 pub const EXTRA_CONTENT_SUMMARY: &str = "summary";
 
 pub const EXTRA_CONTENT_TYPES: [&str; 6] = ["goal", "design", "plan", "notes", "details", "summary"];

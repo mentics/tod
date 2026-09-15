@@ -38,13 +38,17 @@ pub enum SessionPurpose {
     AnswerProcessor,
     /// A drafting (v3) drafter session.
     Drafter,
+    /// A one-turn session that writes a node's summary for its descendants.
+    Summarizer,
 }
 
 impl SessionPurpose {
     pub(crate) fn run_kind(self) -> AgentRunKind {
         match self {
             Self::Chat => AgentRunKind::FleetAgent,
-            Self::QuestionMaker | Self::Drafter => AgentRunKind::QuestionMakerReplenishment,
+            Self::QuestionMaker | Self::Drafter | Self::Summarizer => {
+                AgentRunKind::QuestionMakerReplenishment
+            }
             Self::AnswerProcessor => AgentRunKind::AnswerProcessor,
         }
     }
