@@ -81,6 +81,12 @@ impl AgentProvider for RoutingAgentProvider {
             .or_else(|| self.claude.session_id(key))
     }
 
+    fn fleet_run_session_id(&self, id: RunId) -> Option<String> {
+        self.cursor
+            .fleet_run_session_id(id)
+            .or_else(|| self.claude.fleet_run_session_id(id))
+    }
+
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.cursor
             .session_context_chars(key)

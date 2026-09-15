@@ -40,6 +40,7 @@ pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
     pending: HashMap<RunId, (AgentRunKind, mpsc::Receiver<Result<String, String>>)>,
     run_agent: HashMap<RunId, String>,
+    fleet_run_sessions: HashMap<RunId, String>,
     sessions: HashMap<String, MockSession>,
     traffic_log: Option<SharedAgentTrafficLog>,
     /// Last options passed to [`Self::start_fleet_agent`] (tests / diagnostics).
@@ -62,6 +63,7 @@ impl MockAgentProvider {
             runs: HashMap::new(),
             pending: HashMap::new(),
             run_agent: HashMap::new(),
+            fleet_run_sessions: HashMap::new(),
             sessions: HashMap::new(),
             traffic_log: None,
             last_fleet_options: None,
@@ -179,6 +181,8 @@ impl AgentProvider for MockAgentProvider {
         );
         self.run_agent
             .insert(handle.id, owner_id.to_string());
+        self.fleet_run_sessions
+            .insert(handle.id, format!("mock-fleet-session-{:?}", handle.id));
         Ok(handle)
     }
 
@@ -241,6 +245,10 @@ impl AgentProvider for MockAgentProvider {
         self.sessions
             .get(key)
             .map(|session| session.session_id.clone())
+    }
+
+    fn fleet_run_session_id(&self, id: RunId) -> Option<String> {
+        self.fleet_run_sessions.get(&id).cloned()
     }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {

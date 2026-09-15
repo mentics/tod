@@ -169,6 +169,13 @@ pub trait AgentProvider {
     /// one. Callers persist it so a later process can resume the session.
     fn session_id(&self, key: &str) -> Option<String>;
 
+    /// Agent-side session id for the one-shot fleet-agent run `id` (see
+    /// [`AgentProvider::start_fleet_agent`]), once the agent assigned one.
+    /// Unlike `session_id`, this is keyed by `RunId` rather than a caller
+    /// key, because fleet-agent runs have no long-lived conversation entry.
+    /// Callers persist it the same way they persist `session_id`.
+    fn fleet_run_session_id(&self, id: RunId) -> Option<String>;
+
     /// Characters that have entered conversation `key`'s context since this
     /// provider started holding it: prompts sent, replies, and tool output the
     /// agent reported. A size estimate for callers deciding when to rotate.

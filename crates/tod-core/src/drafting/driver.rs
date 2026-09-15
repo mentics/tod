@@ -779,6 +779,10 @@ mod tests {
             self.sessions.get(key).cloned()
         }
 
+        fn fleet_run_session_id(&self, _id: RunId) -> Option<String> {
+            None
+        }
+
         fn session_context_chars(&self, _: &str) -> Option<u64> {
             Some(0)
         }

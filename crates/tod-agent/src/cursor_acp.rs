@@ -59,6 +59,11 @@ struct ActiveRun {
     activity: Arc<Mutex<Option<String>>>,
     /// Set by the `AcpClient` while it is blocked on `session/request_permission`.
     pending_permission: PendingPermissionSlot,
+    /// Agent-side session id, set once `session/new` returns it. Fleet-agent
+    /// runs (`start_fleet_agent`) are one-shot processes with no `conversations`
+    /// entry, so this is their only way to expose the id a caller needs to
+    /// persist for later resume — see `fleet_run_session_id`.
+    session_id: Arc<Mutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
     receiver: Receiver<WorkerMessage>,
 }
@@ -415,6 +420,8 @@ impl CursorAcpProvider {
 
         let traffic_log = self.traffic_log.clone();
         let write_roots = self.extra_write_roots.clone();
+        let session_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let session_id_for_worker = session_id_slot.clone();
         let worker = thread::spawn(move || {
             let result = run_acp_session(
                 host,
@@ -427,6 +434,7 @@ impl CursorAcpProvider {
                 cancelled_for_worker,
                 activity_for_worker,
                 pending_permission_for_worker,
+                session_id_for_worker,
                 traffic_log,
                 id,
                 kind,
@@ -461,6 +469,7 @@ impl CursorAcpProvider {
                 cancelled,
                 activity,
                 pending_permission,
+                session_id: session_id_slot,
                 worker: Some(worker),
                 receiver: rx,
             },
@@ -588,6 +597,10 @@ impl AgentProvider for CursorAcpProvider {
                 cancelled: conversation.cancelled.clone(),
                 activity: conversation.activity.clone(),
                 pending_permission: conversation.pending_permission.clone(),
+                // Chat-turn callers read the session id via `session_id(key)`
+                // (the `conversations` map), not this slot — it's only
+                // populated for one-shot fleet-agent runs.
+                session_id: Arc::new(Mutex::new(None)),
                 worker: None,
                 receiver,
             },
@@ -599,6 +612,15 @@ impl AgentProvider for CursorAcpProvider {
         self.conversations
             .get(key)
             .and_then(LiveConversation::session_id)
+    }
+
+    fn fleet_run_session_id(&self, id: RunId) -> Option<String> {
+        self.runs.get(&id).and_then(|run| {
+            run.session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
     }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
@@ -948,6 +970,7 @@ fn run_acp_session(
     cancelled: Arc<AtomicBool>,
     activity: Arc<Mutex<Option<String>>>,
     pending_permission: PendingPermissionSlot,
+    session_id_out: Arc<Mutex<Option<String>>>,
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
     kind: AgentRunKind,
@@ -1027,6 +1050,8 @@ fn run_acp_session(
             .get("sessionId")
             .and_then(Value::as_str)
             .context("session/new missing sessionId")?;
+
+        *session_id_out.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
 
         if !session_title.trim().is_empty() {
             name_session(host, session_id, session_title);

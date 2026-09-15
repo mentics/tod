@@ -308,6 +308,7 @@ impl ActionPanelView {
         }
         let mut finished = Vec::new();
         let mut permission_requests = Vec::new();
+        let mut session_ids = Vec::new();
         {
             let Ok(mut agent) = self.agent.try_lock() else {
                 return;
@@ -320,6 +321,9 @@ impl ActionPanelView {
                     AgentRunState::InFlight(_) => {}
                     AgentRunState::NeedsPermission(request) => permission_requests.push(request),
                     AgentRunState::Success(text) => {
+                        if let Some(session_id) = agent.fleet_run_session_id(flight.provider_run_id) {
+                            session_ids.push((flight.fleet_run_id.clone(), session_id));
+                        }
                         finished.push((idx, flight.clone(), Ok(text.unwrap_or_default())));
                     }
                     AgentRunState::Failure(err) => {
@@ -333,6 +337,14 @@ impl ActionPanelView {
         }
         if finished.is_empty() {
             return;
+        }
+        // Persist the agent-side session id (once known) so this run can be
+        // resumed/looked up later — see `tod_agent::AgentProvider::fleet_run_session_id`.
+        for (run_id, agent_session_id) in session_ids {
+            let _ = self.fleet.enqueue(FleetMutation::SetAgentRunSessionId {
+                run_id,
+                agent_session_id,
+            });
         }
         for (_, flight, result) in &finished {
             match result {
