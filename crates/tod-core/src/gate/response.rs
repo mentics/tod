@@ -118,8 +118,12 @@ struct RawRow {
 /// Parse an agent's raw reply text into a [`GateCheckReply`].
 pub fn parse_gate_reply(text: &str) -> Result<GateCheckReply> {
     let yaml = extract_yaml_document(text);
-    let raw: RawReply =
-        serde_yaml::from_str(yaml).context("failed to parse gate-check reply as YAML")?;
+    let raw: RawReply = match serde_yaml::from_str(yaml) {
+        Ok(raw) => raw,
+        Err(err) => serde_yaml::from_str(&quote_free_text_fields(yaml))
+            .map_err(|_| err)
+            .context("failed to parse gate-check reply as YAML")?,
+    };
     let result = GateOutcome::parse(&raw.result)?;
 
     let gate_results = raw
@@ -176,6 +180,42 @@ fn extract_yaml_document(text: &str) -> &str {
         Some(offset) => &text[offset + 1..],
         None => text,
     }
+}
+
+/// Double-quote the free-text fields (`findings`, `detail`) when the agent
+/// wrote them as bare one-line plain scalars. Prose routinely contains `: `
+/// ("covers the entire feature: X, Y, Z"), which YAML reads as a nested
+/// mapping and rejects outright. Only used as a retry after a strict parse
+/// fails, and only touches values that aren't already quoted or block
+/// scalars, so it can't change a reply that parsed on its own.
+fn quote_free_text_fields(yaml: &str) -> String {
+    let mut out = String::with_capacity(yaml.len() + 16);
+    for line in yaml.lines() {
+        out.push_str(&quote_free_text_line(line).unwrap_or_else(|| line.to_string()));
+        out.push('\n');
+    }
+    out
+}
+
+fn quote_free_text_line(line: &str) -> Option<String> {
+    let body = line.trim_start();
+    let indent = &line[..line.len() - body.len()];
+    let (item, body) = match body.strip_prefix("- ") {
+        Some(rest) => ("- ", rest),
+        None => ("", body),
+    };
+    let (key, value) = ["findings:", "detail:"]
+        .iter()
+        .find_map(|key| body.strip_prefix(key).map(|value| (*key, value)))?;
+    if !value.starts_with(' ') {
+        return None;
+    }
+    let value = value.trim();
+    if value.is_empty() || value.starts_with(['"', '\'', '|', '>']) {
+        return None;
+    }
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("{indent}{item}{key} \"{escaped}\""))
 }
 
 /// Find every markdown code fence (```` ``` ```` or ```` ```yaml ````) in
@@ -367,6 +407,24 @@ gate_results:
         // Neither fence has `result:` — falls back to the last fence, which
         // then fails to deserialize (missing required field), same as today.
         assert!(parse_gate_reply(text).is_err());
+    }
+
+    #[test]
+    fn tolerates_an_unquoted_findings_line_containing_a_colon() {
+        // Real failure ("mapping values are not allowed in this context"):
+        // the agent left `findings` and a row's `detail` as bare plain
+        // scalars whose prose contained `: `.
+        let text = "result: pass\nforward_lifecycle: ready\npaused: false\nfindings: All gate criteria pass. 24 steps cover the entire feature: DataSource trait, \"Linear\" adapter.\ngate_results:\n  - criterion_id: a1000002-0002-4002-8002-000000000001\n    outcome: pass\n    detail: Evidence: plan steps map to obligations.\n    action: none\n";
+        let reply = parse_gate_reply(text).unwrap();
+        assert!(reply.result.advances());
+        assert_eq!(
+            reply.findings,
+            "All gate criteria pass. 24 steps cover the entire feature: DataSource trait, \"Linear\" adapter."
+        );
+        assert_eq!(
+            reply.gate_results[0].detail.as_deref(),
+            Some("Evidence: plan steps map to obligations.")
+        );
     }
 
     #[test]

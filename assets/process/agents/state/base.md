@@ -82,6 +82,7 @@ Rules for the envelope, since these break the parser outright:
 
 - No preamble sentence before the document, no trailing prose after it.
 - Do not wrap the reply in a markdown code fence (no ` ``` `).
+- Always double-quote `findings` and `detail` (escaping any `"` inside), or use a `|` block scalar. Unquoted prose containing `: ` — e.g. `covers the feature: X` — is invalid YAML.
 - Everything is one YAML mapping — no second document, no `---section_name` markers, no mixing markdown headings into the reply. `findings` is a field of this same mapping (use a `|` block scalar for multi-line text), not a body of text the fields sit above.
 
 | `result` | Meaning |
