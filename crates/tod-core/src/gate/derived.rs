@@ -7,8 +7,9 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use tod_store::fleet::AgentConfigRow;
-use tod_store::fleet::resolve_agent_config::resolve_agent_configs_for_node;
+use tod_store::fleet::node_actions::{
+    FilesDirectory, resolve_agent_for_node, resolve_files_for_node,
+};
 use tod_store::outline::{GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG};
 use uuid::Uuid;
 
@@ -28,43 +29,53 @@ pub fn evaluate_derived_criterion(
     criterion: &GateCriterion,
 ) -> Result<Option<DerivedOutcome>> {
     match criterion.slug.as_str() {
-        READY_ACTIVE_ACTION_CONFIG_SLUG => action_config_outcome(conn, node_id).map(Some),
+        READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
         _ => Ok(None),
     }
 }
 
-/// Action configs implementation can launch against for `node_id`: the nearest
-/// configs up the tree, minus interview configs, which only run the app's own
-/// interview and gate-check turns.
-pub fn node_action_configs(conn: &Connection, node_id: &str) -> Result<Vec<AgentConfigRow>> {
-    let resolved = resolve_agent_configs_for_node(conn, node_id)?;
-    Ok(resolved
-        .configs
-        .into_iter()
-        .filter(|c| c.mode != "interview")
-        .collect())
+fn fail(detail: impl Into<String>) -> DerivedOutcome {
+    DerivedOutcome {
+        outcome: OUTCOME_FAIL,
+        detail: detail.into(),
+    }
 }
 
-fn action_config_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
-    let configs = node_action_configs(conn, &node_id.to_string())?;
-    if configs.is_empty() {
-        return Ok(DerivedOutcome {
-            outcome: OUTCOME_FAIL,
-            detail: "No action config on this node — create one (F in the task list) before \
-                     starting implementation."
-                .into(),
-        });
-    }
-    let names: Vec<String> = configs
-        .iter()
-        .map(|c| format!("{} ({} · {})", c.id, c.env_type, c.mode))
-        .collect();
+/// Implementation needs an Agent and a ready Files directory, each on the node
+/// or inherited from the nearest ancestor that has the capability.
+fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let node_id = node_id.to_string();
+    let Some(agent) = resolve_agent_for_node(conn, &node_id)? else {
+        return Ok(fail(
+            "No Agent capability on this node or an ancestor — enable it (E in the task list) \
+             before starting implementation.",
+        ));
+    };
+    let Some(files) = resolve_files_for_node(conn, &node_id)? else {
+        return Ok(fail(
+            "No Files capability on this node or an ancestor — enable it and set a workspace \
+             directory before starting implementation.",
+        ));
+    };
+    let directory = match files.directory() {
+        FilesDirectory::Ready(path) => path,
+        FilesDirectory::NeedsWorktreeSetup => {
+            return Ok(fail(format!(
+                "Files on \"{}\" uses a worktree that hasn't been set up yet.",
+                files.source_title
+            )));
+        }
+        FilesDirectory::Missing(reason) => {
+            return Ok(fail(format!("Files on \"{}\": {reason}", files.source_title)));
+        }
+    };
     Ok(DerivedOutcome {
         outcome: OUTCOME_PASS,
         detail: format!(
-            "Action config{}: {}",
-            if configs.len() == 1 { "" } else { "s" },
-            names.join(", ")
+            "Agent from \"{}\"; Files from \"{}\" in {}",
+            agent.source_title,
+            files.source_title,
+            directory.display()
         ),
     })
 }
@@ -72,8 +83,8 @@ fn action_config_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_store::fleet::{FleetMutation, FleetStore, NewAgentConfig};
-    use tod_store::outline::{CreatePosition, OutlineMutation};
+    use tod_store::fleet::{FleetMutation, FleetStore};
+    use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
 
     fn store_with_node() -> (FleetStore, Uuid) {
         let root = std::env::temp_dir().join(format!("tod-gate-derived-{}", Uuid::new_v4()));
@@ -102,20 +113,22 @@ mod tests {
         (store, node)
     }
 
-    fn insert_config(store: &FleetStore, node: Uuid, id: &str, mode: &str) {
+    fn enable(store: &FleetStore, node: Uuid, caps: Vec<Capability>) {
         store
-            .enqueue(FleetMutation::InsertAgent {
-                agent: NewAgentConfig {
-                    id: id.into(),
-                    node_id: node.to_string(),
-                    env_type: "local".into(),
-                    mode: mode.into(),
-                    work_directory: None,
-                    use_worktree: false,
-                    platform: "claude".into(),
-                    model: "default".into(),
-                    effort: "auto".into(),
-                },
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: caps,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+    }
+
+    fn set_repo(store: &FleetStore, node: Uuid, repo: &str) {
+        store
+            .enqueue(FleetMutation::UpdateTaskRepo {
+                id: node.to_string(),
+                repo: Some(repo.into()),
             })
             .unwrap();
         store.writer().flush().unwrap();
@@ -141,27 +154,38 @@ mod tests {
     }
 
     #[test]
-    fn action_config_criterion_fails_without_configs() {
+    fn fails_without_agent() {
         let (store, node) = store_with_node();
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
     }
 
     #[test]
-    fn interview_config_does_not_count_as_action_config() {
+    fn agent_without_files_fails() {
         let (store, node) = store_with_node();
-        insert_config(&store, node, "interview-1", "interview");
+        enable(&store, node, vec![Capability::Agent]);
+        let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("Files"), "{}", outcome.detail);
+    }
+
+    #[test]
+    fn files_without_a_directory_fails() {
+        let (store, node) = store_with_node();
+        enable(&store, node, vec![Capability::Agent, Capability::Files]);
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_FAIL);
     }
 
     #[test]
-    fn action_config_criterion_passes_and_names_the_config() {
+    fn passes_with_agent_and_a_ready_directory() {
         let (store, node) = store_with_node();
-        insert_config(&store, node, "impl-1", "agent");
+        enable(&store, node, vec![Capability::Agent, Capability::Files]);
+        let dir = std::env::temp_dir();
+        set_repo(&store, node, &dir.to_string_lossy());
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
-        assert_eq!(outcome.outcome, OUTCOME_PASS);
-        assert!(outcome.detail.contains("impl-1"), "{}", outcome.detail);
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+        assert!(outcome.detail.contains("Ready node"), "{}", outcome.detail);
     }
 
     #[test]

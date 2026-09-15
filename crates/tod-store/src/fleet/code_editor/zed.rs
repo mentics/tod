@@ -1,9 +1,7 @@
-//! Open an agent workspace directory in the Zed editor.
+//! Zed code editor plugin.
 
+use crate::fleet::code_editor::CodeEditor;
 use crate::fleet::terminal::path_util::normalize_launch_path;
-use crate::fleet::{FleetStore, resolve_agent_workspace};
-use crate::paths::TodPaths;
-use crate::settings::TodSettings;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -93,20 +91,25 @@ pub fn spawn_zed(cwd: &Path) -> Result<()> {
         .map(|_| ())
 }
 
-/// Resolve the agent config workspace (provisioning a worktree if needed) and open it in Zed.
-pub fn open_zed_for_agent_config(
-    fleet: &FleetStore,
-    paths: &TodPaths,
-    settings: &TodSettings,
-    config_id: &str,
-    _node_id: &str,
-) -> Result<PathBuf> {
-    let agent = fleet
-        .get_agent(config_id)?
-        .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
-    spawn_zed(&cwd)?;
-    Ok(normalize_launch_path(&cwd))
+/// The Zed [`CodeEditor`] plugin.
+pub struct ZedEditor;
+
+impl CodeEditor for ZedEditor {
+    fn id(&self) -> &'static str {
+        "zed"
+    }
+
+    fn label(&self) -> &'static str {
+        "Zed"
+    }
+
+    fn is_available(&self) -> bool {
+        resolve_zed_bin().is_some()
+    }
+
+    fn open(&self, dir: &Path) -> Result<()> {
+        spawn_zed(dir)
+    }
 }
 
 #[cfg(test)]

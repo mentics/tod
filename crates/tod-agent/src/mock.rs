@@ -156,7 +156,7 @@ impl Default for MockAgentProvider {
 impl AgentProvider for MockAgentProvider {
     fn start_fleet_agent(
         &mut self,
-        agent_config_id: &str,
+        owner_id: &str,
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
@@ -167,7 +167,7 @@ impl AgentProvider for MockAgentProvider {
         let preview: String = prompt.chars().take(200).collect();
         let reply = format!(
             "Fleet agent run complete (mock).\n\n\
-             Config: {agent_config_id}\n\
+             Owner: {owner_id}\n\
              Cwd: {}\n\n\
              Prompt preview:\n{preview}…",
             cwd.display()
@@ -178,7 +178,7 @@ impl AgentProvider for MockAgentProvider {
             AgentRunState::Success(Some(reply)),
         );
         self.run_agent
-            .insert(handle.id, agent_config_id.to_string());
+            .insert(handle.id, owner_id.to_string());
         Ok(handle)
     }
 
@@ -205,7 +205,7 @@ impl AgentProvider for MockAgentProvider {
             let reply = mock_session_reply(session.messages, &turn);
             session.context_chars += reply.len() as u64;
             let handle = self.finish(kind, Some(&request), AgentRunState::Success(Some(reply)));
-            self.run_agent.insert(handle.id, turn.agent_config_id);
+            self.run_agent.insert(handle.id, turn.owner_id);
             return Ok(handle);
         }
 
@@ -221,7 +221,7 @@ impl AgentProvider for MockAgentProvider {
             ));
         };
         let id = RunId::new();
-        self.run_agent.insert(id, turn.agent_config_id.clone());
+        self.run_agent.insert(id, turn.owner_id.clone());
         self.log_traffic(kind, id, TrafficDirection::Request, &request);
         let (tx, rx) = mpsc::channel();
         let mock_turn = MockInterviewTurn {
@@ -370,7 +370,7 @@ mod tests {
     ) -> SessionTurn {
         SessionTurn {
             key: key.into(),
-            agent_config_id: "config".into(),
+            owner_id: "config".into(),
             cwd: PathBuf::from("."),
             options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
             resume_session_id: resume_session_id.map(str::to_string),

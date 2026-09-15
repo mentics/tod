@@ -28,7 +28,7 @@ pub enum RowAction {
     OpenEdit { task_id: String },
     InlineEdit { task_id: String },
     ToggleTagFilter { task_id: String, tag: String },
-    AgentsControl { task_id: String },
+    ActionsControl { task_id: String },
     ShellsControl { task_id: String },
     LifecycleControl { task_id: String, _lifecycle: String },
     ToggleCollapsed { task_id: String },
@@ -375,44 +375,38 @@ impl ListDelegate for TaskListDelegate {
                     },
                 ));
             }
-            // Only show the agent chip when this node owns (or inherits) an actual
-            // action config target — without the Agent capability there is no
-            // directory to launch against.
-            if item.has_agent || !item.agents.is_empty() {
-                let agents_count = item.agent_count();
-                let agents_label = format!("A {agents_count}");
-                let task_id_agents = item.id.clone();
-                let agents_chip = action_chip(
-                    cx,
-                    border,
-                    primary,
-                    secondary,
-                    background,
-                    foreground,
-                    agents_label,
-                    selected,
-                    if selected { Some("A") } else { None },
-                    {
-                        let sink = sink.clone();
-                        move || {
-                            sink.borrow_mut().push(RowAction::AgentsControl {
-                                task_id: task_id_agents.clone(),
-                            });
-                        }
-                    },
-                );
-                let agents_menu_open = selected
-                    && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-                        matches!(
-                            kind,
-                            RowMenuKind::Agents | RowMenuKind::AgentsEdit | RowMenuKind::OpenCode
-                        ) && id == &item.id
-                    });
-                chips = chips.child(row_menu_anchor(
-                    agents_chip,
-                    agents_menu_open.then(|| self.row_menu.clone()).flatten(),
-                ));
-            }
+        }
+        // The Action chip shows whenever the node resolves Agent or Files —
+        // inherited values count, so it also shows on nodes with no
+        // capabilities of their own. Activating it only opens the Action panel.
+        if item.has_actions {
+            let actions_label = if item.live_run_count > 0 {
+                format!("Actions · {} running", item.live_run_count)
+            } else {
+                "Actions".to_string()
+            };
+            let task_id_actions = item.id.clone();
+            chips = chips.child(action_chip(
+                cx,
+                border,
+                primary,
+                secondary,
+                background,
+                foreground,
+                actions_label,
+                selected,
+                if selected { Some("F") } else { None },
+                {
+                    let sink = sink.clone();
+                    move || {
+                        sink.borrow_mut().push(RowAction::ActionsControl {
+                            task_id: task_id_actions.clone(),
+                        });
+                    }
+                },
+            ));
+        }
+        if is_work {
             if let Some(activity) = item.in_flight_activity.clone() {
                 chips = chips.child(
                     div()
@@ -511,7 +505,7 @@ impl ListDelegate for TaskListDelegate {
         }
         let chips_menu_open = selected
             && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-                matches!(kind, RowMenuKind::Shells | RowMenuKind::ShellAgentPick) && id == &item.id
+                matches!(kind, RowMenuKind::Shells) && id == &item.id
             });
         let title_line = if chips_menu_open {
             title_row.child(row_menu_anchor(chips, self.row_menu.clone()))

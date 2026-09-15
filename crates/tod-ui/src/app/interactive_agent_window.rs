@@ -10,20 +10,47 @@ use gpui::{
 };
 use gpui_component::Root;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tod_store::AgentRole;
 use tod_store::fleet::FleetStore;
-use tod_store::fleet::provision::resolve_agent_workspace;
-use tod_store::fleet::terminal::open_terminal_agent_for_config;
+use tod_store::fleet::terminal::open_terminal_agent_for_node;
 use tod_store::fleet::writer::FleetMutation;
+use tod_store::{AgentLaunchOptions, AgentRole};
 
 #[derive(Debug, Clone)]
 pub struct InteractiveAgentOpenParams {
-    pub config_id: String,
+    /// Node the session was launched from.
+    pub node_id: String,
     pub session_run_id: String,
     /// Assembled app context, sent once ahead of the session's first message.
     /// `None` when reopening an existing session.
     pub initial_context: Option<String>,
+}
+
+/// Where a chat launched from `node_id` runs and with which agent: the resolved
+/// Files directory (else the data root) and the resolved Agent's options (else
+/// the settings for `role`).
+pub fn chat_launch_for_node(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    node_id: &str,
+    role: AgentRole,
+) -> (PathBuf, AgentLaunchOptions) {
+    let _ = fleet.reload_if_stale();
+    let cwd = fleet
+        .resolve_files_for_node(node_id)
+        .ok()
+        .flatten()
+        .and_then(|files| files.ready_directory())
+        .unwrap_or_else(|| paths.data_root().to_path_buf());
+    let launch = fleet
+        .resolve_agent_for_node(node_id)
+        .ok()
+        .flatten()
+        .map(|agent| agent.launch_options(settings, role))
+        .unwrap_or_else(|| settings.launch_options_for(role));
+    (cwd, launch)
 }
 
 #[derive(Clone)]
@@ -164,6 +191,49 @@ impl InteractiveAgentWindowControl {
         Ok((fleet, agent, paths, settings))
     }
 
+    /// Record a new chat-style run on `node_id` and return its id.
+    fn create_run(
+        fleet: &FleetStore,
+        node_id: &str,
+        run_kind: &str,
+        session_name: String,
+        launch: AgentLaunchOptions,
+    ) -> Result<String, String> {
+        fleet
+            .enqueue(FleetMutation::CreateAgentRun {
+                node_id: node_id.to_string(),
+                run_kind: Some(run_kind.into()),
+                session_name: Some(session_name),
+                launch: Some(launch),
+            })
+            .map_err(|err| format!("create session failed: {err}"))?;
+        fleet
+            .writer()
+            .flush()
+            .map_err(|err| format!("create session failed: {err}"))?;
+        let _ = fleet.reload_if_stale();
+        let runs = if run_kind == "implementation" {
+            fleet.list_implementation_sessions_for_node(node_id)
+        } else {
+            fleet.list_interactive_sessions_for_node(node_id)
+        };
+        runs.map_err(|err| format!("create session failed: {err}"))?
+            .into_iter()
+            .next()
+            .map(|run| run.id)
+            .ok_or_else(|| "create session failed: run not created".to_string())
+    }
+
+    fn session_name_for(fleet: &FleetStore, node_id: &str, context_key: Option<&str>) -> String {
+        let subject = fleet
+            .get_node(node_id)
+            .ok()
+            .flatten()
+            .map(|node| node.title)
+            .unwrap_or_default();
+        tod_core::session_name::session_name(context_key, &subject, chrono::Local::now())
+    }
+
     /// Create a new interactive chat session and open its window.
     ///
     /// `context_key` names where the chat was opened from (the agent-context
@@ -171,8 +241,7 @@ impl InteractiveAgentWindowControl {
     /// gives the session its human-readable name.
     pub fn create_and_open_session(
         &self,
-        task_id: &str,
-        config_id: &str,
+        node_id: &str,
         context_key: Option<&str>,
         initial_context: Option<String>,
         cx: &mut App,
@@ -181,48 +250,26 @@ impl InteractiveAgentWindowControl {
         // Settings are bound once at startup; reload from disk so a setting
         // changed in this run (e.g. chat launch mode) takes effect immediately.
         let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
-        let subject = fleet
-            .get_node(task_id)
-            .ok()
-            .flatten()
-            .map(|node| node.title)
-            .unwrap_or_default();
-        let session_name =
-            tod_core::session_name::session_name(context_key, &subject, chrono::Local::now());
+        let session_name = Self::session_name_for(&fleet, node_id, context_key);
+        let (_, launch) = chat_launch_for_node(&fleet, &paths, &settings, node_id, AgentRole::Chat);
 
         if settings.chat_launch_mode == ChatLaunchMode::Terminal {
             return launch_chat_in_terminal(
                 &fleet,
                 &paths,
                 &settings,
-                config_id,
+                node_id,
+                &launch,
                 &session_name,
                 initial_context.as_deref(),
             );
         }
 
-        fleet
-            .enqueue(FleetMutation::CreateAgentRun {
-                config_id: config_id.to_string(),
-                run_kind: Some("interactive".into()),
-                session_name: Some(session_name),
-            })
-            .map_err(|err| format!("create session failed: {err}"))?;
-        fleet
-            .writer()
-            .flush()
-            .map_err(|err| format!("create session failed: {err}"))?;
-        let _ = fleet.reload_if_stale();
-        let session_run_id = fleet
-            .list_interactive_sessions_for_config(config_id)
-            .map_err(|err| format!("create session failed: {err}"))?
-            .into_iter()
-            .next()
-            .map(|run| run.id)
-            .ok_or_else(|| "create session failed: run not created".to_string())?;
+        let session_run_id =
+            Self::create_run(&fleet, node_id, "interactive", session_name, launch)?;
         self.open_session(
             InteractiveAgentOpenParams {
-                config_id: config_id.to_string(),
+                node_id: node_id.to_string(),
                 session_run_id: session_run_id.clone(),
                 initial_context,
             },
@@ -231,56 +278,31 @@ impl InteractiveAgentWindowControl {
         Ok(session_run_id)
     }
 
-    /// Create and open a special `implementation`-kind session for the given
-    /// action config — launched only from the lifecycle panel's Active-phase
-    /// "Implement" button, never reused, and distinguishable from ordinary
-    /// `interactive` sessions on the same config via `run_kind`. Ignores the
-    /// terminal chat-launch-mode setting: an implementation run always needs
-    /// the in-window first-turn path so `initial_context` goes out with the
-    /// first message (see CLAUDE.md's "Agent chat context").
+    /// Create and open a special `implementation`-kind session for the node —
+    /// launched only from the lifecycle panel's Active-phase "Implement" button,
+    /// never reused, and distinguishable from ordinary `interactive` sessions on
+    /// the same node via `run_kind`. Ignores the terminal chat-launch-mode
+    /// setting: an implementation run always needs the in-window first-turn path
+    /// so `initial_context` goes out with the first message (see CLAUDE.md's
+    /// "Agent chat context").
     pub fn create_and_open_implementation_session(
         &self,
-        task_id: &str,
-        config_id: &str,
+        node_id: &str,
         context_key: &str,
         initial_context: String,
         cx: &mut App,
     ) -> Result<String, String> {
-        let (fleet, _, _paths, _settings) = self.bound_resources()?;
-        let subject = fleet
-            .get_node(task_id)
-            .ok()
-            .flatten()
-            .map(|node| node.title)
-            .unwrap_or_default();
-        let session_name = tod_core::session_name::session_name(
-            Some(context_key),
-            &subject,
-            chrono::Local::now(),
-        );
-
-        fleet
-            .enqueue(FleetMutation::CreateAgentRun {
-                config_id: config_id.to_string(),
-                run_kind: Some("implementation".into()),
-                session_name: Some(session_name),
-            })
-            .map_err(|err| format!("create implementation session failed: {err}"))?;
-        fleet
-            .writer()
-            .flush()
-            .map_err(|err| format!("create implementation session failed: {err}"))?;
-        let _ = fleet.reload_if_stale();
-        let session_run_id = fleet
-            .list_implementation_sessions_for_config(config_id)
-            .map_err(|err| format!("create implementation session failed: {err}"))?
-            .into_iter()
-            .next()
-            .map(|run| run.id)
-            .ok_or_else(|| "create implementation session failed: run not created".to_string())?;
+        let (fleet, _, paths, bound_settings) = self.bound_resources()?;
+        let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
+        let session_name = Self::session_name_for(&fleet, node_id, Some(context_key));
+        let (_, launch) =
+            chat_launch_for_node(&fleet, &paths, &settings, node_id, AgentRole::Default);
+        let session_run_id =
+            Self::create_run(&fleet, node_id, "implementation", session_name, launch)
+                .map_err(|err| format!("implementation: {err}"))?;
         self.open_session(
             InteractiveAgentOpenParams {
-                config_id: config_id.to_string(),
+                node_id: node_id.to_string(),
                 session_run_id: session_run_id.clone(),
                 initial_context: Some(initial_context),
             },
@@ -301,57 +323,16 @@ impl InteractiveAgentWindowControl {
     #[allow(clippy::type_complexity)]
     pub fn create_embedded_session(
         &self,
-        task_id: &str,
-        config_id: &str,
+        node_id: &str,
         context_key: Option<&str>,
-    ) -> Result<
-        (
-            std::sync::Arc<FleetStore>,
-            SharedAgent,
-            std::path::PathBuf,
-            TodSettings,
-            String,
-        ),
-        String,
-    > {
+    ) -> Result<(Arc<FleetStore>, SharedAgent, PathBuf, TodSettings, String), String> {
         let (fleet, agent, paths, bound_settings) = self.bound_resources()?;
         let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
-        let subject = fleet
-            .get_node(task_id)
-            .ok()
-            .flatten()
-            .map(|node| node.title)
-            .unwrap_or_default();
-        let session_name =
-            tod_core::session_name::session_name(context_key, &subject, chrono::Local::now());
-
-        fleet
-            .enqueue(FleetMutation::CreateAgentRun {
-                config_id: config_id.to_string(),
-                run_kind: Some("interactive".into()),
-                session_name: Some(session_name),
-            })
-            .map_err(|err| format!("create session failed: {err}"))?;
-        fleet
-            .writer()
-            .flush()
-            .map_err(|err| format!("create session failed: {err}"))?;
-        let _ = fleet.reload_if_stale();
-        let session_run_id = fleet
-            .list_interactive_sessions_for_config(config_id)
-            .map_err(|err| format!("create session failed: {err}"))?
-            .into_iter()
-            .next()
-            .map(|run| run.id)
-            .ok_or_else(|| "create session failed: run not created".to_string())?;
-
-        let agent_row = fleet
-            .get_agent(config_id)
-            .map_err(|err| format!("load agent config: {err}"))?
-            .ok_or_else(|| format!("agent config {config_id} not found"))?;
-        let workspace_cwd = resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
-            .map_err(|err| format!("workspace: {err:#}"))?;
-
+        let session_name = Self::session_name_for(&fleet, node_id, context_key);
+        let (workspace_cwd, launch) =
+            chat_launch_for_node(&fleet, &paths, &settings, node_id, AgentRole::Chat);
+        let session_run_id =
+            Self::create_run(&fleet, node_id, "interactive", session_name, launch)?;
         Ok((fleet, agent, workspace_cwd, settings, session_run_id))
     }
 
@@ -366,26 +347,25 @@ impl InteractiveAgentWindowControl {
         }
 
         let (fleet, agent, paths, settings) = self.bound_resources()?;
-
-        let agent_row = fleet
-            .get_agent(&params.config_id)
-            .map_err(|err| format!("load agent config: {err}"))?
-            .ok_or_else(|| format!("agent config {} not found", params.config_id))?;
-        let workspace_cwd = resolve_agent_workspace(&fleet, &paths, &settings, &agent_row)
-            .map_err(|err| format!("workspace: {err:#}"))?;
+        let (workspace_cwd, _) =
+            chat_launch_for_node(&fleet, &paths, &settings, &params.node_id, AgentRole::Chat);
 
         let run = fleet.get_run(&params.session_run_id).ok().flatten();
         let window_title = match run.as_ref().and_then(|run| run.session_name.clone()) {
             Some(name) => name,
-            None => format!(
-                "Session {} · {}",
-                run.map_or(0, |run| run.run_number),
-                params.config_id
-            ),
+            None => {
+                let title = fleet
+                    .get_node(&params.node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| node.title)
+                    .unwrap_or_default();
+                format!("Session {} · {title}", run.map_or(0, |run| run.run_number))
+            }
         };
 
         let session_run_id = params.session_run_id.clone();
-        let config_id = params.config_id.clone();
+        let node_id = params.node_id.clone();
         let initial_context = params.initial_context.clone();
         let control = self.clone();
 
@@ -411,7 +391,7 @@ impl InteractiveAgentWindowControl {
                     });
                     let view = cx.new(|cx| {
                         InteractiveAgentView::new(
-                            config_id,
+                            node_id,
                             session_run_id,
                             fleet,
                             agent,
@@ -452,12 +432,12 @@ fn launch_chat_in_terminal(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    config_id: &str,
+    node_id: &str,
+    launch: &AgentLaunchOptions,
     session_name: &str,
     initial_context: Option<&str>,
 ) -> Result<String, String> {
-    let platform = settings.platform_for(AgentRole::Chat);
-    let startup_command = match platform {
+    let startup_command = match launch.platform {
         tod_store::AgentPlatform::Claude => {
             let mut cmd = format!("claude --name {}", shell_quote(session_name));
             // "default" / "auto" are this app's own sentinels for "no override" —
@@ -465,12 +445,12 @@ fn launch_chat_in_terminal(
             // `claude` and can throw off its argument parsing (letting a stray
             // token, e.g. from the session name, leak through as an initial
             // prompt). Only pass real overrides.
-            let model = settings.model_for(AgentRole::Chat);
+            let model = launch.model.as_str();
             if model != tod_store::default_model_for(tod_store::AgentPlatform::Claude) {
                 cmd.push_str(" --model ");
                 cmd.push_str(&shell_quote(model));
             }
-            if let Some(effort) = tod_store::effort_for_acp(settings.effort_for(AgentRole::Chat)) {
+            if let Some(effort) = tod_store::effort_for_acp(&launch.effort) {
                 cmd.push_str(" --effort ");
                 cmd.push_str(&shell_quote(effort));
             }
@@ -493,9 +473,15 @@ fn launch_chat_in_terminal(
         }
         tod_store::AgentPlatform::Cursor => "cursor-agent".to_string(),
     };
-    let (run_id, _cwd) =
-        open_terminal_agent_for_config(fleet, paths, settings, config_id, &startup_command)
-            .map_err(|err| format!("launch terminal chat session failed: {err:#}"))?;
+    let (run_id, _cwd) = open_terminal_agent_for_node(
+        fleet,
+        paths,
+        settings,
+        node_id,
+        &startup_command,
+        Some(launch.clone()),
+    )
+    .map_err(|err| format!("launch terminal chat session failed: {err:#}"))?;
     Ok(run_id)
 }
 

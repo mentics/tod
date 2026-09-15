@@ -50,12 +50,10 @@ pub(crate) fn fixture() -> Fixture {
         .insert_session_with_metadata(
             NewInterviewSession {
                 node_id: node,
-                agent_config_id: None,
                 display_name: "Interview".into(),
                 phase: "task-requirements-interview".into(),
             },
             InterviewSessionStatus::Active,
-            None,
         )
         .unwrap()
         .id;

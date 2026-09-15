@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 28;
+pub const CURRENT_USER_VERSION: i32 = 29;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -231,11 +231,337 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v27_to_v28(conn)?;
         conn.pragma_update(None, "user_version", 28)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 29 {
+        migrate_v28_to_v29(conn)?;
+        conn.pragma_update(None, "user_version", 29)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Remove action configs: their configuration moves onto node capabilities and
+/// their runs / shells / notifications attach to nodes.
+///
+/// - `node_capabilities` / `capability_archives` allow 'files' and 'ticket'.
+/// - New `node_files` (worktree flag + set-up worktree) and `node_agent`
+///   (platform / model / effort, each optional). Each node takes its most
+///   recently active non-interview config (else its interview config); an empty
+///   `node_fields.repo` takes that config's work directory.
+/// - Agent nodes with a workspace directory or config gain Files; Agent nodes
+///   with linked issues or PRs gain Ticket.
+/// - `agent_runs` / `shell_sessions` key on `node_id` (runs renumbered per node
+///   by start time, and snapshot the config's platform / model / effort);
+///   `notification_agents` becomes `notification_runs` (the config's latest run);
+///   `interview_sessions.agent_config_id` and `agent_configs` are dropped.
+fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    let table_exists = |name: &str| -> Result<bool> {
+        Ok(conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
+            .exists([name])?)
+    };
+    let column_exists = |table: &str, column: &str| -> Result<bool> {
+        Ok(conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))?
+            .exists([column])?)
+    };
+    let has_configs = table_exists("agent_configs")?;
+    let runs_need_rebuild = has_configs && column_exists("agent_runs", "agent_config_id")?;
+    let shells_need_rebuild = has_configs && column_exists("shell_sessions", "agent_config_id")?;
+    let has_notification_agents = table_exists("notification_agents")?;
+    let interviews_need_rebuild = column_exists("interview_sessions", "agent_config_id")?;
+
+    // Several rebuilt tables are FK parents or children; enforcement must be
+    // off before the transaction opens (the pragma is a no-op inside one).
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    let rename = |from: &str, to: &str| -> Result<()> {
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        Ok(())
+    };
+
+    // ── 1. Capability CHECKs gain 'files' and 'ticket' ──
+    tx.execute_batch(
+        "
+        CREATE TABLE node_capabilities_v29 (
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            capability  TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket')),
+            enabled_at  INTEGER NOT NULL,
+            PRIMARY KEY (node_id, capability)
+        );
+        INSERT INTO node_capabilities_v29 SELECT node_id, capability, enabled_at FROM node_capabilities;
+        DROP TABLE node_capabilities;
+        ",
+    )?;
+    rename("node_capabilities_v29", "node_capabilities")?;
+    tx.execute_batch(
+        "
+        CREATE TABLE capability_archives_v29 (
+            id              BLOB PRIMARY KEY NOT NULL,
+            node_id         BLOB NOT NULL,
+            capability      TEXT NOT NULL CHECK (capability IN ('spec', 'lifecycle', 'agent', 'generator', 'tags', 'files', 'ticket')),
+            archived_at     INTEGER NOT NULL,
+            payload         TEXT NOT NULL
+        );
+        INSERT INTO capability_archives_v29 SELECT id, node_id, capability, archived_at, payload FROM capability_archives;
+        DROP INDEX IF EXISTS idx_capability_archives_node;
+        DROP TABLE capability_archives;
+        ",
+    )?;
+    rename("capability_archives_v29", "capability_archives")?;
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_capability_archives_node ON capability_archives(node_id, archived_at);",
+    )?;
+
+    // ── 2. Files / Agent capability tables ──
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS node_files (
+            node_id               BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            use_worktree          INTEGER NOT NULL DEFAULT 0,
+            worktree_path         TEXT,
+            worktree_lease_id     TEXT,
+            worktree_lease_holder TEXT,
+            updated_at            INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS node_agent (
+            node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            platform    TEXT,
+            model       TEXT,
+            effort      TEXT,
+            updated_at  INTEGER NOT NULL
+        );
+        ",
+    )?;
+
+    // ── 3. One config per node → node_files / node_agent / node_fields.repo ──
+    if has_configs {
+        tx.execute_batch(&format!(
+            "
+            CREATE TEMP TABLE v29_chosen_config AS
+            SELECT node_id, work_directory, use_worktree, worktree_path, worktree_lease_id,
+                   worktree_lease_holder, platform, model, effort
+            FROM (
+                SELECT c.*, ROW_NUMBER() OVER (
+                    PARTITION BY c.node_id
+                    ORDER BY (c.mode = 'interview'),
+                             COALESCE((SELECT MAX(COALESCE(r.ended_at, r.started_at))
+                                       FROM agent_runs r WHERE r.agent_config_id = c.id), 0) DESC,
+                             c.created_at DESC
+                ) AS rn
+                FROM agent_configs c
+                WHERE c.node_id IN (SELECT id FROM nodes)
+            )
+            WHERE rn = 1;
+
+            INSERT OR IGNORE INTO node_files
+                (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at)
+            SELECT node_id, use_worktree, NULLIF(TRIM(COALESCE(worktree_path, '')), ''),
+                   worktree_lease_id, worktree_lease_holder, {NOW}
+            FROM v29_chosen_config;
+
+            INSERT OR IGNORE INTO node_agent (node_id, platform, model, effort, updated_at)
+            SELECT node_id, platform, model, effort, {NOW} FROM v29_chosen_config;
+
+            INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
+            SELECT node_id, '[]', '[]', {NOW} FROM v29_chosen_config;
+
+            UPDATE node_fields
+            SET repo = (SELECT c.work_directory FROM v29_chosen_config c WHERE c.node_id = node_fields.node_id)
+            WHERE COALESCE(TRIM(repo), '') = ''
+              AND node_id IN (SELECT node_id FROM v29_chosen_config
+                              WHERE COALESCE(TRIM(work_directory), '') != '');
+
+            INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
+            SELECT node_id, 'files', {NOW} FROM v29_chosen_config;
+
+            DROP TABLE v29_chosen_config;
+            "
+        ))?;
+    }
+
+    // ── 4. Files / Ticket for existing Agent nodes ──
+    tx.execute_batch(&format!(
+        "
+        INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
+        SELECT nc.node_id, 'files', {NOW}
+        FROM node_capabilities nc JOIN node_fields nf ON nf.node_id = nc.node_id
+        WHERE nc.capability = 'agent' AND COALESCE(TRIM(nf.repo), '') != '';
+
+        INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at)
+        SELECT nc.node_id, 'ticket', {NOW}
+        FROM node_capabilities nc JOIN node_fields nf ON nf.node_id = nc.node_id
+        WHERE nc.capability = 'agent' AND (nf.linked_issues != '[]' OR nf.linked_prs != '[]');
+
+        INSERT OR IGNORE INTO node_files (node_id, use_worktree, updated_at)
+        SELECT node_id, 0, {NOW} FROM node_capabilities WHERE capability = 'files';
+
+        INSERT OR IGNORE INTO node_agent (node_id, updated_at)
+        SELECT node_id, {NOW} FROM node_capabilities WHERE capability = 'agent';
+
+        INSERT OR IGNORE INTO node_fields (node_id, linked_issues, linked_prs, updated_at)
+        SELECT node_id, '[]', '[]', {NOW} FROM node_capabilities WHERE capability IN ('files', 'ticket');
+        "
+    ))?;
+
+    // ── 5. notification_agents → notification_runs (while runs still carry config ids) ──
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS notification_runs (
+            notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+            agent_run_id    TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+            PRIMARY KEY (notification_id, agent_run_id)
+        );
+        ",
+    )?;
+    if has_notification_agents {
+        if runs_need_rebuild && column_exists("notification_agents", "agent_config_id")? {
+            tx.execute_batch(
+                "
+                INSERT OR IGNORE INTO notification_runs (notification_id, agent_run_id)
+                SELECT na.notification_id,
+                       (SELECT r.id FROM agent_runs r WHERE r.agent_config_id = na.agent_config_id
+                        ORDER BY r.run_number DESC LIMIT 1)
+                FROM notification_agents na
+                WHERE EXISTS (SELECT 1 FROM agent_runs r WHERE r.agent_config_id = na.agent_config_id);
+                ",
+            )?;
+        }
+        tx.execute_batch("DROP TABLE notification_agents;")?;
+    }
+
+    // ── 6. agent_runs keyed by node ──
+    if runs_need_rebuild {
+        tx.execute_batch(
+            "
+            CREATE TABLE agent_runs_v29 (
+                id TEXT PRIMARY KEY NOT NULL,
+                node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                run_number INTEGER NOT NULL,
+                runtime_status TEXT NOT NULL CHECK(runtime_status IN (
+                    'starting', 'processing', 'waiting', 'blocked', 'not_running'
+                )),
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                reconnect_pid INTEGER,
+                reconnect_birth_token INTEGER,
+                run_kind TEXT NOT NULL DEFAULT 'auto'
+                    CHECK(run_kind IN ('auto', 'interactive', 'terminal', 'implementation')),
+                session_name TEXT,
+                agent_session_id TEXT,
+                platform TEXT,
+                model TEXT,
+                effort TEXT,
+                UNIQUE(node_id, run_number)
+            );
+            INSERT INTO agent_runs_v29 (
+                id, node_id, run_number, runtime_status, started_at, ended_at,
+                reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
+                platform, model, effort
+            )
+            SELECT r.id, c.node_id,
+                   ROW_NUMBER() OVER (PARTITION BY c.node_id ORDER BY r.started_at, r.id),
+                   r.runtime_status, r.started_at, r.ended_at, r.reconnect_pid,
+                   r.reconnect_birth_token, r.run_kind, r.session_name, r.agent_session_id,
+                   c.platform, c.model, c.effort
+            FROM agent_runs r
+            JOIN agent_configs c ON c.id = r.agent_config_id
+            WHERE c.node_id IN (SELECT id FROM nodes);
+            DELETE FROM notification_runs WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
+            DELETE FROM transcript_turns WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
+            DROP INDEX IF EXISTS idx_agent_runs_config_id;
+            DROP TABLE agent_runs;
+            ",
+        )?;
+        rename("agent_runs_v29", "agent_runs")?;
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_agent_runs_node_id ON agent_runs(node_id);")?;
+    }
+
+    // ── 7. shell_sessions keyed by node ──
+    if shells_need_rebuild {
+        tx.execute_batch(
+            "
+            CREATE TABLE shell_sessions_v29 (
+                id TEXT PRIMARY KEY NOT NULL,
+                node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                reconnect_pid INTEGER,
+                reconnect_birth_token INTEGER,
+                label_number INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO shell_sessions_v29 (id, node_id, reconnect_pid, reconnect_birth_token, label_number)
+            SELECT s.id, c.node_id, s.reconnect_pid, s.reconnect_birth_token,
+                   ROW_NUMBER() OVER (PARTITION BY c.node_id ORDER BY s.label_number, s.id)
+            FROM shell_sessions s
+            JOIN agent_configs c ON c.id = s.agent_config_id
+            WHERE c.node_id IN (SELECT id FROM nodes);
+            DROP INDEX IF EXISTS idx_shell_sessions_config_id;
+            DROP TABLE shell_sessions;
+            ",
+        )?;
+        rename("shell_sessions_v29", "shell_sessions")?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_shell_sessions_node_id ON shell_sessions(node_id);",
+        )?;
+    }
+
+    // ── 8. interview_sessions without agent_config_id ──
+    if interviews_need_rebuild {
+        tx.execute_batch(
+            "
+            CREATE TABLE interview_sessions_v29 (
+                id                   BLOB PRIMARY KEY NOT NULL,
+                node_id              BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                display_name         TEXT NOT NULL,
+                status               TEXT NOT NULL CHECK (status IN ('active', 'archived', 'complete')),
+                phase                TEXT NOT NULL,
+                session_id           TEXT,
+                scratchpad_path      TEXT,
+                created_at           INTEGER NOT NULL,
+                updated_at           INTEGER NOT NULL,
+                question_maker_state TEXT NOT NULL DEFAULT 'idle',
+                exhausted_reason     TEXT
+            );
+            INSERT INTO interview_sessions_v29 (
+                id, node_id, display_name, status, phase, session_id, scratchpad_path,
+                created_at, updated_at, question_maker_state, exhausted_reason
+            )
+            SELECT id, node_id, display_name, status, phase, session_id, scratchpad_path,
+                   created_at, updated_at, question_maker_state, exhausted_reason
+            FROM interview_sessions;
+            DROP INDEX IF EXISTS idx_interview_sessions_node;
+            DROP TABLE interview_sessions;
+            ",
+        )?;
+        rename("interview_sessions_v29", "interview_sessions")?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_interview_sessions_node ON interview_sessions(node_id, status);",
+        )?;
+    }
+
+    // ── 9. Drop action configs ──
+    if has_configs {
+        tx.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_agent_configs_node_id;
+            DROP TABLE agent_configs;
+            ",
+        )?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO _fleet_meta (key, value) VALUES ('schema_epoch', '29')",
+        [],
+    )?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
@@ -2250,13 +2576,203 @@ mod tests {
         assert!(tables.contains(&"nodes".to_string()));
         assert!(tables.contains(&"lists".to_string()));
         assert!(tables.contains(&"outline_entries".to_string()));
-        assert!(tables.contains(&"agent_configs".to_string()));
+        assert!(tables.contains(&"node_files".to_string()));
+        assert!(tables.contains(&"node_agent".to_string()));
         assert!(tables.contains(&"agent_runs".to_string()));
         assert!(tables.contains(&"shell_sessions".to_string()));
         assert!(tables.contains(&"notifications".to_string()));
-        assert!(tables.contains(&"notification_agents".to_string()));
+        assert!(tables.contains(&"notification_runs".to_string()));
         assert!(tables.contains(&"transcript_turns".to_string()));
+        assert!(!tables.contains(&"agent_configs".to_string()));
+        assert!(!tables.contains(&"notification_agents".to_string()));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrate_v28_to_v29_moves_action_configs_onto_nodes() {
+        // A v28 store: one Agent node with two configs (a worktree agent config
+        // and an interview config), runs on both, a shell on each, and a
+        // notification about the agent config.
+        let (dir, conn) = temp_db();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys=OFF;
+            DROP TABLE notification_runs;
+            DROP TABLE agent_runs;
+            DROP TABLE shell_sessions;
+            CREATE TABLE agent_configs (
+                id TEXT PRIMARY KEY NOT NULL,
+                node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE RESTRICT,
+                env_type TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                work_directory TEXT,
+                use_worktree INTEGER NOT NULL DEFAULT 0,
+                worktree_path TEXT,
+                worktree_lease_id TEXT,
+                worktree_lease_holder TEXT,
+                created_at INTEGER NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'claude',
+                model TEXT NOT NULL DEFAULT 'auto',
+                effort TEXT NOT NULL DEFAULT 'auto'
+            );
+            CREATE TABLE agent_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                agent_config_id TEXT NOT NULL REFERENCES agent_configs(id) ON DELETE RESTRICT,
+                run_number INTEGER NOT NULL,
+                runtime_status TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                reconnect_pid INTEGER,
+                reconnect_birth_token INTEGER,
+                run_kind TEXT NOT NULL DEFAULT 'auto',
+                session_name TEXT,
+                agent_session_id TEXT,
+                UNIQUE(agent_config_id, run_number)
+            );
+            CREATE TABLE shell_sessions (
+                id TEXT PRIMARY KEY NOT NULL,
+                agent_config_id TEXT NOT NULL REFERENCES agent_configs(id) ON DELETE CASCADE,
+                reconnect_pid INTEGER,
+                reconnect_birth_token INTEGER,
+                label_number INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE notification_agents (
+                notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+                agent_config_id TEXT NOT NULL REFERENCES agent_configs(id) ON DELETE CASCADE,
+                PRIMARY KEY (notification_id, agent_config_id)
+            );
+            PRAGMA foreign_keys=ON;
+            ",
+        )
+        .unwrap();
+        let node = uuid::Uuid::new_v4().as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at) VALUES (?1, 'n', 'N', 0, 0)",
+            params![node],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'agent', 0)",
+            params![node],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO agent_configs (id, node_id, env_type, mode, work_directory, use_worktree,
+                 worktree_path, created_at, platform, model, effort)
+             VALUES ('cfg-a', ?1, 'local', 'agent', '/repo', 1, '/wt', 1, 'cursor', 'gpt', 'high'),
+                    ('cfg-i', ?1, 'local', 'interview', '/other', 0, NULL, 2, 'claude', 'auto', 'auto')",
+            params![node],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "
+            INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at, run_kind)
+            VALUES ('cfg-i-run-1', 'cfg-i', 1, 'not_running', 50, 'auto'),
+                   ('cfg-a-run-1', 'cfg-a', 1, 'not_running', 10, 'auto'),
+                   ('cfg-a-run-2', 'cfg-a', 2, 'waiting', 30, 'interactive');
+            INSERT INTO shell_sessions (id, agent_config_id, label_number)
+            VALUES ('shell-i', 'cfg-i', 1), ('shell-a', 'cfg-a', 1);
+            INSERT INTO notifications (id, message) VALUES ('n1', 'look');
+            INSERT INTO notification_agents (notification_id, agent_config_id) VALUES ('n1', 'cfg-a');
+            ",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 28).unwrap();
+        drop(conn);
+
+        let path = dir.join("tod.db");
+        let conn = open_writer_connection(&path).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+
+        let (use_worktree, worktree_path): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT use_worktree, worktree_path FROM node_files WHERE node_id = ?1",
+                params![node],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((use_worktree, worktree_path.as_deref()), (1, Some("/wt")));
+        let (platform, model, effort): (String, String, String) = conn
+            .query_row(
+                "SELECT platform, model, effort FROM node_agent WHERE node_id = ?1",
+                params![node],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((platform.as_str(), model.as_str(), effort.as_str()), ("cursor", "gpt", "high"));
+        let repo: String = conn
+            .query_row(
+                "SELECT repo FROM node_fields WHERE node_id = ?1",
+                params![node],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repo, "/repo");
+        let caps: Vec<String> = conn
+            .prepare("SELECT capability FROM node_capabilities WHERE node_id = ?1 ORDER BY capability")
+            .unwrap()
+            .query_map(params![node], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(caps, ["agent", "files"]);
+
+        let runs: Vec<(String, i64, Option<String>)> = conn
+            .prepare("SELECT id, run_number, platform FROM agent_runs WHERE node_id = ?1 ORDER BY run_number")
+            .unwrap()
+            .query_map(params![node], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            runs,
+            [
+                ("cfg-a-run-1".to_string(), 1, Some("cursor".to_string())),
+                ("cfg-a-run-2".to_string(), 2, Some("cursor".to_string())),
+                ("cfg-i-run-1".to_string(), 3, Some("claude".to_string())),
+            ]
+        );
+        let shells: Vec<(String, i64)> = conn
+            .prepare("SELECT id, label_number FROM shell_sessions WHERE node_id = ?1 ORDER BY label_number")
+            .unwrap()
+            .query_map(params![node], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(shells, [("shell-a".to_string(), 1), ("shell-i".to_string(), 2)]);
+        let notified_run: String = conn
+            .query_row(
+                "SELECT agent_run_id FROM notification_runs WHERE notification_id = 'n1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notified_run, "cfg-a-run-2");
+
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('agent_configs', 'notification_agents')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
+        let has_config_column = conn
+            .prepare("SELECT 1 FROM pragma_table_info('interview_sessions') WHERE name = 'agent_config_id'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!has_config_column);
+        let fk_violations = conn
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!fk_violations);
         let _ = fs::remove_dir_all(dir);
     }
 

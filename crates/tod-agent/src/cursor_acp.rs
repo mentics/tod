@@ -501,7 +501,7 @@ impl AgentProvider for CursorAcpProvider {
 
     fn start_fleet_agent(
         &mut self,
-        agent_config_id: &str,
+        owner_id: &str,
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
@@ -516,7 +516,7 @@ impl AgentProvider for CursorAcpProvider {
             session_title,
         )?;
         self.fleet_run_context
-            .insert(handle.id, agent_config_id.to_string());
+            .insert(handle.id, owner_id.to_string());
         Ok(handle)
     }
 
@@ -524,7 +524,7 @@ impl AgentProvider for CursorAcpProvider {
         let blocks = turn.prompt_blocks();
         let SessionTurn {
             key,
-            agent_config_id,
+            owner_id,
             cwd,
             options,
             resume_session_id,
@@ -571,7 +571,7 @@ impl AgentProvider for CursorAcpProvider {
             self.conversations.insert(key.clone(), fresh);
         }
 
-        self.fleet_run_context.insert(id, agent_config_id);
+        self.fleet_run_context.insert(id, owner_id);
         self.log_traffic(
             purpose.run_kind(),
             id,
@@ -1959,7 +1959,7 @@ while True:
         let turn =
             |opening: Option<SessionOpening>, resume: Option<String>, message: &str| SessionTurn {
                 key: "run-1".into(),
-                agent_config_id: "config".into(),
+                owner_id: "config".into(),
                 cwd: dir.clone(),
                 options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
                 resume_session_id: resume,

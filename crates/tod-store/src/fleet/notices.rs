@@ -1,8 +1,8 @@
-//! Stub notice callbacks for agent-removal cascade UX hooks.
+//! Stub notice callbacks for fleet launch-time cleanup UX hooks.
 
 use std::sync::{Arc, Mutex};
 
-/// Optional hooks for fleet cascade events (toast integration deferred to sibling tasks).
+/// Optional hooks for fleet cleanup events (toast integration deferred to sibling tasks).
 #[derive(Clone, Default)]
 pub struct FleetNoticeHooks {
     inner: Arc<Mutex<FleetNoticeHooksInner>>,
@@ -11,7 +11,6 @@ pub struct FleetNoticeHooks {
 #[derive(Default)]
 struct FleetNoticeHooksInner {
     worktree_missing: Vec<String>,
-    agent_auto_deleted: Vec<String>,
 }
 
 impl FleetNoticeHooks {
@@ -19,23 +18,14 @@ impl FleetNoticeHooks {
         Self::default()
     }
 
-    /// Called when a not-running agent is auto-deleted because its worktree path is missing.
-    pub fn on_worktree_missing(&self, agent_id: &str) {
+    /// Called when a node's recorded worktree no longer exists on disk and was cleared.
+    pub fn on_worktree_missing(&self, node_id: &str) {
         self.inner
             .lock()
             .expect("fleet notice hooks mutex")
             .worktree_missing
-            .push(agent_id.to_string());
-        tracing::info!("fleet: worktree missing — auto-deleted agent {agent_id}");
-    }
-
-    /// Called after cascade delete of an agent (e.g. worktree missing on relaunch).
-    pub fn on_agent_auto_deleted(&self, agent_id: &str) {
-        self.inner
-            .lock()
-            .expect("fleet notice hooks mutex")
-            .agent_auto_deleted
-            .push(agent_id.to_string());
+            .push(node_id.to_string());
+        tracing::info!("fleet: worktree missing — cleared worktree for node {node_id}");
     }
 
     #[cfg(test)]

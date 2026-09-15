@@ -3,16 +3,6 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// Associated agent summary for row menus.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentInfo {
-    pub id: String,
-    pub label: String,
-    pub status: String,
-    /// True when this config is inherited from an ancestor node.
-    pub inherited: bool,
-}
-
 /// Open shell session summary for row menus.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellInfo {
@@ -29,7 +19,13 @@ pub struct TaskItem {
     pub lifecycle: String,
     pub entity_path: PathBuf,
     pub tags: Vec<String>,
-    pub agents: Vec<AgentInfo>,
+    /// Agent or Files resolves (on this node or an ancestor), so the Action
+    /// chip shows.
+    pub has_actions: bool,
+    /// Files resolves (on this node or an ancestor).
+    pub has_files: bool,
+    /// Agent runs on this node that haven't ended.
+    pub live_run_count: usize,
     pub shells: Vec<ShellInfo>,
     pub interaction_timestamp: DateTime<Utc>,
     /// Stable display order from outline flatten (preserved when sort = Tree).
@@ -39,6 +35,7 @@ pub struct TaskItem {
     pub collapsed: bool,
     pub is_work_node: bool,
     pub has_spec: bool,
+    /// Agent resolves (on this node or an ancestor).
     pub has_agent: bool,
     pub requirement_count: usize,
     pub constraint_count: usize,
@@ -46,9 +43,8 @@ pub struct TaskItem {
     /// Short status text when a gate-check or on-entry agent turn is
     /// currently running against this node (e.g. "Running gate check…").
     /// Sourced from `LifecyclePanelView::in_flight_activity` — these turns
-    /// run against an interview-mode agent config kept out of `agents`
-    /// (see `task_list::fixtures::load_tasks_from_store`), so without this
-    /// they'd be invisible in the task list while running.
+    /// aren't recorded as agent runs, so without this they'd be invisible in
+    /// the task list while running.
     pub in_flight_activity: Option<String>,
     /// True when this node was produced/is owned by a generator ancestor.
     pub managed: bool,
@@ -65,10 +61,6 @@ pub struct TaskItem {
 }
 
 impl TaskItem {
-    pub fn agent_count(&self) -> usize {
-        self.agents.len()
-    }
-
     pub fn sorted_tags(&self) -> Vec<String> {
         let mut tags = self.tags.clone();
         tags.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
@@ -536,7 +528,9 @@ mod tests {
             lifecycle: lifecycle.into(),
             entity_path: PathBuf::from(id),
             tags: tags.iter().map(|s| s.to_string()).collect(),
-            agents: Vec::new(),
+            has_actions: false,
+            has_files: false,
+            live_run_count: 0,
             shells: Vec::new(),
             interaction_timestamp: Utc::now(),
             tree_ordinal: 0,

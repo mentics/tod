@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
 use tod_store::fleet::{FleetStore, TranscriptTurn};
 
-/// A single row in the agent picker list, unified across fleet configs and
+/// A single row in the agent picker list, unified across fleet agent runs and
 /// traffic-log-only agents (question maker / answer processor).
 #[derive(Debug, Clone)]
 struct AgentRow {
@@ -151,20 +151,27 @@ impl AgentTranscriptsView {
         let mut rows: Vec<AgentRow> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if let Ok(fleet_agents) = self.fleet.list_all_agents() {
-            for agent in fleet_agents {
+        if let Ok(runs) = self.fleet.list_all_runs() {
+            for run in runs {
                 let turn_count = self
                     .fleet
-                    .list_transcript_for_agent(&agent.id)
+                    .list_transcript_for_agent(&run.id)
                     .map(|t| t.len())
                     .unwrap_or(0);
-                if seen.insert(agent.id.clone()) {
+                let title = self
+                    .fleet
+                    .get_node(&run.node_id)
+                    .ok()
+                    .flatten()
+                    .map(|node| node.title)
+                    .unwrap_or_else(|| run.node_id.clone());
+                if seen.insert(run.id.clone()) {
                     rows.push(AgentRow {
-                        id: agent.id.clone(),
-                        label: format!("{} · {} · {}", agent.id, agent.env_type, agent.mode),
+                        id: run.id.clone(),
+                        label: format!("{title} · run {} · {}", run.run_number, run.run_kind),
                         entry_count: turn_count,
-                        last_activity_ms: agent.last_activity_ms,
-                        active: agent.runtime_status != "not_running",
+                        last_activity_ms: Some(run.ended_at.unwrap_or(run.started_at)),
+                        active: run.is_live(),
                     });
                 }
             }
@@ -211,7 +218,7 @@ impl AgentTranscriptsView {
             }
         }
 
-        if let Ok(db_turns) = self.fleet.list_transcript_for_config(agent_id) {
+        if let Ok(db_turns) = self.fleet.list_transcript_for_agent(agent_id) {
             for turn in db_turns {
                 if let Some(row) = fleet_turn_to_row(&turn) {
                     if !rows.iter().any(|existing| {

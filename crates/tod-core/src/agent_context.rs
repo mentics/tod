@@ -130,7 +130,7 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
 
 /// Context key under `media/context/` for an implementation session, launched
 /// from the lifecycle panel's Active-phase "Implement" button (see
-/// `crate::gate` for the transition gate that requires an action config
+/// `crate::gate` for the transition gate that requires Agent and Files
 /// before a node can reach `active` at all).
 pub const IMPLEMENT_CONTEXT_KEY: &str = "active/implement";
 

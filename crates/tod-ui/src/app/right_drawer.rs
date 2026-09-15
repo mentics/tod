@@ -14,7 +14,7 @@
 //! A new panel gets a `DrawerKind` variant and an arm in each method below;
 //! the task list never learns which panel is showing.
 
-use crate::views::agent_config_panel::AgentConfigPanelView;
+use crate::views::action_panel::ActionPanelView;
 use crate::views::lifecycle_panel::LifecyclePanelView;
 use crate::views::obligations::ObligationsView;
 use crate::views::task_edit::TaskEditView;
@@ -29,7 +29,7 @@ pub(crate) enum DrawerKind {
     Obligations,
     Lifecycle,
     VisualDesign,
-    AgentConfig,
+    Action,
 }
 
 const ALL_KINDS: [DrawerKind; 5] = [
@@ -37,7 +37,7 @@ const ALL_KINDS: [DrawerKind; 5] = [
     DrawerKind::Obligations,
     DrawerKind::Lifecycle,
     DrawerKind::VisualDesign,
-    DrawerKind::AgentConfig,
+    DrawerKind::Action,
 ];
 
 /// A change to the drawer, queued from event handlers (which have no
@@ -57,11 +57,8 @@ pub(crate) enum DrawerRequest {
         node_id: Uuid,
         obligation_id: Uuid,
     },
-    OpenAgentConfig {
+    OpenActionPanel {
         task_id: String,
-        config_id: Option<String>,
-        /// Launch an auto run once the panel is open.
-        launch_auto: bool,
     },
     /// The tree selection changed.
     Follow {
@@ -76,7 +73,7 @@ pub(crate) struct RightDrawer {
     pub obligations: Entity<ObligationsView>,
     pub lifecycle: Entity<LifecyclePanelView>,
     pub visual_design: Entity<VisualDesignPanelView>,
-    pub agent_config: Entity<AgentConfigPanelView>,
+    pub action: Entity<ActionPanelView>,
 }
 
 impl RightDrawer {
@@ -86,7 +83,7 @@ impl RightDrawer {
             DrawerKind::Obligations => self.obligations.read(cx).is_open(),
             DrawerKind::Lifecycle => self.lifecycle.read(cx).is_open(),
             DrawerKind::VisualDesign => self.visual_design.read(cx).is_open(),
-            DrawerKind::AgentConfig => self.agent_config.read(cx).is_open(),
+            DrawerKind::Action => self.action.read(cx).is_open(),
         }
     }
 
@@ -117,9 +114,7 @@ impl RightDrawer {
                 DrawerKind::VisualDesign => {
                     self.visual_design.update(cx, |panel, cx| panel.close(cx))
                 }
-                DrawerKind::AgentConfig => {
-                    self.agent_config.update(cx, |panel, cx| panel.close(cx))
-                }
+                DrawerKind::Action => self.action.update(cx, |panel, cx| panel.close(cx)),
             }
         }
     }
@@ -153,22 +148,8 @@ impl RightDrawer {
                     self.close_except(Some(DrawerKind::Obligations), window, cx);
                 }
             }
-            DrawerKind::AgentConfig => {
-                // Show the node's first action config (possibly inherited, so
-                // opened against its owner), or a new-config form if it has none.
-                let first = fleet
-                    .resolve_agents_for_node(task_id)
-                    .ok()
-                    .and_then(|resolved| {
-                        resolved
-                            .configs
-                            .into_iter()
-                            .find(|config| config.mode != "interview")
-                    });
-                self.agent_config.update(cx, |panel, cx| match first {
-                    Some(config) => panel.retarget(&config.node_id, Some(&config.id), window, cx),
-                    None => panel.retarget(task_id, None, window, cx),
-                });
+            DrawerKind::Action => {
+                self.action.update(cx, |panel, cx| panel.retarget(task_id, cx));
             }
         }
     }
@@ -200,9 +181,7 @@ impl RightDrawer {
             Some(DrawerKind::VisualDesign) => {
                 self.visual_design.read(cx).focus_handle(cx).focus(window, cx)
             }
-            Some(DrawerKind::AgentConfig) => {
-                self.agent_config.read(cx).focus_handle(cx).focus(window, cx)
-            }
+            Some(DrawerKind::Action) => self.action.read(cx).focus_handle(cx).focus(window, cx),
             None => {}
         }
     }
@@ -213,7 +192,7 @@ impl RightDrawer {
             DrawerKind::Obligations => self.obligations.clone().into_any_element(),
             DrawerKind::Lifecycle => self.lifecycle.clone().into_any_element(),
             DrawerKind::VisualDesign => self.visual_design.clone().into_any_element(),
-            DrawerKind::AgentConfig => self.agent_config.clone().into_any_element(),
+            DrawerKind::Action => self.action.clone().into_any_element(),
         })
     }
 }

@@ -32,7 +32,7 @@ use tod_store::drafting::{
     ATTENTION_HIGH, ATTENTION_LOW, ATTENTION_MEDIUM, CHOICE_OPEN, DraftingChoice, DraftingDump,
     DraftingRepo, DraftingSummary, MarkedObligation, NodePick,
 };
-use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
+use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::{OUTCOME_FAIL, OUTCOME_PASS, OutlineMutation};
@@ -120,7 +120,6 @@ pub enum DraftingViewEvent {
     OpenAgentChat {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
-        config_id: Option<String>,
     },
 }
 
@@ -252,15 +251,12 @@ impl DraftingView {
                 ObligationsEvent::OpenAgentChat {
                     node_id,
                     obligation_id,
-                    config_id,
                 } => cx.emit(DraftingViewEvent::OpenAgentChat {
                     node_id: *node_id,
                     obligation_id: *obligation_id,
-                    config_id: config_id.clone(),
                 }),
                 ObligationsEvent::RewritePreV3 { .. } => this.request_rewrite(false, cx),
                 ObligationsEvent::DeleteSelectedTask
-                | ObligationsEvent::OpenAgentConfig { .. }
                 | ObligationsEvent::OpenVisualDesign { .. } => {}
             },
         );
@@ -400,13 +396,7 @@ impl DraftingView {
             }
         }
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
-        let agent_ctx = ensure_interview_agent_for_node(
-            &self.fleet,
-            &self.paths,
-            &settings,
-            &node_id.to_string(),
-        )
-        .map_err(|e| format!("Drafting agent setup failed: {e}"))?;
+        let repo_cwd = self.fleet.files_dir_or_data_root(&node_id.to_string());
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
         let manifest = ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
         let prefix =
@@ -415,8 +405,7 @@ impl DraftingView {
             node_id,
             node_title: title,
             mode,
-            agent_config_id: agent_ctx.agent.id.clone(),
-            repo_cwd: agent_ctx.cwd,
+            repo_cwd,
             data_root: self.fleet.paths().root().to_path_buf(),
             tod_cli: tod_core::interview::tod_cli_path(),
             launch: settings.interview_launch_options(),

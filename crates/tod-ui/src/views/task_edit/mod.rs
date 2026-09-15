@@ -1,3 +1,4 @@
+use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_pane_nav};
@@ -16,12 +17,18 @@ use gpui_base::input::{InputBaseState, InputModeKind};
 use gpui_component::input::{AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tag::Tag;
-use gpui_component::{ActiveTheme, Selectable, Sizable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tod_store::fleet::{FleetMutation, FleetStore, NoteItem, validate_interview_workspace};
+use tod_store::fleet::{
+    FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
+    release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
+};
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, OutlineMutation};
-use tod_store::{CredentialStore, resolve_linear_api_key};
+use tod_store::{
+    AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
+    parse_platform, platform_storage, resolve_linear_api_key,
+};
 
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
@@ -30,6 +37,15 @@ const MULTI_LINE_ROWS: f32 = 4.;
 const DETAILS_ROWS: f32 = 6.;
 /// Max visible height of the notes list, in equivalent text lines, before it scrolls.
 const NOTES_MAX_LINES: f32 = 16.;
+const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
+
+/// Next value when cycling an optional catalog field: unset → first → … → last → unset.
+fn cycle_option(current: Option<&str>, options: &[&str]) -> Option<String> {
+    match current.and_then(|c| options.iter().position(|o| *o == c)) {
+        None => options.first().map(|o| o.to_string()),
+        Some(i) => options.get(i + 1).map(|o| o.to_string()),
+    }
+}
 
 fn input_text<M: InputModeKind>(input: &Entity<InputBaseState<M>>, cx: &App) -> String {
     input.read(cx).text().to_string()
@@ -46,7 +62,14 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Purpose => "task-edit-field-purpose",
         TaskEditField::Details => "task-edit-field-details",
         TaskEditField::Obligations => "task-edit-field-obligations",
+        TaskEditField::AgentPlatform => "task-edit-field-agent-platform",
+        TaskEditField::AgentModel => "task-edit-field-agent-model",
+        TaskEditField::AgentEffort => "task-edit-field-agent-effort",
+        TaskEditField::UseWorktree => "task-edit-field-use-worktree",
+        TaskEditField::WorktreeAction => "task-edit-field-worktree-action",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
+        TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
+        TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
         TaskEditField::Capability(Capability::Spec) => "task-edit-field-cap-spec",
         TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
         TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
@@ -78,12 +101,29 @@ enum TaskEditField {
     Purpose,
     Details,
     Obligations,
+    /// Agent capability selects — Enter / click cycles through the catalog.
+    AgentPlatform,
+    AgentModel,
+    AgentEffort,
+    /// Files capability worktree flag.
+    UseWorktree,
+    /// Files capability "Set up worktree" / "Release worktree" button.
+    WorktreeAction,
     Capability(Capability),
 }
 
 impl TaskEditField {
     fn is_text(self) -> bool {
-        !matches!(self, Self::Obligations | Self::Capability(_))
+        !matches!(
+            self,
+            Self::Obligations
+                | Self::AgentPlatform
+                | Self::AgentModel
+                | Self::AgentEffort
+                | Self::UseWorktree
+                | Self::WorktreeAction
+                | Self::Capability(_)
+        )
     }
 }
 
@@ -109,6 +149,7 @@ struct PendingLinearApply {
 
 pub struct TaskEditView {
     fleet: Arc<FleetStore>,
+    paths: TodPaths,
     task_id: Option<String>,
     focus_handle: FocusHandle,
     title_input: Entity<InputState>,
@@ -157,6 +198,12 @@ pub struct TaskEditView {
     generator_config_error: Option<String>,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
+    /// This node's own Agent values (unset = follow settings).
+    node_agent: NodeAgent,
+    resolved_agent: Option<ResolvedAgent>,
+    resolved_files: Option<ResolvedFiles>,
+    worktree_busy: bool,
+    worktree_status: Option<String>,
     _title_subscription: Subscription,
     _linear_subscription: Subscription,
     _github_subscription: Subscription,
@@ -170,7 +217,12 @@ pub struct TaskEditView {
 }
 
 impl TaskEditView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fleet: Arc<FleetStore>,
+        paths: TodPaths,
+    ) -> Self {
         let title_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Task title"));
         let linear_input =
@@ -178,7 +230,7 @@ impl TaskEditView {
         let github_pr_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · #42 or URL"));
         let repo_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Enter to edit · Repository root path")
+            InputState::new(window, cx).placeholder("Enter to edit · Workspace directory")
         });
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
@@ -261,6 +313,7 @@ impl TaskEditView {
 
         Self {
             fleet,
+            paths,
             task_id: None,
             focus_handle: cx.focus_handle(),
             title_input,
@@ -280,6 +333,11 @@ impl TaskEditView {
             generator_config_error: None,
             managed_link: None,
             managed_source_type: None,
+            node_agent: NodeAgent::default(),
+            resolved_agent: None,
+            resolved_files: None,
+            worktree_busy: false,
+            worktree_status: None,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -385,11 +443,23 @@ impl TaskEditView {
         stops.push(TaskEditField::Details);
         if self.capability_enabled(Capability::Agent) {
             stops.extend([
-                TaskEditField::LinearLink,
-                TaskEditField::GithubPr,
+                TaskEditField::AgentPlatform,
+                TaskEditField::AgentModel,
+                TaskEditField::AgentEffort,
+            ]);
+        }
+        if self.capability_enabled(Capability::Files) {
+            stops.extend([
                 TaskEditField::Repo,
                 TaskEditField::Branch,
+                TaskEditField::UseWorktree,
             ]);
+            if self.worktree_action().is_some() {
+                stops.push(TaskEditField::WorktreeAction);
+            }
+        }
+        if self.capability_enabled(Capability::Ticket) {
+            stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
         }
         if self.capability_enabled(Capability::Tags) {
             stops.push(TaskEditField::Tags);
@@ -469,7 +539,13 @@ impl TaskEditView {
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Purpose => self.purpose_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
-            TaskEditField::Obligations | TaskEditField::Capability(_) => return None,
+            TaskEditField::Obligations
+            | TaskEditField::AgentPlatform
+            | TaskEditField::AgentModel
+            | TaskEditField::AgentEffort
+            | TaskEditField::UseWorktree
+            | TaskEditField::WorktreeAction
+            | TaskEditField::Capability(_) => return None,
         })
     }
 
@@ -492,6 +568,18 @@ impl TaskEditView {
                 self.toggle_capability(cap, window, cx);
                 self.clamp_focus_index();
                 cx.notify();
+                return;
+            }
+            TaskEditField::AgentPlatform | TaskEditField::AgentModel | TaskEditField::AgentEffort => {
+                self.cycle_agent_field(field, cx);
+                return;
+            }
+            TaskEditField::UseWorktree => {
+                self.toggle_use_worktree(cx);
+                return;
+            }
+            TaskEditField::WorktreeAction => {
+                self.run_worktree_action(cx);
                 return;
             }
             _ => {
@@ -639,6 +727,8 @@ impl TaskEditView {
         self.loaded_lifecycle = task.lifecycle.clone();
         self.tags = task.tags.clone();
         self.capabilities = self.load_capabilities(&task_id).into_iter().collect();
+        self.worktree_status = None;
+        self.load_action_capabilities();
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
         self.load_managed_link();
@@ -716,6 +806,180 @@ impl TaskEditView {
 
     fn capability_enabled(&self, cap: Capability) -> bool {
         self.capabilities.contains(&cap)
+    }
+
+    /// Resolve Agent / Files (own or inherited) for the open node.
+    fn load_action_capabilities(&mut self) {
+        let Some(task_id) = self.task_id() else {
+            return;
+        };
+        self.resolved_agent = self.fleet.resolve_agent_for_node(&task_id).ok().flatten();
+        self.resolved_files = self.fleet.resolve_files_for_node(&task_id).ok().flatten();
+        self.node_agent = self
+            .resolved_agent
+            .as_ref()
+            .filter(|resolved| !resolved.inherited)
+            .map(|resolved| resolved.agent.clone())
+            .unwrap_or_default();
+    }
+
+    /// This node's own Files values (not an ancestor's).
+    fn own_files(&self) -> Option<&ResolvedFiles> {
+        self.resolved_files.as_ref().filter(|files| !files.inherited)
+    }
+
+    /// This node has a worktree set up.
+    fn has_own_worktree(&self) -> bool {
+        self.own_files().is_some_and(|files| files.worktree_path().is_some())
+    }
+
+    /// `Some(true)` = "Set up worktree", `Some(false)` = "Release worktree".
+    ///
+    /// A recorded worktree can always be released, even with the flag off (e.g. one
+    /// carried over by migration), since it blocks turning Files off.
+    fn worktree_action(&self) -> Option<bool> {
+        let files = self.own_files()?;
+        match files.directory() {
+            FilesDirectory::NeedsWorktreeSetup => Some(true),
+            _ if files.worktree_path().is_some() => Some(false),
+            _ => None,
+        }
+    }
+
+    /// What unset Agent values fall back to.
+    fn settings_launch(&self) -> AgentLaunchOptions {
+        TodSettings::load(&self.paths)
+            .unwrap_or_default()
+            .launch_options_for(AgentRole::Default)
+    }
+
+    fn cycle_agent_field(&mut self, field: TaskEditField, cx: &mut Context<Self>) {
+        let mut agent = self.node_agent.clone();
+        let effective = agent.launch_options(&self.settings_launch());
+        match field {
+            TaskEditField::AgentPlatform => {
+                let options: Vec<&str> =
+                    PLATFORM_ORDER.iter().map(|p| platform_storage(*p)).collect();
+                agent.platform = cycle_option(agent.platform.as_deref(), &options);
+                // Model and effort catalogs are per platform.
+                agent.model = None;
+                agent.effort = None;
+            }
+            TaskEditField::AgentModel => {
+                agent.model = cycle_option(agent.model.as_deref(), models_for(effective.platform));
+            }
+            TaskEditField::AgentEffort => {
+                agent.effort =
+                    cycle_option(agent.effort.as_deref(), efforts_for(effective.platform));
+            }
+            _ => return,
+        }
+        let Some(node_id) = self.task_id() else {
+            return;
+        };
+        if let Err(err) = self.fleet.enqueue(FleetMutation::UpsertNodeAgent {
+            node_id,
+            platform: agent.platform,
+            model: agent.model,
+            effort: agent.effort,
+        }) {
+            self.pending_toast = Some(format!("Failed to save agent settings: {err}"));
+            cx.notify();
+            return;
+        }
+        if self.fleet.writer().flush().is_err() {
+            self.pending_toast = Some("Failed to save agent settings".into());
+            cx.notify();
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        self.load_action_capabilities();
+        self.notify_changed(cx);
+    }
+
+    fn toggle_use_worktree(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.task_id() else {
+            return;
+        };
+        let Some(use_worktree) = self.own_files().map(|files| !files.use_worktree) else {
+            return;
+        };
+        if !use_worktree && self.has_own_worktree() {
+            self.pending_toast = Some("Release the worktree before turning it off".into());
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.fleet.enqueue(FleetMutation::SetNodeUseWorktree {
+            node_id,
+            use_worktree,
+        }) {
+            self.pending_toast = Some(format!("Failed to save worktree setting: {err}"));
+            cx.notify();
+            return;
+        }
+        if self.fleet.writer().flush().is_err() {
+            self.pending_toast = Some("Failed to save worktree setting".into());
+            cx.notify();
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        self.load_action_capabilities();
+        self.clamp_focus_index();
+        self.notify_changed(cx);
+    }
+
+    /// Set up or release the node's worktree off the UI thread.
+    fn run_worktree_action(&mut self, cx: &mut Context<Self>) {
+        let Some(setup) = self.worktree_action() else {
+            return;
+        };
+        if self.worktree_busy {
+            return;
+        }
+        let Some(task_id) = self.task_id() else {
+            return;
+        };
+        self.worktree_busy = true;
+        self.worktree_status = Some(
+            if setup {
+                "Setting up worktree…"
+            } else {
+                "Releasing worktree…"
+            }
+            .into(),
+        );
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<String> = cx
+                .background_spawn(async move {
+                    let settings = TodSettings::load(&paths).unwrap_or_default();
+                    if setup {
+                        setup_worktree_for_node(&fleet, &paths, &settings, &task_id)
+                            .map(|path| format!("Worktree ready at {}", path.display()))
+                    } else {
+                        release_worktree_for_node(&fleet, &paths, &settings, &task_id)
+                            .map(|()| "Worktree released".to_string())
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.worktree_busy = false;
+                match result {
+                    Ok(message) => this.worktree_status = Some(message),
+                    Err(err) => {
+                        this.worktree_status = None;
+                        this.pending_toast = Some(format!("{err:#}"));
+                    }
+                }
+                let _ = this.fleet.reload_if_stale();
+                this.load_action_capabilities();
+                this.clamp_focus_index();
+                this.notify_changed(cx);
+            });
+        })
+        .detach();
     }
 
     fn load_capabilities(&self, task_id: &str) -> Vec<Capability> {
@@ -894,7 +1158,7 @@ impl TaskEditView {
             cx.notify();
             return;
         }
-        if cap == Capability::Agent && self.loaded_repo.is_empty() {
+        if cap == Capability::Files && self.loaded_repo.is_empty() {
             if let Ok(cwd) = std::env::current_dir() {
                 let cwd = cwd.to_string_lossy().into_owned();
                 self.repo_input.update(cx, |input, cx| {
@@ -921,6 +1185,7 @@ impl TaskEditView {
         }
         let _ = self.fleet.reload_if_stale();
         self.capabilities.insert(cap);
+        self.load_action_capabilities();
         if let Some(task_id) = self.task_id() {
             if let Ok(Some(task)) = self.fleet.get_node(&task_id) {
                 self.loaded_lifecycle = task.lifecycle.clone();
@@ -942,9 +1207,9 @@ impl TaskEditView {
         if !self.capabilities.contains(&cap) {
             return;
         }
-        if cap == Capability::Agent {
+        if matches!(cap, Capability::Agent | Capability::Files) {
             if let Some(task_id) = self.task_id() {
-                match self.fleet.agent_capability_disable_blocker(&task_id) {
+                match self.fleet.capability_disable_blocker(&task_id, cap) {
                     Ok(Some(reason)) => {
                         self.pending_toast = Some(reason);
                         cx.notify();
@@ -952,7 +1217,8 @@ impl TaskEditView {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        self.pending_toast = Some(format!("Failed to check action configs: {err}"));
+                        self.pending_toast =
+                            Some(format!("Failed to check {}: {err}", cap.label()));
                         cx.notify();
                         return;
                     }
@@ -1007,10 +1273,11 @@ impl TaskEditView {
         }
         let _ = self.fleet.reload_if_stale();
         self.capabilities.remove(&cap);
+        self.load_action_capabilities();
         if let Some(task_id) = self.task_id() {
             if let Ok(Some(task)) = self.fleet.get_node(&task_id) {
                 self.loaded_lifecycle = task.lifecycle.clone();
-                if cap == Capability::Agent {
+                if cap == Capability::Files {
                     self.loaded_repo.clear();
                     self.loaded_branch.clear();
                     self.repo_input.update(cx, |input, cx| {
@@ -1019,6 +1286,8 @@ impl TaskEditView {
                     self.branch_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
+                }
+                if cap == Capability::Ticket {
                     self.linear_input.update(cx, |input, cx| {
                         input.set_value("", window, cx);
                     });
@@ -1261,6 +1530,11 @@ impl TaskEditView {
             return;
         }
         self.loaded_repo = value;
+        let _ = self.fleet.writer().flush();
+        let _ = self.fleet.reload_if_stale();
+        self.load_action_capabilities();
+        self.clamp_focus_index();
+        cx.notify();
     }
 
     fn persist_branch(&mut self, cx: &mut Context<Self>) {
@@ -1269,6 +1543,12 @@ impl TaskEditView {
         };
         let value = input_text(&self.branch_input, cx).trim().to_string();
         if value == self.loaded_branch {
+            return;
+        }
+        if self.has_own_worktree() {
+            self.pending_toast = Some("Release the worktree before changing the branch".into());
+            self.pending_branch_revert = true;
+            cx.notify();
             return;
         }
         if !self.loaded_repo.is_empty() {
@@ -1296,6 +1576,10 @@ impl TaskEditView {
             return;
         }
         self.loaded_branch = value;
+        let _ = self.fleet.writer().flush();
+        let _ = self.fleet.reload_if_stale();
+        self.load_action_capabilities();
+        cx.notify();
     }
 
     fn persist_notes(&mut self, _cx: &mut Context<Self>) {
@@ -1687,7 +1971,66 @@ impl TaskEditView {
         }
     }
 
-    fn render_agent_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A non-text stop whose value changes on Enter / click.
+    fn render_cycle_field(
+        &self,
+        field: TaskEditField,
+        label: &str,
+        width: f32,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focused = self.field_nav_focused(field);
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        self.apply_focus_scroll_anchor(
+            field,
+            v_flex()
+                .id(field_anchor_id(field))
+                .gap_1()
+                .w(px(width))
+                .flex_shrink_0()
+                .child(Self::render_field_label(label, cx))
+                .child(
+                    div()
+                        .rounded_md()
+                        .when(focused, |el| el.bg(active).border_1().border_color(active_border))
+                        .child(
+                            Button::new((field_anchor_id(field), 0usize))
+                                .label(value)
+                                .outline()
+                                .compact()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.enter_field_edit(field, window, cx);
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    fn render_agent_body(
+        &self,
+        muted: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let effective = self.node_agent.launch_options(&self.settings_launch());
+        let platform_label = match self.node_agent.platform.as_deref().and_then(parse_platform) {
+            Some(platform) => platform.label().to_string(),
+            None => format!("Default ({})", effective.platform.label()),
+        };
+        let model_label = self
+            .node_agent
+            .model
+            .clone()
+            .unwrap_or_else(|| format!("Default ({})", effective.model));
+        let effort_label = self.node_agent.effort.clone().unwrap_or_else(|| {
+            let effort = if effective.effort.is_empty() {
+                "auto"
+            } else {
+                effective.effort.as_str()
+            };
+            format!("Default ({effort})")
+        });
         v_flex()
             .gap_2()
             .px_3()
@@ -1697,23 +2040,105 @@ impl TaskEditView {
                     .gap_2()
                     .items_end()
                     .flex_wrap()
-                    .child(self.render_link_field(
-                        TaskEditField::LinearLink,
-                        "Ticket ID",
-                        120.,
-                        &self.linear_input,
-                        window,
+                    .child(self.render_cycle_field(
+                        TaskEditField::AgentPlatform,
+                        "Platform",
+                        140.,
+                        platform_label,
                         cx,
                     ))
-                    .child(self.render_link_field(
-                        TaskEditField::GithubPr,
-                        "GitHub PR",
-                        110.,
-                        &self.github_pr_input,
-                        window,
+                    .child(self.render_cycle_field(
+                        TaskEditField::AgentModel,
+                        "Model",
+                        200.,
+                        model_label,
+                        cx,
+                    ))
+                    .child(self.render_cycle_field(
+                        TaskEditField::AgentEffort,
+                        "Effort",
+                        140.,
+                        effort_label,
                         cx,
                     )),
             )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Enter or click to cycle · unset values follow Settings"),
+            )
+    }
+
+    fn render_files_body(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let use_worktree = self.own_files().is_some_and(|files| files.use_worktree);
+        let directory = self.own_files().map(|files| files.directory());
+        let action = self.worktree_action();
+        let busy = self.worktree_busy;
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        let foreground = cx.theme().foreground;
+        let toggle_focused = self.field_nav_focused(TaskEditField::UseWorktree);
+        let action_focused = self.field_nav_focused(TaskEditField::WorktreeAction);
+
+        let directory_text = match &directory {
+            Some(FilesDirectory::Ready(path)) => Some(path.display().to_string()),
+            Some(FilesDirectory::Missing(reason)) => Some(reason.clone()),
+            Some(FilesDirectory::NeedsWorktreeSetup) | None => None,
+        };
+        let mut directory_row = h_flex().gap_2().items_center().flex_wrap();
+        if let Some(text) = directory_text {
+            directory_row = directory_row.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .text_sm()
+                    .child(selectable_text("task-edit-files-directory", text, window, cx)),
+            );
+        }
+        if let Some(setup) = action {
+            let label = match (setup, busy) {
+                (true, false) => "Set up worktree",
+                (true, true) => "Setting up…",
+                (false, false) => "Release worktree",
+                (false, true) => "Releasing…",
+            };
+            directory_row = directory_row.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::WorktreeAction,
+                    div()
+                        .id(field_anchor_id(TaskEditField::WorktreeAction))
+                        .rounded_md()
+                        .when(action_focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .child(
+                            Button::new("task-edit-worktree-action")
+                                .label(label)
+                                .outline()
+                                .compact()
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_field_edit(
+                                        TaskEditField::WorktreeAction,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                ),
+            );
+        }
+
+        v_flex()
+            .gap_2()
+            .px_3()
+            .pb_3()
             .child(
                 h_flex()
                     .gap_2()
@@ -1727,7 +2152,7 @@ impl TaskEditView {
                                 .gap_1()
                                 .w(px(280.))
                                 .flex_shrink_0()
-                                .child(Self::render_field_label("Repository root", cx))
+                                .child(Self::render_field_label("Workspace directory", cx))
                                 .child(self.render_nav_input(
                                     TaskEditField::Repo,
                                     self.repo_input.clone(),
@@ -1756,6 +2181,121 @@ impl TaskEditView {
                         ),
                     ),
             )
+            .child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::UseWorktree,
+                    h_flex()
+                        .id(field_anchor_id(TaskEditField::UseWorktree))
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(toggle_focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.enter_field_edit(TaskEditField::UseWorktree, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(foreground)
+                                .child(if use_worktree { "☑" } else { "☐" }),
+                        )
+                        .child(div().text_sm().text_color(foreground).child("Use a worktree")),
+                ),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Self::render_field_label("Resolved directory", cx))
+                    .child(directory_row),
+            )
+            .when_some(self.worktree_status.clone(), |el, status| {
+                el.child(div().text_xs().text_color(muted).child(selectable_text(
+                    "task-edit-worktree-status",
+                    status,
+                    window,
+                    cx,
+                )))
+            })
+    }
+
+    fn render_ticket_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().gap_2().px_3().pb_3().child(
+            h_flex()
+                .gap_2()
+                .items_end()
+                .flex_wrap()
+                .child(self.render_link_field(
+                    TaskEditField::LinearLink,
+                    "Ticket ID",
+                    120.,
+                    &self.linear_input,
+                    window,
+                    cx,
+                ))
+                .child(self.render_link_field(
+                    TaskEditField::GithubPr,
+                    "GitHub PR",
+                    110.,
+                    &self.github_pr_input,
+                    window,
+                    cx,
+                )),
+        )
+    }
+
+    /// Read-only summary of Agent / Files values inherited from an ancestor,
+    /// shown while the capability is off on this node.
+    fn render_inherited_hint(
+        &self,
+        cap: Capability,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let (title, summary) = match cap {
+            Capability::Agent => {
+                let resolved = self.resolved_agent.as_ref().filter(|r| r.inherited)?;
+                let options = resolved.agent.launch_options(&self.settings_launch());
+                (
+                    resolved.source_title.clone(),
+                    format!(
+                        "{} · {} · {}",
+                        options.platform.label(),
+                        options.model,
+                        if options.effort.is_empty() { "auto" } else { options.effort.as_str() }
+                    ),
+                )
+            }
+            Capability::Files => {
+                let resolved = self.resolved_files.as_ref().filter(|f| f.inherited)?;
+                let summary = match resolved.directory() {
+                    FilesDirectory::Ready(path) => path.display().to_string(),
+                    FilesDirectory::NeedsWorktreeSetup => "worktree not set up".to_string(),
+                    FilesDirectory::Missing(reason) => reason,
+                };
+                (resolved.source_title.clone(), summary)
+            }
+            _ => return None,
+        };
+        Some(
+            div()
+                .px_3()
+                .pt_1()
+                .pb_2()
+                .text_xs()
+                .text_color(muted)
+                .child(selectable_text(
+                    gpui::SharedString::from(format!("task-edit-inherited-{}", cap.as_str())),
+                    format!("Inherited from {title}: {summary}"),
+                    window,
+                    cx,
+                ))
+                .into_any_element(),
+        )
     }
 
     fn render_notes_section(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1994,19 +2534,24 @@ impl TaskEditView {
         Self::render_legend_border_section(border, legend, body)
     }
 
-    fn render_agent_section(
+    fn render_action_capability_section(
         &self,
+        cap: Capability,
         cap_index: usize,
         background: gpui::Hsla,
         border: gpui::Hsla,
+        muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let cap = Capability::Agent;
         let body: Option<gpui::AnyElement> = if self.capability_enabled(cap) {
-            Some(self.render_agent_body(window, cx).into_any_element())
+            Some(match cap {
+                Capability::Agent => self.render_agent_body(muted, cx).into_any_element(),
+                Capability::Files => self.render_files_body(muted, window, cx).into_any_element(),
+                _ => self.render_ticket_body(window, cx).into_any_element(),
+            })
         } else {
-            None
+            self.render_inherited_hint(cap, muted, window, cx)
         };
         let legend = self
             .render_section_legend(cap, cap_index, background, cx)
@@ -2362,8 +2907,10 @@ impl TaskEditView {
             Capability::Lifecycle => self
                 .render_lifecycle_section(cap_index, background, border, muted, cx)
                 .into_any_element(),
-            Capability::Agent => self
-                .render_agent_section(cap_index, background, border, window, cx)
+            Capability::Agent | Capability::Files | Capability::Ticket => self
+                .render_action_capability_section(
+                    cap, cap_index, background, border, muted, window, cx,
+                )
                 .into_any_element(),
             Capability::Generator => self
                 .render_generator_section(cap_index, background, border, muted, window, cx)

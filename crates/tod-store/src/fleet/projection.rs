@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FleetMetadata {
     pub task_count: usize,
-    pub agent_count: usize,
+    pub run_count: usize,
     pub notification_count: usize,
     pub shell_session_count: usize,
 }
@@ -105,7 +105,7 @@ fn load_metadata(conn: &Connection) -> Result<FleetMetadata> {
             |row| row.get::<_, i64>(0).map(|n| n as usize),
         )
         .unwrap_or(0);
-    let agent_count: usize = conn.query_row("SELECT COUNT(*) FROM agent_configs", [], |row| {
+    let run_count: usize = conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |row| {
         row.get::<_, i64>(0).map(|n| n as usize)
     })?;
     let notification_count: usize =
@@ -118,7 +118,7 @@ fn load_metadata(conn: &Connection) -> Result<FleetMetadata> {
         })?;
     Ok(FleetMetadata {
         task_count,
-        agent_count,
+        run_count,
         notification_count,
         shell_session_count,
     })

@@ -722,7 +722,6 @@ fn obligation_crud_and_counts() {
 
 #[test]
 fn delete_node_blocked_when_agents_present() {
-    use crate::fleet::repos::agent_config::NewAgentConfig;
     use crate::fleet::writer::FleetMutation;
 
     let root = std::env::temp_dir().join(format!("tod-del-blocked-{}", Uuid::new_v4()));
@@ -749,18 +748,10 @@ fn delete_node_blocked_when_agents_present() {
     store.reload_if_stale().ok();
 
     store
-        .enqueue(FleetMutation::InsertAgent {
-            agent: NewAgentConfig {
-                id: Uuid::new_v4().to_string(),
-                node_id: node_id.to_string(),
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            },
+        .enqueue(FleetMutation::CreateShellSession {
+            id: Uuid::new_v4().to_string(),
+            node_id: node_id.to_string(),
+            reconnect: None,
         })
         .unwrap();
 
@@ -769,7 +760,7 @@ fn delete_node_blocked_when_agents_present() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("node \"Agent task\" has associated agents"),
+        err.contains("node \"Agent task\" has running agents or open shells"),
         "unexpected error: {err}"
     );
     store.reload_if_stale().ok();

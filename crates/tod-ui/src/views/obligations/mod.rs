@@ -17,15 +17,13 @@ use delegate::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Anchor, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored, deferred,
-    div, px,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
 };
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::cell::RefCell;
@@ -34,7 +32,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
-use tod_store::outline::types::Capability;
 use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
 };
@@ -130,13 +127,6 @@ pub enum ObligationsEvent {
         node_id: Uuid,
         /// The specific obligation selected, when one is.
         obligation_id: Option<Uuid>,
-        /// Action config to run. `None` means "resolve it" — no configs exist
-        /// yet, so the shell creates a default from app settings.
-        config_id: Option<String>,
-    },
-    /// Picker's "New action config…" entry.
-    OpenAgentConfig {
-        node_id: Uuid,
     },
     /// Clicked the "Design"/"+ Design" affordance on a design-phase
     /// obligation row — create or open its associated visual-design mockup.
@@ -149,13 +139,6 @@ pub enum ObligationsEvent {
     RewritePreV3 {
         node_id: Uuid,
     },
-}
-
-/// Menu label for one action config in the Ctrl+J picker: platform/mode plus
-/// an inherited marker, since raw config ids aren't meaningful to a user.
-fn agent_config_menu_label(config: &tod_store::fleet::AgentConfigRow, inherited: bool) -> String {
-    let base = format!("{} · {}", config.platform, config.mode);
-    if inherited { format!("↑ {base} (from parent)") } else { base }
 }
 
 pub struct ObligationsView {
@@ -200,9 +183,6 @@ pub struct ObligationsView {
     node_has_agent: bool,
     /// Obligations on this node still marked as written before drafting v3.
     pre_v3_count: usize,
-    /// Open action-config picker, shown when the node has more than one.
-    agent_menu: Option<Entity<PopupMenu>>,
-    _agent_menu_subscription: Option<Subscription>,
     _inline_edit_subscription: Subscription,
     _section_edit_subscription: Subscription,
 }
@@ -289,8 +269,6 @@ impl ObligationsView {
             selected_key: None,
             node_has_agent: false,
             pre_v3_count: 0,
-            agent_menu: None,
-            _agent_menu_subscription: None,
             _inline_edit_subscription,
             _section_edit_subscription,
         }
@@ -377,7 +355,6 @@ impl ObligationsView {
         self.clear_inline_edit_state(window, cx);
         self.node_id = None;
         self.node_has_agent = false;
-        self.close_agent_menu(cx);
         self.title.clear();
         self.items.clear();
         self.selected_key = None;
@@ -394,12 +371,15 @@ impl ObligationsView {
         cx.notify();
     }
 
-    /// Refresh the cached Agent-capability flag, which gates the chat icon.
+    /// Refresh the cached Agent flag (own or inherited), which gates the chat icon.
     fn refresh_node_has_agent(&mut self) {
-        self.node_has_agent = self
-            .node_id
-            .and_then(|node_id| self.fleet.list_node_capabilities(node_id).ok())
-            .is_some_and(|caps| caps.contains(&Capability::Agent));
+        self.node_has_agent = self.node_id.is_some_and(|node_id| {
+            self.fleet
+                .resolve_agent_for_node(&node_id.to_string())
+                .ok()
+                .flatten()
+                .is_some()
+        });
     }
 
     /// Id of the selected obligation, when the selection is an item rather than
@@ -411,112 +391,15 @@ impl ObligationsView {
         }
     }
 
-    fn open_agent_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_agent_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(node_id) = self.node_id else {
             return;
         };
-        if self.agent_menu.is_some() {
-            self.close_agent_menu(cx);
-            return;
-        }
-        let (configs, inherited) = self
-            .fleet
-            .resolve_agents_for_node(&node_id.to_string())
-            .map(|resolved| (resolved.configs, resolved.inherited))
-            .unwrap_or_default();
-        match configs.len() {
-            // No configs yet: the shell creates a default from app settings
-            // rather than making the user fill in a form first.
-            0 => self.emit_agent_chat(node_id, None, cx),
-            1 => {
-                let config_id = configs[0].id.clone();
-                self.emit_agent_chat(node_id, Some(config_id), cx);
-            }
-            // Several: pick one, same as the node tree does.
-            _ => self.open_agent_menu(node_id, configs, inherited, window, cx),
-        }
-    }
-
-    fn emit_agent_chat(
-        &mut self,
-        node_id: Uuid,
-        config_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
         cx.emit(ObligationsEvent::OpenAgentChat {
             node_id,
             obligation_id: self.selected_obligation_id(),
-            config_id,
         });
     }
-
-    fn open_agent_menu(
-        &mut self,
-        node_id: Uuid,
-        configs: Vec<tod_store::fleet::AgentConfigRow>,
-        inherited: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let view = cx.weak_entity();
-        let focus = self.focus_handle.clone();
-        let menu = PopupMenu::build(window, cx, move |mut menu, _window, _cx| {
-            menu = menu.action_context(focus).min_w(px(180.));
-            for config in &configs {
-                let view = view.clone();
-                let config_id = config.id.clone();
-                let label = agent_config_menu_label(config, inherited);
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    let config_id = config_id.clone();
-                    let _ = view.update(cx, |this, cx| {
-                        this.close_agent_menu(cx);
-                        this.emit_agent_chat(node_id, Some(config_id), cx);
-                    });
-                }));
-            }
-            let view = view.clone();
-            menu.item(
-                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        this.close_agent_menu(cx);
-                        cx.emit(ObligationsEvent::OpenAgentConfig { node_id });
-                    });
-                }),
-            )
-        });
-        self._agent_menu_subscription =
-            Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
-                this.close_agent_menu(cx);
-            }));
-        self.agent_menu = Some(menu);
-        cx.notify();
-        cx.on_next_frame(window, |this, window, cx| {
-            if let Some(menu) = this.agent_menu.clone() {
-                menu.update(cx, |menu, cx| {
-                    menu.focus_handle(cx).focus(window, cx);
-                });
-                if let Ok(ks) = gpui::Keystroke::parse("down") {
-                    // `dispatch_keystroke` triggers a synchronous full-window
-                    // redraw, which would re-enter this entity's lease if run
-                    // directly inside this on_next_frame callback (itself an
-                    // `Entity::update` on self). Deferring runs it once that
-                    // lease has been returned to the app.
-                    window.defer(cx, move |window, cx| {
-                        window.dispatch_keystroke(ks, cx);
-                    });
-                }
-            }
-            cx.notify();
-        });
-    }
-
-    fn close_agent_menu(&mut self, cx: &mut Context<Self>) {
-        if self.agent_menu.take().is_some() {
-            self._agent_menu_subscription = None;
-            cx.notify();
-        }
-    }
-
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node_id) = self.node_id else {
@@ -1997,18 +1880,7 @@ impl Render for ObligationsView {
                                     &OpenAgentChat,
                                     None,
                                     cx,
-                                ))
-                                .when_some(self.agent_menu.clone(), |el, menu| {
-                                    el.child(
-                                        deferred(
-                                            anchored()
-                                                .anchor(Anchor::TopLeft)
-                                                .snap_to_window_with_margin(px(8.))
-                                                .child(div().occlude().mt_1().child(menu)),
-                                        )
-                                        .with_priority(1),
-                                    )
-                                }),
+                                )),
                         )
                     })
                     .child(chrome_control_with_shortcut(

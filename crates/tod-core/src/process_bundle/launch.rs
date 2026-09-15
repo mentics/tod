@@ -71,7 +71,6 @@ pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<Str
 pub fn build_fleet_agent_prompt(
     manifest: &ProcessManifest,
     task: &tod_store::fleet::repos::task::FleetTask,
-    config_id: &str,
     cwd: &Path,
 ) -> Result<String> {
     let role = state_role_doc(manifest, &task.lifecycle)?;
@@ -89,7 +88,6 @@ pub fn build_fleet_agent_prompt(
     Ok(format!(
         "{role}\n\n\
          ## Task\n\n\
-         Config id: {config_id}\n\
          Node id: {node_id}\n\
          Title: {title}\n\
          Slug: {slug}\n\

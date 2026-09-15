@@ -1,6 +1,5 @@
 //! One-time bootstrap import from `doc/process/` on disk.
 
-use crate::fleet::repos::agent_config::AgentConfigRepo;
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::Capability;
@@ -69,9 +68,6 @@ pub fn import_doc_process(
     }
 
     let global_count = import_global_obligations(conn, repo_root)?;
-
-    // Reattach legacy agents by slug match.
-    reattach_agents_by_slug(conn)?;
 
     Ok(ImportReport {
         list_id: list.id,
@@ -394,16 +390,6 @@ fn sha256_simple(bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64))
-}
-
-fn reattach_agents_by_slug(conn: &Connection) -> Result<()> {
-    let agent_repo = AgentConfigRepo::new(conn);
-    let agents = agent_repo.list_all()?;
-    for agent in agents {
-        // Already on node_id after v3 migration.
-        let _ = agent;
-    }
-    Ok(())
 }
 
 fn read_title(user_md: &Path) -> Option<String> {

@@ -1,6 +1,6 @@
 //! Notification repository — open rows and hard-delete resolve.
 
-use crate::fleet::repos::agent_config::AgentConfigRepo;
+use crate::fleet::repos::agent_run::AgentRunRepo;
 use crate::outline::uuid_blob::{blob_to_uuid, uuid_to_blob};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -15,7 +15,8 @@ pub struct FleetNotification {
     pub related_node_id: Option<String>,
     /// Back-compat alias.
     pub related_task_id: Option<String>,
-    pub related_agent_ids: Vec<String>,
+    /// Agent runs the notification is about.
+    pub related_run_ids: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -23,7 +24,7 @@ pub enum NotificationRepoError {
     #[error("notification not found")]
     NotFound,
     #[error(transparent)]
-    AgentConfig(#[from] crate::fleet::repos::agent_config::AgentConfigRepoError),
+    Run(#[from] crate::fleet::repos::agent_run::AgentRunRepoError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -55,32 +56,32 @@ impl<'a> NotificationRepo<'a> {
         id: &str,
         message: &str,
         related_node_id: Option<&str>,
-        related_agent_ids: &[String],
+        related_run_ids: &[String],
     ) -> Result<(), NotificationRepoError> {
         let node_blob = Self::node_blob(related_node_id)?;
         self.conn.execute(
             "INSERT INTO notifications (id, message, related_node_id) VALUES (?1, ?2, ?3)",
             params![id, message, node_blob],
         )?;
-        for agent_id in related_agent_ids {
+        for run_id in related_run_ids {
             self.conn.execute(
-                "INSERT INTO notification_agents (notification_id, agent_config_id) VALUES (?1, ?2)",
-                params![id, agent_id],
+                "INSERT INTO notification_runs (notification_id, agent_run_id) VALUES (?1, ?2)",
+                params![id, run_id],
             )?;
         }
         Ok(())
     }
 
-    /// Paired: blocked notification + agent **blocked** status.
+    /// Paired: blocked notification + run **blocked** status.
     pub fn create_blocked(
         &self,
         id: &str,
         message: &str,
         related_node_id: Option<&str>,
-        agent_id: &str,
+        run_id: &str,
     ) -> Result<(), NotificationRepoError> {
-        self.create(id, message, related_node_id, &[agent_id.to_string()])?;
-        AgentConfigRepo::new(self.conn).update_runtime_status(agent_id, "blocked")?;
+        self.create(id, message, related_node_id, &[run_id.to_string()])?;
+        AgentRunRepo::new(self.conn).update_runtime_status(run_id, "blocked")?;
         Ok(())
     }
 
@@ -114,9 +115,9 @@ impl<'a> NotificationRepo<'a> {
             return Ok(None);
         };
         let mut stmt = self.conn.prepare(
-            "SELECT agent_config_id FROM notification_agents WHERE notification_id = ?1 ORDER BY agent_config_id",
+            "SELECT agent_run_id FROM notification_runs WHERE notification_id = ?1 ORDER BY agent_run_id",
         )?;
-        let agent_ids = stmt
+        let run_ids = stmt
             .query_map(params![id], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(Some(FleetNotification {
@@ -124,7 +125,7 @@ impl<'a> NotificationRepo<'a> {
             id,
             message,
             related_node_id,
-            related_agent_ids: agent_ids,
+            related_run_ids: run_ids,
         }))
     }
 
@@ -149,7 +150,7 @@ impl<'a> NotificationRepo<'a> {
     /// Resolve = hard-delete notification and junction rows.
     pub fn resolve(&self, id: &str) -> Result<(), NotificationRepoError> {
         self.conn.execute(
-            "DELETE FROM notification_agents WHERE notification_id = ?1",
+            "DELETE FROM notification_runs WHERE notification_id = ?1",
             params![id],
         )?;
         let deleted = self
@@ -165,42 +166,23 @@ impl<'a> NotificationRepo<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent_config::{
-        AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent,
-    };
-    use crate::fleet::repos::task::{FleetTask, TaskRepo};
-    use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
+    use crate::fleet::repos::{cleanup_test_dir, seed_node, test_writer_conn};
     use crate::fleet::schema;
 
-    fn seed_agent(conn: &Connection) -> String {
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let agent_id = uuid::Uuid::new_v4().to_string();
-        TaskRepo::new(conn)
-            .insert(&FleetTask::new(&task_id, "T", "t"))
-            .unwrap();
-        AgentRepo::new(conn)
-            .insert(&NewAgent {
-                id: agent_id.clone(),
-                node_id: task_id,
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            })
-            .unwrap();
-        agent_id
+    fn seed_run(conn: &Connection) -> String {
+        let node_id = seed_node(conn);
+        AgentRunRepo::new(conn)
+            .create_run(&node_id, "waiting", "auto")
+            .unwrap()
     }
 
     #[test]
     fn resolve_absent_after_reload() {
         let (dir, conn) = test_writer_conn();
-        let agent_id = seed_agent(&conn);
+        let run_id = seed_run(&conn);
         let id = uuid::Uuid::new_v4().to_string();
         NotificationRepo::new(&conn)
-            .create(&id, "needs action", None, &[agent_id])
+            .create(&id, "needs action", None, &[run_id])
             .unwrap();
         NotificationRepo::new(&conn).resolve(&id).unwrap();
 
@@ -213,32 +195,28 @@ mod tests {
     #[test]
     fn junction_round_trip() {
         let (dir, conn) = test_writer_conn();
-        let a1 = seed_agent(&conn);
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let a2 = uuid::Uuid::new_v4().to_string();
-        TaskRepo::new(&conn)
-            .insert(&FleetTask::new(&task_id, "T2", "t2"))
-            .unwrap();
-        AgentRepo::new(&conn)
-            .insert(&NewAgent {
-                id: a2.clone(),
-                node_id: task_id,
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            })
-            .unwrap();
+        let r1 = seed_run(&conn);
+        let r2 = seed_run(&conn);
 
         let id = uuid::Uuid::new_v4().to_string();
         NotificationRepo::new(&conn)
-            .create(&id, "multi", None, &[a1, a2])
+            .create(&id, "multi", None, &[r1, r2])
             .unwrap();
         let loaded = NotificationRepo::new(&conn).get(&id).unwrap().unwrap();
-        assert_eq!(loaded.related_agent_ids.len(), 2);
+        assert_eq!(loaded.related_run_ids.len(), 2);
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn blocked_notification_marks_run_blocked() {
+        let (dir, conn) = test_writer_conn();
+        let run_id = seed_run(&conn);
+        let id = uuid::Uuid::new_v4().to_string();
+        NotificationRepo::new(&conn)
+            .create_blocked(&id, "blocked", None, &run_id)
+            .unwrap();
+        let run = AgentRunRepo::new(&conn).get(&run_id).unwrap().unwrap();
+        assert_eq!(run.runtime_status, "blocked");
         cleanup_test_dir(&dir);
     }
 }

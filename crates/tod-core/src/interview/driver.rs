@@ -35,7 +35,6 @@ pub struct DriverConfig {
     pub interview_session_id: Uuid,
     /// Session phase key (`task-requirements-interview`, …).
     pub phase_key: String,
-    pub agent_config_id: String,
     /// Working directory for design and planning (the node's repo).
     pub repo_cwd: PathBuf,
     pub data_root: PathBuf,
@@ -679,7 +678,7 @@ impl InterviewDriver {
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
-            agent_config_id: self.config.agent_config_id.clone(),
+            owner_id: self.config.node_id.to_string(),
             cwd: self.cwd()?,
             options: self.config.launch.clone(),
             resume_session_id: resume,
@@ -801,7 +800,6 @@ mod tests {
             node_title: "Interview node".into(),
             interview_session_id: fx.session,
             phase_key: "task-requirements-interview".into(),
-            agent_config_id: "config".into(),
             repo_cwd: fx.root.clone(),
             data_root: fx.root.clone(),
             tod_cli: fx.root.join("tod-cli"),

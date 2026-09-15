@@ -38,7 +38,6 @@ pub struct DraftingConfig {
     pub node_id: Uuid,
     pub node_title: String,
     pub mode: DraftingMode,
-    pub agent_config_id: String,
     /// Working directory for the drafting loop (the node's repo).
     pub repo_cwd: PathBuf,
     pub data_root: PathBuf,
@@ -421,7 +420,7 @@ impl DraftingDriver {
                     let key = format!("summary-{node_id}-{}", Uuid::new_v4());
                     let handle = agent.send_session_turn(SessionTurn {
                         key: key.clone(),
-                        agent_config_id: self.config.agent_config_id.clone(),
+                        owner_id: self.config.node_id.to_string(),
                         cwd: cwd.clone(),
                         options: self.config.launch.clone(),
                         resume_session_id: None,
@@ -636,7 +635,7 @@ impl DraftingDriver {
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
-            agent_config_id: self.config.agent_config_id.clone(),
+            owner_id: self.config.node_id.to_string(),
             cwd: self.cwd()?,
             options: self.config.launch.clone(),
             resume_session_id: resume,
@@ -810,7 +809,6 @@ mod tests {
             node_id: fx.node,
             node_title: "Drafting node".into(),
             mode,
-            agent_config_id: "config".into(),
             repo_cwd: fx.root.clone(),
             data_root: fx.root.clone(),
             tod_cli: fx.root.join("tod-cli"),

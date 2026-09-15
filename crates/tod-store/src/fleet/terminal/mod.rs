@@ -8,7 +8,8 @@ mod state;
 use crate::fleet::reconnect_identity::{self};
 use crate::fleet::repos::agent_run::AgentRun;
 use crate::fleet::repos::shell::ShellSession;
-use crate::fleet::{FleetMutation, FleetStore, resolve_agent_workspace};
+use crate::agent_launch::AgentLaunchOptions;
+use crate::fleet::{FleetMutation, FleetStore, resolve_launch_cwd};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
 use anyhow::{Context, Result, bail};
@@ -633,9 +634,9 @@ pub fn verify_shell_session(paths: &TodPaths, shell_id: &str) -> Result<(bool, O
 pub fn prune_stale_shell_sessions(
     fleet: &FleetStore,
     paths: &TodPaths,
-    config_id: &str,
+    node_id: &str,
 ) -> Result<usize> {
-    let shells = fleet.list_shells_for_config(config_id)?;
+    let shells = fleet.list_shells_for_node(node_id)?;
     let mut removed = 0usize;
     for shell in shells {
         if shell_is_alive(paths, &shell) {
@@ -684,9 +685,9 @@ fn terminal_agent_is_alive(paths: &TodPaths, run: &AgentRun) -> bool {
 pub fn prune_stale_terminal_agent_runs(
     fleet: &FleetStore,
     paths: &TodPaths,
-    config_id: &str,
+    node_id: &str,
 ) -> Result<usize> {
-    let runs = fleet.list_terminal_agent_runs_for_config(config_id)?;
+    let runs = fleet.list_terminal_agent_runs_for_node(node_id)?;
     let mut removed = 0usize;
     for run in runs {
         if terminal_agent_is_alive(paths, &run) {
@@ -707,30 +708,16 @@ pub fn prune_stale_terminal_agent_runs(
     Ok(removed)
 }
 
-/// Open a shell session: resolve workspace, spawn terminal, persist session row.
-pub fn open_shell_for_agent_config(
+/// Open a shell in the node's resolved Files directory and persist the session
+/// row; optionally run `startup_command` after bootstrap.
+pub fn open_shell_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    config_id: &str,
     node_id: &str,
-) -> Result<(String, PathBuf)> {
-    open_shell_with_command(fleet, paths, settings, config_id, node_id, None)
-}
-
-/// Open a shell session and optionally run `startup_command` after bootstrap.
-pub fn open_shell_with_command(
-    fleet: &FleetStore,
-    paths: &TodPaths,
-    settings: &TodSettings,
-    config_id: &str,
-    _node_id: &str,
     startup_command: Option<&str>,
 ) -> Result<(String, PathBuf)> {
-    let agent = fleet
-        .get_agent(config_id)?
-        .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+    let cwd = resolve_launch_cwd(fleet, node_id)?;
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
     let shell_id = uuid::Uuid::new_v4().to_string();
@@ -740,7 +727,7 @@ pub fn open_shell_with_command(
     let reconnect = reconnect_identity::record(state.pid);
     fleet.enqueue(FleetMutation::CreateShellSession {
         id: shell_id.clone(),
-        agent_id: config_id.to_string(),
+        node_id: node_id.to_string(),
         reconnect,
     })?;
     fleet.writer().flush().context("persist shell session")?;
@@ -750,22 +737,21 @@ pub fn open_shell_with_command(
 /// Launch the agent CLI in an OS terminal, tracked as a `terminal` agent run (not a shell).
 ///
 /// Uses the agent run id as the terminal state-file key for PID focus/liveness.
-pub fn open_terminal_agent_for_config(
+pub fn open_terminal_agent_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    config_id: &str,
+    node_id: &str,
     startup_command: &str,
+    launch: Option<AgentLaunchOptions>,
 ) -> Result<(String, PathBuf)> {
-    let agent = fleet
-        .get_agent(config_id)?
-        .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+    let cwd = resolve_launch_cwd(fleet, node_id)?;
 
     fleet.enqueue(FleetMutation::CreateAgentRun {
-        config_id: config_id.to_string(),
+        node_id: node_id.to_string(),
         run_kind: Some("terminal".into()),
         session_name: None,
+        launch,
     })?;
     fleet
         .writer()
@@ -774,11 +760,11 @@ pub fn open_terminal_agent_for_config(
     let _ = fleet.reload_if_stale();
 
     let run_id = fleet
-        .list_terminal_agent_runs_for_config(config_id)?
+        .list_terminal_agent_runs_for_node(node_id)?
         .into_iter()
         .next()
         .map(|run| run.id)
-        .with_context(|| format!("terminal agent run not created for {config_id}"))?;
+        .with_context(|| format!("terminal agent run not created for {node_id}"))?;
 
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
@@ -821,19 +807,16 @@ pub fn open_terminal_agent_for_config(
     Ok((run_id, cwd))
 }
 
-/// Focus a terminal agent window, or relaunch the CLI when the process is gone.
+/// Focus a terminal agent window, or relaunch the CLI (with the run's recorded
+/// launch options) when the process is gone.
 pub fn focus_terminal_agent_run(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    config_id: &str,
     run: &AgentRun,
     startup_command: &str,
 ) -> Result<PathBuf> {
-    let agent = fleet
-        .get_agent(config_id)?
-        .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+    let cwd = resolve_launch_cwd(fleet, &run.node_id)?;
 
     if terminal_agent_is_alive(paths, run) {
         if let Some(state) = shell_state_for_session(paths, &run.id) {
@@ -851,8 +834,14 @@ pub fn focus_terminal_agent_run(
         .flush()
         .context("delete stale terminal agent run")?;
 
-    let (_, new_cwd) =
-        open_terminal_agent_for_config(fleet, paths, settings, config_id, startup_command)?;
+    let (_, new_cwd) = open_terminal_agent_for_node(
+        fleet,
+        paths,
+        settings,
+        &run.node_id,
+        startup_command,
+        run.launch_options(),
+    )?;
     Ok(new_cwd)
 }
 
@@ -861,14 +850,9 @@ pub fn focus_shell_session(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    config_id: &str,
-    node_id: &str,
     shell: &ShellSession,
 ) -> Result<PathBuf> {
-    let agent = fleet
-        .get_agent(config_id)?
-        .with_context(|| format!("agent config {config_id} not found"))?;
-    let cwd = resolve_agent_workspace(fleet, paths, settings, &agent)?;
+    let cwd = resolve_launch_cwd(fleet, &shell.node_id)?;
 
     if shell_is_alive(paths, shell) {
         if let Some(state) = shell_state_for_session(paths, &shell.id) {
@@ -886,7 +870,7 @@ pub fn focus_shell_session(
         .flush()
         .context("dismiss stale shell session")?;
 
-    let (_, new_cwd) = open_shell_for_agent_config(fleet, paths, settings, config_id, node_id)?;
+    let (_, new_cwd) = open_shell_for_node(fleet, paths, settings, &shell.node_id, None)?;
     Ok(new_cwd)
 }
 
@@ -1077,11 +1061,45 @@ mod tests {
         cleanup(Some(state.pid));
     }
 
+    /// A task with Files enabled and its workspace directory set to `cwd`.
+    fn insert_files_task(
+        store: &crate::fleet::store::FleetStore,
+        title: &str,
+        slug: &str,
+        cwd: &Path,
+    ) -> String {
+        use crate::fleet::repos::task::FleetTask;
+        use crate::fleet::writer::FleetMutation;
+        use crate::outline::OutlineMutation;
+        use crate::outline::types::Capability;
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        store
+            .enqueue(FleetMutation::InsertTask {
+                task: FleetTask::new(&task_id, title, slug),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: uuid::Uuid::parse_str(&task_id).unwrap(),
+                capabilities: vec![Capability::Files],
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::UpdateTaskRepo {
+                id: task_id.clone(),
+                repo: Some(cwd.display().to_string()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let _ = store.reload_if_stale();
+        task_id
+    }
+
     #[test]
     fn prune_stale_terminal_agent_runs_deletes_dead_runs() {
         use crate::fleet::reconnect_identity::ReconnectIdentity;
-        use crate::fleet::repos::agent_config::NewAgentConfig;
-        use crate::fleet::repos::task::FleetTask;
         use crate::fleet::store::FleetStore;
         use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
         use crate::fleet::writer::FleetMutation;
@@ -1092,42 +1110,25 @@ mod tests {
         set_data_root(fleet_root.clone());
         let paths = crate::paths::TodPaths::discover().unwrap();
 
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let config_id = format!("test-{}", uuid::Uuid::new_v4());
-        store
-            .enqueue(FleetMutation::InsertTask {
-                task: FleetTask::new(&task_id, "Terminal prune", "terminal-prune"),
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
-        store
-            .enqueue(FleetMutation::InsertAgent {
-                agent: NewAgentConfig {
-                    id: config_id.clone(),
-                    node_id: task_id.clone(),
-                    env_type: "local".into(),
-                    mode: "agent".into(),
-                    work_directory: Some(std::env::current_dir().unwrap().display().to_string()),
-                    use_worktree: false,
-                    platform: "claude".into(),
-                    model: "default".into(),
-                    effort: "auto".into(),
-                },
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
+        let node_id = insert_files_task(
+            &store,
+            "Terminal prune",
+            "terminal-prune",
+            &std::env::current_dir().unwrap(),
+        );
 
         store
             .enqueue(FleetMutation::CreateAgentRun {
-                config_id: config_id.clone(),
+                node_id: node_id.clone(),
                 run_kind: Some("terminal".into()),
                 session_name: None,
+                launch: None,
             })
             .unwrap();
         store.writer().flush().unwrap();
         let _ = store.reload_if_stale();
         let run = store
-            .list_terminal_agent_runs_for_config(&config_id)
+            .list_terminal_agent_runs_for_node(&node_id)
             .unwrap()
             .into_iter()
             .next()
@@ -1149,12 +1150,12 @@ mod tests {
             .unwrap();
         store.writer().flush().unwrap();
 
-        let removed = prune_stale_terminal_agent_runs(&store, &paths, &config_id).unwrap();
+        let removed = prune_stale_terminal_agent_runs(&store, &paths, &node_id).unwrap();
         assert_eq!(removed, 1);
         let _ = store.reload_if_stale();
         assert!(
             store
-                .list_terminal_agent_runs_for_config(&config_id)
+                .list_terminal_agent_runs_for_node(&node_id)
                 .unwrap()
                 .is_empty(),
             "dead processing run should be deleted, not kept as not_running"
@@ -1162,15 +1163,16 @@ mod tests {
 
         store
             .enqueue(FleetMutation::CreateAgentRun {
-                config_id: config_id.clone(),
+                node_id: node_id.clone(),
                 run_kind: Some("terminal".into()),
                 session_name: None,
+                launch: None,
             })
             .unwrap();
         store.writer().flush().unwrap();
         let _ = store.reload_if_stale();
         let ended = store
-            .list_terminal_agent_runs_for_config(&config_id)
+            .list_terminal_agent_runs_for_node(&node_id)
             .unwrap()
             .into_iter()
             .next()
@@ -1182,12 +1184,12 @@ mod tests {
             .unwrap();
         store.writer().flush().unwrap();
 
-        let removed = prune_stale_terminal_agent_runs(&store, &paths, &config_id).unwrap();
+        let removed = prune_stale_terminal_agent_runs(&store, &paths, &node_id).unwrap();
         assert_eq!(removed, 1);
         let _ = store.reload_if_stale();
         assert!(
             store
-                .list_terminal_agent_runs_for_config(&config_id)
+                .list_terminal_agent_runs_for_node(&node_id)
                 .unwrap()
                 .is_empty(),
             "already-ended terminal runs should be deleted on prune"
@@ -1199,12 +1201,9 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn open_shell_for_agent_config_registers_live_process() {
-        use crate::fleet::repos::agent_config::NewAgentConfig;
-        use crate::fleet::repos::task::FleetTask;
+    fn open_shell_for_node_registers_live_process() {
         use crate::fleet::store::FleetStore;
         use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
-        use crate::fleet::writer::FleetMutation;
         use crate::paths::{clear_data_root_override, set_data_root};
         use crate::settings::TodSettings;
         use reconnect_identity;
@@ -1226,35 +1225,12 @@ mod tests {
                 .to_string(),
         );
 
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let config_id = format!("test-{}", uuid::Uuid::new_v4());
         let cwd = std::env::current_dir().unwrap();
-        store
-            .enqueue(FleetMutation::InsertTask {
-                task: FleetTask::new(&task_id, "Shell test", "shell-test"),
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
-        store
-            .enqueue(FleetMutation::InsertAgent {
-                agent: NewAgentConfig {
-                    id: config_id.clone(),
-                    node_id: task_id.clone(),
-                    env_type: "local".into(),
-                    mode: "shell".into(),
-                    work_directory: Some(cwd.display().to_string()),
-                    use_worktree: false,
-                    platform: "claude".into(),
-                    model: "default".into(),
-                    effort: "auto".into(),
-                },
-            })
-            .unwrap();
-        store.writer().flush().unwrap();
+        let node_id = insert_files_task(&store, "Shell test", "shell-test", &cwd);
 
         let settings = TodSettings::default();
         let (shell_id, resolved) =
-            open_shell_for_agent_config(&store, &paths, &settings, &config_id, &task_id).unwrap();
+            open_shell_for_node(&store, &paths, &settings, &node_id, None).unwrap();
         assert_eq!(resolved, cwd);
 
         let (alive, pid) = verify_shell_session(&paths, &shell_id).unwrap();

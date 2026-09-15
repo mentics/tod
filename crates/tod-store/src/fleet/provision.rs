@@ -1,128 +1,62 @@
-//! Auto-provision interview-mode agent configs.
+//! Launch directories from the Files capability, and worktree set up / release.
 
-use crate::agent_launch::platform_storage;
 use crate::fleet::FleetStore;
-use crate::fleet::repos::agent_config::{AgentConfigRow, NewAgentConfig};
+use crate::fleet::node_actions::{FilesDirectory, ResolvedFiles};
+use crate::fleet::terminal::{prune_stale_shell_sessions, prune_stale_terminal_agent_runs};
 use crate::fleet::worktree::{self, WorktreeHandle, validate_git_repo};
 use crate::fleet::writer::FleetMutation;
 use crate::path_util::path_for_storage;
 use crate::paths::TodPaths;
 use crate::settings::TodSettings;
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
-use uuid::Uuid;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
-pub struct InterviewAgentContext {
-    pub agent: AgentConfigRow,
-    pub cwd: PathBuf,
+fn resolve_files(fleet: &FleetStore, node_id: &str) -> Result<ResolvedFiles> {
+    fleet.reload_if_stale().ok();
+    fleet
+        .resolve_files_for_node(node_id)?
+        .context("Enable Files and set a workspace directory")
 }
 
-fn task_repo_branch(fleet: &FleetStore, node_id: &str) -> Result<(PathBuf, String)> {
-    let task = fleet
-        .get_task(node_id)?
-        .with_context(|| format!("task {node_id} not found"))?;
-    let repo = task
-        .repo
-        .filter(|s| !s.trim().is_empty())
-        .with_context(|| "set repository on task before starting interview")?;
-    let repo_path = validate_git_repo(PathBuf::from(&repo).as_path())?;
-    let branch = task.branch.unwrap_or_default();
-    Ok((repo_path, branch))
-}
-
-fn ensure_worktree_path_valid(agent: &AgentConfigRow) -> Result<()> {
-    if agent.use_worktree {
-        if let Some(path) = agent.worktree_path.as_deref() {
-            if std::path::Path::new(path).is_dir() {
-                return Ok(());
-            }
-        }
-        bail!("interview agent worktree missing; re-provision required");
-    }
-    Ok(())
-}
-
-pub fn workspace_cwd_for_agent(agent: &AgentConfigRow) -> Result<PathBuf> {
-    if agent.use_worktree {
-        if let Some(path) = agent.worktree_path.as_deref() {
-            let p = PathBuf::from(path);
-            if p.is_dir() {
-                return Ok(p);
-            }
-        }
-        bail!("agent worktree path missing or invalid");
-    }
-    if let Some(dir) = agent.work_directory.as_deref().filter(|s| !s.is_empty()) {
-        return Ok(PathBuf::from(dir));
-    }
-    bail!("agent has no worktree or work directory")
-}
-
-fn repo_root_from_task(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> {
-    let task = fleet
-        .get_node(node_id)?
-        .with_context(|| format!("task {node_id} not found"))?;
-    let repo = task
-        .repo
-        .filter(|s| !s.trim().is_empty())
-        .with_context(|| "set repository on the task (task edit) before using this agent config")?;
-    validate_git_repo(PathBuf::from(&repo).as_path())
-}
-
-/// Resolve the workspace directory for an agent config.
+/// Directory that shells, editors, and coding agents launched from `node_id` run in.
 ///
-/// Uses the config owner's node (`agent.node_id`) for repo/branch lookup.
-///
-/// - Worktree enabled: provision or reuse an isolated worktree under the data root.
-/// - Otherwise: optional explicit `work_directory`, else the owner's git repository root.
-pub fn resolve_agent_workspace(
+/// Never provisions: a node whose worktree hasn't been set up is an error.
+pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> {
+    match resolve_files(fleet, node_id)?.directory() {
+        FilesDirectory::Ready(path) => Ok(path),
+        FilesDirectory::NeedsWorktreeSetup => {
+            bail!("Set up the worktree (Files) before launching")
+        }
+        FilesDirectory::Missing(reason) => bail!("{reason}"),
+    }
+}
+
+/// Set up (or reuse) the worktree for the node owning `node_id`'s Files capability,
+/// using git or Treehouse per settings, and record it on that node.
+pub fn setup_worktree_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
-    agent: &AgentConfigRow,
+    node_id: &str,
 ) -> Result<PathBuf> {
-    let node_id = agent.node_id.as_str();
-    if agent.use_worktree {
-        return ensure_worktree_for_agent_config(fleet, paths, settings, &agent.id, node_id);
+    let files = resolve_files(fleet, node_id)?;
+    if !files.use_worktree {
+        bail!("Turn on the worktree flag (Files) before setting up a worktree");
     }
-    if let Some(dir) = agent.work_directory.as_deref().filter(|s| !s.is_empty()) {
-        let path = PathBuf::from(dir);
+    if let Some(path) = files.worktree_path() {
+        let path = PathBuf::from(path);
         if path.is_dir() {
             return Ok(path);
         }
-        bail!("work directory does not exist: {}", path.display());
     }
-    repo_root_from_task(fleet, node_id)
-}
-
-fn ensure_worktree_for_agent_config(
-    fleet: &FleetStore,
-    paths: &TodPaths,
-    settings: &TodSettings,
-    config_id: &str,
-    node_id: &str,
-) -> Result<PathBuf> {
-    fleet.reload_if_stale().ok();
-    if let Some(agent) = fleet.get_agent(config_id)? {
-        if let Some(path) = agent.worktree_path.as_deref() {
-            let p = PathBuf::from(path);
-            if p.is_dir() {
-                return Ok(p);
-            }
-        }
-    }
-
-    let task = fleet
-        .get_node(node_id)?
-        .with_context(|| format!("task {node_id} not found"))?;
-    let repo = task
-        .repo
-        .filter(|s| !s.trim().is_empty())
-        .with_context(|| "set repository on the task before enabling a worktree")?;
-    let repo_path = validate_git_repo(PathBuf::from(&repo).as_path())?;
-    let branch = task.branch.unwrap_or_default();
-    let lease_holder = format!("tod-{config_id}");
+    let repo = files
+        .repo()
+        .context("Set a workspace directory before setting up a worktree")?;
+    let repo_path = validate_git_repo(Path::new(repo))?;
+    let branch = files.branch().unwrap_or_default().to_string();
+    let owner = files.source_node_id.clone();
+    let lease_holder = format!("tod-{owner}");
     let data_root = settings.resolve_fleet_storage_root(paths)?;
 
     let handle: WorktreeHandle = {
@@ -141,8 +75,8 @@ fn ensure_worktree_for_agent_config(
         )?
     };
 
-    fleet.enqueue(FleetMutation::UpdateAgentWorktreeDetails {
-        id: config_id.to_string(),
+    fleet.enqueue(FleetMutation::UpdateNodeWorktree {
+        node_id: owner,
         worktree_path: Some(path_for_storage(&handle.path)),
         worktree_lease_id: handle.lease.as_ref().map(|l| l.lease_id.clone()),
         worktree_lease_holder: handle.lease.as_ref().map(|l| l.lease_holder.clone()),
@@ -150,99 +84,90 @@ fn ensure_worktree_for_agent_config(
     fleet.writer().flush()?;
     fleet.reload_if_stale()?;
 
-    let path = handle.path;
-    if !path.is_dir() {
-        bail!("provisioned worktree missing at {}", path.display());
+    if !handle.path.is_dir() {
+        bail!("set-up worktree missing at {}", handle.path.display());
     }
-    Ok(path)
+    Ok(handle.path)
 }
 
-/// Describe where this config would run (for UI), without provisioning a worktree.
-pub fn describe_agent_workspace(fleet: &FleetStore, agent: &AgentConfigRow) -> String {
-    let node_id = agent.node_id.as_str();
-    if agent.use_worktree {
-        if let Some(path) = agent.worktree_path.as_deref().filter(|p| !p.is_empty()) {
-            return format!("Worktree: {path}");
-        }
-        return "Worktree: (created on first launch)".into();
-    }
-    if let Some(dir) = agent.work_directory.as_deref().filter(|s| !s.is_empty()) {
-        return format!("Override: {dir}");
-    }
-    match repo_root_from_task(fleet, node_id) {
-        Ok(path) => format!("Repository: {}", path.display()),
-        Err(err) => format!("{err:#}"),
-    }
-}
-
-/// Ensure an interview-mode agent config exists for `node_id`, working directly in the
-/// repo root rather than an isolated worktree.
+/// Release the worktree recorded for the node owning `node_id`'s Files capability.
 ///
-/// Reuses an interview config on this node or a nearer ancestor before creating a new one.
-pub fn ensure_interview_agent_for_node(
+/// Drop shells and terminal agents whose processes have exited (closed outside
+/// the app), so they don't block a release.
+fn prune_stale_sessions(fleet: &FleetStore, paths: &TodPaths) {
+    let mut nodes = BTreeSet::new();
+    nodes.extend(
+        fleet
+            .list_all_shells()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|shell| shell.node_id),
+    );
+    nodes.extend(
+        fleet
+            .list_unended_runs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|run| run.node_id),
+    );
+    for node_id in nodes {
+        let _ = prune_stale_shell_sessions(fleet, paths, &node_id);
+        let _ = prune_stale_terminal_agent_runs(fleet, paths, &node_id);
+    }
+    let _ = fleet.reload_if_stale();
+}
+
+/// Refused while shells or agents run in the worktree. Treehouse leases are
+/// returned; git worktrees are removed only when no other node records the same
+/// path (and never the primary checkout). The node's worktree columns are
+/// cleared either way.
+pub fn release_worktree_for_node(
     fleet: &FleetStore,
-    _paths: &TodPaths,
+    paths: &TodPaths,
     settings: &TodSettings,
     node_id: &str,
-) -> Result<InterviewAgentContext> {
-    fleet.reload_if_stale().ok();
-    if let Some(existing) = fleet.resolve_interview_agent_for_node(node_id)? {
-        ensure_worktree_path_valid(&existing)?;
-        let cwd = workspace_cwd_for_agent(&existing)?;
-        return Ok(InterviewAgentContext {
-            agent: existing,
-            cwd,
-        });
+) -> Result<()> {
+    let files = resolve_files(fleet, node_id)?;
+    let owner = files.source_node_id.clone();
+    let Some(path) = files.worktree_path().map(PathBuf::from) else {
+        return Ok(());
+    };
+    prune_stale_sessions(fleet, paths);
+    if let Some(reason) = fleet.worktree_release_blocker(&owner)? {
+        bail!("{reason}");
     }
-
-    let (repo_path, _branch) = task_repo_branch(fleet, node_id)?;
-    let config_id = format!("interview-{}", Uuid::new_v4());
-
-    fleet.enqueue(FleetMutation::InsertAgent {
-        agent: NewAgentConfig {
-            id: config_id.clone(),
-            node_id: node_id.to_string(),
-            env_type: "local".into(),
-            mode: "interview".into(),
-            work_directory: Some(path_for_storage(&repo_path)),
-            use_worktree: false,
-            platform: platform_storage(settings.agent_platform).to_string(),
-            model: settings.agent_model().to_string(),
-            effort: settings.agent_effort().to_string(),
-        },
+    let has_lease = files
+        .worktree_lease_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty());
+    if !path.is_dir() && !has_lease {
+        // Folder already gone: just drop git's record of it.
+        if let Some(repo) = files.repo() {
+            let _ = worktree::prune_git_worktrees(Path::new(repo));
+        }
+    }
+    if path.is_dir() {
+        if let Some(lease_id) = files.worktree_lease_id.as_deref().filter(|s| !s.is_empty()) {
+            worktree::treehouse_return(&path, lease_id, settings, paths)?;
+        } else {
+            let shared = fleet.read(|conn| {
+                crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
+                    .other_nodes_using_worktree(&owner, &path_for_storage(&path))
+            })?;
+            if shared.is_empty() {
+                if let Some(repo) = files.repo() {
+                    worktree::remove_git_worktree(Path::new(repo), &path)?;
+                }
+            }
+        }
+    }
+    fleet.enqueue(FleetMutation::UpdateNodeWorktree {
+        node_id: owner,
+        worktree_path: None,
+        worktree_lease_id: None,
+        worktree_lease_holder: None,
     })?;
     fleet.writer().flush()?;
     fleet.reload_if_stale()?;
-
-    let agent = fleet
-        .get_agent(&config_id)?
-        .with_context(|| "provisioned interview agent not found")?;
-    let cwd = workspace_cwd_for_agent(&agent)?;
-    Ok(InterviewAgentContext { agent, cwd })
-}
-
-/// Resolve ACP cwd from agent config id (for interview sessions).
-pub fn workspace_cwd_for_interview_agent(
-    fleet: &FleetStore,
-    agent_config_id: &str,
-    paths: &TodPaths,
-    node_id: uuid::Uuid,
-) -> Result<PathBuf> {
-    if let Some(agent) = fleet.get_agent(agent_config_id)? {
-        if let Ok(cwd) = workspace_cwd_for_agent(&agent) {
-            return Ok(cwd);
-        }
-    }
-    workspace_cwd_for_node_fallback(fleet, node_id, paths)
-}
-
-fn workspace_cwd_for_node_fallback(
-    fleet: &FleetStore,
-    node_id: uuid::Uuid,
-    paths: &TodPaths,
-) -> Result<PathBuf> {
-    let projection = fleet.projection();
-    let guard = projection.lock().expect("fleet projection mutex");
-    let conn = guard.connection();
-    crate::outline::workspace_cwd_for_node(&conn, node_id, paths)
+    Ok(())
 }

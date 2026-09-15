@@ -273,7 +273,7 @@ pub fn ensure_worktree(
     branch: &str,
     lease_holder: &str,
 ) -> Result<WorktreeHandle> {
-    use crate::fleet::repos::agent_config::AgentConfigRepo;
+    use crate::fleet::repos::node_files::NodeFilesRepo;
 
     let repo_str = repo.to_string_lossy();
     let branch_key = if branch.is_empty() {
@@ -283,7 +283,7 @@ pub fn ensure_worktree(
     };
 
     if let Some(shared) =
-        AgentConfigRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
+        NodeFilesRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
     {
         let path = PathBuf::from(shared);
         if path.is_dir() {
@@ -293,7 +293,7 @@ pub fn ensure_worktree(
 
     with_creation_lock(data_root, || {
         if let Some(shared) =
-            AgentConfigRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
+            NodeFilesRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
         {
             let path = PathBuf::from(shared);
             if path.is_dir() {
@@ -341,6 +341,87 @@ pub fn ensure_worktree(
         }
         Ok(handle)
     })
+}
+
+/// Remove a git worktree previously added for `repo`. Refuses to touch the
+/// primary checkout, and never forces: uncommitted changes make git refuse.
+pub fn remove_git_worktree(repo: &Path, worktree: &Path) -> Result<()> {
+    if paths_refer_to_same_location(repo, worktree) {
+        return Ok(());
+    }
+    let worktree = path_for_git(worktree);
+    if !is_registered_worktree(repo, &worktree)? {
+        // Already unregistered — e.g. an earlier removal deleted the files but a
+        // process with the folder open kept it on disk. Clean up what's left.
+        let _ = std::fs::remove_dir(&worktree);
+        return Ok(());
+    }
+    let worktree_str = worktree.to_str().context("worktree path utf8")?.to_string();
+    if let Err(err) = run_git(repo, &["worktree", "remove", &worktree_str]) {
+        // git unregisters the worktree before deleting its folder; when only the
+        // folder delete failed, the worktree is already gone as far as git knows.
+        if is_registered_worktree(repo, &worktree)? {
+            return Err(err);
+        }
+        tracing::warn!(
+            "git removed worktree {} but left its folder: {err:#}",
+            worktree.display()
+        );
+    }
+    Ok(())
+}
+
+/// Forget worktrees of `repo` whose folders no longer exist.
+pub fn prune_git_worktrees(repo: &Path) -> Result<()> {
+    run_git(repo, &["worktree", "prune"]).map(|_| ())
+}
+
+/// Whether git still lists `worktree` among `repo`'s worktrees.
+fn is_registered_worktree(repo: &Path, worktree: &Path) -> Result<bool> {
+    let output = run_git(repo, &["worktree", "list", "--porcelain"])?;
+    let target = comparable_path(worktree);
+    Ok(output
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(Path::new)
+        .any(|listed| {
+            comparable_path(listed) == target || paths_refer_to_same_location(listed, worktree)
+        }))
+}
+
+/// Path text normalized for comparing git's output with stored paths.
+fn comparable_path(path: &Path) -> String {
+    let text = path_for_git(path).to_string_lossy().replace('\\', "/");
+    let text = text.trim_end_matches('/');
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text.to_string()
+    }
+}
+
+/// Return a Treehouse lease so the worktree goes back to the pool.
+pub fn treehouse_return(
+    worktree: &Path,
+    lease_id: &str,
+    settings: &TodSettings,
+    paths: &TodPaths,
+) -> Result<()> {
+    let invocation = TreehouseInvocation::resolve(settings, paths)?;
+    let mut command = Command::new("treehouse");
+    invocation.apply_to(&mut command);
+    let output = command
+        .arg("return")
+        .arg(worktree)
+        .arg("--if-lease-id")
+        .arg(lease_id)
+        .output()
+        .context("spawn treehouse return")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("treehouse return failed: {}", stderr.trim());
+    }
+    Ok(())
 }
 
 pub fn validate_git_repo(repo: &Path) -> Result<PathBuf> {
@@ -447,8 +528,29 @@ mod tests {
     }
 
     #[test]
+    fn remove_git_worktree_finishes_a_half_removed_worktree() {
+        let repo = init_temp_repo();
+        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let dest = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let path = git_worktree_add(&repo, &dest, "feature").unwrap();
+        assert!(is_registered_worktree(&repo, &path).unwrap());
+
+        // Simulate git unregistering the worktree but failing to delete its folder.
+        let path_str = path_for_git(&path).to_string_lossy().into_owned();
+        run_git(&repo, &["worktree", "remove", &path_str]).unwrap();
+        fs::create_dir_all(&path).unwrap();
+        assert!(!is_registered_worktree(&repo, &path).unwrap());
+
+        remove_git_worktree(&repo, &path).unwrap();
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
     fn git_worktree_sharing_by_branch() {
-        use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
+        use crate::fleet::repos::node_files::NodeFilesRepo;
         use crate::fleet::repos::task::{FleetTask, TaskRepo};
         use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
         use crate::paths::{clear_data_root_override, set_data_root};
@@ -509,22 +611,9 @@ mod tests {
         .unwrap();
         assert_ne!(main_handle.path, feature_handle.path);
 
-        AgentConfigRepo::new(&conn)
-            .insert(&NewAgentConfig {
-                id: "interview-a".into(),
-                node_id: node_main.clone(),
-                env_type: "local".into(),
-                mode: "interview".into(),
-                work_directory: None,
-                use_worktree: true,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            })
-            .unwrap();
-        AgentConfigRepo::new(&conn)
-            .update_worktree_details(
-                "interview-a",
+        NodeFilesRepo::new(&conn)
+            .update_worktree(
+                &node_main,
                 Some(main_handle.path.to_string_lossy().as_ref()),
                 None,
                 None,
@@ -544,6 +633,12 @@ mod tests {
         .unwrap();
         assert_eq!(reused.path, main_handle.path);
         assert!(reused.lease.is_none());
+
+        remove_git_worktree(&git_repo, &main_handle.path).unwrap();
+        assert!(!main_handle.path.exists());
+        // The primary checkout is never removed.
+        remove_git_worktree(&git_repo, &git_repo).unwrap();
+        assert!(git_repo.exists());
 
         let _ = fs::remove_dir_all(&git_repo);
         let _ = fs::remove_dir_all(&data_root);
