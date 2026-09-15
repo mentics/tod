@@ -11,7 +11,6 @@ use crate::fleet::migration::{
 use crate::fleet::notices::FleetNoticeHooks;
 use crate::fleet::paths::FleetPaths;
 use crate::fleet::projection::FleetProjection;
-use crate::fleet::prompt_queue::MemoryPromptQueue;
 use crate::fleet::reattach;
 use crate::fleet::node_actions::{
     ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
@@ -21,7 +20,7 @@ use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::repos::transcript::{TranscriptRepo, TranscriptTurn};
-use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
+use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
 use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
@@ -41,13 +40,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
-/// Counts for quit modal (memory-only queued + in-flight prompts).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct QuitPromptCounts {
-    pub queued: usize,
-    pub in_flight: usize,
-}
-
 /// App-held handle for fleet persistence (writer + projection + lock + runtime state).
 pub struct FleetStore {
     paths: FleetPaths,
@@ -55,7 +47,6 @@ pub struct FleetStore {
     writer: FleetWriter,
     command_log: Arc<Mutex<crate::fleet::command_log::CommandLog>>,
     projection: Arc<Mutex<FleetProjection>>,
-    prompt_queue: Arc<MemoryPromptQueue>,
     notices: FleetNoticeHooks,
     migration: Option<StorageMigration>,
     traffic_log: Option<SharedAgentTrafficLog>,
@@ -126,7 +117,6 @@ impl FleetStore {
             writer,
             command_log,
             projection,
-            prompt_queue: Arc::new(MemoryPromptQueue::new()),
             notices: FleetNoticeHooks::new(),
             migration: None,
             traffic_log: None,
@@ -235,10 +225,6 @@ impl FleetStore {
 
     pub fn projection(&self) -> Arc<Mutex<FleetProjection>> {
         self.projection.clone()
-    }
-
-    pub fn prompt_queue(&self) -> Arc<MemoryPromptQueue> {
-        self.prompt_queue.clone()
     }
 
     pub fn notices(&self) -> &FleetNoticeHooks {
@@ -823,14 +809,6 @@ impl FleetStore {
             .expect("fleet projection mutex")
             .reload_if_stale()
             .map_err(Into::into)
-    }
-
-    /// Memory-only queued and in-flight prompt counts for quit modal.
-    pub fn quit_prompt_counts(&self) -> QuitPromptCounts {
-        QuitPromptCounts {
-            queued: self.prompt_queue.total_queued(),
-            in_flight: self.prompt_queue.total_in_flight(),
-        }
     }
 
     /// Flush debounced writes before application exit.

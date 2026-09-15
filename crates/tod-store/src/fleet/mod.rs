@@ -11,7 +11,6 @@ pub mod node_actions;
 pub mod notices;
 pub mod paths;
 pub mod projection;
-pub mod prompt_queue;
 pub mod provision;
 pub mod reattach;
 pub mod reconnect_identity;
@@ -39,7 +38,6 @@ pub use node_actions::{FilesDirectory, ResolvedAgent, ResolvedFiles};
 pub use notices::FleetNoticeHooks;
 pub use paths::FleetPaths;
 pub use projection::FleetProjection;
-pub use prompt_queue::MemoryPromptQueue;
 pub use provision::{release_worktree_for_node, resolve_launch_cwd, setup_worktree_for_node};
 pub use reattach::ReattachReport;
 pub use repos::agent_run::AgentRun;
@@ -49,8 +47,8 @@ pub use repos::notification::FleetNotification;
 pub use repos::shell::ShellSession;
 pub use repos::task::{FleetTask, NoteItem};
 pub use repos::transcript::TranscriptTurn;
-pub use runtime::{GuestLivenessCheck, NoopGuestLiveness, PromptDeliveryState};
-pub use store::{FleetStore, QuitPromptCounts};
+pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
+pub use store::FleetStore;
 pub use terminal::{
     default_terminal_hint, focus_shell_session, focus_terminal_agent_run, launch_shell_terminal,
     open_shell_for_node, open_terminal_agent_for_node, prune_stale_shell_sessions,

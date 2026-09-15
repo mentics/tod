@@ -15,14 +15,6 @@ pub trait ShellSpawnMetadata: Send + Sync {
     fn shell_label(&self, session: &ShellSession) -> String;
 }
 
-/// Memory-only prompt delivery state (queued vs in-flight).
-pub trait PromptDeliveryState: Send + Sync {
-    fn queued_count(&self, agent_id: &str) -> usize;
-    fn in_flight_count(&self, agent_id: &str) -> usize;
-    fn total_queued(&self) -> usize;
-    fn total_in_flight(&self) -> usize;
-}
-
 /// No-op guest liveness: host verify alone is sufficient; status becomes `waiting`.
 pub struct NoopGuestLiveness;
 
