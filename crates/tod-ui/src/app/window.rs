@@ -2,6 +2,7 @@ use super::always_on_top;
 use super::data_root_setup::DataRootSetupView;
 use super::fleet_blocked::FleetBlockedView;
 use super::no_focus;
+use super::right_drawer::{DrawerKind, DrawerRequest, RightDrawer};
 #[cfg(feature = "agent-socket")]
 use crate::agent_socket;
 #[cfg(feature = "agent-socket")]
@@ -82,11 +83,8 @@ struct PendingOpenLifecycle {
 pub struct Shell {
     active_view: ShellView,
     task_list: Entity<TaskListView>,
-    task_edit: Entity<TaskEditView>,
-    obligations: Entity<ObligationsView>,
-    lifecycle_panel: Entity<LifecyclePanelView>,
-    visual_design_panel: Entity<VisualDesignPanelView>,
-    action_panel: Entity<ActionPanelView>,
+    /// Every panel shown to the right of the task tree — see `right_drawer`.
+    drawer: RightDrawer,
     sessions: Entity<SessionsView>,
     drafting: Entity<DraftingView>,
     settings: Entity<SettingsView>,
@@ -112,23 +110,10 @@ pub struct Shell {
     pending_rewrite_pre_v3: Option<Uuid>,
     pending_open_lifecycle: Option<PendingOpenLifecycle>,
     pending_return_to_tasks: bool,
-    pending_open_task_edit: Option<String>,
-    pending_close_task_edit: bool,
-    pending_retarget_task_edit: Option<String>,
-    pending_open_lifecycle_panel: Option<String>,
-    pending_close_lifecycle_panel: bool,
-    pending_retarget_lifecycle_panel: Option<String>,
-    pending_focus_lifecycle_panel: bool,
-    pending_open_visual_design: Option<(uuid::Uuid, uuid::Uuid)>,
-    pending_open_obligations: Option<(String, String)>,
-    pending_close_obligations: bool,
-    pending_retarget_obligations: Option<(String, String, bool)>,
+    /// Drawer changes queued by event handlers, applied in order on render.
+    pending_drawer: Vec<DrawerRequest>,
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
-    pending_focus_drawer: bool,
-    pending_open_action_panel: Option<String>,
-    pending_retarget_action_panel: Option<String>,
-    pending_close_action_panel: bool,
     pending_error_toast: Option<String>,
     always_on_top: bool,
     tasks_split_state: Entity<PanelSplitState>,
@@ -336,12 +321,12 @@ impl Shell {
         });
     }
 
-    fn drain_pending_open_lifecycle(&mut self, cx: &mut Context<Self>) {
+    fn drain_pending_open_lifecycle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_open_lifecycle.take() else {
             return;
         };
         self.task_list.update(cx, |list, cx| {
-            list.open_lifecycle_panel(&pending.task_id, &pending.lifecycle, cx);
+            list.open_lifecycle_panel(&pending.task_id, &pending.lifecycle, window, cx);
         });
     }
 
@@ -411,7 +396,7 @@ impl Shell {
             self.agent_status_text = text.into();
             cx.notify();
         }
-        let gate_activity = self.lifecycle_panel.read(cx).in_flight_activity();
+        let gate_activity = self.drawer.lifecycle.read(cx).in_flight_activity();
         self.task_list.update(cx, |list, cx| {
             list.set_agent_activity(gate_activity, cx);
         });
@@ -457,192 +442,108 @@ impl Shell {
         }
     }
 
-    fn open_task_edit(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.obligations.read(cx).is_open() {
-            self.close_obligations(window, cx);
-        }
-        if self.lifecycle_panel.read(cx).is_open() {
-            self.close_lifecycle_panel(window, cx);
-        }
-        self.task_edit.update(cx, |edit, cx| {
-            edit.open(task_id, window, cx);
-        });
-        if !self.task_edit.read(cx).is_open() {
-            self.task_list.update(cx, |list, cx| {
-                list.show_error("Could not open node for editing", window, cx);
-            });
-            cx.notify();
+    fn queue_drawer(&mut self, request: DrawerRequest, cx: &mut Context<Self>) {
+        self.pending_drawer.push(request);
+        cx.notify();
+    }
+
+    /// A drawer panel closed. If that left the drawer empty — rather than the
+    /// panel being swapped out for another — hand focus back to the tree.
+    fn on_drawer_panel_closed(&mut self, cx: &mut Context<Self>) {
+        if self.drawer.is_open(cx) {
             return;
         }
-        self.task_list.update(cx, |list, cx| {
-            list.set_slide_edit_open(true, cx);
-        });
+        self.pending_refocus_task_list = true;
         cx.notify();
     }
 
-    fn close_task_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.task_edit.update(cx, |edit, cx| {
-            edit.close(cx);
-        });
-        self.task_list.update(cx, |list, cx| {
-            list.set_slide_edit_open(false, cx);
-            list.restore_focus(window, cx);
-        });
-        cx.notify();
-    }
-
-    fn retarget_task_edit(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.task_edit.read(cx).is_open() {
-            return;
+    fn drain_pending_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for request in std::mem::take(&mut self.pending_drawer) {
+            self.apply_drawer_request(request, window, cx);
         }
-        self.task_edit.update(cx, |edit, cx| {
-            edit.retarget(task_id, window, cx);
-        });
-        cx.notify();
+        let open = self.drawer.is_open(cx);
+        self.task_list
+            .update(cx, |list, cx| list.set_drawer_open(open, cx));
     }
 
-    fn open_lifecycle_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.obligations.read(cx).is_open() {
-            self.close_obligations(window, cx);
-        }
-        if self.task_edit.read(cx).is_open() {
-            self.close_task_edit(window, cx);
-        }
-        self.lifecycle_panel.update(cx, |panel, cx| {
-            panel.open(task_id, window, cx);
-        });
-        if !self.lifecycle_panel.read(cx).is_open() {
-            self.task_list.update(cx, |list, cx| {
-                list.show_error("Could not open lifecycle panel", window, cx);
-            });
-        } else {
-            self.task_list.update(cx, |list, cx| {
-                list.set_lifecycle_panel_open(true, cx);
-            });
-        }
-        cx.notify();
-    }
-
-    fn close_lifecycle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.lifecycle_panel.update(cx, |panel, cx| {
-            panel.close(cx);
-        });
-        self.task_list.update(cx, |list, cx| {
-            list.set_lifecycle_panel_open(false, cx);
-            list.restore_focus(window, cx);
-        });
-        cx.notify();
-    }
-
-    fn retarget_lifecycle_panel(&mut self, task_id: &str, cx: &mut Context<Self>) {
-        if !self.lifecycle_panel.read(cx).is_open() {
-            return;
-        }
-        self.lifecycle_panel.update(cx, |panel, cx| {
-            panel.retarget(task_id, cx);
-        });
-        cx.notify();
-    }
-
-    fn open_obligations(
+    /// Explicit opens close the other panels and take keyboard focus;
+    /// following the selection does neither (see `RightDrawer::follow`).
+    fn apply_drawer_request(
         &mut self,
-        task_id: &str,
-        title: &str,
+        request: DrawerRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(node_id) = Uuid::parse_str(task_id) else {
-            return;
-        };
-        if self.task_edit.read(cx).is_open() {
-            self.close_task_edit(window, cx);
+        match request {
+            DrawerRequest::OpenTaskEdit { task_id } => {
+                self.drawer
+                    .close_except(Some(DrawerKind::TaskEdit), window, cx);
+                self.drawer
+                    .task_edit
+                    .update(cx, |edit, cx| edit.open(&task_id, window, cx));
+                if !self.drawer.task_edit.read(cx).is_open() {
+                    self.task_list.update(cx, |list, cx| {
+                        list.show_error("Could not open node for editing", window, cx);
+                    });
+                }
+            }
+            DrawerRequest::OpenObligations { task_id, title } => {
+                if let Ok(node_id) = Uuid::parse_str(&task_id) {
+                    self.drawer
+                        .close_except(Some(DrawerKind::Obligations), window, cx);
+                    self.drawer.obligations.update(cx, |panel, cx| {
+                        panel.open(node_id, &title, None, window, cx);
+                    });
+                }
+            }
+            DrawerRequest::OpenLifecycle { task_id } => {
+                self.drawer
+                    .close_except(Some(DrawerKind::Lifecycle), window, cx);
+                self.drawer.lifecycle.update(cx, |panel, cx| {
+                    if panel.is_open() {
+                        panel.retarget(&task_id, cx);
+                    } else {
+                        panel.open(&task_id, window, cx);
+                    }
+                });
+                if self.drawer.lifecycle.read(cx).is_open() {
+                    self.drawer.focus(window, cx);
+                } else {
+                    self.task_list.update(cx, |list, cx| {
+                        list.show_error("Could not open lifecycle panel", window, cx);
+                    });
+                }
+            }
+            DrawerRequest::OpenVisualDesign {
+                node_id,
+                obligation_id,
+            } => {
+                self.open_visual_design_panel(node_id, obligation_id, window, cx);
+            }
+            DrawerRequest::OpenActionPanel { task_id } => {
+                self.drawer
+                    .close_except(Some(DrawerKind::Action), window, cx);
+                self.drawer
+                    .action
+                    .update(cx, |panel, cx| panel.open(&task_id, window, cx));
+                if !self.drawer.action.read(cx).is_open() {
+                    self.task_list.update(cx, |list, cx| {
+                        list.show_error("Could not open the Action panel", window, cx);
+                    });
+                }
+            }
+            DrawerRequest::Follow {
+                task_id: Some(task_id),
+            } => {
+                self.drawer.follow(&task_id, &self.fleet, window, cx);
+            }
+            DrawerRequest::Follow { task_id: None } | DrawerRequest::Close => {
+                self.drawer.close_except(None, window, cx);
+            }
+            DrawerRequest::Focus => {
+                self.drawer.focus(window, cx);
+            }
         }
-        if self.lifecycle_panel.read(cx).is_open() {
-            self.close_lifecycle_panel(window, cx);
-        }
-        self.obligations.update(cx, |panel, cx| {
-            panel.open(node_id, title, None, window, cx);
-        });
-        self.task_list.update(cx, |list, cx| {
-            list.set_obligations_open(true, cx);
-        });
-        cx.notify();
-    }
-
-    fn close_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.obligations.update(cx, |panel, cx| {
-            panel.close(window, cx);
-        });
-        self.task_list.update(cx, |list, cx| {
-            list.set_obligations_open(false, cx);
-            list.restore_focus(window, cx);
-        });
-        cx.notify();
-    }
-
-    fn retarget_obligations(
-        &mut self,
-        task_id: &str,
-        title: &str,
-        focus: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.obligations.read(cx).is_open() {
-            return;
-        }
-        let Ok(node_id) = Uuid::parse_str(task_id) else {
-            return;
-        };
-        self.obligations.update(cx, |panel, cx| {
-            panel.retarget(node_id, title, None, focus, window, cx);
-        });
-        cx.notify();
-    }
-
-    fn open_action_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.task_edit.read(cx).is_open() {
-            self.close_task_edit(window, cx);
-        }
-        if self.obligations.read(cx).is_open() {
-            self.close_obligations(window, cx);
-        }
-        if self.lifecycle_panel.read(cx).is_open() {
-            self.close_lifecycle_panel(window, cx);
-        }
-        self.action_panel.update(cx, |panel, cx| {
-            panel.open(task_id, window, cx);
-        });
-        if self.action_panel.read(cx).is_open() {
-            self.task_list.update(cx, |list, cx| {
-                list.set_action_panel_open(true, cx);
-            });
-        } else {
-            self.task_list.update(cx, |list, cx| {
-                list.show_error("Could not open the Action panel", window, cx);
-            });
-        }
-        cx.notify();
-    }
-
-    fn close_action_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.action_panel.update(cx, |panel, cx| {
-            panel.close(cx);
-        });
-        self.task_list.update(cx, |list, cx| {
-            list.set_action_panel_open(false, cx);
-            list.restore_focus(window, cx);
-        });
-        cx.notify();
-    }
-
-    fn retarget_action_panel(&mut self, task_id: &str, cx: &mut Context<Self>) {
-        if !self.action_panel.read(cx).is_open() {
-            return;
-        }
-        self.action_panel.update(cx, |panel, cx| {
-            panel.retarget(task_id, cx);
-        });
         cx.notify();
     }
 
@@ -862,15 +763,15 @@ impl Shell {
                     list.set_status_message(format!("Undid: {label}"), cx);
                     list.refresh(window, cx);
                 });
-                if self.task_edit.read(cx).is_open() {
-                    self.task_edit.update(cx, |edit, cx| {
+                if self.drawer.task_edit.read(cx).is_open() {
+                    self.drawer.task_edit.update(cx, |edit, cx| {
                         if let Some(id) = edit.open_task_id(cx) {
                             edit.retarget(&id, window, cx);
                         }
                     });
                 }
-                if self.obligations.read(cx).is_open() {
-                    self.obligations.update(cx, |panel, cx| {
+                if self.drawer.obligations.read(cx).is_open() {
+                    self.drawer.obligations.update(cx, |panel, cx| {
                         panel.reload(window, cx);
                     });
                 }
@@ -980,13 +881,9 @@ impl Render for Shell {
         self.drain_pending_open_interview_for_task(window, cx);
         self.drain_pending_rewrite_pre_v3(window, cx);
         self.drain_pending_return_to_tasks(window, cx);
-        self.drain_pending_open_lifecycle(cx);
-        self.drain_pending_task_edit(window, cx);
-        self.drain_pending_obligations(window, cx);
-        self.drain_pending_action_panel(window, cx);
-        self.drain_pending_lifecycle_panel(window, cx);
-        self.drain_pending_visual_design(window, cx);
-        self.drain_pending_focus_drawer(window, cx);
+        self.drain_pending_open_lifecycle(window, cx);
+        self.drain_pending_drawer(window, cx);
+        self.drain_pending_task_list(window, cx);
         self.drain_pending_error_toast(window, cx);
         crate::ui::agent_permission::drain_queued_requests(window, cx);
 
@@ -1066,21 +963,13 @@ impl Shell {
         }
     }
 
-    /// Tasks always use a left tree + right drawer host. Edit and obligations
-    /// replace the (future) agent list in the same right drawer; the tree stays.
+    /// Tasks always use a left tree + right drawer host. Whichever drawer
+    /// panel is open shows the tree's selected node; the tree stays.
     fn render_tasks_split(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
-        let drawer = if self.obligations.read(cx).is_open() {
-            self.obligations.clone().into_any_element()
-        } else if self.task_edit.read(cx).is_open() {
-            self.task_edit.clone().into_any_element()
-        } else if self.visual_design_panel.read(cx).is_open() {
-            self.visual_design_panel.clone().into_any_element()
-        } else if self.lifecycle_panel.read(cx).is_open() {
-            self.lifecycle_panel.clone().into_any_element()
-        } else if self.action_panel.read(cx).is_open() {
-            self.action_panel.clone().into_any_element()
+        let drawer = if let Some(panel) = self.drawer.element(cx) {
+            panel
         } else {
             div()
                 .size_full()
@@ -1109,76 +998,6 @@ impl Shell {
                     .child(self.task_list.clone()),
             )
             .right(div().id("tasks-right-drawer").size_full().child(drawer))
-    }
-
-    fn drain_pending_task_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close_task_edit {
-            self.pending_close_task_edit = false;
-            self.close_task_edit(window, cx);
-        }
-        if let Some(task_id) = self.pending_retarget_task_edit.take() {
-            self.retarget_task_edit(&task_id, window, cx);
-        }
-        if let Some(task_id) = self.pending_open_task_edit.take() {
-            self.open_task_edit(&task_id, window, cx);
-        }
-    }
-
-    /// Ctrl+Right from the task tree: hand focus to whichever drawer is open.
-    fn drain_pending_focus_drawer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.pending_focus_drawer {
-            return;
-        }
-        self.pending_focus_drawer = false;
-        if self.obligations.read(cx).is_open() {
-            self.obligations.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window, cx);
-            });
-        } else if self.task_edit.read(cx).is_open() {
-            self.task_edit.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window, cx);
-            });
-        } else if self.visual_design_panel.read(cx).is_open() {
-            self.visual_design_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window, cx);
-            });
-        } else if self.action_panel.read(cx).is_open() {
-            self.action_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window, cx);
-            });
-        } else if self.lifecycle_panel.read(cx).is_open() {
-            self.lifecycle_panel.update(cx, |panel, cx| {
-                panel.focus_handle(cx).focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
-    fn drain_pending_lifecycle_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close_lifecycle_panel {
-            self.pending_close_lifecycle_panel = false;
-            self.close_lifecycle_panel(window, cx);
-        }
-        if let Some(task_id) = self.pending_retarget_lifecycle_panel.take() {
-            self.retarget_lifecycle_panel(&task_id, cx);
-        }
-        if let Some(task_id) = self.pending_open_lifecycle_panel.take() {
-            self.open_lifecycle_panel(&task_id, window, cx);
-        }
-        if self.pending_focus_lifecycle_panel {
-            self.pending_focus_lifecycle_panel = false;
-            if self.lifecycle_panel.read(cx).is_open() {
-                self.lifecycle_panel.update(cx, |panel, cx| {
-                    panel.focus(window, cx);
-                });
-            }
-        }
-    }
-
-    fn drain_pending_visual_design(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((node_id, obligation_id)) = self.pending_open_visual_design.take() {
-            self.open_visual_design_panel(node_id, obligation_id, window, cx);
-        }
     }
 
     /// Open the visual design panel (mockup `WebView` + embedded agent chat)
@@ -1232,7 +1051,9 @@ impl Shell {
             .unwrap_or("Visual design")
             .to_string();
 
-        self.visual_design_panel.update(cx, |panel, cx| {
+        self.drawer
+            .close_except(Some(DrawerKind::VisualDesign), window, cx);
+        self.drawer.visual_design.update(cx, |panel, cx| {
             panel.open(
                 node_id,
                 obligation_id,
@@ -1307,22 +1128,12 @@ impl Shell {
         )
     }
 
-    fn drain_pending_obligations(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close_obligations {
-            self.pending_close_obligations = false;
-            self.close_obligations(window, cx);
-        }
+    fn drain_pending_task_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending_refocus_task_list {
             self.pending_refocus_task_list = false;
             self.task_list.update(cx, |list, cx| {
                 list.restore_focus(window, cx);
             });
-        }
-        if let Some((task_id, title, focus)) = self.pending_retarget_obligations.take() {
-            self.retarget_obligations(&task_id, &title, focus, window, cx);
-        }
-        if let Some((task_id, title)) = self.pending_open_obligations.take() {
-            self.open_obligations(&task_id, &title, window, cx);
         }
         if self.pending_delete_selected_task {
             self.pending_delete_selected_task = false;
@@ -1330,65 +1141,6 @@ impl Shell {
                 list.delete_selected_task(window, cx);
             });
         }
-    }
-
-    fn drain_pending_action_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close_action_panel {
-            self.pending_close_action_panel = false;
-            self.close_action_panel(window, cx);
-        }
-        if let Some(task_id) = self.pending_retarget_action_panel.take() {
-            self.retarget_action_panel(&task_id, cx);
-        }
-        if let Some(task_id) = self.pending_open_action_panel.take() {
-            self.open_action_panel(&task_id, window, cx);
-        }
-    }
-
-    fn queue_open_action_panel(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.pending_open_action_panel = Some(task_id);
-        cx.notify();
-    }
-
-    fn queue_close_action_panel(&mut self, cx: &mut Context<Self>) {
-        self.pending_close_action_panel = true;
-        cx.notify();
-    }
-
-    fn queue_open_task_edit(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.pending_open_task_edit = Some(task_id);
-        cx.notify();
-    }
-
-    fn queue_retarget_task_edit(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.pending_retarget_task_edit = Some(task_id);
-        cx.notify();
-    }
-
-    fn queue_close_task_edit(&mut self, cx: &mut Context<Self>) {
-        self.pending_close_task_edit = true;
-        cx.notify();
-    }
-
-    fn queue_open_obligations(&mut self, task_id: String, title: String, cx: &mut Context<Self>) {
-        self.pending_open_obligations = Some((task_id, title));
-        cx.notify();
-    }
-
-    fn queue_retarget_obligations(
-        &mut self,
-        task_id: String,
-        title: String,
-        focus: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_retarget_obligations = Some((task_id, title, focus));
-        cx.notify();
-    }
-
-    fn queue_close_obligations(&mut self, cx: &mut Context<Self>) {
-        self.pending_close_obligations = true;
-        cx.notify();
     }
 }
 
@@ -1625,8 +1377,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
                                     match event {
                                         TaskListEvent::FocusDrawer => {
-                                            this.pending_focus_drawer = true;
-                                            cx.notify();
+                                            this.queue_drawer(DrawerRequest::Focus, cx);
                                         }
                                         TaskListEvent::OpenInterview {
                                             task_id,
@@ -1642,68 +1393,52 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
-                                        TaskListEvent::OpenTaskEdit { task_id, .. } => {
-                                            if this.task_edit.read(cx).is_open() {
-                                                this.queue_retarget_task_edit(task_id.clone(), cx);
-                                            } else {
-                                                this.queue_open_task_edit(task_id.clone(), cx);
-                                            }
+                                        TaskListEvent::OpenTaskEdit { task_id } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenTaskEdit {
+                                                    task_id: task_id.clone(),
+                                                },
+                                                cx,
+                                            );
                                         }
-                                        TaskListEvent::OpenObligations {
-                                            task_id,
-                                            title,
-                                            focus,
-                                        } => {
-                                            if this.obligations.read(cx).is_open() {
-                                                this.queue_retarget_obligations(
-                                                    task_id.clone(),
-                                                    title.clone(),
-                                                    *focus,
-                                                    cx,
-                                                );
-                                            } else {
-                                                this.queue_open_obligations(
-                                                    task_id.clone(),
-                                                    title.clone(),
-                                                    cx,
-                                                );
-                                            }
+                                        TaskListEvent::OpenObligations { task_id, title } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenObligations {
+                                                    task_id: task_id.clone(),
+                                                    title: title.clone(),
+                                                },
+                                                cx,
+                                            );
                                         }
-                                        TaskListEvent::CloseTaskEdit => {
-                                            this.queue_close_task_edit(cx);
-                                        }
-                                        TaskListEvent::CloseObligations => {
-                                            this.queue_close_obligations(cx);
+                                        TaskListEvent::CloseDrawer => {
+                                            this.queue_drawer(DrawerRequest::Close, cx);
                                         }
                                         TaskListEvent::OpenLifecycle { task_id, .. } => {
-                                            if this.lifecycle_panel.read(cx).is_open() {
-                                                this.pending_retarget_lifecycle_panel =
-                                                    Some(task_id.clone());
-                                                this.pending_focus_lifecycle_panel = true;
-                                            } else {
-                                                this.pending_open_lifecycle_panel =
-                                                    Some(task_id.clone());
-                                            }
-                                            cx.notify();
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenLifecycle {
+                                                    task_id: task_id.clone(),
+                                                },
+                                                cx,
+                                            );
                                         }
-                                        TaskListEvent::RetargetLifecycle { task_id } => {
-                                            this.pending_retarget_lifecycle_panel =
-                                                Some(task_id.clone());
-                                            cx.notify();
+                                        TaskListEvent::SelectionChanged { task_id } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::Follow {
+                                                    task_id: task_id.clone(),
+                                                },
+                                                cx,
+                                            );
                                         }
                                         TaskListEvent::OpenActionPanel { task_id } => {
-                                            this.queue_open_action_panel(task_id.clone(), cx);
-                                        }
-                                        TaskListEvent::RetargetActionPanel { task_id } => {
-                                            this.pending_retarget_action_panel =
-                                                Some(task_id.clone());
-                                            cx.notify();
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenActionPanel {
+                                                    task_id: task_id.clone(),
+                                                },
+                                                cx,
+                                            );
                                         }
                                         TaskListEvent::LaunchOrFocusAgent { task_id } => {
                                             this.handle_launch_or_focus_agent(task_id.clone(), cx);
-                                        }
-                                        TaskListEvent::CloseActionPanel => {
-                                            this.queue_close_action_panel(cx);
                                         }
                                         TaskListEvent::OpenShell { task_id, shell_id } => {
                                             this.handle_open_shell(
@@ -1729,11 +1464,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 cx.subscribe(&task_edit, |this: &mut Shell, _, event, cx| {
                                     match event {
                                         TaskEditEvent::Close => {
-                                            this.task_list.update(cx, |list, cx| {
-                                                list.set_slide_edit_open(false, cx);
-                                            });
-                                            this.pending_refocus_task_list = true;
-                                            cx.notify();
+                                            this.on_drawer_panel_closed(cx);
                                         }
                                         TaskEditEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
@@ -1745,9 +1476,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             });
                                         }
                                         TaskEditEvent::OpenObligations { task_id, title } => {
-                                            this.queue_open_obligations(
-                                                task_id.clone(),
-                                                title.clone(),
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenObligations {
+                                                    task_id: task_id.clone(),
+                                                    title: title.clone(),
+                                                },
                                                 cx,
                                             );
                                         }
@@ -1757,11 +1490,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 cx.subscribe(&obligations, |this: &mut Shell, _, event, cx| {
                                     match event {
                                         ObligationsEvent::Close => {
-                                            this.task_list.update(cx, |list, cx| {
-                                                list.set_obligations_open(false, cx);
-                                            });
-                                            this.pending_refocus_task_list = true;
-                                            cx.notify();
+                                            this.on_drawer_panel_closed(cx);
                                         }
                                         ObligationsEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
@@ -1785,9 +1514,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             node_id,
                                             obligation_id,
                                         } => {
-                                            this.pending_open_visual_design =
-                                                Some((*node_id, *obligation_id));
-                                            cx.notify();
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenVisualDesign {
+                                                    node_id: *node_id,
+                                                    obligation_id: *obligation_id,
+                                                },
+                                                cx,
+                                            );
                                         }
                                         ObligationsEvent::RewritePreV3 { node_id } => {
                                             this.pending_rewrite_pre_v3 = Some(*node_id);
@@ -1800,11 +1533,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 |this: &mut Shell, _, event, cx| match event {
                                     LifecyclePanelEvent::Close => {
                                         this.task_list.update(cx, |list, cx| {
-                                            list.set_lifecycle_panel_open(false, cx);
                                             list.request_live_refresh(cx);
                                         });
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
+                                        this.on_drawer_panel_closed(cx);
                                     }
                                     LifecyclePanelEvent::FocusTaskList => {
                                         this.pending_refocus_task_list = true;
@@ -1821,8 +1552,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 &visual_design_panel,
                                 |this: &mut Shell, _, event, cx| match event {
                                     VisualDesignPanelEvent::Close => {
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
+                                        this.on_drawer_panel_closed(cx);
                                     }
                                     VisualDesignPanelEvent::FocusTaskList => {
                                         this.pending_refocus_task_list = true;
@@ -1834,11 +1564,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 cx.subscribe(&action_panel, |this: &mut Shell, _, event, cx| {
                                     match event {
                                         ActionPanelEvent::Close => {
-                                            this.task_list.update(cx, |list, cx| {
-                                                list.set_action_panel_open(false, cx);
-                                            });
-                                            this.pending_refocus_task_list = true;
-                                            cx.notify();
+                                            this.on_drawer_panel_closed(cx);
                                         }
                                         ActionPanelEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
@@ -1943,11 +1669,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let shell = Shell {
                                 active_view: ShellView::Tasks,
                                 task_list,
-                                task_edit,
-                                obligations,
-                                lifecycle_panel,
-                                visual_design_panel,
-                                action_panel,
+                                drawer: RightDrawer {
+                                    task_edit,
+                                    obligations,
+                                    lifecycle: lifecycle_panel,
+                                    visual_design: visual_design_panel,
+                                    action: action_panel,
+                                },
                                 sessions,
                                 drafting,
                                 settings,
@@ -1968,23 +1696,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_rewrite_pre_v3: None,
                                 pending_open_lifecycle: None,
                                 pending_return_to_tasks: false,
-                                pending_open_task_edit: None,
-                                pending_close_task_edit: false,
-                                pending_retarget_task_edit: None,
-                                pending_open_lifecycle_panel: None,
-                                pending_close_lifecycle_panel: false,
-                                pending_retarget_lifecycle_panel: None,
-                                pending_focus_lifecycle_panel: false,
-                                pending_open_visual_design: None,
-                                pending_open_obligations: None,
-                                pending_close_obligations: false,
-                                pending_retarget_obligations: None,
+                                pending_drawer: Vec::new(),
                                 pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
-                                pending_focus_drawer: false,
-                                pending_open_action_panel: None,
-                                pending_retarget_action_panel: None,
-                                pending_close_action_panel: false,
                                 pending_error_toast: None,
                                 always_on_top: restore_always_on_top,
                                 tasks_split_state,
@@ -2017,7 +1731,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             shell
                         });
                         let fleet_for_close = fleet.clone();
-                        let lifecycle_panel_for_close = view.read(cx).lifecycle_panel.clone();
+                        let lifecycle_panel_for_close = view.read(cx).drawer.lifecycle.clone();
                         let sessions_for_close = view.read(cx).sessions.clone();
                         let drafting_for_close = view.read(cx).drafting.clone();
                         window.on_window_should_close(cx, move |window, cx| {

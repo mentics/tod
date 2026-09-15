@@ -10,6 +10,49 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[test]
+fn create_node_requires_title_and_slugs_it() {
+    let root = std::env::temp_dir().join(format!("tod-create-title-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "titles".into(),
+            title: "Titles".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+
+    let create = |title: &str| {
+        let id = Uuid::new_v4();
+        let queued = store.enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        });
+        let flushed = queued.and_then(|_| store.writer().flush());
+        (id, flushed)
+    };
+
+    let (blank, result) = create("   ");
+    assert!(result.is_err(), "a blank title must not create a node");
+    store.reload_if_stale().ok();
+    assert!(store.get_node(&blank.to_string()).unwrap().is_none());
+
+    let (named, result) = create("Fix login bug");
+    result.unwrap();
+    store.reload_if_stale().ok();
+    let node = store.get_node(&named.to_string()).unwrap().unwrap();
+    assert_eq!(node.slug, "fix-login-bug");
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn import_from_git_repo_while_data_root_is_sandboxed() {
     let git_root = std::env::current_dir().unwrap();
     if !git_root.join("doc").join("process").is_dir() {

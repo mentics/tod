@@ -18,7 +18,7 @@ pub use import::import_doc_process;
 pub use mutations::{CreatePosition, OutlineMutation, ReorderDirection};
 pub use repos::gate::{
     GateCriterion, GateRepo, NodeGateEvaluation, OUTCOME_FAIL, OUTCOME_PASS, OUTCOME_PENDING,
-    OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_DERIVED, SOURCE_HUMAN,
+    OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG, SOURCE_AGENT, SOURCE_DERIVED, SOURCE_HUMAN,
 };
 pub use repos::obligations::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ObligationCounts, ObligationRepo,

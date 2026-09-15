@@ -194,18 +194,13 @@ pub enum TaskListEvent {
     },
     OpenTaskEdit {
         task_id: String,
-        _title: String,
     },
     OpenObligations {
         task_id: String,
         title: String,
-        /// Whether to move keyboard focus into the obligations panel.
-        /// False when merely following tree selection.
-        focus: bool,
     },
-    CloseTaskEdit,
-    CloseObligations,
-    CloseActionPanel,
+    /// Escape from the tree — close the right drawer, whichever panel it shows.
+    CloseDrawer,
     OpenLifecycle {
         task_id: String,
         /// Current lifecycle at emit time; the panel re-loads the task's
@@ -213,19 +208,13 @@ pub enum TaskListEvent {
         #[allow(dead_code)]
         lifecycle: String,
     },
-    /// The lifecycle panel is already open and the tree selection moved to a
-    /// different node — swap the panel to follow it (panel re-loads the
-    /// task itself, including whether it has the Lifecycle capability).
-    RetargetLifecycle {
-        task_id: String,
+    /// The tree selection changed (`None`: nothing selected). The right
+    /// drawer follows it, whichever panel it is showing.
+    SelectionChanged {
+        task_id: Option<String>,
     },
     /// F / Action chip — open the Action panel for a node.
     OpenActionPanel {
-        task_id: String,
-    },
-    /// The Action panel is already open and the tree selection moved to a
-    /// different node — swap the panel to follow it.
-    RetargetActionPanel {
         task_id: String,
     },
     /// A — open the node's most recent chat session, or start one.
@@ -274,12 +263,12 @@ pub struct TaskListView {
     _row_menu_subscription: Option<Subscription>,
     sort_menu_open: bool,
     edit_open_for: Option<String>,
-    slide_edit_open: bool,
-    obligations_open: bool,
-    lifecycle_panel_open: bool,
-    action_panel_open: bool,
+    /// Whether the shell's right drawer is showing a panel (see `set_drawer_open`).
+    drawer_open: bool,
+    /// Last selection sent as `TaskListEvent::SelectionChanged`.
+    published_selection: Option<String>,
     /// Node created for inline edit that is not yet committed with Enter.
-    draft_node_id: Option<String>,
+    draft: Option<edit::DraftRow>,
     edit_original_title: Option<String>,
     inline_edit_input: Entity<InputState>,
     pending_inline_commit: bool,
@@ -434,11 +423,9 @@ impl TaskListView {
             _row_menu_subscription: None,
             sort_menu_open: false,
             edit_open_for: None,
-            slide_edit_open: false,
-            obligations_open: false,
-            lifecycle_panel_open: false,
-            action_panel_open: false,
-            draft_node_id: None,
+            drawer_open: false,
+            published_selection: initial_selection.1.clone(),
+            draft: None,
             edit_original_title: None,
             inline_edit_input,
             pending_inline_commit: false,
@@ -573,6 +560,7 @@ impl TaskListView {
         self.last_selected = selected_ix;
         self.pending_revert = None;
         self.persist_working_set();
+        self.publish_selection(cx);
         cx.notify();
     }
 
@@ -585,26 +573,31 @@ impl TaskListView {
         if self.edit_open_for.is_some() && previous.as_deref() != Some(new_id.as_str()) {
             self.pending_abandon_edit = true;
         }
-        if self.slide_edit_open && previous.as_deref() != Some(new_id.as_str()) {
-            self.emit_open_edit_for(&new_id, cx);
-        }
-        if self.obligations_open && previous.as_deref() != Some(new_id.as_str()) {
-            self.emit_open_obligations_for(&new_id, false, cx);
-        }
-        if self.lifecycle_panel_open && previous.as_deref() != Some(new_id.as_str()) {
-            cx.emit(TaskListEvent::RetargetLifecycle {
-                task_id: new_id.clone(),
-            });
-        }
-        if self.action_panel_open && previous.as_deref() != Some(new_id.as_str()) {
-            cx.emit(TaskListEvent::RetargetActionPanel {
-                task_id: new_id.clone(),
-            });
-        }
         self.recently_updated_copy_ids.remove(&new_id);
         self.working_set.selected_id = Some(new_id);
         self.persist_working_set();
+        self.publish_selection(cx);
         cx.notify();
+    }
+
+    /// Tell the shell the selection moved so the right drawer follows it.
+    /// Every path that changes `working_set.selected_id` calls this, and
+    /// `render` does too, so a path that forgets still can't strand the drawer
+    /// on a node that is no longer selected.
+    fn publish_selection(&mut self, cx: &mut Context<Self>) {
+        if self.published_selection == self.working_set.selected_id {
+            return;
+        }
+        // A draft row has no node yet; the drawer stays on the last real one.
+        if let Some(id) = self.working_set.selected_id.as_deref() {
+            if self.is_draft_id(id) {
+                return;
+            }
+        }
+        self.published_selection = self.working_set.selected_id.clone();
+        cx.emit(TaskListEvent::SelectionChanged {
+            task_id: self.published_selection.clone(),
+        });
     }
 
     fn persist_working_set(&mut self) {
@@ -837,64 +830,16 @@ impl TaskListView {
         self.set_collapsed(task_id, !task.collapsed, window, cx);
     }
 
+    /// Create a node titled `title` at `position` relative to the selection.
     fn create_tree_node(
         &mut self,
         position: CreatePosition,
+        title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let list_id = match self.active_list_id {
-            Some(id) => id,
-            None => {
-                self.show_error("Create a list first (Enter or Ctrl+Shift+L)", window, cx);
-                return None;
-            }
-        };
-        let before_ids: std::collections::HashSet<_> =
-            self.all_tasks.iter().map(|t| t.id.clone()).collect();
-        let new_node_id = uuid::Uuid::new_v4();
-        let anchor = self
-            .working_set
-            .selected_id
-            .as_deref()
-            .and_then(|id| uuid::Uuid::parse_str(id).ok());
-        let parent_id = if position == CreatePosition::Child {
-            anchor
-        } else {
-            None
-        };
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::CreateNode {
-            node_id: Some(new_node_id),
-            list_id,
-            parent_id,
-            anchor_id: anchor,
-            position,
-            title: String::new(),
-        }) {
-            self.show_error(format!("Failed to create item: {err}"), window, cx);
-            return None;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.show_error(format!("Failed to create item: {err}"), window, cx);
-            return None;
-        }
-        self.live_refresh(window, cx);
-        let new_id = if self
-            .all_tasks
-            .iter()
-            .any(|t| t.id == new_node_id.to_string())
-        {
-            Some(new_node_id.to_string())
-        } else {
-            self.all_tasks
-                .iter()
-                .find(|t| !before_ids.contains(&t.id))
-                .map(|t| t.id.clone())
-        };
-        if let Some(ref id) = new_id {
-            self.select_created_task(id, window, cx);
-        }
-        new_id
+        let draft = self.draft_placement(position, window, cx)?;
+        self.create_node_at(&draft, title, window, cx)
     }
 
     fn reload_outline_lists(&mut self) {
@@ -1106,12 +1051,6 @@ impl TaskListView {
             return;
         }
         self.close_chrome_overlays(cx);
-        if self.slide_edit_open {
-            cx.emit(TaskListEvent::CloseTaskEdit);
-        }
-        if self.obligations_open {
-            cx.emit(TaskListEvent::CloseObligations);
-        }
         cx.emit(TaskListEvent::OpenActionPanel {
             task_id: task_id.to_string(),
         });
@@ -1220,8 +1159,16 @@ impl TaskListView {
         );
     }
 
-    /// Open the lifecycle transition panel for a task (bypasses interview routing).
-    pub fn open_lifecycle_panel(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
+    /// Open the lifecycle transition panel for a task (bypasses interview
+    /// routing), selecting it in the tree so the drawer shows the selection.
+    pub fn open_lifecycle_panel(
+        &mut self,
+        task_id: &str,
+        lifecycle: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_task_by_id(task_id, window, cx);
         cx.emit(TaskListEvent::OpenLifecycle {
             task_id: task_id.to_string(),
             lifecycle: lifecycle.to_string(),
@@ -1252,16 +1199,19 @@ impl TaskListView {
                 state.scroll_to_selected_item(window, cx);
             });
             self.persist_working_set();
+            self.publish_selection(cx);
         }
     }
 
     fn emit_open_edit_for(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        if self.is_draft_id(task_id) {
+            return;
+        }
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
             return;
         };
         cx.emit(TaskListEvent::OpenTaskEdit {
             task_id: task_id.to_string(),
-            _title: task.title.clone(),
         });
         self.set_status_line(format!("Edit: {}", task.title), cx);
     }
@@ -1273,27 +1223,9 @@ impl TaskListView {
         cx: &mut Context<Self>,
     ) {
         self.close_chrome_overlays(cx);
-        if self.obligations_open {
-            cx.emit(TaskListEvent::CloseObligations);
-        }
         self.emit_open_edit_for(task_id, cx);
         self.bump_interaction(task_id, window, cx);
         cx.notify();
-    }
-
-    fn emit_open_obligations_for(&mut self, task_id: &str, focus: bool, cx: &mut Context<Self>) {
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
-            return;
-        };
-        if !task.has_spec {
-            return;
-        }
-        cx.emit(TaskListEvent::OpenObligations {
-            task_id: task_id.to_string(),
-            title: task.title.clone(),
-            focus,
-        });
-        self.set_status_line(format!("Obligations: {}", task.title), cx);
     }
 
     pub fn open_obligations_panel(
@@ -1302,7 +1234,7 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
         };
         if !task.has_spec {
@@ -1310,43 +1242,21 @@ impl TaskListView {
             return;
         }
         self.close_chrome_overlays(cx);
-        if self.slide_edit_open {
-            cx.emit(TaskListEvent::CloseTaskEdit);
-        }
-        self.emit_open_obligations_for(task_id, true, cx);
+        cx.emit(TaskListEvent::OpenObligations {
+            task_id: task_id.to_string(),
+            title: task.title.clone(),
+        });
+        self.set_status_line(format!("Obligations: {}", task.title), cx);
         self.bump_interaction(task_id, window, cx);
         cx.notify();
     }
 
-    pub fn set_slide_edit_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.slide_edit_open = open;
-        if !open {
-            self.set_status_line("", cx);
-        } else {
-            cx.notify();
+    /// Kept in sync by the shell, so Escape in the tree knows to close the drawer.
+    pub fn set_drawer_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.drawer_open == open {
+            return;
         }
-    }
-
-    pub fn set_lifecycle_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.lifecycle_panel_open = open;
-        if !open {
-            self.set_status_line("", cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    pub fn set_obligations_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.obligations_open = open;
-        if !open {
-            self.set_status_line("", cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    pub fn set_action_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.action_panel_open = open;
+        self.drawer_open = open;
         if !open {
             self.set_status_line("", cx);
         } else {
@@ -1428,19 +1338,10 @@ impl TaskListView {
         let visible_before =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         let selected = self.working_set.selected_id.clone();
-        if self.slide_edit_open {
-            cx.emit(TaskListEvent::CloseTaskEdit);
-        }
-        if self.obligations_open {
-            cx.emit(TaskListEvent::CloseObligations);
-        }
-        if self.action_panel_open {
-            cx.emit(TaskListEvent::CloseActionPanel);
-        }
         if self.edit_open_for.as_deref() == Some(task_id) {
             self.edit_open_for = None;
         }
-        self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
+        self.reload_all_tasks();
         self.apply_agent_activity();
         let visible_after =
             Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
@@ -1451,6 +1352,17 @@ impl TaskListView {
             task_id,
         );
         self.rebuild_visible_list(window, cx);
+    }
+
+    /// Load the active list's rows, with the draft row spliced in where it will be created.
+    fn reload_all_tasks(&mut self) {
+        let mut tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
+        if let Some(draft) = &self.draft {
+            if Some(draft.list_id) == self.active_list_id {
+                edit::insert_draft_row(&mut tasks, draft);
+            }
+        }
+        self.all_tasks = tasks;
     }
 
     fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1468,7 +1380,7 @@ impl TaskListView {
                 .filter(|id| self.outline_lists.iter().any(|l| l.id == *id))
                 .or_else(|| self.outline_lists.first().map(|l| l.id));
         }
-        self.all_tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
+        self.reload_all_tasks();
         self.apply_agent_activity();
         if let Some(sel) = selected.clone() {
             if !self.all_tasks.iter().any(|t| t.id == sel) {
@@ -1715,12 +1627,8 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.slide_edit_open {
-            cx.emit(TaskListEvent::CloseTaskEdit);
-        } else if self.obligations_open {
-            cx.emit(TaskListEvent::CloseObligations);
-        } else if self.action_panel_open {
-            cx.emit(TaskListEvent::CloseActionPanel);
+        if self.drawer_open {
+            cx.emit(TaskListEvent::CloseDrawer);
         } else if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
         } else if self.compose_open {
@@ -2072,12 +1980,20 @@ impl TaskListView {
             cx.propagate();
             return;
         }
+        if self.is_draft_edit() {
+            self.reparent_draft(1, window, cx);
+            return;
+        }
         self.reparent_selected(1, window, cx);
     }
 
     fn on_outdent(&mut self, _: &TaskListOutdent, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() && !self.is_draft_edit() {
             cx.propagate();
+            return;
+        }
+        if self.is_draft_edit() {
+            self.reparent_draft(-1, window, cx);
             return;
         }
         self.reparent_selected(-1, window, cx);
@@ -2149,14 +2065,6 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_editing() {
-            let title = self.inline_edit_title(cx);
-            if self.is_draft_edit() && title.is_empty() {
-                self.abandon_inline_edit(window, cx, true);
-            } else if !self.commit_inline_edit(window, cx) {
-                return;
-            }
-        }
         self.create_tree_node_and_edit(CreatePosition::Child, window, cx);
     }
 
@@ -2571,6 +2479,7 @@ impl Render for TaskListView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         self.sync_search_from_input(window, cx);
         self.sync_generator_filter_from_input(window, cx);
+        self.publish_selection(cx);
         if self.pending_live_refresh {
             self.pending_live_refresh = false;
             self.live_refresh(window, cx);

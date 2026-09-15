@@ -4,6 +4,7 @@ mod fleet_blocked;
 mod history_window;
 mod interactive_agent_window;
 mod no_focus;
+mod right_drawer;
 pub mod transcript_window;
 pub mod window;
 
