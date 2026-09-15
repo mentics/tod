@@ -3,11 +3,10 @@
 use crate::interview::{PHASES, PHASE_UNKNOWN};
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
-use crate::outline::types::{Capability, NodeKind};
+use crate::outline::types::Capability;
 use crate::outline::uuid_blob::uuid_to_blob;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::collections::HashSet;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -43,12 +42,9 @@ pub fn resolve_obligations(
     node_id: Uuid,
     max_phase: Option<&str>,
 ) -> Result<Vec<ResolvedObligation>> {
-    let outline = OutlineRepo::new(conn);
-    let entry = outline.get_entry(node_id)?.context("node not in outline")?;
-    let loader = crate::outline::repos::tree::TreeLoader::new(conn);
-    if loader.list_has_open_loop(entry.list_id)? {
-        anyhow::bail!("reference loop in list — fix before resolving obligations");
-    }
+    OutlineRepo::new(conn)
+        .get_entry(node_id)?
+        .context("node not in outline")?;
 
     let mut out = Vec::new();
     let global = ObligationRepo::new(conn).list_global_adopted()?;
@@ -62,17 +58,9 @@ pub fn resolve_obligations(
     let ancestors = ancestor_chain(conn, node_id)?;
     let node_repo = NodeRepo::new(conn);
     let obl_repo = ObligationRepo::new(conn);
-    let mut visited_refs = HashSet::new();
 
     for ancestor_id in ancestors {
-        collect_node_obligations(
-            conn,
-            &node_repo,
-            &obl_repo,
-            ancestor_id,
-            &mut visited_refs,
-            &mut out,
-        )?;
+        collect_node_obligations(&node_repo, &obl_repo, ancestor_id, &mut out)?;
     }
 
     if let Some(max_phase) = max_phase {
@@ -111,30 +99,12 @@ fn collect_ancestors(conn: &Connection, node_id: Uuid, list_id: Uuid) -> Result<
 }
 
 fn collect_node_obligations(
-    conn: &Connection,
     node_repo: &NodeRepo<'_>,
     obl_repo: &ObligationRepo<'_>,
     node_id: Uuid,
-    visited_refs: &mut HashSet<Uuid>,
     out: &mut Vec<ResolvedObligation>,
 ) -> Result<()> {
-    let Some(node) = node_repo.get(node_id)? else {
-        return Ok(());
-    };
-
-    if node.kind == NodeKind::Reference {
-        if let Some(target) = node.ref_target_id {
-            if !visited_refs.insert(target) {
-                return Ok(());
-            }
-            let target_entry = OutlineRepo::new(conn).get_entry(target)?;
-            if let Some(entry) = target_entry {
-                let ancestors = collect_ancestors(conn, target, entry.list_id)?;
-                for aid in ancestors {
-                    collect_node_obligations(conn, node_repo, obl_repo, aid, visited_refs, out)?;
-                }
-            }
-        }
+    if node_repo.get(node_id)?.is_none() {
         return Ok(());
     }
 

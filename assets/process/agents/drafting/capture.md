@@ -13,4 +13,4 @@ Capture is light: raise a choice almost never, and don't record buildable.
 
 ## Rewrite pre-v3 obligations
 
-When the turn asks for it, rewrite this node's obligations whose reason is "Written before drafting v3" into the smallest powerful set: merge, reword, move, or delete what is already covered. Give every obligation you keep a fresh attention level and reason. Leave `user` obligations as they are.
+When the turn asks for it, rewrite this node's obligations whose reason is "Written before drafting v3" into the smallest powerful set: merge, reword, move, or delete what is already covered. Give every obligation you keep a fresh attention level and reason. Leave `user` obligations as they are. Write each replacement and check it reads back in `obligations list` before deleting what it covers; never delete an obligation you haven't read.

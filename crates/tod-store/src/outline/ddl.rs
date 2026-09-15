@@ -15,18 +15,10 @@ CREATE TABLE IF NOT EXISTS nodes (
     id              BLOB PRIMARY KEY NOT NULL,
     slug            TEXT NOT NULL UNIQUE CHECK (length(slug) <= 40),
     title           TEXT NOT NULL,
-    kind            TEXT NOT NULL DEFAULT 'normal'
-                    CHECK (kind IN ('normal', 'reference')),
-    ref_target_id   BLOB REFERENCES nodes(id) ON DELETE RESTRICT,
     created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    CHECK (
-        (kind = 'reference' AND ref_target_id IS NOT NULL)
-        OR (kind = 'normal' AND ref_target_id IS NULL)
-    )
+    updated_at      INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_slug_folded ON nodes(lower(slug));
-CREATE INDEX IF NOT EXISTS idx_nodes_ref_target ON nodes(ref_target_id);
 
 CREATE TABLE IF NOT EXISTS node_capabilities (
     node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
@@ -144,16 +136,6 @@ CREATE TABLE IF NOT EXISTS node_media_links (
     ordinal     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (node_id, media_id, role)
 );
-
-CREATE TABLE IF NOT EXISTS list_health_issues (
-    id          BLOB PRIMARY KEY NOT NULL,
-    list_id     BLOB NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
-    issue_type  TEXT NOT NULL CHECK (issue_type IN ('reference_loop')),
-    detail      TEXT NOT NULL,
-    detected_at INTEGER NOT NULL,
-    cleared_at  INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_list_health_open ON list_health_issues(list_id) WHERE cleared_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS interview_sessions (
     id              BLOB PRIMARY KEY NOT NULL,

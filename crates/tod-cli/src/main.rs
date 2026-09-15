@@ -265,6 +265,9 @@ mod tests {
         assert!(listed.contains("<agent, high: A taste call>"), "{listed}");
 
         // References must name a node that exists.
+        let err = cli(&root, &["obligations", "add", "--node", &node, "--kind", "req", "--body", "…"])
+            .unwrap_err();
+        assert!(err.to_string().contains("has no words"), "{err}");
         let err = cli(
             &root,
             &["obligations", "add", "--node", &node, "--kind", "req", "--body", "Uses [[no-such-node]]."],

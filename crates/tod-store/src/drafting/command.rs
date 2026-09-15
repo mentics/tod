@@ -298,13 +298,20 @@ pub fn record_drafting_turn(
     Ok(json!({}))
 }
 
-/// Refuse an agent's obligation text when it references a slug no node has.
+/// Refuse an agent's obligation text when it has no words (a placeholder such
+/// as `-`) or references a slug no node has.
 pub fn check_references(conn: &Connection, mutation: &OutlineMutation) -> Result<()> {
     let body = match mutation {
         OutlineMutation::CreateObligation { body, .. }
         | OutlineMutation::UpdateObligationBody { body, .. } => body,
         _ => return Ok(()),
     };
+    if !body.chars().any(char::is_alphanumeric) {
+        bail!(
+            "obligation text `{}` has no words: pass the text itself, or `--body -` with the text on stdin",
+            body.trim()
+        );
+    }
     let missing = DraftingRepo::new(conn).missing_slugs(body)?;
     if !missing.is_empty() {
         bail!(

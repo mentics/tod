@@ -3,29 +3,6 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NodeKind {
-    Normal,
-    Reference,
-}
-
-impl NodeKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Normal => "normal",
-            Self::Reference => "reference",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "normal" => Some(Self::Normal),
-            "reference" => Some(Self::Reference),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Capability {
     Spec,
@@ -141,8 +118,6 @@ pub struct Node {
     pub id: Uuid,
     pub slug: String,
     pub title: String,
-    pub kind: NodeKind,
-    pub ref_target_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

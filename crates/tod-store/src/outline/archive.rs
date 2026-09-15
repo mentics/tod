@@ -28,8 +28,6 @@ pub struct ArchivedNode {
     pub id: Uuid,
     pub slug: String,
     pub title: String,
-    pub kind: String,
-    pub ref_target_id: Option<Uuid>,
     pub created_at: i64,
     pub updated_at: i64,
     pub outline: ArchivedOutlineEntry,
@@ -211,30 +209,6 @@ fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
             anyhow::bail!("{label} has associated agents — remove them before deleting");
         }
     }
-    let placeholders = subtree.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let blobs: Vec<Vec<u8>> = subtree.iter().map(|id| uuid_to_blob(*id)).collect();
-    let sql = format!(
-        "SELECT id FROM nodes WHERE kind = 'reference' AND ref_target_id IN ({placeholders})
-         AND id NOT IN ({placeholders})"
-    );
-    let mut refs: Vec<Uuid> = Vec::new();
-    {
-        let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = blobs
-            .iter()
-            .chain(blobs.iter())
-            .map(|b| b as &dyn rusqlite::ToSql)
-            .collect();
-        let mut rows = stmt.query(rusqlite::params_from_iter(params))?;
-        while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(0)?;
-            refs.push(blob_to_uuid_sql(&blob)?);
-        }
-    }
-    if !refs.is_empty() {
-        let label = node_label(conn, root_id);
-        anyhow::bail!("{label} is referenced by other nodes and cannot be deleted");
-    }
     Ok(())
 }
 
@@ -329,8 +303,6 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         id: node.id,
         slug: node.slug,
         title: node.title,
-        kind: node.kind.as_str().to_string(),
-        ref_target_id: node.ref_target_id,
         created_at: node.created_at.timestamp_millis(),
         updated_at: node.updated_at.timestamp_millis(),
         outline: ArchivedOutlineEntry {
@@ -439,16 +411,13 @@ fn snapshot_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<Archived
 
 fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     let blob = uuid_to_blob(archived.id);
-    let ref_blob = archived.ref_target_id.map(uuid_to_blob);
     conn.execute(
-        "INSERT OR IGNORE INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR IGNORE INTO nodes (id, slug, title, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             blob,
             archived.slug,
             archived.title,
-            archived.kind,
-            ref_blob,
             archived.created_at,
             archived.updated_at,
         ],

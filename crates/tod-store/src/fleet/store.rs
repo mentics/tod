@@ -723,14 +723,6 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
-    /// Whether a list has an open reference-loop health issue.
-    pub fn list_has_reference_loop(&self, list_id: uuid::Uuid) -> Result<bool> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        TreeLoader::new(&guard.connection())
-            .list_has_open_loop(list_id)
-            .map_err(Into::into)
-    }
-
     /// Enqueue an outline mutation.
     pub fn enqueue_outline(&self, mutation: OutlineMutation) -> Result<(), FleetWriterError> {
         self.enqueue(FleetMutation::Outline(mutation))

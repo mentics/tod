@@ -15,7 +15,21 @@ pub struct Args {
 
 impl Args {
     pub fn parse(args: &[String]) -> anyhow::Result<Self> {
+        Self::parse_with_stdin(args, || {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+            Ok(text)
+        })
+    }
+
+    /// [`Args::parse`], with `read_stdin` supplying the text of the one flag
+    /// whose value is `-` (`--body -` with a heredoc, for long or multi-line text).
+    pub fn parse_with_stdin(
+        args: &[String],
+        read_stdin: impl FnOnce() -> std::io::Result<String>,
+    ) -> anyhow::Result<Self> {
         let mut out = Args::default();
+        let mut stdin_flag: Option<&String> = None;
         let mut i = 0;
         while i < args.len() {
             let arg = &args[i];
@@ -26,11 +40,25 @@ impl Args {
                 let value = args
                     .get(i)
                     .ok_or_else(|| anyhow::anyhow!("{arg} requires a value"))?;
+                if value == "-" {
+                    if let Some(first) = stdin_flag {
+                        anyhow::bail!("only one flag can read stdin, but {first} and {arg} are both `-`");
+                    }
+                    stdin_flag = Some(arg);
+                }
                 out.flags.insert(arg.clone(), value.clone());
             } else {
                 out.positional.push(arg.clone());
             }
             i += 1;
+        }
+        if let Some(flag) = stdin_flag {
+            let text = read_stdin()?;
+            let text = text.trim_end_matches(['\r', '\n']);
+            if text.trim().is_empty() {
+                anyhow::bail!("{flag} - read nothing from stdin");
+            }
+            out.flags.insert(flag.clone(), text.to_string());
         }
         Ok(out)
     }
@@ -106,6 +134,21 @@ mod tests {
         assert_eq!(parse(&["7"]).unwrap().seq("q").unwrap(), 7);
         assert!(parse(&["x-2"]).unwrap().seq("q").is_err());
         assert!(parse(&[]).unwrap().seq("q").is_err());
+    }
+
+    #[test]
+    fn a_dash_value_reads_its_text_from_stdin() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let args = Args::parse_with_stdin(&argv(&["--kind", "req", "--body", "-"]), || {
+            Ok("Line one.\nLine two.\n".into())
+        })
+        .unwrap();
+        assert_eq!(args.get("--body"), Some("Line one.\nLine two."));
+        assert_eq!(args.get("--kind"), Some("req"));
+        assert!(Args::parse_with_stdin(&argv(&["--body", "-"]), || Ok("\n".into())).is_err());
+        assert!(
+            Args::parse_with_stdin(&argv(&["--body", "-", "--why", "-"]), || Ok("x".into())).is_err()
+        );
     }
 
     #[test]
