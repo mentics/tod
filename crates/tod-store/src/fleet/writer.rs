@@ -117,6 +117,14 @@ pub enum FleetMutation {
         run_id: String,
         agent_session_id: String,
     },
+    /// Cache a run's transcript once it reaches Done — see
+    /// `AgentRunRepo::cache_transcript`.
+    CacheAgentRunTranscript {
+        run_id: String,
+        transcript: String,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
     EndAgentRun {
         run_id: String,
     },
@@ -210,6 +218,7 @@ impl FleetMutation {
                 | FleetMutation::UpdateAgentRunRuntimeStatus { .. }
                 | FleetMutation::CreateAgentRun { .. }
                 | FleetMutation::SetAgentRunSessionId { .. }
+                | FleetMutation::CacheAgentRunTranscript { .. }
                 | FleetMutation::EndAgentRun { .. }
                 | FleetMutation::DeleteAgentRun { .. }
                 | FleetMutation::SendPrompt { .. }
@@ -336,6 +345,17 @@ impl FleetMutation {
                 agent_session_id,
             } => {
                 AgentRunRepo::new(conn).set_agent_session_id(run_id, agent_session_id)?;
+            }
+            FleetMutation::CacheAgentRunTranscript {
+                run_id,
+                transcript,
+                fingerprint,
+            } => {
+                AgentRunRepo::new(conn).cache_transcript(
+                    run_id,
+                    transcript,
+                    fingerprint.as_deref(),
+                )?;
             }
             FleetMutation::EndAgentRun { run_id } => {
                 AgentRunRepo::new(conn).end_run(run_id)?;

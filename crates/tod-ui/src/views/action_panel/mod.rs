@@ -58,6 +58,9 @@ struct InFlightFleetRun {
     fleet_run_id: String,
     prompt_id: String,
     response_id: String,
+    /// Kept to build the cached transcript once the run completes — see
+    /// `FleetMutation::CacheAgentRunTranscript`.
+    prompt: String,
 }
 
 pub struct ActionPanelView {
@@ -347,6 +350,21 @@ impl ActionPanelView {
             });
         }
         for (_, flight, result) in &finished {
+            if let Ok(content) = result {
+                // A fleet-agent run is a single prompt/response pair, so
+                // that pair *is* its transcript — no need to fetch anything
+                // back from the agent. This is the run's whole conversation,
+                // cached once on completion (Done) rather than accumulated
+                // turn-by-turn as it streamed.
+                let transcript = format!("Prompt:\n{}\n\nResponse:\n{content}", flight.prompt);
+                let _ = self.fleet.enqueue(FleetMutation::CacheAgentRunTranscript {
+                    run_id: flight.fleet_run_id.clone(),
+                    transcript,
+                    fingerprint: None,
+                });
+            }
+        }
+        for (_, flight, result) in &finished {
             match result {
                 Ok(content) => {
                     let _ = self.fleet.enqueue(FleetMutation::CompleteResponse {
@@ -476,6 +494,7 @@ impl ActionPanelView {
             error_toast(window, cx, format!("Launch agent failed: {err}"));
             return;
         }
+        let prompt_for_transcript = prompt.clone();
         let provider_run = {
             let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
             let mut agent = self.agent.lock().expect("agent mutex");
@@ -488,6 +507,7 @@ impl ActionPanelView {
                     fleet_run_id: fleet_run_id.clone(),
                     prompt_id,
                     response_id,
+                    prompt: prompt_for_transcript,
                 });
                 self.changed(format!("Launched agent in {}", cwd.display()), cx);
             }
