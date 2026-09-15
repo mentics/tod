@@ -1,6 +1,6 @@
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, Anchor, DismissEvent, Entity, Focusable, InteractiveElement, IntoElement,
+    Anchor, App, Context, DismissEvent, Entity, Focusable, InteractiveElement, IntoElement,
     ParentElement, Styled, Window, anchored, deferred, div, px,
 };
 

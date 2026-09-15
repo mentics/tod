@@ -123,10 +123,8 @@ mod tests {
 
     #[test]
     fn generator_sorts_round_trip_across_save_and_load() {
-        let dir = std::env::temp_dir().join(format!(
-            "tod-working-set-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tod-working-set-test-{}", uuid::Uuid::new_v4()));
         let mut ws = ListWorkingSet::default_sort();
         ws.generator_sorts.insert(
             "gen-1".into(),

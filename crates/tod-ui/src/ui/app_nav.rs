@@ -2,7 +2,7 @@ use crate::ui::actionable::chrome_control_with_shortcut_in_context;
 use crate::ui::key_context::NOT_INPUT;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Anchor, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    Anchor, App, AppContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions, anchored,
     deferred, div, px, rems,

@@ -12,14 +12,14 @@ use crate::ui::list::{
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use delegate::{
-    NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, SECTION_EDIT_TAG,
-    group_row_key, new_section_row_key, obligation_section, phase_row_key, section_row_key,
+    NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, SECTION_EDIT_TAG, group_row_key,
+    new_section_row_key, obligation_section, phase_row_key, section_row_key,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
+    Styled, Subscription, Window, actions, div, px,
 };
 use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
@@ -106,7 +106,10 @@ pub fn register_obligations_keyboard_bindings(cx: &mut App) {
         KeyBinding::new(
             "enter",
             ObligationsCommitEdit,
-            Some(key_context::including_tag(OBLIGATIONS_CONTEXT, SECTION_EDIT_TAG)),
+            Some(key_context::including_tag(
+                OBLIGATIONS_CONTEXT,
+                SECTION_EDIT_TAG,
+            )),
         ),
     ]);
     // Left/Right collapse/expand rows here, so crossing back to the tree uses Ctrl+arrows.
@@ -205,25 +208,27 @@ impl ObligationsView {
         let section_edit_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Section name… (Enter to save, Esc to cancel)")
         });
-        let _section_edit_subscription =
-            cx.subscribe(&section_edit_input, |this, _, event, cx| {
-                if matches!(event, InputEvent::Blur) {
-                    this.pending_abandon_section_edit = true;
-                    cx.notify();
-                }
-            });
+        let _section_edit_subscription = cx.subscribe(&section_edit_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::Blur) {
+                this.pending_abandon_section_edit = true;
+                cx.notify();
+            }
+        });
 
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search obligations…"));
 
-        let delegate = ObligationListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
+        let delegate =
+            ObligationListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
         cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -426,7 +431,11 @@ impl ObligationsView {
     /// ones). `planning` is not a valid obligation phase — planning work is
     /// tracked as plan steps instead — so it never appears here.
     fn phase_order() -> [&'static str; OBLIGATION_PHASES.len()] {
-        [PHASE_REQUIREMENTS, tod_store::interview::PHASE_DESIGN, PHASE_UNKNOWN]
+        [
+            PHASE_REQUIREMENTS,
+            tod_store::interview::PHASE_DESIGN,
+            PHASE_UNKNOWN,
+        ]
     }
 
     /// Items matching the current search query (body or section text),
@@ -435,8 +444,11 @@ impl ObligationsView {
     /// but every term must match for the item to be included. Empty query
     /// matches everything.
     fn search_matches(&self) -> Vec<&NodeObligation> {
-        let terms: Vec<String> =
-            self.search_query.split_whitespace().map(|t| t.to_lowercase()).collect();
+        let terms: Vec<String> = self
+            .search_query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
         if terms.is_empty() {
             return self.items.iter().collect();
         }
@@ -445,8 +457,10 @@ impl ObligationsView {
             .filter(|o| {
                 let body = o.body.to_lowercase();
                 let section = o.section.as_deref().unwrap_or("").to_lowercase();
-                let words: Vec<&str> =
-                    body.split_whitespace().chain(section.split_whitespace()).collect();
+                let words: Vec<&str> = body
+                    .split_whitespace()
+                    .chain(section.split_whitespace())
+                    .collect();
                 terms.iter().all(|term| fuzzy_term_matches(term, &words))
             })
             .collect()
@@ -456,7 +470,11 @@ impl ObligationsView {
         let mut rows = Vec::new();
         let matching = self.search_matches();
         for phase in Self::phase_order() {
-            let phase_items: Vec<_> = matching.iter().filter(|o| o.phase == phase).copied().collect();
+            let phase_items: Vec<_> = matching
+                .iter()
+                .filter(|o| o.phase == phase)
+                .copied()
+                .collect();
             if phase_items.is_empty() {
                 continue;
             }
@@ -1094,7 +1112,14 @@ impl ObligationsView {
             }
             Some(ObligationRow::Item { obligation }) => {
                 let phase = obligation.phase.clone();
-                self.create_in_kind(&phase, &obligation.kind, Some(obligation.id), before, window, cx);
+                self.create_in_kind(
+                    &phase,
+                    &obligation.kind,
+                    Some(obligation.id),
+                    before,
+                    window,
+                    cx,
+                );
             }
             Some(ObligationRow::Phase { phase, .. }) => {
                 self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
@@ -1249,7 +1274,9 @@ impl ObligationsView {
         let next_key = self
             .items
             .iter()
-            .filter(|o| o.phase == phase && o.kind == kind && obligation_section(o) == section && o.id != id)
+            .filter(|o| {
+                o.phase == phase && o.kind == kind && obligation_section(o) == section && o.id != id
+            })
             .find(|o| o.ordinal > obligation.ordinal)
             .map(|o| o.id.to_string())
             .or_else(|| {
@@ -1328,13 +1355,21 @@ impl ObligationsView {
                 RowAction::ToggleGroup { phase, kind } => {
                     self.toggle_group(&phase, &kind, window, cx);
                 }
-                RowAction::ToggleSection { phase, kind, section } => {
+                RowAction::ToggleSection {
+                    phase,
+                    kind,
+                    section,
+                } => {
                     self.toggle_section(&phase, &kind, &section, window, cx);
                 }
                 RowAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
                 }
-                RowAction::StartSectionEdit { phase, kind, section } => {
+                RowAction::StartSectionEdit {
+                    phase,
+                    kind,
+                    section,
+                } => {
                     let kind = if kind == KIND_REQUIREMENT {
                         KIND_REQUIREMENT
                     } else {
@@ -1572,7 +1607,9 @@ impl ObligationsView {
             Some(ObligationRow::Item { obligation }) if obligation.kind == KIND_CONSTRAINT => {
                 (obligation.phase.clone(), KIND_CONSTRAINT)
             }
-            Some(ObligationRow::Item { obligation }) => (obligation.phase.clone(), KIND_REQUIREMENT),
+            Some(ObligationRow::Item { obligation }) => {
+                (obligation.phase.clone(), KIND_REQUIREMENT)
+            }
             Some(ObligationRow::Phase { phase, .. }) => (phase, KIND_REQUIREMENT),
             None => (self.default_creation_phase(), KIND_REQUIREMENT),
         };

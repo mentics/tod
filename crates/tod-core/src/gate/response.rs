@@ -403,7 +403,8 @@ gate_results:
 
     #[test]
     fn falls_back_to_the_last_fence_when_none_have_a_result_field() {
-        let text = "```yaml\ngate_check:\n  forward_state: planning\n```\n\n```yaml\nunrelated: true\n```";
+        let text =
+            "```yaml\ngate_check:\n  forward_state: planning\n```\n\n```yaml\nunrelated: true\n```";
         // Neither fence has `result:` — falls back to the last fence, which
         // then fails to deserialize (missing required field), same as today.
         assert!(parse_gate_reply(text).is_err());

@@ -143,9 +143,14 @@ fn mock_draft(phase: &str, n: usize) -> QuestionDraft {
             covers: vec![format!("mock-area-{n}")],
             context: Some(format!("Mock context for question {n}.")),
             question: format!("Mock question {n}: record this requirement?"),
-            intent: Some("Option 2 means the user wants something different: hand off a follow-up.".into()),
+            intent: Some(
+                "Option 2 means the user wants something different: hand off a follow-up.".into(),
+            ),
             recommend: Some("1".into()),
-            options: vec!["Accept as written".into(), "Not quite — explain in notes".into()],
+            options: vec![
+                "Accept as written".into(),
+                "Not quite — explain in notes".into(),
+            ],
             proposal: Some(Proposal {
                 op: ProposalOp::Add,
                 kind: Some("requirement".into()),
@@ -186,7 +191,8 @@ fn answer_processor(
         .unwrap_or_default();
     let mut processed = 0;
     for seq in seqs {
-        let Some(q) = client.read(|conn| InterviewRepo::new(conn).get_question(row.node_id, seq))?
+        let Some(q) =
+            client.read(|conn| InterviewRepo::new(conn).get_question(row.node_id, seq))?
         else {
             continue;
         };

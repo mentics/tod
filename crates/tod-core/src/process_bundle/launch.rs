@@ -40,7 +40,8 @@ pub fn drafting_session_prefix(
 ) -> Result<String> {
     Ok(format!(
         "## Role\n\n{}\n\n## Drafting conventions\n\n{}\n",
-        read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?.trim(),
+        read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?
+            .trim(),
         read_doc(&manifest.drafting_base_doc())?.trim(),
     ))
 }

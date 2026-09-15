@@ -39,8 +39,17 @@ pub struct ObligationSelection {
 /// Everything the dynamic half of the first message describes.
 #[derive(Debug, Clone)]
 pub struct ContextRequest<'a> {
-    /// Context key under `media/context/` (e.g. `"obligations"`).
-    pub key: &'a str,
+    /// Which surface opened this chat (e.g. `"obligations"`,
+    /// `"design/visual-design"`), for the surface-specific wording in the
+    /// dynamic block below. Not the list of static fragments to load — see
+    /// `layers`.
+    pub surface: &'a str,
+    /// Static context fragments to load, in order — see
+    /// `crate::media::load_static_context`. Each surface picks exactly the
+    /// fragments it needs (e.g. interactive surfaces add `"interactive"`;
+    /// surfaces that never call `tod-cli` leave out `"tod_cli"`), so nothing
+    /// surface-specific leaks into a surface that doesn't want it.
+    pub layers: &'a [&'a str],
     pub data_root: &'a Path,
     pub node: NodeSelection,
     pub obligation: Option<ObligationSelection>,
@@ -53,7 +62,7 @@ pub struct ContextRequest<'a> {
 
 /// Build the full first message: static layers, then the live selection.
 pub fn build_first_message(paths: &MediaPaths, request: &ContextRequest<'_>) -> Result<String> {
-    let mut out = load_static_context(paths, request.key)?;
+    let mut out = load_static_context(paths, request.layers)?;
     out.push_str("\n\n---\n\n");
     out.push_str(&render_dynamic(request));
     Ok(out)
@@ -70,9 +79,7 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
 
     if !request.purposes.is_empty() {
         out.push_str("## Purpose\n\n");
-        out.push_str(
-            "From the top of the tree down to the selected node, most general first:\n\n",
-        );
+        out.push_str("From the top of the tree down to the selected node, most general first:\n\n");
         for purpose in &request.purposes {
             out.push_str(purpose);
             out.push_str("\n\n");
@@ -118,7 +125,7 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
             "\nThe user has this obligation selected, so an unqualified question \
              most likely refers to it.\n",
         );
-    } else if request.key == "obligations" {
+    } else if request.surface == "obligations" {
         out.push_str(
             "\nNo individual obligation is selected — the user is looking at the \
              node's obligations as a whole.\n",
@@ -128,11 +135,17 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
     out
 }
 
-/// Context key under `media/context/` for an implementation session, launched
-/// from the lifecycle panel's Active-phase "Implement" button (see
-/// `crate::gate` for the transition gate that requires Agent and Files
-/// before a node can reach `active` at all).
-pub const IMPLEMENT_CONTEXT_KEY: &str = "active/implement";
+/// Surface key for an implementation session, used for session naming (see
+/// `session_name::session_name_for`) — not a media context key.
+pub const IMPLEMENT_SURFACE_KEY: &str = "active/implement";
+
+/// Static context fragments for an implementation session, launched from the
+/// lifecycle panel's Active-phase "Implement" button (see `crate::gate` for
+/// the transition gate that requires Agent and Files before a node can reach
+/// `active` at all). This is a background work session, not an interactive
+/// chat, so it does not load `"interactive"` (no "confirm before editing",
+/// no "keep replies short" — the agent must act and can be verbose).
+pub const IMPLEMENT_CONTEXT_LAYERS: &[&str] = &["app", "tod_cli", "active/implement"];
 
 /// The user-visible message auto-submitted on an implementation session's
 /// first turn — the Implement button means "go implement this now", so the
@@ -162,8 +175,11 @@ pub struct ImplementRequest<'a> {
 /// Build the full implementation-session first message: static layers (app.md
 /// then active.md then active/implement.md, per the usual context layering),
 /// then the inlined plan and obligation hierarchy.
-pub fn build_implement_message(paths: &MediaPaths, request: &ImplementRequest<'_>) -> Result<String> {
-    let mut out = load_static_context(paths, IMPLEMENT_CONTEXT_KEY)?;
+pub fn build_implement_message(
+    paths: &MediaPaths,
+    request: &ImplementRequest<'_>,
+) -> Result<String> {
+    let mut out = load_static_context(paths, IMPLEMENT_CONTEXT_LAYERS)?;
     out.push_str("\n\n---\n\n");
     out.push_str(&render_implement_dynamic(request));
     Ok(out)
@@ -201,7 +217,11 @@ fn render_implement_dynamic(request: &ImplementRequest<'_>) -> String {
     } else {
         for entry in &request.plan_steps {
             out.push_str("- ");
-            out.push_str(&plan_step_line(&entry.step, &entry.depends_on, &entry.satisfies));
+            out.push_str(&plan_step_line(
+                &entry.step,
+                &entry.depends_on,
+                &entry.satisfies,
+            ));
             out.push('\n');
         }
     }
@@ -244,7 +264,8 @@ mod tests {
     #[test]
     fn includes_data_root_and_node_identity_and_text() {
         let req = ContextRequest {
-            key: "obligations",
+            surface: "obligations",
+            layers: &["obligations"],
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
@@ -261,7 +282,8 @@ mod tests {
     #[test]
     fn purposes_render_general_to_specific_before_selected_node() {
         let req = ContextRequest {
-            key: "obligations",
+            surface: "obligations",
+            layers: &["obligations"],
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
@@ -280,7 +302,8 @@ mod tests {
     #[test]
     fn non_obligations_key_omits_obligations_panel_wording() {
         let req = ContextRequest {
-            key: "design/visual-design",
+            surface: "design/visual-design",
+            layers: &["design/visual-design"],
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
@@ -293,7 +316,8 @@ mod tests {
     #[test]
     fn selected_obligation_contributes_id_and_body() {
         let req = ContextRequest {
-            key: "obligations",
+            surface: "obligations",
+            layers: &["obligations"],
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: Some(ObligationSelection {

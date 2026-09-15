@@ -203,7 +203,9 @@ async fn drain_loop(
 ) {
     while let Ok(pending) = rx.recv().await {
         let result = if matches!(pending.request, UiRequest::Sync) {
-            cx.background_executor().timer(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             Ok("ok".into())
         } else {
             handle_ui_request(cx, window, &transcript_window, &shell, pending.request)
@@ -212,7 +214,9 @@ async fn drain_loop(
 
         while let Ok(pending) = rx.try_recv() {
             let result = if matches!(pending.request, UiRequest::Sync) {
-                cx.background_executor().timer(Duration::from_millis(16)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
                 Ok("ok".into())
             } else {
                 handle_ui_request(cx, window, &transcript_window, &shell, pending.request)

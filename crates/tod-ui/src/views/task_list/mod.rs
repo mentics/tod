@@ -471,7 +471,9 @@ impl TaskListView {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             let mut ticks = 0u32;
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -692,7 +694,11 @@ impl TaskListView {
         let Some(generator_id) = self.generator_ancestor_id(task_id) else {
             return;
         };
-        let entry = self.working_set.generator_sorts.entry(generator_id).or_default();
+        let entry = self
+            .working_set
+            .generator_sorts
+            .entry(generator_id)
+            .or_default();
         if entry.sort_key == tod_core::task::model::SortKey::TicketId {
             entry.sort_key = tod_core::task::model::SortKey::TreeOrder;
             entry.sort_direction = WorkingSet::initial_direction_for_key(entry.sort_key);
@@ -783,7 +789,12 @@ impl TaskListView {
         }
     }
 
-    fn refresh_generator_for(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn refresh_generator_for(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(generator_id) = self.generator_ancestor_id(task_id) else {
             return;
         };
@@ -1113,7 +1124,11 @@ impl TaskListView {
         // Capture in `proposed`, drafting in `design`, the interview in `planning`.
         let label = tod_core::process::spec_view_label(lifecycle).unwrap_or("Interview");
         if interview_phase_for_lifecycle(lifecycle).is_none() {
-            self.show_error(format!("{label} unavailable for this lifecycle state."), window, cx);
+            self.show_error(
+                format!("{label} unavailable for this lifecycle state."),
+                window,
+                cx,
+            );
             return;
         }
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
@@ -1128,13 +1143,20 @@ impl TaskListView {
             return;
         }
         let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
-            self.show_error(format!("{label} unavailable — invalid task id."), window, cx);
+            self.show_error(
+                format!("{label} unavailable — invalid task id."),
+                window,
+                cx,
+            );
             return;
         };
         if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
             if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
                 self.show_error(
-                    format!("Set repository on task before opening {}.", label.to_lowercase()),
+                    format!(
+                        "Set repository on task before opening {}.",
+                        label.to_lowercase()
+                    ),
                     window,
                     cx,
                 );
@@ -1409,7 +1431,11 @@ impl TaskListView {
     /// nothing changed, and deliberately doesn't touch selection or scroll
     /// (unlike `rebuild_visible_list`) so it's safe to call without a
     /// `Window`.
-    pub fn set_agent_activity(&mut self, activity: HashMap<String, String>, cx: &mut Context<Self>) {
+    pub fn set_agent_activity(
+        &mut self,
+        activity: HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.agent_activity == activity {
             return;
         }
@@ -1816,20 +1842,19 @@ impl TaskListView {
             return;
         };
         if self.generator_ancestor_id(&task.id).is_some() {
-            self.show_error(
-                "Cannot paste inside a generator subtree",
-                window,
-                cx,
-            );
+            self.show_error("Cannot paste inside a generator subtree", window, cx);
             return;
         }
         let parent_id = uuid::Uuid::parse_str(&task.id).ok();
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
-            source_node_id,
-            list_id,
-            parent_id,
-            ordinal: 0,
-        }) {
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+                source_node_id,
+                list_id,
+                parent_id,
+                ordinal: 0,
+            })
+        {
             self.show_error(format!("Paste failed: {err}"), window, cx);
             return;
         }

@@ -114,7 +114,12 @@ impl InteractiveAgentWindowControl {
     }
 
     fn end_run_if_unstarted(&self, session_run_id: &str) {
-        let Some(fleet) = self.fleet.lock().expect("interactive agent fleet mutex").clone() else {
+        let Some(fleet) = self
+            .fleet
+            .lock()
+            .expect("interactive agent fleet mutex")
+            .clone()
+        else {
             return;
         };
         let Ok(Some(run)) = fleet.get_run(session_run_id) else {
@@ -496,8 +501,9 @@ fn launch_chat_in_terminal(
                 cmd.push_str(&shell_quote(effort));
             }
             if let Some(context) = initial_context.filter(|c| !c.trim().is_empty()) {
-                let context_path = write_terminal_scratch_file(paths, "chat-context", "md", context)
-                    .map_err(|err| format!("write terminal chat context failed: {err:#}"))?;
+                let context_path =
+                    write_terminal_scratch_file(paths, "chat-context", "md", context)
+                        .map_err(|err| format!("write terminal chat context failed: {err:#}"))?;
                 // `claude` resolves (on Windows) through an npm `.cmd` shim, which
                 // routes the whole command line through cmd.exe's ~8191-character
                 // limit; embedding the full context text as a `Get-Content`/`cat`
@@ -571,7 +577,10 @@ fn write_terminal_launcher_script(paths: &TodPaths, command: &str) -> anyhow::Re
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
         }
-        Ok(format!("bash {}", posix_quote(&script_path.display().to_string())))
+        Ok(format!(
+            "bash {}",
+            posix_quote(&script_path.display().to_string())
+        ))
     }
 }
 

@@ -27,8 +27,8 @@ use gpui::{
     IntoElement, ParentElement, Render, Styled, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_wry::WebView;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use gpui_wry::WebView;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;

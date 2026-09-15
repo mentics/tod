@@ -6,7 +6,9 @@
 //! [`set_generator_config`] never touches `last_refresh_*` fields.
 
 use std::collections::HashMap;
-use tod_integration::{CredentialRequirement, DataSource, DataSourceItem, LinearDataSource, MockDataSource};
+use tod_integration::{
+    CredentialRequirement, DataSource, DataSourceItem, LinearDataSource, MockDataSource,
+};
 use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
@@ -35,7 +37,11 @@ pub fn available_data_sources() -> Vec<(&'static str, String, String)> {
         .into_iter()
         .map(|key| {
             let ds = data_source_for_type(key).expect("registered type key must resolve");
-            (key, ds.display_name().to_string(), ds.description().to_string())
+            (
+                key,
+                ds.display_name().to_string(),
+                ds.description().to_string(),
+            )
         })
         .collect()
 }
@@ -58,8 +64,8 @@ pub fn set_generator_config(
     let data_source = data_source_for_type(data_source_type)
         .ok_or_else(|| format!("unknown data source type: {data_source_type}"))?;
 
-    let config: serde_json::Value = serde_json::from_str(config_json)
-        .map_err(|err| format!("invalid config JSON: {err}"))?;
+    let config: serde_json::Value =
+        serde_json::from_str(config_json).map_err(|err| format!("invalid config JSON: {err}"))?;
     data_source
         .validate_config(&config)
         .map_err(|err| err.to_string())?;
@@ -101,14 +107,20 @@ struct ExistingManaged {
 /// [`CredentialRequirement`]s. Only `linear_api_key` is backed by real
 /// storage today; unknown keys resolve to `None` (the data source itself
 /// decides whether that is fatal, via [`DataSource::fetch`]).
-fn resolve_credential(store: &CredentialStore, requirement: &CredentialRequirement) -> Option<String> {
+fn resolve_credential(
+    store: &CredentialStore,
+    requirement: &CredentialRequirement,
+) -> Option<String> {
     match requirement.key.as_str() {
         "linear_api_key" => resolve_linear_api_key(store),
         _ => None,
     }
 }
 
-fn resolve_credentials(data_root: &std::path::Path, data_source: &dyn DataSource) -> HashMap<String, String> {
+fn resolve_credentials(
+    data_root: &std::path::Path,
+    data_source: &dyn DataSource,
+) -> HashMap<String, String> {
     let store = CredentialStore::from_data_root(data_root);
     data_source
         .credential_requirements()
@@ -302,7 +314,9 @@ pub fn refresh_generator_with(
     });
 
     for mutation in mutations {
-        fleet.enqueue_outline(mutation).map_err(|err| err.to_string())?;
+        fleet
+            .enqueue_outline(mutation)
+            .map_err(|err| err.to_string())?;
     }
     fleet.writer().flush().map_err(|err| err.to_string())?;
     Ok(updated_copy_ids)
@@ -322,7 +336,9 @@ fn collect_linked_copy_updates(
     let mut updated = Vec::new();
     for item in items {
         let links = fleet
-            .read(|conn| GeneratorRepo::new(conn).copy_links_for(generator_node_id, &item.external_id))
+            .read(|conn| {
+                GeneratorRepo::new(conn).copy_links_for(generator_node_id, &item.external_id)
+            })
             .map_err(|err| err.to_string())?;
         for link in links {
             let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
@@ -364,14 +380,22 @@ fn reconcile_level(
         visited.insert(item.external_id.clone());
         let node_id = if let Some(existing_item) = existing.get(&item.external_id) {
             let keep = |field: &str, current: &str, fetched: &str| {
-                if existing_item.user_modified_fields.iter().any(|f| f == field) {
+                if existing_item
+                    .user_modified_fields
+                    .iter()
+                    .any(|f| f == field)
+                {
                     current.to_string()
                 } else {
                     fetched.to_string()
                 }
             };
             let title = keep("title", &existing_item.title, &item.title);
-            let tags = if existing_item.user_modified_fields.iter().any(|f| f == "tags") {
+            let tags = if existing_item
+                .user_modified_fields
+                .iter()
+                .any(|f| f == "tags")
+            {
                 existing_item.tags.clone()
             } else {
                 item.tags.clone()
@@ -469,7 +493,10 @@ mod tests {
         node_id
     }
 
-    fn read_config(root: &std::path::Path, node_id: Uuid) -> Option<tod_store::outline::repos::GeneratorConfig> {
+    fn read_config(
+        root: &std::path::Path,
+        node_id: Uuid,
+    ) -> Option<tod_store::outline::repos::GeneratorConfig> {
         let conn = open_read_connection(&root.join("tod.db")).unwrap();
         GeneratorRepo::new(&conn).get_config(node_id).unwrap()
     }
@@ -480,7 +507,8 @@ mod tests {
         let list_id = fleet.list_outline_lists().unwrap()[0].id;
         let node_id = create_generator_node(&fleet, list_id);
 
-        let result = set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"invalid": true}"#);
+        let result =
+            set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"invalid": true}"#);
         assert!(result.is_err());
         assert!(read_config(&root, node_id).is_none());
 
@@ -676,7 +704,10 @@ mod tests {
         refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
 
         let children = managed_children(&fleet, list_id, node_id);
-        assert_eq!(children[0].1, "Original", "user-edited title must survive refresh");
+        assert_eq!(
+            children[0].1, "Original",
+            "user-edited title must survive refresh"
+        );
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -842,7 +873,12 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn make_copy(fleet: &FleetStore, list_id: Uuid, source_node_id: Uuid, target_parent_id: Uuid) -> Uuid {
+    fn make_copy(
+        fleet: &FleetStore,
+        list_id: Uuid,
+        source_node_id: Uuid,
+        target_parent_id: Uuid,
+    ) -> Uuid {
         fleet
             .enqueue_outline(tod_store::outline::OutlineMutation::PasteManagedNodeCopy {
                 source_node_id,
@@ -974,7 +1010,10 @@ mod tests {
             .read(|conn| {
                 let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
                 let copy = node_repo.get(copy_id).unwrap().unwrap();
-                assert_eq!(copy.title, "User-edited title", "dirty title must not be overwritten");
+                assert_eq!(
+                    copy.title, "User-edited title",
+                    "dirty title must not be overwritten"
+                );
                 Ok(())
             })
             .unwrap();
@@ -990,8 +1029,11 @@ mod tests {
         let node_id = create_generator_node(&fleet, list_id);
         set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
 
-        let ds = MockDataSource::new()
-            .with_items(vec![item("EXT-1", "Parent", vec![item("EXT-2", "Child", vec![])])]);
+        let ds = MockDataSource::new().with_items(vec![item(
+            "EXT-1",
+            "Parent",
+            vec![item("EXT-2", "Child", vec![])],
+        )]);
         refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
         let parent_managed_id = managed_children(&fleet, list_id, node_id)[0].0;
         let child_managed_id = managed_children(&fleet, list_id, parent_managed_id)[0].0;
@@ -1032,8 +1074,14 @@ mod tests {
                 let node_repo = tod_store::outline::repos::NodeRepo::new(conn);
                 let parent_copy = node_repo.get(parent_copy_id).unwrap().unwrap();
                 let child_copy = node_repo.get(child_copy_id).unwrap().unwrap();
-                assert_eq!(parent_copy.title, "User-edited parent", "parent's dirty title stays put");
-                assert_eq!(child_copy.title, "EXT-2: Updated child", "child updates independently of its dirty parent");
+                assert_eq!(
+                    parent_copy.title, "User-edited parent",
+                    "parent's dirty title stays put"
+                );
+                assert_eq!(
+                    child_copy.title, "EXT-2: Updated child",
+                    "child updates independently of its dirty parent"
+                );
                 Ok(())
             })
             .unwrap();
@@ -1136,14 +1184,26 @@ mod tests {
             .with_items(vec![item("EXT-1", "Should not appear", vec![])]);
 
         let missing = missing_credentials(&ds, &HashMap::new());
-        assert_eq!(missing.len(), 1, "refresh should be blocked: credential missing");
-        assert_eq!(ds.fetch_count(), 0, "fetch must not run before the credential check");
+        assert_eq!(
+            missing.len(),
+            1,
+            "refresh should be blocked: credential missing"
+        );
+        assert_eq!(
+            ds.fetch_count(),
+            0,
+            "fetch must not run before the credential check"
+        );
 
         let mut present = HashMap::new();
         present.insert("linear_api_key".to_string(), "secret".to_string());
         assert!(missing_credentials(&ds, &present).is_empty());
         refresh_generator_with(&fleet, node_id, &ds, &present).unwrap();
-        assert_eq!(managed_children(&fleet, list_id, node_id).len(), 1, "refresh proceeds once credentials are present");
+        assert_eq!(
+            managed_children(&fleet, list_id, node_id).len(),
+            1,
+            "refresh proceeds once credentials are present"
+        );
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -1168,7 +1228,11 @@ mod tests {
         let result = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new());
         assert!(result.is_ok());
         assert_eq!(managed_children(&fleet, list_id, node_id).len(), 0);
-        assert_eq!(ds.fetch_count(), 0, "fetch must not run while a refresh is in progress");
+        assert_eq!(
+            ds.fetch_count(),
+            0,
+            "fetch must not run while a refresh is in progress"
+        );
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);

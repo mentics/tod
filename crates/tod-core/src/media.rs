@@ -75,26 +75,25 @@ fn find_dev_media_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Load the static context for `key`, outermost layer first.
+/// Load and concatenate the static context fragments named by `keys`, in the
+/// order given.
 ///
-/// `key` is a `/`-separated path under `context/`. Every ancestor level
-/// contributes its own document, so `obligations` loads `app.md` then
-/// `obligations.md`, and a future `tasks/edit` would load `app.md`,
-/// `tasks.md`, then `tasks/edit.md`. Missing layers are skipped, so a new
-/// surface can ship with only its own file.
-pub fn load_static_context(paths: &MediaPaths, key: &str) -> Result<String> {
+/// Each key is a `/`-separated path to one `.md` file under `context/` (e.g.
+/// `"obligations"`, `"design/visual-design"`) — there is no implicit
+/// ancestor chain. Every surface that assembles a first-turn message picks
+/// its own explicit list of fragments (see `crate::agent_context` and
+/// `crate::gate::context` for the lists each surface uses), so a fragment
+/// like the interactive-chat behavior rules or the `tod-cli` command
+/// reference is included only where it actually applies, and each is
+/// authored once and shared by every caller that needs it. Missing fragments
+/// are skipped, so a caller can list a fragment that not every install
+/// ships.
+pub fn load_static_context(paths: &MediaPaths, keys: &[&str]) -> Result<String> {
     let root = paths.context_root();
-    let mut layers: Vec<PathBuf> = vec![root.join("app.md")];
-
-    let mut prefix = root.clone();
-    let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
-    for segment in &segments {
-        layers.push(prefix.join(format!("{segment}.md")));
-        prefix = prefix.join(segment);
-    }
 
     let mut out = String::new();
-    for layer in layers {
+    for key in keys {
+        let layer = root.join(format!("{key}.md"));
         let Ok(text) = std::fs::read_to_string(&layer) else {
             continue;
         };
@@ -106,7 +105,7 @@ pub fn load_static_context(paths: &MediaPaths, key: &str) -> Result<String> {
 
     if out.is_empty() {
         anyhow::bail!(
-            "no context documents found for `{key}` under {}",
+            "no context documents found for {keys:?} under {}",
             root.display()
         );
     }
@@ -130,18 +129,18 @@ mod tests {
     }
 
     #[test]
-    fn loads_app_then_leaf() {
+    fn loads_listed_keys_in_order() {
         let (_d, paths) = fixture();
-        let text = load_static_context(&paths, "obligations").unwrap();
+        let text = load_static_context(&paths, &["app", "obligations"]).unwrap();
         assert!(text.starts_with("APP"));
         assert!(text.contains("OBLIGATIONS"));
         assert!(text.find("APP").unwrap() < text.find("OBLIGATIONS").unwrap());
     }
 
     #[test]
-    fn nested_key_loads_every_ancestor_level() {
+    fn nested_key_path_resolves_under_context_root() {
         let (_d, paths) = fixture();
-        let text = load_static_context(&paths, "tasks/edit").unwrap();
+        let text = load_static_context(&paths, &["app", "tasks", "tasks/edit"]).unwrap();
         let (a, t, e) = (
             text.find("APP").unwrap(),
             text.find("TASKS").unwrap(),
@@ -151,10 +150,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_layer_is_skipped_not_fatal() {
+    fn missing_key_is_skipped_not_fatal() {
         let (_d, paths) = fixture();
-        let text = load_static_context(&paths, "nonexistent").unwrap();
+        let text = load_static_context(&paths, &["app", "nonexistent"]).unwrap();
         assert_eq!(text, "APP");
+    }
+
+    #[test]
+    fn only_listed_keys_are_included() {
+        let (_d, paths) = fixture();
+        let text = load_static_context(&paths, &["obligations"]).unwrap();
+        assert_eq!(text, "OBLIGATIONS");
     }
 
     /// Minimal self-cleaning temp directory (no dev-dependency needed).

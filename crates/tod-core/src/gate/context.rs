@@ -5,8 +5,8 @@
 //! `assets/process/agents/state/base.md` documents: forward state, criteria
 //! (id/slug/label), and prior evaluations, when any exist for this node.
 
-use crate::node_context::{obligation_line, plan_step_line};
 use crate::media::{MediaPaths, load_static_context};
+use crate::node_context::{obligation_line, plan_step_line};
 use anyhow::Result;
 use std::path::Path;
 use tod_store::outline::{GateCriterion, NodeGateEvaluation, NodeObligation, PlanStep};
@@ -22,11 +22,18 @@ pub struct PlanStepWithLinks {
     pub satisfies: Vec<Uuid>,
 }
 
-/// Context key under `media/context/` for the gate-check static doc.
-pub const GATE_CHECK_CONTEXT_KEY: &str = "gate_check";
+/// Static context fragments for a gate-check turn. This is a single
+/// structured-response turn, not interactive chat (no "confirm before
+/// editing", no "keep replies short"), and it never calls `tod-cli` itself
+/// (it returns YAML; the app persists the result), so it loads neither
+/// `"interactive"` nor `"tod_cli"`.
+pub const GATE_CHECK_CONTEXT_LAYERS: &[&str] = &["app", "gate_check"];
 
-/// Context key under `media/context/` for the on-entry static doc.
-pub const ON_ENTRY_CONTEXT_KEY: &str = "on_entry";
+/// Static context fragments for an on-entry turn. Unlike gate-check, this
+/// turn does its own `tod-cli` mutations (e.g. drafting plan steps), so it
+/// loads `"tod_cli"` — but it is still not interactive chat, so it leaves
+/// out `"interactive"`.
+pub const ON_ENTRY_CONTEXT_LAYERS: &[&str] = &["app", "tod_cli", "on_entry"];
 
 /// Everything the gate-check turn needs to describe the node under check.
 #[derive(Debug, Clone)]
@@ -78,7 +85,7 @@ pub fn build_gate_check_message(
     request: &GateCheckRequest<'_>,
     role_doc: &str,
 ) -> Result<String> {
-    let mut out = load_static_context(paths, GATE_CHECK_CONTEXT_KEY)?;
+    let mut out = load_static_context(paths, GATE_CHECK_CONTEXT_LAYERS)?;
     out.push_str("\n\n---\n\n");
     out.push_str(role_doc.trim());
     out.push_str("\n\n---\n\n");
@@ -95,7 +102,7 @@ pub fn build_on_entry_message(
     request: &GateCheckRequest<'_>,
     role_doc: &str,
 ) -> Result<String> {
-    let mut out = load_static_context(paths, ON_ENTRY_CONTEXT_KEY)?;
+    let mut out = load_static_context(paths, ON_ENTRY_CONTEXT_LAYERS)?;
     out.push_str("\n\n---\n\n");
     out.push_str(role_doc.trim());
     out.push_str("\n\n---\n\n");
@@ -168,9 +175,7 @@ fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> S
 
     if !request.purposes.is_empty() {
         out.push_str("## Purpose\n\n");
-        out.push_str(
-            "From the top of the tree down to the selected node, most general first:\n\n",
-        );
+        out.push_str("From the top of the tree down to the selected node, most general first:\n\n");
         for purpose in &request.purposes {
             out.push_str(purpose);
             out.push_str("\n\n");
@@ -180,7 +185,10 @@ fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> S
     out.push_str("## Selected node\n\n");
     out.push_str(&format!("- **Id:** `{}`\n", request.node_id));
     out.push_str(&format!("- **Title:** {}\n", request.node_title.trim()));
-    out.push_str(&format!("- **Lifecycle state:** {}\n", request.node_lifecycle));
+    out.push_str(&format!(
+        "- **Lifecycle state:** {}\n",
+        request.node_lifecycle
+    ));
     out.push_str("- **mode:** interactive\n");
     out.push_str(&format!("- **phase_purpose:** {phase_purpose}\n"));
     match request.node_body.as_deref().map(str::trim) {
@@ -217,7 +225,11 @@ fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> S
     } else {
         for entry in &request.plan_steps {
             out.push_str("- ");
-            out.push_str(&plan_step_line(&entry.step, &entry.depends_on, &entry.satisfies));
+            out.push_str(&plan_step_line(
+                &entry.step,
+                &entry.depends_on,
+                &entry.satisfies,
+            ));
             out.push('\n');
         }
     }
@@ -372,9 +384,12 @@ mod tests {
             to_state: "planning".into(),
             criteria: Vec::new(),
         };
-        let message =
-            build_gate_check_message(&paths, &request, "## State agent conventions\n\nDo not conduct sequential Q&A in this session.")
-                .unwrap();
+        let message = build_gate_check_message(
+            &paths,
+            &request,
+            "## State agent conventions\n\nDo not conduct sequential Q&A in this session.",
+        )
+        .unwrap();
         assert!(
             message.contains("Do not conduct sequential Q&A in this session."),
             "gate-check message must carry the state role doc so the agent has its \
@@ -399,9 +414,12 @@ mod tests {
             to_state: "planning".into(),
             criteria: Vec::new(),
         };
-        let message =
-            build_on_entry_message(&paths, &request, "## State agent conventions\n\nOn-entry marker text.")
-                .unwrap();
+        let message = build_on_entry_message(
+            &paths,
+            &request,
+            "## State agent conventions\n\nOn-entry marker text.",
+        )
+        .unwrap();
         assert!(message.contains("On-entry marker text."));
     }
 }

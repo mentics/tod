@@ -32,7 +32,10 @@ pub fn register_sessions_keyboard_bindings(_cx: &mut App) {
 #[derive(Debug, Clone)]
 pub enum SessionsEvent {
     ReturnToTaskList,
-    ProceedToLifecycle { task_id: String, lifecycle: String },
+    ProceedToLifecycle {
+        task_id: String,
+        lifecycle: String,
+    },
     /// Forwarded from the embedded obligations panel's chat icon.
     OpenAgentChat {
         node_id: Uuid,
@@ -222,14 +225,20 @@ impl SessionsView {
         items
     }
 
-    fn driver_for(&mut self, session: &InterviewSession) -> Result<Arc<Mutex<InterviewDriver>>, String> {
+    fn driver_for(
+        &mut self,
+        session: &InterviewSession,
+    ) -> Result<Arc<Mutex<InterviewDriver>>, String> {
         if let Some(driver) = self.drivers.get(&session.id) {
             return Ok(driver.clone());
         }
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
-        let repo_cwd = self.fleet.files_dir_or_data_root(&session.node_id.to_string());
+        let repo_cwd = self
+            .fleet
+            .files_dir_or_data_root(&session.node_id.to_string());
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
-        let manifest = ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
+        let manifest =
+            ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
         let prefix = |role| {
             interview_session_prefix(&manifest, role, &session.phase)
                 .map_err(|e| format!("Process bundle: {e}"))

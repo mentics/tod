@@ -11,10 +11,10 @@ use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Anchor, DismissEvent, Entity, FocusHandle, Focusable,
+    Anchor, App, AppContext, ClipboardItem, Context, DismissEvent, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity,
-    Window, actions, anchored, deferred, div, px,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window,
+    actions, anchored, deferred, div, px,
 };
 use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
@@ -227,10 +227,16 @@ impl WorkspaceView {
         };
         let notes_input = textarea("Notes (Enter to edit; Ctrl+Enter to submit)", window, cx);
         let proposed_input = textarea("Proposed text (Enter to edit)", window, cx);
-        let feedback_input =
-            textarea("Feedback on this question (e.g. not useful, too meta)", window, cx);
-        let freeform_input =
-            textarea("Anything to tell the interview directly (Ctrl+Enter to submit)", window, cx);
+        let feedback_input = textarea(
+            "Feedback on this question (e.g. not useful, too meta)",
+            window,
+            cx,
+        );
+        let freeform_input = textarea(
+            "Anything to tell the interview directly (Ctrl+Enter to submit)",
+            window,
+            cx,
+        );
 
         let obligations = cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
         let obligations_phase = phase_for_session_key(&session.phase);
@@ -312,8 +318,9 @@ impl WorkspaceView {
             }
         });
 
-        let question_list_state =
-            cx.new(|cx| ListState::new(QuestionListDelegate::new(Vec::new()), window, cx).searchable(false));
+        let question_list_state = cx.new(|cx| {
+            ListState::new(QuestionListDelegate::new(Vec::new()), window, cx).searchable(false)
+        });
         let _question_list_subscription =
             cx.subscribe(&question_list_state, |this, state, event, cx| match event {
                 ListEvent::Select(ix) | ListEvent::Confirm(ix) => {
@@ -398,13 +405,18 @@ impl WorkspaceView {
                     changed = true;
                     match event {
                         DriverEvent::QuestionMakerFinished { error: None } => {}
-                        DriverEvent::AnswersFinished { questions, error: None } => {
+                        DriverEvent::AnswersFinished {
+                            questions,
+                            error: None,
+                        } => {
                             let labels: Vec<String> =
                                 questions.iter().map(|s| format!("q-{s}")).collect();
                             self.status_line = format!("Processed {}", labels.join(", ")).into();
                         }
                         DriverEvent::QuestionMakerFinished { error: Some(err) }
-                        | DriverEvent::AnswersFinished { error: Some(err), .. } => {
+                        | DriverEvent::AnswersFinished {
+                            error: Some(err), ..
+                        } => {
                             self.error_banner = Some(err.into());
                         }
                     }
@@ -436,8 +448,11 @@ impl WorkspaceView {
         let Ok((questions, recent, summaries, complete)) = self.fleet.read(|conn| {
             let repo = InterviewRepo::new(conn);
             let all = repo.list_questions(node, &[])?;
-            let questions: Vec<InterviewQuestion> =
-                all.iter().filter(|q| q.status == STATUS_OPEN).cloned().collect();
+            let questions: Vec<InterviewQuestion> = all
+                .iter()
+                .filter(|q| q.status == STATUS_OPEN)
+                .cloned()
+                .collect();
             let mut recent: Vec<InterviewQuestion> = all
                 .iter()
                 .filter(|q| q.status == STATUS_ANSWERED && q.phase == phase)
@@ -454,7 +469,12 @@ impl WorkspaceView {
                         .map(|p| (q.seq, describe_proposal(p, &obligations)))
                 })
                 .collect();
-            Ok((questions, recent, summaries, interview_complete(conn, node, session_id)?))
+            Ok((
+                questions,
+                recent,
+                summaries,
+                interview_complete(conn, node, session_id)?,
+            ))
         }) else {
             return false;
         };
@@ -526,7 +546,11 @@ impl WorkspaceView {
             parts.push(format!(
                 "Processing {} answer{}{lanes}",
                 self.driver_status.answers_in_flight,
-                if self.driver_status.answers_in_flight == 1 { "" } else { "s" }
+                if self.driver_status.answers_in_flight == 1 {
+                    ""
+                } else {
+                    "s"
+                }
             ));
         }
         if parts.is_empty() {
@@ -552,26 +576,41 @@ impl WorkspaceView {
     }
 
     fn notes_focused(&self, window: &Window, cx: &App) -> bool {
-        self.notes_input.read(cx).focus_handle(cx).is_focused(window)
+        self.notes_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 
     fn proposed_focused(&self, window: &Window, cx: &App) -> bool {
-        self.proposed_input.read(cx).focus_handle(cx).is_focused(window)
+        self.proposed_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 
     fn feedback_focused(&self, window: &Window, cx: &App) -> bool {
-        self.feedback_input.read(cx).focus_handle(cx).is_focused(window)
+        self.feedback_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
     }
 
     fn response_text_editing(&self) -> bool {
-        self.notes_editing || self.proposed_editing || self.feedback_editing || self.freeform_editing
+        self.notes_editing
+            || self.proposed_editing
+            || self.feedback_editing
+            || self.freeform_editing
     }
 
     /// True when GPUI focus is anywhere inside the obligations panel (e.g. its
     /// search field) — workspace-wide shortcuts like the MC digit keys must not
     /// fire while it holds focus.
     fn obligations_focused(&self, window: &Window, cx: &App) -> bool {
-        self.obligations.read(cx).focus_handle(cx).contains_focused(window, cx)
+        self.obligations
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
     }
 
     fn has_proposed_editor(&self) -> bool {
@@ -637,7 +676,12 @@ impl WorkspaceView {
     }
 
     /// Keep ListState selection aligned with workspace selection (needs a Window).
-    fn sync_question_list_selection(&mut self, window: &mut Window, cx: &mut Context<Self>, scroll: bool) {
+    fn sync_question_list_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        scroll: bool,
+    ) {
         let questions = self.questions.clone();
         let selected = self.selected_seq;
         self.question_list_state.update(cx, |state, cx| {
@@ -699,7 +743,12 @@ impl WorkspaceView {
     }
 
     /// Select the question after the current one (wrapping), once it is gone.
-    fn select_next_question(&mut self, after: i64, window: Option<&mut Window>, cx: &mut Context<Self>) {
+    fn select_next_question(
+        &mut self,
+        after: i64,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let next = self
             .questions
             .iter()
@@ -728,8 +777,10 @@ impl WorkspaceView {
         self.feedback_editing = false;
         self.proposed_loaded_for = None;
         if let Some(window) = window {
-            self.notes_input.update(cx, |input, cx| input.set_value("", window, cx));
-            self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.notes_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.feedback_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
             self.sync_proposed_input(window, cx);
             if should_unfocus {
                 self.focus_handle.focus(window, cx);
@@ -757,7 +808,8 @@ impl WorkspaceView {
             .and_then(proposal_text)
             .unwrap_or_default()
             .to_string();
-        self.proposed_input.update(cx, |input, cx| input.set_value(text, window, cx));
+        self.proposed_input
+            .update(cx, |input, cx| input.set_value(text, window, cx));
         self.proposed_loaded_for = self.selected_seq;
     }
 
@@ -785,7 +837,10 @@ impl WorkspaceView {
             return;
         };
         let notes = self.notes_input.read(cx).value().trim().to_string();
-        let option = self.selected_mc.as_deref().and_then(|k| k.parse::<i64>().ok());
+        let option = self
+            .selected_mc
+            .as_deref()
+            .and_then(|k| k.parse::<i64>().ok());
         if notes.is_empty() && option.is_none() {
             self.error_banner = Some("Pick an option and/or write notes".into());
             cx.notify();
@@ -838,7 +893,8 @@ impl WorkspaceView {
             self.error_banner = None;
             self.status_line = "Sent to the interview".into();
             self.freeform_editing = false;
-            self.freeform_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.freeform_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
     }
@@ -934,7 +990,8 @@ impl WorkspaceView {
         self.error_banner = None;
         self.status_line = format!("Feedback saved for {}", question.label()).into();
         self.feedback_editing = false;
-        self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.feedback_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
@@ -982,7 +1039,9 @@ impl WorkspaceView {
     }
 
     fn option_count(&self) -> usize {
-        self.selected_question().map(|q| option_labels(q).len()).unwrap_or(0)
+        self.selected_question()
+            .map(|q| option_labels(q).len())
+            .unwrap_or(0)
     }
 
     fn response_stop_count(&self) -> usize {
@@ -1116,7 +1175,8 @@ impl WorkspaceView {
         cx.notify();
         // Focus after Input re-renders enabled (disabled when !notes_editing).
         cx.on_next_frame(window, |this, window, cx| {
-            this.notes_input.update(cx, |input, cx| input.focus(window, cx));
+            this.notes_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -1142,7 +1202,8 @@ impl WorkspaceView {
         self.proposed_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.proposed_input.update(cx, |input, cx| input.focus(window, cx));
+            this.proposed_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -1168,7 +1229,8 @@ impl WorkspaceView {
         self.feedback_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.feedback_input.update(cx, |input, cx| input.focus(window, cx));
+            this.feedback_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -1193,7 +1255,8 @@ impl WorkspaceView {
         self.freeform_editing = true;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.freeform_input.update(cx, |input, cx| input.focus(window, cx));
+            this.freeform_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -1222,9 +1285,11 @@ impl WorkspaceView {
             return;
         }
         if self.phase == PHASE_PLANNING {
-            self.plan_steps.update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
+            self.plan_steps
+                .update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
         } else {
-            self.obligations.update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
+            self.obligations
+                .update(cx, |panel, cx| panel.focus_handle(cx).focus(window, cx));
         }
         cx.notify();
     }
@@ -1234,7 +1299,8 @@ impl WorkspaceView {
             return;
         }
         self.workspace_focus = WorkspaceFocus::QuestionList;
-        self.question_list_state.update(cx, |state, cx| state.focus(window, cx));
+        self.question_list_state
+            .update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
 
@@ -1477,8 +1543,10 @@ impl Render for WorkspaceView {
         self.sync_question_list_selection(window, cx, false);
         if self.notes_pending_clear {
             self.notes_pending_clear = false;
-            self.notes_input.update(cx, |input, cx| input.set_value("", window, cx));
-            self.feedback_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.notes_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.feedback_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.sync_proposed_input(window, cx);
         // `window.defer`, not a direct call: render can run reentrantly while
@@ -1506,7 +1574,10 @@ impl Render for WorkspaceView {
         let wait = self.question_maker_waiting().then(|| QuestionMakerWaitUi {
             open: self.questions.len(),
             target: self.replenish_target as usize,
-            elapsed_secs: self.wait_started.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            elapsed_secs: self
+                .wait_started
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0),
             animate_dots: self
                 .wait_started
                 .map(|t| ((t.elapsed().as_millis() / 500) % 4) as usize)
@@ -1519,7 +1590,8 @@ impl Render for WorkspaceView {
             .as_ref()
             .and_then(|q| self.proposal_summaries.get(&q.seq).cloned());
         let status_text = self.agent_status_text();
-        let show_retry = self.driver_status.manual_required || self.driver_status.last_error.is_some();
+        let show_retry =
+            self.driver_status.manual_required || self.driver_status.last_error.is_some();
 
         div()
             .key_context(WORKSPACE_CONTEXT)
@@ -1532,7 +1604,12 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &SubmitAnswer, window, cx| {
                 // Ctrl+Enter is bound globally for Input focus; route to whichever
                 // submit matches the field the user is actually editing.
-                if this.freeform_input.read(cx).focus_handle(cx).is_focused(window) {
+                if this
+                    .freeform_input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+                {
                     this.submit_freeform(window, cx);
                 } else {
                     this.submit_answer(window, cx);
@@ -1541,15 +1618,33 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &FocusNotes, window, cx| {
                 this.enter_notes_edit(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &McDigit1, window, cx| this.on_digit_key("1", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit2, window, cx| this.on_digit_key("2", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit3, window, cx| this.on_digit_key("3", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit4, window, cx| this.on_digit_key("4", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit5, window, cx| this.on_digit_key("5", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit6, window, cx| this.on_digit_key("6", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit7, window, cx| this.on_digit_key("7", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit8, window, cx| this.on_digit_key("8", window, cx)))
-            .on_action(cx.listener(|this, _: &McDigit9, window, cx| this.on_digit_key("9", window, cx)))
+            .on_action(
+                cx.listener(|this, _: &McDigit1, window, cx| this.on_digit_key("1", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit2, window, cx| this.on_digit_key("2", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit3, window, cx| this.on_digit_key("3", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit4, window, cx| this.on_digit_key("4", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit5, window, cx| this.on_digit_key("5", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit6, window, cx| this.on_digit_key("6", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit7, window, cx| this.on_digit_key("7", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit8, window, cx| this.on_digit_key("8", window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &McDigit9, window, cx| this.on_digit_key("9", window, cx)),
+            )
             .on_action(cx.listener(|this, _: &QuestionMoveUp, window, cx| {
                 if this.actions_menu_focused(window, cx)
                     || this.response_text_editing()
@@ -1726,7 +1821,8 @@ impl Render for WorkspaceView {
                 border,
                 muted,
                 show_retry,
-                self.driver_status.question_maker_running || self.driver_status.answers_in_flight > 0,
+                self.driver_status.question_maker_running
+                    || self.driver_status.answers_in_flight > 0,
             ))
     }
 }
@@ -1866,7 +1962,12 @@ fn question_body_view(
     cx: &mut App,
 ) -> impl IntoElement {
     let mut col = v_flex().w_full().min_w_0().gap_3();
-    let text = |id: String, body: String, color: gpui::Hsla, bold: bool, window: &mut Window, cx: &mut App| {
+    let text = |id: String,
+                body: String,
+                color: gpui::Hsla,
+                bold: bool,
+                window: &mut Window,
+                cx: &mut App| {
         let el = selectable_text(SharedString::from(id), SharedString::from(body), window, cx)
             .w_full()
             .min_w_0()
@@ -1874,14 +1975,45 @@ fn question_body_view(
             .text_color(color);
         if bold { el.font_semibold() } else { el }
     };
-    if let Some(context) = q.context.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        col = col.child(text(format!("question-context-{}", q.seq), context.into(), muted, false, window, cx));
+    if let Some(context) = q
+        .context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        col = col.child(text(
+            format!("question-context-{}", q.seq),
+            context.into(),
+            muted,
+            false,
+            window,
+            cx,
+        ));
     }
-    if let Some(question) = q.question.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        col = col.child(text(format!("question-text-{}", q.seq), question.into(), foreground, true, window, cx));
+    if let Some(question) = q
+        .question
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        col = col.child(text(
+            format!("question-text-{}", q.seq),
+            question.into(),
+            foreground,
+            true,
+            window,
+            cx,
+        ));
     }
     if let Some(summary) = proposal_summary {
-        col = col.child(text(format!("question-proposal-{}", q.seq), summary, muted, false, window, cx));
+        col = col.child(text(
+            format!("question-proposal-{}", q.seq),
+            summary,
+            muted,
+            false,
+            window,
+            cx,
+        ));
     }
     col
 }
@@ -1965,10 +2097,18 @@ fn response_column(
         .p_3()
         .gap_2()
         .child(div().text_xs().text_color(muted).child("Response"));
-    let mut scroll_body = v_flex().id("response-scroll-body").w_full().min_w_0().gap_2();
+    let mut scroll_body = v_flex()
+        .id("response-scroll-body")
+        .w_full()
+        .min_w_0()
+        .gap_2();
     let mut stop_idx = 0usize;
     if let Some(q) = question {
-        let recommended_key = q.recommend.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let recommended_key = q
+            .recommend
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         for (idx, label) in option_labels(q).into_iter().enumerate() {
             let key = (idx + 1).to_string();
             scroll_body = scroll_body.child(mc_option_row(
@@ -2009,7 +2149,12 @@ fn response_column(
         .gap_2();
     if show_proposed {
         response_body = response_body
-            .child(div().text_xs().text_color(muted).child("Proposed text (applied with option 1)"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Proposed text (applied with option 1)"),
+            )
             .child(
                 ListItem::new("proposed-field")
                     .selected(proposed_focused)
@@ -2056,23 +2201,31 @@ fn response_column(
                 .child(
                     ListItem::new("other-actions-focus")
                         .selected(actions_focused && !actions_menu_open)
-                        .child(action_dropdown(cx, disabled, actions_menu_open, actions_focused, actions_menu)),
+                        .child(action_dropdown(
+                            cx,
+                            disabled,
+                            actions_menu_open,
+                            actions_focused,
+                            actions_menu,
+                        )),
                 )
                 .child(
-                    ListItem::new("submit-focus").selected(submit_focused).child(
-                        Button::new("submit-answer")
-                            .label("Submit")
-                            .primary()
-                            .compact()
-                            .disabled(disabled)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.submit_answer(window, cx);
-                                    cx.stop_propagation();
-                                }),
-                            ),
-                    ),
+                    ListItem::new("submit-focus")
+                        .selected(submit_focused)
+                        .child(
+                            Button::new("submit-answer")
+                                .label("Submit")
+                                .primary()
+                                .compact()
+                                .disabled(disabled)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.submit_answer(window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        ),
                 ),
         );
 
@@ -2131,7 +2284,12 @@ fn response_column(
         .pt_2()
         .border_t_1()
         .border_color(muted.opacity(0.25))
-        .child(div().text_xs().text_color(muted).child("Tell the interview something"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("Tell the interview something"),
+        )
         .child(
             ListItem::new("freeform-field")
                 .selected(freeform_focused)
@@ -2185,18 +2343,20 @@ fn response_column(
 }
 
 fn populate_action_menu(menu: PopupMenu, view: WeakEntity<WorkspaceView>) -> PopupMenu {
-    OTHER_ACTION_ITEMS.iter().fold(menu, |menu, (action, label)| {
-        let view = view.clone();
-        let action = (*action).to_string();
-        menu.item(PopupMenuItem::new(*label).on_click(move |_, window, cx| {
-            if let Some(entity) = view.upgrade() {
-                entity.update(cx, |this, cx| {
-                    this.set_actions_menu_open(false, cx);
-                    this.submit_action(&action, window, cx);
-                });
-            }
-        }))
-    })
+    OTHER_ACTION_ITEMS
+        .iter()
+        .fold(menu, |menu, (action, label)| {
+            let view = view.clone();
+            let action = (*action).to_string();
+            menu.item(PopupMenuItem::new(*label).on_click(move |_, window, cx| {
+                if let Some(entity) = view.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        this.set_actions_menu_open(false, cx);
+                        this.submit_action(&action, window, cx);
+                    });
+                }
+            }))
+        })
 }
 
 /// Native `PopupMenu` anchored under the trigger.
@@ -2443,9 +2603,15 @@ mod tests {
 
     #[test]
     fn unedited_proposal_text_is_not_resent() {
-        assert_eq!(edited_proposal_text(Some("Fleet uses SQLite."), " Fleet uses SQLite. "), None);
         assert_eq!(
-            edited_proposal_text(Some("Fleet uses SQLite."), "Fleet uses SQLite under the root."),
+            edited_proposal_text(Some("Fleet uses SQLite."), " Fleet uses SQLite. "),
+            None
+        );
+        assert_eq!(
+            edited_proposal_text(
+                Some("Fleet uses SQLite."),
+                "Fleet uses SQLite under the root."
+            ),
             Some("Fleet uses SQLite under the root.".into())
         );
         assert_eq!(edited_proposal_text(None, "anything"), None);
@@ -2464,7 +2630,10 @@ mod tests {
             append: false,
             replaces: Vec::new(),
         };
-        assert_eq!(option_labels(&question(Vec::new(), Some(proposal))), vec!["Accept"]);
+        assert_eq!(
+            option_labels(&question(Vec::new(), Some(proposal))),
+            vec!["Accept"]
+        );
         assert_eq!(
             option_labels(&question(vec!["A".into(), "B".into()], None)),
             vec!["A", "B"]

@@ -7,8 +7,7 @@ use crate::ui::selectable_text::selectable_markdown;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions,
-    div,
+    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -458,9 +457,7 @@ impl InteractiveAgentView {
 
         match state {
             AgentRunState::InFlight(activity) => {
-                self.status_line = activity
-                    .clone()
-                    .unwrap_or_else(|| "Agent thinking…".into());
+                self.status_line = activity.clone().unwrap_or_else(|| "Agent thinking…".into());
                 self.activity = activity;
                 self.pending = Some(PendingRun {
                     run_id: Some(run_id),
@@ -471,10 +468,7 @@ impl InteractiveAgentView {
             }
             AgentRunState::NeedsPermission(request) => {
                 self.status_line = "Waiting for permission…".into();
-                crate::ui::agent_permission::queue_permission_request(
-                    self.agent.clone(),
-                    request,
-                );
+                crate::ui::agent_permission::queue_permission_request(self.agent.clone(), request);
                 self.pending = Some(PendingRun {
                     run_id: Some(run_id),
                     prompt_id,

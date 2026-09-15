@@ -48,7 +48,10 @@ pub fn plan_step_line(step: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> S
     } else {
         format!(
             " deps=[{}]",
-            deps.iter().map(|id| short_id(*id)).collect::<Vec<_>>().join(",")
+            deps.iter()
+                .map(|id| short_id(*id))
+                .collect::<Vec<_>>()
+                .join(",")
         )
     };
     let satisfies = if obligations.is_empty() {
@@ -122,7 +125,10 @@ pub fn render_inherited_context(
         if !order.contains(&item.source_node_id) {
             order.push(item.source_node_id);
         }
-        groups.entry(item.source_node_id).or_default().push(item.obligation);
+        groups
+            .entry(item.source_node_id)
+            .or_default()
+            .push(item.obligation);
     }
 
     let mut out = String::new();

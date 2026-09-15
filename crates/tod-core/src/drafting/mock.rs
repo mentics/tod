@@ -136,7 +136,8 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         };
         let parts = pieces(&dump.body);
         if capture {
-            let goal = client.read(|conn| NodeRepo::new(conn).get_extra_content(node, EXTRA_CONTENT_GOAL))?;
+            let goal = client
+                .read(|conn| NodeRepo::new(conn).get_extra_content(node, EXTRA_CONTENT_GOAL))?;
             if goal.is_none_or(|g| g.trim().is_empty()) {
                 if let Some(first) = parts.first() {
                     client.interview(InterviewCommand::Outline {
@@ -152,7 +153,11 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         }
         for (i, piece) in parts.iter().enumerate() {
             if piece.ends_with('?') {
-                let open = client.read(|conn| Ok(DraftingRepo::new(conn).list_choices(node, &[CHOICE_OPEN])?.len()))?;
+                let open = client.read(|conn| {
+                    Ok(DraftingRepo::new(conn)
+                        .list_choices(node, &[CHOICE_OPEN])?
+                        .len())
+                })?;
                 if open < CHOICE_CAP {
                     let base = sentence(piece);
                     let base = base.trim_end_matches('.');
@@ -176,7 +181,10 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
             }
             let (attention, why) = match i % 3 {
                 0 => (ATTENTION_LOW, "Restates what you said"),
-                1 => (ATTENTION_MEDIUM, "Mock: a reasonable default where people differ"),
+                1 => (
+                    ATTENTION_MEDIUM,
+                    "Mock: a reasonable default where people differ",
+                ),
                 _ => (ATTENTION_HIGH, "Mock: a taste call"),
             };
             add_requirement(client, row, sentence(piece), attention, why)?;
@@ -194,11 +202,18 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         else {
             continue;
         };
-        let Some(choice) = client.read(|conn| DraftingRepo::new(conn).get_choice(node, seq))? else {
+        let Some(choice) = client.read(|conn| DraftingRepo::new(conn).get_choice(node, seq))?
+        else {
             continue;
         };
         if let Some(ob) = choice.options.first().and_then(|o| o.obligations.first()) {
-            add_requirement(client, row, ob.body.clone(), ATTENTION_HIGH, "Mock: picked the first option for you")?;
+            add_requirement(
+                client,
+                row,
+                ob.body.clone(),
+                ATTENTION_HIGH,
+                "Mock: picked the first option for you",
+            )?;
             added += 1;
         }
     }
@@ -234,13 +249,19 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
     let open = client.read(|conn| DraftingRepo::new(conn).list_choices(node, &[CHOICE_OPEN]))?;
     if !capture {
         let (outcome, detail) = if open.is_empty() {
-            ("pass", "Mock: a competent implementer would build this correctly".to_string())
+            (
+                "pass",
+                "Mock: a competent implementer would build this correctly".to_string(),
+            )
         } else {
             (
                 "fail",
                 format!(
                     "Waiting on {}",
-                    open.iter().map(|c| c.label()).collect::<Vec<_>>().join(", ")
+                    open.iter()
+                        .map(|c| c.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             )
         };
@@ -257,10 +278,15 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         .unwrap_or_default();
     let mut summary = Vec::new();
     if added > 0 {
-        summary.push(format!("{title}  + {added} requirement{}", if added == 1 { "" } else { "s" }));
+        summary.push(format!(
+            "{title}  + {added} requirement{}",
+            if added == 1 { "" } else { "s" }
+        ));
     }
     if rewritten > 0 {
-        summary.push(format!("{title}  {rewritten} pre-v3 obligation(s) rewritten"));
+        summary.push(format!(
+            "{title}  {rewritten} pre-v3 obligation(s) rewritten"
+        ));
     }
     if asked > 0 || !open.is_empty() {
         summary.push(format!("{} choice(s) waiting on {title}", open.len()));
@@ -270,7 +296,11 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         summary.push("Not mentioned yet: who can use it".into());
     }
     if !capture {
-        summary.push(if open.is_empty() { "Buildable".into() } else { "Not buildable yet".into() });
+        summary.push(if open.is_empty() {
+            "Buildable".into()
+        } else {
+            "Not buildable yet".into()
+        });
     }
     if summary.is_empty() {
         summary.push("No changes.".into());

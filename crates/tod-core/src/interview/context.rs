@@ -2,11 +2,13 @@
 //! then only what changed since that session's previous turn — never anything
 //! the session already has.
 
+use crate::node_context::{
+    node_title, obligation_line, one_line, plan_step_line, render_inherited_context,
+};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt::Write as _;
 use std::path::Path;
-use crate::node_context::{node_title, obligation_line, one_line, plan_step_line, render_inherited_context};
 use tod_store::interview::*;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
@@ -66,7 +68,11 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     if let Some(session) = scope.interview_session_id {
         writeln!(out, "Session: {session}")?;
     }
-    writeln!(out, "You are the {}.", scope.role.as_str().replace('-', " "))?;
+    writeln!(
+        out,
+        "You are the {}.",
+        scope.role.as_str().replace('-', " ")
+    )?;
 
     let chain = ancestor_chain(conn, scope.node_id)?;
     let purposes: Vec<(Uuid, String)> = chain
@@ -97,7 +103,10 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     if local.is_empty() {
         out.push_str("\n(none yet)\n");
     }
-    for (kind, heading) in [(KIND_REQUIREMENT, "Requirements"), (KIND_CONSTRAINT, "Constraints")] {
+    for (kind, heading) in [
+        (KIND_REQUIREMENT, "Requirements"),
+        (KIND_CONSTRAINT, "Constraints"),
+    ] {
         let items: Vec<&NodeObligation> = local.iter().filter(|o| o.kind == kind).collect();
         if items.is_empty() {
             continue;
@@ -120,7 +129,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
         }
     }
 
-    out.push_str(&render_inherited_context(conn, &nodes, scope.node_id, Some(scope.phase))?);
+    out.push_str(&render_inherited_context(
+        conn,
+        &nodes,
+        scope.node_id,
+        Some(scope.phase),
+    )?);
 
     if scope.phase == PHASE_PLANNING {
         let plan_repo = PlanStepRepo::new(conn);
@@ -177,7 +191,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     if !deferred.is_empty() {
         out.push_str("\n## Deferred questions\n\n");
         for q in deferred {
-            writeln!(out, "- {}: {}", q.label(), one_line(q.question.as_deref().unwrap_or("")))?;
+            writeln!(
+                out,
+                "- {}: {}",
+                q.label(),
+                one_line(q.question.as_deref().unwrap_or(""))
+            )?;
         }
     }
     let answered: Vec<_> = questions
@@ -211,7 +230,11 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
                 out,
                 "- {} (by {}): {} — {}",
                 q.label(),
-                if q.withdrawn_by.is_some() { "the user" } else { "the app" },
+                if q.withdrawn_by.is_some() {
+                    "the user"
+                } else {
+                    "the app"
+                },
                 one_line(q.question.as_deref().unwrap_or("")),
                 one_line(q.withdrawn_reason.as_deref().unwrap_or(""))
             )?;
@@ -235,7 +258,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
 
 /// Everything that changed since `since` that `actor` did not do itself.
 /// Empty when nothing did.
-pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &str) -> Result<String> {
+pub fn delta(
+    conn: &Connection,
+    scope: &ContextScope<'_>,
+    since: i64,
+    actor: &str,
+) -> Result<String> {
     let repo = InterviewRepo::new(conn);
     let nodes = NodeRepo::new(conn);
     let obligations = ObligationRepo::new(conn);
@@ -329,7 +357,11 @@ pub fn delta(conn: &Connection, scope: &ContextScope<'_>, since: i64, actor: &st
                 };
                 match append_from {
                     Some(offset) if offset <= body.len() && body.is_char_boundary(offset) => {
-                        writeln!(content_lines, "+ {ty} (appended):\n{}", indent(&body[offset..], "  "))?
+                        writeln!(
+                            content_lines,
+                            "+ {ty} (appended):\n{}",
+                            indent(&body[offset..], "  ")
+                        )?
                     }
                     _ => writeln!(
                         content_lines,
@@ -468,7 +500,12 @@ fn memory_line(note: &MemoryNote) -> String {
         format!(" ({})", tags.join(", "))
     };
     if note.body.contains('\n') {
-        format!("{} {}{tags}:\n{}", note.label(), note.kind, indent(&note.body, "  "))
+        format!(
+            "{} {}{tags}:\n{}",
+            note.label(),
+            note.kind,
+            indent(&note.body, "  ")
+        )
     } else {
         format!("{} {}{tags}: {}", note.label(), note.kind, note.body)
     }
@@ -479,7 +516,11 @@ fn question_full(q: &InterviewQuestion, role: Role) -> String {
         "{} ({}): {}",
         q.label(),
         q.author,
-        one_line(q.question.as_deref().unwrap_or("(freeform text from the user)"))
+        one_line(
+            q.question
+                .as_deref()
+                .unwrap_or("(freeform text from the user)")
+        )
     );
     if let Some(context) = q.context.as_deref().filter(|c| !c.trim().is_empty()) {
         let _ = write!(out, "\n  context: {}", indent(context, "    ").trim_start());
@@ -543,7 +584,12 @@ fn proposal_line(p: &Proposal) -> String {
 
 fn answered_line(q: &InterviewQuestion) -> String {
     match q.question.as_deref() {
-        Some(question) => format!("{}: {} → {}", q.label(), one_line(question), answer_detail(q)),
+        Some(question) => format!(
+            "{}: {} → {}",
+            q.label(),
+            one_line(question),
+            answer_detail(q)
+        ),
         None => format!(
             "{} freeform: {}",
             q.label(),
@@ -613,7 +659,10 @@ mod tests {
     fn snapshot_shows_each_role_what_it_needs() {
         let fx = fixture();
         let obligation = fx.obligation("Sessions persist.");
-        for (kind, body) in [(MEMORY_PLAN, "The plan so far."), (MEMORY_CONTEXT, "Users are admins.")] {
+        for (kind, body) in [
+            (MEMORY_PLAN, "The plan so far."),
+            (MEMORY_CONTEXT, "Users are admins."),
+        ] {
             fx.user(InterviewCommand::AddMemory {
                 node_id: fx.node,
                 kind: kind.into(),
@@ -639,8 +688,14 @@ mod tests {
 
         let qm = fx.snapshot(Role::QuestionMaker, PHASE_REQUIREMENTS);
         assert!(qm.starts_with("# Interview state"), "{qm}");
-        assert!(qm.contains(&format!("- [{}] Sessions persist.", short_id(obligation))), "{qm}");
-        assert!(qm.contains(&format!("proposal: update [{}]", short_id(obligation))), "{qm}");
+        assert!(
+            qm.contains(&format!("- [{}] Sessions persist.", short_id(obligation))),
+            "{qm}"
+        );
+        assert!(
+            qm.contains(&format!("proposal: update [{}]", short_id(obligation))),
+            "{qm}"
+        );
         assert!(qm.contains("Users are admins."), "{qm}");
         assert!(qm.contains("The plan so far."), "{qm}");
         // The question maker sees intent only on questions it wrote.
@@ -661,15 +716,24 @@ mod tests {
 
         let changes = fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, base, AGENT);
         assert!(changes.starts_with("# Changes"), "{changes}");
-        assert!(changes.contains("+ q-2 (user): Someone else's question?"), "{changes}");
+        assert!(
+            changes.contains("+ q-2 (user): Someone else's question?"),
+            "{changes}"
+        );
         assert!(!changes.contains("Own question?"), "{changes}");
 
         let synced = fx.head();
-        assert_eq!(fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, synced, AGENT), "");
+        assert_eq!(
+            fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, synced, AGENT),
+            ""
+        );
 
         fx.answer(1, None, Some("Because reasons"));
         let changes = fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, synced, AGENT);
-        assert!(changes.contains("q-1 answered: notes: \"Because reasons\""), "{changes}");
+        assert!(
+            changes.contains("q-1 answered: notes: \"Because reasons\""),
+            "{changes}"
+        );
         // Already known: the question text is not sent again.
         assert!(!changes.contains("Own question?"), "{changes}");
         assert!(!changes.contains("Someone else's question?"), "{changes}");
@@ -690,10 +754,16 @@ mod tests {
         let added = fx.obligation("Newly required.");
 
         let changes = fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT);
-        assert!(changes.contains(&format!("- [{}]", short_id(removed))), "{changes}");
+        assert!(
+            changes.contains(&format!("- [{}]", short_id(removed))),
+            "{changes}"
+        );
         assert!(!changes.contains(&short_id(short_lived)), "{changes}");
         assert!(
-            changes.contains(&format!("+ [{}] requirement: Newly required.", short_id(added))),
+            changes.contains(&format!(
+                "+ [{}] requirement: Newly required.",
+                short_id(added)
+            )),
             "{changes}"
         );
     }
@@ -727,8 +797,14 @@ mod tests {
         let planning = fx.snapshot(Role::AnswerProcessor, PHASE_PLANNING);
         assert!(planning.contains(&short_id(req)), "{planning}");
         assert!(planning.contains(&short_id(design)), "{planning}");
-        assert!(planning.contains("Must support offline mode."), "{planning}");
-        assert!(planning.contains("Use SQLite for local cache."), "{planning}");
+        assert!(
+            planning.contains("Must support offline mode."),
+            "{planning}"
+        );
+        assert!(
+            planning.contains("Use SQLite for local cache."),
+            "{planning}"
+        );
     }
 
     #[test]
@@ -738,14 +814,23 @@ mod tests {
         let decision = fx.obligation_with_phase("Use Postgres for storage.", PHASE_DESIGN);
 
         let design_changes = fx.delta(Role::AnswerProcessor, PHASE_DESIGN, base, AGENT);
-        assert!(design_changes.contains("Use Postgres for storage."), "{design_changes}");
+        assert!(
+            design_changes.contains("Use Postgres for storage."),
+            "{design_changes}"
+        );
 
         let planning_changes = fx.delta(Role::AnswerProcessor, PHASE_PLANNING, base, AGENT);
-        assert!(planning_changes.contains("Use Postgres for storage."), "{planning_changes}");
+        assert!(
+            planning_changes.contains("Use Postgres for storage."),
+            "{planning_changes}"
+        );
 
         // A design-phase obligation is not visible back in the requirements phase.
         let requirements_changes = fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT);
-        assert!(!requirements_changes.contains("Use Postgres for storage."), "{requirements_changes}");
+        assert!(
+            !requirements_changes.contains("Use Postgres for storage."),
+            "{requirements_changes}"
+        );
         let _ = decision;
     }
 
@@ -762,7 +847,10 @@ mod tests {
         });
         let qm = fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, base, AGENT);
         assert!(qm.contains("+ m-1 handoff: Ask about exports."), "{qm}");
-        assert_eq!(fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT), "");
+        assert_eq!(
+            fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT),
+            ""
+        );
 
         let synced = fx.head();
         fx.user(InterviewCommand::UpdateMemory {
@@ -807,14 +895,21 @@ mod tests {
 
         let changes = fx.delta(Role::QuestionMaker, PHASE_REQUIREMENTS, base, AGENT);
         assert!(
-            changes.contains(&format!("q-1 withdrawn by the app: {STALE_PROPOSAL_REASON}")),
+            changes.contains(&format!(
+                "q-1 withdrawn by the app: {STALE_PROPOSAL_REASON}"
+            )),
             "{changes}"
         );
-        assert!(changes.contains("q-2 withdrawn by user: Not useful."), "{changes}");
+        assert!(
+            changes.contains("q-2 withdrawn by user: Not useful."),
+            "{changes}"
+        );
 
         let snapshot = fx.snapshot(Role::QuestionMaker, PHASE_REQUIREMENTS);
         assert!(
-            snapshot.contains(&format!("- q-1 (by the app): Reword it? — {STALE_PROPOSAL_REASON}")),
+            snapshot.contains(&format!(
+                "- q-1 (by the app): Reword it? — {STALE_PROPOSAL_REASON}"
+            )),
             "{snapshot}"
         );
         assert!(

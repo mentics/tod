@@ -25,19 +25,48 @@ const TREE_CHEVRON_WIDTH: f32 = 16.0;
 
 #[derive(Debug, Clone)]
 pub enum RowAction {
-    OpenEdit { task_id: String },
-    InlineEdit { task_id: String },
-    ToggleTagFilter { task_id: String, tag: String },
-    ActionsControl { task_id: String },
-    ShellsControl { task_id: String },
-    LifecycleControl { task_id: String, _lifecycle: String },
-    ToggleCollapsed { task_id: String },
-    OpenObligations { task_id: String },
-    DropObligation { task_id: String, obligation_id: uuid::Uuid },
-    RefreshGenerator { task_id: String },
-    OpenExternal { task_id: String },
-    CycleGeneratorSort { task_id: String },
-    ToggleGeneratorFilter { task_id: String },
+    OpenEdit {
+        task_id: String,
+    },
+    InlineEdit {
+        task_id: String,
+    },
+    ToggleTagFilter {
+        task_id: String,
+        tag: String,
+    },
+    ActionsControl {
+        task_id: String,
+    },
+    ShellsControl {
+        task_id: String,
+    },
+    LifecycleControl {
+        task_id: String,
+        _lifecycle: String,
+    },
+    ToggleCollapsed {
+        task_id: String,
+    },
+    OpenObligations {
+        task_id: String,
+    },
+    DropObligation {
+        task_id: String,
+        obligation_id: uuid::Uuid,
+    },
+    RefreshGenerator {
+        task_id: String,
+    },
+    OpenExternal {
+        task_id: String,
+    },
+    CycleGeneratorSort {
+        task_id: String,
+    },
+    ToggleGeneratorFilter {
+        task_id: String,
+    },
 }
 
 pub struct TaskListDelegate {
@@ -504,9 +533,10 @@ impl ListDelegate for TaskListDelegate {
             ));
         }
         let chips_menu_open = selected
-            && self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
-                matches!(kind, RowMenuKind::Shells) && id == &item.id
-            });
+            && self
+                .open_row_menu
+                .as_ref()
+                .is_some_and(|(kind, id)| matches!(kind, RowMenuKind::Shells) && id == &item.id);
         let title_line = if chips_menu_open {
             title_row.child(row_menu_anchor(chips, self.row_menu.clone()))
         } else {

@@ -129,7 +129,9 @@ impl PlanStepsView {
         cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
             loop {
-                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
@@ -171,7 +173,13 @@ impl PlanStepsView {
         self.node_id.is_some()
     }
 
-    pub fn open(&mut self, node_id: Uuid, title: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open(
+        &mut self,
+        node_id: Uuid,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.node_id = Some(node_id);
         self.title = title.to_string();
         self.clear_inline_edit_state(window, cx);
@@ -249,7 +257,11 @@ impl PlanStepsView {
                     .fleet
                     .list_plan_step_obligations(step.id)
                     .unwrap_or_default();
-                PlanStepRow { step, depends_on, satisfies }
+                PlanStepRow {
+                    step,
+                    depends_on,
+                    satisfies,
+                }
             })
             .collect()
     }
@@ -273,8 +285,10 @@ impl PlanStepsView {
 
         self.delegate.set_rows(rows);
         self.delegate.set_selected_index(self.selected_index);
-        self.delegate
-            .set_inline_edit(self.editing_id.map(|id| id.to_string()), self.inline_edit_input.clone());
+        self.delegate.set_inline_edit(
+            self.editing_id.map(|id| id.to_string()),
+            self.inline_edit_input.clone(),
+        );
         if let Some(ix) = selected_ix {
             if previous_index != selected_ix {
                 self.scroll_handle.scroll_to_top_of_item(ix);
@@ -298,15 +312,23 @@ impl PlanStepsView {
     }
 
     fn selected_step(&self) -> Option<PlanStep> {
-        self.delegate.selected_row().map(|r| r.step.clone()).or_else(|| {
-            let key = self.selected_key.as_ref()?;
-            self.items.iter().find(|s| &s.id.to_string() == key).cloned()
-        })
+        self.delegate
+            .selected_row()
+            .map(|r| r.step.clone())
+            .or_else(|| {
+                let key = self.selected_key.as_ref()?;
+                self.items
+                    .iter()
+                    .find(|s| &s.id.to_string() == key)
+                    .cloned()
+            })
     }
 
     fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
-        self.delegate
-            .set_inline_edit(self.editing_id.map(|id| id.to_string()), self.inline_edit_input.clone());
+        self.delegate.set_inline_edit(
+            self.editing_id.map(|id| id.to_string()),
+            self.inline_edit_input.clone(),
+        );
         cx.notify();
     }
 
@@ -332,7 +354,12 @@ impl PlanStepsView {
     }
 
     fn edit_body(&self, cx: &Context<Self>) -> String {
-        self.inline_edit_input.read(cx).text().to_string().trim().to_string()
+        self.inline_edit_input
+            .read(cx)
+            .text()
+            .to_string()
+            .trim()
+            .to_string()
     }
 
     fn start_inline_edit(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -352,7 +379,12 @@ impl PlanStepsView {
         self.rebuild_visible(window, cx);
     }
 
-    fn abandon_inline_edit(&mut self, window: &mut Window, cx: &mut Context<Self>, force_delete_draft: bool) {
+    fn abandon_inline_edit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        force_delete_draft: bool,
+    ) {
         let Some(editing_id) = self.editing_id else {
             return;
         };
@@ -361,9 +393,9 @@ impl PlanStepsView {
 
         if is_draft && (force_delete_draft || body.is_empty()) {
             self.clear_inline_edit_state(window, cx);
-            let _ = self
-                .fleet
-                .enqueue_outline(OutlineMutation::DeletePlanStep { step_id: editing_id });
+            let _ = self.fleet.enqueue_outline(OutlineMutation::DeletePlanStep {
+                step_id: editing_id,
+            });
             let _ = self.fleet.writer().flush();
             self.reload(window, cx);
             self.focus_list(window, cx);
@@ -393,9 +425,9 @@ impl PlanStepsView {
         if body.is_empty() {
             if self.is_draft_edit() {
                 self.clear_inline_edit_state(window, cx);
-                let _ = self
-                    .fleet
-                    .enqueue_outline(OutlineMutation::DeletePlanStep { step_id: editing_id });
+                let _ = self.fleet.enqueue_outline(OutlineMutation::DeletePlanStep {
+                    step_id: editing_id,
+                });
                 let _ = self.fleet.writer().flush();
                 self.reload(window, cx);
                 self.focus_list(window, cx);
@@ -409,7 +441,10 @@ impl PlanStepsView {
         }
         if let Err(err) = self
             .fleet
-            .enqueue_outline(OutlineMutation::UpdatePlanStepBody { step_id: editing_id, body: body.clone() })
+            .enqueue_outline(OutlineMutation::UpdatePlanStepBody {
+                step_id: editing_id,
+                body: body.clone(),
+            })
         {
             crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
             return false;
@@ -429,7 +464,13 @@ impl PlanStepsView {
         true
     }
 
-    fn create_relative(&mut self, after: Option<Uuid>, before: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_relative(
+        &mut self,
+        after: Option<Uuid>,
+        before: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(node_id) = self.node_id else {
             return;
         };
@@ -482,8 +523,17 @@ impl PlanStepsView {
             .filter(|s| s.id != id)
             .find(|s| s.ordinal > step.ordinal)
             .map(|s| s.id.to_string())
-            .or_else(|| self.items.iter().filter(|s| s.id != id).last().map(|s| s.id.to_string()));
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::DeletePlanStep { step_id: id }) {
+            .or_else(|| {
+                self.items
+                    .iter()
+                    .filter(|s| s.id != id)
+                    .last()
+                    .map(|s| s.id.to_string())
+            });
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::DeletePlanStep { step_id: id })
+        {
             crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
             return;
         }
@@ -493,14 +543,22 @@ impl PlanStepsView {
         self.focus_list(window, cx);
     }
 
-    fn move_selected(&mut self, direction: ReorderDirection, window: &mut Window, cx: &mut Context<Self>) {
+    fn move_selected(
+        &mut self,
+        direction: ReorderDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(step) = self.selected_step() else {
             return;
         };
         let id = step.id;
         if let Err(err) = self
             .fleet
-            .enqueue_outline(OutlineMutation::ReorderPlanStep { step_id: id, direction })
+            .enqueue_outline(OutlineMutation::ReorderPlanStep {
+                step_id: id,
+                direction,
+            })
         {
             crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
             return;
@@ -520,10 +578,13 @@ impl PlanStepsView {
             .position(|s| *s == step.status)
             .unwrap_or(0);
         let next = PLAN_STEP_STATUSES[(current_ix + 1) % PLAN_STEP_STATUSES.len()];
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
-            step_id: step.id,
-            status: next.to_string(),
-        }) {
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: step.id,
+                status: next.to_string(),
+            })
+        {
             crate::ui::toast::error_toast(window, cx, format!("Status update failed: {err}"));
             return;
         }
@@ -573,7 +634,12 @@ impl PlanStepsView {
         self.on_smart_enter(window, cx);
     }
 
-    fn on_create_below(&mut self, _: &PlanStepsCreateBelow, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_create_below(
+        &mut self,
+        _: &PlanStepsCreateBelow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_editing() {
             return;
         }
@@ -581,7 +647,12 @@ impl PlanStepsView {
         self.create_relative(after, false, window, cx);
     }
 
-    fn on_create_above(&mut self, _: &PlanStepsCreateAbove, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_create_above(
+        &mut self,
+        _: &PlanStepsCreateAbove,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_editing() {
             return;
         }
@@ -603,7 +674,12 @@ impl PlanStepsView {
         }
     }
 
-    fn on_commit_edit(&mut self, _: &PlanStepsCommitEdit, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_commit_edit(
+        &mut self,
+        _: &PlanStepsCommitEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.is_editing() {
             return;
         }
@@ -621,7 +697,12 @@ impl PlanStepsView {
         }
     }
 
-    fn on_cycle_status(&mut self, _: &PlanStepsCycleStatus, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_cycle_status(
+        &mut self,
+        _: &PlanStepsCycleStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_editing() {
             return;
         }

@@ -46,8 +46,8 @@ use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions,
-    div, px,
+    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions, div,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::spinner::Spinner;
@@ -96,7 +96,10 @@ pub enum LifecyclePanelEvent {
     /// User asked to open the interview for `task_id` at `lifecycle` — an
     /// on-demand fallback, not something the gate check does automatically.
     /// See `TaskListView::open_interview_for_task`.
-    OpenInterview { task_id: String, lifecycle: String },
+    OpenInterview {
+        task_id: String,
+        lifecycle: String,
+    },
 }
 
 /// Keyboard-navigable stops within the panel, in visual order.
@@ -354,8 +357,9 @@ impl LifecyclePanelView {
             let state = self.gate_states.entry(task_id).or_default();
             state.force_advance_armed = true;
             state.gate_error = None;
-            state.gate_status =
-                format!("Click Force advance again to confirm — skips the gate criteria, moves to {next}.");
+            state.gate_status = format!(
+                "Click Force advance again to confirm — skips the gate criteria, moves to {next}."
+            );
             cx.notify();
             return;
         }
@@ -457,17 +461,20 @@ impl LifecyclePanelView {
         row.outcome = OUTCOME_WAIVED.to_string();
         row.detail = Some("Waived by user".to_string());
 
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
-            node_id,
-            results: vec![(
-                criterion_id,
-                OUTCOME_WAIVED.to_string(),
-                Some("Waived by user".to_string()),
-                tod_store::outline::repos::gate::ACTION_NONE.to_string(),
-            )],
-            forward_state: None,
-            source: SOURCE_HUMAN.to_string(),
-        }) {
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::ApplyGateResults {
+                node_id,
+                results: vec![(
+                    criterion_id,
+                    OUTCOME_WAIVED.to_string(),
+                    Some("Waived by user".to_string()),
+                    tod_store::outline::repos::gate::ACTION_NONE.to_string(),
+                )],
+                forward_state: None,
+                source: SOURCE_HUMAN.to_string(),
+            })
+        {
             if let Some(state) = self.gate_states.get_mut(&task_id) {
                 state.gate_error = Some(format!("Failed to waive criterion: {err:#}"));
             }
@@ -506,12 +513,15 @@ impl LifecyclePanelView {
         };
         let next = next.to_string();
 
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
-            node_id,
-            results: Vec::new(),
-            forward_state: Some(next.clone()),
-            source: SOURCE_HUMAN.to_string(),
-        }) {
+        if let Err(err) = self
+            .fleet
+            .enqueue_outline(OutlineMutation::ApplyGateResults {
+                node_id,
+                results: Vec::new(),
+                forward_state: Some(next.clone()),
+                source: SOURCE_HUMAN.to_string(),
+            })
+        {
             if let Some(state) = self.gate_states.get_mut(&task_id) {
                 state.gate_error = Some(format!("Failed to advance lifecycle: {err:#}"));
             }
@@ -537,7 +547,13 @@ impl LifecyclePanelView {
         let Some(task_id) = self.task_id.as_ref() else {
             return Err(String::new());
         };
-        if self.fleet.resolve_agent_for_node(task_id).ok().flatten().is_none() {
+        if self
+            .fleet
+            .resolve_agent_for_node(task_id)
+            .ok()
+            .flatten()
+            .is_none()
+        {
             return Err(
                 "Enable the Agent capability on this node (or an ancestor) to implement.".into(),
             );
@@ -598,12 +614,25 @@ impl LifecyclePanelView {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|step| {
-                    let depends_on = self.fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
-                    let satisfies = self.fleet.list_plan_step_obligations(step.id).unwrap_or_default();
-                    PlanStepWithLinks { step, depends_on, satisfies }
+                    let depends_on = self
+                        .fleet
+                        .list_plan_step_dependencies(step.id)
+                        .unwrap_or_default();
+                    let satisfies = self
+                        .fleet
+                        .list_plan_step_obligations(step.id)
+                        .unwrap_or_default();
+                    PlanStepWithLinks {
+                        step,
+                        depends_on,
+                        satisfies,
+                    }
                 })
                 .collect();
-            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let obligations = self
+                .fleet
+                .list_obligations_for_node(node_id)
+                .unwrap_or_default();
             let ancestor_context = self
                 .fleet
                 .read(|conn| {
@@ -635,12 +664,14 @@ impl LifecyclePanelView {
 
         match build {
             Ok(context) => {
-                match self.interactive_window.create_and_open_implementation_session(
-                    &task_id,
-                    tod_core::agent_context::IMPLEMENT_CONTEXT_KEY,
-                    context,
-                    cx,
-                ) {
+                match self
+                    .interactive_window
+                    .create_and_open_implementation_session(
+                        &task_id,
+                        tod_core::agent_context::IMPLEMENT_SURFACE_KEY,
+                        context,
+                        cx,
+                    ) {
                     Ok(run_id) => {
                         self.implement_status
                             .insert(task_id, format!("Implementing ({run_id})."));
@@ -652,8 +683,10 @@ impl LifecyclePanelView {
                 }
             }
             Err(err) => {
-                self.implement_status
-                    .insert(task_id, format!("Failed to assemble implementation context: {err:#}"));
+                self.implement_status.insert(
+                    task_id,
+                    format!("Failed to assemble implementation context: {err:#}"),
+                );
             }
         }
         cx.notify();
@@ -673,7 +706,9 @@ impl LifecyclePanelView {
                 self.lifecycle_capable = uuid::Uuid::parse_str(task_id)
                     .ok()
                     .and_then(|node_id| self.fleet.list_node_capabilities(node_id).ok())
-                    .is_some_and(|caps| caps.contains(&tod_store::outline::types::Capability::Lifecycle));
+                    .is_some_and(|caps| {
+                        caps.contains(&tod_store::outline::types::Capability::Lifecycle)
+                    });
                 true
             }
             _ => false,
@@ -807,7 +842,11 @@ impl LifecyclePanelView {
         // Drop finished gate-check state for the closed node, but keep it if
         // a check is still in flight so it can keep running and be polled.
         if let Some(id) = self.task_id.as_deref() {
-            if self.gate_states.get(id).is_some_and(|s| s.pending.is_none()) {
+            if self
+                .gate_states
+                .get(id)
+                .is_some_and(|s| s.pending.is_none())
+            {
                 self.gate_states.remove(id);
             }
         }
@@ -819,7 +858,9 @@ impl LifecyclePanelView {
     }
 
     fn current_state(&self) -> Option<&GateCheckState> {
-        self.task_id.as_deref().and_then(|id| self.gate_states.get(id))
+        self.task_id
+            .as_deref()
+            .and_then(|id| self.gate_states.get(id))
     }
 
     fn in_flight(&self) -> bool {
@@ -860,14 +901,16 @@ impl LifecyclePanelView {
         }
         cx.notify();
 
-        let criteria = match self
-            .fleet
-            .gate_criteria_for_transition(node_id, &from_state, &to_state)
-        {
-            Ok(criteria) => criteria,
-            Err(err) => return self.fail_gate_check(&task_id, format!("{err:#}"), cx),
-        };
-        let criteria_catalog: Vec<GateCriterion> = criteria.iter().map(|(c, _)| c.clone()).collect();
+        let criteria =
+            match self
+                .fleet
+                .gate_criteria_for_transition(node_id, &from_state, &to_state)
+            {
+                Ok(criteria) => criteria,
+                Err(err) => return self.fail_gate_check(&task_id, format!("{err:#}"), cx),
+            };
+        let criteria_catalog: Vec<GateCriterion> =
+            criteria.iter().map(|(c, _)| c.clone()).collect();
 
         // Criteria the app can answer from its own data never reach the
         // agent: it isn't shown that data, so it could only guess.
@@ -901,13 +944,20 @@ impl LifecyclePanelView {
                     )
                 })
                 .collect();
-            if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
-                node_id,
-                results,
-                forward_state: None,
-                source: SOURCE_DERIVED.to_string(),
-            }) {
-                return self.fail_gate_check(&task_id, format!("Failed to save gate check: {err:#}"), cx);
+            if let Err(err) = self
+                .fleet
+                .enqueue_outline(OutlineMutation::ApplyGateResults {
+                    node_id,
+                    results,
+                    forward_state: None,
+                    source: SOURCE_DERIVED.to_string(),
+                })
+            {
+                return self.fail_gate_check(
+                    &task_id,
+                    format!("Failed to save gate check: {err:#}"),
+                    cx,
+                );
             }
             let _ = self.fleet.writer().flush();
 
@@ -950,7 +1000,10 @@ impl LifecyclePanelView {
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
                 .ok()
                 .flatten();
-            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let obligations = self
+                .fleet
+                .list_obligations_for_node(node_id)
+                .unwrap_or_default();
             let ancestor_context = self
                 .fleet
                 .read(|conn| {
@@ -968,9 +1021,19 @@ impl LifecyclePanelView {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|step| {
-                    let depends_on = self.fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
-                    let satisfies = self.fleet.list_plan_step_obligations(step.id).unwrap_or_default();
-                    PlanStepWithLinks { step, depends_on, satisfies }
+                    let depends_on = self
+                        .fleet
+                        .list_plan_step_dependencies(step.id)
+                        .unwrap_or_default();
+                    let satisfies = self
+                        .fleet
+                        .list_plan_step_obligations(step.id)
+                        .unwrap_or_default();
+                    PlanStepWithLinks {
+                        step,
+                        depends_on,
+                        satisfies,
+                    }
                 })
                 .collect();
             let media = tod_core::media::MediaPaths::discover()?;
@@ -1107,7 +1170,10 @@ impl LifecyclePanelView {
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
                 .ok()
                 .flatten();
-            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let obligations = self
+                .fleet
+                .list_obligations_for_node(node_id)
+                .unwrap_or_default();
             let ancestor_context = self
                 .fleet
                 .read(|conn| {
@@ -1125,9 +1191,19 @@ impl LifecyclePanelView {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|step| {
-                    let depends_on = self.fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
-                    let satisfies = self.fleet.list_plan_step_obligations(step.id).unwrap_or_default();
-                    PlanStepWithLinks { step, depends_on, satisfies }
+                    let depends_on = self
+                        .fleet
+                        .list_plan_step_dependencies(step.id)
+                        .unwrap_or_default();
+                    let satisfies = self
+                        .fleet
+                        .list_plan_step_obligations(step.id)
+                        .unwrap_or_default();
+                    PlanStepWithLinks {
+                        step,
+                        depends_on,
+                        satisfies,
+                    }
                 })
                 .collect();
             let media = tod_core::media::MediaPaths::discover()?;
@@ -1208,7 +1284,8 @@ impl LifecyclePanelView {
         match run_state {
             AgentRunState::InFlight(activity) => {
                 if let Some(state) = self.gate_states.get_mut(task_id) {
-                    state.on_entry_status = activity.unwrap_or_else(|| "Running on-entry setup…".into());
+                    state.on_entry_status =
+                        activity.unwrap_or_else(|| "Running on-entry setup…".into());
                 }
             }
             AgentRunState::NeedsPermission(request) => {
@@ -1253,7 +1330,11 @@ impl LifecyclePanelView {
         };
         drop(agent);
 
-        let to_state = match self.gate_states.get(task_id).and_then(|s| s.pending.as_ref()) {
+        let to_state = match self
+            .gate_states
+            .get(task_id)
+            .and_then(|s| s.pending.as_ref())
+        {
             Some(p) => p.to_state.clone(),
             None => return,
         };
@@ -1265,10 +1346,7 @@ impl LifecyclePanelView {
                 }
             }
             AgentRunState::NeedsPermission(request) => {
-                crate::ui::agent_permission::queue_permission_request(
-                    self.agent.clone(),
-                    request,
-                );
+                crate::ui::agent_permission::queue_permission_request(self.agent.clone(), request);
             }
             AgentRunState::Success(response) => {
                 if let Some(state) = self.gate_states.get_mut(task_id) {
@@ -1376,12 +1454,15 @@ impl LifecyclePanelView {
         let forward_state = advances.then(|| to_state.to_string());
 
         if !results.is_empty() || advances {
-            if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
-                node_id,
-                results,
-                forward_state: forward_state.clone(),
-                source: SOURCE_AGENT.to_string(),
-            }) {
+            if let Err(err) = self
+                .fleet
+                .enqueue_outline(OutlineMutation::ApplyGateResults {
+                    node_id,
+                    results,
+                    forward_state: forward_state.clone(),
+                    source: SOURCE_AGENT.to_string(),
+                })
+            {
                 let state = self.gate_states.entry(task_id.to_string()).or_default();
                 state.gate_error = Some(format!("Failed to save gate check: {err:#}"));
                 return;
@@ -1497,12 +1578,7 @@ impl Render for LifecyclePanelView {
                     .as_ref()
                     .and_then(|id| self.implement_status.get(id))
                     .cloned();
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .font_semibold()
-                        .child("Implementation"),
-                );
+                body = body.child(div().text_xs().font_semibold().child("Implementation"));
                 let (detail, blocked) = match &directory {
                     Ok(dir) => (format!("Runs in {}", dir.display()), false),
                     Err(reason) => (reason.clone(), true),
@@ -1512,24 +1588,30 @@ impl Render for LifecyclePanelView {
                 } else {
                     "Implement"
                 };
-                body = body.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .items_center()
-                        .child(div().flex_1().text_xs().text_color(muted).child(
-                            selectable_text("lifecycle-panel-implement-detail", detail, window, cx),
-                        ))
-                        .child(
-                            Button::new("lifecycle-panel-implement")
-                                .label(label)
-                                .ghost()
-                                .disabled(blocked || live_run.is_some())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.launch_implementation(cx);
-                                })),
-                        ),
-                );
+                body =
+                    body.child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .items_center()
+                            .child(div().flex_1().text_xs().text_color(muted).child(
+                                selectable_text(
+                                    "lifecycle-panel-implement-detail",
+                                    detail,
+                                    window,
+                                    cx,
+                                ),
+                            ))
+                            .child(
+                                Button::new("lifecycle-panel-implement")
+                                    .label(label)
+                                    .ghost()
+                                    .disabled(blocked || live_run.is_some())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.launch_implementation(cx);
+                                    })),
+                            ),
+                    );
                 if let Some(status) = implement_status {
                     body = body.child(div().text_xs().text_color(muted).child(selectable_text(
                         "lifecycle-panel-implement-status",
@@ -1662,35 +1744,29 @@ impl Render for LifecyclePanelView {
                         .gap_2()
                         .items_center()
                         .child(Spinner::new().with_size(Size::Small))
-                        .child(
-                            div().text_xs().text_color(muted).child(selectable_text(
-                                "lifecycle-panel-gate-status",
-                                gate_status.clone(),
-                                window,
-                                cx,
-                            )),
-                        ),
+                        .child(div().text_xs().text_color(muted).child(selectable_text(
+                            "lifecycle-panel-gate-status",
+                            gate_status.clone(),
+                            window,
+                            cx,
+                        ))),
                 );
             } else if !gate_status.is_empty() {
-                body = body.child(
-                    div().text_xs().text_color(muted).child(selectable_text(
-                        "lifecycle-panel-gate-status",
-                        gate_status.clone(),
-                        window,
-                        cx,
-                    )),
-                );
+                body = body.child(div().text_xs().text_color(muted).child(selectable_text(
+                    "lifecycle-panel-gate-status",
+                    gate_status.clone(),
+                    window,
+                    cx,
+                )));
             }
 
             if let Some(error) = gate_error {
-                body = body.child(
-                    div().text_xs().text_color(danger).child(selectable_text(
-                        "lifecycle-panel-gate-error",
-                        error,
-                        window,
-                        cx,
-                    )),
-                );
+                body = body.child(div().text_xs().text_color(danger).child(selectable_text(
+                    "lifecycle-panel-gate-error",
+                    error,
+                    window,
+                    cx,
+                )));
             }
 
             if on_entry_running {
@@ -1699,24 +1775,20 @@ impl Render for LifecyclePanelView {
                         .gap_2()
                         .items_center()
                         .child(Spinner::new().with_size(Size::Small))
-                        .child(
-                            div().text_xs().text_color(muted).child(selectable_text(
-                                "lifecycle-panel-on-entry-status",
-                                on_entry_status.clone(),
-                                window,
-                                cx,
-                            )),
-                        ),
+                        .child(div().text_xs().text_color(muted).child(selectable_text(
+                            "lifecycle-panel-on-entry-status",
+                            on_entry_status.clone(),
+                            window,
+                            cx,
+                        ))),
                 );
             } else if !on_entry_status.is_empty() {
-                body = body.child(
-                    div().text_xs().text_color(muted).child(selectable_text(
-                        "lifecycle-panel-on-entry-status",
-                        on_entry_status.clone(),
-                        window,
-                        cx,
-                    )),
-                );
+                body = body.child(div().text_xs().text_color(muted).child(selectable_text(
+                    "lifecycle-panel-on-entry-status",
+                    on_entry_status.clone(),
+                    window,
+                    cx,
+                )));
             }
 
             if !criteria_detail.is_empty() {
@@ -1850,7 +1922,8 @@ impl Render for LifecyclePanelView {
                             // so make the lack of in-app support explicit rather than
                             // leaving the human to guess why only Waive showed up.
                             if waivable && action == GateAction::None {
-                                let note = "No in-app resolution yet — waive or resolve outside the app.";
+                                let note =
+                                    "No in-app resolution yet — waive or resolve outside the app.";
                                 explanation = if explanation.trim().is_empty() {
                                     note.to_string()
                                 } else {
@@ -1875,12 +1948,9 @@ impl Render for LifecyclePanelView {
                 body = body.child(
                     v_flex()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .child("Criteria — Waive lets you accept a specific failure without fixing it"),
-                        )
+                        .child(div().text_xs().font_semibold().child(
+                            "Criteria — Waive lets you accept a specific failure without fixing it",
+                        ))
                         .child(list),
                 );
 
@@ -1919,10 +1989,12 @@ impl Render for LifecyclePanelView {
                 this.move_focus(-1, window, cx);
                 cx.stop_propagation();
             }))
-            .on_action(cx.listener(|this, _: &LifecyclePanelFocusDown, window, cx| {
-                this.move_focus(1, window, cx);
-                cx.stop_propagation();
-            }))
+            .on_action(
+                cx.listener(|this, _: &LifecyclePanelFocusDown, window, cx| {
+                    this.move_focus(1, window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .on_action(cx.listener(|this, _: &LifecyclePanelActivate, _, cx| {
                 this.activate_focused(cx);
                 cx.stop_propagation();
@@ -1969,9 +2041,21 @@ pub fn register_lifecycle_panel_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, LifecyclePanelClose, LIFECYCLE_PANEL_CONTEXT);
     cx.bind_keys([
         KeyBinding::new("up", LifecyclePanelFocusUp, Some(LIFECYCLE_PANEL_CONTEXT)),
-        KeyBinding::new("down", LifecyclePanelFocusDown, Some(LIFECYCLE_PANEL_CONTEXT)),
-        KeyBinding::new("enter", LifecyclePanelActivate, Some(LIFECYCLE_PANEL_CONTEXT)),
-        KeyBinding::new("space", LifecyclePanelActivate, Some(LIFECYCLE_PANEL_CONTEXT)),
+        KeyBinding::new(
+            "down",
+            LifecyclePanelFocusDown,
+            Some(LIFECYCLE_PANEL_CONTEXT),
+        ),
+        KeyBinding::new(
+            "enter",
+            LifecyclePanelActivate,
+            Some(LIFECYCLE_PANEL_CONTEXT),
+        ),
+        KeyBinding::new(
+            "space",
+            LifecyclePanelActivate,
+            Some(LIFECYCLE_PANEL_CONTEXT),
+        ),
     ]);
     bind_modified_pane_nav(cx, LIFECYCLE_PANEL_CONTEXT);
 }

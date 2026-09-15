@@ -15,7 +15,9 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
+use tod_store::agent_traffic::{
+    AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
+};
 use tod_store::fleet::{FleetStore, TranscriptTurn};
 
 /// A single row in the agent picker list, unified across fleet agent runs and
@@ -361,10 +363,7 @@ fn render_agent_section(
                         .pr(if badge.is_some() { px(18.) } else { px(0.) })
                         .child(
                             selectable_text(
-                                gpui::SharedString::from(format!(
-                                    "agent-pick-label-{}",
-                                    agent.id
-                                )),
+                                gpui::SharedString::from(format!("agent-pick-label-{}", agent.id)),
                                 agent.label.clone(),
                                 window,
                                 cx,
@@ -374,10 +373,7 @@ fn render_agent_section(
                         )
                         .child(
                             selectable_text(
-                                gpui::SharedString::from(format!(
-                                    "agent-pick-turns-{}",
-                                    agent.id
-                                )),
+                                gpui::SharedString::from(format!("agent-pick-turns-{}", agent.id)),
                                 subtitle,
                                 window,
                                 cx,

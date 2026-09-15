@@ -107,9 +107,9 @@ impl RightDrawer {
             }
             match kind {
                 DrawerKind::TaskEdit => self.task_edit.update(cx, |panel, cx| panel.close(cx)),
-                DrawerKind::Obligations => {
-                    self.obligations.update(cx, |panel, cx| panel.close(window, cx))
-                }
+                DrawerKind::Obligations => self
+                    .obligations
+                    .update(cx, |panel, cx| panel.close(window, cx)),
                 DrawerKind::Lifecycle => self.lifecycle.update(cx, |panel, cx| panel.close(cx)),
                 DrawerKind::VisualDesign => {
                     self.visual_design.update(cx, |panel, cx| panel.close(cx))
@@ -149,12 +149,19 @@ impl RightDrawer {
                 }
             }
             DrawerKind::Action => {
-                self.action.update(cx, |panel, cx| panel.retarget(task_id, cx));
+                self.action
+                    .update(cx, |panel, cx| panel.retarget(task_id, cx));
             }
         }
     }
 
-    fn show_obligations(&self, task_id: &str, fleet: &FleetStore, window: &mut Window, cx: &mut App) {
+    fn show_obligations(
+        &self,
+        task_id: &str,
+        fleet: &FleetStore,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let Ok(node_id) = Uuid::parse_str(task_id) else {
             return;
         };
@@ -171,16 +178,20 @@ impl RightDrawer {
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
         match self.active(cx) {
-            Some(DrawerKind::TaskEdit) => self.task_edit.read(cx).focus_handle(cx).focus(window, cx),
+            Some(DrawerKind::TaskEdit) => {
+                self.task_edit.read(cx).focus_handle(cx).focus(window, cx)
+            }
             Some(DrawerKind::Obligations) => {
                 self.obligations.read(cx).focus_handle(cx).focus(window, cx)
             }
-            Some(DrawerKind::Lifecycle) => {
-                self.lifecycle.update(cx, |panel, cx| panel.focus(window, cx))
-            }
-            Some(DrawerKind::VisualDesign) => {
-                self.visual_design.read(cx).focus_handle(cx).focus(window, cx)
-            }
+            Some(DrawerKind::Lifecycle) => self
+                .lifecycle
+                .update(cx, |panel, cx| panel.focus(window, cx)),
+            Some(DrawerKind::VisualDesign) => self
+                .visual_design
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx),
             Some(DrawerKind::Action) => self.action.read(cx).focus_handle(cx).focus(window, cx),
             None => {}
         }

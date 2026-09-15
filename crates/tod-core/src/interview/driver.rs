@@ -91,8 +91,13 @@ pub struct DriverStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverEvent {
-    QuestionMakerFinished { error: Option<String> },
-    AnswersFinished { questions: Vec<i64>, error: Option<String> },
+    QuestionMakerFinished {
+        error: Option<String>,
+    },
+    AnswersFinished {
+        questions: Vec<i64>,
+        error: Option<String>,
+    },
 }
 
 pub struct InterviewDriver {
@@ -241,7 +246,8 @@ impl InterviewDriver {
         let (open_now, state, unprocessed) = fleet.read(|conn| {
             let repo = InterviewRepo::new(conn);
             Ok((
-                repo.list_questions(self.config.node_id, &[STATUS_OPEN])?.len(),
+                repo.list_questions(self.config.node_id, &[STATUS_OPEN])?
+                    .len(),
                 repo.question_maker_state(self.config.interview_session_id)?
                     .map(|s| s.0)
                     .unwrap_or_default(),
@@ -263,7 +269,8 @@ impl InterviewDriver {
                 } else {
                     self.question_maker_backoff.reset();
                     if open_now <= turn.open_before && state != QUESTION_MAKER_EXHAUSTED {
-                        self.question_maker_idle_until = Some(Instant::now() + QUESTION_MAKER_IDLE_PAUSE);
+                        self.question_maker_idle_until =
+                            Some(Instant::now() + QUESTION_MAKER_IDLE_PAUSE);
                     }
                     None
                 }
@@ -377,9 +384,11 @@ impl InterviewDriver {
 
         for handoff in &open_gate_handoffs {
             let still_failing = failing.iter().any(|(criterion, _)| {
-                handoff
-                    .body
-                    .starts_with(&format!("{}{}", Self::GATE_HANDOFF_PREFIX, criterion.label))
+                handoff.body.starts_with(&format!(
+                    "{}{}",
+                    Self::GATE_HANDOFF_PREFIX,
+                    criterion.label
+                ))
             });
             if !still_failing {
                 fleet.interview(
@@ -400,41 +409,42 @@ impl InterviewDriver {
     fn schedule(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
         let node = self.config.node_id;
         let gate_handoff = self.sync_gate_failures(fleet).unwrap_or(false);
-        let (mut open, unprocessed, state, new_handoff, handoffs_open, stale) = fleet.read(|conn| {
-            let repo = InterviewRepo::new(conn);
-            let handoffs = repo.list_memory(node, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
-            // A handoff is new to the question maker when it was written after that
-            // session's context was built — including during its own turn, which a
-            // timestamp taken when the turn finished would hide.
-            let new_handoff = match repo
-                .live_agent_sessions(node, self.phase, Role::QuestionMaker)?
-                .first()
-            {
-                _ if handoffs.is_empty() => false,
-                None => true,
-                Some(session) => repo
-                    .changes_since(&[node], session.synced_rev, &session.id.to_string())?
-                    .iter()
-                    .any(|c| {
-                        c.entity == ENTITY_MEMORY
-                            && c.op == "insert"
-                            && handoffs.iter().any(|h| h.id == c.entity_id)
-                    }),
-            };
-            Ok((
-                repo.list_questions(node, &[STATUS_OPEN])?.len(),
-                repo.unprocessed_answers(node)?
-                    .into_iter()
-                    .map(|q| q.seq)
-                    .collect::<Vec<_>>(),
-                repo.question_maker_state(self.config.interview_session_id)?
-                    .map(|s| s.0)
-                    .unwrap_or_default(),
-                new_handoff,
-                !handoffs.is_empty(),
-                repo.stale_proposal_questions(node)?,
-            ))
-        })?;
+        let (mut open, unprocessed, state, new_handoff, handoffs_open, stale) =
+            fleet.read(|conn| {
+                let repo = InterviewRepo::new(conn);
+                let handoffs = repo.list_memory(node, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
+                // A handoff is new to the question maker when it was written after that
+                // session's context was built — including during its own turn, which a
+                // timestamp taken when the turn finished would hide.
+                let new_handoff = match repo
+                    .live_agent_sessions(node, self.phase, Role::QuestionMaker)?
+                    .first()
+                {
+                    _ if handoffs.is_empty() => false,
+                    None => true,
+                    Some(session) => repo
+                        .changes_since(&[node], session.synced_rev, &session.id.to_string())?
+                        .iter()
+                        .any(|c| {
+                            c.entity == ENTITY_MEMORY
+                                && c.op == "insert"
+                                && handoffs.iter().any(|h| h.id == c.entity_id)
+                        }),
+                };
+                Ok((
+                    repo.list_questions(node, &[STATUS_OPEN])?.len(),
+                    repo.unprocessed_answers(node)?
+                        .into_iter()
+                        .map(|q| q.seq)
+                        .collect::<Vec<_>>(),
+                    repo.question_maker_state(self.config.interview_session_id)?
+                        .map(|s| s.0)
+                        .unwrap_or_default(),
+                    new_handoff,
+                    !handoffs.is_empty(),
+                    repo.stale_proposal_questions(node)?,
+                ))
+            })?;
 
         // A question whose proposal targets a removed obligation can't be
         // accepted; the answer processor should have withdrawn it, so the app
@@ -484,9 +494,15 @@ impl InterviewDriver {
                     "Target open questions: {}.",
                     self.config.replenish_threshold
                 );
-                if let Err(err) =
-                    self.start_turn(fleet, agent, Role::QuestionMaker, 0, Vec::new(), open, instruction)
-                {
+                if let Err(err) = self.start_turn(
+                    fleet,
+                    agent,
+                    Role::QuestionMaker,
+                    0,
+                    Vec::new(),
+                    open,
+                    instruction,
+                ) {
                     self.question_maker_backoff.fail();
                     return Err(err);
                 }
@@ -522,7 +538,10 @@ impl InterviewDriver {
             [] => Vec::new(),
             [a, b, ..] if fan_out && pending.len() > 1 => {
                 let split = pending.len().div_ceil(2);
-                vec![(*a, pending[..split].to_vec()), (*b, pending[split..].to_vec())]
+                vec![
+                    (*a, pending[..split].to_vec()),
+                    (*b, pending[split..].to_vec()),
+                ]
             }
             [a, ..] => vec![(*a, pending)],
         };
@@ -710,8 +729,7 @@ impl InterviewDriver {
     fn cwd(&self) -> Result<PathBuf> {
         if self.phase == PHASE_REQUIREMENTS {
             let dir = self.config.data_root.join("agent").join("interview");
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             return Ok(dir);
         }
         Ok(self.config.repo_cwd.clone())
@@ -759,7 +777,8 @@ mod tests {
             self.sessions
                 .entry(turn.key.clone())
                 .or_insert_with(|| format!("agent-side-{}", turn.key));
-            self.runs.insert(id, AgentRunState::Success(Some("ok".into())));
+            self.runs
+                .insert(id, AgentRunState::Success(Some("ok".into())));
             self.turns.push(turn);
             Ok(AgentRunHandle { id })
         }
@@ -840,7 +859,10 @@ mod tests {
         assert_eq!(agent.turns.len(), 1);
         let first = &agent.turns[0];
         assert_eq!(first.purpose, SessionPurpose::QuestionMaker);
-        let opening = first.opening.as_ref().expect("first turn opens the session");
+        let opening = first
+            .opening
+            .as_ref()
+            .expect("first turn opens the session");
         let context = opening.context.as_deref().unwrap();
         assert!(context.starts_with("QUESTION MAKER DOCS"), "{context}");
         assert!(context.contains("# Interview state"), "{context}");
@@ -862,10 +884,21 @@ mod tests {
         let second = &agent.turns[1];
         assert_eq!(second.purpose, SessionPurpose::QuestionMaker);
         assert_eq!(actor(second), question_maker, "same session reused");
-        assert!(second.opening.is_none(), "docs and snapshot are not re-sent");
+        assert!(
+            second.opening.is_none(),
+            "docs and snapshot are not re-sent"
+        );
         assert!(second.resume_session_id.is_some());
-        assert!(second.message.contains("q-1 answered: 1 Yes"), "{}", second.message);
-        assert!(!second.message.contains("# Interview state"), "{}", second.message);
+        assert!(
+            second.message.contains("q-1 answered: 1 Yes"),
+            "{}",
+            second.message
+        );
+        assert!(
+            !second.message.contains("# Interview state"),
+            "{}",
+            second.message
+        );
         assert!(
             !second.message.contains("question?"),
             "own questions are not echoed: {}",
@@ -874,9 +907,18 @@ mod tests {
 
         let processor = &agent.turns[2];
         assert_eq!(processor.purpose, SessionPurpose::AnswerProcessor);
-        let context = processor.opening.as_ref().unwrap().context.as_deref().unwrap();
+        let context = processor
+            .opening
+            .as_ref()
+            .unwrap()
+            .context
+            .as_deref()
+            .unwrap();
         assert!(context.starts_with("ANSWER PROCESSOR DOCS"), "{context}");
-        assert!(context.contains("## Answers awaiting processing"), "{context}");
+        assert!(
+            context.contains("## Answers awaiting processing"),
+            "{context}"
+        );
         assert_eq!(processor.message, "# Turn\n\nProcess: q-1.");
         assert_eq!(live_sessions(&fx, Role::QuestionMaker).len(), 1);
     }
@@ -936,7 +978,10 @@ mod tests {
         assert_eq!(agent.turns.len(), 2);
         let second = &agent.turns[1];
         assert_ne!(actor(second), first, "a new session");
-        assert!(second.opening.is_some(), "the new session gets a fresh snapshot");
+        assert!(
+            second.opening.is_some(),
+            "the new session gets a fresh snapshot"
+        );
         assert_eq!(agent.closed, [format!("interview-{first}")]);
         let live = live_sessions(&fx, Role::QuestionMaker);
         assert_eq!(live.len(), 1);
@@ -980,7 +1025,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .0;
-        assert_eq!(state, QUESTION_MAKER_IDLE, "exhaustion cleared for the replacement");
+        assert_eq!(
+            state, QUESTION_MAKER_IDLE,
+            "exhaustion cleared for the replacement"
+        );
     }
 
     #[test]

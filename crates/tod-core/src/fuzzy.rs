@@ -88,10 +88,7 @@ mod tests {
 
     #[test]
     fn words_match_regardless_of_order() {
-        assert!(fuzzy_matches(
-            "login reusable",
-            "Reusable Login Component"
-        ));
+        assert!(fuzzy_matches("login reusable", "Reusable Login Component"));
     }
 
     #[test]

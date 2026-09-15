@@ -11,7 +11,9 @@ use std::fmt::Write as _;
 use tod_store::drafting::*;
 use tod_store::interview::short_id;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::{EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, ancestor_chain, phase_visible};
+use tod_store::outline::{
+    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, ancestor_chain, phase_visible,
+};
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -55,7 +57,12 @@ pub fn choice_line(c: &DraftingChoice) -> String {
         .enumerate()
         .map(|(i, o)| format!("{}. {}", i + 1, one_line(&o.label)))
         .collect();
-    format!("{}: {} — {}", c.label(), one_line(&c.question), options.join(" | "))
+    format!(
+        "{}: {} — {}",
+        c.label(),
+        one_line(&c.question),
+        options.join(" | ")
+    )
 }
 
 pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode) -> Result<String> {
@@ -92,7 +99,10 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
             .get_extra_content(*id, EXTRA_CONTENT_GOAL)?
             .filter(|g| !g.trim().is_empty())
         {
-            let title = nodes.get(*id)?.map(|n| n.title).unwrap_or_else(|| short_id(*id));
+            let title = nodes
+                .get(*id)?
+                .map(|n| n.title)
+                .unwrap_or_else(|| short_id(*id));
             writeln!(purposes, "- {title}: {}", one_line(&goal))?;
         }
     }
@@ -117,7 +127,10 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
     if local.is_empty() {
         out.push_str("\n(none yet)\n");
     }
-    for (kind, heading) in [(KIND_REQUIREMENT, "Requirements"), (KIND_CONSTRAINT, "Constraints")] {
+    for (kind, heading) in [
+        (KIND_REQUIREMENT, "Requirements"),
+        (KIND_CONSTRAINT, "Constraints"),
+    ] {
         let items: Vec<&MarkedObligation> =
             local.iter().filter(|m| m.obligation.kind == kind).collect();
         if items.is_empty() {
@@ -136,7 +149,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
         )?;
     }
 
-    out.push_str(&render_inherited_context(conn, &nodes, scope.node_id, Some(scope.phase))?);
+    out.push_str(&render_inherited_context(
+        conn,
+        &nodes,
+        scope.node_id,
+        Some(scope.phase),
+    )?);
 
     let open = drafting.list_choices(scope.node_id, &[CHOICE_OPEN])?;
     if !open.is_empty() {

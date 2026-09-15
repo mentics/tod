@@ -26,7 +26,11 @@ pub use tod_store::settings::TodSettings;
 
 /// The `tod-cli` executable installed next to the running binary.
 pub fn tod_cli_path() -> std::path::PathBuf {
-    let name = if cfg!(windows) { "tod-cli.exe" } else { "tod-cli" };
+    let name = if cfg!(windows) {
+        "tod-cli.exe"
+    } else {
+        "tod-cli"
+    };
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(name)))

@@ -176,7 +176,6 @@ impl SettingField {
             Self::ChatLaunchMode => "chat-launch-mode",
         }
     }
-
 }
 
 const PLATFORM_ORDER: [AgentPlatform; 2] = [AgentPlatform::Claude, AgentPlatform::Cursor];
@@ -610,7 +609,10 @@ impl SettingsView {
         };
         let platform = self.settings.platform_for(role);
         let items: Vec<String> = match self.selected_agent_column {
-            0 => PLATFORM_ORDER.iter().map(|p| p.label().to_string()).collect(),
+            0 => PLATFORM_ORDER
+                .iter()
+                .map(|p| p.label().to_string())
+                .collect(),
             1 => catalog_strings(models_for(platform)),
             _ => catalog_strings(efforts_for(platform)),
         };

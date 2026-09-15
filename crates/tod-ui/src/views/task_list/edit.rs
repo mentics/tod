@@ -533,7 +533,10 @@ mod tests {
             position,
         };
         insert_draft_row(&mut tasks, &draft);
-        let ix = tasks.iter().position(|t| t.id == id(99).to_string()).unwrap();
+        let ix = tasks
+            .iter()
+            .position(|t| t.id == id(99).to_string())
+            .unwrap();
         (ix, tasks[ix].clone())
     }
 

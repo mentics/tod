@@ -18,9 +18,9 @@ use tod_core::gate::PlanStepWithLinks;
 use tod_core::media::MediaPaths;
 use tod_store::fleet::paths::FleetPaths;
 use tod_store::fleet::schema::open_read_connection;
+use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::uuid_blob::blob_to_uuid_sql;
-use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use uuid::Uuid;
 
 fn main() -> Result<()> {
@@ -39,7 +39,10 @@ fn main() -> Result<()> {
     let node = nodes
         .get(node_id)?
         .with_context(|| format!("node {node_id} not found"))?;
-    let body = nodes.get_extra_content(node_id, EXTRA_CONTENT_DETAILS).ok().flatten();
+    let body = nodes
+        .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
+        .ok()
+        .flatten();
     let obligations = ObligationRepo::new(&conn).list_for_node(node_id)?;
 
     let plan_repo = PlanStepRepo::new(&conn);
@@ -49,7 +52,11 @@ fn main() -> Result<()> {
         .map(|step| {
             let depends_on = plan_repo.list_dependencies(step.id).unwrap_or_default();
             let satisfies = plan_repo.list_obligations(step.id).unwrap_or_default();
-            PlanStepWithLinks { step, depends_on, satisfies }
+            PlanStepWithLinks {
+                step,
+                depends_on,
+                satisfies,
+            }
         })
         .collect();
 
@@ -85,7 +92,8 @@ fn main() -> Result<()> {
 /// The node with the longest root-to-leaf chain across every outline list.
 fn deepest_node(conn: &Connection) -> Result<Uuid> {
     let mut stmt = conn.prepare("SELECT node_id, parent_id FROM outline_entries")?;
-    let mut parent_of: std::collections::HashMap<Uuid, Option<Uuid>> = std::collections::HashMap::new();
+    let mut parent_of: std::collections::HashMap<Uuid, Option<Uuid>> =
+        std::collections::HashMap::new();
     let rows = stmt.query_map([], |row| {
         let node_id: Vec<u8> = row.get(0)?;
         let parent_id: Option<Vec<u8>> = row.get(1)?;

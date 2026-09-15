@@ -90,8 +90,8 @@ fn open_permission_dialog(
                         let agent = agent.clone();
                         let option_id = option.id.clone();
                         let is_allow = option.id.to_ascii_lowercase().contains("allow");
-                        let button = Button::new(("permission-option", idx))
-                            .label(option.label.clone());
+                        let button =
+                            Button::new(("permission-option", idx)).label(option.label.clone());
                         let button = if is_allow { button.primary() } else { button };
                         button.on_click(move |_, window, cx| {
                             OPEN.with(|open| {

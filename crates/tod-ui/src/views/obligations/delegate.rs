@@ -107,16 +107,38 @@ impl ObligationRow {
 
 #[derive(Debug, Clone)]
 pub enum RowAction {
-    TogglePhase { phase: String },
-    ToggleGroup { phase: String, kind: String },
-    ToggleSection { phase: String, kind: String, section: String },
-    StartEdit { obligation_id: uuid::Uuid },
-    StartSectionEdit { phase: String, kind: String, section: String },
-    AddSection { phase: String, kind: String },
-    Select { row_ix: usize },
+    TogglePhase {
+        phase: String,
+    },
+    ToggleGroup {
+        phase: String,
+        kind: String,
+    },
+    ToggleSection {
+        phase: String,
+        kind: String,
+        section: String,
+    },
+    StartEdit {
+        obligation_id: uuid::Uuid,
+    },
+    StartSectionEdit {
+        phase: String,
+        kind: String,
+        section: String,
+    },
+    AddSection {
+        phase: String,
+        kind: String,
+    },
+    Select {
+        row_ix: usize,
+    },
     /// Clicked the design-phase obligation's "Design" affordance — create or
     /// open its associated visual-design mockup.
-    OpenVisualDesign { obligation_id: uuid::Uuid },
+    OpenVisualDesign {
+        obligation_id: uuid::Uuid,
+    },
 }
 
 pub struct ObligationListDelegate {
@@ -470,8 +492,12 @@ impl ObligationListDelegate {
                     );
                 if editing {
                     if let Some(input) = &self.inline_edit_input {
-                        row_el = row_el
-                            .child(div().flex_1().min_w_0().child(Textarea::new(input).w_full()));
+                        row_el = row_el.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Textarea::new(input).w_full()),
+                        );
                     }
                 } else {
                     let id = obligation.id;

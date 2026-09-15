@@ -10,7 +10,9 @@ use rusqlite::Connection;
 use tod_store::fleet::node_actions::{
     FilesDirectory, resolve_agent_for_node, resolve_files_for_node,
 };
-use tod_store::outline::{GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG};
+use tod_store::outline::{
+    GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
+};
 use uuid::Uuid;
 
 /// The app's verdict on one derived criterion.
@@ -66,7 +68,10 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
             )));
         }
         FilesDirectory::Missing(reason) => {
-            return Ok(fail(format!("Files on \"{}\": {reason}", files.source_title)));
+            return Ok(fail(format!(
+                "Files on \"{}\": {reason}",
+                files.source_title
+            )));
         }
     };
     Ok(DerivedOutcome {
@@ -191,6 +196,9 @@ mod tests {
     #[test]
     fn other_criteria_are_left_to_the_agent() {
         let (store, node) = store_with_node();
-        assert_eq!(evaluate(&store, node, "planning-ready.plan-actionable"), None);
+        assert_eq!(
+            evaluate(&store, node, "planning-ready.plan-actionable"),
+            None
+        );
     }
 }

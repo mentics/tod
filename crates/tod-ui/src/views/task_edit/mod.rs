@@ -12,9 +12,11 @@ use gpui::{
     IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollAnchor, ScrollHandle,
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
 };
-use gpui_component::button::{Button, ButtonVariants};
 use gpui_base::input::{InputBaseState, InputModeKind};
-use gpui_component::input::{AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{
+    AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState,
+};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
@@ -234,11 +236,8 @@ impl TaskEditView {
         });
         let branch_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
-        let note_edit_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(2)
-                .placeholder("Note…")
-        });
+        let note_edit_input =
+            cx.new(|cx| TextareaState::new(window, cx).rows(2).placeholder("Note…"));
         let purpose_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(4)
@@ -570,7 +569,9 @@ impl TaskEditView {
                 cx.notify();
                 return;
             }
-            TaskEditField::AgentPlatform | TaskEditField::AgentModel | TaskEditField::AgentEffort => {
+            TaskEditField::AgentPlatform
+            | TaskEditField::AgentModel
+            | TaskEditField::AgentEffort => {
                 self.cycle_agent_field(field, cx);
                 return;
             }
@@ -590,8 +591,12 @@ impl TaskEditView {
                 }
                 if let Some(input) = self.input_for_field(field) {
                     cx.on_next_frame(window, move |_, window, cx| match &input {
-                        AnyInputState::Input(input) => input.update(cx, |input, cx| input.focus(window, cx)),
-                        AnyInputState::Textarea(input) => input.update(cx, |input, cx| input.focus(window, cx)),
+                        AnyInputState::Input(input) => {
+                            input.update(cx, |input, cx| input.focus(window, cx))
+                        }
+                        AnyInputState::Textarea(input) => {
+                            input.update(cx, |input, cx| input.focus(window, cx))
+                        }
                         _ => {}
                     });
                 }
@@ -825,12 +830,15 @@ impl TaskEditView {
 
     /// This node's own Files values (not an ancestor's).
     fn own_files(&self) -> Option<&ResolvedFiles> {
-        self.resolved_files.as_ref().filter(|files| !files.inherited)
+        self.resolved_files
+            .as_ref()
+            .filter(|files| !files.inherited)
     }
 
     /// This node has a worktree set up.
     fn has_own_worktree(&self) -> bool {
-        self.own_files().is_some_and(|files| files.worktree_path().is_some())
+        self.own_files()
+            .is_some_and(|files| files.worktree_path().is_some())
     }
 
     /// `Some(true)` = "Set up worktree", `Some(false)` = "Release worktree".
@@ -858,8 +866,10 @@ impl TaskEditView {
         let effective = agent.launch_options(&self.settings_launch());
         match field {
             TaskEditField::AgentPlatform => {
-                let options: Vec<&str> =
-                    PLATFORM_ORDER.iter().map(|p| platform_storage(*p)).collect();
+                let options: Vec<&str> = PLATFORM_ORDER
+                    .iter()
+                    .map(|p| platform_storage(*p))
+                    .collect();
                 agent.platform = cycle_option(agent.platform.as_deref(), &options);
                 // Model and effort catalogs are per platform.
                 agent.model = None;
@@ -1047,9 +1057,9 @@ impl TaskEditView {
     fn load_generator_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generator_pending_source_type = None;
         self.generator_config_error = None;
-        let config = self.node_uuid().and_then(|node_id| {
-            self.fleet.get_generator_config(node_id).ok().flatten()
-        });
+        let config = self
+            .node_uuid()
+            .and_then(|node_id| self.fleet.get_generator_config(node_id).ok().flatten());
         match config {
             Some(config) => {
                 self.generator_data_source_type = Some(config.data_source_type);
@@ -1098,13 +1108,20 @@ impl TaskEditView {
         else {
             return;
         };
-        let config_json = input_text(&self.generator_config_input, cx).trim().to_string();
+        let config_json = input_text(&self.generator_config_input, cx)
+            .trim()
+            .to_string();
         let config_json = if config_json.is_empty() {
             "{}".to_string()
         } else {
             config_json
         };
-        match tod_core::generator::set_generator_config(&self.fleet, node_id, &data_source_type, &config_json) {
+        match tod_core::generator::set_generator_config(
+            &self.fleet,
+            node_id,
+            &data_source_type,
+            &config_json,
+        ) {
             Ok(()) => {
                 self.generator_config_error = None;
                 self.generator_data_source_type = Some(data_source_type);
@@ -1994,7 +2011,9 @@ impl TaskEditView {
                 .child(
                     div()
                         .rounded_md()
-                        .when(focused, |el| el.bg(active).border_1().border_color(active_border))
+                        .when(focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
                         .child(
                             Button::new((field_anchor_id(field), 0usize))
                                 .label(value)
@@ -2008,11 +2027,7 @@ impl TaskEditView {
         )
     }
 
-    fn render_agent_body(
-        &self,
-        muted: gpui::Hsla,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_agent_body(&self, muted: gpui::Hsla, cx: &mut Context<Self>) -> impl IntoElement {
         let effective = self.node_agent.launch_options(&self.settings_launch());
         let platform_label = match self.node_agent.platform.as_deref().and_then(parse_platform) {
             Some(platform) => platform.label().to_string(),
@@ -2093,13 +2108,9 @@ impl TaskEditView {
         };
         let mut directory_row = h_flex().gap_2().items_center().flex_wrap();
         if let Some(text) = directory_text {
-            directory_row = directory_row.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_sm()
-                    .child(selectable_text("task-edit-files-directory", text, window, cx)),
-            );
+            directory_row = directory_row.child(div().w_full().min_w_0().text_sm().child(
+                selectable_text("task-edit-files-directory", text, window, cx),
+            ));
         }
         if let Some(setup) = action {
             let label = match (setup, busy) {
@@ -2203,7 +2214,12 @@ impl TaskEditView {
                                 .text_color(foreground)
                                 .child(if use_worktree { "☑" } else { "☐" }),
                         )
-                        .child(div().text_sm().text_color(foreground).child("Use a worktree")),
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(foreground)
+                                .child("Use a worktree"),
+                        ),
                 ),
             )
             .child(
@@ -2266,7 +2282,11 @@ impl TaskEditView {
                         "{} · {} · {}",
                         options.platform.label(),
                         options.model,
-                        if options.effort.is_empty() { "auto" } else { options.effort.as_str() }
+                        if options.effort.is_empty() {
+                            "auto"
+                        } else {
+                            options.effort.as_str()
+                        }
                     ),
                 )
             }
@@ -2560,27 +2580,23 @@ impl TaskEditView {
     }
 
     fn render_tags_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .gap_2()
-            .px_3()
-            .pb_3()
-            .child(
-                self.apply_focus_scroll_anchor(
-                    TaskEditField::Tags,
-                    v_flex()
-                        .id(field_anchor_id(TaskEditField::Tags))
-                        .gap_1()
-                        .w_full()
-                        .rounded_md()
-                        .when(self.field_nav_focused(TaskEditField::Tags), |el| {
-                            el.bg(cx.theme().list_active)
-                                .border_1()
-                                .border_color(cx.theme().list_active_border)
-                        })
-                        .child(Self::render_field_label("Tags", cx))
-                        .child(self.render_tags(window, cx)),
-                ),
-            )
+        v_flex().gap_2().px_3().pb_3().child(
+            self.apply_focus_scroll_anchor(
+                TaskEditField::Tags,
+                v_flex()
+                    .id(field_anchor_id(TaskEditField::Tags))
+                    .gap_1()
+                    .w_full()
+                    .rounded_md()
+                    .when(self.field_nav_focused(TaskEditField::Tags), |el| {
+                        el.bg(cx.theme().list_active)
+                            .border_1()
+                            .border_color(cx.theme().list_active_border)
+                    })
+                    .child(Self::render_field_label("Tags", cx))
+                    .child(self.render_tags(window, cx)),
+            ),
+        )
     }
 
     fn render_tags_section(
@@ -2614,7 +2630,10 @@ impl TaskEditView {
     ) -> impl IntoElement {
         let cap = Capability::Generator;
         let body: Option<gpui::AnyElement> = if self.capability_enabled(cap) {
-            Some(self.render_generator_body(background, muted, window, cx).into_any_element())
+            Some(
+                self.render_generator_body(background, muted, window, cx)
+                    .into_any_element(),
+            )
         } else {
             None
         };
@@ -2636,29 +2655,31 @@ impl TaskEditView {
         match &self.generator_data_source_type {
             None => {
                 let selected = self.generator_pending_source_type.clone();
-                col = col.child(Self::render_field_label("Data source", cx)).child(
-                    h_flex().gap_1p5().flex_wrap().children(
-                        tod_core::generator::available_data_sources()
-                            .into_iter()
-                            .enumerate()
-                            .map(|(idx, (key, name, description))| {
-                                let is_selected = selected.as_deref() == Some(key);
-                                let key_owned = key.to_string();
-                                Button::new(("task-edit-gen-source", idx))
-                                    .label(name)
-                                    .compact()
-                                    .selected(is_selected)
-                                    .tooltip(description)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_generator_data_source(
-                                            key_owned.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    }))
-                            }),
-                    ),
-                );
+                col = col
+                    .child(Self::render_field_label("Data source", cx))
+                    .child(
+                        h_flex().gap_1p5().flex_wrap().children(
+                            tod_core::generator::available_data_sources()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(idx, (key, name, description))| {
+                                    let is_selected = selected.as_deref() == Some(key);
+                                    let key_owned = key.to_string();
+                                    Button::new(("task-edit-gen-source", idx))
+                                        .label(name)
+                                        .compact()
+                                        .selected(is_selected)
+                                        .tooltip(description)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.select_generator_data_source(
+                                                key_owned.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                }),
+                        ),
+                    );
                 if selected.is_none() {
                     return col;
                 }
@@ -2679,18 +2700,20 @@ impl TaskEditView {
             }
         }
 
-        col = col.child(Self::render_field_label("Configuration (JSON)", cx)).child(
-            div()
-                .w_full()
-                .rounded_md()
-                .cursor_text()
-                .bg(background)
-                .child(
-                    Textarea::new(&self.generator_config_input)
-                        .w_full()
-                        .h(window.line_height() * 6.),
-                ),
-        );
+        col = col
+            .child(Self::render_field_label("Configuration (JSON)", cx))
+            .child(
+                div()
+                    .w_full()
+                    .rounded_md()
+                    .cursor_text()
+                    .bg(background)
+                    .child(
+                        Textarea::new(&self.generator_config_input)
+                            .w_full()
+                            .h(window.line_height() * 6.),
+                    ),
+            );
 
         if let Some(schema_hint) = self
             .generator_data_source_type
@@ -2701,53 +2724,52 @@ impl TaskEditView {
                 ds.configuration_schema()
                     .fields
                     .iter()
-                    .map(|f| format!("{} ({}){}", f.name, f.help, if f.required { " *" } else { "" }))
+                    .map(|f| {
+                        format!(
+                            "{} ({}){}",
+                            f.name,
+                            f.help,
+                            if f.required { " *" } else { "" }
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" · ")
             })
         {
-            col = col.child(
-                div().text_xs().text_color(muted).child(selectable_text(
-                    "task-edit-gen-schema-hint",
-                    schema_hint,
-                    window,
-                    cx,
-                )),
-            );
+            col = col.child(div().text_xs().text_color(muted).child(selectable_text(
+                "task-edit-gen-schema-hint",
+                schema_hint,
+                window,
+                cx,
+            )));
         }
 
         let danger = cx.theme().danger;
         if let Some(err) = &self.generator_config_error {
-            col = col.child(
-                div().text_xs().text_color(danger).child(selectable_text(
-                    "task-edit-gen-config-error",
-                    err.clone(),
-                    window,
-                    cx,
-                )),
-            );
+            col = col.child(div().text_xs().text_color(danger).child(selectable_text(
+                "task-edit-gen-config-error",
+                err.clone(),
+                window,
+                cx,
+            )));
         }
 
         if let Some(status) = &self.generator_last_status {
-            col = col.child(
-                div().text_xs().text_color(muted).child(selectable_text(
-                    "task-edit-gen-status",
-                    format!("last refresh: {status}"),
-                    window,
-                    cx,
-                )),
-            );
+            col = col.child(div().text_xs().text_color(muted).child(selectable_text(
+                "task-edit-gen-status",
+                format!("last refresh: {status}"),
+                window,
+                cx,
+            )));
         }
 
         if let Some(error) = &self.generator_last_error {
-            col = col.child(
-                div().text_xs().text_color(danger).child(selectable_text(
-                    "task-edit-gen-refresh-error",
-                    error.clone(),
-                    window,
-                    cx,
-                )),
-            );
+            col = col.child(div().text_xs().text_color(danger).child(selectable_text(
+                "task-edit-gen-refresh-error",
+                error.clone(),
+                window,
+                cx,
+            )));
         }
 
         col
@@ -2769,30 +2791,26 @@ impl TaskEditView {
         let external_url = self.managed_external_url();
 
         let mut body = v_flex().gap_3().p_3().w_full();
-        body = body.child(
-            div()
-                .text_lg()
-                .font_semibold()
-                .child(selectable_text(
-                    "task-edit-managed-title",
-                    self.loaded_title.clone(),
-                    window,
-                    cx,
-                )),
-        );
+        body = body.child(div().text_lg().font_semibold().child(selectable_text(
+            "task-edit-managed-title",
+            self.loaded_title.clone(),
+            window,
+            cx,
+        )));
         if !self.tags.is_empty() {
             body = body.child(
-                h_flex()
-                    .gap_1()
-                    .flex_wrap()
-                    .children(self.tags.iter().map(|tag| {
-                        Tag::secondary().small().outline().child(tag.clone())
-                    })),
+                h_flex().gap_1().flex_wrap().children(
+                    self.tags
+                        .iter()
+                        .map(|tag| Tag::secondary().small().outline().child(tag.clone())),
+                ),
             );
         }
         body = body.child(
-            v_flex().gap_1().child(Self::render_field_label("Origin", cx)).child(
-                selectable_text(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Origin", cx))
+                .child(selectable_text(
                     "task-edit-managed-origin",
                     match (&source_type, &link) {
                         (Some(source_type), Some(link)) => {
@@ -2803,8 +2821,7 @@ impl TaskEditView {
                     },
                     window,
                     cx,
-                ),
-            ),
+                )),
         );
         body = body.child(
             v_flex()
@@ -2848,7 +2865,12 @@ impl TaskEditView {
                     .border_b_1()
                     .border_color(border)
                     .bg(secondary)
-                    .child(div().text_sm().font_semibold().child("Managed item (read-only)"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Managed item (read-only)"),
+                    )
                     .child(div().flex_1())
                     .child(chrome_control_with_shortcut(
                         Button::new("task-edit-managed-close")

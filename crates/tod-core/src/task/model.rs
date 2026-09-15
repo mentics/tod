@@ -217,8 +217,18 @@ pub fn lifecycle_rank(lifecycle: &str) -> usize {
 
 /// Ordered lifecycle states, indexed by `lifecycle_rank`.
 pub const LIFECYCLE_STATES: [&str; 12] = [
-    "proposed", "design", "planning", "ready", "active", "verifying", "review", "approved",
-    "merged", "released", "learn", "done",
+    "proposed",
+    "design",
+    "planning",
+    "ready",
+    "active",
+    "verifying",
+    "review",
+    "approved",
+    "merged",
+    "released",
+    "learn",
+    "done",
 ];
 
 /// The state one step ahead of `lifecycle` in `LIFECYCLE_STATES`, if any.

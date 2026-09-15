@@ -131,7 +131,9 @@ impl InterviewClient {
         if rest.is_empty() {
             Ok(Some(Value::Null))
         } else {
-            Ok(Some(serde_json::from_str(rest).context("parse reply from tod")?))
+            Ok(Some(
+                serde_json::from_str(rest).context("parse reply from tod")?,
+            ))
         }
     }
 }
@@ -221,7 +223,10 @@ mod tests {
                 reason: None,
             })
             .unwrap_err();
-        assert!(err.to_string().contains("not found"), "reached the store: {err}");
+        assert!(
+            err.to_string().contains("not found"),
+            "reached the store: {err}"
+        );
         let head = client
             .read(|conn| tod_store::interview::InterviewRepo::new(conn).head_rev())
             .unwrap();

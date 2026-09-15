@@ -30,11 +30,11 @@ use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
+use crate::views::task_edit::{TaskEditEvent, TaskEditView};
+use crate::views::task_list::{TaskListEvent, TaskListView};
 use crate::views::visual_design_panel::{
     EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
 };
-use crate::views::task_edit::{TaskEditEvent, TaskEditView};
-use crate::views::task_list::{TaskListEvent, TaskListView};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -330,7 +330,11 @@ impl Shell {
         });
     }
 
-    fn drain_pending_open_interview_for_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn drain_pending_open_interview_for_task(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((task_id, lifecycle)) = self.pending_open_interview_for_task.take() else {
             return;
         };
@@ -637,7 +641,8 @@ impl Shell {
         build_first_message(
             &media,
             &ContextRequest {
-                key: "obligations",
+                surface: "obligations",
+                layers: &["app", "tod_cli", "interactive", "obligations"],
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
@@ -678,7 +683,8 @@ impl Shell {
                 let cwd = focus_shell_session(&self.fleet, &self.paths, &settings, &shell)?;
                 return Ok(format!("Focused shell in {}", cwd.display()));
             }
-            let (_, cwd) = open_shell_for_node(&self.fleet, &self.paths, &settings, &task_id, None)?;
+            let (_, cwd) =
+                open_shell_for_node(&self.fleet, &self.paths, &settings, &task_id, None)?;
             Ok(format!("Opened terminal in {}", cwd.display()))
         })();
 
@@ -736,7 +742,12 @@ impl Shell {
         cx.notify();
     }
 
-    fn handle_open_code_editor(&mut self, task_id: String, editor_id: String, cx: &mut Context<Self>) {
+    fn handle_open_code_editor(
+        &mut self,
+        task_id: String,
+        editor_id: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = code_editor(&editor_id) else {
             self.queue_error_toast(format!("Unknown code editor: {editor_id}"), cx);
             return;
@@ -1030,8 +1041,7 @@ impl Shell {
                 return;
             }
         };
-        let initial_context = match self.build_visual_design_agent_context(node_id, obligation_id)
-        {
+        let initial_context = match self.build_visual_design_agent_context(node_id, obligation_id) {
             Ok(text) => Some(text),
             Err(err) => {
                 tracing::warn!(
@@ -1110,7 +1120,8 @@ impl Shell {
         build_first_message(
             &media,
             &ContextRequest {
-                key: "design/visual-design",
+                surface: "design/visual-design",
+                layers: &["app", "interactive", "design/visual-design"],
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
@@ -1281,12 +1292,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         // is visible, so it must never sit on the path to `cx.open_window`.
                         let reattach_fleet = fleet.clone();
                         std::thread::spawn(move || {
-                            if let Err(err) =
-                                reattach_fleet.run_launch_hooks(&tod_store::fleet::NoopGuestLiveness)
+                            if let Err(err) = reattach_fleet
+                                .run_launch_hooks(&tod_store::fleet::NoopGuestLiveness)
                             {
-                                tracing::error!(
-                                    "background launch-time reattach failed: {err:#}"
-                                );
+                                tracing::error!("background launch-time reattach failed: {err:#}");
                             }
                         });
                         // Only the one long-lived GUI process should run this listener, so it
@@ -1340,8 +1349,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             }
                         }
                         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
-                        let task_edit =
-                            cx.new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
+                        let task_edit = cx
+                            .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
@@ -1529,26 +1538,29 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
-                            let _lifecycle_panel_subscription = cx.subscribe(
-                                &lifecycle_panel,
-                                |this: &mut Shell, _, event, cx| match event {
-                                    LifecyclePanelEvent::Close => {
-                                        this.task_list.update(cx, |list, cx| {
-                                            list.request_live_refresh(cx);
-                                        });
-                                        this.on_drawer_panel_closed(cx);
+                            let _lifecycle_panel_subscription =
+                                cx.subscribe(&lifecycle_panel, |this: &mut Shell, _, event, cx| {
+                                    match event {
+                                        LifecyclePanelEvent::Close => {
+                                            this.task_list.update(cx, |list, cx| {
+                                                list.request_live_refresh(cx);
+                                            });
+                                            this.on_drawer_panel_closed(cx);
+                                        }
+                                        LifecyclePanelEvent::FocusTaskList => {
+                                            this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
+                                        LifecyclePanelEvent::OpenInterview {
+                                            task_id,
+                                            lifecycle,
+                                        } => {
+                                            this.pending_open_interview_for_task =
+                                                Some((task_id.clone(), lifecycle.clone()));
+                                            cx.notify();
+                                        }
                                     }
-                                    LifecyclePanelEvent::FocusTaskList => {
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
-                                    }
-                                    LifecyclePanelEvent::OpenInterview { task_id, lifecycle } => {
-                                        this.pending_open_interview_for_task =
-                                            Some((task_id.clone(), lifecycle.clone()));
-                                        cx.notify();
-                                    }
-                                },
-                            );
+                                });
                             let _visual_design_panel_subscription = cx.subscribe(
                                 &visual_design_panel,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -1627,7 +1639,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         this.pending_return_to_tasks = true;
                                         cx.notify();
                                     }
-                                    DraftingViewEvent::ProceedToLifecycle { task_id, lifecycle } => {
+                                    DraftingViewEvent::ProceedToLifecycle {
+                                        task_id,
+                                        lifecycle,
+                                    } => {
                                         this.pending_open_lifecycle = Some(PendingOpenLifecycle {
                                             task_id: task_id.clone(),
                                             lifecycle: lifecycle.clone(),
@@ -1716,7 +1731,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             let poll_entity = cx.weak_entity();
                             cx.spawn(async move |_, cx| {
                                 loop {
-                                    cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(500))
+                                        .await;
                                     let _ = poll_entity.update(cx, |shell, cx| {
                                         shell.refresh_agent_status(cx);
                                     });

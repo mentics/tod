@@ -78,12 +78,21 @@ impl PlanStepListDelegate {
         self.selected_index.and_then(|ix| self.rows.get(ix))
     }
 
-    pub fn set_inline_edit(&mut self, editing_id: Option<String>, inline_edit_input: Entity<TextareaState>) {
+    pub fn set_inline_edit(
+        &mut self,
+        editing_id: Option<String>,
+        inline_edit_input: Entity<TextareaState>,
+    ) {
         self.editing_id = editing_id;
         self.inline_edit_input = Some(inline_edit_input);
     }
 
-    pub fn render_row(&self, row_ix: usize, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+    pub fn render_row(
+        &self,
+        row_ix: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
         let row = self.rows.get(row_ix)?.clone();
         let row_key = row.key();
         let selected = self.selected_index == Some(row_ix);
@@ -169,7 +178,9 @@ impl PlanStepListDelegate {
                     .when(selected, |el| {
                         el.on_mouse_down(MouseButton::Left, move |event, _, cx| {
                             if event.click_count >= 2 {
-                                edit_sink.borrow_mut().push(RowAction::StartEdit { step_id: id });
+                                edit_sink
+                                    .borrow_mut()
+                                    .push(RowAction::StartEdit { step_id: id });
                                 notify(&edit_view, cx);
                                 cx.stop_propagation();
                             }
@@ -198,7 +209,13 @@ impl PlanStepListDelegate {
             );
         }
 
-        Some(div().id(("plan-step-row", row_ix)).w_full().child(row_el).into_any_element())
+        Some(
+            div()
+                .id(("plan-step-row", row_ix))
+                .w_full()
+                .child(row_el)
+                .into_any_element(),
+        )
     }
 }
 

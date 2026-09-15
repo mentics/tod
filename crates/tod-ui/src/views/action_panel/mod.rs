@@ -34,8 +34,8 @@ use tod_store::fleet::terminal::{
     remove_shell_state,
 };
 use tod_store::fleet::{
-    AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles,
-    code_editor, code_editors, open_code_editor_for_node, reconnect_identity,
+    AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
+    code_editors, open_code_editor_for_node, reconnect_identity,
 };
 use tod_store::{AgentLaunchOptions, AgentPlatform, AgentRole};
 
@@ -168,7 +168,10 @@ impl ActionPanelView {
             .fleet
             .list_auto_runs_for_node(&task_id)
             .unwrap_or_default();
-        self.shells = self.fleet.list_shells_for_node(&task_id).unwrap_or_default();
+        self.shells = self
+            .fleet
+            .list_shells_for_node(&task_id)
+            .unwrap_or_default();
         // Implementation sessions (launched from the lifecycle panel's Active
         // "Implement" button) show up alongside ordinary chat sessions — same
         // node, just a distinct `run_kind`.
@@ -228,7 +231,9 @@ impl ActionPanelView {
         let fleet = self.fleet.clone();
         cx.spawn(async move |_, cx| {
             loop {
-                cx.background_executor().timer(std::time::Duration::from_secs(5)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(5))
+                    .await;
                 let should_continue = weak
                     .update(cx, |this, cx| {
                         if !this.is_open() || this.shell_poll_generation != generation {
@@ -345,9 +350,11 @@ impl ActionPanelView {
                     });
                 }
                 Err(_) => {
-                    let _ = self.fleet.enqueue(FleetMutation::MarkRunPromptsInterrupted {
-                        run_id: flight.fleet_run_id.clone(),
-                    });
+                    let _ = self
+                        .fleet
+                        .enqueue(FleetMutation::MarkRunPromptsInterrupted {
+                            run_id: flight.fleet_run_id.clone(),
+                        });
                     let _ = self
                         .fleet
                         .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
@@ -505,9 +512,11 @@ impl ActionPanelView {
                 let _ = agent.cancel_run(flight.provider_run_id);
             }
         }
-        let _ = self.fleet.enqueue(FleetMutation::MarkRunPromptsInterrupted {
-            run_id: run_id.to_string(),
-        });
+        let _ = self
+            .fleet
+            .enqueue(FleetMutation::MarkRunPromptsInterrupted {
+                run_id: run_id.to_string(),
+            });
         if let Err(err) = self.fleet.enqueue(FleetMutation::EndAgentRun {
             run_id: run_id.to_string(),
         }) {
@@ -605,7 +614,12 @@ impl ActionPanelView {
     }
 
     fn focus_terminal_agent(&mut self, run_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(run) = self.terminal_agents.iter().find(|r| r.id == run_id).cloned() else {
+        let Some(run) = self
+            .terminal_agents
+            .iter()
+            .find(|r| r.id == run_id)
+            .cloned()
+        else {
             error_toast(window, cx, "Terminal agent run not found.");
             return;
         };
@@ -1011,30 +1025,33 @@ impl ActionPanelView {
     fn render_code_editors(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_launch = self.ready_directory().is_some();
         Self::render_section("Code editors", cx).child(
-            h_flex().gap_2().flex_wrap().children(
-                self.editors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, (id, available))| {
-                        let editor = code_editor(id)?;
-                        let editor_id = *id;
-                        let label = if *available {
-                            format!("Open in {}", editor.label())
-                        } else {
-                            format!("{} (not found)", editor.label())
-                        };
-                        Some(
-                            Button::new(("action-code-editor", idx))
-                                .label(label)
-                                .small()
-                                .compact()
-                                .disabled(!can_launch || !available)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.open_code_editor(editor_id, window, cx);
-                                })),
-                        )
-                    }),
-            ),
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children(
+                    self.editors
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, (id, available))| {
+                            let editor = code_editor(id)?;
+                            let editor_id = *id;
+                            let label = if *available {
+                                format!("Open in {}", editor.label())
+                            } else {
+                                format!("{} (not found)", editor.label())
+                            };
+                            Some(
+                                Button::new(("action-code-editor", idx))
+                                    .label(label)
+                                    .small()
+                                    .compact()
+                                    .disabled(!can_launch || !available)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_code_editor(editor_id, window, cx);
+                                    })),
+                            )
+                        }),
+                ),
         )
     }
 }

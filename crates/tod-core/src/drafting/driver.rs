@@ -189,7 +189,11 @@ impl DraftingDriver {
     }
 
     /// Advance: collect a finished turn, then start one if it is due.
-    pub fn tick(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Vec<DraftingEvent> {
+    pub fn tick(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+    ) -> Vec<DraftingEvent> {
         let mut events = Vec::new();
         self.poll_summaries(fleet, agent, &mut events);
         self.poll(fleet, agent, &mut events);
@@ -251,7 +255,12 @@ impl DraftingDriver {
         }
     }
 
-    fn poll(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider, events: &mut Vec<DraftingEvent>) {
+    fn poll(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        events: &mut Vec<DraftingEvent>,
+    ) {
         let Some(turn) = &self.turn else {
             return;
         };
@@ -344,7 +353,11 @@ impl DraftingDriver {
                 .next();
             let changed_rev = match &session {
                 Some(s) => interview
-                    .changes_since(&ancestor_chain(conn, node)?, s.synced_rev, &s.id.to_string())?
+                    .changes_since(
+                        &ancestor_chain(conn, node)?,
+                        s.synced_rev,
+                        &s.id.to_string(),
+                    )?
                     .into_iter()
                     .filter(|c| c.entity == ENTITY_OBLIGATION || c.entity == ENTITY_CONTENT)
                     .filter(|c| c.fields != ["provenance"])
@@ -386,7 +399,12 @@ impl DraftingDriver {
             rewrite: self.rewrite_requested,
             kickoff,
         };
-        if due.dumps.is_empty() && due.choices.is_empty() && !due.rewrite && !due.kickoff && !quiet_changes {
+        if due.dumps.is_empty()
+            && due.choices.is_empty()
+            && !due.rewrite
+            && !due.kickoff
+            && !quiet_changes
+        {
             self.kickoff_checked = true;
             return Ok(());
         }
@@ -414,31 +432,32 @@ impl DraftingDriver {
             if !summary::claim(node_id) {
                 continue;
             }
-            let started = fleet
-                .read(|conn| summary::request(conn, node_id))
-                .and_then(|(title, message)| {
-                    let key = format!("summary-{node_id}-{}", Uuid::new_v4());
-                    let handle = agent.send_session_turn(SessionTurn {
-                        key: key.clone(),
-                        owner_id: self.config.node_id.to_string(),
-                        cwd: cwd.clone(),
-                        options: self.config.launch.clone(),
-                        resume_session_id: None,
-                        opening: Some(SessionOpening {
-                            title: format!("{title} · summary"),
-                            context: None,
-                        }),
-                        message,
-                        purpose: SessionPurpose::Summarizer,
-                        env: Vec::new(),
-                    })?;
-                    Ok(SummaryRun {
-                        run: handle.id,
-                        node_id,
-                        title,
-                        key,
-                    })
-                });
+            let started =
+                fleet
+                    .read(|conn| summary::request(conn, node_id))
+                    .and_then(|(title, message)| {
+                        let key = format!("summary-{node_id}-{}", Uuid::new_v4());
+                        let handle = agent.send_session_turn(SessionTurn {
+                            key: key.clone(),
+                            owner_id: self.config.node_id.to_string(),
+                            cwd: cwd.clone(),
+                            options: self.config.launch.clone(),
+                            resume_session_id: None,
+                            opening: Some(SessionOpening {
+                                title: format!("{title} · summary"),
+                                context: None,
+                            }),
+                            message,
+                            purpose: SessionPurpose::Summarizer,
+                            env: Vec::new(),
+                        })?;
+                        Ok(SummaryRun {
+                            run: handle.id,
+                            node_id,
+                            title,
+                            key,
+                        })
+                    });
             match started {
                 Ok(run) => self.summaries.push(run),
                 Err(err) => {
@@ -516,7 +535,10 @@ impl DraftingDriver {
                  repair what they made wrong, and record buildable again.\n",
             );
         }
-        write!(out, "\nEnd the turn with the change summary inside {SUMMARY_OPEN} tags.")?;
+        write!(
+            out,
+            "\nEnd the turn with the change summary inside {SUMMARY_OPEN} tags."
+        )?;
         Ok(out.trim_start().to_string())
     }
 
@@ -526,7 +548,12 @@ impl DraftingDriver {
         Ok(())
     }
 
-    fn start_turn(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider, due: Due) -> Result<()> {
+    fn start_turn(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        due: Due,
+    ) -> Result<()> {
         let node = self.config.node_id;
         let phase = self.config.mode.phase();
         let now_ms = tod_store::outline::now_ms();
@@ -857,18 +884,36 @@ mod tests {
         assert_eq!(events, [DraftingEvent::TurnFinished { error: None }]);
         let rows = marked(&fx);
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|m| m.mark.is_agent() && m.mark.attention.is_some()));
+        assert!(
+            rows.iter()
+                .all(|m| m.mark.is_agent() && m.mark.attention.is_some())
+        );
         let (unrouted, summaries) = fx
             .fleet
             .read(|conn| {
                 let repo = DraftingRepo::new(conn);
-                Ok((repo.unrouted_dumps(fx.node)?, repo.recent_summaries(fx.node, 5)?))
+                Ok((
+                    repo.unrouted_dumps(fx.node)?,
+                    repo.recent_summaries(fx.node, 5)?,
+                ))
             })
             .unwrap();
         assert!(unrouted.is_empty());
-        assert!(summaries[0].body.contains("Not mentioned yet"), "{}", summaries[0].body);
-        assert!(!summaries[0].body.contains("Mock:"), "narration is dropped: {}", summaries[0].body);
-        assert!(!summaries[0].body.contains(SUMMARY_OPEN), "{}", summaries[0].body);
+        assert!(
+            summaries[0].body.contains("Not mentioned yet"),
+            "{}",
+            summaries[0].body
+        );
+        assert!(
+            !summaries[0].body.contains("Mock:"),
+            "narration is dropped: {}",
+            summaries[0].body
+        );
+        assert!(
+            !summaries[0].body.contains(SUMMARY_OPEN),
+            "{}",
+            summaries[0].body
+        );
         assert_eq!(agent.turns.len(), 1, "nothing else is due");
     }
 
@@ -887,17 +932,26 @@ mod tests {
             Some("No changes.")
         );
         assert_eq!(
-            change_summary("Checking:<change-summary>\n```text\nApp  + constraint\n```\n</change-summary>").as_deref(),
+            change_summary(
+                "Checking:<change-summary>\n```text\nApp  + constraint\n```\n</change-summary>"
+            )
+            .as_deref(),
             Some("App  + constraint"),
             "a fence inside the tags is unwrapped"
         );
-        assert_eq!(change_summary("Checking:<change-summary>\nApp  + constraint").as_deref(), Some("App  + constraint"));
+        assert_eq!(
+            change_summary("Checking:<change-summary>\nApp  + constraint").as_deref(),
+            Some("App  + constraint")
+        );
         assert_eq!(
             change_summary("Let me look around.\n\nSettings panel  + 1 requirement\n").as_deref(),
             Some("Settings panel  + 1 requirement"),
             "without tags, the last paragraph"
         );
-        assert_eq!(change_summary("Narration:<change-summary> </change-summary>"), None);
+        assert_eq!(
+            change_summary("Narration:<change-summary> </change-summary>"),
+            None
+        );
         assert_eq!(change_summary("  \n"), None);
     }
 
@@ -924,17 +978,30 @@ mod tests {
             obligation_id: drafted,
         });
         assert_eq!(marked(&fx)[0].mark.provenance, PROVENANCE_USER);
-        assert_eq!(buildable(&fx).as_deref(), Some("pass"), "confirming changes no meaning");
+        assert_eq!(
+            buildable(&fx).as_deref(),
+            Some("pass"),
+            "confirming changes no meaning"
+        );
 
         fx.outline(tod_store::outline::OutlineMutation::UpdateObligationBody {
             obligation_id: drafted,
             body: "Every panel supports keyboard navigation.".into(),
         });
-        assert_eq!(buildable(&fx).as_deref(), Some("pending"), "an edit resets buildable");
+        assert_eq!(
+            buildable(&fx).as_deref(),
+            Some("pending"),
+            "an edit resets buildable"
+        );
 
         // Agents cannot confirm.
         let err = fx
-            .act(ACTOR_AGENT, InterviewCommand::ConfirmObligation { obligation_id: drafted })
+            .act(
+                ACTOR_AGENT,
+                InterviewCommand::ConfirmObligation {
+                    obligation_id: drafted,
+                },
+            )
             .unwrap_err();
         assert!(err.to_string().contains("only the user"), "{err}");
     }
@@ -976,8 +1043,16 @@ mod tests {
         assert_eq!(rows[0].mark.provenance, PROVENANCE_USER);
 
         driver.tick(&fx.fleet, &mut agent);
-        assert_eq!(agent.turns.len(), 2, "the resolved choice goes back to the drafter");
-        assert!(agent.turns[1].message.contains("the user picked 1"), "{}", agent.turns[1].message);
+        assert_eq!(
+            agent.turns.len(),
+            2,
+            "the resolved choice goes back to the drafter"
+        );
+        assert!(
+            agent.turns[1].message.contains("the user picked 1"),
+            "{}",
+            agent.turns[1].message
+        );
     }
 
     #[test]
@@ -1006,7 +1081,10 @@ mod tests {
                 .unwrap()
         };
         let before = inherited(&fx);
-        assert!(!before.contains("nobody below"), "requirements are never listed: {before}");
+        assert!(
+            !before.contains("nobody below"),
+            "requirements are never listed: {before}"
+        );
         assert!(before.contains("No summary yet"), "{before}");
 
         let (mut driver, mut agent) = driver(&fx, DraftingMode::Capture);
@@ -1018,15 +1096,28 @@ mod tests {
         driver.tick(&fx.fleet, &mut agent);
         assert_eq!(agent.turns.len(), 1);
         assert_eq!(agent.turns[0].purpose, SessionPurpose::Summarizer);
-        assert!(agent.turns[0].message.contains("nobody below"), "{}", agent.turns[0].message);
+        assert!(
+            agent.turns[0].message.contains("nobody below"),
+            "{}",
+            agent.turns[0].message
+        );
         assert_eq!(driver.status().summarizing, ["Interview node"]);
 
         // The summary lands, then the turn it waited on starts.
         assert!(driver.tick(&fx.fleet, &mut agent).is_empty());
         assert_eq!(agent.turns.len(), 2);
         assert_eq!(agent.turns[1].purpose, SessionPurpose::Drafter);
-        let context = agent.turns[1].opening.as_ref().unwrap().context.as_deref().unwrap();
-        assert!(context.contains("Mock summary of Interview node"), "{context}");
+        let context = agent.turns[1]
+            .opening
+            .as_ref()
+            .unwrap()
+            .context
+            .as_deref()
+            .unwrap();
+        assert!(
+            context.contains("Mock summary of Interview node"),
+            "{context}"
+        );
         assert!(!context.contains("nobody below"), "{context}");
         assert!(!context.contains("No summary yet"), "{context}");
         assert!(driver.status().summarizing.is_empty());

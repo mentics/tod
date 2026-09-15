@@ -33,7 +33,11 @@ pub fn session_name(
     let fixed_len = surface.chars().count()
         + " · ".chars().count()
         + timestamp.chars().count()
-        + if subject.is_empty() { 0 } else { " · ".chars().count() };
+        + if subject.is_empty() {
+            0
+        } else {
+            " · ".chars().count()
+        };
     let subject = if fixed_len + subject.chars().count() > MAX_TOTAL_CHARS {
         let budget = MAX_TOTAL_CHARS.saturating_sub(fixed_len);
         shorten(&subject, budget)
@@ -134,10 +138,13 @@ mod tests {
     #[test]
     fn name_never_exceeds_the_hard_cap() {
         let long_surface_key = "a-very-long-nested-surface-key-that-eats-into-the-budget";
-        let long_subject =
-            "An extremely long task title that on its own would already blow the character budget for a session name";
+        let long_subject = "An extremely long task title that on its own would already blow the character budget for a session name";
         let name = session_name(Some(long_surface_key), long_subject, at(9, 5));
-        assert!(name.chars().count() <= MAX_TOTAL_CHARS, "{name:?} ({} chars)", name.chars().count());
+        assert!(
+            name.chars().count() <= MAX_TOTAL_CHARS,
+            "{name:?} ({} chars)",
+            name.chars().count()
+        );
         assert!(name.ends_with("Sep 10, 9:05 AM"));
     }
 

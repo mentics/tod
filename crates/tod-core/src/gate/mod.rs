@@ -12,10 +12,10 @@ pub mod derived;
 pub mod response;
 pub mod routing;
 
-pub use derived::{DerivedOutcome, evaluate_derived_criterion};
 pub use context::{
-    GATE_CHECK_CONTEXT_KEY, GateCheckRequest, ON_ENTRY_CONTEXT_KEY, PlanStepWithLinks,
+    GATE_CHECK_CONTEXT_LAYERS, GateCheckRequest, ON_ENTRY_CONTEXT_LAYERS, PlanStepWithLinks,
     build_gate_check_message, build_on_entry_message,
 };
+pub use derived::{DerivedOutcome, evaluate_derived_criterion};
 pub use response::{GateAction, GateCheckReply, GateOutcome, GateResultRow, parse_gate_reply};
 pub use routing::{gate_criteria_for, gate_criteria_for_with_conn};

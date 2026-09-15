@@ -14,8 +14,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, actions,
-    div, px,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -115,7 +114,10 @@ pub fn register_drafting_keyboard_bindings(cx: &mut App) {
 #[derive(Debug, Clone)]
 pub enum DraftingViewEvent {
     ReturnToTaskList,
-    ProceedToLifecycle { task_id: String, lifecycle: String },
+    ProceedToLifecycle {
+        task_id: String,
+        lifecycle: String,
+    },
     /// Forwarded from the embedded obligations panel's chat icon.
     OpenAgentChat {
         node_id: Uuid,
@@ -398,7 +400,8 @@ impl DraftingView {
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
         let repo_cwd = self.fleet.files_dir_or_data_root(&node_id.to_string());
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
-        let manifest = ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
+        let manifest =
+            ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
         let prefix =
             drafting_session_prefix(&manifest, mode).map_err(|e| format!("Process bundle: {e}"))?;
         let driver = Arc::new(Mutex::new(DraftingDriver::new(DraftingConfig {
@@ -515,15 +518,29 @@ impl DraftingView {
                 .into_iter()
                 .map(ReviewItem::Choice)
                 .collect();
-            review.extend(repo.review_queue(node_id)?.into_iter().map(ReviewItem::Obligation));
+            review.extend(
+                repo.review_queue(node_id)?
+                    .into_iter()
+                    .map(ReviewItem::Obligation),
+            );
             Ok(Snapshot {
-                lifecycle: NodeRepo::new(conn).get_lifecycle(node_id)?.unwrap_or_default(),
+                lifecycle: NodeRepo::new(conn)
+                    .get_lifecycle(node_id)?
+                    .unwrap_or_default(),
                 review,
                 summaries: repo.recent_summaries(node_id, RECENT_SUMMARIES)?,
                 dumps: repo.recent_dumps(node_id, RECENT_DUMPS)?,
                 buildable: repo.buildable(node_id)?.map(|e| (e.outcome, e.detail)),
-                pre_v3_node: repo.pre_v3_counts(node_id, false)?.iter().map(|(_, n)| n).sum(),
-                pre_v3_subtree: repo.pre_v3_counts(node_id, true)?.iter().map(|(_, n)| n).sum(),
+                pre_v3_node: repo
+                    .pre_v3_counts(node_id, false)?
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                pre_v3_subtree: repo
+                    .pre_v3_counts(node_id, true)?
+                    .iter()
+                    .map(|(_, n)| n)
+                    .sum(),
             })
         }) else {
             return false;
@@ -547,7 +564,9 @@ impl DraftingView {
         if !self.user_selected {
             self.selected = self.data.review.first().map(ReviewItem::key);
         } else if self.selected_index().is_none() {
-            let ix = old_ix.unwrap_or(0).min(self.data.review.len().saturating_sub(1));
+            let ix = old_ix
+                .unwrap_or(0)
+                .min(self.data.review.len().saturating_sub(1));
             self.selected = self.data.review.get(ix).map(ReviewItem::key);
         }
         if self
@@ -573,7 +592,10 @@ impl DraftingView {
     }
 
     fn obligations_focused(&self, window: &Window, cx: &App) -> bool {
-        self.obligations.read(cx).focus_handle(cx).contains_focused(window, cx)
+        self.obligations
+            .read(cx)
+            .focus_handle(cx)
+            .contains_focused(window, cx)
     }
 
     fn command(&mut self, command: InterviewCommand) -> Option<serde_json::Value> {
@@ -674,11 +696,13 @@ impl DraftingView {
         };
         self.picker = None;
         self.editing = Some(m.obligation.id);
-        self.edit_input
-            .update(cx, |input, cx| input.set_value(m.obligation.body.clone(), window, cx));
+        self.edit_input.update(cx, |input, cx| {
+            input.set_value(m.obligation.body.clone(), window, cx)
+        });
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.edit_input.update(cx, |input, cx| input.focus(window, cx));
+            this.edit_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -721,12 +745,15 @@ impl DraftingView {
             .filter(|n| n.id != m.obligation.node_id)
             .collect::<Vec<_>>();
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Send to which node?"));
-        let _subscription =
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| match event {
+        let _subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
                 InputEvent::Change => this.filter_picker(cx),
                 InputEvent::PressEnter { .. } => this.apply_picker(window, cx),
                 _ => {}
-            });
+            },
+        );
         self.editing = None;
         self.picker = Some(Picker {
             obligation_id: m.obligation.id,
@@ -843,7 +870,8 @@ impl DraftingView {
         self.picker = None;
         cx.notify();
         cx.on_next_frame(window, |this, window, cx| {
-            this.dump_input.update(cx, |input, cx| input.focus(window, cx));
+            this.dump_input
+                .update(cx, |input, cx| input.focus(window, cx));
         });
     }
 
@@ -867,7 +895,8 @@ impl DraftingView {
         }) {
             let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("dump");
             self.status_line = format!("Sent {id} to the drafter").into();
-            self.dump_input.update(cx, |input, cx| input.set_value("", window, cx));
+            self.dump_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.after_write(window, cx);
     }
@@ -1016,9 +1045,9 @@ impl Render for DraftingView {
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .on_action(cx.listener(|this, _: &DraftSubmit, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|this, _: &DraftEscape, window, cx| this.escape(window, cx)))
-            .on_action(cx.listener(|_, _: &DraftBack, _, cx| {
-                cx.emit(DraftingViewEvent::ReturnToTaskList)
-            }))
+            .on_action(
+                cx.listener(|_, _: &DraftBack, _, cx| cx.emit(DraftingViewEvent::ReturnToTaskList)),
+            )
             .on_action(cx.listener(|this, _: &DraftPickerUp, _, cx| this.move_picker(-1, cx)))
             .on_action(cx.listener(|this, _: &DraftPickerDown, _, cx| this.move_picker(1, cx)))
             .on_action(cx.listener(|this, _: &PaneFocusLeft, window, cx| {
@@ -1040,31 +1069,52 @@ impl Render for DraftingView {
                     Pane::Dump => this.focus_obligations(window, cx),
                 }
             }));
-        let root = nav_action!(root, cx, DraftUp, |this, window, cx| this.move_selection(-1, cx));
-        let root = nav_action!(root, cx, DraftDown, |this, window, cx| this.move_selection(1, cx));
-        let root = nav_action!(root, cx, DraftActivate, |this, window, cx| this.activate(window, cx));
-        let root = nav_action!(root, cx, DraftConfirm, |this, window, cx| this.confirm(window, cx));
-        let root = nav_action!(root, cx, DraftEdit, |this, window, cx| this.start_edit(window, cx));
-        let root = nav_action!(root, cx, DraftDelete, |this, window, cx| this.delete(window, cx));
+        let root = nav_action!(root, cx, DraftUp, |this, window, cx| this
+            .move_selection(-1, cx));
+        let root = nav_action!(root, cx, DraftDown, |this, window, cx| this
+            .move_selection(1, cx));
+        let root = nav_action!(root, cx, DraftActivate, |this, window, cx| this
+            .activate(window, cx));
+        let root = nav_action!(root, cx, DraftConfirm, |this, window, cx| this
+            .confirm(window, cx));
+        let root = nav_action!(root, cx, DraftEdit, |this, window, cx| this
+            .start_edit(window, cx));
+        let root = nav_action!(root, cx, DraftDelete, |this, window, cx| this
+            .delete(window, cx));
         let root = nav_action!(root, cx, DraftSendElsewhere, |this, window, cx| this
             .open_picker(window, cx));
         let root = nav_action!(root, cx, DraftYouPick, |this, window, cx| this
             .answer(None, window, cx));
         let root = nav_action!(root, cx, DraftFocusDump, |this, window, cx| this
             .enter_dump_edit(window, cx));
-        let root = nav_action!(root, cx, DraftDigit1, |this, window, cx| this.on_digit(1, window, cx));
-        let root = nav_action!(root, cx, DraftDigit2, |this, window, cx| this.on_digit(2, window, cx));
-        let root = nav_action!(root, cx, DraftDigit3, |this, window, cx| this.on_digit(3, window, cx));
-        let root = nav_action!(root, cx, DraftDigit4, |this, window, cx| this.on_digit(4, window, cx));
-        let root = nav_action!(root, cx, DraftDigit5, |this, window, cx| this.on_digit(5, window, cx));
-        let root = nav_action!(root, cx, DraftDigit6, |this, window, cx| this.on_digit(6, window, cx));
-        let root = nav_action!(root, cx, DraftDigit7, |this, window, cx| this.on_digit(7, window, cx));
-        let root = nav_action!(root, cx, DraftDigit8, |this, window, cx| this.on_digit(8, window, cx));
-        let root = nav_action!(root, cx, DraftDigit9, |this, window, cx| this.on_digit(9, window, cx));
+        let root = nav_action!(root, cx, DraftDigit1, |this, window, cx| this
+            .on_digit(1, window, cx));
+        let root = nav_action!(root, cx, DraftDigit2, |this, window, cx| this
+            .on_digit(2, window, cx));
+        let root = nav_action!(root, cx, DraftDigit3, |this, window, cx| this
+            .on_digit(3, window, cx));
+        let root = nav_action!(root, cx, DraftDigit4, |this, window, cx| this
+            .on_digit(4, window, cx));
+        let root = nav_action!(root, cx, DraftDigit5, |this, window, cx| this
+            .on_digit(5, window, cx));
+        let root = nav_action!(root, cx, DraftDigit6, |this, window, cx| this
+            .on_digit(6, window, cx));
+        let root = nav_action!(root, cx, DraftDigit7, |this, window, cx| this
+            .on_digit(7, window, cx));
+        let root = nav_action!(root, cx, DraftDigit8, |this, window, cx| this
+            .on_digit(8, window, cx));
+        let root = nav_action!(root, cx, DraftDigit9, |this, window, cx| this
+            .on_digit(9, window, cx));
 
-        let header = self.render_header(mode, border, muted, window, cx).into_any_element();
-        let review = self.render_review(border, muted, window, cx).into_any_element();
-        let dump = self.render_dump(mode, border, muted, window, cx).into_any_element();
+        let header = self
+            .render_header(mode, border, muted, window, cx)
+            .into_any_element();
+        let review = self
+            .render_review(border, muted, window, cx)
+            .into_any_element();
+        let dump = self
+            .render_dump(mode, border, muted, window, cx)
+            .into_any_element();
 
         root.child(header)
             .when_some(self.error.clone(), |el, message| {
@@ -1083,26 +1133,32 @@ impl Render for DraftingView {
                 )
             })
             .child(
-                div().flex_1().min_h_0().min_w_0().w_full().overflow_hidden().child(
-                    h_resizable("drafting-columns")
-                        .child(
-                            resizable_panel()
-                                .size(px(REVIEW_COLUMN_WIDTH))
-                                .size_range(px(COLUMN_MIN)..Pixels::MAX)
-                                .child(review),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size(px(DUMP_COLUMN_WIDTH))
-                                .size_range(px(COLUMN_MIN)..Pixels::MAX)
-                                .child(dump),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(COLUMN_MIN)..Pixels::MAX)
-                                .child(self.obligations.clone()),
-                        ),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(
+                        h_resizable("drafting-columns")
+                            .child(
+                                resizable_panel()
+                                    .size(px(REVIEW_COLUMN_WIDTH))
+                                    .size_range(px(COLUMN_MIN)..Pixels::MAX)
+                                    .child(review),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(DUMP_COLUMN_WIDTH))
+                                    .size_range(px(COLUMN_MIN)..Pixels::MAX)
+                                    .child(dump),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(COLUMN_MIN)..Pixels::MAX)
+                                    .child(self.obligations.clone()),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -1119,7 +1175,11 @@ impl DraftingView {
     ) -> gpui::AnyElement {
         let theme = cx.theme();
         let (danger, success, warning) = (theme.danger, theme.success, theme.warning);
-        let title = self.node.as_ref().map(|n| n.title.clone()).unwrap_or_default();
+        let title = self
+            .node
+            .as_ref()
+            .map(|n| n.title.clone())
+            .unwrap_or_default();
         let agent = if self.status.running {
             "Drafter working…".to_string()
         } else if !self.status.summarizing.is_empty() {
@@ -1262,9 +1322,14 @@ impl DraftingView {
         }
         for (ix, item) in items.iter().enumerate() {
             let selected = self.selected == Some(item.key());
-            list = list.child(self.render_review_item(ix, item, selected, border, muted, window, cx));
+            list =
+                list.child(self.render_review_item(ix, item, selected, border, muted, window, cx));
         }
-        let heading = if focused { cx.theme().foreground } else { muted };
+        let heading = if focused {
+            cx.theme().foreground
+        } else {
+            muted
+        };
         v_flex()
             .size_full()
             .min_w_0()
@@ -1280,12 +1345,9 @@ impl DraftingView {
                     .child(format!("({})", items.len())),
             )
             .child(
-                div()
-                    .text_xs()
-                    .px_3()
-                    .pb_1()
-                    .text_color(muted)
-                    .child("c confirm · e edit · m send elsewhere · d delete · 1-9 pick · y you pick"),
+                div().text_xs().px_3().pb_1().text_color(muted).child(
+                    "c confirm · e edit · m send elsewhere · d delete · 1-9 pick · y you pick",
+                ),
             )
             .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(list))
             .into_any_element()
@@ -1317,7 +1379,13 @@ impl DraftingView {
             .border_color(border)
             .when(selected, |el| {
                 el.bg(highlight).child(
-                    div().absolute().left_0().top_0().bottom_0().w(px(3.)).bg(primary),
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(primary),
                 )
             })
             .on_mouse_down(
@@ -1334,8 +1402,13 @@ impl DraftingView {
                             .child(format!("{} · your call", choice.label())),
                     )
                     .child(
-                        selectable_text(("drafting-choice-q", ix), choice.question.clone(), window, cx)
-                            .text_sm(),
+                        selectable_text(
+                            ("drafting-choice-q", ix),
+                            choice.question.clone(),
+                            window,
+                            cx,
+                        )
+                        .text_sm(),
                     )
                     .when_some(choice.context.clone(), |el, context| {
                         el.child(
@@ -1396,20 +1469,29 @@ impl DraftingView {
                                     .label("Save")
                                     .primary()
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.save_edit(window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_edit(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new(("drafting-cancel", ix))
                                     .label("Cancel")
                                     .ghost()
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.cancel_edit(window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.cancel_edit(window, cx)
+                                    })),
                             ),
                     );
                 } else {
                     row = row.child(
-                        selectable_text(("drafting-body", ix), m.obligation.body.clone(), window, cx)
-                            .text_sm(),
+                        selectable_text(
+                            ("drafting-body", ix),
+                            m.obligation.body.clone(),
+                            window,
+                            cx,
+                        )
+                        .text_sm(),
                     );
                 }
                 if let Some(why) = m.mark.attention_why.clone() {
@@ -1428,28 +1510,36 @@ impl DraftingView {
                                 Button::new(("drafting-confirm", ix))
                                     .label("Confirm")
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.confirm(window, cx)),
+                                    ),
                             )
                             .child(
                                 Button::new(("drafting-edit", ix))
                                     .label("Edit")
                                     .ghost()
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.start_edit(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new(("drafting-move", ix))
                                     .label("Send elsewhere")
                                     .ghost()
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.open_picker(window, cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_picker(window, cx)
+                                    })),
                             )
                             .child(
                                 Button::new(("drafting-delete", ix))
                                     .label("Delete")
                                     .ghost()
                                     .xsmall()
-                                    .on_click(cx.listener(|this, _, window, cx| this.delete(window, cx))),
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.delete(window, cx)),
+                                    ),
                             ),
                     );
                 }
@@ -1508,8 +1598,12 @@ impl DraftingView {
         let (primary, foreground) = (theme.primary, theme.foreground);
         let focused = self.pane == Pane::Dump;
         let hint = match mode {
-            DraftingMode::Capture => "What is this? Anything you know — goals, must-haves, worries.",
-            DraftingMode::Drafting => "Anything that changes how this gets built. Questions welcome.",
+            DraftingMode::Capture => {
+                "What is this? Anything you know — goals, must-haves, worries."
+            }
+            DraftingMode::Drafting => {
+                "Anything that changes how this gets built. Questions welcome."
+            }
         };
         let waiting: Vec<DraftingDump> = self
             .data
@@ -1522,7 +1616,12 @@ impl DraftingView {
 
         let mut changes = v_flex().w_full().gap_2();
         if summaries.is_empty() {
-            changes = changes.child(div().text_xs().text_color(muted).child("No drafter turns yet."));
+            changes = changes.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("No drafter turns yet."),
+            );
         }
         for (ix, summary) in summaries.iter().enumerate() {
             changes = changes.child(
@@ -1532,8 +1631,13 @@ impl DraftingView {
                     .border_b_1()
                     .border_color(border)
                     .child(
-                        selectable_markdown(("drafting-summary", ix), summary.body.clone(), window, cx)
-                            .text_sm(),
+                        selectable_markdown(
+                            ("drafting-summary", ix),
+                            summary.body.clone(),
+                            window,
+                            cx,
+                        )
+                        .text_sm(),
                     ),
             );
         }
@@ -1558,7 +1662,11 @@ impl DraftingView {
                     .p_0p5()
                     .rounded_md()
                     .border_1()
-                    .border_color(if focused && !self.dump_editing { primary } else { border })
+                    .border_color(if focused && !self.dump_editing {
+                        primary
+                    } else {
+                        border
+                    })
                     .h(px(DUMP_HEIGHT))
                     .overflow_hidden()
                     .on_click(cx.listener(|this, _, window, cx| this.enter_dump_edit(window, cx)))
@@ -1589,7 +1697,11 @@ impl DraftingView {
                             "{} dump{} waiting for the drafter: {}",
                             waiting.len(),
                             plural(waiting.len()),
-                            waiting.iter().map(|d| d.label()).collect::<Vec<_>>().join(", ")
+                            waiting
+                                .iter()
+                                .map(|d| d.label())
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         )),
                 )
             })

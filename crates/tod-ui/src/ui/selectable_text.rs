@@ -154,7 +154,11 @@ mod tests {
     #[gpui::test]
     fn copy_shortcut_copies_a_drag_selection(cx: &mut TestAppContext) {
         let cx = drag_select(cx);
-        cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-c" } else { "ctrl-c" });
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
         let copied = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("alpha beta"));
     }

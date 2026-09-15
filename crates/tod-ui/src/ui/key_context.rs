@@ -34,7 +34,11 @@ pub fn set_input_tab_stop<T: gpui::Focusable>(
 }
 
 /// [`set_input_tab_stop`] for a field held as either kind of input state.
-pub fn set_any_input_tab_stop(input: &gpui_component::input::AnyInputState, tab_stop: bool, cx: &gpui::App) {
+pub fn set_any_input_tab_stop(
+    input: &gpui_component::input::AnyInputState,
+    tab_stop: bool,
+    cx: &gpui::App,
+) {
     let _ = input.focus_handle(cx).tab_stop(tab_stop);
 }
 
