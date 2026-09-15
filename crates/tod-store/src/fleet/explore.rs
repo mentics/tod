@@ -109,8 +109,8 @@ mod tests {
         let blob = node_id.as_bytes().to_vec();
         let now = chrono::Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'normal', NULL, ?4, ?4)",
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
             rusqlite::params![blob, "alpha", "Alpha", now],
         )
         .unwrap();

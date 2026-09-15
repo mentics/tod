@@ -4,10 +4,8 @@ use crate::outline::repos::gate::GateRepo;
 use crate::outline::repos::generator::GeneratorRepo;
 use crate::outline::repos::obligations::{KIND_CONSTRAINT, KIND_REQUIREMENT, ObligationRepo};
 use crate::outline::repos::plan_steps::PlanStepRepo;
-use crate::outline::repos::tree::TreeLoader;
 use crate::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
 use crate::outline::types::{Capability, EXTRA_CONTENT_DETAILS, OutlineEntry};
-use crate::outline::uuid_blob::now_ms;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::Path;
@@ -66,12 +64,6 @@ pub enum OutlineMutation {
         node_id: Uuid,
         capability: Capability,
         archive_payload: String,
-    },
-    CreateReferenceNode {
-        list_id: Uuid,
-        parent_id: Option<Uuid>,
-        title: String,
-        ref_target_id: Uuid,
     },
     ImportDocProcess {
         repo_root: String,
@@ -310,7 +302,6 @@ impl OutlineMutation {
             OutlineMutation::ImportDocProcess { .. }
                 | OutlineMutation::CreateList { .. }
                 | OutlineMutation::CreateNode { .. }
-                | OutlineMutation::CreateReferenceNode { .. }
                 | OutlineMutation::DisableCapability { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
@@ -394,7 +385,6 @@ impl OutlineMutation {
                 let list_id = outline_list_for_node(conn, *node_id)?;
                 bump_ordinals_after(conn, list_id, *parent_id, *ordinal)?;
                 OutlineRepo::new(conn).set_parent(*node_id, *parent_id, *ordinal)?;
-                refresh_loop_health(conn, list_id)?;
             }
             OutlineMutation::ReorderSibling { node_id, direction } => {
                 reorder_sibling(conn, *node_id, *direction)?;
@@ -416,26 +406,6 @@ impl OutlineMutation {
                     *capability,
                     archive_payload,
                 )?;
-            }
-            OutlineMutation::CreateReferenceNode {
-                list_id,
-                parent_id,
-                title,
-                ref_target_id,
-            } => {
-                guard_not_in_generator_subtree(conn, *parent_id)?;
-                let slug = format!("ref-{}", Uuid::new_v4().simple());
-                let node = NodeRepo::new(conn).create_reference(&slug, title, *ref_target_id)?;
-                let outline = OutlineRepo::new(conn);
-                let ordinal = outline.next_ordinal(*list_id, *parent_id)?;
-                outline.insert(&OutlineEntry {
-                    node_id: node.id,
-                    list_id: *list_id,
-                    parent_id: *parent_id,
-                    ordinal,
-                    collapsed: false,
-                })?;
-                refresh_loop_health(conn, *list_id)?;
             }
             OutlineMutation::ImportDocProcess { repo_root } => {
                 let root = Path::new(repo_root);
@@ -529,18 +499,15 @@ impl OutlineMutation {
                 // refresh updates. Managed descendants are removed by the archive
                 // below along with their own links (FK cascade).
                 GeneratorRepo::new(conn).clear_links_for_generator(*node_id)?;
-                let (archive_id, list_id) =
+                let (archive_id, _) =
                     crate::outline::archive::delete_subtree_archived(conn, *node_id)?;
-                refresh_loop_health(conn, list_id)?;
                 return Ok(Some(archive_id));
             }
             OutlineMutation::RestoreNodeSubtree {
                 archive_id,
                 root_node_id,
             } => {
-                let list_id =
-                    crate::outline::archive::restore_subtree(conn, *archive_id, media_root)?;
-                refresh_loop_health(conn, list_id)?;
+                crate::outline::archive::restore_subtree(conn, *archive_id, media_root)?;
                 let _ = root_node_id;
             }
             OutlineMutation::ReorderObligation {
@@ -967,7 +934,6 @@ fn reparent_to_parent_sibling(
     };
 
     outline.set_parent(node_id, new_parent, ordinal)?;
-    refresh_loop_health(conn, list_id)?;
     Ok(())
 }
 
@@ -1236,18 +1202,4 @@ fn copy_managed_node_recursive(
     }
 
     Ok(new_node.id)
-}
-
-fn refresh_loop_health(conn: &Connection, list_id: Uuid) -> Result<()> {
-    use crate::outline::uuid_blob::uuid_to_blob;
-    let loader = TreeLoader::new(conn);
-    conn.execute(
-        "UPDATE list_health_issues SET cleared_at = ?2
-         WHERE list_id = ?1 AND issue_type = 'reference_loop' AND cleared_at IS NULL",
-        rusqlite::params![uuid_to_blob(list_id), now_ms()],
-    )?;
-    if let Some(cycle) = loader.detect_reference_loop(list_id)? {
-        loader.record_loop_issue(list_id, &cycle)?;
-    }
-    Ok(())
 }

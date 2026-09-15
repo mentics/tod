@@ -52,8 +52,8 @@ mod tests {
             let slug = format!("bench-node-{i}");
             let is_generator = i % GENERATOR_COUNT == 0;
             tx.execute(
-                "INSERT INTO nodes (id, slug, title, kind, created_at, updated_at, managed)
-                 VALUES (?1, ?2, ?3, 'normal', 0, 0, ?4)",
+                "INSERT INTO nodes (id, slug, title, created_at, updated_at, managed)
+                 VALUES (?1, ?2, ?3, 0, 0, ?4)",
                 params![uuid_to_blob(node_id), slug, format!("Node {i}"), !is_generator],
             )
             .unwrap();
