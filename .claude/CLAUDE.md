@@ -152,6 +152,10 @@ The interview flow turns a conversation with two agents (question maker, answer 
 
 GPUI views live under `views/` (task list, obligations, agent panels, transcripts, command history) and share input/focus primitives from `ui/`. See the keyboard-focus convention below — it applies to any new editable view.
 
+### UI styling
+
+[doc/ui-style-guide.yaml](../doc/ui-style-guide.yaml) is the source of truth for how the UI looks. Implement each style once, named after its guide entry; views use those implementations, never raw colors, sizes, or spacing.
+
 ### GPUI keyboard focus: navigation mode vs. edit mode
 
 Multi-line and single-line text fields must not trap keyboard navigation. The established pattern (see `crates/tod-ui/src/interview/views/workspace.rs` for the reference implementation):
