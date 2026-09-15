@@ -5,6 +5,7 @@ use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::fleet::repos::{node_id_blob, node_id_column};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+use tod_agent::RunLocation;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
@@ -16,7 +17,10 @@ pub struct AgentRun {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub reconnect: Option<ReconnectIdentity>,
+    /// Why the run was launched: auto/interactive/implementation/terminal.
     pub run_kind: String,
+    /// Where the run physically executes — see `tod_agent::RunLocation`.
+    pub location: RunLocation,
     /// Human-readable name, for interactive chat sessions.
     pub session_name: Option<String>,
     /// Agent-side session id, so a later process can resume the conversation.
@@ -47,7 +51,7 @@ impl AgentRun {
 const RUN_SELECT: &str =
     "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
                     reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
-                    platform, model, effort";
+                    platform, model, effort, location";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -107,10 +111,19 @@ impl<'a> AgentRunRepo<'a> {
         let blob = node_id_blob(node_id)?;
         let run_number = self.next_run_number(&blob)?;
         let run_id = format!("{node_id}-run-{run_number}");
+        // `run_kind` is why the run was launched; `location` is where it
+        // physically executes. Only "terminal" callers run outside tod's own
+        // window today — everything else is `LocalWindow` until dev
+        // container / cloud VM launch paths exist.
+        let location = if run_kind == "terminal" {
+            RunLocation::Terminal
+        } else {
+            RunLocation::LocalWindow
+        };
         self.conn.execute(
             "INSERT INTO agent_runs
-             (id, node_id, run_number, runtime_status, started_at, run_kind, session_name, platform, model, effort)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, node_id, run_number, runtime_status, started_at, run_kind, session_name, platform, model, effort, location)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 run_id,
                 blob,
@@ -122,6 +135,7 @@ impl<'a> AgentRunRepo<'a> {
                 launch.map(|l| platform_storage(l.platform)),
                 launch.map(|l| l.model.as_str()),
                 launch.map(|l| l.effort.as_str()),
+                location.as_str(),
             ],
         )?;
         Ok(run_id)
@@ -347,6 +361,10 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         platform: row.get(11)?,
         model: row.get(12)?,
         effort: row.get(13)?,
+        location: {
+            let raw: String = row.get(14)?;
+            RunLocation::parse(&raw).unwrap_or(RunLocation::LocalWindow)
+        },
     })
 }
 

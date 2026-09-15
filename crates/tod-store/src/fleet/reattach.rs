@@ -7,6 +7,7 @@ use crate::fleet::runtime::GuestLivenessCheck;
 use crate::fleet::writer::{FleetMutation, FleetWriter};
 use anyhow::Result;
 use rusqlite::Connection;
+use tod_agent::RunLocation;
 
 pub type HostVerifyFn = fn(u32, u64) -> bool;
 
@@ -31,7 +32,11 @@ pub fn reattach_on_launch(
     let mut report = ReattachReport::default();
 
     for run in AgentRunRepo::new(conn).list_unended()? {
-        if run.run_kind == "terminal" {
+        // Terminal-located runs are tracked like shells (PID + state file,
+        // see `fleet/terminal/`), not via the pid+birth-token reconnect
+        // identity this loop checks. Dev container / cloud VM locations will
+        // eventually get their own `RunLocationOps` liveness check here too.
+        if run.location == RunLocation::Terminal {
             continue;
         }
         let Some(identity) = run.reconnect else {

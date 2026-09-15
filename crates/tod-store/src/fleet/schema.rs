@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 29;
+pub const CURRENT_USER_VERSION: i32 = 30;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -236,6 +236,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v28_to_v29(conn)?;
         conn.pragma_update(None, "user_version", 29)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 30 {
+        migrate_v29_to_v30(conn)?;
+        conn.pragma_update(None, "user_version", 30)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -258,6 +263,30 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
 ///   by start time, and snapshot the config's platform / model / effort);
 ///   `notification_agents` becomes `notification_runs` (the config's latest run);
 ///   `interview_sessions.agent_config_id` and `agent_configs` are dropped.
+/// Add `location` (the physical `tod_agent::RunLocation` a run executes in)
+/// as its own column, separate from `run_kind` (why the run was launched —
+/// auto/interactive/implementation/terminal). Existing `terminal`-kind runs
+/// are the only ones that ran outside tod's own window, so they backfill to
+/// `terminal`; everything else backfills to `local_window`.
+fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
+    let has_location: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = 'location'")?
+        .exists([])?;
+    if has_location {
+        // Some tests replay migrations from an earlier `user_version` against
+        // a connection that already ran the full migration chain once; the
+        // column is already there in that case.
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE agent_runs ADD COLUMN location TEXT NOT NULL DEFAULT 'local_window';
+        UPDATE agent_runs SET location = 'terminal' WHERE run_kind = 'terminal';
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
     const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
     let table_exists = |name: &str| -> Result<bool> {
