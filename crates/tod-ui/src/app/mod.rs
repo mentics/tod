@@ -90,12 +90,16 @@ impl App {
             // ListItem hover-selected chrome on #0a0a0a. Align with list_active
             // border so menu ↑/↓ selection is clearly visible (req 20).
             {
-                use gpui_component::{Theme, scroll::ScrollbarMode};
+                use gpui_component::{Theme, ThemeMode, scroll::ScrollbarMode};
+                // Always dark. gpui-component's init picks Light regardless of
+                // the system appearance, and `change` resets every color, so
+                // it runs before the tweaks below.
+                Theme::change(ThemeMode::Dark, None, cx);
                 let theme = Theme::global_mut(cx);
                 let border = theme.list_active_border;
                 theme.accent = border.opacity(0.55);
                 theme.accent_foreground = theme.foreground;
-                theme.scrollbar_mode = ScrollbarMode::Always;
+                Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
             }
             if !needs_data_root_setup {
                 register_main_keyboard_bindings(cx);

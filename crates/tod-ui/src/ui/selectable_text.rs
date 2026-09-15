@@ -52,18 +52,17 @@ fn plain_text_html(text: &str) -> SharedString {
 ///
 /// The context menu needs a parent element to hang off, and `TextView` is not
 /// one; the wrapper carries `id` so each menu keeps its own state.
+///
+/// The selection is read when the menu opens: the left mouse-down that clicks
+/// Copy clears the window's selection before the item's handler runs.
 fn with_copy_menu(id: ElementId, view: TextView) -> SelectableText {
     div().id(id).child(view).context_menu(|menu, window, cx| {
-        let has_selection = TextSelection::has_selection(window, cx);
+        let text = TextSelection::selected_text(window, cx).trim().to_string();
         menu.item(
             PopupMenuItem::new("Copy")
-                .disabled(!has_selection)
-                .on_click(|_, window, cx| {
-                    let text = TextSelection::selected_text(window, cx);
-                    let text = text.trim();
-                    if !text.is_empty() {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-                    }
+                .disabled(text.is_empty())
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 }),
         )
     })
@@ -161,14 +160,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn right_click_keeps_the_selection_for_the_copy_menu(cx: &mut TestAppContext) {
+    fn right_click_copy_copies_a_drag_selection(cx: &mut TestAppContext) {
         let cx = drag_select(cx);
-        cx.simulate_mouse_down(point(px(20.), px(8.)), MouseButton::Right, Modifiers::default());
-        cx.simulate_mouse_up(point(px(20.), px(8.)), MouseButton::Right, Modifiers::default());
+        let at = point(px(20.), px(8.));
+        cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::default());
+        // The menu is built on the next frame and opens at the click; its
+        // only item, Copy, sits just below and right of it.
+        cx.run_until_parked();
         cx.update(|window, cx| {
             let _ = window.draw(cx);
-            // The menu's Copy trims, as the selection ends with the paragraph break.
-            assert_eq!(TextSelection::selected_text(window, cx).trim(), "alpha beta");
         });
+        cx.simulate_click(point(px(50.), px(24.)), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            assert!(
+                !TextSelection::has_selection(window, cx),
+                "clicking the menu clears the selection, so Copy must not read it then"
+            );
+        });
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("alpha beta"));
     }
 }
