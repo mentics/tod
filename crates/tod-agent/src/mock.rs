@@ -251,6 +251,17 @@ impl AgentProvider for MockAgentProvider {
         self.fleet_run_sessions.get(&id).cloned()
     }
 
+    fn fetch_full_transcript(
+        &self,
+        _platform: crate::platform::AgentPlatform,
+        _cwd: &std::path::Path,
+        agent_session_id: &str,
+    ) -> anyhow::Result<String> {
+        Ok(format!(
+            "User:\nmock prompt\n\nAssistant:\nmock reply (session {agent_session_id})"
+        ))
+    }
+
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.sessions.get(key).map(|session| session.context_chars)
     }

@@ -29,6 +29,13 @@ impl RoutingAgentProvider {
             AgentPlatform::Claude => &mut self.claude,
         }
     }
+
+    fn for_platform_ref(&self, platform: AgentPlatform) -> &CursorAcpProvider {
+        match platform {
+            AgentPlatform::Cursor => &self.cursor,
+            AgentPlatform::Claude => &self.claude,
+        }
+    }
 }
 
 fn build_host_provider(host: AcpHost, traffic_log: SharedAgentTrafficLog) -> CursorAcpProvider {
@@ -85,6 +92,16 @@ impl AgentProvider for RoutingAgentProvider {
         self.cursor
             .fleet_run_session_id(id)
             .or_else(|| self.claude.fleet_run_session_id(id))
+    }
+
+    fn fetch_full_transcript(
+        &self,
+        platform: AgentPlatform,
+        cwd: &std::path::Path,
+        agent_session_id: &str,
+    ) -> Result<String> {
+        self.for_platform_ref(platform)
+            .fetch_full_transcript(platform, cwd, agent_session_id)
     }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {

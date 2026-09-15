@@ -176,6 +176,16 @@ pub trait AgentProvider {
     /// Callers persist it the same way they persist `session_id`.
     fn fleet_run_session_id(&self, id: RunId) -> Option<String>;
 
+    /// Fetch the full transcript of an already-ended agent-side session by
+    /// resuming/loading it read-only (no prompt sent). Used to populate the
+    /// one-time cached transcript for a `Done` run that has none yet.
+    fn fetch_full_transcript(
+        &self,
+        platform: crate::platform::AgentPlatform,
+        cwd: &std::path::Path,
+        agent_session_id: &str,
+    ) -> anyhow::Result<String>;
+
     /// Characters that have entered conversation `key`'s context since this
     /// provider started holding it: prompts sent, replies, and tool output the
     /// agent reported. A size estimate for callers deciding when to rotate.
