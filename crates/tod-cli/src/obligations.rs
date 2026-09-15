@@ -3,6 +3,7 @@
 use crate::Invocation;
 use crate::args::Args;
 use tod_core::fuzzy::fuzzy_score;
+use tod_store::drafting::{ATTENTION_LEVELS, DraftingRepo, ObligationMark};
 use tod_store::interview::{InterviewCommand, InterviewRepo, PHASE_REQUIREMENTS, short_id};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use tod_store::outline::{
@@ -16,12 +17,15 @@ tod-cli obligations — requirements and constraints on a node
 Obligation ids may be given in full or as the 8-character prefix shown in listings.
 
 COMMANDS:
-    list   --node <UUID> [--kind requirement|constraint] [--inherited] [--search <TEXT>]
-    show   <ID>
-    add    --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--section <NAME>] [--after <ID>] [--before]
-    update <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown]      (--section \"\" clears it)
-    delete <ID>
+    list       --node <UUID> [--kind requirement|constraint] [--inherited] [--search <TEXT>]
+    show       <ID>
+    add        --node <UUID> --kind requirement|constraint --body <TEXT> --phase requirements|design [--section <NAME>] [--after <ID>] [--before] [--attention low|medium|high --why <TEXT>]
+    update     <ID> [--body <TEXT>] [--section <NAME>] [--phase requirements|design|unknown] [--attention low|medium|high --why <TEXT>]      (--section \"\" clears it)
+    move       <ID> --node <UUID>
+    delete     <ID>
+    check-refs [--node <UUID>]      obligations whose [[slug]] names no node
 
+Listings mark obligations nobody has confirmed as <agent, attention: reason>.
 Inside an interview, an agent's `add` always writes its own session's phase —
 `--phase` there only matters when running `add` outside an interview.
 ";
@@ -38,7 +42,9 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "show" => show(&inv, &args),
         "add" => add(&inv, &args),
         "update" => update(&inv, &args),
+        "move" => move_to(&inv, &args),
         "delete" => delete(&inv, &args),
+        "check-refs" => check_refs(&inv, &args),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
 }
@@ -73,18 +79,61 @@ fn normalize_creation_phase(raw: &str) -> anyhow::Result<&'static str> {
     }
 }
 
+/// `--attention` with its required `--why`, validated.
+fn attention(args: &Args) -> anyhow::Result<Option<(String, String)>> {
+    let Some(level) = args.get("--attention") else {
+        if args.get("--why").is_some() {
+            anyhow::bail!("--why goes with --attention");
+        }
+        return Ok(None);
+    };
+    let level = level.trim().to_ascii_lowercase();
+    if !ATTENTION_LEVELS.contains(&level.as_str()) {
+        anyhow::bail!("--attention `{level}` (expected low|medium|high)");
+    }
+    let why = args
+        .get("--why")
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("--attention needs --why <one-line reason>"))?;
+    Ok(Some((level, why.to_string())))
+}
+
 fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
     inv.client()
         .read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw))
 }
 
+/// ` <agent, high: reason>` for obligations nobody confirmed; empty for the user's.
+fn mark_text(mark: Option<&ObligationMark>) -> String {
+    match mark {
+        Some(m) if m.is_agent() => match (&m.attention, &m.attention_why) {
+            (Some(level), Some(why)) => format!(" <agent, {level}: {why}>"),
+            (Some(level), None) => format!(" <agent, {level}>"),
+            _ => " <agent>".to_string(),
+        },
+        _ => String::new(),
+    }
+}
+
+fn mark_json(mark: Option<&ObligationMark>) -> serde_json::Value {
+    serde_json::json!({
+        "provenance": mark.map(|m| m.provenance.clone()),
+        "attention": mark.and_then(|m| m.attention.clone()),
+        "attention_why": mark.and_then(|m| m.attention_why.clone()),
+    })
+}
+
+type Row = (NodeObligation, Option<String>, Option<ObligationMark>);
+
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let node = args.node()?;
     let kind = args.get("--kind").map(normalize_kind).transpose()?;
     let search = args.get("--search");
-    let rows: Vec<(NodeObligation, Option<String>)> = inv.client().read(|conn| {
+    let rows: Vec<Row> = inv.client().read(|conn| {
         let nodes = NodeRepo::new(conn);
-        let rows = if args.has("--inherited") {
+        let drafting = DraftingRepo::new(conn);
+        let rows: Vec<(NodeObligation, Option<String>)> = if args.has("--inherited") {
             resolve_obligations(conn, node, None)?
                 .into_iter()
                 .map(|r| {
@@ -110,14 +159,19 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .map(|o| (o, None))
                 .collect()
         };
-        Ok(rows)
+        rows.into_iter()
+            .map(|(o, source)| {
+                let mark = drafting.mark(o.id)?;
+                Ok((o, source, mark))
+            })
+            .collect()
     })?;
-    let mut rows: Vec<_> = rows
+    let mut rows: Vec<Row> = rows
         .into_iter()
-        .filter(|(o, _)| kind.is_none_or(|k| o.kind == k))
+        .filter(|(o, _, _)| kind.is_none_or(|k| o.kind == k))
         .collect();
     if let Some(query) = search {
-        let mut scored: Vec<(i32, (NodeObligation, Option<String>))> = rows
+        let mut scored: Vec<(i32, Row)> = rows
             .into_iter()
             .filter_map(|row| {
                 let haystack = format!("{} {}", row.0.section.as_deref().unwrap_or(""), row.0.body);
@@ -130,8 +184,8 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if inv.json {
         let items: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(r, source)| {
-                serde_json::json!({
+            .map(|(r, source, mark)| {
+                let mut item = serde_json::json!({
                     "id": r.id.to_string(),
                     "node_id": r.node_id.to_string(),
                     "kind": r.kind,
@@ -139,7 +193,13 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                     "body": r.body,
                     "phase": r.phase,
                     "inherited_from": source,
-                })
+                });
+                if let (Some(item), serde_json::Value::Object(extra)) =
+                    (item.as_object_mut(), mark_json(mark.as_ref()))
+                {
+                    item.extend(extra);
+                }
+                item
             })
             .collect();
         return Ok(serde_json::Value::Array(items).to_string());
@@ -149,7 +209,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     Ok(rows
         .iter()
-        .map(|(o, source)| {
+        .map(|(o, source, mark)| {
             let section = o
                 .section
                 .as_deref()
@@ -160,10 +220,11 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .map(|s| format!(" [from \"{s}\"]"))
                 .unwrap_or_default();
             format!(
-                "[{}] {}/{}{section}{from}: {}",
+                "[{}] {}/{}{section}{from}{}: {}",
                 short_id(o.id),
                 o.phase,
                 o.kind,
+                mark_text(mark.as_ref()),
                 o.body
             )
         })
@@ -173,22 +234,28 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 
 fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let raw = args.target("an obligation id")?;
-    let row = inv.client().read(|conn| {
+    let (row, mark) = inv.client().read(|conn| {
         let id = InterviewRepo::new(conn).resolve_obligation_id(raw)?;
-        ObligationRepo::new(conn)
+        let row = ObligationRepo::new(conn)
             .get(id)?
-            .ok_or_else(|| anyhow::anyhow!("obligation {raw} not found"))
+            .ok_or_else(|| anyhow::anyhow!("obligation {raw} not found"))?;
+        Ok((row, DraftingRepo::new(conn).mark(id)?))
     })?;
     if inv.json {
-        return Ok(serde_json::json!({
+        let mut value = serde_json::json!({
             "id": row.id.to_string(),
             "node_id": row.node_id.to_string(),
             "kind": row.kind,
             "section": row.section,
             "body": row.body,
             "phase": row.phase,
-        })
-        .to_string());
+        });
+        if let (Some(item), serde_json::Value::Object(extra)) =
+            (value.as_object_mut(), mark_json(mark.as_ref()))
+        {
+            item.extend(extra);
+        }
+        return Ok(value.to_string());
     }
     let section = row
         .section
@@ -196,10 +263,11 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(|s| format!(" ({s})"))
         .unwrap_or_default();
     Ok(format!(
-        "[{}] {}/{}{section} on node {}\n{}",
+        "[{}] {}/{}{section}{} on node {}\n{}",
         short_id(row.id),
         row.phase,
         row.kind,
+        mark_text(mark.as_ref()),
         row.node_id,
         row.body
     ))
@@ -214,12 +282,14 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .map(normalize_creation_phase)
         .transpose()?
         .unwrap_or(PHASE_REQUIREMENTS);
+    let attention = attention(args)?;
     let after = args.get("--after").map(|raw| resolve(inv, raw)).transpose()?;
     let id = Uuid::new_v4();
+    let client = inv.client();
     // Routed through `interview()` (not the raw `.outline()` mutation queue) so
     // an interview agent's own phase overrides whatever `--phase` it passed —
     // see `InterviewCommand::Outline` in tod-store::interview::command.
-    inv.client().interview(InterviewCommand::Outline {
+    client.interview(InterviewCommand::Outline {
         mutation: OutlineMutation::CreateObligation {
             obligation_id: Some(id),
             node_id: node,
@@ -236,6 +306,13 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         },
         target: None,
     })?;
+    if let Some((level, why)) = attention {
+        client.interview(InterviewCommand::SetAttention {
+            obligation_id: id,
+            attention: level,
+            why: Some(why),
+        })?;
+    }
     Ok(ack(id, inv.json))
 }
 
@@ -244,8 +321,9 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let body = args.get("--body");
     let section = args.get("--section");
     let phase = args.get("--phase").map(normalize_phase).transpose()?;
-    if body.is_none() && section.is_none() && phase.is_none() {
-        anyhow::bail!("--body, --section, and/or --phase is required");
+    let attention = attention(args)?;
+    if body.is_none() && section.is_none() && phase.is_none() && attention.is_none() {
+        anyhow::bail!("--body, --section, --phase, and/or --attention is required");
     }
     let client = inv.client();
     let mut target = Some(id);
@@ -273,9 +351,29 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 obligation_id: id,
                 phase: phase.to_string(),
             },
-            target,
+            target: target.take(),
         })?;
     }
+    if let Some((level, why)) = attention {
+        client.interview(InterviewCommand::SetAttention {
+            obligation_id: id,
+            attention: level,
+            why: Some(why),
+        })?;
+    }
+    Ok(ack(id, inv.json))
+}
+
+fn move_to(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let id = resolve(inv, args.target("an obligation id")?)?;
+    let node = args.node()?;
+    inv.client().interview(InterviewCommand::Outline {
+        mutation: OutlineMutation::MoveObligation {
+            obligation_id: id,
+            target_node_id: node,
+        },
+        target: Some(id),
+    })?;
     Ok(ack(id, inv.json))
 }
 
@@ -286,6 +384,41 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         target: Some(id),
     })?;
     Ok(ack(id, inv.json))
+}
+
+fn check_refs(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let scope = args.uuid("--node")?;
+    let broken = inv
+        .client()
+        .read(|conn| DraftingRepo::new(conn).broken_references(scope))?;
+    if inv.json {
+        let items: Vec<serde_json::Value> = broken
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "obligation_id": b.obligation_id.to_string(),
+                    "node_id": b.node_id.to_string(),
+                    "slug": b.slug,
+                })
+            })
+            .collect();
+        return Ok(serde_json::Value::Array(items).to_string());
+    }
+    if broken.is_empty() {
+        return Ok("(none)".to_string());
+    }
+    Ok(broken
+        .iter()
+        .map(|b| {
+            format!(
+                "[{}] on node {}: no node has slug [[{}]]",
+                short_id(b.obligation_id),
+                b.node_id,
+                b.slug
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn ack(id: Uuid, json: bool) -> String {

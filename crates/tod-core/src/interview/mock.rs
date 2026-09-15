@@ -43,6 +43,7 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
     match turn.purpose {
         SessionPurpose::QuestionMaker => question_maker(&client, &row, &text, &received),
         SessionPurpose::AnswerProcessor => answer_processor(&client, &row, &text, &received),
+        SessionPurpose::Drafter => crate::drafting::mock::drafter(&client, &row, &text),
         SessionPurpose::Chat => bail!("not an interview turn"),
     }
 }

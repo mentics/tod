@@ -1,6 +1,7 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
 pub mod credentials;
+pub mod drafting;
 pub mod fleet;
 pub mod install;
 pub mod interview;

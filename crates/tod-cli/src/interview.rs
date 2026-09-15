@@ -48,7 +48,7 @@ COMMANDS:
     exhausted --session <UUID> --reason <TEXT>
 ";
 
-fn split(inv: &Invocation, usage: &str) -> anyhow::Result<Option<(String, Args)>> {
+pub(crate) fn split(inv: &Invocation, usage: &str) -> anyhow::Result<Option<(String, Args)>> {
     let mut rest = inv.rest.clone();
     if rest.is_empty() || rest.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(None);
@@ -58,12 +58,12 @@ fn split(inv: &Invocation, usage: &str) -> anyhow::Result<Option<(String, Args)>
     Ok(Some((command, Args::parse(&rest)?)))
 }
 
-fn unknown(command: &str, usage: &str) -> anyhow::Error {
+pub(crate) fn unknown(command: &str, usage: &str) -> anyhow::Error {
     anyhow::anyhow!("unknown command `{command}`\n\n{}", usage.trim_end())
 }
 
 /// One-line acknowledgement of a write.
-fn ack(value: &Value, json: bool) -> String {
+pub(crate) fn ack(value: &Value, json: bool) -> String {
     if json {
         return value.to_string();
     }

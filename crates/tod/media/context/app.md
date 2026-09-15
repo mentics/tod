@@ -67,16 +67,46 @@ and you need its id or slug to reference or inspect it. The match is fuzzy
 ### obligations
 
 ```
-tod-cli --data-root <DATA_ROOT> obligations list   --node <NODE_UUID> [--kind requirement|constraint]
-tod-cli --data-root <DATA_ROOT> obligations show   <OBLIGATION_UUID> --node <NODE_UUID>
-tod-cli --data-root <DATA_ROOT> obligations add    --node <NODE_UUID> --kind requirement|constraint --body <TEXT> [--after <OBLIGATION_UUID>] [--before]
-tod-cli --data-root <DATA_ROOT> obligations update <OBLIGATION_UUID> --body <TEXT>
-tod-cli --data-root <DATA_ROOT> obligations delete <OBLIGATION_UUID>
+tod-cli --data-root <DATA_ROOT> obligations list       --node <NODE_UUID> [--kind requirement|constraint] [--inherited]
+tod-cli --data-root <DATA_ROOT> obligations show       <OBLIGATION_UUID>
+tod-cli --data-root <DATA_ROOT> obligations add        --node <NODE_UUID> --kind requirement|constraint --body <TEXT> [--after <OBLIGATION_UUID>] [--before] [--attention low|medium|high --why <TEXT>]
+tod-cli --data-root <DATA_ROOT> obligations update     <OBLIGATION_UUID> [--body <TEXT>] [--attention low|medium|high --why <TEXT>]
+tod-cli --data-root <DATA_ROOT> obligations move       <OBLIGATION_UUID> --node <NODE_UUID>
+tod-cli --data-root <DATA_ROOT> obligations delete     <OBLIGATION_UUID>
+tod-cli --data-root <DATA_ROOT> obligations check-refs [--node <NODE_UUID>]
 ```
 
 `add` appends to the end of its kind group by default. Pass `--after` to place
 it after a specific obligation, and add `--before` to place it before that one
 instead.
+
+Every obligation has a **provenance**. What you write through `tod-cli` is
+`agent`: in effect, but not confirmed by the user, and listed with a
+`<agent, attention: reason>` mark. Only the user, in the app, makes one `user`.
+When you write or change one, give `--attention` (how likely the user is to
+change it) with a one-line `--why`. `move` keeps provenance.
+
+Obligation text can reference any node inline by slug: `[[dynamic-form]]`. A
+write naming a slug no node has is refused; `check-refs` lists existing
+obligations whose references are broken.
+
+### drafting
+
+The record of drafting a node's spec: the user's dumps, the rare choices put to
+the user, and the node's **buildable** evaluation (the `design` → `planning`
+gate). Choices are `c-<n>` and dumps `d-<n>`.
+
+```
+tod-cli --data-root <DATA_ROOT> drafting dump            [--node <NODE_UUID>] --body <TEXT>
+tod-cli --data-root <DATA_ROOT> drafting dumps           --node <NODE_UUID> [--limit N]
+tod-cli --data-root <DATA_ROOT> drafting choices         --node <NODE_UUID> [--status open|answered|delegated|withdrawn]
+tod-cli --data-root <DATA_ROOT> drafting add-choice      --node <NODE_UUID>      # YAML on stdin: question, context, options: [{label, obligations: [{kind, body, section}]}]
+tod-cli --data-root <DATA_ROOT> drafting withdraw-choice --node <NODE_UUID> <c-N>
+tod-cli --data-root <DATA_ROOT> drafting buildable       --node <NODE_UUID> --outcome pass|fail|pending [--detail <TEXT>]
+```
+
+`dump` hands the text to the node's drafter, as if the user had typed it in the
+drafting view.
 
 ### plan
 

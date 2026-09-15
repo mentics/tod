@@ -1285,8 +1285,10 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Capture in `proposed`, drafting in `design`, the interview in `planning`.
+        let label = tod_core::process::spec_view_label(lifecycle).unwrap_or("Interview");
         if interview_phase_for_lifecycle(lifecycle).is_none() {
-            self.show_error("Interview unavailable for this lifecycle state.", window, cx);
+            self.show_error(format!("{label} unavailable for this lifecycle state."), window, cx);
             return;
         }
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
@@ -1294,20 +1296,20 @@ impl TaskListView {
         };
         if !task.is_work_node {
             self.show_error(
-                "Interview unavailable — task is not a work node.",
+                format!("{label} unavailable — task is not a work node."),
                 window,
                 cx,
             );
             return;
         }
         let Ok(node_id) = uuid::Uuid::parse_str(&task.id) else {
-            self.show_error("Interview unavailable — invalid task id.", window, cx);
+            self.show_error(format!("{label} unavailable — invalid task id."), window, cx);
             return;
         };
         if let Ok(Some(task_row)) = self.fleet.get_task(task_id) {
             if task_row.repo.as_ref().is_none_or(|r| r.trim().is_empty()) {
                 self.show_error(
-                    "Set repository on task before starting interview.",
+                    format!("Set repository on task before opening {}.", label.to_lowercase()),
                     window,
                     cx,
                 );
@@ -1316,7 +1318,7 @@ impl TaskListView {
             let repo = task_row.repo.as_deref().unwrap_or("");
             let branch = task_row.branch.as_deref().unwrap_or("");
             if let Err(err) = validate_interview_workspace(PathBuf::from(repo).as_path(), branch) {
-                self.show_error(format!("Interview workspace: {err:#}"), window, cx);
+                self.show_error(format!("{label} workspace: {err:#}"), window, cx);
                 return;
             }
         }
@@ -1326,7 +1328,10 @@ impl TaskListView {
             lifecycle: lifecycle.to_string(),
             title: task.title.clone(),
         });
-        self.set_status_line(format!("Opening interview for {}", task.title), cx);
+        self.set_status_line(
+            format!("Opening {} for {}", label.to_lowercase(), task.title),
+            cx,
+        );
     }
 
     /// Open the lifecycle transition panel for a task (bypasses interview routing).

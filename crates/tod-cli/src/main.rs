@@ -9,6 +9,7 @@
 //! that changed since the session's context was built.
 
 mod args;
+mod drafting;
 mod interview;
 mod node;
 mod obligations;
@@ -33,6 +34,7 @@ GLOBAL OPTIONS:
 NOUNS:
     node                   Outline nodes: create, inspect, search, move, delete
     obligations            Requirements and constraints attached to a node
+    drafting               Dumps, choices, and buildable while a node's spec is drafted
     content                A node's goal, design, and notes
     plan                   Structured, dependency-graph plan steps for a node
     questions              Interview questions for a node
@@ -67,8 +69,10 @@ pub struct Invocation {
 }
 
 impl Invocation {
+    /// Writes are an agent's unless `TOD_INTERVIEW_ACTOR` names a session:
+    /// `tod-cli` is the agents' interface, and the GUI never goes through it.
     pub fn client(&self) -> InterviewClient {
-        InterviewClient::from_env(&self.data_root)
+        InterviewClient::from_env_or(&self.data_root, tod_store::interview::ACTOR_AGENT)
     }
 }
 
@@ -120,6 +124,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     match noun.as_str() {
         "node" => node::run(invocation),
         "obligations" => obligations::run(invocation),
+        "drafting" => drafting::run(invocation),
         "content" => interview::content(invocation),
         "plan" => plan::run(invocation),
         "questions" => interview::questions(invocation),
@@ -127,7 +132,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design)"
+            "unknown noun `{other}` (expected: node, obligations, drafting, content, plan, questions, memory, interview, visual-design)"
         ),
     }
 }
@@ -245,8 +250,28 @@ mod tests {
         let listed = cli(&root, &["obligations", "list", "--node", &node]).unwrap();
         assert_eq!(
             listed,
-            format!("[{short}] requirements/requirement (Core): Keep it simple.")
+            format!("[{short}] requirements/requirement (Core) <agent>: Keep it simple.")
         );
+
+        // Attention needs its reason; both show in listings.
+        let err = cli(&root, &["obligations", "update", &short, "--attention", "high"]).unwrap_err();
+        assert!(err.to_string().contains("--why"), "{err}");
+        cli(
+            &root,
+            &["obligations", "update", &short, "--attention", "high", "--why", "A taste call"],
+        )
+        .unwrap();
+        let listed = cli(&root, &["obligations", "list", "--node", &node]).unwrap();
+        assert!(listed.contains("<agent, high: A taste call>"), "{listed}");
+
+        // References must name a node that exists.
+        let err = cli(
+            &root,
+            &["obligations", "add", "--node", &node, "--kind", "req", "--body", "Uses [[no-such-node]]."],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("[[no-such-node]]"), "{err}");
+        assert_eq!(cli(&root, &["obligations", "check-refs"]).unwrap(), "(none)");
 
         let updated = cli(
             &root,
@@ -266,6 +291,37 @@ mod tests {
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drafting_dumps_choices_and_buildable() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        assert_eq!(
+            cli(&root, &["drafting", "dump", "--node", &node, "--body", "Notes sync."]).unwrap(),
+            "ok d-1"
+        );
+        let dumps = cli(&root, &["drafting", "dumps", "--node", &node]).unwrap();
+        assert_eq!(dumps, "d-1 (not routed): Notes sync.");
+
+        assert_eq!(cli(&root, &["drafting", "choices", "--node", &node]).unwrap(), "(none)");
+        let err = cli(
+            &root,
+            &["drafting", "buildable", "--node", &node, "--outcome", "maybe"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("pass"), "{err}");
+        assert_eq!(
+            cli(
+                &root,
+                &["drafting", "buildable", "--node", &node, "--outcome", "pass", "--detail", "Clear."]
+            )
+            .unwrap(),
+            "ok"
+        );
+        let err = cli(&root, &["drafting", "withdraw-choice", "--node", &node, "c-4"]).unwrap_err();
+        assert!(err.to_string().contains("c-4"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 

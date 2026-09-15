@@ -8,6 +8,7 @@ pub mod transcript_window;
 pub mod window;
 
 use crate::cli::LaunchOptions;
+use crate::drafting::register_drafting_keyboard_bindings;
 use crate::interview::views::{
     register_sessions_keyboard_bindings, register_settings_keyboard_bindings,
 };
@@ -41,6 +42,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_lifecycle_panel_keyboard_bindings(cx);
     register_agent_config_keyboard_bindings(cx);
     register_sessions_keyboard_bindings(cx);
+    register_drafting_keyboard_bindings(cx);
     register_settings_keyboard_bindings(cx);
     register_database_keyboard_bindings(cx);
     register_agent_transcripts_keyboard_bindings(cx);

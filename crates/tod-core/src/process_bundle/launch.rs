@@ -22,12 +22,26 @@ pub fn interview_session_prefix(
     let role_doc = match role {
         Role::QuestionMaker => manifest.question_maker_doc(base)?,
         Role::AnswerProcessor => manifest.answer_processor_doc(base)?,
+        Role::Drafter => anyhow::bail!("the drafter's opening comes from drafting_session_prefix"),
     };
     Ok(format!(
         "## Role\n\n{}\n\n## Interview phase\n\n{}\n\n## Shared conventions\n\n{}\n",
         read_doc(&role_doc)?.trim(),
         read_doc(&manifest.interview_phase_doc(base)?)?.trim(),
         read_doc(&manifest.base_doc(base)?)?.trim(),
+    ))
+}
+
+/// The byte-stable opening of every drafter session in `mode`: the mode's
+/// doc, then the drafting conventions shared by capture and drafting.
+pub fn drafting_session_prefix(
+    manifest: &ProcessManifest,
+    mode: crate::drafting::DraftingMode,
+) -> Result<String> {
+    Ok(format!(
+        "## Role\n\n{}\n\n## Drafting conventions\n\n{}\n",
+        read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?.trim(),
+        read_doc(&manifest.drafting_base_doc())?.trim(),
     ))
 }
 

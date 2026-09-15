@@ -12,6 +12,7 @@ use crate::app::interactive_agent_window::{
 };
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
+use crate::drafting::{DraftingView, DraftingViewEvent};
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
 use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
@@ -39,6 +40,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_core::drafting::DraftingMode;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
@@ -62,6 +64,8 @@ const TASKS_DRAWER_MIN: f32 = 280.0;
 enum ShellView {
     Tasks,
     Interview,
+    /// Capture (`proposed`) and the drafting loop (`design`).
+    Drafting,
     Settings,
     Database,
 }
@@ -99,6 +103,7 @@ pub struct Shell {
     visual_design_panel: Entity<VisualDesignPanelView>,
     agent_panel: Entity<AgentConfigPanelView>,
     sessions: Entity<SessionsView>,
+    drafting: Entity<DraftingView>,
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
     fleet: Arc<FleetStore>,
@@ -117,6 +122,9 @@ pub struct Shell {
     /// "Open interview" affordance, validated and routed through
     /// `TaskListView::open_interview_for_task` once `window` is available.
     pending_open_interview_for_task: Option<(String, String)>,
+    /// Node whose pre-v3 obligations the drafter should rewrite (from the
+    /// obligations panel), opened in the drafting view once `window` is available.
+    pending_rewrite_pre_v3: Option<Uuid>,
     pending_open_lifecycle: Option<PendingOpenLifecycle>,
     pending_return_to_tasks: bool,
     pending_open_task_edit: Option<String>,
@@ -147,6 +155,7 @@ pub struct Shell {
     _visual_design_panel_subscription: Subscription,
     _agent_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
+    _drafting_subscription: Subscription,
     _settings_subscription: Subscription,
 }
 
@@ -156,6 +165,7 @@ fn collect_running_work(
     fleet: &FleetStore,
     lifecycle_panel: &Entity<LifecyclePanelView>,
     sessions: &Entity<SessionsView>,
+    drafting: &Entity<DraftingView>,
     cx: &App,
 ) -> Vec<SharedString> {
     let mut items = Vec::new();
@@ -197,6 +207,9 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
+    for item in drafting.read(cx).running_drafting_work() {
+        items.push(SharedString::from(item));
+    }
     items
 }
 
@@ -206,6 +219,8 @@ impl Shell {
             .update(cx, |list, _| list.app_nav_mut().close());
         self.sessions
             .update(cx, |sessions, cx| sessions.close_app_nav(cx));
+        self.drafting
+            .update(cx, |drafting, _| drafting.close_app_nav());
         self.settings
             .update(cx, |settings, _| settings.app_nav_mut().close());
         self.database
@@ -232,6 +247,10 @@ impl Shell {
                     sessions.focus(window);
                 });
             }
+            ShellView::Drafting => {
+                let focus = self.drafting.read(cx).focus_handle(cx);
+                focus.focus(window);
+            }
             ShellView::Settings => {
                 let focus = self.settings.read(cx).focus_handle(cx);
                 focus.focus(window);
@@ -252,14 +271,40 @@ impl Shell {
         title: String,
         cx: &mut Context<Self>,
     ) {
+        // Capture and design are drafted; planning keeps its interview.
+        self.active_view = if DraftingMode::for_lifecycle(&lifecycle).is_some() {
+            ShellView::Drafting
+        } else {
+            ShellView::Interview
+        };
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,
             node_id,
             lifecycle,
             title,
         });
-        self.active_view = ShellView::Interview;
         cx.notify();
+    }
+
+    fn drain_pending_rewrite_pre_v3(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node_id) = self.pending_rewrite_pre_v3.take() else {
+            return;
+        };
+        let lifecycle = self
+            .fleet
+            .get_task(&node_id.to_string())
+            .ok()
+            .flatten()
+            .map(|t| t.lifecycle)
+            .unwrap_or_default();
+        let proceed = (!lifecycle.is_empty()).then(|| TaskListProceedContext {
+            task_id: node_id.to_string(),
+            lifecycle,
+        });
+        self.active_view = ShellView::Drafting;
+        self.drafting.update(cx, |drafting, cx| {
+            drafting.open(node_id, proceed, Some(false), window, cx);
+        });
     }
 
     fn drain_pending_return_to_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -274,6 +319,21 @@ impl Shell {
         let Some(pending) = self.pending_open_interview.take() else {
             return;
         };
+        if DraftingMode::for_lifecycle(&pending.lifecycle).is_some() {
+            self.drafting.update(cx, |drafting, cx| {
+                drafting.open(
+                    pending.node_id,
+                    Some(TaskListProceedContext {
+                        task_id: pending.task_id,
+                        lifecycle: pending.lifecycle,
+                    }),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+            return;
+        }
         let phase = interview_phase_for_lifecycle(&pending.lifecycle)
             .unwrap_or("task-requirements-interview");
         let phase_label = interview_phase_label(phase);
@@ -1079,6 +1139,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending_open_interview(window, cx);
         self.drain_pending_open_interview_for_task(window, cx);
+        self.drain_pending_rewrite_pre_v3(window, cx);
         self.drain_pending_return_to_tasks(window, cx);
         self.drain_pending_open_lifecycle(cx);
         self.drain_pending_task_edit(window, cx);
@@ -1160,6 +1221,7 @@ impl Shell {
         match self.active_view {
             ShellView::Tasks => self.render_tasks_split(cx).into_any_element(),
             ShellView::Interview => self.sessions.clone().into_any_element(),
+            ShellView::Drafting => self.drafting.clone().into_any_element(),
             ShellView::Settings => self.settings.clone().into_any_element(),
             ShellView::Database => self.database.clone().into_any_element(),
         }
@@ -1738,6 +1800,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let sessions = cx.new(|cx| {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
+                        let agent_for_drafting = agent.clone();
+                        let drafting = cx.new(|cx| {
+                            DraftingView::new(window, cx, agent_for_drafting, fleet.clone())
+                        });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
                         let view = cx.new(|cx| {
@@ -1948,6 +2014,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 Some((*node_id, *obligation_id));
                                             cx.notify();
                                         }
+                                        ObligationsEvent::RewritePreV3 { node_id } => {
+                                            this.pending_rewrite_pre_v3 = Some(*node_id);
+                                            cx.notify();
+                                        }
                                     }
                                 });
                             let _lifecycle_panel_subscription = cx.subscribe(
@@ -2052,6 +2122,45 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     }
                                 },
                             );
+                            let _drafting_subscription = cx.subscribe(
+                                &drafting,
+                                |this: &mut Shell, _, event, cx| match event {
+                                    DraftingViewEvent::ReturnToTaskList => {
+                                        this.pending_return_to_tasks = true;
+                                        cx.notify();
+                                    }
+                                    DraftingViewEvent::ProceedToLifecycle { task_id, lifecycle } => {
+                                        this.pending_open_lifecycle = Some(PendingOpenLifecycle {
+                                            task_id: task_id.clone(),
+                                            lifecycle: lifecycle.clone(),
+                                        });
+                                        this.pending_return_to_tasks = true;
+                                        cx.notify();
+                                    }
+                                    DraftingViewEvent::OpenAgentChat {
+                                        node_id,
+                                        obligation_id,
+                                        config_id,
+                                    } => {
+                                        // Deferred for the same reason as the sessions arm:
+                                        // nested entity leases are still on the stack.
+                                        let node_id = *node_id;
+                                        let obligation_id = *obligation_id;
+                                        let config_id = config_id.clone();
+                                        let weak = cx.weak_entity();
+                                        cx.defer(move |cx| {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                this.open_obligations_agent_chat(
+                                                    node_id,
+                                                    obligation_id,
+                                                    config_id,
+                                                    cx,
+                                                );
+                                            });
+                                        });
+                                    }
+                                },
+                            );
                             let _settings_subscription = cx.subscribe(
                                 &settings,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -2072,6 +2181,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 visual_design_panel,
                                 agent_panel,
                                 sessions,
+                                drafting,
                                 settings,
                                 database,
                                 fleet: fleet.clone(),
@@ -2087,6 +2197,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
+                                pending_rewrite_pre_v3: None,
                                 pending_open_lifecycle: None,
                                 pending_return_to_tasks: false,
                                 pending_open_task_edit: None,
@@ -2117,6 +2228,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _visual_design_panel_subscription,
                                 _agent_panel_subscription,
                                 _sessions_subscription,
+                                _drafting_subscription,
                                 _settings_subscription,
                             };
                             let poll_entity = cx.weak_entity();
@@ -2140,11 +2252,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let fleet_for_close = fleet.clone();
                         let lifecycle_panel_for_close = view.read(cx).lifecycle_panel.clone();
                         let sessions_for_close = view.read(cx).sessions.clone();
+                        let drafting_for_close = view.read(cx).drafting.clone();
                         window.on_window_should_close(cx, move |window, cx| {
                             let running = collect_running_work(
                                 &fleet_for_close,
                                 &lifecycle_panel_for_close,
                                 &sessions_for_close,
+                                &drafting_for_close,
                                 cx,
                             );
                             if running.is_empty() {

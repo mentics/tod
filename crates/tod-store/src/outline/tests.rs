@@ -810,17 +810,24 @@ fn gate_criteria_seed_on_migration() {
     let _store = FleetStore::open(&root).unwrap();
     let conn = schema::open_writer_connection(&db).unwrap();
     let repo = GateRepo::new(&conn);
+    // Drafting v3: `buildable` is the only active design → planning criterion.
     let design_planning = repo.list_for_transition("design", "planning").unwrap();
-    assert_eq!(design_planning.len(), 11);
+    assert_eq!(design_planning.len(), 1);
+    assert_eq!(design_planning[0].slug, crate::drafting::BUILDABLE_CRITERION_SLUG);
+    let superseded = GATE_CRITERIA
+        .iter()
+        .filter(|c| c.from_state == "design" && c.to_state == "planning")
+        .count()
+        - 1;
     let planning_ready = repo.list_for_transition("planning", "ready").unwrap();
-    assert_eq!(planning_ready.len(), 12);
+    assert_eq!(planning_ready.len(), 11);
     let ready_active = repo.list_for_transition("ready", "active").unwrap();
     assert_eq!(ready_active.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
     assert_eq!(verifying_review.len(), 9);
     assert_eq!(
         design_planning.len() + planning_ready.len() + ready_active.len() + verifying_review.len(),
-        GATE_CRITERIA.len()
+        GATE_CRITERIA.len() - superseded
     );
     let _ = fs::remove_dir_all(root);
 }

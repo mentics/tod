@@ -278,7 +278,8 @@ impl WorkspaceView {
                 }
                 ObligationsEvent::DeleteSelectedTask
                 | ObligationsEvent::OpenAgentConfig { .. }
-                | ObligationsEvent::OpenVisualDesign { .. } => {}
+                | ObligationsEvent::OpenVisualDesign { .. }
+                | ObligationsEvent::RewritePreV3 { .. } => {}
             },
         );
 

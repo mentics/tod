@@ -36,13 +36,15 @@ pub enum SessionPurpose {
     QuestionMaker,
     /// An interview answer processor session.
     AnswerProcessor,
+    /// A drafting (v3) drafter session.
+    Drafter,
 }
 
 impl SessionPurpose {
     pub(crate) fn run_kind(self) -> AgentRunKind {
         match self {
             Self::Chat => AgentRunKind::FleetAgent,
-            Self::QuestionMaker => AgentRunKind::QuestionMakerReplenishment,
+            Self::QuestionMaker | Self::Drafter => AgentRunKind::QuestionMakerReplenishment,
             Self::AnswerProcessor => AgentRunKind::AnswerProcessor,
         }
     }

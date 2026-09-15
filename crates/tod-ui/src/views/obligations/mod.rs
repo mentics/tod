@@ -144,6 +144,11 @@ pub enum ObligationsEvent {
         node_id: Uuid,
         obligation_id: Uuid,
     },
+    /// "Rewrite pre-v3" — have the drafter rewrite this node's obligations
+    /// written before drafting v3.
+    RewritePreV3 {
+        node_id: Uuid,
+    },
 }
 
 /// Menu label for one action config in the Ctrl+J picker: platform/mode plus
@@ -193,6 +198,8 @@ pub struct ObligationsView {
     /// Whether the current node has the Agent capability. Cached because
     /// `render` consults it every frame and the lookup hits SQLite.
     node_has_agent: bool,
+    /// Obligations on this node still marked as written before drafting v3.
+    pre_v3_count: usize,
     /// Open action-config picker, shown when the node has more than one.
     agent_menu: Option<Entity<PopupMenu>>,
     _agent_menu_subscription: Option<Subscription>,
@@ -281,6 +288,7 @@ impl ObligationsView {
             pending_live_refresh: false,
             selected_key: None,
             node_has_agent: false,
+            pre_v3_count: 0,
             agent_menu: None,
             _agent_menu_subscription: None,
             _inline_edit_subscription,
@@ -521,6 +529,12 @@ impl ObligationsView {
             .fleet
             .list_obligations_for_node(node_id)
             .unwrap_or_default();
+        let marks = self
+            .fleet
+            .read(|conn| tod_store::drafting::DraftingRepo::new(conn).marks_for_node(node_id))
+            .unwrap_or_default();
+        self.pre_v3_count = marks.values().filter(|m| m.is_pre_v3()).count();
+        self.delegate.set_marks(marks);
         self.rebuild_visible(window, cx);
     }
 
@@ -1865,6 +1879,7 @@ impl Render for ObligationsView {
         let border = theme.border;
         let accent = theme.primary;
         let muted = theme.muted_foreground;
+        let pre_v3_count = self.pre_v3_count;
 
         v_flex()
             .key_context(OBLIGATIONS_CONTEXT)
@@ -1949,6 +1964,20 @@ impl Render for ObligationsView {
                             search = search.suffix(pill);
                         }
                         search
+                    })
+                    .when(pre_v3_count > 0, |row| {
+                        row.child(
+                            Button::new("obligations-rewrite-pre-v3")
+                                .label(format!("Rewrite pre-v3 ({pre_v3_count})"))
+                                .ghost()
+                                .compact()
+                                .tooltip("Have the drafter rewrite obligations written before drafting v3")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(node_id) = this.node_id {
+                                        cx.emit(ObligationsEvent::RewritePreV3 { node_id });
+                                    }
+                                })),
+                        )
                     })
                     .when(self.node_has_agent, |row| {
                         row.child(

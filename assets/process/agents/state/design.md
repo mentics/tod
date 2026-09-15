@@ -4,71 +4,47 @@
 
 ## On entry
 
-1. Read lifecycle state, resolved obligations (including inherited and design-phase), plan steps (if any), open parked interview memory, and the interview history.
+1. Read lifecycle state, resolved obligations (including inherited and design-phase), open choices, the buildable evaluation, and plan steps (if any).
 2. Regenerate the node's summary from its now-settled requirements-phase obligations: `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append — this is the only place a requirements-based summary is written). Ancestor nodes use this to give this node's descendants a short scope statement in place of a full obligations dump.
-3. If design is complete (or explicitly waived) and gate checklist passes → verify upstream conformance and proceed to exit.
+3. If the node is buildable and the gate checklist passes → verify upstream conformance and proceed to exit.
 
 ## Responsibilities
 
-### Design interview
+### The drafting loop
 
-Run a **design interview** via the app unless waived at the `proposed` → `design` gate.
+The node's spec is drafted in the app's **drafting** view (`agent/drafting/drafter.md`). The user dumps, reviews `agent` obligations highest attention first, sends things elsewhere, and answers the rare choice; the drafter researches, drafts the smallest powerful set of obligations, places what belongs on other nodes, and records **buildable**. This session does not run sequential Q&A.
 
-- Probe until design-phase information is sufficient; prefer principles/clusters; do not re-ask settled obligations.
-- Consume parked interview memory tagged `design`; promote it into a design-phase obligation (`tod-cli obligations add --phase design`) or discuss with the human; mark it done when consumed.
-- Probe: costly-to-reverse choices, named **constructions**, open design questions.
-- Do **not** probe for optional metadata (Links, non-goals) unless the human volunteers.
-- Record waivers in interview memory.
-
-Do not conduct sequential Q&A in the parent session — use question maker + answer-processor invocations.
+- **Goal:** the smallest set of obligations that gets the node built correctly, with the least human attention. An obligation is written only where a competent implementer following the codebase would otherwise get it wrong.
+- **Rules climb:** a constraint lives on the highest node where it holds.
+- **Provenance:** drafted obligations are `agent` and in effect. Nothing but the user touching one makes it `user`; never ask for confirmation.
+- **References:** obligations reference other nodes inline as `[[slug]]` instead of restating them.
 
 ### Research and spikes
 
 Resolve **design** questions here—not in `planning` or `active`.
 
 - Run spikes in subagents/worktrees when needed.
-- Record useful research in durable notes the app can attach to the node or repo.
-
-Deferred spikes need an explicit **decision tree** (outcome → action) recorded in a design-phase obligation or interview memory.
+- Deferred spikes need an explicit **decision tree** (outcome → action) recorded in a design-phase obligation.
 
 ### Visual design
 
-When the node has **user-visible UI**, appearance and layout need human Accept before leaving design (unless waived).
-
-- Hand off to the **visual design** side tool when appropriate.
-- Link accepted packages from the relevant design-phase obligation's body (**required** vs **guideline**).
-
-### Design obligations
-
-Produce, update, or **deliberately omit** design-phase obligations on the node (`tod-cli obligations add --kind requirement|constraint`, phase is set automatically from the session):
-
-- Omit when requirements-phase obligations + plan suffice (note the waiver in interview memory).
-- One decision per obligation: intention and constructions in the body; external references labeled **required** vs **guideline**; never restate a requirements-phase obligation that already covers it — narrow or add detail instead, and edit an existing obligation in place when a decision changes it rather than duplicating it.
+Visual design is part of the drafting loop: for anything the user will see, a mockup is drawn before anything is asked, saved with `tod-cli visual-design save`, and one requirement "matches the mockup" replaces the layout obligations it covers.
 
 **Implementation interview belongs in `planning`, not here.**
 
-### Reconcile
-
-Before exit, reconcile requirements-phase and design-phase obligations for consistency.
-
 ## Forward gate rules (`design` → `planning`)
 
-Apply these prose rules in addition to checklist criteria the app sends for this transition:
+The gate is **buildable** only: no choice is open, and the drafter judged that a competent implementer, given the hierarchical context, the node's obligations, the nodes they reference, the mockups, and the codebase, would build it correctly. Any dump, edit, or move touching the node resets it to pending.
 
-- Node obligations include measurable requirements (statement and/or non-redundant success criteria); constraints are measurable and verifiable.
-- Design-phase obligations conform to applicable requirements-phase obligations (node + ancestors) and there are **no open design questions**; alternatively design is **explicitly skipped**.
-- **Research** for design questions has been done in-phase (and contributed to ancestor obligations where useful).
-- Needed **spikes** are complete, **or** any deferred spikes are enumerated with an explicit decision tree (outcome → action).
-- Implementation interview belongs in `planning`, not here.
-- **Parked items (soft):** review open parked interview memory; nothing left that would be **bad not to cover in design** before leaving (design-parked items must be consumed or explicitly deferred with a decision tree). Items parked for planning may remain.
-- **Obligation dedupe (blocking):** Re-check node obligations and any new cross-cutting rules introduced by design-phase obligations against ancestor obligations and sibling nodes (same rules as `proposed` → `design`). Resolve duplicates/conflicts with the human before advancing; elevate when the concern is tree-wide.
+- Confirming `agent` obligations is **never** required, and passing the gate leaves every obligation's provenance as it was.
+- Obligation references resolve (`tod-cli obligations check-refs --node <UUID>` prints `(none)`).
 
 Living checklist items for this transition are stored in the app database; return `gate_results` for each when gate-checking.
 
 ## Exit
 
-When the `design` → `planning` gate passes (including **obligation dedupe**), return `forward_lifecycle: planning` (app applies).
+When the `design` → `planning` gate passes, return `forward_lifecycle: planning` (app applies).
 
 ## Blockers
 
-Unresolved design questions, unenumerated deferred spikes, or upstream conflicts → `blocked` / stay in `design`.
+Open choices, a failing buildable evaluation the drafter can't resolve, unenumerated deferred spikes, or upstream conflicts → `blocked` / stay in `design`.

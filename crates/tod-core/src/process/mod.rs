@@ -60,6 +60,18 @@ pub fn interview_phase_for_lifecycle(lifecycle: &str) -> Option<&'static str> {
     }
 }
 
+/// What the view that writes a node's spec is called in `lifecycle`: capture
+/// in `proposed`, the drafting loop in `design`, the (v2) interview in
+/// `planning`. `None` where no such view applies.
+pub fn spec_view_label(lifecycle: &str) -> Option<&'static str> {
+    match lifecycle {
+        "proposed" => Some("Capture"),
+        "design" => Some("Drafting"),
+        "planning" => Some("Interview"),
+        _ => None,
+    }
+}
+
 /// Map interview phase → lifecycle state when the outline DB has no row yet.
 /// Unknown phases default to `proposed`.
 pub fn lifecycle_for_interview_phase(phase: &str) -> &'static str {

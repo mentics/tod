@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 24;
+pub const CURRENT_USER_VERSION: i32 = 25;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -211,11 +211,148 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v23_to_v24(conn)?;
         conn.pragma_update(None, "user_version", 24)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 25 {
+        migrate_v24_to_v25(conn)?;
+        conn.pragma_update(None, "user_version", 25)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// Drafting (v3): obligation provenance and attention, the dump / choice /
+/// change-summary record, and the `drafter` agent-session role. Every step
+/// checks before it acts, so the migration is safe to run again under a
+/// different version number.
+fn migrate_v24_to_v25(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        Ok(conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))?
+            .exists([column])?)
+    };
+    let has_provenance = has_column("node_obligations", "provenance")?;
+    let has_attention = has_column("node_obligations", "attention")?;
+    let has_attention_why = has_column("node_obligations", "attention_why")?;
+    let sessions_sql: String = conn.query_row(
+        "SELECT COALESCE((SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'interview_agent_sessions'), '')",
+        [],
+        |row| row.get(0),
+    )?;
+    let rebuild_sessions = !sessions_sql.is_empty() && !sessions_sql.contains("'drafter'");
+
+    let tx = conn.unchecked_transaction()?;
+    if !has_provenance {
+        tx.execute_batch(
+            "ALTER TABLE node_obligations ADD COLUMN provenance TEXT NOT NULL DEFAULT 'agent'
+                CHECK (provenance IN ('agent', 'user'));",
+        )?;
+    }
+    if !has_attention {
+        tx.execute_batch(
+            "ALTER TABLE node_obligations ADD COLUMN attention TEXT
+                CHECK (attention IN ('low', 'medium', 'high'));",
+        )?;
+    }
+    if !has_attention_why {
+        tx.execute_batch("ALTER TABLE node_obligations ADD COLUMN attention_why TEXT;")?;
+    }
+    if !has_provenance {
+        tx.execute(
+            "UPDATE node_obligations SET attention = 'medium', attention_why = ?1
+             WHERE provenance = 'agent' AND attention IS NULL",
+            [crate::drafting::PRE_V3_ATTENTION_WHY],
+        )?;
+    }
+    tx.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS drafting_dumps (
+            id              BLOB PRIMARY KEY NOT NULL,
+            seq             INTEGER NOT NULL UNIQUE,
+            target_node_id  BLOB REFERENCES nodes(id) ON DELETE SET NULL,
+            body            TEXT NOT NULL,
+            routing         TEXT,
+            created_at      INTEGER NOT NULL,
+            routed_at       INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_drafting_dumps_target
+            ON drafting_dumps(target_node_id, routed_at);
+
+        CREATE TABLE IF NOT EXISTS drafting_choices (
+            id            BLOB PRIMARY KEY NOT NULL,
+            node_id       BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            seq           INTEGER NOT NULL,
+            phase         TEXT NOT NULL,
+            context       TEXT,
+            question      TEXT NOT NULL,
+            options       TEXT NOT NULL,
+            status        TEXT NOT NULL CHECK (status IN ('open', 'answered', 'delegated', 'withdrawn')),
+            answer        INTEGER,
+            created_at    INTEGER NOT NULL,
+            answered_at   INTEGER,
+            processed_at  INTEGER,
+            UNIQUE (node_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS idx_drafting_choices_node
+            ON drafting_choices(node_id, status, seq);
+
+        CREATE TABLE IF NOT EXISTS drafting_summaries (
+            id          BLOB PRIMARY KEY NOT NULL,
+            node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            body        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            UNIQUE (node_id, seq)
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_drafting_buildable_reset AFTER INSERT ON interview_changes
+        WHEN NEW.entity = 'obligation' AND (NEW.fields IS NULL OR NEW.fields != 'provenance')
+        BEGIN
+            UPDATE node_gate_evaluations
+               SET outcome = 'pending', detail = NULL,
+                   evaluated_at = CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)
+             WHERE node_id = NEW.node_id AND outcome != 'pending'
+               AND criterion_id = (SELECT id FROM gate_criteria WHERE slug = 'design-planning.buildable');
+        END;
+        ",
+    )?;
+    if rebuild_sessions {
+        tx.execute_batch(
+            "
+            CREATE TABLE interview_agent_sessions_v25 (
+                id                    BLOB PRIMARY KEY NOT NULL,
+                node_id               BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                interview_session_id  BLOB REFERENCES interview_sessions(id) ON DELETE SET NULL,
+                phase                 TEXT NOT NULL,
+                role                  TEXT NOT NULL CHECK (role IN ('question-maker', 'answer-processor', 'drafter')),
+                lane                  INTEGER NOT NULL DEFAULT 0,
+                agent_session_id      TEXT,
+                synced_rev            INTEGER NOT NULL,
+                est_tokens            INTEGER NOT NULL DEFAULT 0,
+                snapshot_tokens       INTEGER NOT NULL DEFAULT 0,
+                turns                 INTEGER NOT NULL DEFAULT 0,
+                state                 TEXT NOT NULL CHECK (state IN ('live', 'retired')),
+                created_at            INTEGER NOT NULL,
+                last_turn_at          INTEGER
+            );
+            INSERT INTO interview_agent_sessions_v25
+                SELECT id, node_id, interview_session_id, phase, role, lane, agent_session_id,
+                       synced_rev, est_tokens, snapshot_tokens, turns, state, created_at, last_turn_at
+                FROM interview_agent_sessions;
+            DROP INDEX IF EXISTS idx_interview_agent_sessions_key;
+            DROP TABLE interview_agent_sessions;
+            ALTER TABLE interview_agent_sessions_v25 RENAME TO interview_agent_sessions;
+            CREATE INDEX IF NOT EXISTS idx_interview_agent_sessions_key
+                ON interview_agent_sessions(node_id, phase, role, state);
+            ",
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

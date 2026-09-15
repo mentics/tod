@@ -131,6 +131,8 @@ pub struct ObligationListDelegate {
     editing_id: Option<String>,
     inline_edit_input: Option<Entity<InputState>>,
     section_edit_input: Option<Entity<InputState>>,
+    /// Provenance by obligation id; `agent` rows get a subtle marker.
+    marks: std::collections::HashMap<uuid::Uuid, tod_store::drafting::ObligationMark>,
 }
 
 impl ObligationListDelegate {
@@ -147,7 +149,15 @@ impl ObligationListDelegate {
             editing_id: None,
             inline_edit_input: None,
             section_edit_input: None,
+            marks: std::collections::HashMap::new(),
         }
+    }
+
+    pub fn set_marks(
+        &mut self,
+        marks: std::collections::HashMap<uuid::Uuid, tod_store::drafting::ObligationMark>,
+    ) {
+        self.marks = marks;
     }
 
     pub fn set_rows(&mut self, rows: Vec<ObligationRow>) {
@@ -420,6 +430,7 @@ impl ObligationListDelegate {
                 } else {
                     theme.foreground
                 };
+                let marker_color = theme.muted_foreground;
                 let select_sink = sink.clone();
                 let select_view = view.clone();
                 let mut row_el = h_flex()
@@ -488,6 +499,16 @@ impl ObligationListDelegate {
                             })
                             .child(obligation_body(row_ix, &body, color, window, cx)),
                     );
+                    if self.marks.get(&id).is_some_and(|m| m.is_agent()) {
+                        row_el = row_el.child(
+                            div()
+                                .text_xs()
+                                .text_color(marker_color)
+                                .flex_shrink_0()
+                                .pt_0p5()
+                                .child("agent"),
+                        );
+                    }
                     if obligation.phase == PHASE_DESIGN {
                         let has_design = obligation.visual_design_path.is_some();
                         let design_sink = self.action_sink.clone();

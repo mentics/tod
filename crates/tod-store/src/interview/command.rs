@@ -125,6 +125,56 @@ pub enum InterviewCommand {
         #[serde(default)]
         target: Option<Uuid>,
     },
+
+    // ── Drafting (v3) ───────────────────────────────────────────────────
+    /// Something the user said, aimed at a node (or nowhere in particular).
+    AddDump {
+        #[serde(default)]
+        node_id: Option<Uuid>,
+        body: String,
+    },
+    AddChoice {
+        node_id: Uuid,
+        #[serde(default)]
+        context: Option<String>,
+        question: String,
+        options: Vec<crate::drafting::ChoiceOption>,
+    },
+    /// `option: None` delegates the call back to the drafter.
+    AnswerChoice {
+        node_id: Uuid,
+        seq: i64,
+        #[serde(default)]
+        option: Option<i64>,
+    },
+    WithdrawChoice {
+        node_id: Uuid,
+        seq: i64,
+    },
+    ConfirmObligation {
+        obligation_id: Uuid,
+    },
+    SetAttention {
+        obligation_id: Uuid,
+        attention: String,
+        #[serde(default)]
+        why: Option<String>,
+    },
+    SetBuildable {
+        node_id: Uuid,
+        outcome: String,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    RecordDraftingTurn {
+        node_id: Uuid,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        dump_seqs: Vec<i64>,
+        #[serde(default)]
+        choice_seqs: Vec<i64>,
+    },
 }
 
 /// Execute `command` as `actor` (`user`, or an interview agent session id).
@@ -576,6 +626,9 @@ pub fn execute(
                     Ok(format!("{} was deleted", short_id(*target)))
                 })?;
             }
+            if actor != ACTOR_USER {
+                crate::drafting::check_references(conn, mutation)?;
+            }
             // An agent-driven obligation write always uses its own session's
             // phase — it cannot claim a different one via the CLI arg.
             let mut owned;
@@ -593,6 +646,54 @@ pub fn execute(
             mutation.execute(conn, media_root)?;
             Ok(json!({}))
         }
+
+        InterviewCommand::AddDump { node_id, body } => crate::drafting::add_dump(conn, *node_id, body),
+        InterviewCommand::AddChoice {
+            node_id,
+            context,
+            question,
+            options,
+        } => crate::drafting::add_choice(
+            conn,
+            agent.as_ref(),
+            *node_id,
+            context.as_deref(),
+            question,
+            options,
+        ),
+        InterviewCommand::AnswerChoice {
+            node_id,
+            seq,
+            option,
+        } => crate::drafting::answer_choice(conn, media_root, *node_id, *seq, *option),
+        InterviewCommand::WithdrawChoice { node_id, seq } => {
+            crate::drafting::withdraw_choice(conn, *node_id, *seq)
+        }
+        InterviewCommand::ConfirmObligation { obligation_id } => {
+            crate::drafting::confirm_obligation(conn, actor, *obligation_id)
+        }
+        InterviewCommand::SetAttention {
+            obligation_id,
+            attention,
+            why,
+        } => crate::drafting::set_attention(conn, *obligation_id, attention, why.as_deref()),
+        InterviewCommand::SetBuildable {
+            node_id,
+            outcome,
+            detail,
+        } => crate::drafting::set_buildable(conn, actor, *node_id, outcome, detail.as_deref()),
+        InterviewCommand::RecordDraftingTurn {
+            node_id,
+            summary,
+            dump_seqs,
+            choice_seqs,
+        } => crate::drafting::record_drafting_turn(
+            conn,
+            *node_id,
+            summary.as_deref(),
+            dump_seqs,
+            choice_seqs,
+        ),
     }
 }
 

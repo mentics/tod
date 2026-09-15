@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod drafting;
 mod interview;
 mod ui;
 mod views;

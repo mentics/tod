@@ -31,11 +31,16 @@ impl InterviewClient {
 
     /// Acting as the interview agent session named in the environment, or the user.
     pub fn from_env(data_root: impl Into<PathBuf>) -> Self {
+        Self::from_env_or(data_root, ACTOR_USER)
+    }
+
+    /// Acting as the interview agent session named in the environment, or `fallback`.
+    pub fn from_env_or(data_root: impl Into<PathBuf>, fallback: &str) -> Self {
         let actor = std::env::var(ACTOR_ENV)
             .ok()
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty())
-            .unwrap_or_else(|| ACTOR_USER.to_string());
+            .unwrap_or_else(|| fallback.to_string());
         Self::new(data_root, actor)
     }
 

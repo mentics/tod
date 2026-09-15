@@ -204,7 +204,7 @@ impl InterviewDriver {
                 self.last_error = Some(message.clone());
             }
             events.push(match turn.role {
-                Role::QuestionMaker => DriverEvent::QuestionMakerFinished { error },
+                Role::QuestionMaker | Role::Drafter => DriverEvent::QuestionMakerFinished { error },
                 Role::AnswerProcessor => DriverEvent::AnswersFinished {
                     questions: turn.questions.clone(),
                     error,
@@ -254,7 +254,7 @@ impl InterviewDriver {
         })?;
 
         let failed = match turn.role {
-            Role::QuestionMaker => {
+            Role::QuestionMaker | Role::Drafter => {
                 if let Some(message) = run_error {
                     self.question_maker_backoff.fail();
                     if self.question_maker_backoff.failures >= MAX_QUESTION_MAKER_FAILURES {
@@ -306,7 +306,7 @@ impl InterviewDriver {
 
         // A session whose turns keep failing may be broken; start the next one fresh.
         let backoff = match turn.role {
-            Role::QuestionMaker => &self.question_maker_backoff,
+            Role::QuestionMaker | Role::Drafter => &self.question_maker_backoff,
             Role::AnswerProcessor => &self.answer_backoff,
         };
         if failed.is_some() && backoff.failures >= 2 {
@@ -635,7 +635,7 @@ impl InterviewDriver {
                     Ok((rev, state))
                 })?;
                 let prefix = match role {
-                    Role::QuestionMaker => &self.config.question_maker_prefix,
+                    Role::QuestionMaker | Role::Drafter => &self.config.question_maker_prefix,
                     Role::AnswerProcessor => &self.config.answer_processor_prefix,
                 };
                 // Byte-stable docs first so the provider can cache them across sessions.
@@ -659,6 +659,7 @@ impl InterviewDriver {
                     match role {
                         Role::QuestionMaker => "question maker",
                         Role::AnswerProcessor => "answer processor",
+                        Role::Drafter => "drafter",
                     },
                     self.phase
                 );
@@ -687,6 +688,7 @@ impl InterviewDriver {
             purpose: match role {
                 Role::QuestionMaker => SessionPurpose::QuestionMaker,
                 Role::AnswerProcessor => SessionPurpose::AnswerProcessor,
+                Role::Drafter => SessionPurpose::Drafter,
             },
             env: vec![(ACTOR_ENV.to_string(), session_id.to_string())],
         })?;

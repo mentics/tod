@@ -1498,7 +1498,12 @@ impl Render for LifecyclePanelView {
                     })
                     .child(
                         Button::new("lifecycle-panel-open-interview")
-                            .label("Open interview")
+                            .label(format!(
+                                "Open {}",
+                                tod_core::process::spec_view_label(&self.lifecycle)
+                                    .unwrap_or("Interview")
+                                    .to_lowercase()
+                            ))
                             .ghost()
                             .w_full()
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1686,7 +1691,10 @@ impl Render for LifecyclePanelView {
                         if action == GateAction::Interview {
                             buttons = buttons.child(
                                 Button::new(("lifecycle-panel-criterion-interview", index))
-                                    .label("Interview")
+                                    .label(
+                                        tod_core::process::spec_view_label(&self.lifecycle)
+                                            .unwrap_or("Interview"),
+                                    )
                                     .ghost()
                                     .compact()
                                     .w_full()
