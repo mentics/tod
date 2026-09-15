@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_agent::{SessionOpening, SessionTurn};
-use tod_store::fleet::repos::transcript::TranscriptTurn;
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::{AgentRole, TodSettings, parse_platform, platform_storage};
 
@@ -48,9 +47,18 @@ enum InteractiveAgentStop {
 
 struct PendingRun {
     run_id: Option<RunId>,
-    prompt_id: String,
-    response_id: String,
     user_text: String,
+}
+
+/// Prior-session history shown above the live conversation. Populated from
+/// the run's cached transcript, or fetched once in the background (via ACP
+/// resume/load) when a resumable session has none cached yet.
+enum TranscriptHistory {
+    /// No prior agent-side session — nothing to load.
+    NotNeeded,
+    Loading,
+    Loaded(String),
+    FetchFailed(String),
 }
 
 pub struct InteractiveAgentView {
@@ -67,6 +75,9 @@ pub struct InteractiveAgentView {
     window_control: InteractiveAgentWindowControl,
     prompt_input: Entity<TextareaState>,
     conversation: Vec<(String, String)>,
+    /// Prior-session history, distinct from `conversation` (this window's own
+    /// live turns) — see [`TranscriptHistory`].
+    history: TranscriptHistory,
     pending: Option<PendingRun>,
     /// Latest human-readable activity reported by the agent for the pending
     /// run (a tool call, a permission request, …), shown in place of the
@@ -116,11 +127,9 @@ impl InteractiveAgentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let conversation = fleet
-            .list_transcript_for_agent(&session_run_id)
-            .ok()
-            .map(|turns| conversation_from_transcript(&turns))
-            .unwrap_or_default();
+        // This window's own live turns start empty every time it opens —
+        // prior-session history is loaded separately into `history` below.
+        let conversation = Vec::new();
 
         // The run records the platform/model/effort it was started with; a run
         // without that record follows the "Chat with agent" settings.
@@ -131,6 +140,7 @@ impl InteractiveAgentView {
             .map(|node| node.title)
             .unwrap_or_default();
         let run = fleet.get_run(&session_run_id).ok().flatten();
+        let cached_transcript = run.as_ref().and_then(|run| run.cached_transcript.clone());
         let launch = run
             .as_ref()
             .and_then(|run| run.launch_options())
@@ -140,6 +150,12 @@ impl InteractiveAgentView {
             .and_then(|run| run.session_name.clone())
             .unwrap_or_else(|| format!("Session {}", run.as_ref().map_or(0, |run| run.run_number)));
         let agent_session_id = run.and_then(|run| run.agent_session_id);
+
+        let history = match (&cached_transcript, &agent_session_id) {
+            (Some(text), _) => TranscriptHistory::Loaded(text.clone()),
+            (None, Some(_)) => TranscriptHistory::Loading,
+            (None, None) => TranscriptHistory::NotNeeded,
+        };
 
         let prompt_input = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -159,13 +175,26 @@ impl InteractiveAgentView {
             }
         });
 
-        // A session that already has turns was opened with its context, and its
-        // agent session still holds it.
-        let context_prefix = if conversation.is_empty() {
+        // A resumed session was opened with its context before, and its
+        // agent-side session still holds it.
+        let context_prefix = if agent_session_id.is_none() {
             initial_context
         } else {
             None
         };
+
+        if matches!(history, TranscriptHistory::Loading) {
+            spawn_history_fetch(
+                fleet.clone(),
+                agent.clone(),
+                session_run_id.clone(),
+                launch.platform,
+                workspace_cwd.clone(),
+                agent_session_id.clone().expect("Loading implies a session id"),
+                cx,
+            );
+        }
+
         let view = Self {
             node_id,
             node_title,
@@ -180,6 +209,7 @@ impl InteractiveAgentView {
             window_control,
             prompt_input,
             conversation,
+            history,
             pending: None,
             activity: None,
             status_line: "Ready".into(),
@@ -352,8 +382,6 @@ impl InteractiveAgentView {
             input.set_value("", window, cx);
         });
 
-        let prompt_id = uuid::Uuid::new_v4().to_string();
-        let response_id = uuid::Uuid::new_v4().to_string();
         let session_run_id = self.session_run_id.clone();
 
         self.error_banner = None;
@@ -361,23 +389,8 @@ impl InteractiveAgentView {
         self.activity = None;
         self.pending = Some(PendingRun {
             run_id: None,
-            prompt_id: prompt_id.clone(),
-            response_id: response_id.clone(),
             user_text: text.clone(),
         });
-
-        if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
-            id: prompt_id.clone(),
-            run_id: session_run_id.clone(),
-            content: text.clone(),
-        }) {
-            self.fail_submit(format!("Fleet: {err}"), cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.fail_submit(format!("Fleet: {err}"), cx);
-            return;
-        }
 
         let provider_run = match self.agent.lock() {
             Ok(mut provider) => {
@@ -430,12 +443,7 @@ impl InteractiveAgentView {
         let agent_session_id = agent.session_id(&self.session_run_id);
         drop(agent);
 
-        let PendingRun {
-            prompt_id,
-            response_id,
-            user_text,
-            ..
-        } = match self.pending.take() {
+        let PendingRun { user_text, .. } = match self.pending.take() {
             Some(p) => p,
             None => return,
         };
@@ -448,8 +456,6 @@ impl InteractiveAgentView {
                 self.activity = activity;
                 self.pending = Some(PendingRun {
                     run_id: Some(run_id),
-                    prompt_id,
-                    response_id,
                     user_text,
                 });
             }
@@ -461,8 +467,6 @@ impl InteractiveAgentView {
                 );
                 self.pending = Some(PendingRun {
                     run_id: Some(run_id),
-                    prompt_id,
-                    response_id,
                     user_text,
                 });
             }
@@ -470,16 +474,6 @@ impl InteractiveAgentView {
                 let assistant = response.unwrap_or_default();
                 self.conversation
                     .push((user_text.clone(), assistant.clone()));
-                if let Err(err) = self.fleet.enqueue(FleetMutation::CompleteResponse {
-                    response_id,
-                    run_id: self.session_run_id.clone(),
-                    content: assistant,
-                    prompt_id,
-                }) {
-                    self.error_banner = Some(format!("Fleet: {err}"));
-                } else {
-                    let _ = self.fleet.writer().flush();
-                }
                 self.status_line = "Agent replied".into();
                 self.error_banner = None;
                 self.activity = None;
@@ -649,28 +643,45 @@ fn render_agent_thinking_panel(
         )
 }
 
-fn conversation_from_transcript(turns: &[TranscriptTurn]) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    let mut i = 0;
-    while i < turns.len() {
-        if turns[i].kind == "prompt" {
-            let user = turns[i].content.clone();
-            let assistant = turns
-                .get(i + 1)
-                .filter(|turn| turn.kind == "response")
-                .map(|turn| turn.content.clone())
-                .unwrap_or_default();
-            if !assistant.is_empty() {
-                pairs.push((user, assistant));
-                i += 2;
-            } else {
-                i += 1;
-            }
-        } else {
-            i += 1;
+/// Fetch a resumed session's full transcript in the background (no prompt
+/// sent, so it never blocks the window) and cache it once it lands.
+fn spawn_history_fetch(
+    fleet: Arc<FleetStore>,
+    agent: SharedAgent,
+    run_id: String,
+    platform: tod_store::AgentPlatform,
+    cwd: PathBuf,
+    agent_session_id: String,
+    cx: &mut Context<InteractiveAgentView>,
+) {
+    let entity = cx.weak_entity();
+    cx.spawn(async move |_, cx| {
+        let fetch = std::thread::spawn(move || {
+            let agent = agent.lock().unwrap_or_else(|e| e.into_inner());
+            agent.fetch_full_transcript(platform, &cwd, &agent_session_id)
+        })
+        .join();
+        let result = match fetch {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("transcript fetch thread panicked".into()),
+        };
+        if let Ok(text) = &result {
+            let _ = fleet.enqueue(FleetMutation::CacheAgentRunTranscript {
+                run_id,
+                transcript: text.clone(),
+                fingerprint: None,
+            });
         }
-    }
-    pairs
+        let _ = entity.update(cx, |this, cx| {
+            this.history = match result {
+                Ok(text) => TranscriptHistory::Loaded(text),
+                Err(err) => TranscriptHistory::FetchFailed(err),
+            };
+            cx.notify();
+        });
+    })
+    .detach();
 }
 
 impl Focusable for InteractiveAgentView {
@@ -785,6 +796,68 @@ impl Render for InteractiveAgentView {
                 .children(body)
                 .into_any_element()
         });
+
+        let history_panel = match &self.history {
+            TranscriptHistory::NotNeeded => None,
+            TranscriptHistory::Loading => Some(
+                h_flex()
+                    .id("interactive-agent-history-loading")
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel_bg)
+                    .child(gpui_component::spinner::Spinner::new())
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Loading prior transcript…"),
+                    )
+                    .into_any_element(),
+            ),
+            TranscriptHistory::Loaded(text) => Some(
+                v_flex()
+                    .id("interactive-agent-history")
+                    .gap_2()
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel_bg)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_semibold()
+                            .text_color(muted)
+                            .child("Prior session"),
+                    )
+                    .child(crate::ui::selectable_text::selectable_text(
+                        "interactive-agent-history-text",
+                        text.clone(),
+                        window,
+                        cx,
+                    ))
+                    .into_any_element(),
+            ),
+            TranscriptHistory::FetchFailed(err) => Some(
+                div()
+                    .id("interactive-agent-history-error")
+                    .p_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(border)
+                    .bg(panel_bg)
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(format!("Couldn't load prior transcript: {err}")),
+                    )
+                    .into_any_element(),
+            ),
+        };
 
         div()
             .key_context(INTERACTIVE_AGENT_CONTEXT)
@@ -942,6 +1015,7 @@ impl Render for InteractiveAgentView {
                             .v_flex()
                             .gap_3()
                             .children(context_panel)
+                            .children(history_panel)
                             .when(show_empty, |el| {
                                 el.child(
                                     div()
