@@ -7,8 +7,8 @@
 //! with the text directly and only needs `tod-cli` for what it was not given.
 
 use crate::gate::PlanStepWithLinks;
-use crate::interview::context::{obligation_line, plan_step_line};
 use crate::media::{MediaPaths, load_static_context};
+use crate::node_context::{obligation_line, plan_step_line};
 use anyhow::Result;
 use std::path::Path;
 use tod_store::outline::NodeObligation;
@@ -134,14 +134,10 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
 /// before a node can reach `active` at all).
 pub const IMPLEMENT_CONTEXT_KEY: &str = "active/implement";
 
-/// One node's own obligations, paired with its title, for rendering the full
-/// ancestor-to-node obligation hierarchy an implementation session gets
-/// up front.
-#[derive(Debug, Clone)]
-pub struct ImplementNodeObligations {
-    pub node_title: String,
-    pub obligations: Vec<NodeObligation>,
-}
+/// The user-visible message auto-submitted on an implementation session's
+/// first turn — the Implement button means "go implement this now", so the
+/// session shouldn't sit waiting on the user to type that themselves.
+pub const IMPLEMENT_START_MESSAGE: &str = "Go implement this.";
 
 /// Everything an implementation session's first-turn context describes.
 #[derive(Debug, Clone)]
@@ -150,9 +146,17 @@ pub struct ImplementRequest<'a> {
     pub node: NodeSelection,
     /// This node's plan steps with their dependency and `--satisfies` links.
     pub plan_steps: Vec<PlanStepWithLinks>,
-    /// Obligations for this node and every ancestor, most general (root)
-    /// first, ending with the node itself.
-    pub obligation_hierarchy: Vec<ImplementNodeObligations>,
+    /// This node's own obligations (requirements/constraints) in full — they
+    /// define what "done" means for this session. Not ancestors' — those
+    /// come in `ancestor_context` instead.
+    pub obligations: Vec<NodeObligation>,
+    /// Rendered ancestor context — build with
+    /// `tod_core::node_context::render_inherited_context`, the one place
+    /// this policy (each ancestor's title, generated summary, and
+    /// constraints, never its full requirements) is implemented. Callers
+    /// build this from a live connection since `ImplementRequest` itself
+    /// carries no DB handle.
+    pub ancestor_context: String,
 }
 
 /// Build the full implementation-session first message: static layers (app.md
@@ -202,26 +206,23 @@ fn render_implement_dynamic(request: &ImplementRequest<'_>) -> String {
         }
     }
 
+    out.push_str("\n## Obligations\n\n");
     out.push_str(
-        "\n## Obligation hierarchy\n\n\
-         From the root of the tree down to this node, most general first:\n\n",
+        "This node's own — they define what \"done\" means for this \
+         session, not the summarized ancestor context below.\n\n",
     );
-    if request.obligation_hierarchy.is_empty() {
+    if request.obligations.is_empty() {
         out.push_str("(none)\n");
     } else {
-        for level in &request.obligation_hierarchy {
-            out.push_str(&format!("### {}\n\n", level.node_title.trim()));
-            if level.obligations.is_empty() {
-                out.push_str("(none)\n\n");
-                continue;
-            }
-            for o in &level.obligations {
-                out.push_str("- ");
-                out.push_str(&obligation_line(o));
-                out.push('\n');
-            }
+        for o in &request.obligations {
+            out.push_str("- ");
+            out.push_str(&obligation_line(o));
             out.push('\n');
         }
+    }
+
+    if !request.ancestor_context.is_empty() {
+        out.push_str(&request.ancestor_context);
     }
 
     out

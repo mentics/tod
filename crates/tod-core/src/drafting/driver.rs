@@ -996,7 +996,7 @@ mod tests {
         let inherited = |fx: &Fixture| {
             fx.fleet
                 .read(|conn| {
-                    crate::interview::context::render_inherited_context(
+                    crate::node_context::render_inherited_context(
                         conn,
                         &tod_store::outline::repos::NodeRepo::new(conn),
                         child,

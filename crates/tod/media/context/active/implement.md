@@ -12,11 +12,12 @@ almost every turn:
 
 - **The plan** for this node — its plan steps, in order, with their
   dependency and `--satisfies` links to obligations.
-- **The full obligation hierarchy for this node** — this node's own
-  requirements and constraints, plus every ancestor's, most general first.
-  Constraints bound what you are allowed to change; requirements are what
-  "done" means. Both were baked in directly rather than fetched, since
-  reading them is the common case for an implementation turn.
+- **The obligation hierarchy for this node** — this node's own requirements
+  and constraints in full (they define what "done" means for this session),
+  plus each ancestor's generated summary and constraints only, most general
+  first. An ancestor's requirements aren't inlined: its scope is settled and
+  out of bounds here. Constraints bound what you are allowed to change
+  anywhere in the tree, so those still come through in full at every level.
 
 Treat both blocks as a snapshot taken when this session started. They do not
 update automatically as you work.

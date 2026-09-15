@@ -6,11 +6,12 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fmt::Write as _;
 use std::path::Path;
+use crate::node_context::{node_title, obligation_line, one_line, plan_step_line, render_inherited_context};
 use tod_store::interview::*;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, EXTRA_CONTENT_SUMMARY, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation,
-    PlanStep, ancestor_chain, phase_visible, resolve_obligations, uuid_to_blob,
+    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ancestor_chain,
+    phase_visible, uuid_to_blob,
 };
 use uuid::Uuid;
 
@@ -38,156 +39,12 @@ fn phase_content_types(_phase: &str) -> &'static [&'static str] {
     &["goal"]
 }
 
-pub(crate) fn plan_step_line(step: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
-    let deps = if deps.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " deps=[{}]",
-            deps.iter().map(|id| short_id(*id)).collect::<Vec<_>>().join(",")
-        )
-    };
-    let satisfies = if obligations.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " satisfies=[{}]",
-            obligations
-                .iter()
-                .map(|id| short_id(*id))
-                .collect::<Vec<_>>()
-                .join(",")
-        )
-    };
-    format!(
-        "[{}] {}{deps}{satisfies}: {}",
-        short_id(step.id),
-        step.status,
-        one_line(&step.body)
-    )
-}
-
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn indent(text: &str, prefix: &str) -> String {
     text.trim()
         .lines()
         .map(|line| format!("{prefix}{line}"))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-pub(crate) fn obligation_line(o: &NodeObligation) -> String {
-    let section = o
-        .section
-        .as_deref()
-        .map(|s| format!(" ({s})"))
-        .unwrap_or_default();
-    let visual_design = if o.visual_design_path.is_some() {
-        " [visual design attached]"
-    } else {
-        ""
-    };
-    format!(
-        "[{}] {}{section}: {}{visual_design}",
-        short_id(o.id),
-        o.kind,
-        one_line(&o.body)
-    )
-}
-
-fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {
-    if id.is_nil() {
-        return "global".into();
-    }
-    nodes
-        .get(id)
-        .ok()
-        .flatten()
-        .map(|n| n.title)
-        .unwrap_or_else(|| short_id(id))
-}
-
-/// Renders `node_id`'s ancestor (and global) obligations for interview and
-/// gate-check context. Each ancestor contributes its title, its generated
-/// summary (`EXTRA_CONTENT_SUMMARY`), and its constraint-kind obligations in
-/// full. Its requirements are never listed: the summary stands in for them,
-/// and a deep tree would otherwise put hundreds into every context. The
-/// drafting driver writes missing summaries before a turn
-/// (`crate::drafting::summary`); anywhere else, an ancestor still without
-/// one gets a pointer to `tod-cli` instead. Global (no owning node)
-/// obligations always show in full; there is nothing to summarize about
-/// them.
-pub fn render_inherited_context(
-    conn: &Connection,
-    nodes: &NodeRepo<'_>,
-    node_id: Uuid,
-    max_phase: Option<&str>,
-) -> Result<String> {
-    let inherited: Vec<_> = resolve_obligations(conn, node_id, max_phase)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.source_node_id != node_id)
-        .collect();
-    if inherited.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut order: Vec<Uuid> = Vec::new();
-    let mut groups: std::collections::HashMap<Uuid, Vec<NodeObligation>> =
-        std::collections::HashMap::new();
-    for item in inherited {
-        if !order.contains(&item.source_node_id) {
-            order.push(item.source_node_id);
-        }
-        groups.entry(item.source_node_id).or_default().push(item.obligation);
-    }
-
-    let mut out = String::new();
-    out.push_str("\n## Inherited context (ancestors)\n\n");
-    out.push_str(
-        "Each ancestor below is summarized, not fully restated — its scope \
-         is settled and out of bounds here. Only decide what belongs to \
-         *this* node; a gap in an ancestor's own scope belongs on that \
-         ancestor, not as a question or obligation on this node.\n",
-    );
-
-    for source_id in order {
-        let items = groups.remove(&source_id).unwrap_or_default();
-        if source_id.is_nil() {
-            out.push_str("\n### Global\n");
-            for o in &items {
-                writeln!(out, "- {}", obligation_line(o))?;
-            }
-            continue;
-        }
-        let title = node_title(nodes, source_id);
-        writeln!(out, "\n### From \"{title}\"")?;
-        let summary = nodes
-            .get_extra_content(source_id, EXTRA_CONTENT_SUMMARY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty());
-        let constraints: Vec<&NodeObligation> =
-            items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
-        match summary {
-            Some(summary) => writeln!(out, "{}", one_line(&summary))?,
-            None if constraints.len() < items.len() => writeln!(
-                out,
-                "(No summary yet. Its requirements, if you need them: `obligations list --node {source_id}`.)"
-            )?,
-            None => {}
-        }
-        if !constraints.is_empty() {
-            out.push_str("\nConstraints:\n");
-            for o in constraints {
-                writeln!(out, "- {}", obligation_line(o))?;
-            }
-        }
-    }
-    Ok(out)
 }
 
 pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {

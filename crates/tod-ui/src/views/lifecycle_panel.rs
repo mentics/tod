@@ -603,15 +603,18 @@ impl LifecyclePanelView {
                     PlanStepWithLinks { step, depends_on, satisfies }
                 })
                 .collect();
-            let obligation_hierarchy = self
+            let obligations = self.fleet.list_obligations_for_node(node_id).unwrap_or_default();
+            let ancestor_context = self
                 .fleet
-                .resolve_obligation_hierarchy_for_node(node_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(node_title, obligations)| {
-                    tod_core::agent_context::ImplementNodeObligations { node_title, obligations }
+                .read(|conn| {
+                    tod_core::node_context::render_inherited_context(
+                        conn,
+                        &NodeRepo::new(conn),
+                        node_id,
+                        None,
+                    )
                 })
-                .collect();
+                .unwrap_or_default();
             let media = tod_core::media::MediaPaths::discover()?;
             tod_core::agent_context::build_implement_message(
                 &media,
@@ -624,7 +627,8 @@ impl LifecyclePanelView {
                         lifecycle: Some(self.lifecycle.clone()),
                     },
                     plan_steps,
-                    obligation_hierarchy,
+                    obligations,
+                    ancestor_context,
                 },
             )
         })();
@@ -950,7 +954,7 @@ impl LifecyclePanelView {
             let ancestor_context = self
                 .fleet
                 .read(|conn| {
-                    tod_core::interview::context::render_inherited_context(
+                    tod_core::node_context::render_inherited_context(
                         conn,
                         &NodeRepo::new(conn),
                         node_id,
@@ -1107,7 +1111,7 @@ impl LifecyclePanelView {
             let ancestor_context = self
                 .fleet
                 .read(|conn| {
-                    tod_core::interview::context::render_inherited_context(
+                    tod_core::node_context::render_inherited_context(
                         conn,
                         &NodeRepo::new(conn),
                         node_id,

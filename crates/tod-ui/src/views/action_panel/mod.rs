@@ -571,6 +571,7 @@ impl ActionPanelView {
                 // Reopening an existing session: its agent session already holds
                 // the context it was opened with.
                 initial_context: None,
+                auto_submit_message: None,
             },
             cx,
         ) {

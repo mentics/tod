@@ -3,7 +3,8 @@
 //! dumps and choices.
 
 use crate::drafting::DraftingMode;
-use crate::interview::context::{ContextScope, render_inherited_context};
+use crate::interview::context::ContextScope;
+use crate::node_context::render_inherited_context;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::fmt::Write as _;

@@ -5,7 +5,7 @@
 //! `assets/process/agents/state/base.md` documents: forward state, criteria
 //! (id/slug/label), and prior evaluations, when any exist for this node.
 
-use crate::interview::context::{obligation_line, plan_step_line};
+use crate::node_context::{obligation_line, plan_step_line};
 use crate::media::{MediaPaths, load_static_context};
 use anyhow::Result;
 use std::path::Path;
@@ -47,7 +47,7 @@ pub struct GateCheckRequest<'a> {
     /// aren't confused by ancestor obligations mixed into the same list.
     pub obligations: Vec<NodeObligation>,
     /// Rendered ancestor context — see
-    /// `tod_core::interview::context::render_inherited_context`: each
+    /// `tod_core::node_context::render_inherited_context`: each
     /// ancestor's title, generated summary, and constraints, not its full
     /// requirements. Callers build this from a live connection since
     /// `GateCheckRequest` itself carries no DB handle.

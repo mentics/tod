@@ -167,6 +167,7 @@ impl VisualDesignPanelView {
                 chat.workspace_cwd,
                 chat.window_control,
                 chat.initial_context,
+                None,
                 chat.settings,
                 window,
                 cx,

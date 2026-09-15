@@ -25,6 +25,11 @@ pub struct InteractiveAgentOpenParams {
     /// Assembled app context, sent once ahead of the session's first message.
     /// `None` when reopening an existing session.
     pub initial_context: Option<String>,
+    /// When set, the first turn's user-visible message is submitted
+    /// automatically instead of waiting on the user to type one — used by the
+    /// implementation session, where clicking "Implement" already expresses
+    /// the user's intent.
+    pub auto_submit_message: Option<String>,
 }
 
 /// Where a chat launched from `node_id` runs and with which agent: the resolved
@@ -97,10 +102,38 @@ impl InteractiveAgentWindowControl {
     }
 
     /// Forget a closed session window and stop its agent process. The
-    /// agent-side session is kept, so reopening the window resumes it.
+    /// agent-side session is kept, so reopening the window resumes it — unless
+    /// the window closed before the user ever sent a first message, in which
+    /// case the run never actually started and is ended instead: otherwise it
+    /// would sit "live" forever (blocking the lifecycle panel's one-at-a-time
+    /// Implement lock, for an implementation run) despite nothing running.
     pub fn release_session(&self, session_run_id: &str) {
         self.remove_handle(session_run_id);
         self.close_agent_session(session_run_id);
+        self.end_run_if_unstarted(session_run_id);
+    }
+
+    fn end_run_if_unstarted(&self, session_run_id: &str) {
+        let Some(fleet) = self.fleet.lock().expect("interactive agent fleet mutex").clone() else {
+            return;
+        };
+        let Ok(Some(run)) = fleet.get_run(session_run_id) else {
+            return;
+        };
+        if run.agent_session_id.is_some() {
+            return;
+        }
+        let has_turns = fleet
+            .list_transcript_for_agent(session_run_id)
+            .map(|turns| !turns.is_empty())
+            .unwrap_or(true);
+        if has_turns {
+            return;
+        }
+        let _ = fleet.enqueue(FleetMutation::EndAgentRun {
+            run_id: session_run_id.to_string(),
+        });
+        let _ = fleet.writer().flush();
     }
 
     fn close_agent_session(&self, session_run_id: &str) {
@@ -272,6 +305,7 @@ impl InteractiveAgentWindowControl {
                 node_id: node_id.to_string(),
                 session_run_id: session_run_id.clone(),
                 initial_context,
+                auto_submit_message: None,
             },
             cx,
         )?;
@@ -284,7 +318,9 @@ impl InteractiveAgentWindowControl {
     /// the same node via `run_kind`. Ignores the terminal chat-launch-mode
     /// setting: an implementation run always needs the in-window first-turn path
     /// so `initial_context` goes out with the first message (see CLAUDE.md's
-    /// "Agent chat context").
+    /// "Agent chat context"). Clicking "Implement" already states the user's
+    /// intent, so the first turn's message is submitted automatically instead
+    /// of waiting on the user to type one (`IMPLEMENT_START_MESSAGE`).
     pub fn create_and_open_implementation_session(
         &self,
         node_id: &str,
@@ -305,6 +341,9 @@ impl InteractiveAgentWindowControl {
                 node_id: node_id.to_string(),
                 session_run_id: session_run_id.clone(),
                 initial_context: Some(initial_context),
+                auto_submit_message: Some(
+                    tod_core::agent_context::IMPLEMENT_START_MESSAGE.to_string(),
+                ),
             },
             cx,
         )?;
@@ -367,6 +406,7 @@ impl InteractiveAgentWindowControl {
         let session_run_id = params.session_run_id.clone();
         let node_id = params.node_id.clone();
         let initial_context = params.initial_context.clone();
+        let auto_submit_message = params.auto_submit_message.clone();
         let control = self.clone();
 
         let opened = cx
@@ -398,6 +438,7 @@ impl InteractiveAgentWindowControl {
                             workspace_cwd,
                             control,
                             initial_context,
+                            auto_submit_message,
                             settings,
                             window,
                             cx,

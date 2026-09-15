@@ -623,48 +623,6 @@ impl FleetStore {
             .collect())
     }
 
-    /// This node's obligation hierarchy for an implementation session:
-    /// obligations grouped by the node that owns them, root ancestor first
-    /// and this node last, each paired with that node's title. Global
-    /// adopted obligations (no owning node) are grouped under a synthetic
-    /// "(global)" heading. See `tod_core::agent_context::ImplementRequest`.
-    pub fn resolve_obligation_hierarchy_for_node(
-        &self,
-        node_id: uuid::Uuid,
-    ) -> Result<Vec<(String, Vec<NodeObligation>)>> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        let resolved = crate::outline::resolve_obligations(&conn, node_id, None)?;
-        let chain = crate::outline::resolve::ancestor_chain(&conn, node_id).unwrap_or_default();
-        let node_repo = NodeRepo::new(&conn);
-
-        let mut order: Vec<uuid::Uuid> = Vec::new();
-        let mut grouped: HashMap<uuid::Uuid, Vec<NodeObligation>> = HashMap::new();
-        for r in resolved {
-            grouped.entry(r.source_node_id).or_default().push(r.obligation);
-        }
-        for id in &chain {
-            if grouped.contains_key(id) && !order.contains(id) {
-                order.push(*id);
-            }
-        }
-        if grouped.contains_key(&uuid::Uuid::nil()) {
-            order.insert(0, uuid::Uuid::nil());
-        }
-
-        let mut out = Vec::new();
-        for id in order {
-            let obligations = grouped.remove(&id).unwrap_or_default();
-            let title = if id.is_nil() {
-                "(global)".to_string()
-            } else {
-                node_repo.get(id).ok().flatten().map_or_else(|| id.to_string(), |n| n.title)
-            };
-            out.push((title, obligations));
-        }
-        Ok(out)
-    }
-
     /// Plan steps for a node, in display order.
     pub fn list_plan_steps_for_node(&self, node_id: uuid::Uuid) -> Result<Vec<PlanStep>> {
         let guard = self.projection.lock().expect("fleet projection mutex");

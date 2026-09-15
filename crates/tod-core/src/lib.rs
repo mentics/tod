@@ -14,6 +14,7 @@ pub mod interview;
 pub mod linear_import;
 pub mod logging;
 pub mod media;
+pub mod node_context;
 pub mod process;
 pub mod process_bundle;
 pub mod session_name;

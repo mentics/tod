@@ -712,6 +712,7 @@ impl Shell {
                     node_id: task_id.clone(),
                     session_run_id: run.id,
                     initial_context: None,
+                    auto_submit_message: None,
                 },
                 cx,
             ),

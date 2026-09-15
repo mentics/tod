@@ -112,6 +112,10 @@ impl InteractiveAgentView {
         window_control: InteractiveAgentWindowControl,
         // Assembled app context, sent once ahead of the session's first message.
         initial_context: Option<String>,
+        // When set, submitted as the first turn's message automatically
+        // instead of waiting on the user to type one (e.g. the implementation
+        // session's "Go implement this.").
+        auto_submit_message: Option<String>,
         settings: TodSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -200,13 +204,25 @@ impl InteractiveAgentView {
             embedded: false,
             _poll_task,
         };
-        // Focus straight into the prompt box so the window opens ready for
-        // typing, without waiting on a click or Enter to enter edit mode.
-        cx.defer_in(window, |this, window, cx| {
-            this.prompt_input.update(cx, |input, cx| {
-                input.focus(window, cx);
+        let is_first_message = view.conversation.is_empty() && view.agent_session_id.is_none();
+        if let Some(message) = auto_submit_message.filter(|_| is_first_message) {
+            // Auto-submit on the next frame, same timing as the focus-into-prompt
+            // path below, since submit needs a live window.
+            cx.defer_in(window, move |this, window, cx| {
+                this.prompt_input.update(cx, |input, cx| {
+                    input.set_value(&message, window, cx);
+                });
+                this.submit_prompt(window, cx);
             });
-        });
+        } else {
+            // Focus straight into the prompt box so the window opens ready for
+            // typing, without waiting on a click or Enter to enter edit mode.
+            cx.defer_in(window, |this, window, cx| {
+                this.prompt_input.update(cx, |input, cx| {
+                    input.focus(window, cx);
+                });
+            });
+        }
         view
     }
 
