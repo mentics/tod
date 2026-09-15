@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 23;
+pub const CURRENT_USER_VERSION: i32 = 24;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -206,6 +206,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v22_to_v23(conn)?;
         conn.pragma_update(None, "user_version", 23)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 24 {
+        migrate_v23_to_v24(conn)?;
+        conn.pragma_update(None, "user_version", 24)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -214,15 +219,48 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Repairs stores that already ran the buggy original `migrate_v22_to_v23`,
+/// which rebuilt `nodes` without carrying over the `managed` column added by
+/// `migrate_v18_to_v19` — silently dropping it and breaking every query that
+/// reads it (e.g. the generator/managed-node checks the tree view runs per
+/// row, which made the whole node tree appear empty). Re-derives `managed`
+/// from `managed_node_links`, which the buggy migration never touched, so no
+/// data is lost beyond stores where the column was already gone before that
+/// table could be consulted.
+fn migrate_v23_to_v24(conn: &Connection) -> Result<()> {
+    let has_managed: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'managed'")?
+        .exists([])?;
+    if has_managed {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE nodes ADD COLUMN managed INTEGER NOT NULL DEFAULT 0;")?;
+    tx.execute_batch(
+        "UPDATE nodes SET managed = 1
+         WHERE id IN (SELECT node_id FROM managed_node_links);",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Slugs are now permanently immutable (assigned once at creation and never
 /// regenerated on title/ticket changes, nor editable by the user), so the
 /// `slug_manual` flag that used to distinguish "auto-derived" from
 /// "user-overridden" slugs no longer means anything — drop the column.
 fn migrate_v22_to_v23(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    let has_slug_manual: bool = tx
+    let has_slug_manual: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'slug_manual'")?
         .exists([])?;
+    if has_slug_manual {
+        // `nodes` is the parent of several FK relationships (node_tags,
+        // node_fields, node_capabilities, ...), so dropping and recreating
+        // it must happen with FK enforcement off — and that pragma is a
+        // documented no-op once a transaction is open, so it has to be set
+        // on the connection before the transaction begins.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    }
+    let tx = conn.unchecked_transaction()?;
     if has_slug_manual {
         tx.execute_batch(
             "
@@ -235,13 +273,14 @@ fn migrate_v22_to_v23(conn: &Connection) -> Result<()> {
                 ref_target_id   BLOB REFERENCES nodes(id) ON DELETE RESTRICT,
                 created_at      INTEGER NOT NULL,
                 updated_at      INTEGER NOT NULL,
+                managed         INTEGER NOT NULL DEFAULT 0,
                 CHECK (
                     (kind = 'reference' AND ref_target_id IS NOT NULL)
                     OR (kind = 'normal' AND ref_target_id IS NULL)
                 )
             );
-            INSERT INTO nodes_v23 (id, slug, title, kind, ref_target_id, created_at, updated_at)
-                SELECT id, slug, title, kind, ref_target_id, created_at, updated_at FROM nodes;
+            INSERT INTO nodes_v23 (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+                SELECT id, slug, title, kind, ref_target_id, created_at, updated_at, managed FROM nodes;
             DROP INDEX IF EXISTS idx_nodes_slug_folded;
             DROP INDEX IF EXISTS idx_nodes_ref_target;
             DROP TABLE nodes;
@@ -258,6 +297,9 @@ fn migrate_v22_to_v23(conn: &Connection) -> Result<()> {
         )?;
     }
     tx.commit()?;
+    if has_slug_manual {
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    }
     Ok(())
 }
 
@@ -1546,6 +1588,139 @@ mod tests {
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn migrate_v22_to_v23_with_referencing_child_rows() {
+        // Reproduces a v22 store with real data: a node carrying a
+        // node_capabilities row (FK -> nodes) plus the pre-v23 slug_manual
+        // column. Rebuilding `nodes` here previously ran DROP TABLE nodes
+        // while foreign_keys enforcement was still on, which SQLite refuses
+        // when another table (node_capabilities) still references it.
+        let (dir, conn) = temp_db();
+        let id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN slug_manual INTEGER NOT NULL DEFAULT 0;")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, slug_manual)
+             VALUES (?1, 'a-node', 'A Node', 'normal', NULL, 0, 0, 1)",
+            params![id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, 'lifecycle', 0)",
+            params![id],
+        )
+        .unwrap();
+        // Simulate a pre-existing dangling ref_target_id (orphaned reference
+        // node) — the kind of real-world data inconsistency that would make
+        // the INSERT into the rebuilt table fail its FK check if enforcement
+        // stayed on during the rebuild.
+        conn.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, slug_manual)
+             VALUES (?1, 'dangling-ref', 'Dangling Ref', 'reference', ?2, 0, 0, 0)",
+            params![
+                uuid::Uuid::new_v4().as_bytes().to_vec(),
+                uuid::Uuid::new_v4().as_bytes().to_vec()
+            ],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        conn.pragma_update(None, "user_version", 22).unwrap();
+        drop(conn);
+
+        let path = dir.join("tod.db");
+        let conn = open_writer_connection(&path).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+        let title: String = conn
+            .query_row("SELECT title FROM nodes WHERE slug = 'a-node'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "A Node");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrate_v23_to_v24_restores_dropped_managed_column() {
+        // Reproduces a store that already ran the buggy original
+        // migrate_v22_to_v23 (nodes rebuilt without `managed`), which broke
+        // every query selecting that column — including the per-row
+        // generator/managed-node check the tree view runs, making the whole
+        // node tree render empty. The node's managed_node_links row must
+        // still be enough to recover its managed=1 state.
+        let (dir, conn) = temp_db();
+        let node_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        let generator_id = uuid::Uuid::new_v4().as_bytes().to_vec();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+             VALUES (?1, 'managed-node', 'Managed Node', 'normal', NULL, 0, 0, 1)",
+            params![node_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, kind, ref_target_id, created_at, updated_at, managed)
+             VALUES (?1, 'gen', 'Gen', 'normal', NULL, 0, 0, 0)",
+            params![generator_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO managed_node_links (node_id, generator_node_id, external_id, source_type, user_modified_fields)
+             VALUES (?1, ?2, 'ext-1', 'linear', '[]')",
+            params![node_id, generator_id],
+        )
+        .unwrap();
+        // Simulate the buggy migration's damage directly: drop `managed`
+        // like the original migrate_v22_to_v23 did, and pin the store at v23
+        // so recovery has to happen through migrate_v23_to_v24.
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys=OFF;
+            CREATE TABLE nodes_damaged (
+                id BLOB PRIMARY KEY NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'normal',
+                ref_target_id BLOB,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO nodes_damaged (id, slug, title, kind, ref_target_id, created_at, updated_at)
+                SELECT id, slug, title, kind, ref_target_id, created_at, updated_at FROM nodes;
+            DROP TABLE nodes;
+            ALTER TABLE nodes_damaged RENAME TO nodes;
+            PRAGMA foreign_keys=ON;
+            ",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 23).unwrap();
+        drop(conn);
+
+        let path = dir.join("tod.db");
+        let conn = open_writer_connection(&path).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+        let managed: i64 = conn
+            .query_row(
+                "SELECT managed FROM nodes WHERE slug = 'managed-node'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed, 1);
+        let unmanaged: i64 = conn
+            .query_row("SELECT managed FROM nodes WHERE slug = 'gen'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(unmanaged, 0);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

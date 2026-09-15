@@ -305,18 +305,6 @@ impl<'a> AgentConfigRepo<'a> {
         self.list_for_node(task_id)
     }
 
-    pub fn list_with_reconnect(&self) -> Result<Vec<AgentConfigRow>, AgentConfigRepoError> {
-        let sql = format!(
-            "{} WHERE r.reconnect_pid IS NOT NULL AND r.reconnect_birth_token IS NOT NULL ORDER BY c.id",
-            Self::SELECT_ROW
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map([], row_to_config_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
     pub fn get(&self, id: &str) -> Result<Option<AgentConfigRow>, AgentConfigRepoError> {
         let sql = format!("{} WHERE c.id = ?1", Self::SELECT_ROW);
         self.conn

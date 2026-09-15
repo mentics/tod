@@ -18,7 +18,6 @@ The interview is not a required step — it exists only for decisions you genuin
 When an interview does run, it should probe only the genuine unknowns:
 
 - Order/slicing decisions you couldn't resolve yourself.
-- How verification will prove a requirement, where that's genuinely undetermined.
 - Assumptions you can't accept on your own — accept or convert to requirements.
 
 Prefer questions with proposals when constructions are clear; do not re-ask settled obligations.

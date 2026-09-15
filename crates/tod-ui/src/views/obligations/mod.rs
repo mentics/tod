@@ -2039,7 +2039,7 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Del deletes · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
             )
             .into_any_element()
     }

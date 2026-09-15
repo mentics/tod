@@ -134,7 +134,10 @@
       "Bash(/c/data/git/tod/target/debug/tod-cli.exe:*)",
       "Bash(C:datagittodtargetdebugtod-cli.exe obligations delete 41a44925 --data-root C:datagittod.localdata)",
       "Bash(C:\\\\data\\\\git\\\\tod\\\\target\\\\dev-fast\\\\tod-cli.exe questions withdraw:*)",
-      "Bash(\"/c/data/git/tod/target/dev-fast/tod-cli.exe\":*)"
+      "Bash(\"/c/data/git/tod/target/dev-fast/tod-cli.exe\":*)",
+      "Bash(C:datagittodtargetdev-fasttod-cli.exe questions withdraw --data-root \"C:\\\\data\\\\git\\\\tod\\\\.local\\\\data\" --node c01b1570-3516-468b-8db7-9fe38adfff4a q-222 --reason \"This question covers reusable dynamic form layout structure, which belongs on the Dynamic Forms node where the component is defined, not on the Linear adapter implementation node.\")",
+      "Bash(\"C:/data/git/tod/target/dev-fast/tod-cli.exe\" questions withdraw --data-root \"C:/data/git/tod/.local/data\" --node c01b1570-3516-468b-8db7-9fe38adfff4a q-222 --reason \"This question covers reusable dynamic form layout structure, which belongs on the Dynamic Forms node where the component is defined, not on the Linear adapter implementation node.\")",
+      "Bash(\"/c/data/git/tod/target/dev-fast/tod-cli.exe\" questions withdraw --data-root \"/c/data/git/tod/.local/data\" --node c01b1570-3516-468b-8db7-9fe38adfff4a q-222 --reason \"This question covers reusable dynamic form layout structure, which belongs on the Dynamic Forms node where the component is defined, not on the Linear adapter implementation node.\")"
     ]
   }
 }

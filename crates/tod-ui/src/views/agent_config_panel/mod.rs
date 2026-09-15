@@ -30,6 +30,7 @@ use tod_store::fleet::terminal::{
 };
 use tod_store::fleet::{
     AgentRun, FleetMutation, FleetStore, NewAgentConfig, open_zed_for_agent_config,
+    reconnect_identity,
 };
 use tod_store::{
     AgentPlatform, coerce_effort, coerce_model, efforts_for, models_for, parse_platform,
@@ -758,6 +759,17 @@ impl AgentConfigPanelView {
         }) {
             self.show_error(window, cx, format!("Launch agent failed: {err}"));
             return;
+        }
+        // Record this process's own identity: the agent run lives only in
+        // this tod process's memory, so on the next launch (a different
+        // process) reattach-on-launch will see this identity fail
+        // verification and correctly clear a stale status left by a crash
+        // or force-quit, instead of leaving it stuck as "running" forever.
+        if let Some(identity) = reconnect_identity::record(std::process::id()) {
+            let _ = self.fleet.enqueue(FleetMutation::UpdateAgentReconnect {
+                id: config_id.clone(),
+                identity,
+            });
         }
         if let Err(err) = self.flush_fleet() {
             self.show_error(window, cx, format!("Launch agent failed: {err}"));

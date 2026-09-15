@@ -28,9 +28,16 @@ pub fn reattach_on_launch(
     let agent_repo = AgentConfigRepo::new(conn);
     let shell_repo = ShellRepo::new(conn);
 
-    let agents = agent_repo.list_with_reconnect()?;
-    for agent in agents {
+    for agent in agent_repo.list_all()? {
         let Some(identity) = agent.reconnect else {
+            // No reconnect identity means this status can't have survived a
+            // fresh process start (coding-agent runs live only in the tod
+            // process that launched them) — clear any stale active status
+            // left over from a crash or force-quit.
+            if is_active_status(&agent.runtime_status) {
+                mark_agent_not_running(writer, &agent.id)?;
+                report.agents_not_running += 1;
+            }
             continue;
         };
         if host_verify(identity.pid, identity.birth_token) && guest.guest_alive(&agent) {
@@ -63,6 +70,10 @@ pub fn reattach_on_launch(
     }
 
     Ok(report)
+}
+
+fn is_active_status(status: &str) -> bool {
+    matches!(status, "starting" | "processing" | "waiting" | "blocked")
 }
 
 fn mark_agent_not_running(writer: &FleetWriter, agent_id: &str) -> Result<()> {
@@ -184,6 +195,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM notifications", [], |row| row.get(0))
             .unwrap();
         assert_eq!(notification_count, 0);
+
+        writer.shutdown().unwrap();
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn stale_status_without_reconnect_identity_is_cleared() {
+        let (dir, conn) = test_writer_conn();
+        let path = dir.join("tod.db");
+        let writer = FleetWriter::open_with_debounce(
+            &path,
+            Duration::from_millis(10),
+            crate::fleet::command_log::CommandLog::shared(),
+        )
+        .unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        TaskRepo::new(&conn)
+            .insert(&FleetTask::new(&task_id, "T", "t"))
+            .unwrap();
+        AgentRepo::new(&conn)
+            .insert(&NewAgent {
+                id: agent_id.clone(),
+                node_id: task_id,
+                env_type: "local".into(),
+                mode: "agent".into(),
+                work_directory: None,
+                use_worktree: false,
+                platform: "cursor".into(),
+                model: "default".into(),
+                effort: "auto".into(),
+            })
+            .unwrap();
+        // Simulate a crash / force-quit: the run was left "waiting" with no
+        // reconnect identity ever recorded (the pre-fix state for coding
+        // agents, which never persisted one).
+        AgentRepo::new(&conn)
+            .update_runtime_status(&agent_id, "waiting")
+            .unwrap();
+
+        let report =
+            reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_fail_verify).unwrap();
+        assert_eq!(report.agents_not_running, 1);
+        assert_eq!(report.agents_live, 0);
+
+        let agent = AgentRepo::new(&conn).get(&agent_id).unwrap().unwrap();
+        assert_eq!(agent.runtime_status, "not_running");
 
         writer.shutdown().unwrap();
         cleanup_test_dir(&dir);
