@@ -21,6 +21,14 @@ pub struct AgentRun {
     pub run_kind: String,
     /// Where the run physically executes — see `tod_agent::RunLocation`.
     pub location: RunLocation,
+    /// The run's transcript, cached once it reaches `Done`. Never written
+    /// while a run is live — see `tod_agent::claude_transcript_fingerprint`
+    /// for why this is refreshed lazily rather than kept in sync.
+    pub cached_transcript: Option<String>,
+    /// Cheap fingerprint of the cached transcript's last entry, used to
+    /// detect whether it has moved (e.g. resumed externally) without
+    /// re-fetching the whole thing.
+    pub transcript_fingerprint: Option<String>,
     /// Human-readable name, for interactive chat sessions.
     pub session_name: Option<String>,
     /// Agent-side session id, so a later process can resume the conversation.
@@ -51,7 +59,7 @@ impl AgentRun {
 const RUN_SELECT: &str =
     "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
                     reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
-                    platform, model, effort, location";
+                    platform, model, effort, location, cached_transcript, transcript_fingerprint";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -299,6 +307,25 @@ impl<'a> AgentRunRepo<'a> {
         Ok(())
     }
 
+    /// Cache a run's transcript and fingerprint — called once, when a run
+    /// transitions to `Done` (or when a later touch finds the fingerprint
+    /// has moved and re-fetches). Never called while a run is live.
+    pub fn cache_transcript(
+        &self,
+        id: &str,
+        transcript: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<(), AgentRunRepoError> {
+        let updated = self.conn.execute(
+            "UPDATE agent_runs SET cached_transcript = ?2, transcript_fingerprint = ?3 WHERE id = ?1",
+            params![id, transcript, fingerprint],
+        )?;
+        if updated == 0 {
+            return Err(AgentRunRepoError::NotFound);
+        }
+        Ok(())
+    }
+
     pub fn clear_reconnect(&self, id: &str) -> Result<(), AgentRunRepoError> {
         let updated = self.conn.execute(
             "UPDATE agent_runs SET reconnect_pid = NULL, reconnect_birth_token = NULL WHERE id = ?1",
@@ -365,6 +392,8 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
             let raw: String = row.get(14)?;
             RunLocation::parse(&raw).unwrap_or(RunLocation::LocalWindow)
         },
+        cached_transcript: row.get(15)?,
+        transcript_fingerprint: row.get(16)?,
     })
 }
 

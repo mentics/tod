@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 30;
+pub const CURRENT_USER_VERSION: i32 = 31;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -241,6 +241,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v29_to_v30(conn)?;
         conn.pragma_update(None, "user_version", 30)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 31 {
+        migrate_v30_to_v31(conn)?;
+        conn.pragma_update(None, "user_version", 31)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -284,6 +289,27 @@ fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
         UPDATE agent_runs SET location = 'terminal' WHERE run_kind = 'terminal';
         ",
     )?;
+    Ok(())
+}
+
+/// Cache a run's transcript on the row itself once it reaches `Done`, plus a
+/// cheap fingerprint of the last thing seen (see `tod_agent::claude_transcript_fingerprint`)
+/// so a later touch can tell "did this move since we cached it" without
+/// re-fetching. Nothing populates these yet — this just adds the columns.
+fn migrate_v30_to_v31(conn: &Connection) -> Result<()> {
+    let has_column = |column: &str| -> Result<bool> {
+        Ok(conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = ?1"
+            ))?
+            .exists([column])?)
+    };
+    if !has_column("cached_transcript")? {
+        conn.execute_batch("ALTER TABLE agent_runs ADD COLUMN cached_transcript TEXT;")?;
+    }
+    if !has_column("transcript_fingerprint")? {
+        conn.execute_batch("ALTER TABLE agent_runs ADD COLUMN transcript_fingerprint TEXT;")?;
+    }
     Ok(())
 }
 
