@@ -1,13 +1,13 @@
 //! Callable trait surface for agent-runtime integration (guest liveness, shells, prompts).
 
-use crate::fleet::repos::agent_config::AgentConfigRow as FleetAgent;
+use crate::fleet::repos::agent_run::AgentRun;
 use crate::fleet::repos::shell::ShellSession;
 
 /// After host PID+birth_token match, confirm the guest agent session is reachable.
 pub trait GuestLivenessCheck: Send + Sync {
-    fn guest_alive(&self, agent: &FleetAgent) -> bool;
+    fn guest_alive(&self, run: &AgentRun) -> bool;
     /// Live runtime status to persist after successful reattach (e.g. `waiting`).
-    fn live_runtime_status(&self, agent: &FleetAgent) -> &str;
+    fn live_runtime_status(&self, run: &AgentRun) -> &str;
 }
 
 /// Shell spawn metadata for reconnect / display (stub until real runtime wiring).
@@ -27,11 +27,11 @@ pub trait PromptDeliveryState: Send + Sync {
 pub struct NoopGuestLiveness;
 
 impl GuestLivenessCheck for NoopGuestLiveness {
-    fn guest_alive(&self, _agent: &FleetAgent) -> bool {
+    fn guest_alive(&self, _run: &AgentRun) -> bool {
         true
     }
 
-    fn live_runtime_status(&self, _agent: &FleetAgent) -> &str {
+    fn live_runtime_status(&self, _run: &AgentRun) -> &str {
         "waiting"
     }
 }
@@ -40,11 +40,11 @@ impl GuestLivenessCheck for NoopGuestLiveness {
 pub struct UnreachableGuestLiveness;
 
 impl GuestLivenessCheck for UnreachableGuestLiveness {
-    fn guest_alive(&self, _agent: &FleetAgent) -> bool {
+    fn guest_alive(&self, _run: &AgentRun) -> bool {
         false
     }
 
-    fn live_runtime_status(&self, _agent: &FleetAgent) -> &str {
+    fn live_runtime_status(&self, _run: &AgentRun) -> &str {
         "waiting"
     }
 }

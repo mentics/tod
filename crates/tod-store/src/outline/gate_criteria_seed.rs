@@ -213,7 +213,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "ready",
         to_state: "active",
         slug: "ready-active.action-config-configured",
-        label: "Does the node have at least one action config configured to do the implementation work?",
+        label: "Does the node have Agent and Files configured (with a ready directory) to do the implementation work?",
         sort_order: 1,
     },
     // verifying → review

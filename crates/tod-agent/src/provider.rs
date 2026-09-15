@@ -112,7 +112,7 @@ pub struct SessionOpening {
 #[derive(Debug, Clone)]
 pub struct SessionTurn {
     pub key: String,
-    pub agent_config_id: String,
+    pub owner_id: String,
     pub cwd: PathBuf,
     pub options: AgentLaunchOptions,
     /// Agent-side session id the caller recorded from an earlier process.
@@ -154,7 +154,7 @@ pub trait AgentProvider {
     /// mechanism (Cursor) ignore it.
     fn start_fleet_agent(
         &mut self,
-        agent_config_id: &str,
+        owner_id: &str,
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
@@ -199,7 +199,7 @@ mod tests {
     fn turn(opening: Option<SessionOpening>) -> SessionTurn {
         SessionTurn {
             key: "run-1".into(),
-            agent_config_id: "config".into(),
+            owner_id: "config".into(),
             cwd: PathBuf::from("."),
             options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
             resume_session_id: None,

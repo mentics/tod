@@ -43,14 +43,12 @@ impl SessionStore {
         &self,
         new_session: NewInterviewSession,
         status: InterviewSessionStatus,
-        agent_config_id: Option<String>,
     ) -> Result<InterviewSession> {
         let id = Uuid::new_v4();
         self.commit(FleetMutation::InsertInterviewSession {
             id,
             new_session,
             status: status.as_str().to_string(),
-            agent_config_id,
         })?;
         self.fleet.reload_if_stale().ok();
         self.get_session(id)?
@@ -136,12 +134,10 @@ mod tests {
             .insert_session_with_metadata(
                 NewInterviewSession {
                     node_id,
-                    agent_config_id: None,
                     display_name: "Test".into(),
                     phase: "design-interview".into(),
                 },
                 InterviewSessionStatus::Active,
-                None,
             )
             .unwrap();
         assert_eq!(session.display_name, "Test");

@@ -274,12 +274,14 @@ impl<'a> TaskRepo<'a> {
     pub fn delete(&self, id: &str) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
         let blob = uuid_to_blob(node_id);
-        let agent_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM agent_configs WHERE node_id = ?1",
+        let running: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_runs
+                     WHERE node_id = ?1 AND ended_at IS NULL AND runtime_status != 'not_running')
+                  + (SELECT COUNT(*) FROM shell_sessions WHERE node_id = ?1)",
             params![blob],
             |row| row.get(0),
         )?;
-        if agent_count > 0 {
+        if running > 0 {
             return Err(TaskRepoError::HasAgents);
         }
         let deleted = self
@@ -353,9 +355,7 @@ fn parse_notes(raw: Option<String>) -> Vec<NoteItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent_config::{
-        AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent,
-    };
+    use crate::fleet::repos::agent_run::AgentRunRepo;
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
 
     #[test]
@@ -384,31 +384,24 @@ mod tests {
     }
 
     #[test]
-    fn delete_blocked_when_agents_reference_task() {
+    fn delete_blocked_while_agent_runs_on_task() {
         let (dir, conn) = test_writer_conn();
         let task_repo = TaskRepo::new(&conn);
-        let agent_repo = AgentRepo::new(&conn);
+        let run_repo = AgentRunRepo::new(&conn);
         let task_id = uuid::Uuid::new_v4().to_string();
         task_repo
             .insert(&FleetTask::new(&task_id, "Blocked", "blocked"))
             .unwrap();
-        agent_repo
-            .insert(&NewAgent {
-                id: uuid::Uuid::new_v4().to_string(),
-                node_id: task_id.clone(),
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            })
-            .unwrap();
+        let run_id = run_repo.create_run(&task_id, "waiting", "auto").unwrap();
 
         let err = task_repo.delete(&task_id).unwrap_err();
         assert!(matches!(err, TaskRepoError::HasAgents));
         assert!(task_repo.get(&task_id).unwrap().is_some());
+
+        // Stopped runs don't block; they're deleted with the task.
+        run_repo.update_runtime_status(&run_id, "not_running").unwrap();
+        task_repo.delete(&task_id).unwrap();
+        assert!(run_repo.get(&run_id).unwrap().is_none());
         cleanup_test_dir(&dir);
     }
 

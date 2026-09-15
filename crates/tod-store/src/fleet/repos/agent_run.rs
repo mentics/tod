@@ -1,13 +1,16 @@
-//! Agent run repository — ephemeral agent process instances tied to a config.
+//! Agent run repository — agent process instances launched from a node.
 
+use crate::agent_launch::{AgentLaunchOptions, parse_platform, platform_storage};
 use crate::fleet::reconnect_identity::ReconnectIdentity;
+use crate::fleet::repos::{node_id_blob, node_id_column};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: String,
-    pub agent_config_id: String,
+    /// Node (UUID string) the run was launched from.
+    pub node_id: String,
     pub run_number: i64,
     pub runtime_status: String,
     pub started_at: i64,
@@ -18,11 +21,33 @@ pub struct AgentRun {
     pub session_name: Option<String>,
     /// Agent-side session id, so a later process can resume the conversation.
     pub agent_session_id: Option<String>,
+    /// Platform / model / effort the run started with.
+    pub platform: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+impl AgentRun {
+    /// Launch options recorded when the run started, if any were recorded.
+    pub fn launch_options(&self) -> Option<AgentLaunchOptions> {
+        let platform = parse_platform(self.platform.as_deref()?)?;
+        Some(AgentLaunchOptions {
+            platform,
+            model: self.model.clone().unwrap_or_default(),
+            effort: self.effort.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Not ended and not marked stopped.
+    pub fn is_live(&self) -> bool {
+        self.ended_at.is_none() && self.runtime_status != "not_running"
+    }
 }
 
 const RUN_SELECT: &str =
-    "SELECT id, agent_config_id, run_number, runtime_status, started_at, ended_at,
-                    reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id";
+    "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
+                    reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
+                    platform, model, effort";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -30,10 +55,19 @@ pub enum AgentRunRepoError {
     NotFound,
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 pub struct AgentRunRepo<'a> {
     conn: &'a Connection,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl<'a> AgentRunRepo<'a> {
@@ -41,173 +75,161 @@ impl<'a> AgentRunRepo<'a> {
         Self { conn }
     }
 
-    fn next_run_number(&self, config_id: &str) -> Result<i64, AgentRunRepoError> {
+    fn next_run_number(&self, node_blob: &[u8]) -> Result<i64, AgentRunRepoError> {
         let n: i64 = self.conn.query_row(
-            "SELECT COALESCE(MAX(run_number), 0) + 1 FROM agent_runs WHERE agent_config_id = ?1",
-            params![config_id],
+            "SELECT COALESCE(MAX(run_number), 0) + 1 FROM agent_runs WHERE node_id = ?1",
+            params![node_blob],
             |row| row.get(0),
         )?;
         Ok(n)
     }
 
-    /// Create a new run; returns run id `{config-id}-run-{n}`.
+    /// Create a new run; returns run id `{node-id}-run-{n}`.
     pub fn create_run(
         &self,
-        config_id: &str,
+        node_id: &str,
         runtime_status: &str,
         run_kind: &str,
     ) -> Result<String, AgentRunRepoError> {
-        self.create_named_run(config_id, runtime_status, run_kind, None)
+        self.create_named_run(node_id, runtime_status, run_kind, None, None)
     }
 
-    /// Create a new run with a human-readable session name.
+    /// Create a new run with a human-readable session name and the launch
+    /// options it starts with.
     pub fn create_named_run(
         &self,
-        config_id: &str,
+        node_id: &str,
         runtime_status: &str,
         run_kind: &str,
         session_name: Option<&str>,
+        launch: Option<&AgentLaunchOptions>,
     ) -> Result<String, AgentRunRepoError> {
-        let run_number = self.next_run_number(config_id)?;
-        let run_id = format!("{config_id}-run-{run_number}");
-        let now_ms: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let blob = node_id_blob(node_id)?;
+        let run_number = self.next_run_number(&blob)?;
+        let run_id = format!("{node_id}-run-{run_number}");
         self.conn.execute(
-            "INSERT INTO agent_runs (id, agent_config_id, run_number, runtime_status, started_at, run_kind, session_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![run_id, config_id, run_number, runtime_status, now_ms, run_kind, session_name],
+            "INSERT INTO agent_runs
+             (id, node_id, run_number, runtime_status, started_at, run_kind, session_name, platform, model, effort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run_id,
+                blob,
+                run_number,
+                runtime_status,
+                now_ms(),
+                run_kind,
+                session_name,
+                launch.map(|l| platform_storage(l.platform)),
+                launch.map(|l| l.model.as_str()),
+                launch.map(|l| l.effort.as_str()),
+            ],
         )?;
         Ok(run_id)
     }
 
-    pub fn list_for_config(&self, config_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+    fn list_where(
+        &self,
+        node_id: &str,
+        run_kind: Option<&str>,
+    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let blob = node_id_blob(node_id)?;
         let sql = format!(
             "{RUN_SELECT}
              FROM agent_runs
-             WHERE agent_config_id = ?1
+             WHERE node_id = ?1 AND (?2 IS NULL OR run_kind = ?2)
              ORDER BY run_number DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![config_id], row_to_run)?
+            .query_map(params![blob, run_kind], row_to_run)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn list_interactive_for_config(
-        &self,
-        config_id: &str,
-    ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
-        let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1 AND run_kind = 'interactive'
-             ORDER BY run_number DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![config_id], row_to_run)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+    pub fn list_for_node(&self, node_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        self.list_where(node_id, None)
     }
 
-    pub fn list_terminal_for_config(
+    pub fn list_interactive_for_node(
         &self,
-        config_id: &str,
+        node_id: &str,
     ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
-        let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1 AND run_kind = 'terminal'
-             ORDER BY run_number DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![config_id], row_to_run)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.list_where(node_id, Some("interactive"))
     }
 
-    pub fn list_auto_for_config(
+    pub fn list_terminal_for_node(
         &self,
-        config_id: &str,
+        node_id: &str,
     ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
-        let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1 AND run_kind = 'auto'
-             ORDER BY run_number DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(params![config_id], row_to_run)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        self.list_where(node_id, Some("terminal"))
+    }
+
+    pub fn list_auto_for_node(&self, node_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        self.list_where(node_id, Some("auto"))
     }
 
     /// Implementation runs (launched from the lifecycle panel's Active-phase
-    /// "Implement" button) for a config, newest first. Distinct from
+    /// "Implement" button) for a node, newest first. Distinct from
     /// `run_kind = 'interactive'` sessions launched directly from the
-    /// action-config panel — see `has_live_implementation_run`.
-    pub fn list_implementation_for_config(
+    /// Action panel — see `has_live_implementation_run`.
+    pub fn list_implementation_for_node(
         &self,
-        config_id: &str,
+        node_id: &str,
     ) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        self.list_where(node_id, Some("implementation"))
+    }
+
+    /// Whether an `implementation`-kind run is still alive for this node —
+    /// the one-at-a-time lock backing the lifecycle panel's Implement button.
+    /// Live means not yet ended; this intentionally ignores other run kinds
+    /// on the same node, which are unrelated and allowed to run alongside.
+    pub fn has_live_implementation_run(
+        &self,
+        node_id: &str,
+    ) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        Ok(self
+            .list_implementation_for_node(node_id)?
+            .into_iter()
+            .find(AgentRun::is_live))
+    }
+
+    /// Every run that has not ended, across all nodes (reattach at launch).
+    pub fn list_unended(&self) -> Result<Vec<AgentRun>, AgentRunRepoError> {
         let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1 AND run_kind = 'implementation'
-             ORDER BY run_number DESC"
+            "{RUN_SELECT} FROM agent_runs WHERE ended_at IS NULL ORDER BY node_id, run_number"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map(params![config_id], row_to_run)?
+            .query_map([], row_to_run)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Whether an `implementation`-kind run is still alive for this config —
-    /// the one-at-a-time lock backing the lifecycle panel's Implement button.
-    /// Live means not yet ended; this intentionally ignores other run kinds
-    /// on the same config, which are unrelated and allowed to run alongside.
-    pub fn has_live_implementation_run(
-        &self,
-        config_id: &str,
-    ) -> Result<Option<AgentRun>, AgentRunRepoError> {
+    /// Every run across all nodes, newest first.
+    pub fn list_all(&self) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!("{RUN_SELECT} FROM agent_runs ORDER BY started_at DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Live runs recorded on this node.
+    pub fn list_live_for_node(&self, node_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
         Ok(self
-            .list_implementation_for_config(config_id)?
+            .list_for_node(node_id)?
             .into_iter()
-            .find(|run| run.ended_at.is_none() && run.runtime_status != "not_running"))
+            .filter(AgentRun::is_live)
+            .collect())
     }
 
-    pub fn latest_auto_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
-        let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1 AND run_kind = 'auto'
-             ORDER BY run_number DESC
-             LIMIT 1"
-        );
-        self.conn
-            .query_row(&sql, params![config_id], row_to_run)
-            .optional()
-            .map_err(Into::into)
+    pub fn latest_auto_run(&self, node_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        Ok(self.list_auto_for_node(node_id)?.into_iter().next())
     }
 
-    pub fn latest_run(&self, config_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
-        let sql = format!(
-            "{RUN_SELECT}
-             FROM agent_runs
-             WHERE agent_config_id = ?1
-             ORDER BY run_number DESC
-             LIMIT 1"
-        );
-        self.conn
-            .query_row(&sql, params![config_id], row_to_run)
-            .optional()
-            .map_err(Into::into)
+    pub fn latest_run(&self, node_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
+        Ok(self.list_for_node(node_id)?.into_iter().next())
     }
 
     pub fn get(&self, id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
@@ -275,13 +297,9 @@ impl<'a> AgentRunRepo<'a> {
     }
 
     pub fn end_run(&self, id: &str) -> Result<(), AgentRunRepoError> {
-        let now_ms: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
         let updated = self.conn.execute(
             "UPDATE agent_runs SET runtime_status = 'not_running', ended_at = ?2 WHERE id = ?1",
-            params![id, now_ms],
+            params![id, now_ms()],
         )?;
         if updated == 0 {
             return Err(AgentRunRepoError::NotFound);
@@ -317,7 +335,7 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
     };
     Ok(AgentRun {
         id: row.get(0)?,
-        agent_config_id: row.get(1)?,
+        node_id: node_id_column(row, 1)?,
         run_number: row.get(2)?,
         runtime_status: row.get(3)?,
         started_at: row.get(4)?,
@@ -326,5 +344,40 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         run_kind: row.get(8)?,
         session_name: row.get(9)?,
         agent_session_id: row.get(10)?,
+        platform: row.get(11)?,
+        model: row.get(12)?,
+        effort: row.get(13)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::repos::{cleanup_test_dir, seed_node, test_writer_conn};
+    use crate::settings::AgentPlatform;
+
+    #[test]
+    fn runs_number_per_node_and_record_launch_options() {
+        let (dir, conn) = test_writer_conn();
+        let node_id = seed_node(&conn);
+        let repo = AgentRunRepo::new(&conn);
+        let first = repo.create_run(&node_id, "waiting", "auto").unwrap();
+        let launch = AgentLaunchOptions::from_settings(AgentPlatform::Cursor, "composer-2.5", "high");
+        let second = repo
+            .create_named_run(&node_id, "waiting", "interactive", Some("chat"), Some(&launch))
+            .unwrap();
+        assert_eq!(first, format!("{node_id}-run-1"));
+        assert_eq!(second, format!("{node_id}-run-2"));
+
+        let run = repo.get(&second).unwrap().unwrap();
+        assert_eq!(run.node_id, node_id);
+        assert_eq!(run.launch_options(), Some(launch));
+        assert!(repo.get(&first).unwrap().unwrap().launch_options().is_none());
+
+        assert_eq!(repo.list_live_for_node(&node_id).unwrap().len(), 2);
+        repo.end_run(&first).unwrap();
+        assert_eq!(repo.list_live_for_node(&node_id).unwrap().len(), 1);
+        assert_eq!(repo.list_unended().unwrap().len(), 1);
+        cleanup_test_dir(&dir);
+    }
 }

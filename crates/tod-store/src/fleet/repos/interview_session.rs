@@ -36,7 +36,6 @@ impl InterviewSessionStatus {
 pub struct InterviewSession {
     pub id: Uuid,
     pub node_id: Uuid,
-    pub agent_config_id: Option<String>,
     pub display_name: String,
     pub status: InterviewSessionStatus,
     pub phase: String,
@@ -49,7 +48,6 @@ pub struct InterviewSession {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewInterviewSession {
     pub node_id: Uuid,
-    pub agent_config_id: Option<String>,
     pub display_name: String,
     pub phase: String,
 }
@@ -72,12 +70,11 @@ impl<'a> InterviewSessionRepo<'a> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO interview_sessions
-             (id, node_id, agent_config_id, display_name, status, phase, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             (id, node_id, display_name, status, phase, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(new_session.node_id),
-                new_session.agent_config_id,
                 new_session.display_name,
                 status.as_str(),
                 new_session.phase,
@@ -127,7 +124,7 @@ impl<'a> InterviewSessionRepo<'a> {
 
     pub fn list_all(&self) -> Result<Vec<InterviewSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, agent_config_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
+            "SELECT id, node_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
              FROM interview_sessions ORDER BY updated_at DESC",
         )?;
         let rows = stmt
@@ -138,7 +135,7 @@ impl<'a> InterviewSessionRepo<'a> {
 
     pub fn list_by_status(&self, status: InterviewSessionStatus) -> Result<Vec<InterviewSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, agent_config_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
+            "SELECT id, node_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
              FROM interview_sessions WHERE status = ?1 ORDER BY updated_at DESC",
         )?;
         let rows = stmt
@@ -150,7 +147,7 @@ impl<'a> InterviewSessionRepo<'a> {
     pub fn get(&self, id: Uuid) -> Result<Option<InterviewSession>> {
         self.conn
             .query_row(
-                "SELECT id, node_id, agent_config_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
+                "SELECT id, node_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
                  FROM interview_sessions WHERE id = ?1",
                 params![uuid_to_blob(id)],
                 row_to_session,
@@ -161,7 +158,7 @@ impl<'a> InterviewSessionRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<InterviewSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, agent_config_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
+            "SELECT id, node_id, display_name, status, phase, session_id, scratchpad_path, created_at, updated_at
              FROM interview_sessions WHERE node_id = ?1 ORDER BY updated_at DESC",
         )?;
         let rows = stmt
@@ -181,15 +178,14 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<InterviewSession>
         node_id: blob_to_uuid_sql(&node_blob).map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, e.into())
         })?,
-        agent_config_id: row.get(2)?,
-        display_name: row.get(3)?,
-        status: InterviewSessionStatus::from_str(row.get::<_, String>(4)?.as_str()).map_err(
-            |e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into()),
+        display_name: row.get(2)?,
+        status: InterviewSessionStatus::from_str(row.get::<_, String>(3)?.as_str()).map_err(
+            |e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into()),
         )?,
-        phase: row.get(5)?,
-        session_id: row.get(6)?,
-        scratchpad_path: row.get(7)?,
-        created_at: ms_to_datetime(row.get(8)?),
-        updated_at: ms_to_datetime(row.get(9)?),
+        phase: row.get(4)?,
+        session_id: row.get(5)?,
+        scratchpad_path: row.get(6)?,
+        created_at: ms_to_datetime(row.get(7)?),
+        updated_at: ms_to_datetime(row.get(8)?),
     })
 }

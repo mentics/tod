@@ -8,18 +8,14 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 
 use super::TaskListEvent;
 use super::TaskListView;
-use super::model::{AgentInfo, TaskItem};
+use super::model::TaskItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RowMenuKind {
-    Agents,
-    AgentsEdit,
-    OpenCode,
     Shells,
-    ShellAgentPick,
 }
 
-/// Anchor a standard popup menu under a row trigger (agents chip, etc.).
+/// Anchor a standard popup menu under a row trigger.
 pub(super) fn row_menu_anchor(
     trigger: impl IntoElement,
     menu: Option<Entity<PopupMenu>>,
@@ -38,46 +34,6 @@ pub(super) fn row_menu_anchor(
 }
 
 impl TaskListView {
-    pub(super) fn toggle_agents_menu(
-        &mut self,
-        task_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::Agents, task_id.to_string())) {
-            // Double-press is handled by the caller (activate first). Keep toggle for chip clicks.
-            self.close_row_menu(cx);
-        } else {
-            self.open_row_menu_for(RowMenuKind::Agents, task_id.to_string(), window, cx);
-        }
-    }
-
-    pub(super) fn toggle_agents_edit_menu(
-        &mut self,
-        task_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::AgentsEdit, task_id.to_string())) {
-            self.close_row_menu(cx);
-        } else {
-            self.open_row_menu_for(RowMenuKind::AgentsEdit, task_id.to_string(), window, cx);
-        }
-    }
-
-    pub(super) fn toggle_open_code_menu(
-        &mut self,
-        task_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::OpenCode, task_id.to_string())) {
-            self.close_row_menu(cx);
-        } else {
-            self.open_row_menu_for(RowMenuKind::OpenCode, task_id.to_string(), window, cx);
-        }
-    }
-
     pub(super) fn toggle_shells_menu(
         &mut self,
         task_id: &str,
@@ -88,20 +44,6 @@ impl TaskListView {
             self.close_row_menu(cx);
         } else {
             self.open_row_menu_for(RowMenuKind::Shells, task_id.to_string(), window, cx);
-        }
-    }
-
-    pub(super) fn toggle_shell_agent_picker(
-        &mut self,
-        task_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.open_row_menu.as_ref() == Some(&(RowMenuKind::ShellAgentPick, task_id.to_string()))
-        {
-            self.close_row_menu(cx);
-        } else {
-            self.open_row_menu_for(RowMenuKind::ShellAgentPick, task_id.to_string(), window, cx);
         }
     }
 
@@ -176,66 +118,6 @@ fn build_row_menu(
     view: gpui::WeakEntity<TaskListView>,
 ) -> PopupMenu {
     match kind {
-        RowMenuKind::Agents => {
-            for agent in &task.agents {
-                let view = view.clone();
-                let label = agent_menu_label(agent);
-                let task_id = task.id.clone();
-                let agent_id = agent.id.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_agent_launch(&view, &task_id, &agent_id, cx);
-                }));
-            }
-            let view = view.clone();
-            let task_id = task.id.clone();
-            menu.item(
-                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
-                    activate_agent_config(&view, &task_id, None, cx);
-                }),
-            )
-        }
-        RowMenuKind::AgentsEdit => {
-            for agent in &task.agents {
-                let edit_view = view.clone();
-                let label = format!("Edit · {}", agent_menu_label(agent));
-                let task_id = task.id.clone();
-                let agent_id = agent.id.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_agent_config(&edit_view, &task_id, Some(agent_id.clone()), cx);
-                }));
-                let delete_view = view.clone();
-                let delete_label = format!("Delete · {}", agent_menu_label(agent));
-                let agent_id = agent.id.clone();
-                menu = menu.item(PopupMenuItem::new(delete_label).on_click(move |_, _, cx| {
-                    activate_agent_delete(&delete_view, &agent_id, cx);
-                }));
-            }
-            let view = view.clone();
-            let task_id = task.id.clone();
-            menu.item(
-                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
-                    activate_agent_config(&view, &task_id, None, cx);
-                }),
-            )
-        }
-        RowMenuKind::OpenCode => {
-            for agent in &task.agents {
-                let view = view.clone();
-                let label = agent_menu_label(agent);
-                let task_id = task.id.clone();
-                let agent_id = agent.id.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_open_zed(&view, &task_id, &agent_id, cx);
-                }));
-            }
-            let view = view.clone();
-            let task_id = task.id.clone();
-            menu.item(
-                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
-                    activate_agent_config(&view, &task_id, None, cx);
-                }),
-            )
-        }
         RowMenuKind::Shells => {
             for shell in &task.shells {
                 let view = view.clone();
@@ -243,123 +125,22 @@ fn build_row_menu(
                 let task_id = task.id.clone();
                 let shell_id = shell.id.clone();
                 menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_shell(&view, &task_id, Some(shell_id.clone()), None, cx);
+                    activate_shell(&view, &task_id, Some(shell_id.clone()), cx);
                 }));
             }
             let view = view.clone();
             let task_id = task.id.clone();
-            let first_agent = task.agents.first().map(|a| a.id.clone());
             menu.item(PopupMenuItem::new("New shell…").on_click(move |_, _, cx| {
-                activate_shell(&view, &task_id, None, first_agent.clone(), cx);
+                activate_shell(&view, &task_id, None, cx);
             }))
         }
-        RowMenuKind::ShellAgentPick => {
-            for agent in &task.agents {
-                let view = view.clone();
-                let label = agent_menu_label(agent);
-                let task_id = task.id.clone();
-                let agent_id = agent.id.clone();
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    activate_shell(&view, &task_id, None, Some(agent_id.clone()), cx);
-                }));
-            }
-            let view = view.clone();
-            let task_id = task.id.clone();
-            menu.item(
-                PopupMenuItem::new("New action config…").on_click(move |_, _, cx| {
-                    activate_agent_config(&view, &task_id, None, cx);
-                }),
-            )
-        }
     }
-}
-
-fn agent_menu_label(agent: &AgentInfo) -> String {
-    let base = format!("{} · {}", agent.label, format_status_label(&agent.status));
-    if agent.inherited {
-        format!("↑ {base} (from parent)")
-    } else {
-        base
-    }
-}
-
-fn format_status_label(status: &str) -> &str {
-    match status {
-        "starting" => "Starting",
-        "processing" => "Processing",
-        "waiting" => "Waiting",
-        "blocked" => "Blocked",
-        "not_running" => "Not running",
-        other => other,
-    }
-}
-
-fn activate_agent_launch(
-    view: &gpui::WeakEntity<TaskListView>,
-    task_id: &str,
-    agent_id: &str,
-    cx: &mut App,
-) {
-    let Some(entity) = view.upgrade() else {
-        return;
-    };
-    entity.update(cx, |this, cx| {
-        this.close_row_menu(cx);
-        cx.emit(TaskListEvent::LaunchOrFocusAgent {
-            task_id: task_id.to_string(),
-            config_id: agent_id.to_string(),
-        });
-        this.set_status_message(format!("Launching agent {agent_id}"), cx);
-    });
-}
-
-fn activate_agent_delete(view: &gpui::WeakEntity<TaskListView>, agent_id: &str, cx: &mut App) {
-    let Some(entity) = view.upgrade() else {
-        return;
-    };
-    entity.update(cx, |this, cx| {
-        this.close_row_menu(cx);
-        cx.emit(TaskListEvent::DeleteAgentConfig {
-            config_id: agent_id.to_string(),
-        });
-    });
-}
-
-fn activate_open_zed(
-    view: &gpui::WeakEntity<TaskListView>,
-    task_id: &str,
-    agent_id: &str,
-    cx: &mut App,
-) {
-    let Some(entity) = view.upgrade() else {
-        return;
-    };
-    entity.update(cx, |this, cx| {
-        this.close_row_menu(cx);
-        this.emit_open_zed(task_id, agent_id, cx);
-    });
-}
-
-fn activate_agent_config(
-    view: &gpui::WeakEntity<TaskListView>,
-    task_id: &str,
-    agent_id: Option<String>,
-    cx: &mut App,
-) {
-    let Some(entity) = view.upgrade() else {
-        return;
-    };
-    entity.update(cx, |this, cx| {
-        this.close_row_menu(cx);
-        this.emit_open_agent_config(task_id, agent_id.as_deref(), cx);
-    });
 }
 
 fn activate_shell(
     view: &gpui::WeakEntity<TaskListView>,
     task_id: &str,
     shell_id: Option<String>,
-    agent_id: Option<String>,
     cx: &mut App,
 ) {
     let Some(entity) = view.upgrade() else {
@@ -370,13 +151,14 @@ fn activate_shell(
         cx.emit(TaskListEvent::OpenShell {
             task_id: task_id.to_string(),
             shell_id: shell_id.clone(),
-            agent_id: agent_id.clone(),
         });
-        let msg = match (shell_id, agent_id) {
-            (Some(id), _) => format!("Opened shell {id}"),
-            (None, Some(id)) => format!("Creating shell in agent {id} environment"),
-            (None, None) => "Creating shell…".into(),
-        };
-        this.set_status_message(msg, cx);
+        this.set_status_message(
+            if shell_id.is_some() {
+                "Focusing shell…".to_string()
+            } else {
+                "Opening a new shell…".to_string()
+            },
+            cx,
+        );
     });
 }

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use tod_store::fleet::{FleetStore, ResolvedAgentConfigs};
+use tod_store::fleet::FleetStore;
 use tod_store::outline::types::Capability;
 
-use super::model::{AgentInfo, ShellInfo, TaskItem};
+use super::model::{ShellInfo, TaskItem};
 
 /// Load tree rows from the outline store for `list_id` (or empty when none).
 pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<TaskItem> {
@@ -20,7 +20,6 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
             let is_work = !row.capabilities.is_empty();
             let has_spec = row.capabilities.contains(&Capability::Spec);
             let has_lifecycle = row.capabilities.contains(&Capability::Lifecycle);
-            let has_agent = row.capabilities.contains(&Capability::Agent);
             let counts = counts.get(&row.node.id).copied().unwrap_or_default();
             // Only Lifecycle capability owns a lifecycle chip. Do not invent "proposed"
             // when Agent/Spec alone are enabled.
@@ -30,70 +29,30 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 String::new()
             };
             let node_id = row.node.id.to_string();
-            let resolved =
-                store
-                    .resolve_agents_for_node(&node_id)
-                    .unwrap_or_else(|_| ResolvedAgentConfigs {
-                        queried_node_id: node_id.clone(),
-                        source_node_id: node_id.clone(),
-                        inherited: false,
-                        configs: Vec::new(),
-                    });
-            // Interview-mode configs are auto-provisioned/managed by the interview
-            // flow itself and are not user-facing action configs — keep them out of
-            // the regular agent list/pickers entirely (see CLAUDE.md interview notes).
-            let action_configs: Vec<_> = resolved
-                .configs
-                .iter()
-                .filter(|a| a.mode != "interview")
-                .collect();
-            let agents: Vec<AgentInfo> = action_configs
-                .iter()
-                .map(|a| {
-                    let mut status = a.runtime_status.clone();
-                    if let Ok(runs) = store.list_terminal_agent_runs_for_config(&a.id) {
-                        let terminal_live = runs.iter().any(|run| {
-                            run.reconnect.is_some()
-                                && run.ended_at.is_none()
-                                && run.runtime_status != "not_running"
-                        });
-                        if terminal_live
-                            && matches!(
-                                status.as_str(),
-                                "not_running" | "waiting" | "starting" | "processing"
-                            )
-                        {
-                            status = "processing".into();
-                        }
-                    }
-                    AgentInfo {
-                        id: a.id.clone(),
-                        label: format!(
-                            "{} {}",
-                            env_chip_label(&a.env_type),
-                            mode_chip_label(&a.mode)
-                        ),
-                        status,
-                        inherited: resolved.inherited,
-                    }
+            // Agent and Files inherit from the nearest ancestor that has them.
+            let has_agent = store
+                .resolve_agent_for_node(&node_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let has_files = store
+                .resolve_files_for_node(&node_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let live_run_count = store
+                .list_runs_for_node(&node_id)
+                .map(|runs| runs.iter().filter(|run| run.is_live()).count())
+                .unwrap_or(0);
+            let shells = store
+                .list_shells_for_node(&node_id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|shell| ShellInfo {
+                    label: format!("shell {}", shell.label_number),
+                    id: shell.id,
                 })
                 .collect();
-            let mut shells = Vec::new();
-            for config in &action_configs {
-                if let Ok(sessions) = store.list_shells_for_config(&config.id) {
-                    for shell in sessions {
-                        let label = if action_configs.len() > 1 {
-                            format!("{} · {}", config.id, shell.id)
-                        } else {
-                            shell.id.clone()
-                        };
-                        shells.push(ShellInfo {
-                            id: shell.id,
-                            label,
-                        });
-                    }
-                }
-            }
             TaskItem {
                 id: node_id,
                 ticket_id: row.ticket_id,
@@ -101,7 +60,9 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 lifecycle,
                 entity_path: node_scratchpad_path(&row.node.id.to_string()),
                 tags: row.tags,
-                agents,
+                has_actions: has_agent || has_files,
+                has_files,
+                live_run_count,
                 shells,
                 interaction_timestamp: row.node.updated_at,
                 tree_ordinal: row.tree_ordinal,
@@ -133,24 +94,6 @@ fn node_scratchpad_path(node_id: &str) -> PathBuf {
         .join(node_id)
 }
 
-fn env_chip_label(env_type: &str) -> String {
-    match env_type {
-        "local" => "host".into(),
-        "devcontainer" => "dc".into(),
-        "micro_vm" => "vm".into(),
-        other => other.to_string(),
-    }
-}
-
-fn mode_chip_label(mode: &str) -> String {
-    match mode {
-        "agent" => "auto".into(),
-        "shell" => "interactive".into(),
-        "interview" => "interview".into(),
-        _other => mode.to_string(),
-    }
-}
-
 /// Generate a large in-memory fixture set for list performance tests.
 #[cfg(test)]
 pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
@@ -163,7 +106,9 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             lifecycle: "active".into(),
             entity_path: PathBuf::from(format!("test/scale-{i}")),
             tags: vec![],
-            agents: Vec::new(),
+            has_actions: false,
+            has_files: false,
+            live_run_count: 0,
             shells: Vec::new(),
             interaction_timestamp: Utc::now(),
             tree_ordinal: i,

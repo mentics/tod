@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use tod_core::interview::driver::{DriverConfig, InterviewDriver};
 use tod_core::interview::phase::base_interview_phase;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, interview_session_prefix};
-use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
+use tod_store::fleet::FleetStore;
 use tod_store::interview::Role;
 use uuid::Uuid;
 
@@ -37,7 +37,6 @@ pub enum SessionsEvent {
     OpenAgentChat {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
-        config_id: Option<String>,
     },
 }
 
@@ -146,7 +145,6 @@ impl SessionsView {
 
         // Provisioning does blocking disk/SQLite work, so it runs on the
         // background executor; the spinner paints meanwhile.
-        let paths = self.paths.clone();
         let fleet = self.fleet.clone();
         let phase_owned = phase.to_string();
         let display_name = format!("{entity_label} — {phase_label}");
@@ -154,24 +152,14 @@ impl SessionsView {
         cx.spawn(async move |_, cx| {
             let outcome: Result<InterviewSession, String> = cx
                 .background_spawn(async move {
-                    let settings = TodSettings::load(&paths).map_err(|e| e.to_string())?;
-                    let agent_ctx = ensure_interview_agent_for_node(
-                        &fleet,
-                        &paths,
-                        &settings,
-                        &node_id.to_string(),
-                    )
-                    .map_err(|e| e.to_string())?;
                     SessionStore::open(fleet.clone())
                         .insert_session_with_metadata(
                             NewInterviewSession {
                                 node_id,
-                                agent_config_id: Some(agent_ctx.agent.id.clone()),
                                 display_name,
                                 phase: phase_owned,
                             },
                             InterviewSessionStatus::Active,
-                            Some(agent_ctx.agent.id),
                         )
                         .map_err(|e| e.to_string())
                 })
@@ -239,13 +227,7 @@ impl SessionsView {
             return Ok(driver.clone());
         }
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
-        let agent_ctx = ensure_interview_agent_for_node(
-            &self.fleet,
-            &self.paths,
-            &settings,
-            &session.node_id.to_string(),
-        )
-        .map_err(|e| format!("Interview agent setup failed: {e}"))?;
+        let repo_cwd = self.fleet.files_dir_or_data_root(&session.node_id.to_string());
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
         let manifest = ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
         let prefix = |role| {
@@ -264,11 +246,7 @@ impl SessionsView {
             node_title,
             interview_session_id: session.id,
             phase_key: session.phase.clone(),
-            agent_config_id: session
-                .agent_config_id
-                .clone()
-                .unwrap_or_else(|| agent_ctx.agent.id.clone()),
-            repo_cwd: agent_ctx.cwd,
+            repo_cwd,
             data_root: self.fleet.paths().root().to_path_buf(),
             tod_cli: tod_core::interview::tod_cli_path(),
             launch: settings.interview_launch_options(),
@@ -333,12 +311,10 @@ impl SessionsView {
             WorkspaceEvent::OpenAgentChat {
                 node_id,
                 obligation_id,
-                config_id,
             } => {
                 cx.emit(SessionsEvent::OpenAgentChat {
                     node_id: *node_id,
                     obligation_id: *obligation_id,
-                    config_id: config_id.clone(),
                 });
             }
         });

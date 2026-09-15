@@ -1,6 +1,6 @@
 //! Shared helpers for fleet persistence verification tests.
 
-use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
+use crate::fleet::repos::agent_run::AgentRunRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use rusqlite::Connection;
 use std::fs;
@@ -11,7 +11,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScaleSnapshot {
     pub task_count: usize,
-    pub agent_count: usize,
+    pub run_count: usize,
 }
 
 /// Create a unique ephemeral fleet storage root.
@@ -63,10 +63,10 @@ fn deterministic_task(index: usize) -> FleetTask {
     }
 }
 
-/// Insert ~500 tasks and ~100 agents with deterministic varied fields.
+/// Insert ~500 tasks and ~100 agent runs with deterministic varied fields.
 pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
     const TASK_COUNT: usize = 500;
-    const AGENT_COUNT: usize = 100;
+    const RUN_COUNT: usize = 100;
 
     let mut task_ids = Vec::with_capacity(TASK_COUNT);
     for index in 0..TASK_COUNT {
@@ -77,29 +77,15 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
             .expect("scale task insert");
     }
 
-    for index in 0..AGENT_COUNT {
-        let agent = NewAgent {
-            id: format!("scale-agent-{index:03}"),
-            node_id: task_ids[index % TASK_COUNT].clone(),
-            env_type: if index % 2 == 0 {
-                "local".into()
-            } else {
-                "devcontainer".into()
-            },
-            mode: "agent".into(),
-            work_directory: None,
-            use_worktree: false,
-            platform: "claude".into(),
-            model: "default".into(),
-            effort: "auto".into(),
-        };
-        AgentRepo::new(conn)
-            .insert(&agent)
-            .expect("scale agent insert");
+    for index in 0..RUN_COUNT {
+        let status = if index % 2 == 0 { "waiting" } else { "not_running" };
+        AgentRunRepo::new(conn)
+            .create_run(&task_ids[index % TASK_COUNT], status, "auto")
+            .expect("scale run insert");
     }
 
     ScaleSnapshot {
         task_count: TASK_COUNT,
-        agent_count: AGENT_COUNT,
+        run_count: RUN_COUNT,
     }
 }

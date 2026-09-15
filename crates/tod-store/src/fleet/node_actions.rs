@@ -1,0 +1,356 @@
+//! Resolve a node's Files and Agent capability values.
+//!
+//! Both inherit from the nearest ancestor (or the node itself) that has the
+//! capability enabled; nodes between them without the capability are skipped.
+
+use crate::agent_launch::AgentLaunchOptions;
+use crate::fleet::repos::node_agent::{NodeAgent, NodeAgentRepo};
+use crate::fleet::repos::node_files::NodeFilesRepo;
+use crate::outline::repos::NodeRepo;
+use crate::outline::types::Capability;
+use crate::outline::uuid_blob::uuid_to_blob;
+use crate::settings::{AgentRole, TodSettings};
+use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+/// Files capability values for a node, possibly inherited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFiles {
+    /// Node that owns the Files capability (the node itself unless inherited).
+    pub source_node_id: String,
+    pub source_title: String,
+    pub inherited: bool,
+    /// Workspace directory (`node_fields.repo`).
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub use_worktree: bool,
+    pub worktree_path: Option<String>,
+    pub worktree_lease_id: Option<String>,
+    pub worktree_lease_holder: Option<String>,
+}
+
+/// Where launches from a node run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesDirectory {
+    Ready(PathBuf),
+    /// Worktree flag on, but no worktree has been set up (or it's gone).
+    NeedsWorktreeSetup,
+    /// No usable directory; the reason is user-facing.
+    Missing(String),
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|v| !v.is_empty())
+}
+
+impl ResolvedFiles {
+    pub fn repo(&self) -> Option<&str> {
+        non_empty(&self.repo)
+    }
+
+    pub fn branch(&self) -> Option<&str> {
+        non_empty(&self.branch)
+    }
+
+    /// A worktree has been set up and recorded.
+    pub fn worktree_path(&self) -> Option<&str> {
+        non_empty(&self.worktree_path)
+    }
+
+    /// The resolved directory: the worktree when enabled, else the workspace directory.
+    pub fn directory(&self) -> FilesDirectory {
+        let Some(repo) = self.repo() else {
+            return FilesDirectory::Missing("Set a workspace directory".into());
+        };
+        if self.use_worktree {
+            return match self.worktree_path() {
+                Some(path) if Path::new(path).is_dir() => FilesDirectory::Ready(PathBuf::from(path)),
+                _ => FilesDirectory::NeedsWorktreeSetup,
+            };
+        }
+        let path = PathBuf::from(repo);
+        if path.is_dir() {
+            FilesDirectory::Ready(path)
+        } else {
+            FilesDirectory::Missing(format!("Workspace directory does not exist: {repo}"))
+        }
+    }
+
+    pub fn ready_directory(&self) -> Option<PathBuf> {
+        match self.directory() {
+            FilesDirectory::Ready(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
+/// Agent capability values for a node, possibly inherited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgent {
+    pub source_node_id: String,
+    pub source_title: String,
+    pub inherited: bool,
+    pub agent: NodeAgent,
+}
+
+impl ResolvedAgent {
+    /// Launch options with unset values following the settings for `role`.
+    pub fn launch_options(&self, settings: &TodSettings, role: AgentRole) -> AgentLaunchOptions {
+        self.agent.launch_options(&settings.launch_options_for(role))
+    }
+}
+
+/// Nearest node (starting at `node_id`, walking up) with `cap` enabled.
+fn nearest_with_capability(
+    conn: &Connection,
+    node_id: &str,
+    cap: Capability,
+) -> Result<Option<(Uuid, String, bool)>> {
+    let Ok(uuid) = Uuid::parse_str(node_id) else {
+        return Ok(None);
+    };
+    let chain = crate::outline::ancestor_chain(conn, uuid)?;
+    let node_repo = NodeRepo::new(conn);
+    for id in chain.into_iter().rev() {
+        if node_repo.list_capabilities(id)?.contains(&cap) {
+            let title = node_repo.get(id)?.map(|n| n.title).unwrap_or_default();
+            return Ok(Some((id, title, id != uuid)));
+        }
+    }
+    Ok(None)
+}
+
+pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option<ResolvedFiles>> {
+    let Some((source, source_title, inherited)) =
+        nearest_with_capability(conn, node_id, Capability::Files)?
+    else {
+        return Ok(None);
+    };
+    let source_node_id = source.to_string();
+    let (repo, branch): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT repo, branch FROM node_fields WHERE node_id = ?1",
+            params![uuid_to_blob(source)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or_default();
+    let files = NodeFilesRepo::new(conn).get(&source_node_id)?;
+    Ok(Some(ResolvedFiles {
+        source_title,
+        inherited,
+        repo,
+        branch,
+        use_worktree: files.as_ref().is_some_and(|f| f.use_worktree),
+        worktree_path: files.as_ref().and_then(|f| f.worktree_path.clone()),
+        worktree_lease_id: files.as_ref().and_then(|f| f.worktree_lease_id.clone()),
+        worktree_lease_holder: files.as_ref().and_then(|f| f.worktree_lease_holder.clone()),
+        source_node_id,
+    }))
+}
+
+pub fn resolve_agent_for_node(conn: &Connection, node_id: &str) -> Result<Option<ResolvedAgent>> {
+    let Some((source, source_title, inherited)) =
+        nearest_with_capability(conn, node_id, Capability::Agent)?
+    else {
+        return Ok(None);
+    };
+    let source_node_id = source.to_string();
+    let agent = NodeAgentRepo::new(conn)
+        .get(&source_node_id)?
+        .unwrap_or_else(|| NodeAgent {
+            node_id: source_node_id.clone(),
+            ..NodeAgent::default()
+        });
+    Ok(Some(ResolvedAgent {
+        source_node_id,
+        source_title,
+        inherited,
+        agent,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fleet::store::FleetStore;
+    use crate::fleet::test_util::{cleanup_fleet_root, temp_fleet_root};
+    use crate::fleet::writer::FleetMutation;
+    use crate::outline::{CreatePosition, OutlineMutation};
+
+    struct Tree {
+        root: PathBuf,
+        store: FleetStore,
+        grandparent: Uuid,
+        parent: Uuid,
+        child: Uuid,
+    }
+
+    fn setup_tree() -> Tree {
+        let root = temp_fleet_root();
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: "t".into(),
+                title: "T".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        let mut ids = Vec::new();
+        let mut parent: Option<Uuid> = None;
+        for title in ["Grandparent", "Parent", "Child"] {
+            let node_id = Uuid::new_v4();
+            store
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(node_id),
+                    list_id,
+                    parent_id: parent,
+                    anchor_id: parent,
+                    position: if parent.is_some() {
+                        CreatePosition::Child
+                    } else {
+                        CreatePosition::Below
+                    },
+                    title: title.into(),
+                })
+                .unwrap();
+            store.writer().flush().unwrap();
+            ids.push(node_id);
+            parent = Some(node_id);
+        }
+        store.reload_if_stale().ok();
+        Tree {
+            root,
+            store,
+            grandparent: ids[0],
+            parent: ids[1],
+            child: ids[2],
+        }
+    }
+
+    fn enable(store: &FleetStore, node: Uuid, caps: Vec<Capability>) {
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: caps,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+    }
+
+    fn set_repo(store: &FleetStore, node: Uuid, repo: &str) {
+        store
+            .enqueue(FleetMutation::UpdateTaskRepo {
+                id: node.to_string(),
+                repo: Some(repo.into()),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+    }
+
+    #[test]
+    fn child_inherits_parent_files() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.parent, vec![Capability::Files]);
+        set_repo(&tree.store, tree.parent, "/parent/repo");
+        let files = tree
+            .store
+            .resolve_files_for_node(&tree.child.to_string())
+            .unwrap()
+            .expect("inherited files");
+        assert!(files.inherited);
+        assert_eq!(files.source_node_id, tree.parent.to_string());
+        assert_eq!(files.source_title, "Parent");
+        assert_eq!(files.repo(), Some("/parent/repo"));
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn child_local_capability_overrides_parent() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.parent, vec![Capability::Files]);
+        set_repo(&tree.store, tree.parent, "/parent/repo");
+        enable(&tree.store, tree.child, vec![Capability::Files]);
+        set_repo(&tree.store, tree.child, "/child/repo");
+        let files = tree
+            .store
+            .resolve_files_for_node(&tree.child.to_string())
+            .unwrap()
+            .unwrap();
+        assert!(!files.inherited);
+        assert_eq!(files.repo(), Some("/child/repo"));
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn skips_parent_without_capability_uses_grandparent() {
+        let tree = setup_tree();
+        enable(&tree.store, tree.grandparent, vec![Capability::Agent]);
+        tree.store
+            .enqueue(FleetMutation::UpsertNodeAgent {
+                node_id: tree.grandparent.to_string(),
+                platform: Some("cursor".into()),
+                model: None,
+                effort: None,
+            })
+            .unwrap();
+        enable(&tree.store, tree.parent, vec![Capability::Files]);
+        let agent = tree
+            .store
+            .resolve_agent_for_node(&tree.child.to_string())
+            .unwrap()
+            .expect("grandparent agent");
+        assert!(agent.inherited);
+        assert_eq!(agent.source_node_id, tree.grandparent.to_string());
+        assert_eq!(agent.agent.platform.as_deref(), Some("cursor"));
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn no_capability_in_chain_resolves_nothing() {
+        let tree = setup_tree();
+        assert!(
+            tree.store
+                .resolve_files_for_node(&tree.child.to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tree.store
+                .resolve_agent_for_node(&tree.child.to_string())
+                .unwrap()
+                .is_none()
+        );
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn directory_reflects_worktree_state() {
+        let dir = std::env::temp_dir();
+        let mut files = ResolvedFiles {
+            source_node_id: Uuid::new_v4().to_string(),
+            source_title: "N".into(),
+            inherited: false,
+            repo: None,
+            branch: None,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+        };
+        assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
+        files.repo = Some(dir.display().to_string());
+        assert_eq!(files.directory(), FilesDirectory::Ready(dir.clone()));
+        files.use_worktree = true;
+        assert_eq!(files.directory(), FilesDirectory::NeedsWorktreeSetup);
+        files.worktree_path = Some(dir.display().to_string());
+        assert_eq!(files.directory(), FilesDirectory::Ready(dir));
+    }
+}

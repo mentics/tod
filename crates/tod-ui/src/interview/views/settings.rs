@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tod_core::logging;
 use tod_store::fleet::default_terminal_hint;
-use tod_store::{AgentLaunchOptions, AgentRole, efforts_for, models_for, parse_platform};
+use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -807,10 +807,6 @@ impl SettingsView {
 
     pub fn agent_platform(&self) -> AgentPlatform {
         self.settings.agent_platform
-    }
-
-    pub fn launch_options_for(&self, role: AgentRole) -> AgentLaunchOptions {
-        self.settings.launch_options_for(role)
     }
 
     fn agent_selects(&self, role: AgentRole) -> &AgentRoleSelects {

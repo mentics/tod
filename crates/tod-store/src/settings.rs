@@ -153,9 +153,10 @@ impl AgentLaunchByPlatform {
 /// Which agent a set of platform / model / effort settings is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
-    /// New action configs, and anything without a more specific setting.
+    /// Coding agents launched from a node (unset Agent capability values), and
+    /// anything without a more specific setting.
     Default,
-    /// Action configs created when chatting with an agent from a panel.
+    /// Chatting with an agent from a panel (unset Agent capability values).
     Chat,
     /// Interview question-maker / answer-processor work.
     Interview,
@@ -294,10 +295,10 @@ pub struct TodSettings {
     /// Parent directory for Treehouse worktree pools (`TREEHOUSE_WORKTREES`). When unset, pools live under `TREEHOUSE_HOME`.
     #[serde(default)]
     pub treehouse_worktrees_root: Option<PathBuf>,
-    /// Platform / model / effort for new action configs.
+    /// Platform / model / effort for coding agents, where the node's Agent capability leaves them unset.
     #[serde(default)]
     pub default_agent: AgentRoleSettings,
-    /// Platform / model / effort for action configs created by "chat with agent".
+    /// Platform / model / effort for "chat with agent", where the node's Agent capability leaves them unset.
     #[serde(default)]
     pub chat_agent: AgentRoleSettings,
     /// Where "chat with agent" opens a session: app window or external terminal.

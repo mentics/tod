@@ -1,4 +1,4 @@
-pub mod agent_config_panel;
+pub mod action_panel;
 pub mod agent_transcripts;
 pub mod command_history;
 pub mod database;

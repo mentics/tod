@@ -58,7 +58,7 @@ use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
-use tod_store::fleet::{FleetStore, ensure_interview_agent_for_node};
+use tod_store::fleet::{FleetStore, resolve_launch_cwd};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
@@ -225,10 +225,8 @@ impl LifecyclePanelView {
 
     /// Task ids with a gate check or on-entry run currently in flight, paired
     /// with a short human-readable status — for the task list to show a
-    /// "running" badge on the row even though these turns run against an
-    /// interview-mode agent config that `task_list::fixtures` deliberately
-    /// keeps out of the regular `agents` chip (see its comment there).
-    /// Without this, a gate check would leave no visible trace anywhere in
+    /// "running" badge on the row. These turns aren't recorded as agent runs,
+    /// so without this a gate check would leave no visible trace anywhere in
     /// the task list while it runs.
     pub fn in_flight_activity(&self) -> HashMap<String, String> {
         self.gate_states
@@ -521,56 +519,50 @@ impl LifecyclePanelView {
         cx.notify();
     }
 
-    /// Action configs available to launch implementation against, when the
-    /// current node is in the `active` lifecycle state — mirrors
-    /// `task_list::fixtures::load_tasks_from_store`'s filtering (interview
-    /// configs are not user-facing action configs).
-    fn active_action_configs(&self) -> Vec<tod_store::fleet::AgentConfigRow> {
+    /// Where implementation would run: the node needs a resolved Agent and a
+    /// ready Files directory. `Err` carries the user-facing reason.
+    fn implement_directory(&self) -> Result<std::path::PathBuf, String> {
         let Some(task_id) = self.task_id.as_ref() else {
-            return Vec::new();
+            return Err(String::new());
         };
-        if self.lifecycle != "active" {
-            return Vec::new();
+        if self.fleet.resolve_agent_for_node(task_id).ok().flatten().is_none() {
+            return Err(
+                "Enable the Agent capability on this node (or an ancestor) to implement.".into(),
+            );
         }
-        self.fleet
-            .resolve_agents_for_node(task_id)
-            .map(|resolved| {
-                resolved
-                    .configs
-                    .into_iter()
-                    .filter(|c| c.mode != "interview")
-                    .collect()
-            })
-            .unwrap_or_default()
+        resolve_launch_cwd(&self.fleet, task_id).map_err(|err| format!("{err:#}"))
     }
 
-    /// Whether an `implementation`-kind run is already alive for `config_id`
-    /// — the one-at-a-time lock. Untagged sessions on the same config (e.g.
-    /// a plain chat launched from the action-config panel) are ignored.
-    fn implementation_run_live(&self, config_id: &str) -> Option<String> {
+    /// The node's live `implementation`-kind run, if any — the one-at-a-time
+    /// lock. Other sessions on the node (e.g. a plain chat launched from the
+    /// Action panel) are ignored.
+    fn implementation_run_live(&self) -> Option<String> {
+        let task_id = self.task_id.as_ref()?;
         self.fleet
-            .live_implementation_session_for_config(config_id)
+            .live_implementation_session_for_node(task_id)
             .ok()
             .flatten()
             .map(|run| run.id)
     }
 
-    /// Launch (or, if one is already live, report) the special
-    /// `implementation`-kind session for `config_id` — see module docs on
-    /// `active_action_configs` and `crate::app::InteractiveAgentWindowControl::
+    /// Launch (or, if one is already live, report) the node's
+    /// `implementation`-kind session — see `crate::app::InteractiveAgentWindowControl::
     /// create_and_open_implementation_session`. Assembles the initial context
     /// (plan + full obligation hierarchy) via `tod_core::agent_context` and
     /// sends it with the session's first turn, same mechanism as any other
     /// in-window agent chat.
-    fn launch_implementation(&mut self, config_id: String, cx: &mut Context<Self>) {
+    fn launch_implementation(&mut self, cx: &mut Context<Self>) {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        if let Some(run_id) = self.implementation_run_live(&config_id) {
-            self.implement_status.insert(
-                task_id,
-                format!("Already implementing on {config_id} ({run_id})."),
-            );
+        if let Some(run_id) = self.implementation_run_live() {
+            self.implement_status
+                .insert(task_id, format!("Already implementing ({run_id})."));
+            cx.notify();
+            return;
+        }
+        if let Err(reason) = self.implement_directory() {
+            self.implement_status.insert(task_id, reason);
             cx.notify();
             return;
         }
@@ -629,14 +621,13 @@ impl LifecyclePanelView {
             Ok(context) => {
                 match self.interactive_window.create_and_open_implementation_session(
                     &task_id,
-                    &config_id,
                     tod_core::agent_context::IMPLEMENT_CONTEXT_KEY,
                     context,
                     cx,
                 ) {
                     Ok(run_id) => {
                         self.implement_status
-                            .insert(task_id, format!("Implementing on {config_id} ({run_id})."));
+                            .insert(task_id, format!("Implementing ({run_id})."));
                     }
                     Err(err) => {
                         self.implement_status
@@ -852,8 +843,14 @@ impl LifecyclePanelView {
         let mut criteria_catalog: Vec<GateCriterion> = Vec::new();
         let result: anyhow::Result<(SessionTurn, String)> = (|| {
             let settings = TodSettings::load(&self.paths).unwrap_or_default();
-            let agent_ctx =
-                ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, &task_id)?;
+            let cwd = self.fleet.files_dir_or_data_root(&task_id);
+            let options = self
+                .fleet
+                .resolve_agent_for_node(&task_id)
+                .ok()
+                .flatten()
+                .map(|agent| agent.launch_options(&settings, AgentRole::Default))
+                .unwrap_or_else(|| settings.launch_options_for(AgentRole::Default));
             let criteria =
                 self.fleet
                     .gate_criteria_for_transition(node_id, &from_state, &to_state)?;
@@ -914,9 +911,9 @@ impl LifecyclePanelView {
                 format!("Gate check: {node_title} ({from_state} \u{2192} {to_state})");
             let turn = SessionTurn {
                 key: format!("gate-check-{}", uuid::Uuid::new_v4()),
-                agent_config_id: agent_ctx.agent.id.clone(),
-                cwd: agent_ctx.cwd,
-                options: settings.launch_options_for(AgentRole::Default),
+                owner_id: task_id.to_string(),
+                cwd,
+                options,
                 resume_session_id: None,
                 opening: Some(SessionOpening {
                     title: session_title,
@@ -1007,8 +1004,14 @@ impl LifecyclePanelView {
 
         let result: anyhow::Result<SessionTurn> = (|| {
             let settings = TodSettings::load(&self.paths).unwrap_or_default();
-            let agent_ctx =
-                ensure_interview_agent_for_node(&self.fleet, &self.paths, &settings, &task_id)?;
+            let cwd = self.fleet.files_dir_or_data_root(&task_id);
+            let options = self
+                .fleet
+                .resolve_agent_for_node(&task_id)
+                .ok()
+                .flatten()
+                .map(|agent| agent.launch_options(&settings, AgentRole::Default))
+                .unwrap_or_else(|| settings.launch_options_for(AgentRole::Default));
             let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
             let body = self
                 .fleet
@@ -1062,9 +1065,9 @@ impl LifecyclePanelView {
             )?;
             Ok(SessionTurn {
                 key: format!("on-entry-{}", uuid::Uuid::new_v4()),
-                agent_config_id: agent_ctx.agent.id.clone(),
-                cwd: agent_ctx.cwd,
-                options: settings.launch_options_for(AgentRole::Default),
+                owner_id: task_id.to_string(),
+                cwd,
+                options,
                 resume_session_id: None,
                 opening: Some(SessionOpening {
                     title: format!("On entry: {title} ({lifecycle})"),
@@ -1391,7 +1394,8 @@ impl Render for LifecyclePanelView {
             );
 
             if self.lifecycle == "active" {
-                let configs = self.active_action_configs();
+                let directory = self.implement_directory();
+                let live_run = self.implementation_run_live();
                 let implement_status = self
                     .task_id
                     .as_ref()
@@ -1401,50 +1405,35 @@ impl Render for LifecyclePanelView {
                     div()
                         .text_xs()
                         .font_semibold()
-                        .child("Action configs"),
+                        .child("Implementation"),
                 );
-                if configs.is_empty() {
-                    body = body.child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("No action configs on this node yet."),
-                    );
+                let (detail, blocked) = match &directory {
+                    Ok(dir) => (format!("Runs in {}", dir.display()), false),
+                    Err(reason) => (reason.clone(), true),
+                };
+                let label = if live_run.is_some() {
+                    "Implementing…"
                 } else {
-                    for config in configs {
-                        let config_id = config.id.clone();
-                        let live_run = self.implementation_run_live(&config_id);
-                        let label = match &live_run {
-                            Some(_) => format!("Implementing… ({})", config.id),
-                            None => format!("Implement ({})", config.id),
-                        };
-                        let row_id = format!("lifecycle-panel-implement-row-{}", config.id);
-                        let button_id = format!("lifecycle-panel-implement-{}", config.id);
-                        body = body.child(
-                            h_flex()
-                                .w_full()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    div().flex_1().text_xs().child(selectable_text(
-                                        gpui::SharedString::from(row_id),
-                                        format!("{} · {}", config.env_type, config.mode),
-                                        window,
-                                        cx,
-                                    )),
-                                )
-                                .child(
-                                    Button::new(gpui::SharedString::from(button_id))
-                                        .label(label)
-                                        .ghost()
-                                        .disabled(live_run.is_some())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.launch_implementation(config_id.clone(), cx);
-                                        })),
-                                ),
-                        );
-                    }
-                }
+                    "Implement"
+                };
+                body = body.child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        .child(div().flex_1().text_xs().text_color(muted).child(
+                            selectable_text("lifecycle-panel-implement-detail", detail, window, cx),
+                        ))
+                        .child(
+                            Button::new("lifecycle-panel-implement")
+                                .label(label)
+                                .ghost()
+                                .disabled(blocked || live_run.is_some())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.launch_implementation(cx);
+                                })),
+                        ),
+                );
                 if let Some(status) = implement_status {
                     body = body.child(div().text_xs().text_color(muted).child(selectable_text(
                         "lifecycle-panel-implement-status",

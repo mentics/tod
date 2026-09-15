@@ -103,7 +103,6 @@ pub enum WorkspaceEvent {
     OpenAgentChat {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
-        config_id: Option<String>,
     },
 }
 
@@ -267,16 +266,13 @@ impl WorkspaceView {
                 ObligationsEvent::OpenAgentChat {
                     node_id,
                     obligation_id,
-                    config_id,
                 } => {
                     cx.emit(WorkspaceEvent::OpenAgentChat {
                         node_id: *node_id,
                         obligation_id: *obligation_id,
-                        config_id: config_id.clone(),
                     });
                 }
                 ObligationsEvent::DeleteSelectedTask
-                | ObligationsEvent::OpenAgentConfig { .. }
                 | ObligationsEvent::OpenVisualDesign { .. }
                 | ObligationsEvent::RewritePreV3 { .. } => {}
             },

@@ -53,7 +53,8 @@ pub enum VisualDesignPanelEvent {
 /// (mirroring `open_obligations_agent_chat`'s call into
 /// `InteractiveAgentWindowControl`).
 pub struct EmbeddedChatParams {
-    pub config_id: String,
+    /// Node the chat is launched from.
+    pub node_id: String,
     pub session_run_id: String,
     pub fleet: Arc<FleetStore>,
     pub agent: SharedAgent,
@@ -154,7 +155,7 @@ impl VisualDesignPanelView {
 
         let view = cx.new(|cx| {
             InteractiveAgentView::new(
-                chat.config_id,
+                chat.node_id,
                 chat.session_run_id,
                 chat.fleet,
                 chat.agent,

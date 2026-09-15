@@ -1,13 +1,13 @@
-//! Seed `.local/test/zed-verify` with one task + agent config for socket smoke tests.
+//! Seed `.local/test/zed-verify` with one task with Files enabled for socket smoke tests.
 //!
 //! ```bash
 //! cargo run -p tod-store --example seed_zed_sandbox
 //! ```
 
 use std::path::PathBuf;
-use tod_store::fleet::repos::agent_config::NewAgentConfig;
 use tod_store::fleet::repos::task::FleetTask;
 use tod_store::fleet::{FleetMutation, FleetStore};
+use tod_store::outline::{OutlineMutation, types::Capability};
 
 fn main() -> anyhow::Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -27,8 +27,8 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
 
     let store = FleetStore::open(&root)?;
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let config_id = "zed-smoke-cfg".to_string();
+    let node_id = uuid::Uuid::new_v4();
+    let task_id = node_id.to_string();
 
     store.enqueue(FleetMutation::InsertTask {
         task: FleetTask {
@@ -46,24 +46,14 @@ fn main() -> anyhow::Result<()> {
     })?;
     store.writer().flush()?;
 
-    store.enqueue(FleetMutation::InsertAgent {
-        agent: NewAgentConfig {
-            id: config_id.clone(),
-            node_id: task_id.clone(),
-            env_type: "local".into(),
-            mode: "agent".into(),
-            work_directory: Some(workspace.display().to_string()),
-            use_worktree: false,
-            platform: "claude".into(),
-            model: "auto".into(),
-            effort: "auto".into(),
-        },
+    store.enqueue_outline(OutlineMutation::EnableCapabilities {
+        node_id,
+        capabilities: vec![Capability::Files],
     })?;
     store.writer().flush()?;
 
     println!("seeded {}", root.display());
     println!("task_id={task_id}");
-    println!("config_id={config_id}");
     println!("cwd={}", workspace.display());
     Ok(())
 }

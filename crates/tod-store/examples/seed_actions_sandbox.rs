@@ -1,7 +1,8 @@
-//! Seed parent+child outline with Agent and Files capabilities only on the parent.
+//! Seed a parent+child outline whose parent has Agent, Files, and Ticket pointing
+//! at a throwaway git repo, for live-testing worktrees, shells, chat, and editors.
 //!
 //! ```bash
-//! cargo run -p tod-store --example seed_inherit_sandbox
+//! cargo run -p tod-store --example seed_actions_sandbox -- <data-root> <git-repo>
 //! ```
 
 use std::path::PathBuf;
@@ -9,16 +10,9 @@ use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::outline::{CreatePosition, OutlineMutation, types::Capability};
 
 fn main() -> anyhow::Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(".local/test/inherit-verify");
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()?;
-    let workspace = {
-        let text = workspace.display().to_string();
-        PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
-    };
+    let mut args = std::env::args().skip(1);
+    let root = PathBuf::from(args.next().expect("usage: <data-root> <git-repo>"));
+    let repo = PathBuf::from(args.next().expect("usage: <data-root> <git-repo>"));
 
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
@@ -27,8 +21,8 @@ fn main() -> anyhow::Result<()> {
 
     let store = FleetStore::open(&root)?;
     store.enqueue_outline(OutlineMutation::CreateList {
-        slug: "inherit".into(),
-        title: "Inherit".into(),
+        slug: "actions".into(),
+        title: "Actions".into(),
     })?;
     store.writer().flush()?;
     let list_id = store.list_outline_lists()?[0].id;
@@ -39,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         parent_id: None,
         anchor_id: None,
         position: CreatePosition::Below,
-        title: "Parent project".into(),
+        title: "Actions project".into(),
     })?;
     store.writer().flush()?;
     store.reload_if_stale().ok();
@@ -47,15 +41,21 @@ fn main() -> anyhow::Result<()> {
 
     store.enqueue_outline(OutlineMutation::EnableCapabilities {
         node_id: parent_id,
-        capabilities: vec![Capability::Agent, Capability::Files, Capability::Lifecycle],
+        capabilities: vec![Capability::Agent, Capability::Files, Capability::Ticket],
     })?;
     store.enqueue(FleetMutation::UpdateTaskRepo {
         id: parent_id.to_string(),
-        repo: Some(workspace.display().to_string()),
+        repo: Some(repo.display().to_string()),
     })?;
     store.enqueue(FleetMutation::UpdateTaskBranch {
         id: parent_id.to_string(),
-        branch: Some("main".into()),
+        branch: Some("feature-x".into()),
+    })?;
+    store.enqueue(FleetMutation::UpsertNodeAgent {
+        node_id: parent_id.to_string(),
+        platform: Some("claude".into()),
+        model: Some("fable".into()),
+        effort: Some("high".into()),
     })?;
     store.writer().flush()?;
 
@@ -77,27 +77,8 @@ fn main() -> anyhow::Result<()> {
         .node
         .id;
 
-    let files = store
-        .resolve_files_for_node(&child_id.to_string())?
-        .expect("child should inherit parent Files");
-    assert!(files.inherited, "child should inherit parent Files");
-    assert_eq!(files.source_node_id, parent_id.to_string());
-    let agent = store
-        .resolve_agent_for_node(&child_id.to_string())?
-        .expect("child should inherit parent Agent");
-    assert!(agent.inherited, "child should inherit parent Agent");
-
     println!("seeded {}", root.display());
     println!("parent_id={parent_id}");
     println!("child_id={child_id}");
-    println!("cwd={}", workspace.display());
-
-    std::fs::write(
-        root.join("ids.txt"),
-        format!(
-            "parent_id={parent_id}\nchild_id={child_id}\ncwd={}\n",
-            workspace.display()
-        ),
-    )?;
     Ok(())
 }

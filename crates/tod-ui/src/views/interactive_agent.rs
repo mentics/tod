@@ -54,7 +54,8 @@ struct PendingRun {
 }
 
 pub struct InteractiveAgentView {
-    config_id: String,
+    node_id: String,
+    node_title: String,
     session_run_id: String,
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
@@ -103,7 +104,7 @@ pub struct InteractiveAgentView {
 
 impl InteractiveAgentView {
     pub fn new(
-        config_id: String,
+        node_id: String,
         session_run_id: String,
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
@@ -121,12 +122,19 @@ impl InteractiveAgentView {
             .map(|turns| conversation_from_transcript(&turns))
             .unwrap_or_default();
 
-        // Always the app's current "Chat with agent" default, not whatever
-        // platform/model/effort happens to be stored on the agent config row —
-        // the settings are the single source of truth for a chat session.
-        let launch = settings.launch_options_for(AgentRole::Chat);
-
+        // The run records the platform/model/effort it was started with; a run
+        // without that record follows the "Chat with agent" settings.
+        let node_title = fleet
+            .get_node(&node_id)
+            .ok()
+            .flatten()
+            .map(|node| node.title)
+            .unwrap_or_default();
         let run = fleet.get_run(&session_run_id).ok().flatten();
+        let launch = run
+            .as_ref()
+            .and_then(|run| run.launch_options())
+            .unwrap_or_else(|| settings.launch_options_for(AgentRole::Chat));
         let session_name = run
             .as_ref()
             .and_then(|run| run.session_name.clone())
@@ -159,7 +167,8 @@ impl InteractiveAgentView {
             None
         };
         let view = Self {
-            config_id,
+            node_id,
+            node_title,
             session_run_id,
             fleet,
             agent,
@@ -308,6 +317,15 @@ impl InteractiveAgentView {
         })
     }
 
+    /// The platform/model/effort this session was started with.
+    fn launch_options(&self) -> tod_store::AgentLaunchOptions {
+        tod_store::AgentLaunchOptions {
+            platform: parse_platform(&self.platform).unwrap_or(self.settings.agent_platform),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+        }
+    }
+
     fn fail_submit(&mut self, message: String, cx: &mut Context<Self>) {
         self.pending = None;
         self.error_banner = Some(message);
@@ -350,9 +368,8 @@ impl InteractiveAgentView {
 
         if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
             id: prompt_id.clone(),
-            agent_id: self.config_id.clone(),
+            run_id: session_run_id.clone(),
             content: text.clone(),
-            run_id: Some(session_run_id.clone()),
         }) {
             self.fail_submit(format!("Fleet: {err}"), cx);
             return;
@@ -364,12 +381,10 @@ impl InteractiveAgentView {
 
         let provider_run = match self.agent.lock() {
             Ok(mut provider) => {
-                // Same rule as construction: always the current settings
-                // default, never a stale value from the agent config row.
-                let options = self.settings.launch_options_for(AgentRole::Chat);
+                let options = self.launch_options();
                 provider.send_session_turn(SessionTurn {
                     key: session_run_id,
-                    agent_config_id: self.config_id.clone(),
+                    owner_id: self.node_id.clone(),
                     cwd: self.workspace_cwd.clone(),
                     options,
                     resume_session_id: self.agent_session_id.clone(),
@@ -457,10 +472,9 @@ impl InteractiveAgentView {
                     .push((user_text.clone(), assistant.clone()));
                 if let Err(err) = self.fleet.enqueue(FleetMutation::CompleteResponse {
                     response_id,
-                    agent_id: self.config_id.clone(),
+                    run_id: self.session_run_id.clone(),
                     content: assistant,
                     prompt_id,
-                    run_id: Some(self.session_run_id.clone()),
                 }) {
                     self.error_banner = Some(format!("Fleet: {err}"));
                 } else {
@@ -814,9 +828,9 @@ impl Render for InteractiveAgentView {
                             .gap_x_4()
                             .gap_y_1()
                             .child(render_header_field(
-                                "interactive-agent-header-agent",
-                                "Agent",
-                                self.config_id.clone(),
+                                "interactive-agent-header-task",
+                                "Task",
+                                self.node_title.clone(),
                                 foreground,
                                 muted,
                                 window,

@@ -1,7 +1,9 @@
 use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
+use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::node_agent::NodeAgentRepo;
+use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
@@ -67,45 +69,28 @@ pub enum FleetMutation {
     DeleteTask {
         id: String,
     },
-    // --- Agent (debounced) ---
-    UpdateAgentWorktree {
-        id: String,
-        worktree_path: Option<String>,
+    // --- Files capability (immediate) ---
+    /// Set the node's worktree flag (workspace dir / branch use `UpdateTaskRepo` / `UpdateTaskBranch`).
+    SetNodeUseWorktree {
+        node_id: String,
+        use_worktree: bool,
     },
-    UpdateAgentWorktreeDetails {
-        id: String,
+    /// Record (or clear, with `None`s) the node's set-up worktree.
+    UpdateNodeWorktree {
+        node_id: String,
         worktree_path: Option<String>,
         worktree_lease_id: Option<String>,
         worktree_lease_holder: Option<String>,
     },
-    // --- Agent (immediate) ---
-    InsertAgent {
-        agent: NewAgentConfig,
+    // --- Agent capability (immediate) ---
+    /// Platform / model / effort for a node; `None` follows settings.
+    UpsertNodeAgent {
+        node_id: String,
+        platform: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
     },
-    UpdateAgentConfig {
-        id: String,
-        env_type: String,
-        mode: String,
-        work_directory: Option<String>,
-        use_worktree: bool,
-        platform: String,
-        model: String,
-        effort: String,
-    },
-    DeleteAgent {
-        id: String,
-    },
-    UpdateAgentRuntimeStatus {
-        id: String,
-        runtime_status: String,
-    },
-    UpdateAgentReconnect {
-        id: String,
-        identity: ReconnectIdentity,
-    },
-    ClearAgentReconnect {
-        id: String,
-    },
+    // --- Agent runs (immediate) ---
     UpdateAgentRunReconnect {
         run_id: String,
         identity: ReconnectIdentity,
@@ -118,11 +103,14 @@ pub enum FleetMutation {
         runtime_status: String,
     },
     CreateAgentRun {
-        config_id: String,
+        node_id: String,
         run_kind: Option<String>,
         /// Human-readable name, for interactive chat sessions.
         #[serde(default)]
         session_name: Option<String>,
+        /// Platform / model / effort the run starts with.
+        #[serde(default)]
+        launch: Option<AgentLaunchOptions>,
     },
     /// Record the agent-side session id behind an interactive chat run.
     SetAgentRunSessionId {
@@ -139,40 +127,38 @@ pub enum FleetMutation {
     /// Paired: sent prompt + **processing**.
     SendPrompt {
         id: String,
-        agent_id: String,
+        run_id: String,
         content: String,
-        run_id: Option<String>,
     },
     /// Paired: response + **waiting** + prompt **complete**.
     CompleteResponse {
         response_id: String,
-        agent_id: String,
+        run_id: String,
         content: String,
         prompt_id: String,
-        run_id: Option<String>,
     },
     /// Insert prompt without status side-effect (legacy / testing).
     InsertPromptTurn {
         id: String,
-        agent_id: String,
+        run_id: String,
         content: String,
     },
-    MarkAgentPromptsInterrupted {
-        agent_id: String,
+    MarkRunPromptsInterrupted {
+        run_id: String,
     },
     // --- Notification (immediate) ---
     CreateNotification {
         id: String,
         message: String,
         related_task_id: Option<String>,
-        related_agent_ids: Vec<String>,
+        related_run_ids: Vec<String>,
     },
-    /// Paired: blocked notification + agent **blocked**.
+    /// Paired: blocked notification + run **blocked**.
     CreateBlockedNotification {
         id: String,
         message: String,
         related_task_id: Option<String>,
-        agent_id: String,
+        run_id: String,
     },
     ResolveNotification {
         id: String,
@@ -180,7 +166,7 @@ pub enum FleetMutation {
     // --- Shell (immediate) ---
     CreateShellSession {
         id: String,
-        agent_id: String,
+        node_id: String,
         reconnect: Option<ReconnectIdentity>,
     },
     DismissShellSession {
@@ -196,7 +182,6 @@ pub enum FleetMutation {
         id: uuid::Uuid,
         new_session: crate::fleet::repos::interview_session::NewInterviewSession,
         status: String,
-        agent_config_id: Option<String>,
     },
     UpdateInterviewSessionScaffolding {
         id: uuid::Uuid,
@@ -209,18 +194,6 @@ pub enum FleetMutation {
     },
 }
 
-fn resolve_or_create_run(conn: &Connection, config_id: &str) -> Result<String> {
-    let run_repo = AgentRunRepo::new(conn);
-    if let Some(run) = run_repo.latest_auto_run(config_id)? {
-        if run.runtime_status != "not_running" {
-            return Ok(run.id);
-        }
-    }
-    run_repo
-        .create_run(config_id, "starting", "auto")
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
 impl FleetMutation {
     pub fn is_immediate(&self) -> bool {
         if let FleetMutation::Outline(m) = self {
@@ -229,12 +202,9 @@ impl FleetMutation {
         matches!(
             self,
             FleetMutation::DeleteTask { .. }
-                | FleetMutation::DeleteAgent { .. }
-                | FleetMutation::InsertAgent { .. }
-                | FleetMutation::UpdateAgentConfig { .. }
-                | FleetMutation::UpdateAgentRuntimeStatus { .. }
-                | FleetMutation::UpdateAgentReconnect { .. }
-                | FleetMutation::ClearAgentReconnect { .. }
+                | FleetMutation::SetNodeUseWorktree { .. }
+                | FleetMutation::UpdateNodeWorktree { .. }
+                | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
                 | FleetMutation::ClearAgentRunReconnect { .. }
                 | FleetMutation::UpdateAgentRunRuntimeStatus { .. }
@@ -245,7 +215,7 @@ impl FleetMutation {
                 | FleetMutation::SendPrompt { .. }
                 | FleetMutation::CompleteResponse { .. }
                 | FleetMutation::InsertPromptTurn { .. }
-                | FleetMutation::MarkAgentPromptsInterrupted { .. }
+                | FleetMutation::MarkRunPromptsInterrupted { .. }
                 | FleetMutation::CreateNotification { .. }
                 | FleetMutation::CreateBlockedNotification { .. }
                 | FleetMutation::ResolveNotification { .. }
@@ -302,57 +272,37 @@ impl FleetMutation {
             FleetMutation::DeleteTask { id } => {
                 TaskRepo::new(conn).delete(id)?;
             }
-            FleetMutation::UpdateAgentWorktree { id, worktree_path } => {
-                AgentConfigRepo::new(conn).update_worktree(id, worktree_path.as_deref())?;
+            FleetMutation::SetNodeUseWorktree {
+                node_id,
+                use_worktree,
+            } => {
+                NodeFilesRepo::new(conn).set_use_worktree(node_id, *use_worktree)?;
             }
-            FleetMutation::UpdateAgentWorktreeDetails {
-                id,
+            FleetMutation::UpdateNodeWorktree {
+                node_id,
                 worktree_path,
                 worktree_lease_id,
                 worktree_lease_holder,
             } => {
-                AgentConfigRepo::new(conn).update_worktree_details(
-                    id,
+                NodeFilesRepo::new(conn).update_worktree(
+                    node_id,
                     worktree_path.as_deref(),
                     worktree_lease_id.as_deref(),
                     worktree_lease_holder.as_deref(),
                 )?;
             }
-            FleetMutation::InsertAgent { agent } => {
-                AgentConfigRepo::new(conn).insert(agent)?;
-            }
-            FleetMutation::UpdateAgentConfig {
-                id,
-                env_type,
-                mode,
-                work_directory,
-                use_worktree,
+            FleetMutation::UpsertNodeAgent {
+                node_id,
                 platform,
                 model,
                 effort,
             } => {
-                AgentConfigRepo::new(conn).update_fields(
-                    id,
-                    env_type,
-                    mode,
-                    work_directory.as_deref(),
-                    *use_worktree,
-                    platform,
-                    model,
-                    effort,
+                NodeAgentRepo::new(conn).upsert(
+                    node_id,
+                    platform.as_deref(),
+                    model.as_deref(),
+                    effort.as_deref(),
                 )?;
-            }
-            FleetMutation::DeleteAgent { id } => {
-                AgentConfigRepo::new(conn).delete_cascade(id)?;
-            }
-            FleetMutation::UpdateAgentRuntimeStatus { id, runtime_status } => {
-                AgentConfigRepo::new(conn).update_runtime_status(id, runtime_status)?;
-            }
-            FleetMutation::UpdateAgentReconnect { id, identity } => {
-                AgentConfigRepo::new(conn).update_reconnect(id, *identity)?;
-            }
-            FleetMutation::ClearAgentReconnect { id } => {
-                AgentConfigRepo::new(conn).clear_reconnect(id)?;
             }
             FleetMutation::UpdateAgentRunReconnect { run_id, identity } => {
                 AgentRunRepo::new(conn).update_reconnect(run_id, *identity)?;
@@ -367,16 +317,18 @@ impl FleetMutation {
                 AgentRunRepo::new(conn).update_runtime_status(run_id, runtime_status)?;
             }
             FleetMutation::CreateAgentRun {
-                config_id,
+                node_id,
                 run_kind,
                 session_name,
+                launch,
             } => {
                 let kind = run_kind.as_deref().unwrap_or("auto");
                 AgentRunRepo::new(conn).create_named_run(
-                    config_id,
+                    node_id,
                     "waiting",
                     kind,
                     session_name.as_deref(),
+                    launch.as_ref(),
                 )?;
             }
             FleetMutation::SetAgentRunSessionId {
@@ -393,71 +345,58 @@ impl FleetMutation {
             }
             FleetMutation::SendPrompt {
                 id,
-                agent_id,
-                content,
                 run_id,
+                content,
             } => {
-                let run_id = match run_id {
-                    Some(run_id) => run_id.clone(),
-                    None => resolve_or_create_run(conn, agent_id)?,
-                };
-                TranscriptRepo::new(conn).send_prompt(id, &run_id, content)?;
+                TranscriptRepo::new(conn).send_prompt(id, run_id, content)?;
             }
             FleetMutation::CompleteResponse {
                 response_id,
-                agent_id,
+                run_id,
                 content,
                 prompt_id,
-                run_id,
             } => {
-                let run_id = match run_id {
-                    Some(run_id) => run_id.clone(),
-                    None => resolve_or_create_run(conn, agent_id)?,
-                };
                 TranscriptRepo::new(conn).complete_response(
                     response_id,
-                    &run_id,
+                    run_id,
                     content,
                     prompt_id,
                 )?;
             }
             FleetMutation::InsertPromptTurn {
                 id,
-                agent_id,
+                run_id,
                 content,
             } => {
-                let run_id = resolve_or_create_run(conn, agent_id)?;
-                TranscriptRepo::new(conn).insert_prompt(id, &run_id, content)?;
+                TranscriptRepo::new(conn).insert_prompt(id, run_id, content)?;
             }
-            FleetMutation::MarkAgentPromptsInterrupted { agent_id } => {
-                if let Some(run) = AgentRunRepo::new(conn).latest_run(agent_id)? {
-                    TranscriptRepo::new(conn).mark_incomplete_prompts_interrupted(&run.id)?;
-                }
+            FleetMutation::MarkRunPromptsInterrupted { run_id } => {
+                TranscriptRepo::new(conn).mark_incomplete_prompts_interrupted(run_id)?;
             }
             FleetMutation::CreateNotification {
                 id,
                 message,
                 related_task_id,
-                related_agent_ids,
+                related_run_ids,
             } => {
                 NotificationRepo::new(conn).create(
                     id,
                     message,
                     related_task_id.as_deref(),
-                    related_agent_ids,
+                    related_run_ids,
                 )?;
             }
             FleetMutation::CreateBlockedNotification {
                 id,
                 message,
                 related_task_id,
-                agent_id,
+                run_id,
             } => {
                 NotificationRepo::new(conn).create_blocked(
                     id,
                     message,
                     related_task_id.as_deref(),
-                    agent_id,
+                    run_id,
                 )?;
             }
             FleetMutation::ResolveNotification { id } => {
@@ -465,10 +404,10 @@ impl FleetMutation {
             }
             FleetMutation::CreateShellSession {
                 id,
-                agent_id,
+                node_id,
                 reconnect,
             } => {
-                ShellRepo::new(conn).create(id, agent_id, *reconnect)?;
+                ShellRepo::new(conn).create(id, node_id, *reconnect)?;
             }
             FleetMutation::DismissShellSession { id } => {
                 ShellRepo::new(conn).dismiss(id)?;
@@ -480,19 +419,12 @@ impl FleetMutation {
                 id,
                 new_session,
                 status,
-                agent_config_id,
             } => {
                 use crate::fleet::repos::interview_session::{
-                    InterviewSessionRepo, InterviewSessionStatus, NewInterviewSession,
+                    InterviewSessionRepo, InterviewSessionStatus,
                 };
                 let status = InterviewSessionStatus::from_str(status)?;
-                let session = NewInterviewSession {
-                    agent_config_id: agent_config_id
-                        .clone()
-                        .or(new_session.agent_config_id.clone()),
-                    ..new_session.clone()
-                };
-                InterviewSessionRepo::new(conn).insert_with_id(*id, session, status)?;
+                InterviewSessionRepo::new(conn).insert_with_id(*id, new_session.clone(), status)?;
             }
             FleetMutation::UpdateInterviewSessionScaffolding {
                 id,
@@ -1036,9 +968,8 @@ mod tests {
         assert!(
             FleetMutation::SendPrompt {
                 id: "p".into(),
-                agent_id: "a".into(),
+                run_id: "r".into(),
                 content: "hi".into(),
-                run_id: None,
             }
             .is_immediate()
         );

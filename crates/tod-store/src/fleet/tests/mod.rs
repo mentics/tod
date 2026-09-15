@@ -3,7 +3,7 @@
 use crate::fleet::launch::FleetLaunchError;
 use crate::fleet::lock::FleetLockError;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::fleet::repos::agent_config::{AgentConfigRepo as AgentRepo, NewAgentConfig as NewAgent};
+use crate::fleet::repos::agent_run::AgentRunRepo;
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, NoteItem, TaskRepo};
@@ -11,6 +11,8 @@ use crate::fleet::schema;
 use crate::fleet::store::FleetStore;
 use crate::fleet::test_util::{cleanup_fleet_root, insert_scale_data, temp_fleet_root};
 use crate::fleet::writer::{FleetMutation, FleetWriter};
+use crate::outline::OutlineMutation;
+use crate::outline::types::Capability;
 use rusqlite::OptionalExtension;
 use std::thread;
 use std::time::Duration;
@@ -139,7 +141,7 @@ fn debounced_mutations_lost_when_writer_abandoned() {
 }
 
 #[test]
-fn scale_generator_inserts_tasks_and_agents() {
+fn scale_generator_inserts_tasks_and_runs() {
     let root = temp_fleet_root();
     let db_path = root.join("tod.db");
     let conn = schema::open_writer_connection(&db_path).unwrap();
@@ -149,7 +151,7 @@ fn scale_generator_inserts_tasks_and_agents() {
     let store = FleetStore::open(&root).unwrap();
     let meta = store.projection().lock().unwrap().metadata().clone();
     assert_eq!(meta.task_count, snapshot.task_count);
-    assert_eq!(meta.agent_count, snapshot.agent_count);
+    assert_eq!(meta.run_count, snapshot.run_count);
 
     let tasks = store.list_tasks().unwrap();
     assert_eq!(tasks.len(), snapshot.task_count);
@@ -158,13 +160,13 @@ fn scale_generator_inserts_tasks_and_agents() {
 
     let projection = store.projection();
     let guard = projection.lock().unwrap();
-    let agent_total: usize = guard
+    let run_total: usize = guard
         .connection()
-        .query_row("SELECT COUNT(*) FROM agent_configs", [], |row| {
+        .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| {
             row.get::<_, i64>(0).map(|n| n as usize)
         })
         .unwrap();
-    assert_eq!(agent_total, snapshot.agent_count);
+    assert_eq!(run_total, snapshot.run_count);
 
     drop(store);
     cleanup_fleet_root(&root);
@@ -208,7 +210,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     .unwrap();
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    let run_id = format!("{task_id}-run-1");
     let prompt_id = uuid::Uuid::new_v4().to_string();
     let response_id = uuid::Uuid::new_v4().to_string();
     let notification_id = uuid::Uuid::new_v4().to_string();
@@ -217,6 +219,10 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     let identity = ReconnectIdentity {
         pid: std::process::id(),
         birth_token: 42,
+    };
+    let get_run = |id: &str| {
+        let conn = schema::open_read_connection(&db_path).unwrap();
+        AgentRunRepo::new(&conn).get(id).unwrap()
     };
 
     writer
@@ -227,70 +233,39 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     writer.flush().unwrap();
 
     writer
-        .enqueue(FleetMutation::InsertAgent {
-            agent: NewAgent {
-                id: agent_id.clone(),
-                node_id: task_id.clone(),
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            },
+        .enqueue(FleetMutation::CreateAgentRun {
+            node_id: task_id.clone(),
+            run_kind: None,
+            session_name: None,
+            launch: None,
         })
         .unwrap();
     short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(AgentRepo::new(&conn).get(&agent_id).unwrap().is_some());
-    }
+    assert!(get_run(&run_id).is_some());
 
     writer
-        .enqueue(FleetMutation::UpdateAgentRuntimeStatus {
-            id: agent_id.clone(),
-            runtime_status: "waiting".into(),
+        .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
+            run_id: run_id.clone(),
+            runtime_status: "processing".into(),
         })
         .unwrap();
     short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert_eq!(
-            AgentRepo::new(&conn)
-                .get(&agent_id)
-                .unwrap()
-                .unwrap()
-                .runtime_status,
-            "waiting"
-        );
-    }
+    assert_eq!(get_run(&run_id).unwrap().runtime_status, "processing");
 
     writer
-        .enqueue(FleetMutation::UpdateAgentReconnect {
-            id: agent_id.clone(),
+        .enqueue(FleetMutation::UpdateAgentRunReconnect {
+            run_id: run_id.clone(),
             identity,
         })
         .unwrap();
     short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert_eq!(
-            AgentRepo::new(&conn)
-                .get(&agent_id)
-                .unwrap()
-                .unwrap()
-                .reconnect,
-            Some(identity)
-        );
-    }
+    assert_eq!(get_run(&run_id).unwrap().reconnect, Some(identity));
 
     writer
         .enqueue(FleetMutation::SendPrompt {
             id: prompt_id.clone(),
-            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
             content: "hello".into(),
-            run_id: None,
         })
         .unwrap();
     short_settle();
@@ -302,10 +277,9 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     writer
         .enqueue(FleetMutation::CompleteResponse {
             response_id: response_id.clone(),
-            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
             content: "world".into(),
             prompt_id: prompt_id.clone(),
-            run_id: None,
         })
         .unwrap();
     short_settle();
@@ -319,7 +293,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
             id: notification_id.clone(),
             message: "open".into(),
             related_task_id: Some(task_id.clone()),
-            related_agent_ids: vec![agent_id.clone()],
+            related_run_ids: vec![run_id.clone()],
         })
         .unwrap();
     short_settle();
@@ -338,26 +312,16 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
             id: blocked_notification_id.clone(),
             message: "blocked".into(),
             related_task_id: Some(task_id.clone()),
-            agent_id: agent_id.clone(),
+            run_id: run_id.clone(),
         })
         .unwrap();
     short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert_eq!(
-            AgentRepo::new(&conn)
-                .get(&agent_id)
-                .unwrap()
-                .unwrap()
-                .runtime_status,
-            "blocked"
-        );
-    }
+    assert_eq!(get_run(&run_id).unwrap().runtime_status, "blocked");
 
     writer
         .enqueue(FleetMutation::CreateShellSession {
             id: shell_id.clone(),
-            agent_id: agent_id.clone(),
+            node_id: task_id.clone(),
             reconnect: Some(identity),
         })
         .unwrap();
@@ -366,7 +330,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
         let conn = schema::open_read_connection(&db_path).unwrap();
         assert!(
             ShellRepo::new(&conn)
-                .list_for_agent(&agent_id)
+                .list_for_node(&task_id)
                 .unwrap()
                 .iter()
                 .any(|session| session.id == shell_id)
@@ -382,7 +346,7 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     {
         let conn = schema::open_read_connection(&db_path).unwrap();
         let session = ShellRepo::new(&conn)
-            .list_for_agent(&agent_id)
+            .list_for_node(&task_id)
             .unwrap()
             .into_iter()
             .find(|session| session.id == shell_id)
@@ -413,25 +377,22 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     }
 
     writer
-        .enqueue(FleetMutation::ClearAgentReconnect {
-            id: agent_id.clone(),
+        .enqueue(FleetMutation::ClearAgentRunReconnect {
+            run_id: run_id.clone(),
         })
         .unwrap();
     writer
-        .enqueue(FleetMutation::MarkAgentPromptsInterrupted {
-            agent_id: agent_id.clone(),
+        .enqueue(FleetMutation::MarkRunPromptsInterrupted {
+            run_id: run_id.clone(),
         })
         .unwrap();
     writer
-        .enqueue(FleetMutation::DeleteAgent {
-            id: agent_id.clone(),
+        .enqueue(FleetMutation::DeleteAgentRun {
+            run_id: run_id.clone(),
         })
         .unwrap();
     short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(AgentRepo::new(&conn).get(&agent_id).unwrap().is_none());
-    }
+    assert!(get_run(&run_id).is_none());
 
     writer
         .enqueue(FleetMutation::DeleteTask {
@@ -489,7 +450,7 @@ fn task_round_trip_survives_store_close_and_reopen() {
 fn notification_round_trip_and_resolve_absent_after_reopen() {
     let root = temp_fleet_root();
     let task_id = uuid::Uuid::new_v4().to_string();
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    let run_id = format!("{task_id}-run-1");
     let notification_id = uuid::Uuid::new_v4().to_string();
 
     {
@@ -501,18 +462,11 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
             .unwrap();
         store.writer().flush().unwrap();
         store
-            .enqueue(FleetMutation::InsertAgent {
-                agent: NewAgent {
-                    id: agent_id.clone(),
-                    node_id: task_id,
-                    env_type: "local".into(),
-                    mode: "agent".into(),
-                    work_directory: None,
-                    use_worktree: false,
-                    platform: "claude".into(),
-                    model: "default".into(),
-                    effort: "auto".into(),
-                },
+            .enqueue(FleetMutation::CreateAgentRun {
+                node_id: task_id.clone(),
+                run_kind: None,
+                session_name: None,
+                launch: None,
             })
             .unwrap();
         store
@@ -520,7 +474,7 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
                 id: notification_id.clone(),
                 message: "needs review".into(),
                 related_task_id: None,
-                related_agent_ids: vec![agent_id.clone()],
+                related_run_ids: vec![run_id.clone()],
             })
             .unwrap();
         store.writer().wait_for_idle().unwrap();
@@ -532,7 +486,7 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, notification_id);
         assert_eq!(open[0].message, "needs review");
-        assert_eq!(open[0].related_agent_ids, vec![agent_id.clone()]);
+        assert_eq!(open[0].related_run_ids, vec![run_id.clone()]);
 
         store
             .enqueue(FleetMutation::ResolveNotification {
@@ -551,88 +505,200 @@ fn notification_round_trip_and_resolve_absent_after_reopen() {
 }
 
 #[test]
-fn agent_capability_disable_blocker_reflects_owned_configs_and_liveness() {
+fn capability_disable_blockers_reflect_running_work() {
     let root = temp_fleet_root();
     let store = FleetStore::open(&root).unwrap();
     let task_id = uuid::Uuid::new_v4().to_string();
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    let node_uuid = uuid::Uuid::parse_str(&task_id).unwrap();
 
     store
         .enqueue(FleetMutation::InsertTask {
             task: FleetTask::new(&task_id, "Blocker check", "blocker-check"),
         })
         .unwrap();
-    store.writer().flush().unwrap();
-
-    // No owned configs — nothing to block on.
-    assert!(
-        store
-            .agent_capability_disable_blocker(&task_id)
-            .unwrap()
-            .is_none()
-    );
-
     store
-        .enqueue(FleetMutation::InsertAgent {
-            agent: NewAgent {
-                id: agent_id.clone(),
-                node_id: task_id.clone(),
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            },
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node_uuid,
+            capabilities: vec![Capability::Files],
         })
         .unwrap();
     store.writer().flush().unwrap();
 
-    // An idle config still blocks — disabling must never orphan or silently delete it.
-    let idle_reason = store
-        .agent_capability_disable_blocker(&task_id)
-        .unwrap()
-        .expect("idle config should block disable");
-    assert!(idle_reason.contains("action config"));
-    assert!(!idle_reason.contains("running"));
+    // Nothing running — nothing to block on.
+    for cap in [Capability::Agent, Capability::Files] {
+        assert!(store.capability_disable_blocker(&task_id, cap).unwrap().is_none());
+    }
 
+    // A live run blocks disabling Agent, not Files.
+    let run_id = format!("{task_id}-run-1");
+    store
+        .enqueue(FleetMutation::CreateAgentRun {
+            node_id: task_id.clone(),
+            run_kind: None,
+            session_name: None,
+            launch: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let reason = store
+        .capability_disable_blocker(&task_id, Capability::Agent)
+        .unwrap()
+        .expect("live run should block disabling Agent");
+    assert!(reason.contains("running"));
+    assert!(
+        store
+            .capability_disable_blocker(&task_id, Capability::Files)
+            .unwrap()
+            .is_none()
+    );
+    store
+        .enqueue(FleetMutation::EndAgentRun {
+            run_id: run_id.clone(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert!(
+        store
+            .capability_disable_blocker(&task_id, Capability::Agent)
+            .unwrap()
+            .is_none()
+    );
+
+    // An open shell blocks disabling Files.
     let shell_id = uuid::Uuid::new_v4().to_string();
     store
         .enqueue(FleetMutation::CreateShellSession {
             id: shell_id.clone(),
-            agent_id: agent_id.clone(),
+            node_id: task_id.clone(),
             reconnect: None,
         })
         .unwrap();
     store.writer().flush().unwrap();
-
-    // An open shell sharpens the message to call out live sessions specifically.
-    let running_reason = store
-        .agent_capability_disable_blocker(&task_id)
+    let reason = store
+        .capability_disable_blocker(&task_id, Capability::Files)
         .unwrap()
-        .expect("open shell should block disable");
-    assert!(running_reason.contains("running"));
-
+        .expect("open shell should block disabling Files");
+    assert!(reason.contains("shell"));
     store
-        .enqueue(FleetMutation::DismissShellSession {
-            id: shell_id.clone(),
-        })
+        .enqueue(FleetMutation::DismissShellSession { id: shell_id })
         .unwrap();
+
+    // So does a set-up worktree.
     store
-        .enqueue(FleetMutation::DeleteAgent {
-            id: agent_id.clone(),
+        .enqueue(FleetMutation::UpdateNodeWorktree {
+            node_id: task_id.clone(),
+            worktree_path: Some("/wt/blocker".into()),
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
         })
         .unwrap();
     store.writer().flush().unwrap();
+    let reason = store
+        .capability_disable_blocker(&task_id, Capability::Files)
+        .unwrap()
+        .expect("set-up worktree should block disabling Files");
+    assert!(reason.contains("worktree"));
 
-    // Once the config is gone, disabling is unblocked again.
+    store
+        .enqueue(FleetMutation::UpdateNodeWorktree {
+            node_id: task_id.clone(),
+            worktree_path: None,
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
     assert!(
         store
-            .agent_capability_disable_blocker(&task_id)
+            .capability_disable_blocker(&task_id, Capability::Files)
             .unwrap()
             .is_none()
     );
 
+    drop(store);
+    cleanup_fleet_root(&root);
+}
+
+#[test]
+fn worktree_release_blocker_reflects_running_shells_and_agents() {
+    let root = temp_fleet_root();
+    let store = FleetStore::open(&root).unwrap();
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let node_uuid = uuid::Uuid::parse_str(&task_id).unwrap();
+
+    store
+        .enqueue(FleetMutation::InsertTask {
+            task: FleetTask::new(&task_id, "Release check", "release-check"),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: node_uuid,
+            capabilities: vec![Capability::Files],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+
+    // A shell that's no longer running doesn't block; a running one does.
+    store
+        .enqueue(FleetMutation::CreateShellSession {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_id: task_id.clone(),
+            reconnect: None,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+
+    let live_shell = uuid::Uuid::new_v4().to_string();
+    store
+        .enqueue(FleetMutation::CreateShellSession {
+            id: live_shell.clone(),
+            node_id: task_id.clone(),
+            reconnect: crate::fleet::reconnect_identity::record(std::process::id()),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let reason = store
+        .worktree_release_blocker(&task_id)
+        .unwrap()
+        .expect("running shell should block release");
+    assert!(reason.contains("1 shell"));
+    store
+        .enqueue(FleetMutation::DismissShellSession { id: live_shell })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+
+    // An agent at work blocks until it ends.
+    let run_id = format!("{task_id}-run-1");
+    store
+        .enqueue(FleetMutation::CreateAgentRun {
+            node_id: task_id.clone(),
+            run_kind: None,
+            session_name: None,
+            launch: None,
+        })
+        .unwrap();
+    store
+        .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
+            run_id: run_id.clone(),
+            runtime_status: "processing".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let reason = store
+        .worktree_release_blocker(&task_id)
+        .unwrap()
+        .expect("working agent should block release");
+    assert!(reason.contains("1 agent"));
+    store
+        .enqueue(FleetMutation::EndAgentRun { run_id })
+        .unwrap();
+    store.writer().flush().unwrap();
+    assert!(store.worktree_release_blocker(&task_id).unwrap().is_none());
+
+    drop(store);
     cleanup_fleet_root(&root);
 }

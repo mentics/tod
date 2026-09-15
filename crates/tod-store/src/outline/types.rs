@@ -10,6 +10,8 @@ pub enum Capability {
     Agent,
     Generator,
     Tags,
+    Files,
+    Ticket,
 }
 
 impl Capability {
@@ -20,6 +22,8 @@ impl Capability {
             Self::Agent => "agent",
             Self::Generator => "generator",
             Self::Tags => "tags",
+            Self::Files => "files",
+            Self::Ticket => "ticket",
         }
     }
 
@@ -30,14 +34,18 @@ impl Capability {
             "agent" => Some(Self::Agent),
             "generator" => Some(Self::Generator),
             "tags" => Some(Self::Tags),
+            "files" => Some(Self::Files),
+            "ticket" => Some(Self::Ticket),
             _ => None,
         }
     }
 
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Spec,
         Self::Lifecycle,
         Self::Agent,
+        Self::Files,
+        Self::Ticket,
         Self::Generator,
         Self::Tags,
     ];
@@ -49,6 +57,8 @@ impl Capability {
             Self::Agent => "Agent",
             Self::Generator => "Generator",
             Self::Tags => "Tags",
+            Self::Files => "Files",
+            Self::Ticket => "Ticket",
         }
     }
 
@@ -56,7 +66,9 @@ impl Capability {
         match self {
             Self::Spec => "Requirements, constraints, and interview artifacts",
             Self::Lifecycle => "Process state and lifecycle transitions",
-            Self::Agent => "Repository, links, and agent workspace",
+            Self::Agent => "Agent platform, model, and effort for chats and coding agents",
+            Self::Files => "Workspace directory, branch, and optional worktree",
+            Self::Ticket => "Ticket ID and pull request links",
             Self::Generator => "Automatically produce and manage descendant nodes from an external data source",
             Self::Tags => "Freeform labels for organizing and filtering nodes",
         }
@@ -69,8 +81,12 @@ impl Capability {
             }
             Self::Lifecycle => "Disabling Lifecycle will remove this node's lifecycle state.",
             Self::Agent => {
-                "Disabling Agent will remove repository settings, links, and notes stored on this node."
+                "Disabling Agent will remove the platform, model, and effort stored on this node."
             }
+            Self::Files => {
+                "Disabling Files will remove the workspace directory, branch, and worktree settings stored on this node."
+            }
+            Self::Ticket => "Disabling Ticket will remove the ticket ID and pull request links stored on this node.",
             Self::Generator => {
                 "Disabling Generator will permanently delete all managed child nodes under this node."
             }

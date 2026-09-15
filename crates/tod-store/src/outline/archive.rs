@@ -38,6 +38,10 @@ pub struct ArchivedNode {
     pub tags: Option<ArchivedTags>,
     pub obligations: Vec<ArchivedObligation>,
     pub capability_archives: Vec<ArchivedCapabilityArchive>,
+    #[serde(default)]
+    pub files: Option<ArchivedNodeFiles>,
+    #[serde(default)]
+    pub agent: Option<ArchivedNodeAgent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +59,25 @@ pub struct ArchivedFields {
     pub notes: Option<String>,
     pub linked_issues: String,
     pub linked_prs: String,
+    pub updated_at: i64,
+}
+
+/// Files capability row (`node_files`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedNodeFiles {
+    pub use_worktree: bool,
+    pub worktree_path: Option<String>,
+    pub worktree_lease_id: Option<String>,
+    pub worktree_lease_holder: Option<String>,
+    pub updated_at: i64,
+}
+
+/// Agent capability row (`node_agent`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedNodeAgent {
+    pub platform: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub updated_at: i64,
 }
 
@@ -199,17 +222,75 @@ fn validate_delete(conn: &Connection, root_id: Uuid) -> Result<()> {
     let list_id = entry.list_id;
     let subtree = collect_subtree_ids(&outline, list_id, root_id)?;
     for node_id in &subtree {
-        let agent_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM agent_configs WHERE node_id = ?1",
+        let running: i64 = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_runs
+                     WHERE node_id = ?1 AND ended_at IS NULL AND runtime_status != 'not_running')
+                  + (SELECT COUNT(*) FROM shell_sessions WHERE node_id = ?1)",
             params![uuid_to_blob(*node_id)],
             |row| row.get(0),
         )?;
-        if agent_count > 0 {
+        if running > 0 {
             let label = node_label(conn, root_id);
-            anyhow::bail!("{label} has associated agents — remove them before deleting");
+            anyhow::bail!("{label} has running agents or open shells — stop them before deleting");
         }
     }
     Ok(())
+}
+
+fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFields>> {
+    conn.query_row(
+        "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
+         FROM node_fields WHERE node_id = ?1",
+        params![uuid_to_blob(node_id)],
+        |row| {
+            Ok(ArchivedFields {
+                repo: row.get(0)?,
+                branch: row.get(1)?,
+                notes: row.get(2)?,
+                linked_issues: row.get(3)?,
+                linked_prs: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedNodeFiles>> {
+    conn.query_row(
+        "SELECT use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at
+         FROM node_files WHERE node_id = ?1",
+        params![uuid_to_blob(node_id)],
+        |row| {
+            Ok(ArchivedNodeFiles {
+                use_worktree: row.get::<_, i64>(0)? != 0,
+                worktree_path: row.get(1)?,
+                worktree_lease_id: row.get(2)?,
+                worktree_lease_holder: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn snapshot_node_agent(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedNodeAgent>> {
+    conn.query_row(
+        "SELECT platform, model, effort, updated_at FROM node_agent WHERE node_id = ?1",
+        params![uuid_to_blob(node_id)],
+        |row| {
+            Ok(ArchivedNodeAgent {
+                platform: row.get(0)?,
+                model: row.get(1)?,
+                effort: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
@@ -229,23 +310,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
             |row| row.get(0),
         )
         .optional()?;
-    let fields = conn
-        .query_row(
-            "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
-             FROM node_fields WHERE node_id = ?1",
-            params![uuid_to_blob(node_id)],
-            |row| {
-                Ok(ArchivedFields {
-                    repo: row.get(0)?,
-                    branch: row.get(1)?,
-                    notes: row.get(2)?,
-                    linked_issues: row.get(3)?,
-                    linked_prs: row.get(4)?,
-                    updated_at: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
+    let fields = snapshot_fields(conn, node_id)?;
     let tags = conn
         .query_row(
             "SELECT tags, updated_at FROM node_tags WHERE node_id = ?1",
@@ -317,6 +382,8 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         tags,
         obligations,
         capability_archives,
+        files: snapshot_node_files(conn, node_id)?,
+        agent: snapshot_node_agent(conn, node_id)?,
     })
 }
 
@@ -342,24 +409,22 @@ pub fn build_capability_disable_payload(
             serde_json::json!({ "lifecycle": state })
         }
         Capability::Agent => {
-            let fields = conn
-                .query_row(
-                    "SELECT repo, branch, notes, linked_issues, linked_prs, updated_at
-                     FROM node_fields WHERE node_id = ?1",
-                    params![uuid_to_blob(node_id)],
-                    |row| {
-                        Ok(ArchivedFields {
-                            repo: row.get(0)?,
-                            branch: row.get(1)?,
-                            notes: row.get(2)?,
-                            linked_issues: row.get(3)?,
-                            linked_prs: row.get(4)?,
-                            updated_at: row.get(5)?,
-                        })
-                    },
-                )
-                .optional()?;
-            serde_json::json!({ "fields": fields })
+            serde_json::json!({ "agent": snapshot_node_agent(conn, node_id)? })
+        }
+        Capability::Files => {
+            let fields = snapshot_fields(conn, node_id)?;
+            serde_json::json!({
+                "repo": fields.as_ref().and_then(|f| f.repo.clone()),
+                "branch": fields.as_ref().and_then(|f| f.branch.clone()),
+                "files": snapshot_node_files(conn, node_id)?,
+            })
+        }
+        Capability::Ticket => {
+            let fields = snapshot_fields(conn, node_id)?;
+            serde_json::json!({
+                "linked_issues": fields.as_ref().map(|f| f.linked_issues.clone()),
+                "linked_prs": fields.as_ref().map(|f| f.linked_prs.clone()),
+            })
         }
         Capability::Tags => {
             let tags = conn
@@ -466,6 +531,28 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO node_tags (node_id, tags, updated_at) VALUES (?1, ?2, ?3)",
             params![blob, tags.tags, tags.updated_at],
+        )?;
+    }
+    if let Some(files) = &archived.files {
+        conn.execute(
+            "INSERT OR IGNORE INTO node_files
+               (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                blob,
+                i32::from(files.use_worktree),
+                files.worktree_path,
+                files.worktree_lease_id,
+                files.worktree_lease_holder,
+                files.updated_at,
+            ],
+        )?;
+    }
+    if let Some(agent) = &archived.agent {
+        conn.execute(
+            "INSERT OR IGNORE INTO node_agent (node_id, platform, model, effort, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![blob, agent.platform, agent.model, agent.effort, agent.updated_at],
         )?;
     }
     for obl in &archived.obligations {
@@ -625,12 +712,40 @@ mod tests {
             })
             .unwrap();
 
+        NodeRepo::new(&conn)
+            .enable_capabilities(child_id, &[Capability::Agent, Capability::Files])
+            .unwrap();
+        let child = child_id.to_string();
+        crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
+            .update_worktree(&child, Some("/wt/child"), None, None)
+            .unwrap();
+        crate::fleet::repos::node_agent::NodeAgentRepo::new(&conn)
+            .upsert(&child, Some("cursor"), None, Some("high"))
+            .unwrap();
+
         let archive_id = delete_subtree_archived(&conn, parent_id).unwrap().0;
         assert!(NodeRepo::new(&conn).get(parent_id).unwrap().is_none());
+        assert!(
+            crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
+                .get(&child)
+                .unwrap()
+                .is_none()
+        );
 
         restore_subtree(&conn, archive_id, &dir).unwrap();
         assert!(NodeRepo::new(&conn).get(parent_id).unwrap().is_some());
         assert!(NodeRepo::new(&conn).get(child_id).unwrap().is_some());
+        let files = crate::fleet::repos::node_files::NodeFilesRepo::new(&conn)
+            .get(&child)
+            .unwrap()
+            .expect("files restored");
+        assert_eq!(files.worktree_path(), Some("/wt/child"));
+        let agent = crate::fleet::repos::node_agent::NodeAgentRepo::new(&conn)
+            .get(&child)
+            .unwrap()
+            .expect("agent restored");
+        assert_eq!(agent.platform.as_deref(), Some("cursor"));
+        assert_eq!(agent.effort.as_deref(), Some("high"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -60,14 +60,14 @@ fn sum_interview_counts(a: InterviewAgentCounts, b: InterviewAgentCounts) -> Int
 impl AgentProvider for RoutingAgentProvider {
     fn start_fleet_agent(
         &mut self,
-        agent_config_id: &str,
+        owner_id: &str,
         cwd: PathBuf,
         prompt: String,
         options: AgentLaunchOptions,
         session_title: String,
     ) -> Result<AgentRunHandle> {
         self.for_platform(options.platform)
-            .start_fleet_agent(agent_config_id, cwd, prompt, options, session_title)
+            .start_fleet_agent(owner_id, cwd, prompt, options, session_title)
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {

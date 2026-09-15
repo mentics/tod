@@ -144,18 +144,20 @@ impl<'a> NodeRepo<'a> {
                 }
             }
             Capability::Agent => {
-                let has_fields = self
-                    .conn
-                    .query_row(
-                        "SELECT 1 FROM node_fields WHERE node_id = ?1",
-                        params![&blob],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some();
-                if !has_fields {
-                    self.set_fields(node_id, None, None, None, &[], &[])?;
-                }
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO node_agent (node_id, updated_at) VALUES (?1, ?2)",
+                    params![&blob, now_ms()],
+                )?;
+            }
+            Capability::Files => {
+                self.ensure_fields_row(node_id)?;
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO node_files (node_id, use_worktree, updated_at) VALUES (?1, 0, ?2)",
+                    params![&blob, now_ms()],
+                )?;
+            }
+            Capability::Ticket => {
+                self.ensure_fields_row(node_id)?;
             }
             Capability::Tags => {
                 let has_tags = self
@@ -176,6 +178,23 @@ impl<'a> NodeRepo<'a> {
                 // No additional initialization needed at enable time.
                 // Configuration is saved separately via SetGeneratorConfig mutation.
             }
+        }
+        Ok(())
+    }
+
+    /// `node_fields` backs both Files (repo / branch) and Ticket (issues / PRs).
+    fn ensure_fields_row(&self, node_id: Uuid) -> Result<()> {
+        let has_fields = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM node_fields WHERE node_id = ?1",
+                params![uuid_to_blob(node_id)],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_fields {
+            self.set_fields(node_id, None, None, None, &[], &[])?;
         }
         Ok(())
     }
@@ -373,7 +392,22 @@ impl<'a> NodeRepo<'a> {
             }
             Capability::Agent => {
                 self.conn
-                    .execute("DELETE FROM node_fields WHERE node_id = ?1", params![blob])?;
+                    .execute("DELETE FROM node_agent WHERE node_id = ?1", params![blob])?;
+            }
+            Capability::Files => {
+                self.conn
+                    .execute("DELETE FROM node_files WHERE node_id = ?1", params![blob])?;
+                self.conn.execute(
+                    "UPDATE node_fields SET repo = NULL, branch = NULL, updated_at = ?2 WHERE node_id = ?1",
+                    params![blob, now_ms()],
+                )?;
+            }
+            Capability::Ticket => {
+                self.conn.execute(
+                    "UPDATE node_fields SET linked_issues = '[]', linked_prs = '[]', updated_at = ?2
+                     WHERE node_id = ?1",
+                    params![blob, now_ms()],
+                )?;
             }
             Capability::Tags => {
                 self.conn

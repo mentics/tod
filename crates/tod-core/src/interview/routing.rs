@@ -155,12 +155,10 @@ mod tests {
             .insert_session_with_metadata(
                 NewInterviewSession {
                     node_id,
-                    agent_config_id: None,
                     display_name: "T".into(),
                     phase: "task-requirements-interview".into(),
                 },
                 InterviewSessionStatus::Complete,
-                None,
             )
             .unwrap();
         assert!(
@@ -183,12 +181,10 @@ mod tests {
             .insert_session_with_metadata(
                 NewInterviewSession {
                     node_id,
-                    agent_config_id: None,
                     display_name: "T".into(),
                     phase: "task-requirements-interview".into(),
                 },
                 InterviewSessionStatus::Active,
-                None,
             )
             .unwrap();
         let complete = || {

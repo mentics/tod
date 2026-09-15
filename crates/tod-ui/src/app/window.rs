@@ -25,7 +25,7 @@ use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::{error_toast, notification_overlay};
-use crate::views::agent_config_panel::{AgentConfigPanelEvent, AgentConfigPanelView};
+use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
@@ -45,11 +45,8 @@ use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
-use tod_store::fleet::NewAgentConfig;
-use tod_store::fleet::{
-    FleetLaunchError, FleetMutation, FleetStore, focus_shell_session, open_shell_for_agent_config,
-    open_zed_for_agent_config,
-};
+use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
+use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
 use uuid::Uuid;
 
 actions!(
@@ -82,18 +79,6 @@ struct PendingOpenLifecycle {
     lifecycle: String,
 }
 
-struct PendingOpenAgent {
-    task_id: String,
-    agent_id: Option<String>,
-}
-
-struct PendingLaunchOrFocusAgent {
-    task_id: String,
-    config_id: String,
-    /// When true, open the panel and launch an auto run after open.
-    launch_auto: bool,
-}
-
 pub struct Shell {
     active_view: ShellView,
     task_list: Entity<TaskListView>,
@@ -101,7 +86,7 @@ pub struct Shell {
     obligations: Entity<ObligationsView>,
     lifecycle_panel: Entity<LifecyclePanelView>,
     visual_design_panel: Entity<VisualDesignPanelView>,
-    agent_panel: Entity<AgentConfigPanelView>,
+    action_panel: Entity<ActionPanelView>,
     sessions: Entity<SessionsView>,
     drafting: Entity<DraftingView>,
     settings: Entity<SettingsView>,
@@ -141,10 +126,9 @@ pub struct Shell {
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
     pending_focus_drawer: bool,
-    pending_open_agent: Option<PendingOpenAgent>,
-    pending_launch_or_focus_agent: Option<PendingLaunchOrFocusAgent>,
-    pending_close_agent_panel: bool,
-    pending_retarget_agent: Option<(String, String)>,
+    pending_open_action_panel: Option<String>,
+    pending_retarget_action_panel: Option<String>,
+    pending_close_action_panel: bool,
     pending_error_toast: Option<String>,
     always_on_top: bool,
     tasks_split_state: Entity<PanelSplitState>,
@@ -153,7 +137,7 @@ pub struct Shell {
     _obligations_subscription: Subscription,
     _lifecycle_panel_subscription: Subscription,
     _visual_design_panel_subscription: Subscription,
-    _agent_panel_subscription: Subscription,
+    _action_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
     _drafting_subscription: Subscription,
     _settings_subscription: Subscription,
@@ -169,24 +153,23 @@ fn collect_running_work(
     cx: &App,
 ) -> Vec<SharedString> {
     let mut items = Vec::new();
-    if let Ok(agents) = fleet.list_all_agents() {
-        for agent in agents {
+    if let Ok(runs) = fleet.list_unended_runs() {
+        for run in runs {
             if matches!(
-                agent.runtime_status.as_str(),
+                run.runtime_status.as_str(),
                 "starting" | "processing" | "waiting" | "blocked"
             ) {
                 let title = fleet
-                    .get_task(&agent.node_id)
+                    .get_task(&run.node_id)
                     .ok()
                     .flatten()
                     .map(|t| t.title)
-                    .unwrap_or_else(|| agent.node_id.clone());
-                let platform = agent.platform.as_str();
-                let platform_label = match platform {
-                    "claude" => "Claude",
-                    "cursor" => "Cursor",
-                    "mock" => "Mock",
-                    other if !other.is_empty() => other,
+                    .unwrap_or_else(|| run.node_id.clone());
+                let platform_label = match run.platform.as_deref() {
+                    Some("claude") => "Claude",
+                    Some("cursor") => "Cursor",
+                    Some("mock") => "Mock",
+                    Some(other) if !other.is_empty() => other,
                     _ => "Coding",
                 };
                 items.push(SharedString::from(format!(
@@ -401,7 +384,8 @@ impl Shell {
 
     fn compute_status_groups(&self) -> AgentStatusGroups {
         let mut groups = AgentStatusGroups::default();
-        if let Ok(agents) = self.fleet.list_all_agents() {
+        if let Ok(runs) = self.fleet.list_unended_runs() {
+            let agents: Vec<_> = runs.into_iter().filter(|run| run.is_live()).collect();
             groups.fleet.total = agents.len() as u32;
             groups.fleet.processing = agents
                 .iter()
@@ -616,55 +600,48 @@ impl Shell {
         cx.notify();
     }
 
-    fn open_agent_panel(
-        &mut self,
-        task_id: &str,
-        agent_id: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_action_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.task_edit.read(cx).is_open() {
             self.close_task_edit(window, cx);
         }
         if self.obligations.read(cx).is_open() {
             self.close_obligations(window, cx);
         }
-        self.agent_panel.update(cx, |panel, cx| {
-            if let Some(agent_id) = agent_id {
-                panel.open_edit(task_id, agent_id, window, cx);
-            } else {
-                panel.open_new(task_id, window, cx);
-            }
+        if self.lifecycle_panel.read(cx).is_open() {
+            self.close_lifecycle_panel(window, cx);
+        }
+        self.action_panel.update(cx, |panel, cx| {
+            panel.open(task_id, window, cx);
         });
-        self.task_list.update(cx, |list, cx| {
-            list.set_agent_panel_open(true, cx);
-        });
+        if self.action_panel.read(cx).is_open() {
+            self.task_list.update(cx, |list, cx| {
+                list.set_action_panel_open(true, cx);
+            });
+        } else {
+            self.task_list.update(cx, |list, cx| {
+                list.show_error("Could not open the Action panel", window, cx);
+            });
+        }
         cx.notify();
     }
 
-    fn close_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_panel.update(cx, |panel, cx| {
+    fn close_action_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.action_panel.update(cx, |panel, cx| {
             panel.close(cx);
         });
         self.task_list.update(cx, |list, cx| {
-            list.set_agent_panel_open(false, cx);
+            list.set_action_panel_open(false, cx);
             list.restore_focus(window, cx);
         });
         cx.notify();
     }
 
-    fn retarget_agent_panel(
-        &mut self,
-        task_id: &str,
-        agent_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.agent_panel.read(cx).is_open() {
+    fn retarget_action_panel(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        if !self.action_panel.read(cx).is_open() {
             return;
         }
-        self.agent_panel.update(cx, |panel, cx| {
-            panel.retarget(task_id, Some(agent_id), window, cx);
+        self.action_panel.update(cx, |panel, cx| {
+            panel.retarget(task_id, cx);
         });
         cx.notify();
     }
@@ -690,22 +667,8 @@ impl Shell {
         &mut self,
         node_id: uuid::Uuid,
         obligation_id: Option<uuid::Uuid>,
-        config_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        // `None` means the panel found no configs: create a default from app
-        // settings so the user gets a conversation rather than a form.
-        let config_id = match config_id {
-            Some(id) => id,
-            None => match self.create_default_agent_config(node_id, cx) {
-                Ok(id) => id,
-                Err(err) => {
-                    self.queue_error_toast(err, cx);
-                    return;
-                }
-            },
-        };
-
         let context = match self.build_obligations_agent_context(node_id, obligation_id) {
             Ok(text) => Some(text),
             Err(err) => {
@@ -722,60 +685,12 @@ impl Shell {
 
         if let Err(err) = self._interactive_agent_window.create_and_open_session(
             &node_id.to_string(),
-            &config_id,
             Some("obligations"),
             context,
             cx,
         ) {
             self.queue_error_toast(err, cx);
         }
-    }
-
-    /// Create an action config from the "Chat with agent" settings
-    /// (platform/model/effort).
-    fn create_default_agent_config(
-        &mut self,
-        node_id: uuid::Uuid,
-        cx: &mut Context<Self>,
-    ) -> Result<String, String> {
-        let launch = self
-            .settings
-            .read(cx)
-            .launch_options_for(tod_store::AgentRole::Chat);
-        let node_slug = self
-            .fleet
-            .get_node(&node_id.to_string())
-            .ok()
-            .flatten()
-            .map(|node| node.slug)
-            .unwrap_or_else(|| node_id.to_string());
-        let config_id = format!("{node_slug}-1");
-
-        self.fleet
-            .enqueue(FleetMutation::InsertAgent {
-                agent: NewAgentConfig {
-                    id: config_id.clone(),
-                    node_id: node_id.to_string(),
-                    env_type: "local".into(),
-                    mode: "agent".into(),
-                    // Leave the workspace unset so `resolve_agent_workspace`
-                    // resolves it the same way fleet-launched agents do: the
-                    // node's worktree if configured, otherwise its repo root.
-                    work_directory: None,
-                    use_worktree: false,
-                    platform: tod_agent::agent_launch::platform_storage(launch.platform)
-                        .to_string(),
-                    model: launch.model,
-                    effort: launch.effort,
-                },
-            })
-            .map_err(|err| format!("Create action config failed: {err}"))?;
-        self.fleet
-            .writer()
-            .flush()
-            .map_err(|err| format!("Create action config failed: {err}"))?;
-        let _ = self.fleet.reload_if_stale();
-        Ok(config_id)
     }
 
     /// Assemble the agent's first message: bundled context docs plus the live
@@ -850,7 +765,6 @@ impl Shell {
         &mut self,
         task_id: String,
         shell_id: Option<String>,
-        agent_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
@@ -860,39 +774,10 @@ impl Shell {
                     .fleet
                     .get_shell(&shell_id)?
                     .ok_or_else(|| anyhow::anyhow!("shell session not found"))?;
-                let config_id = shell.agent_id.clone();
-                let cwd = focus_shell_session(
-                    &self.fleet,
-                    &self.paths,
-                    &settings,
-                    &config_id,
-                    &task_id,
-                    &shell,
-                )?;
-                return Ok(format!("Opened terminal in {}", cwd.display()));
+                let cwd = focus_shell_session(&self.fleet, &self.paths, &settings, &shell)?;
+                return Ok(format!("Focused shell in {}", cwd.display()));
             }
-
-            let config_id = if let Some(agent_id) = agent_id {
-                agent_id
-            } else {
-                self.fleet
-                    .resolve_agents_for_node(&task_id)?
-                    .configs
-                    .into_iter()
-                    .next()
-                    .map(|row| row.id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("no action config for this task; create one with F first")
-                    })?
-            };
-
-            let (_, cwd) = open_shell_for_agent_config(
-                &self.fleet,
-                &self.paths,
-                &settings,
-                &config_id,
-                &task_id,
-            )?;
+            let (_, cwd) = open_shell_for_node(&self.fleet, &self.paths, &settings, &task_id, None)?;
             Ok(format!("Opened terminal in {}", cwd.display()))
         })();
 
@@ -911,108 +796,62 @@ impl Shell {
         cx.notify();
     }
 
-    fn handle_launch_or_focus_agent(
-        &mut self,
-        task_id: String,
-        config_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(agent) = self.fleet.get_agent(&config_id).ok().flatten() else {
-            self.queue_error_toast(format!("Action config {config_id} not found"), cx);
-            return;
+    /// A — open the node's most recent chat session, or start a new one.
+    fn handle_launch_or_focus_agent(&mut self, task_id: String, cx: &mut Context<Self>) {
+        let _ = self.fleet.reload_if_stale();
+        let latest = self
+            .fleet
+            .list_interactive_sessions_for_node(&task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        let result = match latest {
+            Some(run) => self._interactive_agent_window.open_session(
+                InteractiveAgentOpenParams {
+                    node_id: task_id.clone(),
+                    session_run_id: run.id,
+                    initial_context: None,
+                },
+                cx,
+            ),
+            None => self
+                ._interactive_agent_window
+                .create_and_open_session(&task_id, None, None, cx)
+                .map(|_| ()),
         };
-        match agent.mode.as_str() {
-            "interview" => {
-                self.queue_error_toast(
-                    "Interview agents are launched from the Interview view.",
-                    cx,
-                );
-            }
-            "shell" => {
-                let sessions = self
-                    .fleet
-                    .list_interactive_sessions_for_config(&config_id)
-                    .unwrap_or_default();
-                let result = if let Some(run) = sessions.first() {
-                    self._interactive_agent_window.open_session(
-                        InteractiveAgentOpenParams {
-                            config_id: config_id.clone(),
-                            session_run_id: run.id.clone(),
-                            initial_context: None,
-                        },
-                        cx,
-                    )
-                } else {
-                    self._interactive_agent_window
-                        .create_and_open_session(&task_id, &config_id, None, None, cx)
-                        .map(|_| ())
-                };
-                match result {
-                    Ok(()) => {
-                        let _ = self.fleet.reload_if_stale();
-                        self.task_list.update(cx, |list, cx| {
-                            list.set_status_message(
-                                format!("Opened interactive agent {config_id}"),
-                                cx,
-                            );
-                            list.request_live_refresh(cx);
-                        });
-                    }
-                    Err(err) => {
-                        self.queue_error_toast(format!("Interactive agent failed: {err}"), cx);
-                    }
-                }
-            }
-            _ => {
-                // Auto mode: focus panel if running, else open panel and launch.
-                let running = matches!(
-                    agent.runtime_status.as_str(),
-                    "starting" | "processing" | "waiting" | "blocked"
-                );
-                self.pending_launch_or_focus_agent = Some(PendingLaunchOrFocusAgent {
-                    task_id,
-                    config_id,
-                    launch_auto: !running,
+        match result {
+            Ok(()) => {
+                let _ = self.fleet.reload_if_stale();
+                self.task_list.update(cx, |list, cx| {
+                    list.set_status_message("Opened agent chat".to_string(), cx);
+                    list.request_live_refresh(cx);
                 });
-                cx.notify();
+            }
+            Err(err) => {
+                self.queue_error_toast(format!("Agent chat failed: {err}"), cx);
             }
         }
         cx.notify();
     }
 
-    fn handle_open_zed(&mut self, task_id: String, config_id: String, cx: &mut Context<Self>) {
-        let settings = TodSettings::load(&self.paths).unwrap_or_default();
-        let result =
-            open_zed_for_agent_config(&self.fleet, &self.paths, &settings, &config_id, &task_id);
-        match result {
+    fn handle_open_code_editor(&mut self, task_id: String, editor_id: String, cx: &mut Context<Self>) {
+        let Some(editor) = code_editor(&editor_id) else {
+            self.queue_error_toast(format!("Unknown code editor: {editor_id}"), cx);
+            return;
+        };
+        match open_code_editor_for_node(&self.fleet, editor, &task_id) {
             Ok(cwd) => {
                 self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(format!("Opened Zed in {}", cwd.display()), cx);
+                    list.set_status_message(
+                        format!("Opened {} in {}", editor.label(), cwd.display()),
+                        cx,
+                    );
                 });
             }
             Err(err) => {
                 self.queue_error_toast(format!("Open code failed: {err:#}"), cx);
             }
         }
-        cx.notify();
-    }
-
-    fn handle_delete_agent_config(&mut self, config_id: String, cx: &mut Context<Self>) {
-        if let Err(err) = self.fleet.enqueue(FleetMutation::DeleteAgent {
-            id: config_id.clone(),
-        }) {
-            self.queue_error_toast(format!("Delete failed: {err}"), cx);
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
-            self.queue_error_toast(format!("Delete failed: {err}"), cx);
-            return;
-        }
-        let _ = self.fleet.reload_if_stale();
-        self.task_list.update(cx, |list, cx| {
-            list.set_status_message(format!("Deleted action config {config_id}"), cx);
-            list.request_live_refresh(cx);
-        });
         cx.notify();
     }
 
@@ -1144,7 +983,7 @@ impl Render for Shell {
         self.drain_pending_open_lifecycle(cx);
         self.drain_pending_task_edit(window, cx);
         self.drain_pending_obligations(window, cx);
-        self.drain_pending_agent_panel(window, cx);
+        self.drain_pending_action_panel(window, cx);
         self.drain_pending_lifecycle_panel(window, cx);
         self.drain_pending_visual_design(window, cx);
         self.drain_pending_focus_drawer(window, cx);
@@ -1240,8 +1079,8 @@ impl Shell {
             self.visual_design_panel.clone().into_any_element()
         } else if self.lifecycle_panel.read(cx).is_open() {
             self.lifecycle_panel.clone().into_any_element()
-        } else if self.agent_panel.read(cx).is_open() {
-            self.agent_panel.clone().into_any_element()
+        } else if self.action_panel.read(cx).is_open() {
+            self.action_panel.clone().into_any_element()
         } else {
             div()
                 .size_full()
@@ -1251,11 +1090,11 @@ impl Shell {
                 .gap_2()
                 .bg(theme.background)
                 .text_color(muted)
-                .child(div().text_sm().font_semibold().child("Action configs"))
+                .child(div().text_sm().font_semibold().child("Actions"))
                 .child(
                     div()
                         .text_xs()
-                        .child("A agent · T shell · C code · F action config"),
+                        .child("A agent chat · T shell · C code editor · F actions"),
                 )
                 .into_any_element()
         };
@@ -1303,8 +1142,8 @@ impl Shell {
             self.visual_design_panel.update(cx, |panel, cx| {
                 panel.focus_handle(cx).focus(window, cx);
             });
-        } else if self.agent_panel.read(cx).is_open() {
-            self.agent_panel.update(cx, |panel, cx| {
+        } else if self.action_panel.read(cx).is_open() {
+            self.action_panel.update(cx, |panel, cx| {
                 panel.focus_handle(cx).focus(window, cx);
             });
         } else if self.lifecycle_panel.read(cx).is_open() {
@@ -1361,16 +1200,9 @@ impl Shell {
         let Some(obligation) = self.fleet.get_obligation(obligation_id).ok().flatten() else {
             return;
         };
-        let config_id = match self.create_default_agent_config(node_id, cx) {
-            Ok(id) => id,
-            Err(err) => {
-                self.queue_error_toast(err, cx);
-                return;
-            }
-        };
         let (fleet, agent, workspace_cwd, settings, session_run_id) = match self
             ._interactive_agent_window
-            .create_embedded_session(&task_id, &config_id, Some("design/visual-design"))
+            .create_embedded_session(&task_id, Some("design/visual-design"))
         {
             Ok(session) => session,
             Err(err) => {
@@ -1406,7 +1238,7 @@ impl Shell {
                 obligation_id,
                 &title,
                 EmbeddedChatParams {
-                    config_id,
+                    node_id: task_id.clone(),
                     session_run_id,
                     fleet,
                     agent,
@@ -1500,44 +1332,26 @@ impl Shell {
         }
     }
 
-    fn drain_pending_agent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending_close_agent_panel {
-            self.pending_close_agent_panel = false;
-            self.close_agent_panel(window, cx);
+    fn drain_pending_action_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_close_action_panel {
+            self.pending_close_action_panel = false;
+            self.close_action_panel(window, cx);
         }
-        if let Some((task_id, agent_id)) = self.pending_retarget_agent.take() {
-            self.retarget_agent_panel(&task_id, &agent_id, window, cx);
+        if let Some(task_id) = self.pending_retarget_action_panel.take() {
+            self.retarget_action_panel(&task_id, cx);
         }
-        if let Some(pending) = self.pending_open_agent.take() {
-            self.open_agent_panel(&pending.task_id, pending.agent_id.as_deref(), window, cx);
-        }
-        if let Some(pending) = self.pending_launch_or_focus_agent.take() {
-            self.open_agent_panel(&pending.task_id, Some(&pending.config_id), window, cx);
-            if pending.launch_auto {
-                self.agent_panel.update(cx, |panel, cx| {
-                    panel.launch_auto_run(window, cx);
-                });
-            }
+        if let Some(task_id) = self.pending_open_action_panel.take() {
+            self.open_action_panel(&task_id, window, cx);
         }
     }
 
-    fn queue_open_agent(
-        &mut self,
-        task_id: String,
-        agent_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_open_agent = Some(PendingOpenAgent { task_id, agent_id });
+    fn queue_open_action_panel(&mut self, task_id: String, cx: &mut Context<Self>) {
+        self.pending_open_action_panel = Some(task_id);
         cx.notify();
     }
 
-    fn queue_retarget_agent(&mut self, task_id: String, agent_id: String, cx: &mut Context<Self>) {
-        self.pending_retarget_agent = Some((task_id, agent_id));
-        cx.notify();
-    }
-
-    fn queue_close_agent_panel(&mut self, cx: &mut Context<Self>) {
-        self.pending_close_agent_panel = true;
+    fn queue_close_action_panel(&mut self, cx: &mut Context<Self>) {
+        self.pending_close_action_panel = true;
         cx.notify();
     }
 
@@ -1773,7 +1587,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             }
                         }
                         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
-                        let task_edit = cx.new(|cx| TaskEditView::new(window, cx, fleet.clone()));
+                        let task_edit =
+                            cx.new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
@@ -1787,9 +1602,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
-                        let agent_panel = cx.new(|cx| {
-                            AgentConfigPanelView::new(
-                                window,
+                        let action_panel = cx.new(|cx| {
+                            ActionPanelView::new(
                                 cx,
                                 fleet.clone(),
                                 agent.clone(),
@@ -1877,61 +1691,31 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 Some(task_id.clone());
                                             cx.notify();
                                         }
-                                        TaskListEvent::OpenAgentDetail { task_id, agent_id } => {
-                                            if this.agent_panel.read(cx).is_open() {
-                                                if let Some(agent_id) = agent_id.clone() {
-                                                    this.queue_retarget_agent(
-                                                        task_id.clone(),
-                                                        agent_id,
-                                                        cx,
-                                                    );
-                                                } else {
-                                                    this.queue_open_agent(
-                                                        task_id.clone(),
-                                                        None,
-                                                        cx,
-                                                    );
-                                                }
-                                            } else {
-                                                this.queue_open_agent(
-                                                    task_id.clone(),
-                                                    agent_id.clone(),
-                                                    cx,
-                                                );
-                                            }
+                                        TaskListEvent::OpenActionPanel { task_id } => {
+                                            this.queue_open_action_panel(task_id.clone(), cx);
                                         }
-                                        TaskListEvent::LaunchOrFocusAgent {
-                                            task_id,
-                                            config_id,
-                                        } => {
-                                            this.handle_launch_or_focus_agent(
-                                                task_id.clone(),
-                                                config_id.clone(),
-                                                cx,
-                                            );
+                                        TaskListEvent::RetargetActionPanel { task_id } => {
+                                            this.pending_retarget_action_panel =
+                                                Some(task_id.clone());
+                                            cx.notify();
                                         }
-                                        TaskListEvent::DeleteAgentConfig { config_id } => {
-                                            this.handle_delete_agent_config(config_id.clone(), cx);
+                                        TaskListEvent::LaunchOrFocusAgent { task_id } => {
+                                            this.handle_launch_or_focus_agent(task_id.clone(), cx);
                                         }
-                                        TaskListEvent::CloseAgentPanel => {
-                                            this.queue_close_agent_panel(cx);
+                                        TaskListEvent::CloseActionPanel => {
+                                            this.queue_close_action_panel(cx);
                                         }
-                                        TaskListEvent::OpenShell {
-                                            task_id,
-                                            shell_id,
-                                            agent_id,
-                                        } => {
+                                        TaskListEvent::OpenShell { task_id, shell_id } => {
                                             this.handle_open_shell(
                                                 task_id.clone(),
                                                 shell_id.clone(),
-                                                agent_id.clone(),
                                                 cx,
                                             );
                                         }
-                                        TaskListEvent::OpenZed { task_id, config_id } => {
-                                            this.handle_open_zed(
+                                        TaskListEvent::OpenCodeEditor { task_id, editor_id } => {
+                                            this.handle_open_code_editor(
                                                 task_id.clone(),
-                                                config_id.clone(),
+                                                editor_id.clone(),
                                                 cx,
                                             );
                                         }
@@ -1990,21 +1774,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         ObligationsEvent::OpenAgentChat {
                                             node_id,
                                             obligation_id,
-                                            config_id,
                                         } => {
                                             this.open_obligations_agent_chat(
                                                 *node_id,
                                                 *obligation_id,
-                                                config_id.clone(),
                                                 cx,
                                             );
-                                        }
-                                        ObligationsEvent::OpenAgentConfig { node_id } => {
-                                            this.pending_open_agent = Some(PendingOpenAgent {
-                                                task_id: node_id.to_string(),
-                                                agent_id: None,
-                                            });
-                                            cx.notify();
                                         }
                                         ObligationsEvent::OpenVisualDesign {
                                             node_id,
@@ -2055,22 +1830,21 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     }
                                 },
                             );
-                            let _agent_panel_subscription =
-                                cx.subscribe(&agent_panel, |this: &mut Shell, _, event, cx| {
+                            let _action_panel_subscription =
+                                cx.subscribe(&action_panel, |this: &mut Shell, _, event, cx| {
                                     match event {
-                                        AgentConfigPanelEvent::Close => {
+                                        ActionPanelEvent::Close => {
                                             this.task_list.update(cx, |list, cx| {
-                                                list.set_agent_panel_open(false, cx);
+                                                list.set_action_panel_open(false, cx);
                                             });
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
-                                        AgentConfigPanelEvent::FocusTaskList => {
+                                        ActionPanelEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
                                             cx.notify();
                                         }
-                                        AgentConfigPanelEvent::Saved { .. }
-                                        | AgentConfigPanelEvent::Deleted { .. } => {
+                                        ActionPanelEvent::Changed => {
                                             this.task_list.update(cx, |list, cx| {
                                                 list.request_live_refresh(cx);
                                             });
@@ -2095,7 +1869,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     SessionsEvent::OpenAgentChat {
                                         node_id,
                                         obligation_id,
-                                        config_id,
                                     } => {
                                         // `cx.defer`, not a direct call: this event
                                         // arrives synchronously through several nested
@@ -2107,14 +1880,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         // effect cycle (and all those leases) has flushed.
                                         let node_id = *node_id;
                                         let obligation_id = *obligation_id;
-                                        let config_id = config_id.clone();
                                         let weak = cx.weak_entity();
                                         cx.defer(move |cx| {
                                             let _ = weak.update(cx, |this, cx| {
                                                 this.open_obligations_agent_chat(
                                                     node_id,
                                                     obligation_id,
-                                                    config_id,
                                                     cx,
                                                 );
                                             });
@@ -2140,20 +1911,17 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     DraftingViewEvent::OpenAgentChat {
                                         node_id,
                                         obligation_id,
-                                        config_id,
                                     } => {
                                         // Deferred for the same reason as the sessions arm:
                                         // nested entity leases are still on the stack.
                                         let node_id = *node_id;
                                         let obligation_id = *obligation_id;
-                                        let config_id = config_id.clone();
                                         let weak = cx.weak_entity();
                                         cx.defer(move |cx| {
                                             let _ = weak.update(cx, |this, cx| {
                                                 this.open_obligations_agent_chat(
                                                     node_id,
                                                     obligation_id,
-                                                    config_id,
                                                     cx,
                                                 );
                                             });
@@ -2179,7 +1947,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 obligations,
                                 lifecycle_panel,
                                 visual_design_panel,
-                                agent_panel,
+                                action_panel,
                                 sessions,
                                 drafting,
                                 settings,
@@ -2214,10 +1982,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
                                 pending_focus_drawer: false,
-                                pending_open_agent: None,
-                                pending_launch_or_focus_agent: None,
-                                pending_close_agent_panel: false,
-                                pending_retarget_agent: None,
+                                pending_open_action_panel: None,
+                                pending_retarget_action_panel: None,
+                                pending_close_action_panel: false,
                                 pending_error_toast: None,
                                 always_on_top: restore_always_on_top,
                                 tasks_split_state,
@@ -2226,7 +1993,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _obligations_subscription,
                                 _lifecycle_panel_subscription,
                                 _visual_design_panel_subscription,
-                                _agent_panel_subscription,
+                                _action_panel_subscription,
                                 _sessions_subscription,
                                 _drafting_subscription,
                                 _settings_subscription,

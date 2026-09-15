@@ -135,20 +135,18 @@ impl<'a> TranscriptRepo<'a> {
         Ok(rows)
     }
 
-    /// List turns for all runs of an agent config (historical aggregate).
-    pub fn list_for_config(
-        &self,
-        agent_config_id: &str,
-    ) -> Result<Vec<TranscriptTurn>, TranscriptRepoError> {
+    /// List turns for all runs launched from a node (historical aggregate).
+    pub fn list_for_node(&self, node_id: &str) -> Result<Vec<TranscriptTurn>, TranscriptRepoError> {
+        let blob = crate::fleet::repos::node_id_blob(node_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.agent_run_id, t.sequence, t.kind, t.prompt_status, t.content, t.originating_prompt_id
              FROM transcript_turns t
              INNER JOIN agent_runs r ON t.agent_run_id = r.id
-             WHERE r.agent_config_id = ?1
-             ORDER BY t.sequence",
+             WHERE r.node_id = ?1
+             ORDER BY r.run_number, t.sequence",
         )?;
         let rows = stmt
-            .query_map(params![agent_config_id], row_to_turn)?
+            .query_map(params![blob], row_to_turn)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -177,32 +175,13 @@ fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptTurn> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent_config::{AgentConfigRepo, NewAgentConfig};
     use crate::fleet::repos::agent_run::AgentRunRepo;
-    use crate::fleet::repos::task::{FleetTask, TaskRepo};
-    use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
+    use crate::fleet::repos::{cleanup_test_dir, seed_node, test_writer_conn};
 
     fn seed_run(conn: &Connection) -> String {
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let config_id = uuid::Uuid::new_v4().to_string();
-        TaskRepo::new(conn)
-            .insert(&FleetTask::new(&task_id, "T", "t"))
-            .unwrap();
-        AgentConfigRepo::new(conn)
-            .insert(&NewAgentConfig {
-                id: config_id.clone(),
-                node_id: task_id,
-                env_type: "local".into(),
-                mode: "agent".into(),
-                work_directory: None,
-                use_worktree: false,
-                platform: "claude".into(),
-                model: "default".into(),
-                effort: "auto".into(),
-            })
-            .unwrap();
+        let node_id = seed_node(conn);
         AgentRunRepo::new(conn)
-            .create_run(&config_id, "waiting", "auto")
+            .create_run(&node_id, "waiting", "auto")
             .unwrap()
     }
 
