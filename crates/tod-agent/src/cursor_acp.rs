@@ -876,28 +876,7 @@ fn name_session(host: AcpHost, session_id: &str, title: &str) {
     }
 }
 
-/// Claude Code's config directory, resolved the way the CLI resolves it.
-fn claude_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-    } else {
-        std::env::var_os("HOME")
-    };
-    home.map(|home| PathBuf::from(home).join(".claude"))
-}
-
-/// Claude Code keeps one `<session-id>.jsonl` per session, under a directory per project.
-fn find_claude_session_log(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let file_name = format!("{session_id}.jsonl");
-    std::fs::read_dir(config_dir.join("projects"))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join(&file_name))
-        .find(|path| path.is_file())
-}
+use crate::run_state::{claude_config_dir, find_claude_session_log};
 
 fn append_claude_custom_title(
     config_dir: &Path,

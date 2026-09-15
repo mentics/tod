@@ -18,7 +18,10 @@ pub mod util;
 
 pub use agent_launch::{AgentLaunchOptions, effort_for_acp};
 pub use platform::AgentPlatform;
-pub use run_state::{EngagementState, LivenessResult, RunHandle, RunLocation, RunLocationOps};
+pub use run_state::{
+    EngagementState, LivenessResult, RunHandle, RunLocation, RunLocationOps,
+    claude_transcript_fingerprint,
+};
 
 #[allow(unused_imports)] // public API surface for agent backends
 pub use acp_host::AcpHost;
