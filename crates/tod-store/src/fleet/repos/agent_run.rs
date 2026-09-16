@@ -5,6 +5,16 @@ use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::fleet::repos::{node_id_blob, node_id_column};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
+use tod_agent::RunLocation;
+
+/// The only two durable states a run's `runtime_status` column should ever
+/// be written as. Anything more granular (what an agent is doing right now,
+/// whether it's waiting on the user) is `tod_agent::EngagementState` —
+/// live-only, never persisted, since this column only needs to answer
+/// "should tod try to reconnect to this, or is it done" for a process that
+/// just started with no live connection to anything yet.
+pub const RUNTIME_STATUS_ACTIVE: &str = "active";
+pub const RUNTIME_STATUS_DONE: &str = "not_running";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
@@ -16,7 +26,18 @@ pub struct AgentRun {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub reconnect: Option<ReconnectIdentity>,
+    /// Why the run was launched: auto/interactive/implementation/terminal.
     pub run_kind: String,
+    /// Where the run physically executes — see `tod_agent::RunLocation`.
+    pub location: RunLocation,
+    /// The run's transcript, cached once it reaches `Done`. Never written
+    /// while a run is live — see `tod_agent::claude_transcript_fingerprint`
+    /// for why this is refreshed lazily rather than kept in sync.
+    pub cached_transcript: Option<String>,
+    /// Cheap fingerprint of the cached transcript's last entry, used to
+    /// detect whether it has moved (e.g. resumed externally) without
+    /// re-fetching the whole thing.
+    pub transcript_fingerprint: Option<String>,
     /// Human-readable name, for interactive chat sessions.
     pub session_name: Option<String>,
     /// Agent-side session id, so a later process can resume the conversation.
@@ -40,14 +61,14 @@ impl AgentRun {
 
     /// Not ended and not marked stopped.
     pub fn is_live(&self) -> bool {
-        self.ended_at.is_none() && self.runtime_status != "not_running"
+        self.ended_at.is_none() && self.runtime_status != RUNTIME_STATUS_DONE
     }
 }
 
 const RUN_SELECT: &str =
     "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
                     reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
-                    platform, model, effort";
+                    platform, model, effort, location, cached_transcript, transcript_fingerprint";
 
 #[derive(Debug, Error)]
 pub enum AgentRunRepoError {
@@ -107,10 +128,19 @@ impl<'a> AgentRunRepo<'a> {
         let blob = node_id_blob(node_id)?;
         let run_number = self.next_run_number(&blob)?;
         let run_id = format!("{node_id}-run-{run_number}");
+        // `run_kind` is why the run was launched; `location` is where it
+        // physically executes. Only "terminal" callers run outside tod's own
+        // window today — everything else is `LocalWindow` until dev
+        // container / cloud VM launch paths exist.
+        let location = if run_kind == "terminal" {
+            RunLocation::Terminal
+        } else {
+            RunLocation::LocalWindow
+        };
         self.conn.execute(
             "INSERT INTO agent_runs
-             (id, node_id, run_number, runtime_status, started_at, run_kind, session_name, platform, model, effort)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, node_id, run_number, runtime_status, started_at, run_kind, session_name, platform, model, effort, location)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 run_id,
                 blob,
@@ -122,6 +152,7 @@ impl<'a> AgentRunRepo<'a> {
                 launch.map(|l| platform_storage(l.platform)),
                 launch.map(|l| l.model.as_str()),
                 launch.map(|l| l.effort.as_str()),
+                location.as_str(),
             ],
         )?;
         Ok(run_id)
@@ -285,6 +316,25 @@ impl<'a> AgentRunRepo<'a> {
         Ok(())
     }
 
+    /// Cache a run's transcript and fingerprint — called once, when a run
+    /// transitions to `Done` (or when a later touch finds the fingerprint
+    /// has moved and re-fetches). Never called while a run is live.
+    pub fn cache_transcript(
+        &self,
+        id: &str,
+        transcript: &str,
+        fingerprint: Option<&str>,
+    ) -> Result<(), AgentRunRepoError> {
+        let updated = self.conn.execute(
+            "UPDATE agent_runs SET cached_transcript = ?2, transcript_fingerprint = ?3 WHERE id = ?1",
+            params![id, transcript, fingerprint],
+        )?;
+        if updated == 0 {
+            return Err(AgentRunRepoError::NotFound);
+        }
+        Ok(())
+    }
+
     pub fn clear_reconnect(&self, id: &str) -> Result<(), AgentRunRepoError> {
         let updated = self.conn.execute(
             "UPDATE agent_runs SET reconnect_pid = NULL, reconnect_birth_token = NULL WHERE id = ?1",
@@ -307,12 +357,8 @@ impl<'a> AgentRunRepo<'a> {
         Ok(())
     }
 
-    /// Hard-delete a run and its transcript turns.
+    /// Hard-delete a run.
     pub fn delete_run(&self, id: &str) -> Result<(), AgentRunRepoError> {
-        self.conn.execute(
-            "DELETE FROM transcript_turns WHERE agent_run_id = ?1",
-            params![id],
-        )?;
         let deleted = self
             .conn
             .execute("DELETE FROM agent_runs WHERE id = ?1", params![id])?;
@@ -347,6 +393,12 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRun> {
         platform: row.get(11)?,
         model: row.get(12)?,
         effort: row.get(13)?,
+        location: {
+            let raw: String = row.get(14)?;
+            RunLocation::parse(&raw).unwrap_or(RunLocation::LocalWindow)
+        },
+        cached_transcript: row.get(15)?,
+        transcript_fingerprint: row.get(16)?,
     })
 }
 
@@ -361,10 +413,10 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let node_id = seed_node(&conn);
         let repo = AgentRunRepo::new(&conn);
-        let first = repo.create_run(&node_id, "waiting", "auto").unwrap();
+        let first = repo.create_run(&node_id, RUNTIME_STATUS_ACTIVE, "auto").unwrap();
         let launch = AgentLaunchOptions::from_settings(AgentPlatform::Cursor, "composer-2.5", "high");
         let second = repo
-            .create_named_run(&node_id, "waiting", "interactive", Some("chat"), Some(&launch))
+            .create_named_run(&node_id, RUNTIME_STATUS_ACTIVE, "interactive", Some("chat"), Some(&launch))
             .unwrap();
         assert_eq!(first, format!("{node_id}-run-1"));
         assert_eq!(second, format!("{node_id}-run-2"));

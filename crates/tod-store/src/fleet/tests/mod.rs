@@ -3,7 +3,7 @@
 use crate::fleet::launch::FleetLaunchError;
 use crate::fleet::lock::FleetLockError;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, NoteItem, TaskRepo};
@@ -211,8 +211,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let run_id = format!("{task_id}-run-1");
-    let prompt_id = uuid::Uuid::new_v4().to_string();
-    let response_id = uuid::Uuid::new_v4().to_string();
     let notification_id = uuid::Uuid::new_v4().to_string();
     let blocked_notification_id = uuid::Uuid::new_v4().to_string();
     let shell_id = uuid::Uuid::new_v4().to_string();
@@ -246,11 +244,14 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
     writer
         .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
             run_id: run_id.clone(),
-            runtime_status: "processing".into(),
+            runtime_status: RUNTIME_STATUS_ACTIVE.into(),
         })
         .unwrap();
     short_settle();
-    assert_eq!(get_run(&run_id).unwrap().runtime_status, "processing");
+    assert_eq!(
+        get_run(&run_id).unwrap().runtime_status,
+        RUNTIME_STATUS_ACTIVE
+    );
 
     writer
         .enqueue(FleetMutation::UpdateAgentRunReconnect {
@@ -260,33 +261,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
         .unwrap();
     short_settle();
     assert_eq!(get_run(&run_id).unwrap().reconnect, Some(identity));
-
-    writer
-        .enqueue(FleetMutation::SendPrompt {
-            id: prompt_id.clone(),
-            run_id: run_id.clone(),
-            content: "hello".into(),
-        })
-        .unwrap();
-    short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(row_exists(&conn, "transcript_turns", &prompt_id));
-    }
-
-    writer
-        .enqueue(FleetMutation::CompleteResponse {
-            response_id: response_id.clone(),
-            run_id: run_id.clone(),
-            content: "world".into(),
-            prompt_id: prompt_id.clone(),
-        })
-        .unwrap();
-    short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(row_exists(&conn, "transcript_turns", &response_id));
-    }
 
     writer
         .enqueue(FleetMutation::CreateNotification {
@@ -316,7 +290,12 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
         })
         .unwrap();
     short_settle();
-    assert_eq!(get_run(&run_id).unwrap().runtime_status, "blocked");
+    // A blocked *notification* doesn't change whether the run is active or
+    // done — that's an EngagementState concern now, not a persisted one.
+    assert_eq!(
+        get_run(&run_id).unwrap().runtime_status,
+        RUNTIME_STATUS_ACTIVE
+    );
 
     writer
         .enqueue(FleetMutation::CreateShellSession {
@@ -378,11 +357,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
 
     writer
         .enqueue(FleetMutation::ClearAgentRunReconnect {
-            run_id: run_id.clone(),
-        })
-        .unwrap();
-    writer
-        .enqueue(FleetMutation::MarkRunPromptsInterrupted {
             run_id: run_id.clone(),
         })
         .unwrap();
@@ -684,7 +658,7 @@ fn worktree_release_blocker_reflects_running_shells_and_agents() {
     store
         .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
             run_id: run_id.clone(),
-            runtime_status: "processing".into(),
+            runtime_status: RUNTIME_STATUS_ACTIVE.into(),
         })
         .unwrap();
     store.writer().flush().unwrap();

@@ -38,6 +38,7 @@ use crate::views::visual_design_panel::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -140,10 +141,7 @@ fn collect_running_work(
     let mut items = Vec::new();
     if let Ok(runs) = fleet.list_unended_runs() {
         for run in runs {
-            if matches!(
-                run.runtime_status.as_str(),
-                "starting" | "processing" | "waiting" | "blocked"
-            ) {
+            if run.is_live() {
                 let title = fleet
                     .get_task(&run.node_id)
                     .ok()
@@ -373,16 +371,20 @@ impl Shell {
 
     fn compute_status_groups(&self) -> AgentStatusGroups {
         let mut groups = AgentStatusGroups::default();
-        if let Ok(runs) = self.fleet.list_unended_runs() {
-            let agents: Vec<_> = runs.into_iter().filter(|run| run.is_live()).collect();
-            groups.fleet.total = agents.len() as u32;
-            groups.fleet.processing = agents
-                .iter()
-                .filter(|a| a.runtime_status == "processing")
+        if let Ok(registry) = self._interactive_agent_window.engagement().lock() {
+            groups.fleet.total = registry.len() as u32;
+            groups.fleet.processing = registry
+                .values()
+                .filter(|state| matches!(state, EngagementState::WaitingOnAgent))
                 .count() as u32;
-            groups.fleet.blocked = agents
-                .iter()
-                .filter(|a| a.runtime_status == "blocked")
+            groups.fleet.blocked = registry
+                .values()
+                .filter(|state| {
+                    matches!(
+                        state,
+                        EngagementState::WaitingOnUser | EngagementState::WaitingOnOther(_)
+                    )
+                })
                 .count() as u32;
         }
         if let Ok(provider) = self.agent.lock() {
@@ -1193,6 +1195,57 @@ fn open_fleet_store(
     Ok(Arc::new(store))
 }
 
+/// One-time fetch-and-cache for runs `run_launch_hooks` just found dead (or
+/// that ended in an earlier process) with a resumable agent-side session but
+/// no cached transcript yet. Read-only (no prompt sent) and best-effort: a
+/// run whose worktree is gone or whose agent process can't be reached is
+/// skipped silently, since a live open of the transcript window will retry.
+fn backfill_missing_transcripts(fleet: &Arc<FleetStore>, agent: &SharedAgent) {
+    let runs = match fleet.list_all_runs() {
+        Ok(runs) => runs,
+        Err(err) => {
+            tracing::error!("backfill_missing_transcripts: listing runs failed: {err:#}");
+            return;
+        }
+    };
+    for run in runs {
+        if run.is_live() || run.cached_transcript.is_some() {
+            continue;
+        }
+        let (Some(agent_session_id), Some(platform_str)) =
+            (run.agent_session_id.clone(), run.platform.clone())
+        else {
+            continue;
+        };
+        let Some(platform) = tod_store::parse_platform(&platform_str) else {
+            continue;
+        };
+        let Ok(cwd) = tod_store::fleet::resolve_launch_cwd(fleet, &run.node_id) else {
+            continue;
+        };
+        let transcript = {
+            let agent = agent.lock().unwrap_or_else(|e| e.into_inner());
+            agent.fetch_full_transcript(platform, &cwd, &agent_session_id)
+        };
+        match transcript {
+            Ok(text) => {
+                let _ = fleet.enqueue(tod_store::fleet::FleetMutation::CacheAgentRunTranscript {
+                    run_id: run.id,
+                    transcript: text,
+                    fingerprint: None,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    "backfill_missing_transcripts: fetch failed: {err:#}"
+                );
+            }
+        }
+    }
+    let _ = fleet.writer().flush();
+}
+
 pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     #[cfg(feature = "agent-socket")]
     let socket_addr = opts.agent_socket;
@@ -1291,12 +1344,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         // powershell.exe per row) — none of it needs to finish before the window
                         // is visible, so it must never sit on the path to `cx.open_window`.
                         let reattach_fleet = fleet.clone();
+                        let reattach_agent = agent.clone();
                         std::thread::spawn(move || {
                             if let Err(err) = reattach_fleet
                                 .run_launch_hooks(&tod_store::fleet::NoopGuestLiveness)
                             {
                                 tracing::error!("background launch-time reattach failed: {err:#}");
                             }
+                            backfill_missing_transcripts(&reattach_fleet, &reattach_agent);
                         });
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`

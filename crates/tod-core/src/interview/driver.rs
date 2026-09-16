@@ -787,6 +787,19 @@ mod tests {
             self.sessions.get(key).cloned()
         }
 
+        fn fleet_run_session_id(&self, _id: RunId) -> Option<String> {
+            None
+        }
+
+        fn fetch_full_transcript(
+            &self,
+            _platform: tod_agent::AgentPlatform,
+            _cwd: &std::path::Path,
+            _agent_session_id: &str,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
         fn session_context_chars(&self, key: &str) -> Option<u64> {
             self.chars.get(key).copied()
         }

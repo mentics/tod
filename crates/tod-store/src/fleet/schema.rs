@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 29;
+pub const CURRENT_USER_VERSION: i32 = 33;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -236,6 +236,26 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v28_to_v29(conn)?;
         conn.pragma_update(None, "user_version", 29)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 30 {
+        migrate_v29_to_v30(conn)?;
+        conn.pragma_update(None, "user_version", 30)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 31 {
+        migrate_v30_to_v31(conn)?;
+        conn.pragma_update(None, "user_version", 31)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 32 {
+        migrate_v31_to_v32(conn)?;
+        conn.pragma_update(None, "user_version", 32)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 33 {
+        migrate_v32_to_v33(conn)?;
+        conn.pragma_update(None, "user_version", 33)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -258,6 +278,129 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
 ///   by start time, and snapshot the config's platform / model / effort);
 ///   `notification_agents` becomes `notification_runs` (the config's latest run);
 ///   `interview_sessions.agent_config_id` and `agent_configs` are dropped.
+/// Add `location` (the physical `tod_agent::RunLocation` a run executes in)
+/// as its own column, separate from `run_kind` (why the run was launched —
+/// auto/interactive/implementation/terminal). Existing `terminal`-kind runs
+/// are the only ones that ran outside tod's own window, so they backfill to
+/// `terminal`; everything else backfills to `local_window`.
+fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
+    let has_location: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = 'location'")?
+        .exists([])?;
+    if has_location {
+        // Some tests replay migrations from an earlier `user_version` against
+        // a connection that already ran the full migration chain once; the
+        // column is already there in that case.
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE agent_runs ADD COLUMN location TEXT NOT NULL DEFAULT 'local_window';
+        UPDATE agent_runs SET location = 'terminal' WHERE run_kind = 'terminal';
+        ",
+    )?;
+    Ok(())
+}
+
+/// Collapse `agent_runs.runtime_status` from its old 5 values down to the
+/// 2 the app actually writes now: `active` (was `starting`/`processing`/
+/// `waiting`/`blocked`) and `not_running` (unchanged — the "done" state).
+/// The finer-grained states now live only in `tod_agent::EngagementState`,
+/// computed live and never persisted (nothing durable needs them: on a fresh
+/// process start there's no live connection to ask, only "should tod try to
+/// reconnect, or is this done").
+///
+/// A full table rebuild, not just a data `UPDATE`: SQLite can't narrow a
+/// CHECK constraint in place, and the old constraint only permitted the 5
+/// original values — so `'active'` has to come in via a new table, the same
+/// rename-dance `migrate_v29_to_v30`'s agent_runs rebuild uses.
+fn migrate_v32_to_v33(conn: &Connection) -> Result<()> {
+    let rename = |from: &str, to: &str| -> Result<()> {
+        conn.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))?;
+        Ok(())
+    };
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE agent_runs_v33 (
+            id TEXT PRIMARY KEY NOT NULL,
+            node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            run_number INTEGER NOT NULL,
+            runtime_status TEXT NOT NULL CHECK(runtime_status IN ('active', 'not_running')),
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            reconnect_pid INTEGER,
+            reconnect_birth_token INTEGER,
+            run_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(run_kind IN ('auto', 'interactive', 'terminal', 'implementation')),
+            session_name TEXT,
+            agent_session_id TEXT,
+            platform TEXT,
+            model TEXT,
+            effort TEXT,
+            location TEXT NOT NULL DEFAULT 'local_window',
+            cached_transcript TEXT,
+            transcript_fingerprint TEXT,
+            UNIQUE(node_id, run_number)
+        );
+        INSERT INTO agent_runs_v33 (
+            id, node_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
+            platform, model, effort, location, cached_transcript, transcript_fingerprint
+        )
+        SELECT id, node_id, run_number,
+               CASE WHEN runtime_status IN ('starting', 'processing', 'waiting', 'blocked')
+                    THEN 'active' ELSE 'not_running' END,
+               started_at, ended_at, reconnect_pid, reconnect_birth_token, run_kind,
+               session_name, agent_session_id, platform, model, effort, location,
+               cached_transcript, transcript_fingerprint
+        FROM agent_runs;
+        DROP INDEX IF EXISTS idx_agent_runs_node_id;
+        DROP TABLE agent_runs;
+        ",
+    )?;
+    rename("agent_runs_v33", "agent_runs")?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_node_id ON agent_runs(node_id);
+        PRAGMA foreign_keys=ON;
+        ",
+    )?;
+    Ok(())
+}
+
+/// Drop `transcript_turns`: nothing has written or read it since
+/// `cached_transcript` replaced turn-by-turn recording (agent runs now cache
+/// their transcript once, on completion, fetched from the agent itself).
+fn migrate_v31_to_v32(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_transcript_turns_run_id;
+         DROP TABLE IF EXISTS transcript_turns;",
+    )?;
+    Ok(())
+}
+
+/// Cache a run's transcript on the row itself once it reaches `Done`, plus a
+/// cheap fingerprint of the last thing seen (see `tod_agent::claude_transcript_fingerprint`)
+/// so a later touch can tell "did this move since we cached it" without
+/// re-fetching. Nothing populates these yet — this just adds the columns.
+fn migrate_v30_to_v31(conn: &Connection) -> Result<()> {
+    let has_column = |column: &str| -> Result<bool> {
+        Ok(conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('agent_runs') WHERE name = ?1"
+            ))?
+            .exists([column])?)
+    };
+    if !has_column("cached_transcript")? {
+        conn.execute_batch("ALTER TABLE agent_runs ADD COLUMN cached_transcript TEXT;")?;
+    }
+    if !has_column("transcript_fingerprint")? {
+        conn.execute_batch("ALTER TABLE agent_runs ADD COLUMN transcript_fingerprint TEXT;")?;
+    }
+    Ok(())
+}
+
 fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
     const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
     let table_exists = |name: &str| -> Result<bool> {
@@ -477,7 +620,6 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
             JOIN agent_configs c ON c.id = r.agent_config_id
             WHERE c.node_id IN (SELECT id FROM nodes);
             DELETE FROM notification_runs WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
-            DELETE FROM transcript_turns WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
             DROP INDEX IF EXISTS idx_agent_runs_config_id;
             DROP TABLE agent_runs;
             ",
@@ -2582,9 +2724,9 @@ mod tests {
         assert!(tables.contains(&"shell_sessions".to_string()));
         assert!(tables.contains(&"notifications".to_string()));
         assert!(tables.contains(&"notification_runs".to_string()));
-        assert!(tables.contains(&"transcript_turns".to_string()));
         assert!(!tables.contains(&"agent_configs".to_string()));
         assert!(!tables.contains(&"notification_agents".to_string()));
+        assert!(!tables.contains(&"transcript_turns".to_string()));
 
         let _ = fs::remove_dir_all(dir);
     }

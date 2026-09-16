@@ -1,13 +1,12 @@
 use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::agent_launch::AgentLaunchOptions;
-use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::node_agent::NodeAgentRepo;
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
-use crate::fleet::repos::transcript::TranscriptRepo;
 use crate::fleet::schema;
 use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::fleet::undo::{
@@ -117,33 +116,18 @@ pub enum FleetMutation {
         run_id: String,
         agent_session_id: String,
     },
+    /// Cache a run's transcript once it reaches Done — see
+    /// `AgentRunRepo::cache_transcript`.
+    CacheAgentRunTranscript {
+        run_id: String,
+        transcript: String,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
     EndAgentRun {
         run_id: String,
     },
     DeleteAgentRun {
-        run_id: String,
-    },
-    // --- Transcript (immediate) ---
-    /// Paired: sent prompt + **processing**.
-    SendPrompt {
-        id: String,
-        run_id: String,
-        content: String,
-    },
-    /// Paired: response + **waiting** + prompt **complete**.
-    CompleteResponse {
-        response_id: String,
-        run_id: String,
-        content: String,
-        prompt_id: String,
-    },
-    /// Insert prompt without status side-effect (legacy / testing).
-    InsertPromptTurn {
-        id: String,
-        run_id: String,
-        content: String,
-    },
-    MarkRunPromptsInterrupted {
         run_id: String,
     },
     // --- Notification (immediate) ---
@@ -210,12 +194,9 @@ impl FleetMutation {
                 | FleetMutation::UpdateAgentRunRuntimeStatus { .. }
                 | FleetMutation::CreateAgentRun { .. }
                 | FleetMutation::SetAgentRunSessionId { .. }
+                | FleetMutation::CacheAgentRunTranscript { .. }
                 | FleetMutation::EndAgentRun { .. }
                 | FleetMutation::DeleteAgentRun { .. }
-                | FleetMutation::SendPrompt { .. }
-                | FleetMutation::CompleteResponse { .. }
-                | FleetMutation::InsertPromptTurn { .. }
-                | FleetMutation::MarkRunPromptsInterrupted { .. }
                 | FleetMutation::CreateNotification { .. }
                 | FleetMutation::CreateBlockedNotification { .. }
                 | FleetMutation::ResolveNotification { .. }
@@ -325,7 +306,7 @@ impl FleetMutation {
                 let kind = run_kind.as_deref().unwrap_or("auto");
                 AgentRunRepo::new(conn).create_named_run(
                     node_id,
-                    "waiting",
+                    RUNTIME_STATUS_ACTIVE,
                     kind,
                     session_name.as_deref(),
                     launch.as_ref(),
@@ -337,41 +318,22 @@ impl FleetMutation {
             } => {
                 AgentRunRepo::new(conn).set_agent_session_id(run_id, agent_session_id)?;
             }
+            FleetMutation::CacheAgentRunTranscript {
+                run_id,
+                transcript,
+                fingerprint,
+            } => {
+                AgentRunRepo::new(conn).cache_transcript(
+                    run_id,
+                    transcript,
+                    fingerprint.as_deref(),
+                )?;
+            }
             FleetMutation::EndAgentRun { run_id } => {
                 AgentRunRepo::new(conn).end_run(run_id)?;
             }
             FleetMutation::DeleteAgentRun { run_id } => {
                 AgentRunRepo::new(conn).delete_run(run_id)?;
-            }
-            FleetMutation::SendPrompt {
-                id,
-                run_id,
-                content,
-            } => {
-                TranscriptRepo::new(conn).send_prompt(id, run_id, content)?;
-            }
-            FleetMutation::CompleteResponse {
-                response_id,
-                run_id,
-                content,
-                prompt_id,
-            } => {
-                TranscriptRepo::new(conn).complete_response(
-                    response_id,
-                    run_id,
-                    content,
-                    prompt_id,
-                )?;
-            }
-            FleetMutation::InsertPromptTurn {
-                id,
-                run_id,
-                content,
-            } => {
-                TranscriptRepo::new(conn).insert_prompt(id, run_id, content)?;
-            }
-            FleetMutation::MarkRunPromptsInterrupted { run_id } => {
-                TranscriptRepo::new(conn).mark_incomplete_prompts_interrupted(run_id)?;
             }
             FleetMutation::CreateNotification {
                 id,
@@ -966,10 +928,8 @@ mod tests {
     fn mutation_immediate_classification() {
         assert!(FleetMutation::DeleteTask { id: "x".into() }.is_immediate());
         assert!(
-            FleetMutation::SendPrompt {
-                id: "p".into(),
+            FleetMutation::EndAgentRun {
                 run_id: "r".into(),
-                content: "hi".into(),
             }
             .is_immediate()
         );

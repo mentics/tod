@@ -1,12 +1,15 @@
 //! Callable trait surface for agent-runtime integration (guest liveness, shells, prompts).
 
-use crate::fleet::repos::agent_run::AgentRun;
+use crate::fleet::repos::agent_run::{AgentRun, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::shell::ShellSession;
 
 /// After host PID+birth_token match, confirm the guest agent session is reachable.
 pub trait GuestLivenessCheck: Send + Sync {
     fn guest_alive(&self, run: &AgentRun) -> bool;
-    /// Live runtime status to persist after successful reattach (e.g. `waiting`).
+    /// Live runtime status to persist after successful reattach — always
+    /// `RUNTIME_STATUS_ACTIVE`; `runtime_status` only distinguishes active
+    /// from done, so every impl agrees here regardless of how it checked
+    /// liveness.
     fn live_runtime_status(&self, run: &AgentRun) -> &str;
 }
 
@@ -15,15 +18,7 @@ pub trait ShellSpawnMetadata: Send + Sync {
     fn shell_label(&self, session: &ShellSession) -> String;
 }
 
-/// Memory-only prompt delivery state (queued vs in-flight).
-pub trait PromptDeliveryState: Send + Sync {
-    fn queued_count(&self, agent_id: &str) -> usize;
-    fn in_flight_count(&self, agent_id: &str) -> usize;
-    fn total_queued(&self) -> usize;
-    fn total_in_flight(&self) -> usize;
-}
-
-/// No-op guest liveness: host verify alone is sufficient; status becomes `waiting`.
+/// No-op guest liveness: host verify alone is sufficient.
 pub struct NoopGuestLiveness;
 
 impl GuestLivenessCheck for NoopGuestLiveness {
@@ -32,7 +27,7 @@ impl GuestLivenessCheck for NoopGuestLiveness {
     }
 
     fn live_runtime_status(&self, _run: &AgentRun) -> &str {
-        "waiting"
+        RUNTIME_STATUS_ACTIVE
     }
 }
 
@@ -45,7 +40,7 @@ impl GuestLivenessCheck for UnreachableGuestLiveness {
     }
 
     fn live_runtime_status(&self, _run: &AgentRun) -> &str {
-        "waiting"
+        RUNTIME_STATUS_ACTIVE
     }
 }
 

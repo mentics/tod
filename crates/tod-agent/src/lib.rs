@@ -13,10 +13,15 @@ mod mock;
 pub mod platform;
 mod provider;
 mod routing;
+pub mod run_state;
 pub mod util;
 
 pub use agent_launch::{AgentLaunchOptions, effort_for_acp};
 pub use platform::AgentPlatform;
+pub use run_state::{
+    EngagementState, LivenessResult, RunHandle, RunLocation, RunLocationOps,
+    SharedEngagementRegistry, claude_transcript_fingerprint, shared_engagement_registry,
+};
 
 #[allow(unused_imports)] // public API surface for agent backends
 pub use acp_host::AcpHost;

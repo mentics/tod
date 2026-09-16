@@ -59,6 +59,11 @@ struct ActiveRun {
     activity: Arc<Mutex<Option<String>>>,
     /// Set by the `AcpClient` while it is blocked on `session/request_permission`.
     pending_permission: PendingPermissionSlot,
+    /// Agent-side session id, set once `session/new` returns it. Fleet-agent
+    /// runs (`start_fleet_agent`) are one-shot processes with no `conversations`
+    /// entry, so this is their only way to expose the id a caller needs to
+    /// persist for later resume — see `fleet_run_session_id`.
+    session_id: Arc<Mutex<Option<String>>>,
     worker: Option<JoinHandle<()>>,
     receiver: Receiver<WorkerMessage>,
 }
@@ -415,6 +420,8 @@ impl CursorAcpProvider {
 
         let traffic_log = self.traffic_log.clone();
         let write_roots = self.extra_write_roots.clone();
+        let session_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let session_id_for_worker = session_id_slot.clone();
         let worker = thread::spawn(move || {
             let result = run_acp_session(
                 host,
@@ -427,6 +434,7 @@ impl CursorAcpProvider {
                 cancelled_for_worker,
                 activity_for_worker,
                 pending_permission_for_worker,
+                session_id_for_worker,
                 traffic_log,
                 id,
                 kind,
@@ -461,6 +469,7 @@ impl CursorAcpProvider {
                 cancelled,
                 activity,
                 pending_permission,
+                session_id: session_id_slot,
                 worker: Some(worker),
                 receiver: rx,
             },
@@ -588,6 +597,10 @@ impl AgentProvider for CursorAcpProvider {
                 cancelled: conversation.cancelled.clone(),
                 activity: conversation.activity.clone(),
                 pending_permission: conversation.pending_permission.clone(),
+                // Chat-turn callers read the session id via `session_id(key)`
+                // (the `conversations` map), not this slot — it's only
+                // populated for one-shot fleet-agent runs.
+                session_id: Arc::new(Mutex::new(None)),
                 worker: None,
                 receiver,
             },
@@ -599,6 +612,30 @@ impl AgentProvider for CursorAcpProvider {
         self.conversations
             .get(key)
             .and_then(LiveConversation::session_id)
+    }
+
+    fn fleet_run_session_id(&self, id: RunId) -> Option<String> {
+        self.runs.get(&id).and_then(|run| {
+            run.session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+    }
+
+    fn fetch_full_transcript(
+        &self,
+        _platform: crate::platform::AgentPlatform,
+        cwd: &Path,
+        agent_session_id: &str,
+    ) -> Result<String> {
+        fetch_transcript(
+            self.host,
+            &self.agent_bin,
+            cwd,
+            agent_session_id,
+            self.traffic_log.clone(),
+        )
     }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
@@ -854,28 +891,7 @@ fn name_session(host: AcpHost, session_id: &str, title: &str) {
     }
 }
 
-/// Claude Code's config directory, resolved the way the CLI resolves it.
-fn claude_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(dir));
-    }
-    let home = if cfg!(windows) {
-        std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))
-    } else {
-        std::env::var_os("HOME")
-    };
-    home.map(|home| PathBuf::from(home).join(".claude"))
-}
-
-/// Claude Code keeps one `<session-id>.jsonl` per session, under a directory per project.
-fn find_claude_session_log(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    let file_name = format!("{session_id}.jsonl");
-    std::fs::read_dir(config_dir.join("projects"))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join(&file_name))
-        .find(|path| path.is_file())
-}
+use crate::run_state::{claude_config_dir, find_claude_session_log};
 
 fn append_claude_custom_title(
     config_dir: &Path,
@@ -948,6 +964,7 @@ fn run_acp_session(
     cancelled: Arc<AtomicBool>,
     activity: Arc<Mutex<Option<String>>>,
     pending_permission: PendingPermissionSlot,
+    session_id_out: Arc<Mutex<Option<String>>>,
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
     kind: AgentRunKind,
@@ -972,6 +989,7 @@ fn run_acp_session(
         next_id: 1,
         request_rx,
         assistant_text: String::new(),
+        replay_transcript: Vec::new(),
         cancelled: cancelled.clone(),
         traffic_log,
         run_id,
@@ -1028,6 +1046,8 @@ fn run_acp_session(
             .and_then(Value::as_str)
             .context("session/new missing sessionId")?;
 
+        *session_id_out.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+
         if !session_title.trim().is_empty() {
             name_session(host, session_id, session_title);
         }
@@ -1079,6 +1099,12 @@ struct AcpClient {
     next_id: i64,
     request_rx: Receiver<AcpRequest>,
     assistant_text: String,
+    /// Every message chunk seen on this connection, by role, coalesced across
+    /// consecutive chunks of the same role. Populated during live turns and
+    /// (more importantly) during a `session/resume`/`session/load` replay, so
+    /// [`fetch_transcript`] can read back full history without a separate
+    /// tracking mechanism.
+    replay_transcript: Vec<(&'static str, String)>,
     cancelled: Arc<AtomicBool>,
     traffic_log: Option<SharedAgentTrafficLog>,
     run_id: RunId,
@@ -1117,6 +1143,26 @@ impl AcpClient {
 
     fn set_activity(&self, activity: Option<String>) {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = activity;
+    }
+
+    fn push_replay_chunk(&mut self, role: &'static str, text: &str) {
+        match self.replay_transcript.last_mut() {
+            Some((last_role, buf)) if *last_role == role => buf.push_str(text),
+            _ => self.replay_transcript.push((role, text.to_string())),
+        }
+    }
+
+    /// Render every captured chunk (from live turns and any resume/load
+    /// replay on this connection) as a plain-text transcript.
+    fn replay_transcript_text(&self) -> String {
+        self.replay_transcript
+            .iter()
+            .map(|(role, text)| {
+                let label = if *role == "user" { "User" } else { "Assistant" };
+                format!("{label}:\n{text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Publish a permission request for `poll_run` to surface, then block
@@ -1259,8 +1305,17 @@ impl AcpClient {
                             .and_then(Value::as_str)
                         {
                             self.assistant_text.push_str(text);
+                            self.push_replay_chunk("assistant", text);
                         }
                         self.set_activity(Some("Writing reply…".to_string()));
+                    } else if kind == "user_message_chunk" {
+                        if let Some(text) = update
+                            .get("content")
+                            .and_then(|c| c.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            self.push_replay_chunk("user", text);
+                        }
                     } else if kind == "agent_thought_chunk" {
                         self.set_activity(Some("Thinking…".to_string()));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
@@ -1688,6 +1743,7 @@ impl PersistentAcpSession {
             next_id: 1,
             request_rx,
             assistant_text: String::new(),
+        replay_transcript: Vec::new(),
             cancelled: cancelled.clone(),
             traffic_log,
             run_id,
@@ -1800,6 +1856,44 @@ impl PersistentAcpSession {
         }
         let _ = self._reader_handle.join();
     }
+}
+
+/// Fetch a resumable session's full transcript by connecting fresh and
+/// issuing `session/resume`/`session/load` — no prompt is sent, and the
+/// process is torn down immediately after. Used to populate the one-time
+/// cached transcript for a run that doesn't have one yet (e.g. reopening a
+/// `Done` chat window, or reconciling on force-exit).
+pub(crate) fn fetch_transcript(
+    host: AcpHost,
+    agent_bin: &Path,
+    cwd: &Path,
+    session_id: &str,
+    traffic_log: Option<SharedAgentTrafficLog>,
+) -> Result<String> {
+    let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let activity = Arc::new(Mutex::new(None));
+    let pending_permission: PendingPermissionSlot = Arc::new(Mutex::new(None));
+    let session = PersistentAcpSession::connect(
+        host,
+        agent_bin,
+        cwd,
+        "",
+        "",
+        child_slot.clone(),
+        cancelled,
+        activity,
+        pending_permission,
+        &[],
+        &SessionStart::Resume(session_id.to_string()),
+        traffic_log,
+        AgentRunKind::FleetAgent,
+        &[],
+        None,
+    )?;
+    let text = session.client.replay_transcript_text();
+    session.shutdown(child_slot);
+    Ok(text)
 }
 
 #[cfg(test)]

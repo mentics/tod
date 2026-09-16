@@ -9,6 +9,7 @@
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
+use tod_agent::{EngagementState, SharedEngagementRegistry};
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
@@ -33,6 +34,7 @@ use tod_store::fleet::terminal::{
     open_terminal_agent_for_node, prune_stale_shell_sessions, prune_stale_terminal_agent_runs,
     remove_shell_state,
 };
+use tod_store::fleet::repos::agent_run::RUNTIME_STATUS_ACTIVE;
 use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
     code_editors, open_code_editor_for_node, reconnect_identity,
@@ -56,8 +58,9 @@ pub enum ActionPanelEvent {
 struct InFlightFleetRun {
     provider_run_id: RunId,
     fleet_run_id: String,
-    prompt_id: String,
-    response_id: String,
+    /// Kept to build the cached transcript once the run completes — see
+    /// `FleetMutation::CacheAgentRunTranscript`.
+    prompt: String,
 }
 
 pub struct ActionPanelView {
@@ -280,10 +283,10 @@ impl ActionPanelView {
         if let Some(name) = session.session_name.as_deref() {
             return name.to_string();
         }
-        if let Ok(turns) = self.fleet.list_transcript_for_agent(&session.id) {
-            if let Some(first) = turns.iter().find(|t| t.kind == "prompt") {
-                let preview: String = first.content.chars().take(48).collect();
-                let suffix = if first.content.chars().count() > 48 {
+        if let Some(cached) = session.cached_transcript.as_deref() {
+            if let Some(first_line) = cached.lines().find(|line| !line.trim().is_empty()) {
+                let preview: String = first_line.chars().take(48).collect();
+                let suffix = if first_line.chars().count() > 48 {
                     "…"
                 } else {
                     ""
@@ -311,8 +314,10 @@ impl ActionPanelView {
         if self.in_flight.is_empty() {
             return;
         }
+        let engagement = self.interactive_window.engagement();
         let mut finished = Vec::new();
         let mut permission_requests = Vec::new();
+        let mut session_ids = Vec::new();
         {
             let Ok(mut agent) = self.agent.try_lock() else {
                 return;
@@ -322,9 +327,23 @@ impl ActionPanelView {
                     continue;
                 };
                 match state {
-                    AgentRunState::InFlight(_) => {}
-                    AgentRunState::NeedsPermission(request) => permission_requests.push(request),
+                    AgentRunState::InFlight(_) => {
+                        if let Ok(mut registry) = engagement.lock() {
+                            registry
+                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnAgent);
+                        }
+                    }
+                    AgentRunState::NeedsPermission(request) => {
+                        if let Ok(mut registry) = engagement.lock() {
+                            registry
+                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnUser);
+                        }
+                        permission_requests.push(request);
+                    }
                     AgentRunState::Success(text) => {
+                        if let Some(session_id) = agent.fleet_run_session_id(flight.provider_run_id) {
+                            session_ids.push((flight.fleet_run_id.clone(), session_id));
+                        }
                         finished.push((idx, flight.clone(), Ok(text.unwrap_or_default())));
                     }
                     AgentRunState::Failure(err) => {
@@ -339,30 +358,41 @@ impl ActionPanelView {
         if finished.is_empty() {
             return;
         }
-        for (_, flight, result) in &finished {
-            match result {
-                Ok(content) => {
-                    let _ = self.fleet.enqueue(FleetMutation::CompleteResponse {
-                        response_id: flight.response_id.clone(),
-                        run_id: flight.fleet_run_id.clone(),
-                        content: content.clone(),
-                        prompt_id: flight.prompt_id.clone(),
-                    });
-                }
-                Err(_) => {
-                    let _ = self
-                        .fleet
-                        .enqueue(FleetMutation::MarkRunPromptsInterrupted {
-                            run_id: flight.fleet_run_id.clone(),
-                        });
-                    let _ = self
-                        .fleet
-                        .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
-                            run_id: flight.fleet_run_id.clone(),
-                            runtime_status: "blocked".into(),
-                        });
-                }
+        if let Ok(mut registry) = engagement.lock() {
+            for (_, flight, _) in &finished {
+                registry.remove(&flight.fleet_run_id);
             }
+        }
+        // Persist the agent-side session id (once known) so this run can be
+        // resumed/looked up later — see `tod_agent::AgentProvider::fleet_run_session_id`.
+        for (run_id, agent_session_id) in session_ids {
+            let _ = self.fleet.enqueue(FleetMutation::SetAgentRunSessionId {
+                run_id,
+                agent_session_id,
+            });
+        }
+        for (_, flight, result) in &finished {
+            if let Ok(content) = result {
+                // A fleet-agent run is a single prompt/response pair, so
+                // that pair *is* its transcript — no need to fetch anything
+                // back from the agent. This is the run's whole conversation,
+                // cached once on completion (Done) rather than accumulated
+                // turn-by-turn as it streamed.
+                let transcript = format!("Prompt:\n{}\n\nResponse:\n{content}", flight.prompt);
+                let _ = self.fleet.enqueue(FleetMutation::CacheAgentRunTranscript {
+                    run_id: flight.fleet_run_id.clone(),
+                    transcript,
+                    fingerprint: None,
+                });
+            }
+        }
+        // Every finished run — success or failure — is done: end it so it
+        // doesn't linger `is_live()` until the next app-launch reattach pass
+        // notices its reconnect identity is stale.
+        for (_, flight, _) in &finished {
+            let _ = self.fleet.enqueue(FleetMutation::EndAgentRun {
+                run_id: flight.fleet_run_id.clone(),
+            });
         }
         let mut indices: Vec<usize> = finished.iter().map(|(idx, _, _)| *idx).collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -464,26 +494,9 @@ impl ActionPanelView {
                 identity,
             });
         }
-        let _ = self
-            .fleet
-            .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
-                run_id: fleet_run_id.clone(),
-                runtime_status: "processing".into(),
-            });
-        let prompt_id = uuid::Uuid::new_v4().to_string();
-        let response_id = uuid::Uuid::new_v4().to_string();
-        if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
-            id: prompt_id.clone(),
-            run_id: fleet_run_id.clone(),
-            content: prompt.clone(),
-        }) {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
-            return;
-        }
-        if let Err(err) = self.flush_fleet() {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
-            return;
-        }
+        // CreateAgentRun already inserted this run as active — nothing else
+        // to set here now that runtime_status only distinguishes active/done.
+        let prompt_for_transcript = prompt.clone();
         let provider_run = {
             let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
             let mut agent = self.agent.lock().expect("agent mutex");
@@ -494,8 +507,7 @@ impl ActionPanelView {
                 self.in_flight.push(InFlightFleetRun {
                     provider_run_id: handle.id,
                     fleet_run_id: fleet_run_id.clone(),
-                    prompt_id,
-                    response_id,
+                    prompt: prompt_for_transcript,
                 });
                 self.changed(format!("Launched agent in {}", cwd.display()), cx);
             }
@@ -525,11 +537,6 @@ impl ActionPanelView {
                 let _ = agent.cancel_run(flight.provider_run_id);
             }
         }
-        let _ = self
-            .fleet
-            .enqueue(FleetMutation::MarkRunPromptsInterrupted {
-                run_id: run_id.to_string(),
-            });
         if let Err(err) = self.fleet.enqueue(FleetMutation::EndAgentRun {
             run_id: run_id.to_string(),
         }) {
@@ -730,10 +737,7 @@ impl ActionPanelView {
         self.in_flight
             .iter()
             .any(|flight| flight.fleet_run_id == run.id)
-            || matches!(
-                run.runtime_status.as_str(),
-                "starting" | "processing" | "waiting"
-            )
+            || run.runtime_status == RUNTIME_STATUS_ACTIVE
     }
 
     fn render_section(title: &'static str, cx: &Context<Self>) -> gpui::Div {
@@ -812,6 +816,8 @@ impl ActionPanelView {
             options.effort
         );
 
+        let engagement = self.interactive_window.engagement();
+
         let mut section = Self::render_section("Agents", cx).child(
             selectable_text("action-panel-agent-summary", agent_summary, window, cx)
                 .text_xs()
@@ -826,7 +832,7 @@ impl ActionPanelView {
             })
             .children(self.chat_sessions.iter().enumerate().map(|(idx, session)| {
                 let label = self.session_label(session);
-                let status = format_status_label(&session.runtime_status);
+                let status = format_status_label(&session.id, &session.runtime_status, &engagement);
                 let session_id = session.id.clone();
                 h_flex()
                     .gap_2()
@@ -869,7 +875,7 @@ impl ActionPanelView {
                 let label = format!(
                     "run {} · {}",
                     run.run_number,
-                    format_status_label(&run.runtime_status)
+                    format_status_label(&run.id, &run.runtime_status, &engagement)
                 );
                 let stop_run_id = run.id.clone();
                 let delete_run_id = run.id.clone();
@@ -923,7 +929,7 @@ impl ActionPanelView {
                 let label = format!(
                     "terminal {} · {}",
                     run.run_number,
-                    format_status_label(&run.runtime_status)
+                    format_status_label(&run.id, &run.runtime_status, &engagement)
                 );
                 let focus_id = run.id.clone();
                 let delete_id = run.id.clone();
@@ -1208,16 +1214,30 @@ impl Render for ActionPanelView {
     }
 }
 
-fn format_status_label(status: &str) -> String {
-    match status {
-        "starting" => "Starting",
-        "processing" => "Processing",
-        "waiting" => "Waiting",
-        "blocked" => "Blocked",
-        "not_running" => "Not running",
-        other => other,
+/// Prefer the live `EngagementState` for this run when something is
+/// currently polling it; otherwise fall back to the persisted two-state
+/// `runtime_status` (active/done), since nothing is watching the run to know
+/// anything more specific right now.
+fn format_status_label(
+    run_id: &str,
+    runtime_status: &str,
+    engagement: &SharedEngagementRegistry,
+) -> String {
+    if let Ok(registry) = engagement.lock()
+        && let Some(state) = registry.get(run_id)
+    {
+        return match state {
+            EngagementState::WaitingOnAgent => "Processing".to_string(),
+            EngagementState::WaitingOnUser => "Waiting for you".to_string(),
+            EngagementState::WaitingOnOther(reason) => reason.clone(),
+            EngagementState::Done => "Done".to_string(),
+        };
     }
-    .into()
+    if runtime_status == RUNTIME_STATUS_ACTIVE {
+        "Active".to_string()
+    } else {
+        "Done".to_string()
+    }
 }
 
 pub fn register_action_panel_keyboard_bindings(cx: &mut App) {
