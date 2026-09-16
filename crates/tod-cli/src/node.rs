@@ -11,7 +11,7 @@ use tod_store::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
 use tod_store::outline::{CreatePosition, Node, OutlineMutation};
 use uuid::Uuid;
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 tod-cli node — outline nodes
 
 Nodes may be addressed by slug or full UUID.

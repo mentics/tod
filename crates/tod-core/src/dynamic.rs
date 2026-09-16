@@ -23,6 +23,20 @@ pub struct NodeSelection {
     /// Node body/details, when the node has any.
     pub body: Option<String>,
     pub lifecycle: Option<String>,
+    /// The node's stable slug, when the caller has it. Rendered so an agent
+    /// can address the node by slug rather than pasting a UUID.
+    pub slug: Option<String>,
+}
+
+/// Where a session's work lands: the repo, branch, and directory a fleet agent
+/// was launched into.
+#[derive(Debug, Clone)]
+pub struct Workspace {
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub cwd: String,
+    /// Free-text notes recorded on the task.
+    pub notes: Vec<String>,
 }
 
 /// A specific obligation selected within the surface.
@@ -61,6 +75,8 @@ pub enum DynamicBlock {
     AncestorContext,
     /// This node's plan steps with their dependency and `satisfies` links.
     Plan,
+    /// Repo, branch, working directory, and task notes.
+    Workspace,
 }
 
 /// Everything any block might need. A surface fills in what its blocks use and
@@ -76,6 +92,7 @@ pub struct DynamicContext<'a> {
     pub obligations: &'a [NodeObligation],
     pub ancestor_context: &'a str,
     pub plan_steps: &'a [PlanStepWithLinks],
+    pub workspace: Option<&'a Workspace>,
 }
 
 /// Render `blocks`, in order, under a single `# Current context` heading.
@@ -117,6 +134,9 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             out.push_str("## Selected node\n\n");
             out.push_str(&format!("- **Id:** `{}`\n", node.id));
             out.push_str(&format!("- **Title:** {}\n", node.title.trim()));
+            if let Some(slug) = node.slug.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!("- **Slug:** `{}`\n", slug.trim()));
+            }
             if let Some(lifecycle) = node.lifecycle.as_deref() {
                 if !lifecycle.trim().is_empty() {
                     out.push_str(&format!("- **Lifecycle state:** {}\n", lifecycle.trim()));
@@ -205,6 +225,28 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                 }
             }
         }
+
+        DynamicBlock::Workspace => {
+            let Some(workspace) = ctx.workspace else { return };
+            out.push_str("\n## Workspace\n\n");
+            out.push_str(&format!(
+                "- **Repository:** {}\n",
+                workspace.repo.as_deref().unwrap_or("(not set)")
+            ));
+            out.push_str(&format!(
+                "- **Branch:** {}\n",
+                workspace.branch.as_deref().unwrap_or("(default)")
+            ));
+            out.push_str(&format!("- **Working directory:** {}\n", workspace.cwd));
+            out.push_str("\n**Notes:**\n\n");
+            if workspace.notes.is_empty() {
+                out.push_str("(none)\n");
+            } else {
+                for note in &workspace.notes {
+                    out.push_str(&format!("- {note}\n"));
+                }
+            }
+        }
     }
 }
 
@@ -218,6 +260,7 @@ mod tests {
             title: "Obligations Panel".into(),
             body: Some("Panel for editing direct obligations.".into()),
             lifecycle: Some("active".into()),
+            slug: Some("obligations-panel".into()),
         }
     }
 

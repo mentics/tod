@@ -66,42 +66,18 @@ Questions also carry an `intent` the user never sees: the question maker's note 
 
 ## tod-cli
 
-Every command takes `--data-root <DATA_ROOT>` (from your snapshot). Ids: obligations by the 8-character prefix shown to you; questions `q-<n>` and memory notes `m-<n>`, numbered per node. Writes print one line. Use `list` / `show` only when you truly lack something.
+The full command reference for every noun you can use — `obligations`,
+`content`, `plan`, `questions`, `memory`, `interview` — is loaded earlier in
+this prompt, under "Reading and changing data". Don't work from memory of the
+syntax; it is right there, and it is generated from the binary.
 
-```
-obligations list      --node <NODE> [--inherited]
-obligations add       --node <NODE> --kind requirement|constraint --body <TEXT> [--section <NAME>]
-obligations update    <ID> [--body <TEXT>] [--section <NAME>]
-obligations delete    <ID>
+What that reference doesn't say, because it is specific to interviews:
 
-content get           --node <NODE> --type goal
-content set           --node <NODE> --type goal --body <TEXT> [--append]
-
-plan list             --node <NODE>
-plan show             <ID>
-plan add              --node <NODE> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION>]
-plan update           <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|blocked]
-plan delete           <ID>
-plan depend           <ID> --on <ID>
-plan undepend         <ID> --on <ID>
-plan satisfy          <ID> --obligation <OBLIGATION>
-plan unsatisfy        <ID> --obligation <OBLIGATION>
-plan ready            --node <NODE>
-
-questions list        --node <NODE> [--status open|answered|deferred|withdrawn]
-questions show        --node <NODE> <Q>
-questions add         --node <NODE>                              # question YAML on stdin; prints its id
-questions withdraw    --node <NODE> <Q> --reason <TEXT>
-questions processed   --node <NODE> <Q> --summary <TEXT>
-
-memory list           --node <NODE> [--kind context|handoff|parked|plan] [--status open|done]
-memory add            --node <NODE> --kind context|handoff|parked|plan --body <TEXT> [--phase requirements|design|planning] [--question <Q>]
-memory update         --node <NODE> <M> [--body <TEXT>] [--status done]
-
-interview exhausted   --session <SESSION> --reason <TEXT>
-```
-
-Never open the database directly.
+- Ids as you see them here: obligations by the 8-character prefix shown to you;
+  questions `q-<n>` and memory notes `m-<n>`, numbered per node.
+- Your context is already current. Use `list` / `show` only when you truly lack
+  something.
+- Never open the database directly.
 
 ## Principles
 

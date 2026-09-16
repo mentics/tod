@@ -152,12 +152,22 @@ themselves, addressed by the node's stable slug or full UUID; every other noun
 
 Adding a command means adding a noun/verb that wraps an existing mutation, not
 new SQL. Keep `tod-cli`'s dependencies minimal: agents shell out to it
-repeatedly, so startup cost is a feature. `media/context/cli/` is the one
-canonical place `tod-cli` command syntax is documented for agents — a new noun
-gets its own `cli/<noun>.md` there, which surfaces then opt into, instead of
-being re-explained inline wherever it's used. A test
-(`context_recipes::tests::tod_cli_syntax_appears_only_under_cli`) enforces
-this.
+repeatedly, so startup cost is a feature.
+
+`media/context/cli/` is the one canonical place `tod-cli` command syntax is
+documented for agents — one `cli/<noun>.md` per noun the binary dispatches,
+which surfaces opt into, instead of being re-explained inline wherever it's
+used. Adding a noun means adding its fragment and putting it in the recipes
+that need it. Three sets of tests hold this together:
+
+- `tod_cli::doc_sync` pins each fragment to that noun's own `USAGE` string —
+  every verb documented, no verb invented. This is what catches a new verb
+  whose agent-facing docs were never updated.
+- `context_recipes::tests::tod_cli_syntax_appears_only_under_cli` keeps syntax
+  out of `stance/`, `domain/`, and `surface/`.
+- `context_recipes::tests::process_docs_do_not_carry_their_own_command_tables`
+  keeps it out of `assets/process/` too. Those role docs may still say *which*
+  noun applies in prose; they must not restate how to call it.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 

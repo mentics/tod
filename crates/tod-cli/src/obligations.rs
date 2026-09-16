@@ -14,7 +14,7 @@ use tod_store::outline::{
 };
 use uuid::Uuid;
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 tod-cli obligations — requirements and constraints on a node
 
 Obligation ids may be given in full or as the 8-character prefix shown in listings.

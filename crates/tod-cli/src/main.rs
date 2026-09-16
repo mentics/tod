@@ -9,6 +9,8 @@
 //! that changed since the session's context was built.
 
 mod args;
+#[cfg(test)]
+mod doc_sync;
 mod drafting;
 mod interview;
 mod node;

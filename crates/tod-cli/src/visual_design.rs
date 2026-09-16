@@ -17,7 +17,7 @@ use tod_store::outline::NodeObligation;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::ObligationRepo;
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 tod-cli visual-design — the UI mockup associated with one obligation
 
 COMMANDS:

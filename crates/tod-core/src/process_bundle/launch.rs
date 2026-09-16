@@ -2,12 +2,13 @@
 
 use super::manifest::ProcessManifest;
 use crate::context_recipes::{self, DRAFTING_AGENT, FLEET_AUTONOMOUS, INTERVIEW_AGENT};
-use crate::dynamic::DynamicContext;
+use crate::dynamic::{DynamicContext, NodeSelection, Workspace};
 use crate::interview::phase::base_interview_phase;
 use crate::media::{MediaPaths, load_static_context};
 use anyhow::{Context, Result};
 use std::path::Path;
 use tod_store::interview::Role;
+use uuid::Uuid;
 
 /// A surface's static context fragments, followed by the process-bundle docs
 /// that are its role. Kept separate from `context_recipes::build_message`
@@ -105,16 +106,18 @@ pub fn build_fleet_agent_prompt(
     cwd: &Path,
 ) -> Result<String> {
     let role = state_role_doc(manifest, &task.lifecycle)?;
-    let repo = task.repo.as_deref().unwrap_or("(not set)");
-    let branch = task.branch.as_deref().unwrap_or("(default)");
-    let notes = if task.notes.is_empty() {
-        "(none)".to_string()
-    } else {
-        task.notes
-            .iter()
-            .map(|n| format!("- {}", n.text))
-            .collect::<Vec<_>>()
-            .join("\n")
+    let node = NodeSelection {
+        id: Uuid::parse_str(&task.id).unwrap_or_default(),
+        title: task.title.clone(),
+        body: None,
+        lifecycle: Some(task.lifecycle.clone()),
+        slug: Some(task.slug.clone()),
+    };
+    let workspace = Workspace {
+        repo: task.repo.clone(),
+        branch: task.branch.clone(),
+        cwd: cwd.display().to_string(),
+        notes: task.notes.iter().map(|n| n.text.clone()).collect(),
     };
     context_recipes::build_message(
         media,
@@ -122,30 +125,15 @@ pub fn build_fleet_agent_prompt(
         Some(&role),
         &DynamicContext {
             data_root: Some(data_root),
+            node: Some(&node),
+            workspace: Some(&workspace),
             ..Default::default()
         },
-        &format!(
-        "## Task\n\n\
-         Node id: {node_id}\n\
-         Title: {title}\n\
-         Slug: {slug}\n\
-         Lifecycle: {lifecycle}\n\
-         Repository: {repo}\n\
-         Branch: {branch}\n\
-         Working directory: {cwd}\n\
-         \n\
-         ## Notes\n\n\
-         {notes}\n\n\
-         ## Instruction\n\n\
+        "\n## Instruction\n\n\
          Begin autonomous work for this task in the working directory. \
          Follow the lifecycle state responsibilities above. \
-         When you finish this slice of work, summarize what you did and any blockers.",
-        lifecycle = task.lifecycle,
-        node_id = task.id,
-        title = task.title,
-        slug = task.slug,
-            cwd = cwd.display(),
-        ),
+         When you finish this slice of work, summarize what you did and any \
+         blockers.\n",
     )
 }
 

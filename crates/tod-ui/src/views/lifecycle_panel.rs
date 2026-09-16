@@ -651,6 +651,7 @@ impl LifecyclePanelView {
                     data_root: self.paths.data_root(),
                     node: tod_core::agent_context::NodeSelection {
                         id: node_id,
+                        slug: Some(node.slug.clone()),
                         title: node.title,
                         body,
                         lifecycle: Some(self.lifecycle.clone()),

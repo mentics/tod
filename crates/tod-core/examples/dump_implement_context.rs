@@ -74,6 +74,7 @@ fn main() -> Result<()> {
                 title: node.title.clone(),
                 body,
                 lifecycle: nodes.get_lifecycle(node_id).ok().flatten(),
+                slug: Some(node.slug.clone()),
             },
             plan_steps,
             obligations,

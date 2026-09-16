@@ -645,6 +645,7 @@ impl Shell {
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
+                    slug: Some(node.slug.clone()),
                     title: node.title,
                     body,
                     lifecycle: Some(node.lifecycle),
@@ -1123,6 +1124,7 @@ impl Shell {
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
+                    slug: Some(node.slug.clone()),
                     title: node.title,
                     body,
                     lifecycle: Some(node.lifecycle),

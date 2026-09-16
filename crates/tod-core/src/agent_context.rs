@@ -116,6 +116,7 @@ mod tests {
             title: "Obligations Panel".into(),
             body: Some("Panel for editing direct obligations.".into()),
             lifecycle: Some("active".into()),
+            slug: Some("obligations-panel".into()),
         }
     }
 

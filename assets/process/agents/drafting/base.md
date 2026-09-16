@@ -104,30 +104,13 @@ Write "No changes." inside the tags when nothing changed. Never mention agents, 
 
 ## tod-cli
 
-Every command takes `--data-root <DATA_ROOT>` (from your snapshot). Obligations by the 8-character id shown to you; choices `c-<n>`, per node. Writes print one line. For long or multi-line text, pass `-` as the value (`--body -`) and the text on stdin; one flag per command.
+The full command reference for every noun you can use — `node`, `obligations`,
+`content`, `drafting`, `visual-design` — is loaded earlier in this prompt,
+under "Reading and changing data". Don't work from memory of the syntax; it is
+right there, and it is generated from the binary.
 
-```
-node search           --query <TEXT>
-node show             <SLUG_OR_UUID>
-node create           --title <TEXT> --parent <SLUG_OR_UUID>
+What that reference doesn't say, because it is specific to drafting:
 
-obligations list      --node <NODE> [--inherited]
-obligations add       --node <NODE> --kind requirement|constraint --body <TEXT> --attention low|medium|high --why <TEXT> [--section <NAME>]
-obligations update    <ID> [--body <TEXT>] [--section <NAME>] [--attention low|medium|high --why <TEXT>]
-obligations move      <ID> --node <NODE>
-obligations delete    <ID>
-obligations deleted   --node <NODE>                 # restorable deletions, as r-<n>
-obligations restore   <r-N>...                      # undo a deletion or an edit
-obligations check-refs [--node <NODE>]
-
-content set           --node <NODE> --type goal --body <TEXT>
-
-drafting choices      --node <NODE> [--status open]
-drafting add-choice   --node <NODE>                  # choice YAML on stdin
-drafting withdraw-choice --node <NODE> <C>
-drafting buildable    --node <NODE> --outcome pass|fail --detail <TEXT>
-
-visual-design save    --obligation <ID> --html-file <PATH>
-```
-
-Never open the database directly.
+- Ids as you see them here: obligations by the 8-character id shown to you;
+  choices `c-<n>`, numbered per node.
+- Never open the database directly.

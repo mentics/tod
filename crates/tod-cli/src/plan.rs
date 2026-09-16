@@ -8,7 +8,7 @@ use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
 use uuid::Uuid;
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 tod-cli plan — structured plan steps on a node
 
 Plan step ids may be given in full or as the 8-character prefix shown in listings.

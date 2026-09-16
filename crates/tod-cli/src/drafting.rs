@@ -8,7 +8,7 @@ use std::io::Read;
 use tod_store::drafting::{ChoiceOption, DraftingRepo};
 use tod_store::interview::InterviewCommand;
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 tod-cli drafting — dumps, choices, and buildable while a node's spec is drafted
 
 COMMANDS:

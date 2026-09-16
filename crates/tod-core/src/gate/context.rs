@@ -165,6 +165,7 @@ fn node_selection(request: &GateCheckRequest<'_>) -> NodeSelection {
         title: request.node_title.clone(),
         body: request.node_body.clone(),
         lifecycle: Some(request.node_lifecycle.clone()),
+        slug: None,
     }
 }
 

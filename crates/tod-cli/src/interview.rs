@@ -8,7 +8,7 @@ use tod_store::interview::*;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
 
-const CONTENT_USAGE: &str = "\
+pub(crate) const CONTENT_USAGE: &str = "\
 tod-cli content — a node's goal, design, plan, and generated summary
 
 COMMANDS:
@@ -20,7 +20,7 @@ COMMANDS:
 docs' On-entry steps.
 ";
 
-const QUESTIONS_USAGE: &str = "\
+pub(crate) const QUESTIONS_USAGE: &str = "\
 tod-cli questions — interview questions on a node
 
 COMMANDS:
@@ -32,7 +32,7 @@ COMMANDS:
     processed --node <UUID> <q-N> --summary <TEXT>
 ";
 
-const MEMORY_USAGE: &str = "\
+pub(crate) const MEMORY_USAGE: &str = "\
 tod-cli memory — interview memory on a node
 
 COMMANDS:
@@ -41,7 +41,7 @@ COMMANDS:
     update --node <UUID> <m-N> [--body <TEXT>] [--status open|done]
 ";
 
-const INTERVIEW_USAGE: &str = "\
+pub(crate) const INTERVIEW_USAGE: &str = "\
 tod-cli interview — interview session state
 
 COMMANDS:

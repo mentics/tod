@@ -145,6 +145,10 @@ tod stores in general — only about the concepts it will handle.
 | `cli/drafting.md` | `drafting` noun |
 | `cli/visual-design.md` | `visual-design save` (currently inlined in `design/visual-design.md`) |
 
+There is one fragment per noun the binary dispatches — as built, that is all
+nine: `node`, `obligations`, `plan`, `drafting`, `visual-design`, `content`,
+`questions`, `memory`, `interview`.
+
 A surface that mutates nothing (4) loads none of these. Surface 2 loads
 `cli/intro` + `cli/visual-design` only. This also gives the process-bundle
 surfaces (6–10) something to load instead of re-explaining `tod-cli` in twelve
@@ -276,14 +280,29 @@ All four steps are done.
    process-bundle surfaces via `with_static_context`. All ten surfaces are
    registered in `ALL_RECIPES`.
 
+### Gaps closed since
+
+- **The fleet run's workspace is modelled.** `DynamicBlock::Workspace` renders
+  repo, branch, cwd and notes, and `NodeSelection` gained `slug`, so
+  `build_fleet_agent_prompt` no longer hand-rolls a Task block. Only its
+  closing Instruction is still surface-specific.
+- **The `cli/` fragments are pinned to the binary.** They had already drifted:
+  `obligations add` requires `--phase` and the fragment omitted it, `node list`
+  takes `--list`, `visual-design` has `show` and `clear`. Four of the nine
+  nouns (`content`, `questions`, `memory`, `interview`) had no fragment at all,
+  so the interview agents could only work from the copy in their role doc.
+  All nine now exist and are checked against each noun's own `USAGE` string by
+  `tod-cli`'s `doc_sync` tests: every verb documented, no verb invented.
+- **The process docs no longer carry command tables.** `interview/base.md` and
+  `drafting/base.md` point at the `cli/` fragments their recipes load, keeping
+  only what is genuinely theirs (how ids appear in their snapshots). A test
+  enforces this over all of `assets/process/`.
+
 ### Known remaining gaps
 
-- The fleet autonomous run still renders its own Task/Notes/Instruction block
-  (repo, branch, cwd, notes). Modelling it would need a `Workspace` dynamic
-  block; the fields exist only in `process_bundle::launch` today.
 - The interview and drafting surfaces contribute static fragments only. Their
   dynamic halves stay in `interview::context` and `drafting::context`, which
   have their own shape and byte-stability requirements for session reuse.
-- Twelve files under `assets/process/` still describe `tod-cli` usage. The
-  `tod_cli_syntax_appears_only_under_cli` test covers `media/context/` only;
-  extending it over the process bundle means reconciling those docs first.
+- State role docs still mention `tod-cli <noun>` in prose (not as command
+  tables). That is deliberate — the prose says *which* noun applies, the `cli/`
+  fragment says how to call it.

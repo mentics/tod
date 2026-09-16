@@ -197,9 +197,6 @@ pub const ON_ENTRY: ContextRecipe = ContextRecipe {
 /// no domain model and no `tod-cli` reference, despite its role docs telling
 /// it to use `tod-cli`.
 ///
-/// Its dynamic half beyond the data root (repo, branch, cwd, notes) is still
-/// assembled in `process_bundle::launch`, which is the only place those fields
-/// exist.
 pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
     name: "fleet autonomous run",
     layers: &[
@@ -212,7 +209,11 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/plan",
     ],
-    blocks: &[DynamicBlock::DataRoot],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Node,
+        DynamicBlock::Workspace,
+    ],
 };
 
 /// An interview agent turn (question-maker or answer-processor). Its dynamic
@@ -225,8 +226,14 @@ pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
         "stance/agent-to-agent",
         "domain/outline",
         "domain/obligations",
+        "domain/plan",
         "cli/intro",
         "cli/obligations",
+        "cli/content",
+        "cli/plan",
+        "cli/questions",
+        "cli/memory",
+        "cli/interview",
     ],
     blocks: &[],
 };
@@ -240,8 +247,11 @@ pub const DRAFTING_AGENT: ContextRecipe = ContextRecipe {
         "domain/outline",
         "domain/obligations",
         "cli/intro",
+        "cli/node",
         "cli/obligations",
+        "cli/content",
         "cli/drafting",
+        "cli/visual-design",
     ],
     blocks: &[],
 };
@@ -381,6 +391,67 @@ mod tests {
                 "{key}.md spells out a tod-cli invocation; \
                  document it under cli/ and reference it by name instead"
             );
+        }
+    }
+
+    /// The same rule over `assets/process/`. The interview and drafting role
+    /// docs each carried their own command table, abbreviated and already
+    /// drifted from the binary (the interview one omitted `obligations add
+    /// --phase`, which is required). They now point at the `cli/` fragments
+    /// their recipes load.
+    ///
+    /// A fenced block is the tell: prose may still say "change them with
+    /// `tod-cli plan`".
+    #[test]
+    fn process_docs_do_not_carry_their_own_command_tables() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join("process");
+        if !root.is_dir() {
+            return;
+        }
+        let nouns = [
+            "node ",
+            "obligations ",
+            "plan ",
+            "drafting ",
+            "content ",
+            "questions ",
+            "memory ",
+            "interview ",
+            "visual-design ",
+        ];
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let mut fenced = false;
+                for line in text.lines() {
+                    if line.trim_start().starts_with("```") {
+                        fenced = !fenced;
+                        continue;
+                    }
+                    if !fenced {
+                        continue;
+                    }
+                    assert!(
+                        !nouns.iter().any(|n| line.starts_with(n)),
+                        "{} has a tod-cli command table ({line:?}); \
+                         the cli/ fragments are the one reference — point at them",
+                        path.display()
+                    );
+                }
+            }
         }
     }
 
