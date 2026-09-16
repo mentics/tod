@@ -18,7 +18,7 @@ use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tod_agent::{SessionOpening, SessionTurn};
+use tod_agent::{EngagementState, SessionOpening, SessionTurn, SharedEngagementRegistry};
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::{AgentRole, TodSettings, parse_platform, platform_storage};
 
@@ -106,6 +106,10 @@ pub struct InteractiveAgentView {
     auto_scroll: bool,
     /// Turn count as of the last render, so a new turn can be detected.
     last_turn_count: usize,
+    /// Where this session's live `EngagementState` is published while a turn
+    /// is pending — see `poll_agent`. Shared across every chat window and the
+    /// Action panel's auto-runs, so the status bar can read one source.
+    engagement: SharedEngagementRegistry,
     /// True when this view is embedded inside another panel (e.g. the visual
     /// design panel) rather than owning its own OS window — `close()` must
     /// then leave the window alone and let the embedding panel handle it.
@@ -124,6 +128,7 @@ impl InteractiveAgentView {
         // Assembled app context, sent once ahead of the session's first message.
         initial_context: Option<String>,
         settings: TodSettings,
+        engagement: SharedEngagementRegistry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -228,6 +233,7 @@ impl InteractiveAgentView {
             auto_scroll: true,
             last_turn_count: 0,
             embedded: false,
+            engagement,
             _poll_task,
         };
         // Focus straight into the prompt box so the window opens ready for
@@ -458,6 +464,7 @@ impl InteractiveAgentView {
                     run_id: Some(run_id),
                     user_text,
                 });
+                self.set_engagement(EngagementState::WaitingOnAgent);
             }
             AgentRunState::NeedsPermission(request) => {
                 self.status_line = "Waiting for permission…".into();
@@ -469,6 +476,7 @@ impl InteractiveAgentView {
                     run_id: Some(run_id),
                     user_text,
                 });
+                self.set_engagement(EngagementState::WaitingOnUser);
             }
             AgentRunState::Success(response) => {
                 let assistant = response.unwrap_or_default();
@@ -478,14 +486,31 @@ impl InteractiveAgentView {
                 self.error_banner = None;
                 self.activity = None;
                 self.record_agent_session_id(agent_session_id);
+                self.clear_engagement();
             }
             AgentRunState::Failure(message) => {
                 self.error_banner = Some(message);
                 self.status_line = "Agent run failed".into();
                 self.activity = None;
+                self.clear_engagement();
             }
         }
         cx.notify();
+    }
+
+    /// Publish this session's live engagement state — see the `engagement`
+    /// field doc. Keyed by the fleet run id, not the provider's `RunId`, so
+    /// the status bar can key on the same id `ActionPanelView` uses.
+    fn set_engagement(&self, state: EngagementState) {
+        if let Ok(mut registry) = self.engagement.lock() {
+            registry.insert(self.session_run_id.clone(), state);
+        }
+    }
+
+    fn clear_engagement(&self) {
+        if let Ok(mut registry) = self.engagement.lock() {
+            registry.remove(&self.session_run_id);
+        }
     }
 
     /// Persist the agent-side session id when the agent first reports it (or
@@ -510,6 +535,7 @@ impl InteractiveAgentView {
 
     fn close(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
         self.window_control.release_session(&self.session_run_id);
+        self.clear_engagement();
         if !self.embedded {
             window.remove_window();
         }

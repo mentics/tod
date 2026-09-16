@@ -9,6 +9,7 @@
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
+use tod_agent::EngagementState;
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
@@ -307,6 +308,7 @@ impl ActionPanelView {
         if self.in_flight.is_empty() {
             return;
         }
+        let engagement = self.interactive_window.engagement();
         let mut finished = Vec::new();
         let mut permission_requests = Vec::new();
         let mut session_ids = Vec::new();
@@ -319,8 +321,19 @@ impl ActionPanelView {
                     continue;
                 };
                 match state {
-                    AgentRunState::InFlight(_) => {}
-                    AgentRunState::NeedsPermission(request) => permission_requests.push(request),
+                    AgentRunState::InFlight(_) => {
+                        if let Ok(mut registry) = engagement.lock() {
+                            registry
+                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnAgent);
+                        }
+                    }
+                    AgentRunState::NeedsPermission(request) => {
+                        if let Ok(mut registry) = engagement.lock() {
+                            registry
+                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnUser);
+                        }
+                        permission_requests.push(request);
+                    }
                     AgentRunState::Success(text) => {
                         if let Some(session_id) = agent.fleet_run_session_id(flight.provider_run_id) {
                             session_ids.push((flight.fleet_run_id.clone(), session_id));
@@ -338,6 +351,11 @@ impl ActionPanelView {
         }
         if finished.is_empty() {
             return;
+        }
+        if let Ok(mut registry) = engagement.lock() {
+            for (_, flight, _) in &finished {
+                registry.remove(&flight.fleet_run_id);
+            }
         }
         // Persist the agent-side session id (once known) so this run can be
         // resumed/looked up later — see `tod_agent::AgentProvider::fleet_run_session_id`.
@@ -362,15 +380,13 @@ impl ActionPanelView {
                 });
             }
         }
-        for (_, flight, result) in &finished {
-            if result.is_err() {
-                let _ = self
-                    .fleet
-                    .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
-                        run_id: flight.fleet_run_id.clone(),
-                        runtime_status: "blocked".into(),
-                    });
-            }
+        // Every finished run — success or failure — is done: end it so it
+        // doesn't linger `is_live()` until the next app-launch reattach pass
+        // notices its reconnect identity is stale.
+        for (_, flight, _) in &finished {
+            let _ = self.fleet.enqueue(FleetMutation::EndAgentRun {
+                run_id: flight.fleet_run_id.clone(),
+            });
         }
         let mut indices: Vec<usize> = finished.iter().map(|(idx, _, _)| *idx).collect();
         indices.sort_unstable_by(|a, b| b.cmp(a));

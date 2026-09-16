@@ -158,6 +158,7 @@ impl VisualDesignPanelView {
         self.webview = None;
         self.pending_webview_url = None;
 
+        let engagement = chat.window_control.engagement();
         let view = cx.new(|cx| {
             InteractiveAgentView::new(
                 chat.node_id,
@@ -168,6 +169,7 @@ impl VisualDesignPanelView {
                 chat.window_control,
                 chat.initial_context,
                 chat.settings,
+                engagement,
                 window,
                 cx,
             )

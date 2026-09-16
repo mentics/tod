@@ -16,6 +16,7 @@ use tod_store::fleet::FleetStore;
 use tod_store::fleet::terminal::open_terminal_agent_for_node;
 use tod_store::fleet::writer::FleetMutation;
 use tod_store::{AgentLaunchOptions, AgentRole};
+use tod_agent::{SharedEngagementRegistry, shared_engagement_registry};
 
 #[derive(Debug, Clone)]
 pub struct InteractiveAgentOpenParams {
@@ -60,6 +61,11 @@ pub struct InteractiveAgentWindowControl {
     agent: Arc<Mutex<Option<SharedAgent>>>,
     paths: Arc<Mutex<Option<TodPaths>>>,
     settings: Arc<Mutex<Option<TodSettings>>>,
+    /// Live `EngagementState` per fleet run id, written by every chat window's
+    /// (and, via `ActionPanelView`, every fleet-agent auto-run's) poll loop.
+    /// Never bound/late-set like the other fields — it doesn't depend on the
+    /// fleet store or agent provider, so it's simply created once here.
+    engagement: SharedEngagementRegistry,
 }
 
 impl InteractiveAgentWindowControl {
@@ -70,7 +76,12 @@ impl InteractiveAgentWindowControl {
             agent: Arc::new(Mutex::new(None)),
             paths: Arc::new(Mutex::new(None)),
             settings: Arc::new(Mutex::new(None)),
+            engagement: shared_engagement_registry(),
         }
+    }
+
+    pub fn engagement(&self) -> SharedEngagementRegistry {
+        self.engagement.clone()
     }
 
     pub fn bind(
@@ -389,6 +400,7 @@ impl InteractiveAgentWindowControl {
                         control_for_close.release_session(&session_for_close);
                         true
                     });
+                    let engagement = control.engagement();
                     let view = cx.new(|cx| {
                         InteractiveAgentView::new(
                             node_id,
@@ -399,6 +411,7 @@ impl InteractiveAgentWindowControl {
                             control,
                             initial_context,
                             settings,
+                            engagement,
                             window,
                             cx,
                         )

@@ -13,8 +13,10 @@
 //! stored.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// The four ways tod can be running an agent process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +61,21 @@ pub enum EngagementState {
     WaitingOnUser,
     WaitingOnOther(String),
     Done,
+}
+
+/// Shared home for every run's current `EngagementState`, keyed by the fleet
+/// agent-run id. A run only has an entry while something is actively polling
+/// it — nothing here is persisted; a poll loop that stops running (window
+/// closed, turn finished) removes its entries rather than leaving them stale.
+///
+/// This is the single producer both the status bar and any per-run label
+/// should read from, instead of each re-deriving status from `AgentRunState`
+/// (or worse, from the durable `runtime_status` column, which only knows
+/// active/done).
+pub type SharedEngagementRegistry = Arc<Mutex<HashMap<String, EngagementState>>>;
+
+pub fn shared_engagement_registry() -> SharedEngagementRegistry {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// A handle with enough identity for a `RunLocationOps` impl to check
