@@ -642,7 +642,7 @@ impl Shell {
             &media,
             &ContextRequest {
                 surface: "obligations",
-                layers: &["app", "tod_cli", "interactive", "obligations"],
+                layers: tod_core::agent_context::OBLIGATIONS_CONTEXT_LAYERS,
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
@@ -1121,7 +1121,7 @@ impl Shell {
             &media,
             &ContextRequest {
                 surface: "design/visual-design",
-                layers: &["app", "interactive", "design/visual-design"],
+                layers: tod_core::agent_context::VISUAL_DESIGN_CONTEXT_LAYERS,
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,

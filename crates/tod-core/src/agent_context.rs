@@ -135,6 +135,34 @@ fn render_dynamic(request: &ContextRequest<'_>) -> String {
     out
 }
 
+/// Static context fragments for the obligations-panel chat. Interactive, and
+/// the one surface with a scoped exception to "confirm first" — see
+/// `surface/obligations.md`, which states that exception in terms of the
+/// stance rather than flatly contradicting it.
+pub const OBLIGATIONS_CONTEXT_LAYERS: &[&str] = &[
+    "stance/interactive-chat",
+    "domain/outline",
+    "domain/obligations",
+    "domain/plan",
+    "cli/intro",
+    "cli/node",
+    "cli/obligations",
+    "cli/plan",
+    "surface/obligations",
+];
+
+/// Static context fragments for the visual-design chat. It mutates through
+/// exactly one command, so it loads `cli/visual-design` and none of the other
+/// nouns.
+pub const VISUAL_DESIGN_CONTEXT_LAYERS: &[&str] = &[
+    "stance/interactive-chat",
+    "domain/outline",
+    "domain/obligations",
+    "cli/intro",
+    "cli/visual-design",
+    "surface/visual-design",
+];
+
 /// Surface key for an implementation session, used for session naming (see
 /// `session_name::session_name_for`) — not a media context key.
 pub const IMPLEMENT_SURFACE_KEY: &str = "active/implement";
@@ -142,10 +170,24 @@ pub const IMPLEMENT_SURFACE_KEY: &str = "active/implement";
 /// Static context fragments for an implementation session, launched from the
 /// lifecycle panel's Active-phase "Implement" button (see `crate::gate` for
 /// the transition gate that requires Agent and Files before a node can reach
-/// `active` at all). This is a background work session, not an interactive
-/// chat, so it does not load `"interactive"` (no "confirm before editing",
-/// no "keep replies short" — the agent must act and can be verbose).
-pub const IMPLEMENT_CONTEXT_LAYERS: &[&str] = &["app", "tod_cli", "active/implement"];
+/// `active` at all).
+///
+/// Stance is `autonomous-session`, not `interactive-chat`: nobody is waiting
+/// at a prompt, so the agent must act without confirming and may be as verbose
+/// as the work needs. Domain covers what it handles (outline, obligations,
+/// plan, lifecycle) and no more; the CLI nouns are the two it actually writes
+/// through. See `doc/agent-context-map.md` for the full per-surface map.
+pub const IMPLEMENT_CONTEXT_LAYERS: &[&str] = &[
+    "stance/autonomous-session",
+    "domain/outline",
+    "domain/obligations",
+    "domain/plan",
+    "domain/lifecycle",
+    "cli/intro",
+    "cli/obligations",
+    "cli/plan",
+    "surface/implement",
+];
 
 /// The user-visible message auto-submitted on an implementation session's
 /// first turn — the Implement button means "go implement this now", so the

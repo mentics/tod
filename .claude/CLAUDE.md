@@ -109,21 +109,35 @@ agent-side session id (`agent_runs.agent_session_id`) instead of replaying
 history. Session names come from `tod_core::session_name` (surface, task title,
 start time). The context is:
 
-1. **Static layers** from `crates/tod/media/context/`, outermost first. The key
-   is a `/`-separated path, and every ancestor level contributes: `obligations`
-   loads `app.md` then `obligations.md`; a future `tasks/edit` would load
-   `app.md`, `tasks.md`, then `tasks/edit.md`. Missing layers are skipped, so a
-   new surface can ship with only its own file.
+1. **Static fragments** from `crates/tod/media/context/`, named by an explicit
+   ordered list — there is **no** implicit ancestor chain. Fragments are
+   organized by category, and a prompt is assembled in this order:
+
+   | Category | Rule |
+   |---|---|
+   | `stance/` | **Exactly one.** Interactive-chat, autonomous-session, one-shot, or agent-to-agent. The *only* place behavioral policy (confirm-or-act, brevity, whether questions are possible) may live. |
+   | `domain/` | Only the concepts the surface actually handles — outline, obligations, lifecycle, capabilities, plan. |
+   | `cli/` | `cli/intro` plus only the nouns the surface uses. The only place `tod-cli` syntax is documented. |
+   | `surface/` | What this particular job is. Scoped exceptions to the stance are stated here, *as* exceptions. |
+
 2. **A dynamic block** with the data root and the live selection — ids *and*
    text, so the agent can work with the content directly and only needs
    `tod-cli` for what it was not given.
 
-To add a context, drop a new `.md` under `media/context/` and pass its key.
+Each surface's fragment list is a `const` next to the code that launches it
+(`tod_core::agent_context`, `tod_core::gate::context`) and is registered in
+`tod_core::context_recipes::ALL_RECIPES`, whose tests enforce the rules above
+— missing fragments are skipped silently at load time, so an unregistered or
+misspelled recipe is caught only there.
+
+To add a surface: write a `surface/*.md`, define its fragment list as a const,
+register it in `ALL_RECIPES`. `doc/agent-context-map.md` maps every surface to
+what it needs and why.
 
 ### `tod-cli` — the agent's interface to the data
 
 Agents do not get raw database access; they get `tod-cli`, installed next to the
-`tod` executable and documented for them in `media/context/app.md`. Every
+`tod` executable and documented for them under `media/context/cli/`. Every
 mutation goes through `tod_store`'s `OutlineMutation` queue — the same path the
 GUI uses — so invariants cannot be bypassed and the agent never sees the schema.
 The `node` noun (list/show/create/rename/move/delete) is CRUD on outline nodes
@@ -132,9 +146,12 @@ themselves, addressed by the node's stable slug or full UUID; every other noun
 
 Adding a command means adding a noun/verb that wraps an existing mutation, not
 new SQL. Keep `tod-cli`'s dependencies minimal: agents shell out to it
-repeatedly, so startup cost is a feature. `media/context/app.md` is the one
+repeatedly, so startup cost is a feature. `media/context/cli/` is the one
 canonical place `tod-cli` command syntax is documented for agents — a new noun
-gets a section there instead of being re-explained inline wherever it's used.
+gets its own `cli/<noun>.md` there, which surfaces then opt into, instead of
+being re-explained inline wherever it's used. A test
+(`context_recipes::tests::tod_cli_syntax_appears_only_under_cli`) enforces
+this.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 

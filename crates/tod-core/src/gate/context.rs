@@ -22,18 +22,36 @@ pub struct PlanStepWithLinks {
     pub satisfies: Vec<Uuid>,
 }
 
-/// Static context fragments for a gate-check turn. This is a single
-/// structured-response turn, not interactive chat (no "confirm before
-/// editing", no "keep replies short"), and it never calls `tod-cli` itself
-/// (it returns YAML; the app persists the result), so it loads neither
-/// `"interactive"` nor `"tod_cli"`.
-pub const GATE_CHECK_CONTEXT_LAYERS: &[&str] = &["app", "gate_check"];
+/// Static context fragments for a gate-check turn. Stance is `one-shot`: a
+/// single structured-response turn that must not end by asking a question.
+/// It loads no `cli/` fragments at all — it returns YAML and the app persists
+/// the result, so it never mutates anything. It does load
+/// `domain/capabilities`, because gate criteria routinely turn on which
+/// capabilities a node has. See `doc/agent-context-map.md`.
+pub const GATE_CHECK_CONTEXT_LAYERS: &[&str] = &[
+    "stance/one-shot",
+    "domain/outline",
+    "domain/obligations",
+    "domain/lifecycle",
+    "domain/capabilities",
+    "domain/plan",
+    "surface/gate-check",
+];
 
-/// Static context fragments for an on-entry turn. Unlike gate-check, this
-/// turn does its own `tod-cli` mutations (e.g. drafting plan steps), so it
-/// loads `"tod_cli"` — but it is still not interactive chat, so it leaves
-/// out `"interactive"`.
-pub const ON_ENTRY_CONTEXT_LAYERS: &[&str] = &["app", "tod_cli", "on_entry"];
+/// Static context fragments for an on-entry turn. Unlike gate-check this turn
+/// does real work (e.g. `planning` drafting plan steps), so its stance is
+/// `autonomous-session` and it loads the CLI nouns it writes through.
+pub const ON_ENTRY_CONTEXT_LAYERS: &[&str] = &[
+    "stance/autonomous-session",
+    "domain/outline",
+    "domain/obligations",
+    "domain/lifecycle",
+    "domain/plan",
+    "cli/intro",
+    "cli/obligations",
+    "cli/plan",
+    "surface/on-entry",
+];
 
 /// Everything the gate-check turn needs to describe the node under check.
 #[derive(Debug, Clone)]

@@ -5,6 +5,7 @@
 //! Persistence lives in `tod-store`; agent transport lives in `tod-agent`.
 
 pub mod agent_context;
+pub mod context_recipes;
 pub mod drafting;
 pub mod fuzzy;
 pub mod gate;
