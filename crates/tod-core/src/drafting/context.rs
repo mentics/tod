@@ -4,30 +4,23 @@
 
 use crate::drafting::DraftingMode;
 use crate::interview::context::ContextScope;
-use crate::node_context::render_inherited_context;
+use crate::node_context::{
+    one_line, render_inherited_context, write_obligations_by_kind, write_purpose_chain,
+    write_snapshot_header,
+};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::fmt::Write as _;
 use tod_store::drafting::*;
 use tod_store::interview::short_id;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, ancestor_chain, phase_visible,
-};
+use tod_store::outline::{EXTRA_CONTENT_GOAL, phase_visible};
 
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// One obligation as the drafter sees it: id, kind, section, provenance, and
-/// (for `agent` ones) attention with its reason.
+/// One obligation as the drafter sees it: id, kind, provenance, and (for
+/// `agent` ones) attention with its reason. Its section is the heading it is
+/// listed under (see `write_obligations_by_kind`).
 pub fn marked_line(m: &MarkedObligation) -> String {
     let o = &m.obligation;
-    let section = o
-        .section
-        .as_deref()
-        .map(|s| format!(" ({s})"))
-        .unwrap_or_default();
     let mark = if m.mark.is_agent() {
         match (&m.mark.attention, &m.mark.attention_why) {
             (Some(level), Some(why)) => format!("agent, {level}: {}", one_line(why)),
@@ -43,7 +36,7 @@ pub fn marked_line(m: &MarkedObligation) -> String {
         ""
     };
     format!(
-        "[{}] {}{section} <{mark}>: {}{visual}",
+        "[{}] {} <{mark}>: {}{visual}",
         short_id(o.id),
         o.kind,
         one_line(&o.body)
@@ -69,19 +62,13 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
     let nodes = NodeRepo::new(conn);
     let drafting = DraftingRepo::new(conn);
     let mut out = String::from("# Drafting state\n\n");
-    writeln!(out, "Data root: {}", scope.data_root.display())?;
-    writeln!(out, "tod-cli: {}", scope.tod_cli.display())?;
-    match nodes.get(scope.node_id)? {
-        Some(node) => writeln!(
-            out,
-            "Node: {} [[{}]] \"{}\"",
-            scope.node_id, node.slug, node.title
-        )?,
-        None => writeln!(out, "Node: {}", scope.node_id)?,
-    }
-    if let Some(lifecycle) = nodes.get_lifecycle(scope.node_id)? {
-        writeln!(out, "Lifecycle: {lifecycle}")?;
-    }
+    write_snapshot_header(
+        &mut out,
+        &nodes,
+        scope.data_root,
+        scope.tod_cli,
+        scope.node_id,
+    )?;
     writeln!(
         out,
         "Mode: {}",
@@ -92,23 +79,7 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
     )?;
     writeln!(out, "Phase: {}", scope.phase)?;
 
-    let chain = ancestor_chain(conn, scope.node_id)?;
-    let mut purposes = String::new();
-    for id in chain.iter().filter(|id| **id != scope.node_id) {
-        if let Some(goal) = nodes
-            .get_extra_content(*id, EXTRA_CONTENT_GOAL)?
-            .filter(|g| !g.trim().is_empty())
-        {
-            let title = nodes
-                .get(*id)?
-                .map(|n| n.title)
-                .unwrap_or_else(|| short_id(*id));
-            writeln!(purposes, "- {title}: {}", one_line(&goal))?;
-        }
-    }
-    if !purposes.is_empty() {
-        write!(out, "\n## Purpose (root first)\n\n{purposes}")?;
-    }
+    write_purpose_chain(&mut out, conn, &nodes, scope.node_id)?;
     out.push_str("\n## Goal\n\n");
     match nodes
         .get_extra_content(scope.node_id, EXTRA_CONTENT_GOAL)?
@@ -118,29 +89,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
         None => out.push_str("(none yet)\n"),
     }
 
-    out.push_str("\n## Obligations\n");
     let local: Vec<MarkedObligation> = drafting
         .marked_obligations(scope.node_id)?
         .into_iter()
         .filter(|m| phase_visible(&m.obligation.phase, scope.phase))
         .collect();
-    if local.is_empty() {
-        out.push_str("\n(none yet)\n");
-    }
-    for (kind, heading) in [
-        (KIND_REQUIREMENT, "Requirements"),
-        (KIND_CONSTRAINT, "Constraints"),
-    ] {
-        let items: Vec<&MarkedObligation> =
-            local.iter().filter(|m| m.obligation.kind == kind).collect();
-        if items.is_empty() {
-            continue;
-        }
-        writeln!(out, "\n### {heading}\n")?;
-        for m in items {
-            writeln!(out, "- {}", marked_line(m))?;
-        }
-    }
+    write_obligations_by_kind(&mut out, &local, |m| &m.obligation, marked_line)?;
     let pre_v3 = local.iter().filter(|m| m.mark.is_pre_v3()).count();
     if pre_v3 > 0 {
         writeln!(

@@ -298,17 +298,32 @@ All four steps are done.
   only what is genuinely theirs (how ids appear in their snapshots). A test
   enforces this over all of `assets/process/`.
 
-### Known remaining gaps
+### Decisions
 
-- The interview and drafting surfaces contribute static fragments only. Their
-  dynamic halves stay in `interview::context` and `drafting::context`, where
-  `snapshot` and `delta` are a matched pair: a session gets the snapshot once,
-  and every later turn carries only the changes since that session's own
-  watermark, rendered in the same shapes so the agent recognizes them as the
-  same objects. `DynamicBlock` has no delta half, so folding the snapshot into
-  blocks would split that pair across two modules with nothing keeping them in
-  lockstep. Closing this means giving `DynamicBlock` a delta mode, not just
-  moving the snapshot.
-- State role docs still mention `tod-cli <noun>` in prose (not as command
-  tables). That is deliberate — the prose says *which* noun applies, the `cli/`
-  fragment says how to call it.
+**Interview and drafting snapshots are not blocks.** These two surfaces take
+their static fragments from their recipes like every other surface, but their
+dynamic halves stay as `snapshot` functions in `interview::context` and
+`drafting::context`. Blocks exist so that surfaces needing the same thing share
+one renderer, and moving these snapshots into blocks would share nothing:
+
+- Most of each snapshot is used by one surface only. Questions, memory, and
+  content belong to the interview; marked obligations, open choices, and
+  "buildable" belong to drafting. Each would become a block with one user.
+- The sections that do overlap with existing blocks are filtered by phase,
+  and in the interview by role too. Blocks are deliberately unaware of which
+  surface they serve, and teaching them either filter would bring back the
+  per-surface branching they replaced.
+- Both snapshots query the database directly, and `DynamicContext`
+  deliberately carries no connection.
+
+The per-turn `delta` is a separate concern: it reports what changed since a
+session's change-log watermark, not the current state, so it has no block
+counterpart either way. Line formats stay consistent across snapshot, delta,
+and blocks because all three use `node_context`'s line renderers
+(`obligation_line`, `plan_step_line`). What the two snapshots have in common
+(header, purpose chain, obligations by kind) also lives there
+(`write_snapshot_header`, `write_purpose_chain`, `write_obligations_by_kind`).
+
+**Role docs may name a `tod-cli` noun in prose.** The prose says *which* noun
+applies, and the `cli/` fragment says how to call it. Command tables are what
+is banned.

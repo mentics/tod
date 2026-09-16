@@ -19,9 +19,7 @@ use uuid::Uuid;
 pub(crate) const NODE_SUMMARY_OPEN: &str = "<node-summary>";
 pub(crate) const NODE_SUMMARY_CLOSE: &str = "</node-summary>";
 
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+use crate::node_context::one_line;
 
 pub fn has_summary(nodes: &NodeRepo<'_>, node_id: Uuid) -> bool {
     nodes

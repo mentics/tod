@@ -4,6 +4,7 @@
 
 use crate::node_context::{
     node_title, obligation_line, one_line, plan_step_line, render_inherited_context,
+    write_obligations_by_kind, write_purpose_chain, write_snapshot_header,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,8 +13,8 @@ use std::path::Path;
 use tod_store::interview::*;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ancestor_chain,
-    phase_visible, uuid_to_blob,
+    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, NodeObligation, ancestor_chain, phase_visible,
+    uuid_to_blob,
 };
 use uuid::Uuid;
 
@@ -53,17 +54,13 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
     let nodes = NodeRepo::new(conn);
     let repo = InterviewRepo::new(conn);
     let mut out = String::from("# Interview state\n\n");
-    writeln!(out, "Data root: {}", scope.data_root.display())?;
-    writeln!(out, "tod-cli: {}", scope.tod_cli.display())?;
-    writeln!(
-        out,
-        "Node: {} \"{}\"",
+    write_snapshot_header(
+        &mut out,
+        &nodes,
+        scope.data_root,
+        scope.tod_cli,
         scope.node_id,
-        node_title(&nodes, scope.node_id)
     )?;
-    if let Some(lifecycle) = nodes.get_lifecycle(scope.node_id)? {
-        writeln!(out, "Lifecycle: {lifecycle}")?;
-    }
     writeln!(out, "Phase: {}", scope.phase)?;
     if let Some(session) = scope.interview_session_id {
         writeln!(out, "Session: {session}")?;
@@ -74,60 +71,19 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
         scope.role.as_str().replace('-', " ")
     )?;
 
-    let chain = ancestor_chain(conn, scope.node_id)?;
-    let purposes: Vec<(Uuid, String)> = chain
-        .iter()
-        .filter(|id| **id != scope.node_id)
-        .filter_map(|id| {
-            nodes
-                .get_extra_content(*id, EXTRA_CONTENT_GOAL)
-                .ok()
-                .flatten()
-                .filter(|p| !p.trim().is_empty())
-                .map(|p| (*id, p))
-        })
-        .collect();
-    if !purposes.is_empty() {
-        out.push_str("\n## Purpose (root first)\n\n");
-        for (id, purpose) in purposes {
-            writeln!(out, "- {}: {}", node_title(&nodes, id), one_line(&purpose))?;
-        }
-    }
+    write_purpose_chain(&mut out, conn, &nodes, scope.node_id)?;
 
-    out.push_str("\n## Obligations\n");
     let local: Vec<NodeObligation> = ObligationRepo::new(conn)
         .list_for_node(scope.node_id)?
         .into_iter()
         .filter(|o| phase_visible(&o.phase, scope.phase))
         .collect();
-    if local.is_empty() {
-        out.push_str("\n(none yet)\n");
-    }
-    for (kind, heading) in [
-        (KIND_REQUIREMENT, "Requirements"),
-        (KIND_CONSTRAINT, "Constraints"),
-    ] {
-        let items: Vec<&NodeObligation> = local.iter().filter(|o| o.kind == kind).collect();
-        if items.is_empty() {
-            continue;
-        }
-        writeln!(out, "\n### {heading}")?;
-        let mut sections: Vec<Option<&str>> = Vec::new();
-        for o in &items {
-            if !sections.contains(&o.section.as_deref()) {
-                sections.push(o.section.as_deref());
-            }
-        }
-        sections.sort_by_key(|s| s.is_some());
-        for section in sections {
-            if let Some(section) = section {
-                writeln!(out, "{section}:")?;
-            }
-            for o in items.iter().filter(|o| o.section.as_deref() == section) {
-                writeln!(out, "- [{}] {}", short_id(o.id), one_line(&o.body))?;
-            }
-        }
-    }
+    write_obligations_by_kind(
+        &mut out,
+        &local,
+        |o| o,
+        |o| format!("[{}] {}", short_id(o.id), one_line(&o.body)),
+    )?;
 
     out.push_str(&render_inherited_context(
         conn,
