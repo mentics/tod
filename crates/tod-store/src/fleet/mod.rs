@@ -46,7 +46,6 @@ pub use repos::node_files::NodeFiles;
 pub use repos::notification::FleetNotification;
 pub use repos::shell::ShellSession;
 pub use repos::task::{FleetTask, NoteItem};
-pub use repos::transcript::TranscriptTurn;
 pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
 pub use store::FleetStore;
 pub use terminal::{

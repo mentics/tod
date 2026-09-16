@@ -93,9 +93,6 @@ fn mark_run_not_running(writer: &FleetWriter, run_id: &str) -> Result<()> {
     writer.enqueue(FleetMutation::ClearAgentRunReconnect {
         run_id: run_id.to_string(),
     })?;
-    writer.enqueue(FleetMutation::MarkRunPromptsInterrupted {
-        run_id: run_id.to_string(),
-    })?;
     Ok(())
 }
 

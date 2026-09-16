@@ -16,7 +16,7 @@ use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
-use tod_store::fleet::{FleetStore, TranscriptTurn};
+use tod_store::fleet::FleetStore;
 
 /// A single row in the agent picker list, unified across fleet agent runs and
 /// traffic-log-only agents (question maker / answer processor).
@@ -153,11 +153,7 @@ impl AgentTranscriptsView {
 
         if let Ok(runs) = self.fleet.list_all_runs() {
             for run in runs {
-                let turn_count = self
-                    .fleet
-                    .list_transcript_for_agent(&run.id)
-                    .map(|t| t.len())
-                    .unwrap_or(0);
+                let turn_count = run.cached_transcript.is_some() as usize;
                 let title = self
                     .fleet
                     .get_node(&run.node_id)
@@ -218,16 +214,19 @@ impl AgentTranscriptsView {
             }
         }
 
-        if let Ok(db_turns) = self.fleet.list_transcript_for_agent(agent_id) {
-            for turn in db_turns {
-                if let Some(row) = fleet_turn_to_row(&turn) {
-                    if !rows.iter().any(|existing| {
-                        existing.sequence == row.sequence && existing.label == row.label
-                    }) {
-                        rows.push(row);
-                    }
-                }
-            }
+        if let Some(cached) = self
+            .fleet
+            .get_run(agent_id)
+            .ok()
+            .flatten()
+            .and_then(|run| run.cached_transcript)
+        {
+            rows.push(TurnRow {
+                sequence: u64::MAX,
+                direction: TrafficDirection::Response,
+                label: "cached transcript".into(),
+                content: cached.into(),
+            });
         }
 
         rows.sort_by_key(|row| row.sequence);
@@ -421,20 +420,6 @@ fn entry_to_row(entry: TrafficEntry) -> TurnRow {
         .into(),
         content: entry.content.into(),
     }
-}
-
-fn fleet_turn_to_row(turn: &TranscriptTurn) -> Option<TurnRow> {
-    let direction = match turn.kind.as_str() {
-        "prompt" => TrafficDirection::Request,
-        "response" => TrafficDirection::Response,
-        _ => return None,
-    };
-    Some(TurnRow {
-        sequence: turn.sequence as u64,
-        direction,
-        label: format!("#{} · {} · fleet", turn.sequence, direction.label()).into(),
-        content: turn.content.clone().into(),
-    })
 }
 
 impl Focusable for AgentTranscriptsView {

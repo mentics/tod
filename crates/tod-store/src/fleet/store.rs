@@ -19,7 +19,6 @@ use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
-use crate::fleet::repos::transcript::{TranscriptRepo, TranscriptTurn};
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
@@ -248,31 +247,7 @@ impl FleetStore {
         if self.migration.is_some() {
             return Err(FleetWriterError::MigrationBlocked);
         }
-        self.log_mutation(&mutation);
         self.writer.enqueue(mutation)
-    }
-
-    fn log_mutation(&self, mutation: &FleetMutation) {
-        let Some(log) = &self.traffic_log else {
-            return;
-        };
-        match mutation {
-            FleetMutation::SendPrompt {
-                run_id, content, ..
-            } => {
-                log.lock()
-                    .expect("traffic log mutex")
-                    .record_fleet_request(run_id, content);
-            }
-            FleetMutation::CompleteResponse {
-                run_id, content, ..
-            } => {
-                log.lock()
-                    .expect("traffic log mutex")
-                    .record_fleet_response(run_id, content);
-            }
-            _ => {}
-        }
     }
 
     /// List all tasks from the read-only projection.
@@ -520,21 +495,6 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
-    /// Read transcript turns for an agent run.
-    pub fn list_transcript_for_agent(&self, agent_run_id: &str) -> Result<Vec<TranscriptTurn>> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        TranscriptRepo::new(&guard.connection())
-            .list_for_agent_run(agent_run_id)
-            .map_err(Into::into)
-    }
-
-    /// Transcript turns for every run launched from a node.
-    pub fn list_transcript_for_node(&self, node_id: &str) -> Result<Vec<TranscriptTurn>> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        TranscriptRepo::new(&guard.connection())
-            .list_for_node(node_id)
-            .map_err(Into::into)
-    }
 
     /// List all outline lists.
     pub fn list_outline_lists(&self) -> Result<Vec<OutlineList>> {

@@ -7,7 +7,6 @@ pub mod node_files;
 pub mod notification;
 pub mod shell;
 pub mod task;
-pub mod transcript;
 
 use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
 

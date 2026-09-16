@@ -211,8 +211,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let run_id = format!("{task_id}-run-1");
-    let prompt_id = uuid::Uuid::new_v4().to_string();
-    let response_id = uuid::Uuid::new_v4().to_string();
     let notification_id = uuid::Uuid::new_v4().to_string();
     let blocked_notification_id = uuid::Uuid::new_v4().to_string();
     let shell_id = uuid::Uuid::new_v4().to_string();
@@ -260,33 +258,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
         .unwrap();
     short_settle();
     assert_eq!(get_run(&run_id).unwrap().reconnect, Some(identity));
-
-    writer
-        .enqueue(FleetMutation::SendPrompt {
-            id: prompt_id.clone(),
-            run_id: run_id.clone(),
-            content: "hello".into(),
-        })
-        .unwrap();
-    short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(row_exists(&conn, "transcript_turns", &prompt_id));
-    }
-
-    writer
-        .enqueue(FleetMutation::CompleteResponse {
-            response_id: response_id.clone(),
-            run_id: run_id.clone(),
-            content: "world".into(),
-            prompt_id: prompt_id.clone(),
-        })
-        .unwrap();
-    short_settle();
-    {
-        let conn = schema::open_read_connection(&db_path).unwrap();
-        assert!(row_exists(&conn, "transcript_turns", &response_id));
-    }
 
     writer
         .enqueue(FleetMutation::CreateNotification {
@@ -378,11 +349,6 @@ fn immediate_mutation_categories_persist_without_debounce_wait() {
 
     writer
         .enqueue(FleetMutation::ClearAgentRunReconnect {
-            run_id: run_id.clone(),
-        })
-        .unwrap();
-    writer
-        .enqueue(FleetMutation::MarkRunPromptsInterrupted {
             run_id: run_id.clone(),
         })
         .unwrap();

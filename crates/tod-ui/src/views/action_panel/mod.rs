@@ -506,9 +506,6 @@ impl ActionPanelView {
                 let _ = agent.cancel_run(flight.provider_run_id);
             }
         }
-        let _ = self.fleet.enqueue(FleetMutation::MarkRunPromptsInterrupted {
-            run_id: run_id.to_string(),
-        });
         if let Err(err) = self.fleet.enqueue(FleetMutation::EndAgentRun {
             run_id: run_id.to_string(),
         }) {
