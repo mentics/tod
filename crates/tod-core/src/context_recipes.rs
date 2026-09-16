@@ -217,9 +217,10 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
 };
 
 /// An interview agent turn (question-maker or answer-processor). Its dynamic
-/// half is `interview::context::{snapshot, delta}`, which has its own shape
-/// and its own byte-stability requirements, so this recipe contributes static
-/// fragments only.
+/// half is `interview::context::{snapshot, delta}` — a matched pair, where a
+/// session gets the snapshot once and later turns carry only the changes since
+/// its own watermark, rendered in the same shapes. `DynamicBlock` has no delta
+/// half, so this recipe contributes static fragments only.
 pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
     name: "interview agent",
     layers: &[

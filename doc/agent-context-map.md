@@ -301,8 +301,14 @@ All four steps are done.
 ### Known remaining gaps
 
 - The interview and drafting surfaces contribute static fragments only. Their
-  dynamic halves stay in `interview::context` and `drafting::context`, which
-  have their own shape and byte-stability requirements for session reuse.
+  dynamic halves stay in `interview::context` and `drafting::context`, where
+  `snapshot` and `delta` are a matched pair: a session gets the snapshot once,
+  and every later turn carries only the changes since that session's own
+  watermark, rendered in the same shapes so the agent recognizes them as the
+  same objects. `DynamicBlock` has no delta half, so folding the snapshot into
+  blocks would split that pair across two modules with nothing keeping them in
+  lockstep. Closing this means giving `DynamicBlock` a delta mode, not just
+  moving the snapshot.
 - State role docs still mention `tod-cli <noun>` in prose (not as command
   tables). That is deliberate — the prose says *which* noun applies, the `cli/`
   fragment says how to call it.
