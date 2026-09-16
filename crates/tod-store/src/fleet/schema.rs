@@ -310,21 +310,61 @@ fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
 /// process start there's no live connection to ask, only "should tod try to
 /// reconnect, or is this done").
 ///
-/// Just a data normalization, not a table rebuild: the CHECK constraint
-/// still technically permits the old 5 values (SQLite can't narrow a CHECK
-/// without rebuilding the table, and unlike `location`/`cached_transcript`
-/// gaining new columns, this migration only needs to change what values
-/// exist, not the schema shape) — matching how a stray old value would be
-/// harmless leftover data, not a code path anything still reads.
-/// Collapse `agent_runs.runtime_status` to the two values it actually needs:
-/// active (`'waiting'`, reusing an existing CHECK-permitted string rather
-/// than introducing `'active'`, which would require rebuilding the table to
-/// widen the constraint) and done (`'not_running'`).
+/// A full table rebuild, not just a data `UPDATE`: SQLite can't narrow a
+/// CHECK constraint in place, and the old constraint only permitted the 5
+/// original values — so `'active'` has to come in via a new table, the same
+/// rename-dance `migrate_v29_to_v30`'s agent_runs rebuild uses.
 fn migrate_v32_to_v33(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "UPDATE agent_runs SET runtime_status = 'waiting'
-         WHERE runtime_status IN ('starting', 'processing', 'blocked')",
-        [],
+    let rename = |from: &str, to: &str| -> Result<()> {
+        conn.execute_batch(&format!("ALTER TABLE {from} RENAME TO {to};"))?;
+        Ok(())
+    };
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE agent_runs_v33 (
+            id TEXT PRIMARY KEY NOT NULL,
+            node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            run_number INTEGER NOT NULL,
+            runtime_status TEXT NOT NULL CHECK(runtime_status IN ('active', 'not_running')),
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            reconnect_pid INTEGER,
+            reconnect_birth_token INTEGER,
+            run_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(run_kind IN ('auto', 'interactive', 'terminal', 'implementation')),
+            session_name TEXT,
+            agent_session_id TEXT,
+            platform TEXT,
+            model TEXT,
+            effort TEXT,
+            location TEXT NOT NULL DEFAULT 'local_window',
+            cached_transcript TEXT,
+            transcript_fingerprint TEXT,
+            UNIQUE(node_id, run_number)
+        );
+        INSERT INTO agent_runs_v33 (
+            id, node_id, run_number, runtime_status, started_at, ended_at,
+            reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
+            platform, model, effort, location, cached_transcript, transcript_fingerprint
+        )
+        SELECT id, node_id, run_number,
+               CASE WHEN runtime_status IN ('starting', 'processing', 'waiting', 'blocked')
+                    THEN 'active' ELSE 'not_running' END,
+               started_at, ended_at, reconnect_pid, reconnect_birth_token, run_kind,
+               session_name, agent_session_id, platform, model, effort, location,
+               cached_transcript, transcript_fingerprint
+        FROM agent_runs;
+        DROP INDEX IF EXISTS idx_agent_runs_node_id;
+        DROP TABLE agent_runs;
+        ",
+    )?;
+    rename("agent_runs_v33", "agent_runs")?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_node_id ON agent_runs(node_id);
+        PRAGMA foreign_keys=ON;
+        ",
     )?;
     Ok(())
 }

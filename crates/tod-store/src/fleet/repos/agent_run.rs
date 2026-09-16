@@ -13,13 +13,7 @@ use tod_agent::RunLocation;
 /// live-only, never persisted, since this column only needs to answer
 /// "should tod try to reconnect to this, or is it done" for a process that
 /// just started with no live connection to anything yet.
-///
-/// `"waiting"` (not `"active"`) is reused for the active state rather than
-/// introducing a new string: the column's CHECK constraint still lists the
-/// old 5 values (narrowing it requires a full table rebuild — see
-/// `migrate_v32_to_v33`'s doc comment for why that wasn't done), so the
-/// active value has to be one SQLite already accepts.
-pub const RUNTIME_STATUS_ACTIVE: &str = "waiting";
+pub const RUNTIME_STATUS_ACTIVE: &str = "active";
 pub const RUNTIME_STATUS_DONE: &str = "not_running";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
