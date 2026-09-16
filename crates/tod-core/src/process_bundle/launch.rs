@@ -1,10 +1,28 @@
 //! Agent prompt assembly from bundled process docs.
 
 use super::manifest::ProcessManifest;
+use crate::context_recipes::{self, DRAFTING_AGENT, FLEET_AUTONOMOUS, INTERVIEW_AGENT};
+use crate::dynamic::DynamicContext;
 use crate::interview::phase::base_interview_phase;
+use crate::media::{MediaPaths, load_static_context};
 use anyhow::{Context, Result};
 use std::path::Path;
 use tod_store::interview::Role;
+
+/// A surface's static context fragments, followed by the process-bundle docs
+/// that are its role. Kept separate from `context_recipes::build_message`
+/// because these surfaces render their dynamic half themselves.
+fn with_static_context(
+    paths: &MediaPaths,
+    recipe: &context_recipes::ContextRecipe,
+    docs: String,
+) -> Result<String> {
+    let mut out = load_static_context(paths, recipe.layers)?;
+    out.push_str("\n\n---\n\n");
+    out.push_str(docs.trim());
+    out.push('\n');
+    Ok(out)
+}
 
 fn read_doc(path: &Path) -> Result<String> {
     std::fs::read_to_string(path)
@@ -15,6 +33,7 @@ fn read_doc(path: &Path) -> Result<String> {
 /// the phase `phase_key`: role doc, phase doc, shared conventions.
 pub fn interview_session_prefix(
     manifest: &ProcessManifest,
+    media: &MediaPaths,
     role: Role,
     phase_key: &str,
 ) -> Result<String> {
@@ -24,26 +43,35 @@ pub fn interview_session_prefix(
         Role::AnswerProcessor => manifest.answer_processor_doc(base)?,
         Role::Drafter => anyhow::bail!("the drafter's opening comes from drafting_session_prefix"),
     };
-    Ok(format!(
-        "## Role\n\n{}\n\n## Interview phase\n\n{}\n\n## Shared conventions\n\n{}\n",
-        read_doc(&role_doc)?.trim(),
-        read_doc(&manifest.interview_phase_doc(base)?)?.trim(),
-        read_doc(&manifest.base_doc(base)?)?.trim(),
-    ))
+    with_static_context(
+        media,
+        &INTERVIEW_AGENT,
+        format!(
+            "## Role\n\n{}\n\n## Interview phase\n\n{}\n\n## Shared conventions\n\n{}\n",
+            read_doc(&role_doc)?.trim(),
+            read_doc(&manifest.interview_phase_doc(base)?)?.trim(),
+            read_doc(&manifest.base_doc(base)?)?.trim(),
+        ),
+    )
 }
 
 /// The byte-stable opening of every drafter session in `mode`: the mode's
 /// doc, then the drafting conventions shared by capture and drafting.
 pub fn drafting_session_prefix(
     manifest: &ProcessManifest,
+    media: &MediaPaths,
     mode: crate::drafting::DraftingMode,
 ) -> Result<String> {
-    Ok(format!(
-        "## Role\n\n{}\n\n## Drafting conventions\n\n{}\n",
-        read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?
-            .trim(),
-        read_doc(&manifest.drafting_base_doc())?.trim(),
-    ))
+    with_static_context(
+        media,
+        &DRAFTING_AGENT,
+        format!(
+            "## Role\n\n{}\n\n## Drafting conventions\n\n{}\n",
+            read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?
+                .trim(),
+            read_doc(&manifest.drafting_base_doc())?.trim(),
+        ),
+    )
 }
 
 /// The state agent's role doc for `lifecycle`: shared state-agent conventions
@@ -71,6 +99,8 @@ pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<Str
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
 pub fn build_fleet_agent_prompt(
     manifest: &ProcessManifest,
+    media: &MediaPaths,
+    data_root: &Path,
     task: &tod_store::fleet::repos::task::FleetTask,
     cwd: &Path,
 ) -> Result<String> {
@@ -86,9 +116,16 @@ pub fn build_fleet_agent_prompt(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok(format!(
-        "{role}\n\n\
-         ## Task\n\n\
+    context_recipes::build_message(
+        media,
+        &FLEET_AUTONOMOUS,
+        Some(&role),
+        &DynamicContext {
+            data_root: Some(data_root),
+            ..Default::default()
+        },
+        &format!(
+        "## Task\n\n\
          Node id: {node_id}\n\
          Title: {title}\n\
          Slug: {slug}\n\
@@ -107,8 +144,9 @@ pub fn build_fleet_agent_prompt(
         node_id = task.id,
         title = task.title,
         slug = task.slug,
-        cwd = cwd.display(),
-    ))
+            cwd = cwd.display(),
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -129,11 +167,41 @@ mod tests {
         }
         let install = TodInstallPaths::from_process_root(root).unwrap();
         let manifest = ProcessManifest::load(&install).unwrap();
+        let media = MediaPaths::discover().unwrap();
         let prefix =
-            interview_session_prefix(&manifest, Role::AnswerProcessor, "design-interview").unwrap();
+            interview_session_prefix(&manifest, &media, Role::AnswerProcessor, "design-interview")
+                .unwrap();
         let role = prefix.find("# Answer processor").unwrap();
         let phase = prefix.find("# Phase: design").unwrap();
         let base = prefix.find("## Shared conventions").unwrap();
         assert!(role < phase && phase < base);
+    }
+
+    /// The interview agents got no media context at all until the recipe
+    /// registry took them on — no domain model, and no `tod-cli` reference
+    /// despite their role docs telling them to use it.
+    #[test]
+    fn interview_prefix_carries_its_media_fragments_before_the_role_docs() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join("process");
+        if !root.join("README.md").is_file() {
+            return;
+        }
+        let install = TodInstallPaths::from_process_root(root).unwrap();
+        let manifest = ProcessManifest::load(&install).unwrap();
+        let media = MediaPaths::discover().unwrap();
+        let prefix =
+            interview_session_prefix(&manifest, &media, Role::AnswerProcessor, "design-interview")
+                .unwrap();
+        let stance = prefix.find("Your counterpart is **another agent**").unwrap();
+        let cli = prefix.find("tod-cli --data-root").unwrap();
+        let role = prefix.find("# Answer processor").unwrap();
+        assert!(
+            stance < cli && cli < role,
+            "media fragments must precede the process-bundle role docs"
+        );
     }
 }

@@ -402,8 +402,10 @@ impl DraftingView {
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
         let manifest =
             ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
-        let prefix =
-            drafting_session_prefix(&manifest, mode).map_err(|e| format!("Process bundle: {e}"))?;
+        let media = tod_core::media::MediaPaths::discover()
+            .map_err(|e| format!("Media bundle: {e}"))?;
+        let prefix = drafting_session_prefix(&manifest, &media, mode)
+            .map_err(|e| format!("Process bundle: {e}"))?;
         let driver = Arc::new(Mutex::new(DraftingDriver::new(DraftingConfig {
             node_id,
             node_title: title,

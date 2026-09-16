@@ -124,15 +124,21 @@ start time). The context is:
    text, so the agent can work with the content directly and only needs
    `tod-cli` for what it was not given.
 
-Each surface's fragment list is a `const` next to the code that launches it
-(`tod_core::agent_context`, `tod_core::gate::context`) and is registered in
-`tod_core::context_recipes::ALL_RECIPES`, whose tests enforce the rules above
-— missing fragments are skipped silently at load time, so an unregistered or
-misspelled recipe is caught only there.
+Both halves are named by the surface's `ContextRecipe` in
+`tod_core::context_recipes`, which holds every surface's fragment list and
+block list and is the one place they are registered. `build_message` there is
+the single assembler — there is no per-surface prompt builder. The dynamic
+block renderers live in `tod_core::dynamic` and know nothing about which
+surface they are serving; anything surface-specific is a parameter on the block
+(e.g. `SelectedObligation { fallback }`).
 
-To add a surface: write a `surface/*.md`, define its fragment list as a const,
-register it in `ALL_RECIPES`. `doc/agent-context-map.md` maps every surface to
-what it needs and why.
+The tests in `context_recipes` enforce the rules above — missing fragments are
+skipped silently at load time, so an unregistered or misspelled recipe is
+caught only there.
+
+To add a surface: write a `surface/*.md`, add a `ContextRecipe` const, register
+it in `ALL_RECIPES`, and call `build_message`. `doc/agent-context-map.md` maps
+every surface to what it needs and why.
 
 ### `tod-cli` — the agent's interface to the data
 

@@ -1,8 +1,10 @@
 # Agent context map
 
-What every agent-facing surface in tod actually needs in its prompt, what it
-gets today, and the building blocks that would let each one ask for exactly
-that.
+What every agent-facing surface in tod actually needs in its prompt, and the
+building blocks that let each one ask for exactly that.
+
+Sections 1–2 describe the state this restructuring started from; §3–6 are the
+design; §7 records what is built and what is left.
 
 ## 1. The surfaces
 
@@ -253,21 +255,35 @@ Structural mistakes should fail a test, not a prompt dump review:
    `media/context/` and `assets/process/` for `tod-cli ` in a fenced block,
    with an explicit allowlist.
 
-## 7. Sequencing
+## 7. Status
 
-1. ~~**Split the files.**~~ **Done.** `stance/`, `domain/`, `cli/`, `surface/`
-   created; `app.md`, `tod_cli.md`, `interactive.md` and the old surface docs
-   redistributed and deleted. The five media-channel recipes now name their
-   fragments explicitly, as consts registered in
-   `tod_core::context_recipes::ALL_RECIPES`. Resolves §2.1–2.4.
-2. ~~**Add the guardrail tests**~~ **Done** — all five in §6 are implemented in
-   `crates/tod-core/src/context_recipes.rs`. `CLAUDE.md` updated (§2.5, §2.6).
-3. **Compose the dynamic block.** Introduce `DynamicBlock` and delete the
-   `surface == "obligations"` branch; `ContextRequest.surface` disappears.
-4. **Unify the assembler.** Introduce `ContextRecipe`, fold the seven builders
-   into one, and give surfaces 6–10 media fragments for the first time.
-   `stance/agent-to-agent.md` and `cli/drafting.md` already exist for this and
-   are allowlisted as intentionally-unused until then.
+All four steps are done.
 
-Steps 3 and 4 are the cleanup that keeps a sixth surface from re-introducing
-the same drift.
+1. **Split the files.** `stance/`, `domain/`, `cli/`, `surface/` created;
+   `app.md`, `tod_cli.md`, `interactive.md` and the old surface docs
+   redistributed and deleted. Resolves §2.1-2.4.
+2. **Guardrail tests.** All five in §6, plus three more that fell out of the
+   registry: own-obligations must be followed by ancestor context, a recipe
+   loading `cli/` must render the data root, and the interview prefix must
+   carry its media fragments ahead of its role docs.
+3. **Dynamic blocks composed.** `crate::dynamic` owns the renderers; a surface
+   names the blocks it wants. The `surface == "obligations"` branch is gone —
+   the panel's "no obligation selected" remark is now a `fallback` the recipe
+   supplies, so the renderer no longer knows who it serves.
+4. **One assembler.** `context_recipes::build_message` replaced the separate
+   builders in `agent_context` and `gate::context`, and
+   `process_bundle::launch` now composes media fragments onto the three
+   process-bundle surfaces via `with_static_context`. All ten surfaces are
+   registered in `ALL_RECIPES`.
+
+### Known remaining gaps
+
+- The fleet autonomous run still renders its own Task/Notes/Instruction block
+  (repo, branch, cwd, notes). Modelling it would need a `Workspace` dynamic
+  block; the fields exist only in `process_bundle::launch` today.
+- The interview and drafting surfaces contribute static fragments only. Their
+  dynamic halves stay in `interview::context` and `drafting::context`, which
+  have their own shape and byte-stability requirements for session reuse.
+- Twelve files under `assets/process/` still describe `tod-cli` usage. The
+  `tod_cli_syntax_appears_only_under_cli` test covers `media/context/` only;
+  extending it over the process bundle means reconciling those docs first.

@@ -409,7 +409,20 @@ impl ActionPanelView {
                 return;
             }
         };
-        let prompt = match build_fleet_agent_prompt(&manifest, &task, &cwd) {
+        let media = match tod_core::media::MediaPaths::discover() {
+            Ok(media) => media,
+            Err(err) => {
+                error_toast(window, cx, format!("Media bundle: {err:#}"));
+                return;
+            }
+        };
+        let prompt = match build_fleet_agent_prompt(
+            &manifest,
+            &media,
+            self.paths.data_root(),
+            &task,
+            &cwd,
+        ) {
             Ok(prompt) => prompt,
             Err(err) => {
                 error_toast(window, cx, format!("Prompt assembly failed: {err:#}"));

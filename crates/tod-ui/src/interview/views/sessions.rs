@@ -239,8 +239,10 @@ impl SessionsView {
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
         let manifest =
             ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;
+        let media = tod_core::media::MediaPaths::discover()
+            .map_err(|e| format!("Media bundle: {e}"))?;
         let prefix = |role| {
-            interview_session_prefix(&manifest, role, &session.phase)
+            interview_session_prefix(&manifest, &media, role, &session.phase)
                 .map_err(|e| format!("Process bundle: {e}"))
         };
         let node_title = self

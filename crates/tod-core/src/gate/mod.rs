@@ -13,7 +13,7 @@ pub mod response;
 pub mod routing;
 
 pub use context::{
-    GATE_CHECK_CONTEXT_LAYERS, GateCheckRequest, ON_ENTRY_CONTEXT_LAYERS, PlanStepWithLinks,
+    GATE_CHECK_RECIPE, GateCheckRequest, ON_ENTRY_RECIPE, PlanStepWithLinks,
     build_gate_check_message, build_on_entry_message,
 };
 pub use derived::{DerivedOutcome, evaluate_derived_criterion};

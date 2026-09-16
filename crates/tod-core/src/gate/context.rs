@@ -5,8 +5,9 @@
 //! `assets/process/agents/state/base.md` documents: forward state, criteria
 //! (id/slug/label), and prior evaluations, when any exist for this node.
 
-use crate::media::{MediaPaths, load_static_context};
-use crate::node_context::{obligation_line, plan_step_line};
+use crate::context_recipes::{self, ContextRecipe};
+use crate::dynamic::{DynamicContext, NodeSelection};
+use crate::media::MediaPaths;
 use anyhow::Result;
 use std::path::Path;
 use tod_store::outline::{GateCriterion, NodeGateEvaluation, NodeObligation, PlanStep};
@@ -22,36 +23,11 @@ pub struct PlanStepWithLinks {
     pub satisfies: Vec<Uuid>,
 }
 
-/// Static context fragments for a gate-check turn. Stance is `one-shot`: a
-/// single structured-response turn that must not end by asking a question.
-/// It loads no `cli/` fragments at all — it returns YAML and the app persists
-/// the result, so it never mutates anything. It does load
-/// `domain/capabilities`, because gate criteria routinely turn on which
-/// capabilities a node has. See `doc/agent-context-map.md`.
-pub const GATE_CHECK_CONTEXT_LAYERS: &[&str] = &[
-    "stance/one-shot",
-    "domain/outline",
-    "domain/obligations",
-    "domain/lifecycle",
-    "domain/capabilities",
-    "domain/plan",
-    "surface/gate-check",
-];
+/// The gate-check surface's recipe (static fragments + dynamic blocks).
+pub const GATE_CHECK_RECIPE: &ContextRecipe = &context_recipes::GATE_CHECK;
 
-/// Static context fragments for an on-entry turn. Unlike gate-check this turn
-/// does real work (e.g. `planning` drafting plan steps), so its stance is
-/// `autonomous-session` and it loads the CLI nouns it writes through.
-pub const ON_ENTRY_CONTEXT_LAYERS: &[&str] = &[
-    "stance/autonomous-session",
-    "domain/outline",
-    "domain/obligations",
-    "domain/lifecycle",
-    "domain/plan",
-    "cli/intro",
-    "cli/obligations",
-    "cli/plan",
-    "surface/on-entry",
-];
+/// The on-entry surface's recipe.
+pub const ON_ENTRY_RECIPE: &ContextRecipe = &context_recipes::ON_ENTRY;
 
 /// Everything the gate-check turn needs to describe the node under check.
 #[derive(Debug, Clone)]
@@ -103,12 +79,14 @@ pub fn build_gate_check_message(
     request: &GateCheckRequest<'_>,
     role_doc: &str,
 ) -> Result<String> {
-    let mut out = load_static_context(paths, GATE_CHECK_CONTEXT_LAYERS)?;
-    out.push_str("\n\n---\n\n");
-    out.push_str(role_doc.trim());
-    out.push_str("\n\n---\n\n");
-    out.push_str(&render_dynamic(request));
-    Ok(out)
+    let node = node_selection(request);
+    context_recipes::build_message(
+        paths,
+        GATE_CHECK_RECIPE,
+        Some(role_doc),
+        &dynamic_context(request, "gate_check", &node),
+        &gate_check_tail(request),
+    )
 }
 
 /// Build the on-entry message: static layers, the state agent's own role doc,
@@ -120,12 +98,12 @@ pub fn build_on_entry_message(
     request: &GateCheckRequest<'_>,
     role_doc: &str,
 ) -> Result<String> {
-    let mut out = load_static_context(paths, ON_ENTRY_CONTEXT_LAYERS)?;
-    out.push_str("\n\n---\n\n");
-    out.push_str(role_doc.trim());
-    out.push_str("\n\n---\n\n");
-    out.push_str(&render_node_context(request, "on_entry"));
-    out.push_str(
+    let node = node_selection(request);
+    context_recipes::build_message(
+        paths,
+        ON_ENTRY_RECIPE,
+        Some(role_doc),
+        &dynamic_context(request, "on_entry", &node),
         "\nYou have just entered this lifecycle state. Perform this state's \
          **\"On entry\"** responsibilities from your role doc now, directly \
          via `tod-cli` (e.g. drafting or refining plan steps) — do not wait \
@@ -137,13 +115,14 @@ pub fn build_on_entry_message(
          gate, and do not return `result` or `gate_results` — this reply is \
          not parsed as structured data. Reply with a short plain-text \
          summary of what you did, or that nothing was needed.\n",
-    );
-    Ok(out)
+    )
 }
 
-fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
-    let mut out = render_node_context(request, "gate_check");
-    out.push_str("\n## Gate check\n\n");
+/// The gate-check-only tail, appended after the shared dynamic blocks: the
+/// structured `gate_check:` section `assets/process/agents/state/base.md`
+/// documents, plus the response-format rules for it.
+fn gate_check_tail(request: &GateCheckRequest<'_>) -> String {
+    let mut out = String::from("\n## Gate check\n\n");
     out.push_str(&render_gate_check_yaml(request));
     out.push_str(
         "\nEvaluate your forward gate for this transition now. This is a \
@@ -178,81 +157,33 @@ fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
     out
 }
 
-/// Shared prefix for both message kinds: data root, purpose chain, selected
-/// node metadata (with the given `phase_purpose` value), obligations, and
-/// plan steps. `render_dynamic` appends the gate-check block after this;
-/// `build_on_entry_message` appends its own trailing instruction instead.
-fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> String {
-    let mut out = String::from("# Current context\n\n");
-
-    out.push_str(&format!(
-        "**Data root:** `{}`\n\n\
-         Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
-        request.data_root.display()
-    ));
-
-    if !request.purposes.is_empty() {
-        out.push_str("## Purpose\n\n");
-        out.push_str("From the top of the tree down to the selected node, most general first:\n\n");
-        for purpose in &request.purposes {
-            out.push_str(purpose);
-            out.push_str("\n\n");
-        }
+/// `GateCheckRequest` carries the node's fields flat; the dynamic blocks want
+/// them as a `NodeSelection`.
+fn node_selection(request: &GateCheckRequest<'_>) -> NodeSelection {
+    NodeSelection {
+        id: request.node_id,
+        title: request.node_title.clone(),
+        body: request.node_body.clone(),
+        lifecycle: Some(request.node_lifecycle.clone()),
     }
+}
 
-    out.push_str("## Selected node\n\n");
-    out.push_str(&format!("- **Id:** `{}`\n", request.node_id));
-    out.push_str(&format!("- **Title:** {}\n", request.node_title.trim()));
-    out.push_str(&format!(
-        "- **Lifecycle state:** {}\n",
-        request.node_lifecycle
-    ));
-    out.push_str("- **mode:** interactive\n");
-    out.push_str(&format!("- **phase_purpose:** {phase_purpose}\n"));
-    match request.node_body.as_deref().map(str::trim) {
-        Some(body) if !body.is_empty() => {
-            out.push_str("\n**Details:**\n\n");
-            out.push_str(body);
-            out.push('\n');
-        }
-        _ => {}
+/// Map the request onto the blocks both state-agent surfaces render.
+fn dynamic_context<'a>(
+    request: &'a GateCheckRequest<'a>,
+    phase_purpose: &'a str,
+    node: &'a NodeSelection,
+) -> DynamicContext<'a> {
+    DynamicContext {
+        data_root: Some(request.data_root),
+        node: Some(node),
+        process_fields: Some(("interactive", phase_purpose)),
+        purposes: &request.purposes,
+        obligations: &request.obligations,
+        ancestor_context: &request.ancestor_context,
+        plan_steps: &request.plan_steps,
+        ..Default::default()
     }
-
-    out.push_str("\n## Obligations\n\n");
-    out.push_str(
-        "This node's own — evaluate the gate and probe questions against \
-         these, not against ancestor obligations below.\n\n",
-    );
-    if request.obligations.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        for o in &request.obligations {
-            out.push_str("- ");
-            out.push_str(&obligation_line(o));
-            out.push('\n');
-        }
-    }
-
-    if !request.ancestor_context.is_empty() {
-        out.push_str(&request.ancestor_context);
-    }
-
-    out.push_str("\n## Plan steps\n\n");
-    if request.plan_steps.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        for entry in &request.plan_steps {
-            out.push_str("- ");
-            out.push_str(&plan_step_line(
-                &entry.step,
-                &entry.depends_on,
-                &entry.satisfies,
-            ));
-            out.push('\n');
-        }
-    }
-
-    out
 }
 
 fn render_gate_check_yaml(request: &GateCheckRequest<'_>) -> String {
@@ -293,6 +224,25 @@ fn render_gate_check_yaml(request: &GateCheckRequest<'_>) -> String {
 mod tests {
     use super::*;
     use tod_store::outline::{OUTCOME_PASS, SOURCE_AGENT};
+
+    /// The dynamic half of a gate-check message: the shared blocks plus the
+    /// gate-check tail, without needing a media bundle on disk.
+    fn render_dynamic(request: &GateCheckRequest<'_>) -> String {
+        let node = node_selection(request);
+        let mut out = crate::dynamic::render(
+            GATE_CHECK_RECIPE.blocks,
+            &dynamic_context(request, "gate_check", &node),
+        );
+        out.push_str(&gate_check_tail(request));
+        out
+    }
+
+    /// The dynamic half of an on-entry message — same blocks, no tail.
+    fn render_node_context(request: &GateCheckRequest<'_>, phase_purpose: &str) -> String {
+        let node = node_selection(request);
+        let ctx = dynamic_context(request, phase_purpose, &node);
+        crate::dynamic::render(ON_ENTRY_RECIPE.blocks, &ctx)
+    }
 
     fn criterion(id: Uuid) -> GateCriterion {
         GateCriterion {

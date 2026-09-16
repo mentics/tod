@@ -641,8 +641,7 @@ impl Shell {
         build_first_message(
             &media,
             &ContextRequest {
-                surface: "obligations",
-                layers: tod_core::agent_context::OBLIGATIONS_CONTEXT_LAYERS,
+                recipe: tod_core::agent_context::OBLIGATIONS_RECIPE,
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
@@ -1120,8 +1119,7 @@ impl Shell {
         build_first_message(
             &media,
             &ContextRequest {
-                surface: "design/visual-design",
-                layers: tod_core::agent_context::VISUAL_DESIGN_CONTEXT_LAYERS,
+                recipe: tod_core::agent_context::VISUAL_DESIGN_RECIPE,
                 data_root: self.paths.data_root(),
                 node: NodeSelection {
                     id: node_id,
