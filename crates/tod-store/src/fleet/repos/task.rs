@@ -355,7 +355,9 @@ fn parse_notes(raw: Option<String>) -> Vec<NoteItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet::repos::agent_run::AgentRunRepo;
+    use crate::fleet::repos::agent_run::{
+        AgentRunRepo, RUNTIME_STATUS_ACTIVE, RUNTIME_STATUS_DONE,
+    };
     use crate::fleet::repos::{cleanup_test_dir, test_writer_conn};
 
     #[test]
@@ -392,14 +394,18 @@ mod tests {
         task_repo
             .insert(&FleetTask::new(&task_id, "Blocked", "blocked"))
             .unwrap();
-        let run_id = run_repo.create_run(&task_id, "waiting", "auto").unwrap();
+        let run_id = run_repo
+            .create_run(&task_id, RUNTIME_STATUS_ACTIVE, "auto")
+            .unwrap();
 
         let err = task_repo.delete(&task_id).unwrap_err();
         assert!(matches!(err, TaskRepoError::HasAgents));
         assert!(task_repo.get(&task_id).unwrap().is_some());
 
         // Stopped runs don't block; they're deleted with the task.
-        run_repo.update_runtime_status(&run_id, "not_running").unwrap();
+        run_repo
+            .update_runtime_status(&run_id, RUNTIME_STATUS_DONE)
+            .unwrap();
         task_repo.delete(&task_id).unwrap();
         assert!(run_repo.get(&run_id).unwrap().is_none());
         cleanup_test_dir(&dir);

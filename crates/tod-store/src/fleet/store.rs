@@ -15,7 +15,7 @@ use crate::fleet::reattach;
 use crate::fleet::node_actions::{
     ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
 };
-use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo};
+use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
@@ -378,8 +378,7 @@ impl FleetStore {
         }
         let mut agents = 0;
         for run in AgentRunRepo::new(&conn).list_unended()? {
-            let running = run.reconnect.is_some()
-                || matches!(run.runtime_status.as_str(), "starting" | "processing");
+            let running = run.reconnect.is_some() || run.runtime_status == RUNTIME_STATUS_ACTIVE;
             if running && uses_owner(&run.node_id)? {
                 agents += 1;
             }

@@ -1,6 +1,6 @@
 //! Shared helpers for fleet persistence verification tests.
 
-use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE, RUNTIME_STATUS_DONE};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use rusqlite::Connection;
 use std::fs;
@@ -78,7 +78,11 @@ pub fn insert_scale_data(conn: &Connection) -> ScaleSnapshot {
     }
 
     for index in 0..RUN_COUNT {
-        let status = if index % 2 == 0 { "waiting" } else { "not_running" };
+        let status = if index % 2 == 0 {
+            RUNTIME_STATUS_ACTIVE
+        } else {
+            RUNTIME_STATUS_DONE
+        };
         AgentRunRepo::new(conn)
             .create_run(&task_ids[index % TASK_COUNT], status, "auto")
             .expect("scale run insert");

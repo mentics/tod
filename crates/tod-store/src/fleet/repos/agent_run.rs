@@ -7,6 +7,21 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 use tod_agent::RunLocation;
 
+/// The only two durable states a run's `runtime_status` column should ever
+/// be written as. Anything more granular (what an agent is doing right now,
+/// whether it's waiting on the user) is `tod_agent::EngagementState` —
+/// live-only, never persisted, since this column only needs to answer
+/// "should tod try to reconnect to this, or is it done" for a process that
+/// just started with no live connection to anything yet.
+///
+/// `"waiting"` (not `"active"`) is reused for the active state rather than
+/// introducing a new string: the column's CHECK constraint still lists the
+/// old 5 values (narrowing it requires a full table rebuild — see
+/// `migrate_v32_to_v33`'s doc comment for why that wasn't done), so the
+/// active value has to be one SQLite already accepts.
+pub const RUNTIME_STATUS_ACTIVE: &str = "waiting";
+pub const RUNTIME_STATUS_DONE: &str = "not_running";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub id: String,
@@ -52,7 +67,7 @@ impl AgentRun {
 
     /// Not ended and not marked stopped.
     pub fn is_live(&self) -> bool {
-        self.ended_at.is_none() && self.runtime_status != "not_running"
+        self.ended_at.is_none() && self.runtime_status != RUNTIME_STATUS_DONE
     }
 }
 
@@ -404,10 +419,10 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let node_id = seed_node(&conn);
         let repo = AgentRunRepo::new(&conn);
-        let first = repo.create_run(&node_id, "waiting", "auto").unwrap();
+        let first = repo.create_run(&node_id, RUNTIME_STATUS_ACTIVE, "auto").unwrap();
         let launch = AgentLaunchOptions::from_settings(AgentPlatform::Cursor, "composer-2.5", "high");
         let second = repo
-            .create_named_run(&node_id, "waiting", "interactive", Some("chat"), Some(&launch))
+            .create_named_run(&node_id, RUNTIME_STATUS_ACTIVE, "interactive", Some("chat"), Some(&launch))
             .unwrap();
         assert_eq!(first, format!("{node_id}-run-1"));
         assert_eq!(second, format!("{node_id}-run-2"));

@@ -34,6 +34,7 @@ use tod_store::fleet::terminal::{
     open_terminal_agent_for_node, prune_stale_shell_sessions, prune_stale_terminal_agent_runs,
     remove_shell_state,
 };
+use tod_store::fleet::repos::agent_run::RUNTIME_STATUS_ACTIVE;
 use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles,
     code_editor, code_editors, open_code_editor_for_node, reconnect_identity,
@@ -475,12 +476,8 @@ impl ActionPanelView {
                 identity,
             });
         }
-        let _ = self
-            .fleet
-            .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
-                run_id: fleet_run_id.clone(),
-                runtime_status: "processing".into(),
-            });
+        // CreateAgentRun already inserted this run as active — nothing else
+        // to set here now that runtime_status only distinguishes active/done.
         let prompt_for_transcript = prompt.clone();
         let provider_run = {
             let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
@@ -716,10 +713,7 @@ impl ActionPanelView {
         self.in_flight
             .iter()
             .any(|flight| flight.fleet_run_id == run.id)
-            || matches!(
-                run.runtime_status.as_str(),
-                "starting" | "processing" | "waiting"
-            )
+            || run.runtime_status == RUNTIME_STATUS_ACTIVE
     }
 
     fn render_section(title: &'static str, cx: &Context<Self>) -> gpui::Div {

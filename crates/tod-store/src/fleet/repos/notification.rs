@@ -1,6 +1,7 @@
 //! Notification repository — open rows and hard-delete resolve.
 
-use crate::fleet::repos::agent_run::AgentRunRepo;
+#[cfg(test)]
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::outline::uuid_blob::{blob_to_uuid, uuid_to_blob};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -72,7 +73,10 @@ impl<'a> NotificationRepo<'a> {
         Ok(())
     }
 
-    /// Paired: blocked notification + run **blocked** status.
+    /// A notification about a run that needs attention. Doesn't touch
+    /// `runtime_status` — whether a run is stuck waiting on something is an
+    /// `tod_agent::EngagementState` concern (live-only), not a durable one;
+    /// this run is still active either way.
     pub fn create_blocked(
         &self,
         id: &str,
@@ -80,9 +84,7 @@ impl<'a> NotificationRepo<'a> {
         related_node_id: Option<&str>,
         run_id: &str,
     ) -> Result<(), NotificationRepoError> {
-        self.create(id, message, related_node_id, &[run_id.to_string()])?;
-        AgentRunRepo::new(self.conn).update_runtime_status(run_id, "blocked")?;
-        Ok(())
+        self.create(id, message, related_node_id, &[run_id.to_string()])
     }
 
     pub fn get(&self, id: &str) -> Result<Option<FleetNotification>, NotificationRepoError> {
@@ -172,7 +174,7 @@ mod tests {
     fn seed_run(conn: &Connection) -> String {
         let node_id = seed_node(conn);
         AgentRunRepo::new(conn)
-            .create_run(&node_id, "waiting", "auto")
+            .create_run(&node_id, RUNTIME_STATUS_ACTIVE, "auto")
             .unwrap()
     }
 
@@ -208,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_notification_marks_run_blocked() {
+    fn blocked_notification_leaves_run_active() {
         let (dir, conn) = test_writer_conn();
         let run_id = seed_run(&conn);
         let id = uuid::Uuid::new_v4().to_string();
@@ -216,7 +218,7 @@ mod tests {
             .create_blocked(&id, "blocked", None, &run_id)
             .unwrap();
         let run = AgentRunRepo::new(&conn).get(&run_id).unwrap().unwrap();
-        assert_eq!(run.runtime_status, "blocked");
+        assert_eq!(run.runtime_status, RUNTIME_STATUS_ACTIVE);
         cleanup_test_dir(&dir);
     }
 }

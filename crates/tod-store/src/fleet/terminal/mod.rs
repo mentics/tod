@@ -6,7 +6,7 @@ pub(crate) mod path_util;
 mod state;
 
 use crate::fleet::reconnect_identity::{self};
-use crate::fleet::repos::agent_run::AgentRun;
+use crate::fleet::repos::agent_run::{AgentRun, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::shell::ShellSession;
 use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::{FleetMutation, FleetStore, resolve_launch_cwd};
@@ -798,7 +798,7 @@ pub fn open_terminal_agent_for_node(
     })?;
     fleet.enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
         run_id: run_id.clone(),
-        runtime_status: "processing".into(),
+        runtime_status: RUNTIME_STATUS_ACTIVE.into(),
     })?;
     fleet
         .writer()
@@ -1145,7 +1145,7 @@ mod tests {
         store
             .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
                 run_id: run.id.clone(),
-                runtime_status: "processing".into(),
+                runtime_status: RUNTIME_STATUS_ACTIVE.into(),
             })
             .unwrap();
         store.writer().flush().unwrap();

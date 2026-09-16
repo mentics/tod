@@ -1,6 +1,6 @@
 //! Launch-time reattach orchestration for agent runs and shell sessions.
 
-use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE, RUNTIME_STATUS_DONE};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::runtime::GuestLivenessCheck;
@@ -82,13 +82,13 @@ pub fn reattach_on_launch(
 }
 
 fn is_active_status(status: &str) -> bool {
-    matches!(status, "starting" | "processing" | "waiting" | "blocked")
+    status == RUNTIME_STATUS_ACTIVE
 }
 
 fn mark_run_not_running(writer: &FleetWriter, run_id: &str) -> Result<()> {
     writer.enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
         run_id: run_id.to_string(),
-        runtime_status: "not_running".to_string(),
+        runtime_status: RUNTIME_STATUS_DONE.to_string(),
     })?;
     writer.enqueue(FleetMutation::ClearAgentRunReconnect {
         run_id: run_id.to_string(),
@@ -165,7 +165,7 @@ mod tests {
     fn failed_reattach_persists_not_running_without_notification() {
         let (dir, conn) = test_writer_conn();
         let writer = open_writer(&dir);
-        let run_id = seed_run(&conn, "processing");
+        let run_id = seed_run(&conn, RUNTIME_STATUS_ACTIVE);
         AgentRunRepo::new(&conn)
             .update_reconnect(
                 &run_id,
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(report.agents_not_running, 1);
 
         let run = AgentRunRepo::new(&conn).get(&run_id).unwrap().unwrap();
-        assert_eq!(run.runtime_status, "not_running");
+        assert_eq!(run.runtime_status, RUNTIME_STATUS_DONE);
         assert!(run.reconnect.is_none());
 
         let notification_count: i64 = conn
@@ -199,7 +199,7 @@ mod tests {
         let writer = open_writer(&dir);
         // Simulate a crash / force-quit: the run was left "waiting" with no
         // reconnect identity ever recorded.
-        let run_id = seed_run(&conn, "waiting");
+        let run_id = seed_run(&conn, RUNTIME_STATUS_ACTIVE);
 
         let report =
             reattach_on_launch(&conn, &writer, &NoopGuestLiveness, always_fail_verify).unwrap();
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(report.agents_live, 0);
 
         let run = AgentRunRepo::new(&conn).get(&run_id).unwrap().unwrap();
-        assert_eq!(run.runtime_status, "not_running");
+        assert_eq!(run.runtime_status, RUNTIME_STATUS_DONE);
 
         writer.shutdown().unwrap();
         cleanup_test_dir(&dir);
@@ -217,7 +217,7 @@ mod tests {
     fn successful_reattach_persists_live_status() {
         let (dir, conn) = test_writer_conn();
         let writer = open_writer(&dir);
-        let run_id = seed_run(&conn, "processing");
+        let run_id = seed_run(&conn, RUNTIME_STATUS_ACTIVE);
         let identity = reconnect_identity::record(std::process::id()).expect("current pid");
         AgentRunRepo::new(&conn)
             .update_reconnect(&run_id, identity)
@@ -228,7 +228,7 @@ mod tests {
         assert_eq!(report.agents_live, 1);
 
         let run = AgentRunRepo::new(&conn).get(&run_id).unwrap().unwrap();
-        assert_eq!(run.runtime_status, "waiting");
+        assert_eq!(run.runtime_status, RUNTIME_STATUS_ACTIVE);
 
         writer.shutdown().unwrap();
         cleanup_test_dir(&dir);

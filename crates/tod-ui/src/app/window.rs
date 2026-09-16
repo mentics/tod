@@ -140,10 +140,7 @@ fn collect_running_work(
     let mut items = Vec::new();
     if let Ok(runs) = fleet.list_unended_runs() {
         for run in runs {
-            if matches!(
-                run.runtime_status.as_str(),
-                "starting" | "processing" | "waiting" | "blocked"
-            ) {
+            if run.is_live() {
                 let title = fleet
                     .get_task(&run.node_id)
                     .ok()

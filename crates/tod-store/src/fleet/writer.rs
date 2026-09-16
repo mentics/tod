@@ -1,7 +1,7 @@
 use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::agent_launch::AgentLaunchOptions;
-use crate::fleet::repos::agent_run::AgentRunRepo;
+use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::node_agent::NodeAgentRepo;
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::notification::NotificationRepo;
@@ -306,7 +306,7 @@ impl FleetMutation {
                 let kind = run_kind.as_deref().unwrap_or("auto");
                 AgentRunRepo::new(conn).create_named_run(
                     node_id,
-                    "waiting",
+                    RUNTIME_STATUS_ACTIVE,
                     kind,
                     session_name.as_deref(),
                     launch.as_ref(),
