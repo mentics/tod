@@ -38,6 +38,7 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -366,16 +367,20 @@ impl Shell {
 
     fn compute_status_groups(&self) -> AgentStatusGroups {
         let mut groups = AgentStatusGroups::default();
-        if let Ok(runs) = self.fleet.list_unended_runs() {
-            let agents: Vec<_> = runs.into_iter().filter(|run| run.is_live()).collect();
-            groups.fleet.total = agents.len() as u32;
-            groups.fleet.processing = agents
-                .iter()
-                .filter(|a| a.runtime_status == "processing")
+        if let Ok(registry) = self._interactive_agent_window.engagement().lock() {
+            groups.fleet.total = registry.len() as u32;
+            groups.fleet.processing = registry
+                .values()
+                .filter(|state| matches!(state, EngagementState::WaitingOnAgent))
                 .count() as u32;
-            groups.fleet.blocked = agents
-                .iter()
-                .filter(|a| a.runtime_status == "blocked")
+            groups.fleet.blocked = registry
+                .values()
+                .filter(|state| {
+                    matches!(
+                        state,
+                        EngagementState::WaitingOnUser | EngagementState::WaitingOnOther(_)
+                    )
+                })
                 .count() as u32;
         }
         if let Ok(provider) = self.agent.lock() {

@@ -9,7 +9,7 @@
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
-use tod_agent::EngagementState;
+use tod_agent::{EngagementState, SharedEngagementRegistry};
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
@@ -792,6 +792,8 @@ impl ActionPanelView {
             options.effort
         );
 
+        let engagement = self.interactive_window.engagement();
+
         let mut section = Self::render_section("Agents", cx).child(
             selectable_text("action-panel-agent-summary", agent_summary, window, cx)
                 .text_xs()
@@ -806,7 +808,7 @@ impl ActionPanelView {
             })
             .children(self.chat_sessions.iter().enumerate().map(|(idx, session)| {
                 let label = self.session_label(session);
-                let status = format_status_label(&session.runtime_status);
+                let status = format_status_label(&session.id, &session.runtime_status, &engagement);
                 let session_id = session.id.clone();
                 h_flex()
                     .gap_2()
@@ -849,7 +851,7 @@ impl ActionPanelView {
                 let label = format!(
                     "run {} · {}",
                     run.run_number,
-                    format_status_label(&run.runtime_status)
+                    format_status_label(&run.id, &run.runtime_status, &engagement)
                 );
                 let stop_run_id = run.id.clone();
                 let delete_run_id = run.id.clone();
@@ -903,7 +905,7 @@ impl ActionPanelView {
                 let label = format!(
                     "terminal {} · {}",
                     run.run_number,
-                    format_status_label(&run.runtime_status)
+                    format_status_label(&run.id, &run.runtime_status, &engagement)
                 );
                 let focus_id = run.id.clone();
                 let delete_id = run.id.clone();
@@ -1185,16 +1187,30 @@ impl Render for ActionPanelView {
     }
 }
 
-fn format_status_label(status: &str) -> String {
-    match status {
-        "starting" => "Starting",
-        "processing" => "Processing",
-        "waiting" => "Waiting",
-        "blocked" => "Blocked",
-        "not_running" => "Not running",
-        other => other,
+/// Prefer the live `EngagementState` for this run when something is
+/// currently polling it; otherwise fall back to the persisted two-state
+/// `runtime_status` (active/done), since nothing is watching the run to know
+/// anything more specific right now.
+fn format_status_label(
+    run_id: &str,
+    runtime_status: &str,
+    engagement: &SharedEngagementRegistry,
+) -> String {
+    if let Ok(registry) = engagement.lock()
+        && let Some(state) = registry.get(run_id)
+    {
+        return match state {
+            EngagementState::WaitingOnAgent => "Processing".to_string(),
+            EngagementState::WaitingOnUser => "Waiting for you".to_string(),
+            EngagementState::WaitingOnOther(reason) => reason.clone(),
+            EngagementState::Done => "Done".to_string(),
+        };
     }
-    .into()
+    if runtime_status == RUNTIME_STATUS_ACTIVE {
+        "Active".to_string()
+    } else {
+        "Done".to_string()
+    }
 }
 
 pub fn register_action_panel_keyboard_bindings(cx: &mut App) {
