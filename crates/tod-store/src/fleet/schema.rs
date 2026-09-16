@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 31;
+pub const CURRENT_USER_VERSION: i32 = 32;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -246,6 +246,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v30_to_v31(conn)?;
         conn.pragma_update(None, "user_version", 31)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 32 {
+        migrate_v31_to_v32(conn)?;
+        conn.pragma_update(None, "user_version", 32)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -296,6 +301,17 @@ fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
 /// cheap fingerprint of the last thing seen (see `tod_agent::claude_transcript_fingerprint`)
 /// so a later touch can tell "did this move since we cached it" without
 /// re-fetching. Nothing populates these yet — this just adds the columns.
+/// Drop `transcript_turns`: nothing has written or read it since
+/// `cached_transcript` replaced turn-by-turn recording (agent runs now cache
+/// their transcript once, on completion, fetched from the agent itself).
+fn migrate_v31_to_v32(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_transcript_turns_run_id;
+         DROP TABLE IF EXISTS transcript_turns;",
+    )?;
+    Ok(())
+}
+
 fn migrate_v30_to_v31(conn: &Connection) -> Result<()> {
     let has_column = |column: &str| -> Result<bool> {
         Ok(conn
@@ -532,7 +548,6 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
             JOIN agent_configs c ON c.id = r.agent_config_id
             WHERE c.node_id IN (SELECT id FROM nodes);
             DELETE FROM notification_runs WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
-            DELETE FROM transcript_turns WHERE agent_run_id NOT IN (SELECT id FROM agent_runs_v29);
             DROP INDEX IF EXISTS idx_agent_runs_config_id;
             DROP TABLE agent_runs;
             ",
@@ -2637,9 +2652,9 @@ mod tests {
         assert!(tables.contains(&"shell_sessions".to_string()));
         assert!(tables.contains(&"notifications".to_string()));
         assert!(tables.contains(&"notification_runs".to_string()));
-        assert!(tables.contains(&"transcript_turns".to_string()));
         assert!(!tables.contains(&"agent_configs".to_string()));
         assert!(!tables.contains(&"notification_agents".to_string()));
+        assert!(!tables.contains(&"transcript_turns".to_string()));
 
         let _ = fs::remove_dir_all(dir);
     }

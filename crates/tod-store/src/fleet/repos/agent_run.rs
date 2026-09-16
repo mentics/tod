@@ -348,12 +348,8 @@ impl<'a> AgentRunRepo<'a> {
         Ok(())
     }
 
-    /// Hard-delete a run and its transcript turns.
+    /// Hard-delete a run.
     pub fn delete_run(&self, id: &str) -> Result<(), AgentRunRepoError> {
-        self.conn.execute(
-            "DELETE FROM transcript_turns WHERE agent_run_id = ?1",
-            params![id],
-        )?;
         let deleted = self
             .conn
             .execute("DELETE FROM agent_runs WHERE id = ?1", params![id])?;
