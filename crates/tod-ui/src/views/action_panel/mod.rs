@@ -56,8 +56,6 @@ pub enum ActionPanelEvent {
 struct InFlightFleetRun {
     provider_run_id: RunId,
     fleet_run_id: String,
-    prompt_id: String,
-    response_id: String,
     /// Kept to build the cached transcript once the run completes — see
     /// `FleetMutation::CacheAgentRunTranscript`.
     prompt: String,
@@ -278,10 +276,10 @@ impl ActionPanelView {
         if let Some(name) = session.session_name.as_deref() {
             return name.to_string();
         }
-        if let Ok(turns) = self.fleet.list_transcript_for_agent(&session.id) {
-            if let Some(first) = turns.iter().find(|t| t.kind == "prompt") {
-                let preview: String = first.content.chars().take(48).collect();
-                let suffix = if first.content.chars().count() > 48 {
+        if let Some(cached) = session.cached_transcript.as_deref() {
+            if let Some(first_line) = cached.lines().find(|line| !line.trim().is_empty()) {
+                let preview: String = first_line.chars().take(48).collect();
+                let suffix = if first_line.chars().count() > 48 {
                     "…"
                 } else {
                     ""
@@ -365,26 +363,13 @@ impl ActionPanelView {
             }
         }
         for (_, flight, result) in &finished {
-            match result {
-                Ok(content) => {
-                    let _ = self.fleet.enqueue(FleetMutation::CompleteResponse {
-                        response_id: flight.response_id.clone(),
+            if result.is_err() {
+                let _ = self
+                    .fleet
+                    .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
                         run_id: flight.fleet_run_id.clone(),
-                        content: content.clone(),
-                        prompt_id: flight.prompt_id.clone(),
+                        runtime_status: "blocked".into(),
                     });
-                }
-                Err(_) => {
-                    let _ = self.fleet.enqueue(FleetMutation::MarkRunPromptsInterrupted {
-                        run_id: flight.fleet_run_id.clone(),
-                    });
-                    let _ = self
-                        .fleet
-                        .enqueue(FleetMutation::UpdateAgentRunRuntimeStatus {
-                            run_id: flight.fleet_run_id.clone(),
-                            runtime_status: "blocked".into(),
-                        });
-                }
             }
         }
         let mut indices: Vec<usize> = finished.iter().map(|(idx, _, _)| *idx).collect();
@@ -480,20 +465,6 @@ impl ActionPanelView {
                 run_id: fleet_run_id.clone(),
                 runtime_status: "processing".into(),
             });
-        let prompt_id = uuid::Uuid::new_v4().to_string();
-        let response_id = uuid::Uuid::new_v4().to_string();
-        if let Err(err) = self.fleet.enqueue(FleetMutation::SendPrompt {
-            id: prompt_id.clone(),
-            run_id: fleet_run_id.clone(),
-            content: prompt.clone(),
-        }) {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
-            return;
-        }
-        if let Err(err) = self.flush_fleet() {
-            error_toast(window, cx, format!("Launch agent failed: {err}"));
-            return;
-        }
         let prompt_for_transcript = prompt.clone();
         let provider_run = {
             let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
@@ -505,8 +476,6 @@ impl ActionPanelView {
                 self.in_flight.push(InFlightFleetRun {
                     provider_run_id: handle.id,
                     fleet_run_id: fleet_run_id.clone(),
-                    prompt_id,
-                    response_id,
                     prompt: prompt_for_transcript,
                 });
                 self.changed(format!("Launched agent in {}", cwd.display()), cx);
