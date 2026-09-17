@@ -23,8 +23,6 @@ pub struct LaunchOptions {
     pub no_focus: bool,
     /// CLI `--log-level` override for this process run.
     pub log_level: Option<LogLevel>,
-    /// When true, run `doc/process` bootstrap import before opening the UI.
-    pub import_process: bool,
     /// When true, discover bundled process docs, load manifest, print paths, and exit.
     pub verify_process_bundle: bool,
 }
@@ -43,7 +41,6 @@ impl Default for LaunchOptions {
             agent_backend_from_cli: false,
             no_focus: false,
             log_level: None,
-            import_process: false,
             verify_process_bundle: false,
         }
     }
@@ -159,9 +156,6 @@ impl LaunchOptions {
                 }
                 "--no-focus" => {
                     opts.no_focus = true;
-                }
-                "--import-process" => {
-                    opts.import_process = true;
                 }
                 "--verify-process-bundle" => {
                     opts.verify_process_bundle = true;

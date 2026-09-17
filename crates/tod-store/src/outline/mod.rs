@@ -4,7 +4,6 @@ pub mod archive;
 pub mod ddl;
 pub mod file_refs;
 pub mod gate_criteria_seed;
-pub mod import;
 pub mod migrate_interview;
 pub mod mutations;
 pub mod references;
@@ -17,7 +16,6 @@ pub mod workspace;
 
 pub use file_refs::{check_no_file_references, referenced_files};
 pub use gate_criteria_seed::{GATE_CRITERIA, seed_gate_criteria};
-pub use import::import_doc_process;
 pub use mutations::{CreatePosition, OutlineMutation, ReorderDirection};
 pub use references::{BrokenReference, broken_references, check_references, referenced_slugs};
 pub use repos::gate::{

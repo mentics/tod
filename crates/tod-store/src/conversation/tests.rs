@@ -278,12 +278,6 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
             None,
         ),
         (
-            M::ImportDocProcess {
-                repo_root: ".".into(),
-            },
-            None,
-        ),
-        (
             M::CreateObligation {
                 obligation_id: Some(id()),
                 node_id: id(),

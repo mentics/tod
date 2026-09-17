@@ -66,9 +66,6 @@ pub enum OutlineMutation {
         capability: Capability,
         archive_payload: String,
     },
-    ImportDocProcess {
-        repo_root: String,
-    },
     CreateObligation {
         obligation_id: Option<Uuid>,
         node_id: Uuid,
@@ -339,8 +336,7 @@ impl OutlineMutation {
     pub fn is_immediate(&self) -> bool {
         matches!(
             self,
-            OutlineMutation::ImportDocProcess { .. }
-                | OutlineMutation::CreateList { .. }
+            OutlineMutation::CreateList { .. }
                 | OutlineMutation::CreateNode { .. }
                 | OutlineMutation::DisableCapability { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
@@ -452,11 +448,6 @@ impl OutlineMutation {
                     *capability,
                     archive_payload,
                 )?;
-            }
-            OutlineMutation::ImportDocProcess { repo_root } => {
-                let root = Path::new(repo_root);
-                crate::outline::import::import_doc_process(conn, root, media_root)
-                    .context("doc/process import failed")?;
             }
             OutlineMutation::CreateObligation {
                 obligation_id,
