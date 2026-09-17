@@ -169,7 +169,7 @@ cargo run -p tod -- --data-root .local/test/my-sandbox --agent mock --no-focus
 ```
 | `--agent mock` | In-process mock provider (instant; for almost all UI tests) |
 | `--agent cursor` | Real Cursor Agent CLI over ACP (rare protocol smoke only; still use `--data-root`) |
-| `--no-focus` | Open without stealing OS keyboard focus (recommended for e2e while you work) |
+| `--no-focus` | No window (main or secondary) takes OS keyboard focus; implied by `--agent-socket`/`--agent-socket-port` |
 | `--agent-socket HOST:PORT` | Enable control socket on a specific address (dev builds only) |
 | `--agent-socket-port PORT` | Shorthand for `127.0.0.1:PORT` — use a different port per parallel test instance |
 

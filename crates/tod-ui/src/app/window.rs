@@ -1873,7 +1873,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
         no_focus::after_window_open(previous_foreground);
     }
 
-    if restore_always_on_top {
+    // A topmost window would sit over whatever the user is doing.
+    if restore_always_on_top && !no_focus {
         always_on_top::set(true);
     }
 
@@ -1907,6 +1908,7 @@ pub fn open_data_root_setup(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()
                 origin: point(px(0.), px(0.)),
                 size: size(px(720.), px(420.)),
             })),
+            focus: no_focus::window_focus(),
             ..Default::default()
         },
         {

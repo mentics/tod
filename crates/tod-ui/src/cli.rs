@@ -179,6 +179,13 @@ impl LaunchOptions {
             opts.agent_socket = Some(SocketAddr::from(([127, 0, 0, 1], port)));
         }
 
+        // The control socket exists only for automated verification, which must
+        // never pull focus away from whoever is using this machine.
+        #[cfg(feature = "agent-socket")]
+        if opts.agent_socket.is_some() {
+            opts.no_focus = true;
+        }
+
         Ok(opts)
     }
 }
@@ -238,6 +245,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(opts.agent_socket.unwrap().to_string(), "127.0.0.1:9876");
+        assert!(opts.no_focus, "agent socket implies --no-focus");
     }
 
     #[test]
@@ -263,6 +271,7 @@ mod tests {
             LaunchOptions::from_args(["tod".into(), "--agent-socket-port".into(), "9877".into()])
                 .unwrap();
         assert_eq!(opts.agent_socket.unwrap().to_string(), "127.0.0.1:9877");
+        assert!(opts.no_focus, "agent socket implies --no-focus");
     }
 
     #[cfg(feature = "agent-socket")]

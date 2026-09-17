@@ -1,4 +1,34 @@
-//! Keep startup from stealing OS focus (e2e / agent control socket).
+//! Keep the app from stealing OS focus (e2e / agent control socket).
+//!
+//! `--no-focus` (implied by the agent control socket) is process-wide: every
+//! window opens without activation and nothing calls `activate_window`, which
+//! on Windows injects a synthetic Alt keypress and forces itself foreground.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Turn no-focus mode on for this process. Set once at startup.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether windows must avoid taking OS focus.
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+/// Value for `WindowOptions::focus` on every window the app opens.
+pub fn window_focus() -> bool {
+    !enabled()
+}
+
+/// Bring an existing window forward, unless no-focus mode forbids it.
+pub fn activate(window: &mut gpui::Window) {
+    if !enabled() {
+        window.activate_window();
+    }
+}
 
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;

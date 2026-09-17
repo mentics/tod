@@ -43,7 +43,7 @@ CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. C
 
 ### `--agent mock` for UI work
 
-For any UI-facing change, prefer driving the real app over guessing: `--agent mock` gives an instant, in-process fake agent (no real API calls), and `--no-focus` lets it run without stealing OS focus while you keep working. `--agent cursor` drives the real Cursor Agent CLI over ACP and is only for rare protocol-level smoke tests.
+For any UI-facing change, prefer driving the real app over guessing: `--agent mock` gives an instant, in-process fake agent (no real API calls), and `--no-focus` keeps every window it opens from stealing OS focus while the user keeps working (the agent control socket implies it, but pass it anyway on any automated launch). `--agent cursor` drives the real Cursor Agent CLI over ACP and is only for rare protocol-level smoke tests.
 
 ### Agent control socket (dev/CI only, not in release builds)
 

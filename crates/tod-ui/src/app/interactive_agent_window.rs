@@ -197,7 +197,7 @@ impl InteractiveAgentWindowControl {
     fn focus_handle(&self, cx: &mut App, handle: AnyWindowHandle) -> Result<(), String> {
         handle
             .update(cx, |_, window, _| {
-                window.activate_window();
+                super::no_focus::activate(window);
                 Ok(())
             })
             .map_err(|err| format!("focus interactive agent window failed: {err}"))?
@@ -429,6 +429,7 @@ impl InteractiveAgentWindowControl {
                         origin: point(px(120.), px(120.)),
                         size: size(px(720.), px(640.)),
                     })),
+                    focus: super::no_focus::window_focus(),
                     ..Default::default()
                 },
                 move |window, cx| {
