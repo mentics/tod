@@ -802,13 +802,28 @@ impl TaskListView {
         let Ok(node_id) = uuid::Uuid::parse_str(&generator_id) else {
             return;
         };
-        match tod_core::generator::refresh_generator(&self.fleet, node_id) {
-            Ok(updated_ids) => {
-                self.recently_updated_copy_ids
-                    .extend(updated_ids.into_iter().map(|id| id.to_string()));
-            }
-            Err(err) => self.show_error(format!("Refresh failed: {err}"), window, cx),
-        }
+        // The fetch reaches the network, so it runs on the background executor
+        // and the user keeps working; the row shows "refreshing…" meanwhile,
+        // off the generator's own in-progress status.
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { tod_core::generator::refresh_generator(&fleet, node_id) },
+                )
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(updated_ids) => {
+                        this.recently_updated_copy_ids
+                            .extend(updated_ids.into_iter().map(|id| id.to_string()));
+                    }
+                    Err(err) => this.show_error(format!("Refresh failed: {err}"), window, cx),
+                }
+                this.live_refresh(window, cx);
+            });
+        })
+        .detach();
         self.live_refresh(window, cx);
     }
 

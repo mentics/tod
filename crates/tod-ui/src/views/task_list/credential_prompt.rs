@@ -1,4 +1,4 @@
-use gpui::{Context, ParentElement, Styled, Window, div, px};
+use gpui::{AppContext, Context, ParentElement, Styled, Window, div, px};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
@@ -188,12 +188,16 @@ impl TaskListView {
 
         let entity = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            let fetch = std::thread::spawn(move || {
-                tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
-            })
-            .join();
+            // `background_spawn`, never a thread we join here: this future runs
+            // on the foreground executor, so blocking in it would freeze the UI
+            // for the whole round trip.
+            let fetch = cx
+                .background_spawn(async move {
+                    tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
+                })
+                .await;
             let pending = match fetch {
-                Ok(Ok(issue)) => PendingTicketImport {
+                Ok(issue) => PendingTicketImport {
                     generation,
                     ticket: issue.identifier,
                     title: Some(issue.title),
@@ -202,7 +206,7 @@ impl TaskListView {
                     draft_node_id: draft_node_id.clone(),
                     auth_failure: false,
                 },
-                Ok(Err(err)) => PendingTicketImport {
+                Err(err) => PendingTicketImport {
                     generation,
                     ticket: ticket_owned.clone(),
                     title: None,
@@ -214,15 +218,6 @@ impl TaskListView {
                         tod_store::linear::LinearError::Api(ref msg)
                             if msg.contains("Invalid Linear API key")
                     ),
-                },
-                Err(_) => PendingTicketImport {
-                    generation,
-                    ticket: ticket_owned.clone(),
-                    title: None,
-                    description: None,
-                    error: Some("Linear fetch thread panicked".into()),
-                    draft_node_id: draft_node_id.clone(),
-                    auth_failure: false,
                 },
             };
             let _ = entity.update(cx, |this, cx| {
