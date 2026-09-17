@@ -174,7 +174,7 @@ process-bundle role doc plays this part and stays where it is.
 `render_dynamic` currently hard-codes `if request.surface == "obligations"`.
 Replace with a list of block renderers the recipe names:
 
-`DataRoot`, `PurposeChain`, `Node`, `SelectedObligation`, `NodeObligations`,
+`DataRoot`, `Node`, `SelectedObligation`, `NodeObligations`,
 `AncestorObligations`, `Plan`, `GateCriteria`, `Workspace`.
 
 Each surface lists the blocks it wants, in order. No renderer needs to know
@@ -189,7 +189,7 @@ which surface it is serving.
 2 Visual-design chat
   stance/interactive-chat, domain/outline, domain/obligations,
   cli/intro, cli/visual-design, surface/visual-design
-  dyn: DataRoot, PurposeChain, Node, SelectedObligation
+  dyn: DataRoot, Node, AncestorObligations, SelectedObligation
 
 3 Implementation session
   stance/autonomous-session, domain/outline, domain/obligations, domain/plan,
@@ -219,7 +219,7 @@ which surface it is serving.
   cli/memory, cli/interview                     [+ role + phase + interview base]
   dyn: interview snapshot / delta (unchanged)
 
-9,10 Drafting agents — removed with drafting (schema v35); the
+9,10 Drafting agents — removed with drafting (schema v37); the
   conversation view (surface 11) replaced them
 
 11 Conversation
@@ -325,7 +325,7 @@ All four steps are done.
   visual-design chat uses it.
 - **Drafting is gone.** Surfaces 9 and 10, `DRAFTING_AGENT`, `cli/drafting.md`,
   and `assets/process/agents/drafting/` were removed with the drafting view
-  (schema v35). Proposed and design nodes open the conversation view.
+  (schema v37). Proposed and design nodes open the conversation view.
 
 ### Decisions
 
@@ -353,9 +353,11 @@ session's change-log watermark (for a conversation: the user's own edits and
 reversals, and items changed elsewhere, since its previous turn), not the
 current state, so it has no block counterpart either way. Line formats stay consistent across snapshot, delta,
 and blocks because all three use `node_context`'s line renderers
-(`obligation_line`, `plan_step_line`). The interview snapshot's header,
-purpose chain, and obligations-by-kind writers also live there
-(`write_snapshot_header`, `write_purpose_chain`, `write_obligations_by_kind`).
+(`obligation_line`, `plan_step_line`). The interview snapshot's header and
+obligations-by-kind writers also live there
+(`write_snapshot_header`, `write_obligations_by_kind`). A node inherits one
+thing of each Spec ancestor besides its constraints — the ancestor's summary —
+and `render_inherited_context` is the only place that renders it.
 
 **Role docs may name a `tod-cli` noun in prose.** The prose says *which* noun
 applies, and the `cli/` fragment says how to call it. Command tables are what

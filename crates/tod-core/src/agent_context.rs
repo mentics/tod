@@ -26,11 +26,10 @@ pub struct ContextRequest<'a> {
     pub data_root: &'a Path,
     pub node: NodeSelection,
     pub obligation: Option<ObligationSelection>,
-    /// Purpose (Spec capability's `goal`) for the selected node and every
-    /// ancestor that has one, ordered from the root of the tree down to the
-    /// selected node — general inherited purpose first, this node's own
-    /// purpose last.
-    pub purposes: Vec<String>,
+    /// Rendered ancestor context — build with
+    /// `tod_core::node_context::render_inherited_context`: what the node
+    /// inherits, each Spec ancestor's summary and constraints.
+    pub ancestor_context: String,
 }
 
 /// The recipe for a chat opened from the visual-design panel.
@@ -45,7 +44,7 @@ pub fn build_first_message(paths: &MediaPaths, request: &ContextRequest<'_>) -> 
         &DynamicContext {
             data_root: Some(request.data_root),
             node: Some(&request.node),
-            purposes: &request.purposes,
+            ancestor_context: &request.ancestor_context,
             obligation: request.obligation.as_ref(),
             ..Default::default()
         },
@@ -115,8 +114,8 @@ mod tests {
         layers: &[],
         blocks: &[
             DynamicBlock::DataRoot,
-            DynamicBlock::PurposeChain,
             DynamicBlock::Node,
+            DynamicBlock::AncestorContext,
             DynamicBlock::SelectedObligation {
                 fallback: "No individual obligation is selected",
             },
@@ -139,7 +138,7 @@ mod tests {
             &DynamicContext {
                 data_root: Some(request.data_root),
                 node: Some(&request.node),
-                purposes: &request.purposes,
+                ancestor_context: &request.ancestor_context,
                 obligation: request.obligation.as_ref(),
                 ..Default::default()
             },
@@ -153,7 +152,7 @@ mod tests {
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
-            purposes: Vec::new(),
+            ancestor_context: String::new(),
         };
         let text = dynamic_for(&req);
         assert!(text.contains("data") && text.contains("tod"));
@@ -164,22 +163,20 @@ mod tests {
     }
 
     #[test]
-    fn purposes_render_general_to_specific_before_selected_node() {
+    fn a_chat_carries_what_the_node_inherits() {
         let req = ContextRequest {
             recipe: NODE_CHAT,
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
-            purposes: vec!["Ship the product.".into(), "Ship this feature.".into()],
+            ancestor_context: "\n## Inherited context (ancestors)\n\n### From \"Product\"\nShips it.\n"
+                .into(),
         };
         let text = dynamic_for(&req);
-        let purpose_idx = text.find("## Purpose").unwrap();
-        let ship_product_idx = text.find("Ship the product.").unwrap();
-        let ship_feature_idx = text.find("Ship this feature.").unwrap();
-        let node_idx = text.find("## Selected node").unwrap();
-        assert!(purpose_idx < ship_product_idx);
-        assert!(ship_product_idx < ship_feature_idx);
-        assert!(ship_feature_idx < node_idx);
+        assert!(
+            text.find("## Selected node").unwrap() < text.find("Ships it.").unwrap(),
+            "{text}"
+        );
     }
 
     /// A selection fallback is one recipe's wording, so a different surface
@@ -192,7 +189,7 @@ mod tests {
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
-            purposes: Vec::new(),
+            ancestor_context: String::new(),
         };
         assert!(!dynamic_for(&req).contains("No individual obligation is selected"));
     }
@@ -209,7 +206,7 @@ mod tests {
                 body: "Must round-trip".into(),
                 visual_design_path: None,
             }),
-            purposes: Vec::new(),
+            ancestor_context: String::new(),
         };
         let text = dynamic_for(&req);
         assert!(text.contains(&Uuid::from_u128(7).to_string()));

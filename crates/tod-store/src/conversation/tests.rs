@@ -462,7 +462,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         (
             M::SetExtraContent {
                 node_id: id(),
-                content_type: "goal".into(),
+                content_type: "details".into(),
                 body: String::new(),
             },
             None,
@@ -1377,8 +1377,8 @@ fn agent_writes_record_one_action_and_other_actors_record_none() {
     // Unrecorded kinds still run.
     fx.agent(M::SetExtraContent {
         node_id: fx.n1,
-        content_type: "goal".into(),
-        body: "A goal.".into(),
+        content_type: "details".into(),
+        body: "Some details.".into(),
     })
     .unwrap();
     assert_eq!(fx.action_count(), 1);

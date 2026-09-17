@@ -1,10 +1,18 @@
 //! Node repository — nodes, capabilities, lifecycle, fields.
 
-use crate::outline::types::{Capability, Node};
+use crate::outline::types::{Capability, EXTRA_CONTENT_SUMMARY, Node};
 use crate::outline::uuid_blob::{blob_to_uuid_sql, ms_to_datetime, now_ms, uuid_to_blob};
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
+
+/// A node's generated summary (see `EXTRA_CONTENT_SUMMARY`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSummary {
+    pub body: String,
+    /// The node's details or obligations changed after this was written.
+    pub stale: bool,
+}
 
 pub struct NodeRepo<'a> {
     conn: &'a Connection,
@@ -323,7 +331,7 @@ impl<'a> NodeRepo<'a> {
         self.conn.execute(
             "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(node_id, content_type) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at",
+             ON CONFLICT(node_id, content_type) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at, stale = 0",
             params![
                 uuid_to_blob(Uuid::new_v4()),
                 uuid_to_blob(node_id),
@@ -333,6 +341,22 @@ impl<'a> NodeRepo<'a> {
             ],
         )?;
         Ok(())
+    }
+
+    /// The node's generated summary, if it has a non-blank one, and whether its
+    /// details or obligations changed since it was written.
+    pub fn get_summary(&self, node_id: Uuid) -> Result<Option<NodeSummary>> {
+        let row: Option<(String, bool)> = self
+            .conn
+            .query_row(
+                "SELECT body, stale FROM node_extra_content WHERE node_id = ?1 AND content_type = ?2",
+                params![uuid_to_blob(node_id), EXTRA_CONTENT_SUMMARY],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row
+            .filter(|(body, _)| !body.trim().is_empty())
+            .map(|(body, stale)| NodeSummary { body, stale }))
     }
 
     pub fn disable_capability_archive(

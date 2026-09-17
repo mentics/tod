@@ -12,6 +12,8 @@ tod-cli --data-root <DATA_ROOT> node create --title <TEXT> (--parent <SLUG_OR_UU
 tod-cli --data-root <DATA_ROOT> node rename <SLUG_OR_UUID> --title <TEXT>
 tod-cli --data-root <DATA_ROOT> node move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
 tod-cli --data-root <DATA_ROOT> node delete <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node notes    <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node add-note <SLUG_OR_UUID> --body <TEXT>
 ```
 
 `list` and `create` need to know which outline list to act on: pass `--parent`
@@ -33,3 +35,8 @@ Use `tree` to see a node's whole subtree at once: one line per node, indented
 by depth, as `<slug>  <title>  (obligations: <n>, plan steps: <m>)`. `--depth N`
 shows only N levels below the node (`--depth 0` is the node alone); a line
 whose children were cut off says how many are hidden (`, 3 more below`).
+
+`notes` lists a node's notes, oldest first, each headed by its id. Notes are
+the freeform jottings shown in the node's Notes section in the app — distinct
+from its `details` (see `content`) and from obligations. When asked to add a
+note, use `add-note`: it appends one note and never changes existing ones.

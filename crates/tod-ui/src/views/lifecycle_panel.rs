@@ -995,7 +995,6 @@ impl LifecyclePanelView {
                 .flatten()
                 .map(|agent| agent.launch_options(&settings, AgentRole::Default))
                 .unwrap_or_else(|| settings.launch_options_for(AgentRole::Default));
-            let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
             let body = self
                 .fleet
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
@@ -1050,7 +1049,6 @@ impl LifecyclePanelView {
                     node_title: node_title.clone(),
                     node_lifecycle: from_state.clone(),
                     node_body: body,
-                    purposes,
                     obligations,
                     ancestor_context,
                     plan_steps,
@@ -1165,7 +1163,6 @@ impl LifecyclePanelView {
                 .flatten()
                 .map(|agent| agent.launch_options(&settings, AgentRole::Default))
                 .unwrap_or_else(|| settings.launch_options_for(AgentRole::Default));
-            let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
             let body = self
                 .fleet
                 .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
@@ -1219,7 +1216,6 @@ impl LifecyclePanelView {
                     node_title: title.clone(),
                     node_lifecycle: lifecycle.clone(),
                     node_body: body,
-                    purposes,
                     obligations,
                     ancestor_context,
                     plan_steps,

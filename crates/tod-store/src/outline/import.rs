@@ -1,5 +1,6 @@
 //! One-time bootstrap import from `doc/process/` on disk.
 
+use crate::outline::file_refs::referenced_files;
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::Capability;
@@ -14,7 +15,6 @@ pub struct ImportReport {
     pub list_id: Uuid,
     pub projects: usize,
     pub tasks: usize,
-    pub global_obligations: usize,
 }
 
 /// Import `doc/process` under `repo_root` into the outline schema.
@@ -67,13 +67,10 @@ pub fn import_doc_process(
         }
     }
 
-    let global_count = import_global_obligations(conn, repo_root)?;
-
     Ok(ImportReport {
         list_id: list.id,
         projects,
         tasks,
-        global_obligations: global_count,
     })
 }
 
@@ -184,38 +181,6 @@ fn import_task(
     Ok(())
 }
 
-fn import_global_obligations(conn: &Connection, repo_root: &Path) -> Result<usize> {
-    let dir = repo_root
-        .join("doc")
-        .join("process")
-        .join("shared")
-        .join("constraints");
-    if !dir.is_dir() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
-    for entry in fs::read_dir(&dir)?.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let slug = path.file_stem().unwrap().to_string_lossy().to_string();
-        if slug == "README" {
-            continue;
-        }
-        let body = fs::read_to_string(&path)?;
-        let title = slug.clone();
-        let id = Uuid::new_v4();
-        conn.execute(
-            "INSERT OR IGNORE INTO global_obligations (id, slug, title, kind, ordinal, body, adopted)
-             VALUES (?1, ?2, ?3, 'constraint', 1, ?4, 1)",
-            rusqlite::params![uuid_to_blob(id), slug, title, body],
-        )?;
-        count += 1;
-    }
-    Ok(count)
-}
-
 fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Result<()> {
     let mut in_requirements = false;
     let mut in_constraints = false;
@@ -241,7 +206,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            insert_extra_content(conn, node_id, "goal", rest)?;
+            insert_extra_content(conn, node_id, "details", rest)?;
             continue;
         }
         let Some(num_end) = trimmed.find('.') else {
@@ -251,6 +216,12 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
         if num_part.chars().all(|c| c.is_ascii_digit()) {
             let text = trimmed[num_end + 1..].trim();
             if text.is_empty() {
+                continue;
+            }
+            // "Follow [`doc/process/shared/constraints/x.md`](...)" points at a
+            // file the data root does not hold.
+            if !referenced_files(text).is_empty() {
+                tracing::warn!(%node_id, text, "skipping imported obligation that references a file");
                 continue;
             }
             if in_requirements {

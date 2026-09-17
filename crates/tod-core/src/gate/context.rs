@@ -39,8 +39,6 @@ pub struct GateCheckRequest<'a> {
     /// Node body/details, when the node has any (the `details` extra-content
     /// field — design decisions live as design-phase obligations, not here).
     pub node_body: Option<String>,
-    /// Inherited + own purpose, most general first (see `agent_context::ContextRequest`).
-    pub purposes: Vec<String>,
     /// This node's own obligations (requirements/constraints) — not
     /// ancestors' — so a `verifying`/`review` gate check can confirm every
     /// requirement was traced without shelling out to `tod-cli obligations
@@ -179,7 +177,6 @@ fn dynamic_context<'a>(
         data_root: Some(request.data_root),
         node: Some(node),
         process_fields: Some(("interactive", phase_purpose)),
-        purposes: &request.purposes,
         obligations: &request.obligations,
         ancestor_context: &request.ancestor_context,
         plan_steps: &request.plan_steps,
@@ -265,7 +262,6 @@ mod tests {
             node_title: "Ship it".into(),
             node_lifecycle: "verifying".into(),
             node_body: None,
-            purposes: Vec::new(),
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
@@ -288,7 +284,6 @@ mod tests {
             node_title: "Ship it".into(),
             node_lifecycle: "design".into(),
             node_body: None,
-            purposes: Vec::new(),
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
@@ -322,7 +317,6 @@ mod tests {
             node_title: "Ship it".into(),
             node_lifecycle: "planning".into(),
             node_body: None,
-            purposes: Vec::new(),
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
@@ -345,7 +339,6 @@ mod tests {
             node_title: "Ship it".into(),
             node_lifecycle: "design".into(),
             node_body: None,
-            purposes: Vec::new(),
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
@@ -375,7 +368,6 @@ mod tests {
             node_title: "Ship it".into(),
             node_lifecycle: "planning".into(),
             node_body: None,
-            purposes: Vec::new(),
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),

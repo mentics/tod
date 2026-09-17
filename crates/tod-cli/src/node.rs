@@ -6,6 +6,7 @@
 use crate::Invocation;
 use crate::args::Args;
 use tod_core::fuzzy::fuzzy_score;
+use tod_store::fleet::repos::task::TaskRepo;
 use tod_store::interview::InterviewCommand;
 use std::collections::HashMap;
 use tod_store::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo, PlanStepRepo};
@@ -26,6 +27,8 @@ COMMANDS:
     rename <SLUG_OR_UUID> --title <TEXT>
     move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
     delete <SLUG_OR_UUID>
+    notes    <SLUG_OR_UUID>
+    add-note <SLUG_OR_UUID> --body <TEXT>
 
 `list`/`create` need to know which outline list to act on: pass --parent to act
 relative to an existing node (its list is used automatically), or --list for a
@@ -34,7 +37,9 @@ subtree (archived for undo, same as the app). `search` looks up a node by an
 approximate/fuzzy title across every list, for when you only have a misheard
 or partial title rather than a slug or id. `tree` prints the node and its
 descendants indented, each with its obligation and plan-step counts; --depth
-limits how many levels below the node are shown (default: all).
+limits how many levels below the node are shown (default: all). `notes` lists a
+node's notes, oldest first; `add-note` appends one (existing notes are never
+changed).
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -53,6 +58,8 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "rename" => rename(&inv, &args),
         "move" => move_node(&inv, &args),
         "delete" => delete(&inv, &args),
+        "notes" => notes(&inv, &args),
+        "add-note" => add_note(&inv, &args),
         other => anyhow::bail!("unknown command `{other}`\n\n{}", USAGE.trim_end()),
     }
 }
@@ -400,6 +407,41 @@ fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         target: Some(id),
     })?;
     Ok(ack(&node, inv.json))
+}
+
+fn notes(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let id = resolve(inv, args.target("a node")?)?;
+    let notes = inv.client().read(move |conn| {
+        NodeRepo::new(conn)
+            .get(id)?
+            .ok_or_else(|| anyhow::anyhow!("node not found"))?;
+        Ok(TaskRepo::new(conn).notes(id)?)
+    })?;
+    if inv.json {
+        return Ok(serde_json::to_string(&notes)?);
+    }
+    if notes.is_empty() {
+        return Ok("(none)".to_string());
+    }
+    Ok(notes
+        .iter()
+        .map(|n| format!("[{}]
+{}", n.id, n.text))
+        .collect::<Vec<_>>()
+        .join("
+
+"))
+}
+
+fn add_note(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let id = resolve(inv, args.target("a node")?)?;
+    let text = args.require("--body")?.to_string();
+    let value = inv.client().interview(InterviewCommand::AddNote { node_id: id, text })?;
+    let note_id = value["id"].as_str().unwrap_or_default().to_string();
+    if inv.json {
+        return Ok(serde_json::json!({ "id": note_id, "status": "ok" }).to_string());
+    }
+    Ok(format!("ok {note_id}"))
 }
 
 fn ack(node: &Node, json: bool) -> String {

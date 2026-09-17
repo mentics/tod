@@ -43,7 +43,7 @@ CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. C
 
 ### `--agent mock` for UI work
 
-For any UI-facing change, prefer driving the real app over guessing: `--agent mock` gives an instant, in-process fake agent (no real API calls), and `--no-focus` lets it run without stealing OS focus while you keep working. `--agent cursor` drives the real Cursor Agent CLI over ACP and is only for rare protocol-level smoke tests.
+For any UI-facing change, prefer driving the real app over guessing: `--agent mock` gives an instant, in-process fake agent (no real API calls), and `--no-focus` keeps every window it opens from stealing OS focus while the user keeps working (the agent control socket implies it, but pass it anyway on any automated launch). `--agent cursor` drives the real Cursor Agent CLI over ACP and is only for rare protocol-level smoke tests.
 
 ### Agent control socket (dev/CI only, not in release builds)
 
@@ -196,7 +196,7 @@ that need it. Three sets of tests hold this together:
 
 ### `tod-core::conversation` / `tod-store::conversation` — the conversation view's agent and log
 
-`tod_store::conversation` (schema v34+) holds `conversations`, their transcript
+`tod_store::conversation` (schema v36+) holds `conversations`, their transcript
 `conversation_turns` (`user` / `agent` / `error` / `rotation`), the
 `conversation_actions` each made, and per-conversation `conversation_flags` (the
 unsure flag belongs to the change set, not the item). An agent writing as
@@ -216,7 +216,7 @@ snapshot, the `Focus` block's loader), and `mock.rs`, which plays the agent for
 `add plan …`, `add node …`, `rename <id>: …`, `delete <id>`,
 `move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>`). The agent reads
 its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
-(schema v35); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
+(schema v37); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
 stay only for the interview.
 
 ### `tod-store::fleet` — agent/worktree orchestration

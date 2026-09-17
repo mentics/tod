@@ -1,7 +1,7 @@
 //! The one place that resolves and renders a node's inherited (ancestor)
 //! obligation context. Every surface that assembles context for a node —
-//! interview snapshots, gate checks, "on entry" hooks, and
-//! the lifecycle panel's implementation sessions — calls
+//! interview snapshots, gate checks, "on entry" hooks, agent chats, and the
+//! lifecycle panel's implementation sessions — calls
 //! [`render_inherited_context`] rather than re-deriving this policy locally.
 //!
 //! The policy (per the user's stated design): an ancestor's scope is settled
@@ -23,8 +23,8 @@ use std::path::Path;
 use tod_store::interview::short_id;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, EXTRA_CONTENT_SUMMARY, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation,
-    PlanStep, ancestor_chain, resolve_obligations,
+    Capability, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, PlanStep, ancestor_chain,
+    resolve_obligations,
 };
 use uuid::Uuid;
 
@@ -33,9 +33,6 @@ pub(crate) fn one_line(text: &str) -> String {
 }
 
 pub(crate) fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {
-    if id.is_nil() {
-        return "global".into();
-    }
     nodes
         .get(id)
         .ok()
@@ -62,32 +59,6 @@ pub(crate) fn write_snapshot_header(
     }
     if let Some(lifecycle) = nodes.get_lifecycle(node_id)? {
         writeln!(out, "Lifecycle: {lifecycle}")?;
-    }
-    Ok(())
-}
-
-/// Each ancestor's purpose, root first, one line apiece. `node_id`'s own
-/// purpose is not included. Writes nothing when no ancestor has one.
-pub(crate) fn write_purpose_chain(
-    out: &mut String,
-    conn: &Connection,
-    nodes: &NodeRepo<'_>,
-    node_id: Uuid,
-) -> Result<()> {
-    let mut lines = String::new();
-    for id in ancestor_chain(conn, node_id)?
-        .into_iter()
-        .filter(|id| *id != node_id)
-    {
-        if let Some(goal) = nodes
-            .get_extra_content(id, EXTRA_CONTENT_GOAL)?
-            .filter(|g| !g.trim().is_empty())
-        {
-            writeln!(lines, "- {}: {}", node_title(nodes, id), one_line(&goal))?;
-        }
-    }
-    if !lines.is_empty() {
-        write!(out, "\n## Purpose (root first)\n\n{lines}")?;
     }
     Ok(())
 }
@@ -191,40 +162,62 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     )
 }
 
-/// Renders `node_id`'s ancestor (and global) obligations. Each ancestor
-/// contributes its title, its generated summary (`EXTRA_CONTENT_SUMMARY`),
-/// and its constraint-kind obligations in full. Its requirements are never
-/// listed: the summary stands in for them, and a deep tree would otherwise
-/// put hundreds into every context. An ancestor still without one gets a pointer to `tod-cli` instead. Global
-/// (no owning node) obligations always show in full; there is nothing to
-/// summarize about them. This never includes `node_id`'s own obligations —
-/// callers show those separately, in full.
+/// Renders what `node_id` inherits: each Spec ancestor, root first, with its
+/// title, its generated summary (`NodeRepo::get_summary`), and its
+/// constraint-kind obligations in full. The summary is the only account of an
+/// ancestor's scope a descendant gets: its details and requirements are never
+/// listed, since a deep tree would otherwise put hundreds of unrelated rows
+/// into every context. An ancestor still without a summary gets a pointer to
+/// `tod-cli` instead. This never includes anything of `node_id`'s
+/// own — callers show that separately.
 pub fn render_inherited_context(
     conn: &Connection,
     nodes: &NodeRepo<'_>,
     node_id: Uuid,
     max_phase: Option<&str>,
 ) -> Result<String> {
-    let inherited: Vec<_> = resolve_obligations(conn, node_id, max_phase)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|r| r.source_node_id != node_id)
-        .collect();
-    if inherited.is_empty() {
-        return Ok(String::new());
-    }
-
-    let mut order: Vec<Uuid> = Vec::new();
     let mut groups: std::collections::HashMap<Uuid, Vec<NodeObligation>> =
         std::collections::HashMap::new();
-    for item in inherited {
-        if !order.contains(&item.source_node_id) {
-            order.push(item.source_node_id);
-        }
+    for item in resolve_obligations(conn, node_id, max_phase).unwrap_or_default() {
         groups
             .entry(item.source_node_id)
             .or_default()
             .push(item.obligation);
+    }
+    let mut ancestors = String::new();
+    for source_id in ancestor_chain(conn, node_id)?
+        .into_iter()
+        .filter(|id| *id != node_id)
+    {
+        let items = groups.remove(&source_id).unwrap_or_default();
+        let summary = nodes.get_summary(source_id).ok().flatten();
+        let has_spec = nodes
+            .list_capabilities(source_id)
+            .is_ok_and(|caps| caps.contains(&Capability::Spec));
+        if !has_spec || (summary.is_none() && items.is_empty()) {
+            continue;
+        }
+        let title = node_title(nodes, source_id);
+        writeln!(ancestors, "\n### From \"{title}\"")?;
+        let constraints: Vec<&NodeObligation> =
+            items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
+        match summary {
+            Some(summary) => writeln!(ancestors, "{}", one_line(&summary.body))?,
+            None if constraints.len() < items.len() => writeln!(
+                ancestors,
+                "(No summary yet. Its requirements, if you need them: `obligations list --node {source_id}`.)"
+            )?,
+            None => {}
+        }
+        if !constraints.is_empty() {
+            ancestors.push_str("\nConstraints:\n");
+            for o in constraints {
+                writeln!(ancestors, "- {}", obligation_line(o))?;
+            }
+        }
+    }
+    if ancestors.is_empty() {
+        return Ok(String::new());
     }
 
     let mut out = String::new();
@@ -235,40 +228,7 @@ pub fn render_inherited_context(
          *this* node; a gap in an ancestor's own scope belongs on that \
          ancestor, not as a question or obligation on this node.\n",
     );
-
-    for source_id in order {
-        let items = groups.remove(&source_id).unwrap_or_default();
-        if source_id.is_nil() {
-            out.push_str("\n### Global\n");
-            for o in &items {
-                writeln!(out, "- {}", obligation_line(o))?;
-            }
-            continue;
-        }
-        let title = node_title(nodes, source_id);
-        writeln!(out, "\n### From \"{title}\"")?;
-        let summary = nodes
-            .get_extra_content(source_id, EXTRA_CONTENT_SUMMARY)
-            .ok()
-            .flatten()
-            .filter(|s| !s.trim().is_empty());
-        let constraints: Vec<&NodeObligation> =
-            items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
-        match summary {
-            Some(summary) => writeln!(out, "{}", one_line(&summary))?,
-            None if constraints.len() < items.len() => writeln!(
-                out,
-                "(No summary yet. Its requirements, if you need them: `obligations list --node {source_id}`.)"
-            )?,
-            None => {}
-        }
-        if !constraints.is_empty() {
-            out.push_str("\nConstraints:\n");
-            for o in constraints {
-                writeln!(out, "- {}", obligation_line(o))?;
-            }
-        }
-    }
+    out.push_str(&ancestors);
     Ok(out)
 }
 
@@ -287,6 +247,43 @@ mod tests {
             phase: "requirements".into(),
             visual_design_path: None,
         }
+    }
+
+    /// A Spec ancestor's summary reaches its descendants whether or not the
+    /// ancestor has obligations; its details never do.
+    #[test]
+    fn an_ancestor_is_inherited_as_its_summary_alone() {
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+        let fx = crate::interview::test_support::fixture();
+        let child = Uuid::new_v4();
+        fx.outline(OutlineMutation::CreateNode {
+            node_id: Some(child),
+            list_id: fx.fleet.list_outline_lists().unwrap()[0].id,
+            parent_id: Some(fx.node),
+            anchor_id: None,
+            position: CreatePosition::Child,
+            title: "Child".into(),
+        });
+        let set = |content_type: &str, body: &str| {
+            fx.outline(OutlineMutation::SetExtraContent {
+                node_id: fx.node,
+                content_type: content_type.into(),
+                body: body.into(),
+            })
+        };
+        let inherited = || {
+            fx.fleet
+                .read(|conn| render_inherited_context(conn, &NodeRepo::new(conn), child, None))
+                .unwrap()
+        };
+        set("details", "Long freeform account of the parent.");
+        assert_eq!(inherited(), "", "details alone are not inherited");
+
+        set("summary", "Covers the parent.");
+        let text = inherited();
+        assert!(text.contains("### From \"Interview node\""), "{text}");
+        assert!(text.contains("Covers the parent."), "{text}");
+        assert!(!text.contains("Long freeform"), "{text}");
     }
 
     fn render(items: &[NodeObligation]) -> String {

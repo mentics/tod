@@ -26,7 +26,7 @@ use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
 };
-use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_GOAL, OutlineMutation};
+use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
     parse_platform, platform_storage, resolve_linear_api_key,
@@ -35,7 +35,6 @@ use tod_store::{
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
 const MAX_TAGS: usize = 10;
-const MULTI_LINE_ROWS: f32 = 4.;
 const DETAILS_ROWS: f32 = 6.;
 /// Max visible height of the notes list, in equivalent text lines, before it scrolls.
 const NOTES_MAX_LINES: f32 = 16.;
@@ -61,7 +60,6 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Tags => "task-edit-field-tags",
         TaskEditField::Repo => "task-edit-field-repo",
         TaskEditField::Branch => "task-edit-field-branch",
-        TaskEditField::Purpose => "task-edit-field-purpose",
         TaskEditField::Details => "task-edit-field-details",
         TaskEditField::Obligations => "task-edit-field-obligations",
         TaskEditField::AgentPlatform => "task-edit-field-agent-platform",
@@ -100,7 +98,6 @@ enum TaskEditField {
     Tags,
     Repo,
     Branch,
-    Purpose,
     Details,
     Obligations,
     /// Agent capability selects — Enter / click cycles through the catalog.
@@ -159,7 +156,6 @@ pub struct TaskEditView {
     github_pr_input: Entity<InputState>,
     repo_input: Entity<InputState>,
     branch_input: Entity<InputState>,
-    purpose_input: Entity<TextareaState>,
     details_input: Entity<TextareaState>,
     tag_draft_input: Entity<InputState>,
     note_edit_input: Entity<TextareaState>,
@@ -170,9 +166,10 @@ pub struct TaskEditView {
     loaded_repo: String,
     loaded_branch: String,
     loaded_lifecycle: String,
-    loaded_purpose: String,
     loaded_details: String,
-    loaded_summary: String,
+    loaded_summary: Option<NodeSummary>,
+    /// The store changed; reload what other writers (agents) may have touched.
+    pending_live_refresh: bool,
     notes: Vec<NoteItem>,
     details_collapsed: bool,
     notes_collapsed: bool,
@@ -211,7 +208,6 @@ pub struct TaskEditView {
     _github_subscription: Subscription,
     _repo_subscription: Subscription,
     _branch_subscription: Subscription,
-    _purpose_subscription: Subscription,
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
     _note_edit_subscription: Subscription,
@@ -238,11 +234,6 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · main"));
         let note_edit_input =
             cx.new(|cx| TextareaState::new(window, cx).rows(2).placeholder("Note…"));
-        let purpose_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(4)
-                .placeholder("Enter to edit · Goal, context, or problem statement…")
-        });
         let details_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(6)
@@ -256,6 +247,30 @@ impl TaskEditView {
                 .placeholder("Enter to edit · Configuration JSON…")
         });
         let body_scroll_handle = ScrollHandle::new();
+
+        let poll_entity = cx.weak_entity();
+        let fleet_for_poll = fleet.clone();
+        cx.spawn(async move |_, cx| {
+            let mut fleet_rx = fleet_for_poll.subscribe_changes();
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let mut changed = false;
+                while fleet_rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                if changed {
+                    let Ok(()) = poll_entity.update(cx, |this, cx| {
+                        this.pending_live_refresh = true;
+                        cx.notify();
+                    }) else {
+                        break;
+                    };
+                }
+            }
+        })
+        .detach();
         let scroll_anchor = ScrollAnchor::for_handle(body_scroll_handle.clone());
 
         let _title_subscription = cx.subscribe(&title_input, |this, _, event, cx| {
@@ -288,11 +303,6 @@ impl TaskEditView {
                 this.commit_note_edit(cx);
             }
         });
-        let _purpose_subscription = cx.subscribe(&purpose_input, |this, _, event, cx| {
-            if matches!(event, InputEvent::Blur) {
-                this.persist_purpose(cx);
-            }
-        });
         let _details_subscription = cx.subscribe(&details_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur) {
                 this.persist_details(cx);
@@ -320,7 +330,6 @@ impl TaskEditView {
             github_pr_input,
             repo_input,
             branch_input,
-            purpose_input,
             details_input,
             tag_draft_input,
             note_edit_input,
@@ -344,9 +353,9 @@ impl TaskEditView {
             loaded_repo: String::new(),
             loaded_branch: String::new(),
             loaded_lifecycle: String::new(),
-            loaded_purpose: String::new(),
             loaded_details: String::new(),
-            loaded_summary: String::new(),
+            loaded_summary: None,
+            pending_live_refresh: false,
             notes: Vec::new(),
             details_collapsed: false,
             notes_collapsed: false,
@@ -371,7 +380,6 @@ impl TaskEditView {
             _github_subscription,
             _repo_subscription,
             _branch_subscription,
-            _purpose_subscription,
             _details_subscription,
             _tag_draft_subscription,
             _note_edit_subscription,
@@ -464,7 +472,6 @@ impl TaskEditView {
             stops.push(TaskEditField::Tags);
         }
         if self.capability_enabled(Capability::Spec) {
-            stops.push(TaskEditField::Purpose);
             stops.push(TaskEditField::Obligations);
         }
         for cap in Capability::ALL {
@@ -536,7 +543,6 @@ impl TaskEditView {
             TaskEditField::Tags => self.tag_draft_input.clone().into(),
             TaskEditField::Repo => self.repo_input.clone().into(),
             TaskEditField::Branch => self.branch_input.clone().into(),
-            TaskEditField::Purpose => self.purpose_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::Obligations
             | TaskEditField::AgentPlatform
@@ -636,14 +642,13 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, AnyInputState); 8] = [
+        let inputs: [(TaskEditField, AnyInputState); 7] = [
             (TaskEditField::Title, self.title_input.clone().into()),
             (TaskEditField::LinearLink, self.linear_input.clone().into()),
             (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
             (TaskEditField::Tags, self.tag_draft_input.clone().into()),
             (TaskEditField::Repo, self.repo_input.clone().into()),
             (TaskEditField::Branch, self.branch_input.clone().into()),
-            (TaskEditField::Purpose, self.purpose_input.clone().into()),
             (TaskEditField::Details, self.details_input.clone().into()),
         ];
         for (field, input) in inputs {
@@ -655,14 +660,13 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, AnyInputState); 8] = [
+        let inputs: [(TaskEditField, AnyInputState); 7] = [
             (TaskEditField::Title, self.title_input.clone().into()),
             (TaskEditField::LinearLink, self.linear_input.clone().into()),
             (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
             (TaskEditField::Tags, self.tag_draft_input.clone().into()),
             (TaskEditField::Repo, self.repo_input.clone().into()),
             (TaskEditField::Branch, self.branch_input.clone().into()),
-            (TaskEditField::Purpose, self.purpose_input.clone().into()),
             (TaskEditField::Details, self.details_input.clone().into()),
         ];
         for (field, input) in inputs {
@@ -713,6 +717,47 @@ impl TaskEditView {
                 input.set_value("", window, cx);
             });
         }
+        if std::mem::take(&mut self.pending_live_refresh) {
+            self.live_refresh(window, cx);
+        }
+    }
+
+    /// Pick up what agents write while the panel is open: the summary, the
+    /// obligation counts, and the details unless the user is editing them.
+    fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(task_id), Some(node_id)) = (self.task_id(), self.node_uuid()) else {
+            return;
+        };
+        let _ = self.fleet.reload_if_stale();
+        self.load_summary();
+        self.load_obligation_counts(&task_id);
+        if self.editing_note_id.is_none()
+            && let Ok(Some(task)) = self.fleet.get_node(&task_id)
+        {
+            self.notes = task.notes;
+        }
+        let unedited = !self.field_editing(TaskEditField::Details)
+            && input_text(&self.details_input, cx) == self.loaded_details;
+        if unedited {
+            let details = self
+                .fleet
+                .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            if details != self.loaded_details {
+                self.loaded_details = details.clone();
+                self.details_input.update(cx, |input, cx| {
+                    input.set_value(details, window, cx);
+                });
+            }
+        }
+    }
+
+    fn load_summary(&mut self) {
+        self.loaded_summary = self
+            .node_uuid()
+            .and_then(|node_id| self.fleet.get_summary(node_id).ok().flatten());
     }
 
     fn load_task(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -743,16 +788,6 @@ impl TaskEditView {
         let branch = self.loaded_branch.clone();
         self.notes = task.notes.clone();
         self.editing_note_id = None;
-        let purpose = self
-            .node_uuid()
-            .and_then(|node_id| {
-                self.fleet
-                    .get_extra_content(node_id, EXTRA_CONTENT_GOAL)
-                    .ok()
-                    .flatten()
-            })
-            .unwrap_or_default();
-        self.loaded_purpose = purpose.clone();
         let details = self
             .node_uuid()
             .and_then(|node_id| {
@@ -763,15 +798,7 @@ impl TaskEditView {
             })
             .unwrap_or_default();
         self.loaded_details = details.clone();
-        self.loaded_summary = self
-            .node_uuid()
-            .and_then(|node_id| {
-                self.fleet
-                    .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_SUMMARY)
-                    .ok()
-                    .flatten()
-            })
-            .unwrap_or_default();
+        self.load_summary();
 
         self.title_input.update(cx, |input, cx| {
             input.set_value(task.title, window, cx);
@@ -787,9 +814,6 @@ impl TaskEditView {
         });
         self.branch_input.update(cx, |input, cx| {
             input.set_value(branch, window, cx);
-        });
-        self.purpose_input.update(cx, |input, cx| {
-            input.set_value(purpose, window, cx);
         });
         self.details_input.update(cx, |input, cx| {
             input.set_value(details, window, cx);
@@ -1407,7 +1431,7 @@ impl TaskEditView {
                 linked_issues: vec![ticket.clone()],
             });
             self.pending_toast = Some(
-                "Linear API key not configured — linked ticket only; purpose not imported".into(),
+                "Linear API key not configured — linked ticket only; description not imported".into(),
             );
             cx.notify();
             return;
@@ -1468,8 +1492,8 @@ impl TaskEditView {
                         Some(format!("Failed to import {}: {err}", pending.ticket));
                 } else {
                     if let Some(description) = issue.description {
-                        self.loaded_purpose = description.clone();
-                        self.purpose_input.update(cx, |input, cx| {
+                        self.loaded_details = description.clone();
+                        self.details_input.update(cx, |input, cx| {
                             input.set_value(description, window, cx);
                         });
                     }
@@ -1664,32 +1688,6 @@ impl TaskEditView {
         self.notes.retain(|n| n.id != id);
         self.persist_notes(cx);
         cx.notify();
-    }
-
-    fn persist_purpose(&mut self, cx: &mut Context<Self>) {
-        let Some(node_id) = self.node_uuid() else {
-            return;
-        };
-        if !self.capability_enabled(Capability::Spec) {
-            return;
-        }
-        let value = input_text(&self.purpose_input, cx);
-        if value == self.loaded_purpose {
-            return;
-        }
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::SetExtraContent {
-                node_id,
-                content_type: EXTRA_CONTENT_GOAL.to_string(),
-                body: value.clone(),
-            })
-        {
-            self.pending_toast = Some(format!("Failed to save purpose: {err}"));
-            cx.notify();
-            return;
-        }
-        self.loaded_purpose = value;
     }
 
     fn persist_details(&mut self, cx: &mut Context<Self>) {
@@ -2433,6 +2431,38 @@ impl TaskEditView {
             .into_any_element()
     }
 
+    /// The Spec summary, read-only: what descendants inherit of this node.
+    /// Agents write it from the details and obligations.
+    fn render_summary(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = match &self.loaded_summary {
+            Some(summary) if summary.stale => "Summary · out of date",
+            _ => "Summary",
+        };
+        v_flex()
+            .gap_1()
+            .w_full()
+            .child(Self::render_field_label(label, cx))
+            .child(match &self.loaded_summary {
+                Some(summary) => selectable_markdown(
+                    "task-edit-summary",
+                    summary.body.clone(),
+                    window,
+                    cx,
+                )
+                .into_any_element(),
+                None => div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("None yet — an agent writes it from the details and obligations when a child node needs it.")
+                    .into_any_element(),
+            })
+    }
+
     fn render_spec_section(
         &self,
         cap_index: usize,
@@ -2454,39 +2484,7 @@ impl TaskEditView {
                     .gap_2()
                     .px_3()
                     .pb_3()
-                    .child(
-                        self.apply_focus_scroll_anchor(
-                            TaskEditField::Purpose,
-                            v_flex()
-                                .id(field_anchor_id(TaskEditField::Purpose))
-                                .gap_1()
-                                .w_full()
-                                .child(Self::render_field_label("Purpose", cx))
-                                .child(self.render_nav_input(
-                                    TaskEditField::Purpose,
-                                    self.purpose_input.clone(),
-                                    Some(MULTI_LINE_ROWS),
-                                    window,
-                                    cx,
-                                )),
-                        ),
-                    )
-                    .children(if self.loaded_summary.trim().is_empty() {
-                        None
-                    } else {
-                        Some(
-                            v_flex()
-                                .gap_1()
-                                .w_full()
-                                .child(Self::render_field_label("Generated summary", cx))
-                                .child(selectable_markdown(
-                                    "task-edit-summary",
-                                    self.loaded_summary.clone(),
-                                    window,
-                                    cx,
-                                )),
-                        )
-                    })
+                    .child(self.render_summary(muted, window, cx))
                     .child(
                         self.apply_focus_scroll_anchor(
                             TaskEditField::Obligations,

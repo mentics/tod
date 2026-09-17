@@ -4,14 +4,14 @@
 
 ## On entry
 
-1. Read the node's lifecycle state, resolved obligations (including inherited), and goal.
+1. Read the node's lifecycle state, resolved obligations (including inherited), and details.
 2. If obligations already satisfy the gate and the human has directed design → verify preconditions and proceed to exit.
 
 ## Responsibilities
 
 ### Capture
 
-The user captures what they want in the app's **conversation** view: the conversation agent turns each piece of direction into the node's goal and requirements-phase obligations, and flags what it is unsure of in the conversation's change set. This session does not run sequential Q&A.
+The user captures what they want in the app's **conversation** view: the conversation agent turns each piece of direction into requirements-phase obligations (and the node's details, when it has none), and flags what it is unsure of in the conversation's change set. This session does not run sequential Q&A.
 
 - Obligations are in effect as soon as they are written. Never ask the user to confirm obligations.
 - **Inherit, do not duplicate** — nodes inherit ancestor constraints automatically. Record only node-specific obligations and exceptions. Never copy or paraphrase inherited obligations at this node.

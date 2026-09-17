@@ -79,8 +79,8 @@ pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
-        DynamicBlock::PurposeChain,
         DynamicBlock::Node,
+        DynamicBlock::AncestorContext,
         DynamicBlock::SelectedObligation { fallback: "" },
     ],
 };
@@ -134,7 +134,6 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
     ],
     blocks: &[
         DynamicBlock::DataRoot,
-        DynamicBlock::PurposeChain,
         DynamicBlock::Node,
         DynamicBlock::NodeProcessFields,
         DynamicBlock::NodeObligations {

@@ -14,7 +14,7 @@ pub mod tree;
 pub use gate::GateRepo;
 pub use generator::{GeneratorConfig, GeneratorRepo, ManagedNodeLink};
 pub use list::ListRepo;
-pub use node::NodeRepo;
+pub use node::{NodeRepo, NodeSummary};
 pub use obligations::ObligationRepo;
 pub use outline::OutlineRepo;
 pub use plan_steps::PlanStepRepo;

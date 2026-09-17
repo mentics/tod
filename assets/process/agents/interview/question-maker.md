@@ -88,7 +88,7 @@ Attach a proposal whenever you can already write the change. It folds the decisi
 | `add` | `kind`, `text`, optional `section`, optional `node` | Adds an obligation — to an ancestor when `node` is given |
 | `update` | `id`, `text`, optional `section` | Rewrites an obligation |
 | `delete` | `id` | Removes an obligation |
-| `content` | `type: goal`, `text`, optional `append: true` | Sets or appends to node content |
+| `content` | `type: details`, `text`, optional `append: true` | Sets or appends to the node's details |
 
 Add `replaces: [<id>, …]` to any op to delete those obligations as part of the same accept. Use it whenever the new text supersedes something, so accepting never leaves a contradiction behind.
 

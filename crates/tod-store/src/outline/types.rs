@@ -108,20 +108,20 @@ impl Capability {
     }
 }
 
-/// `node_extra_content.content_type` value for the node's purpose / goal statement.
-pub const EXTRA_CONTENT_GOAL: &str = "goal";
-
-/// `node_extra_content.content_type` value for the node's imported/freeform details.
+/// `node_extra_content.content_type` value for the node's freeform details:
+/// what the node is, written by the user or an agent (or imported from a
+/// ticket). Any node may have them; the summary is generated from them.
 pub const EXTRA_CONTENT_DETAILS: &str = "details";
 
-/// `node_extra_content.content_type` value for the node's generated summary.
-/// Ancestor context shows this plus constraints in place of the ancestor's
-/// requirements. The state docs regenerate it on entering `design` and
-/// `planning`.
+/// `node_extra_content.content_type` value for the Spec node's generated
+/// summary, written by an agent from the node's details and obligations. It is
+/// the one thing about an ancestor (besides its constraints) that descendants
+/// inherit. Changing the details or obligations marks it stale
+/// (`node_extra_content.stale`); the state docs regenerate it on entering
+/// `design` and `planning`.
 pub const EXTRA_CONTENT_SUMMARY: &str = "summary";
 
-pub const EXTRA_CONTENT_TYPES: [&str; 6] =
-    ["goal", "design", "plan", "notes", "details", "summary"];
+pub const EXTRA_CONTENT_TYPES: [&str; 5] = ["design", "plan", "notes", "details", "summary"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineList {

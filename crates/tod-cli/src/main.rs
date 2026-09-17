@@ -36,7 +36,7 @@ GLOBAL OPTIONS:
 NOUNS:
     node                   Outline nodes: create, inspect, search, move, delete
     obligations            Requirements and constraints attached to a node
-    content                A node's goal, design, and notes
+    content                A node's details, design, plan, and summary
     plan                   Structured, dependency-graph plan steps for a node
     questions              Interview questions for a node
     memory                 Interview memory notes for a node
@@ -228,6 +228,39 @@ mod tests {
         assert!(first_line.contains(&login.to_string()), "{results}");
         assert!(first_line.contains("Reusable Login Component"), "{results}");
         assert!(!results.contains(&node.to_string()), "{results}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn node_notes_append_without_touching_existing_ones() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        assert_eq!(cli(&root, &["node", "notes", &node]).unwrap(), "(none)");
+
+        let first = cli(&root, &["node", "add-note", &node, "--body", "First."]).unwrap();
+        let first = first.strip_prefix("ok ").expect("one-line ack").to_string();
+        cli(&root, &["node", "add-note", &node, "--body", "Second."]).unwrap();
+        let err = cli(&root, &["node", "add-note", &node, "--body", "  "]).unwrap_err();
+        assert!(err.to_string().contains("required"), "{err}");
+
+        let listed = cli(&root, &["node", "notes", &node]).unwrap();
+        assert!(listed.starts_with(&format!("[{first}]
+First.
+
+[")), "{listed}");
+        assert!(listed.ends_with("]
+Second."), "{listed}");
+
+        let fleet = FleetStore::open(&root).unwrap();
+        let notes = fleet
+            .read(|conn| {
+                Ok(tod_store::fleet::repos::task::TaskRepo::new(conn)
+                    .notes(node.parse().unwrap())?)
+            })
+            .unwrap();
+        assert_eq!(notes.len(), 2);
+        drop(fleet);
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -5,7 +5,7 @@
 ## On entry
 
 1. Read lifecycle state, obligations (including design-phase, if any), existing plan steps (`tod-cli plan list`), open parked interview memory, and the interview history.
-2. Regenerate the node's summary from its now-settled design (overwriting the requirements-only version written on entering `design`): `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append).
+2. Regenerate the node's summary from its details and now-settled design (overwriting the requirements-only version written on entering `design`): `tod-cli content set --node <UUID> --type summary --body <TEXT>` (overwrite, not append).
 3. Draft the plan yourself, directly with `tod-cli plan` (see **Plan steps** below) — before considering whether to open an interview. Most of a plan follows mechanically from settled design obligations; generate everything you can determine on your own right now, on this transition, rather than leaving it for interview turns to build up piecemeal.
 4. If plan steps exist and cover everything you can determine, and gate criteria pass → verify conformance and traceability, then proceed to exit.
 

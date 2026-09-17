@@ -126,6 +126,12 @@ pub enum InterviewCommand {
         target: Option<Uuid>,
     },
 
+    /// Append a note to a node's notes list.
+    AddNote {
+        node_id: Uuid,
+        text: String,
+    },
+
     // ── Conversation ────────────────────────────────────────────────────
     /// Start a conversation about `focus` with a caller-chosen id.
     CreateConversation {
@@ -765,6 +771,14 @@ pub fn execute(
             )?;
             Ok(serde_json::to_value(outcome)?)
         }
+        InterviewCommand::AddNote { node_id, text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                bail!("note text is required");
+            }
+            let note = crate::fleet::repos::task::TaskRepo::new(conn).append_note(*node_id, text)?;
+            Ok(json!({ "id": note.id.to_string() }))
+        }
     }
 }
 
@@ -871,8 +885,8 @@ fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) ->
         }
         ProposalOp::Content => {
             let ty = p.content_type.as_deref().unwrap_or_default();
-            if !["goal", "design", "plan"].contains(&ty) {
-                bail!("proposal content needs type: goal|design|plan");
+            if !["details", "design", "plan"].contains(&ty) {
+                bail!("proposal content needs type: details|design|plan");
             }
             if !has_text {
                 bail!("proposal content needs text");

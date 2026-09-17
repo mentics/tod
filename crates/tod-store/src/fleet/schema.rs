@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 35;
+pub const CURRENT_USER_VERSION: i32 = 37;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -91,6 +91,14 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         anyhow::bail!(
             "fleet database user_version {version} is newer than supported {CURRENT_USER_VERSION}"
         );
+    }
+    let version = rewind_pre_merge_conversation_store(conn, version)?;
+    if (1..34).contains(&version) {
+        // v34's staleness triggers write to `node_extra_content`, which older
+        // migrations rebuild. A real store below v34 has none; this clears them
+        // off a store whose `user_version` was wound back to replay those
+        // migrations (as tests do). `migrate_v33_to_v34` recreates them.
+        conn.execute_batch(SUMMARY_STALE_TRIGGER_DROPS)?;
     }
     if version < 1 {
         bootstrap_v1(conn)?;
@@ -266,12 +274,42 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v34_to_v35(conn)?;
         conn.pragma_update(None, "user_version", 35)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 36 {
+        migrate_v35_to_v36(conn)?;
+        conn.pragma_update(None, "user_version", 36)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 37 {
+        migrate_v36_to_v37(conn)?;
+        conn.pragma_update(None, "user_version", 37)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
     Ok(())
+}
+
+/// Before the conversation view was merged with main, its branch numbered its
+/// own migrations v34 (conversation tables) and v35 (drop drafting and the
+/// obligation marks), the numbers main used for the summary rework and the
+/// global-obligation drop. A store written by that branch has `conversations`
+/// but not main's `node_extra_content.stale`; wind it back to v33 so main's v34
+/// and v35 run, then the (idempotent) v36 and v37 again.
+fn rewind_pre_merge_conversation_store(conn: &Connection, version: i32) -> Result<i32> {
+    if !(34..=35).contains(&version) {
+        return Ok(version);
+    }
+    let has = |sql: &str| -> Result<bool> { Ok(conn.prepare(sql)?.exists([])?) };
+    let branch_store = has("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'")?
+        && !has("SELECT 1 FROM pragma_table_info('node_extra_content') WHERE name = 'stale'")?;
+    if !branch_store {
+        return Ok(version);
+    }
+    conn.pragma_update(None, "user_version", 33)?;
+    Ok(33)
 }
 
 /// Remove action configs: their configuration moves onto node capabilities and
@@ -312,8 +350,132 @@ fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Drop `global_obligations`: every obligation lives on a node in the outline.
+/// The table only ever held copies of the repo's shared constraint docs,
+/// written by the `doc/process` bootstrap import.
+fn migrate_v34_to_v35(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS global_obligations;")?;
+    Ok(())
+}
+
+const SUMMARY_STALE_TRIGGER_DROPS: &str = "
+    DROP TRIGGER IF EXISTS trg_summary_stale_details_insert;
+    DROP TRIGGER IF EXISTS trg_summary_stale_details_update;
+    DROP TRIGGER IF EXISTS trg_summary_stale_obligation_insert;
+    DROP TRIGGER IF EXISTS trg_summary_stale_obligation_update;
+    DROP TRIGGER IF EXISTS trg_summary_stale_obligation_delete;
+";
+
+/// A node is described by its `details` and, with Spec, by the `summary`
+/// descendants inherit; the separate `goal` statement goes.
+///
+/// - Each `goal` merges into the node's `details`: it becomes the details when
+///   there are none, and otherwise leads them (unless they already contain it).
+/// - `node_extra_content` is rebuilt without 'goal' and gains `stale`, set on
+///   a node's summary whenever its details or obligations change and cleared
+///   when the summary is rewritten (`NodeRepo::set_extra_content`). Triggers
+///   keep it, so every write path marks it.
+/// - The rebuild drops the change-log triggers; they are recreated as
+///   `migrate_v27_to_v28` defined them.
+fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "
+        UPDATE node_extra_content AS d
+        SET body = CASE
+                WHEN trim(d.body) = '' THEN g.body
+                ELSE trim(g.body) || char(10) || char(10) || d.body
+            END,
+            updated_at = {NOW}
+        FROM node_extra_content AS g
+        WHERE d.content_type = 'details'
+            AND g.content_type = 'goal'
+            AND g.node_id = d.node_id
+            AND trim(g.body) != ''
+            AND instr(d.body, trim(g.body)) = 0;
+        INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+        SELECT randomblob(16), g.node_id, 'details', g.body, {NOW}
+        FROM node_extra_content AS g
+        WHERE g.content_type = 'goal'
+            AND trim(g.body) != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM node_extra_content AS d
+                WHERE d.node_id = g.node_id AND d.content_type = 'details'
+            );
+
+        CREATE TABLE node_extra_content_v34 (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL CHECK (content_type IN ('design', 'plan', 'notes', 'details', 'summary')),
+            body         TEXT NOT NULL DEFAULT '',
+            updated_at   INTEGER NOT NULL,
+            stale        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (node_id, content_type)
+        );
+        INSERT INTO node_extra_content_v34 (id, node_id, content_type, body, updated_at)
+        SELECT id, node_id, content_type, body, updated_at FROM node_extra_content
+        WHERE content_type != 'goal';
+        DROP TABLE node_extra_content;
+        ALTER TABLE node_extra_content_v34 RENAME TO node_extra_content;
+
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_insert AFTER INSERT ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_update AFTER UPDATE ON node_extra_content
+        WHEN OLD.body IS NOT NEW.body BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (NEW.node_id, 'content', NEW.id, 'update',
+                CASE WHEN length(NEW.body) > length(OLD.body)
+                        AND substr(NEW.body, 1, length(OLD.body)) = OLD.body
+                    THEN 'append:' || length(CAST(OLD.body AS BLOB)) ELSE 'body' END,
+                {ACTOR}, {NOW});
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_ic_content_delete AFTER DELETE ON node_extra_content BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
+            VALUES (OLD.node_id, 'content', OLD.id, 'delete', NULL, {ACTOR}, {NOW});
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_summary_stale_details_insert
+        AFTER INSERT ON node_extra_content WHEN NEW.content_type = 'details' BEGIN
+            UPDATE node_extra_content SET stale = 1
+            WHERE node_id = NEW.node_id AND content_type = 'summary';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_summary_stale_details_update
+        AFTER UPDATE ON node_extra_content
+        WHEN NEW.content_type = 'details' AND OLD.body IS NOT NEW.body BEGIN
+            UPDATE node_extra_content SET stale = 1
+            WHERE node_id = NEW.node_id AND content_type = 'summary';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_summary_stale_obligation_insert
+        AFTER INSERT ON node_obligations BEGIN
+            UPDATE node_extra_content SET stale = 1
+            WHERE node_id = NEW.node_id AND content_type = 'summary';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_summary_stale_obligation_update
+        AFTER UPDATE ON node_obligations
+        WHEN OLD.node_id IS NOT NEW.node_id OR OLD.body IS NOT NEW.body
+            OR OLD.kind IS NOT NEW.kind OR OLD.section IS NOT NEW.section
+            OR OLD.phase IS NOT NEW.phase
+        BEGIN
+            UPDATE node_extra_content SET stale = 1
+            WHERE node_id IN (OLD.node_id, NEW.node_id) AND content_type = 'summary';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_summary_stale_obligation_delete
+        AFTER DELETE ON node_obligations BEGIN
+            UPDATE node_extra_content SET stale = 1
+            WHERE node_id = OLD.node_id AND content_type = 'summary';
+        END;
+        "
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// The obligation columns the drafting-era marks used (provenance and
-/// attention). `migrate_v34_to_v35` drops them; unsure flags now live per
+/// attention). `migrate_v36_to_v37` drops them; unsure flags now live per
 /// conversation in `conversation_flags`.
 const OBLIGATION_MARK_COLUMNS: [&str; 3] = ["attention_why", "attention", "provenance"];
 
@@ -329,7 +491,7 @@ const OBLIGATION_MARK_COLUMNS: [&str; 3] = ["attention_why", "attention", "prove
 ///   (`ALTER TABLE .. DROP COLUMN` refuses while any trigger names them).
 ///
 /// Every step checks before it acts, so running it twice is harmless.
-fn migrate_v34_to_v35(conn: &Connection) -> Result<()> {
+fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
     const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
     const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
     const PRIOR: &str = "json_object(
@@ -397,7 +559,7 @@ fn migrate_v34_to_v35(conn: &Connection) -> Result<()> {
 /// Conversation log: conversations (each about one focus), their turns, the
 /// outline actions made during them (with enough state to reverse each one),
 /// and the per-conversation unsure flags. See `crate::conversation`.
-fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
+fn migrate_v35_to_v36(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS conversations (
@@ -927,7 +1089,7 @@ fn migrate_v26_to_v27(conn: &Connection) -> Result<()> {
     let has_prior: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('interview_changes') WHERE name = 'prior'")?
         .exists([])?;
-    // The mark columns were dropped at v35; a replay against a newer store
+    // The mark columns were dropped at v37; a replay against a newer store
     // must not name them, or every obligation edit would fail.
     let has_marks: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('node_obligations') WHERE name = 'provenance'")?
@@ -2543,7 +2705,7 @@ pub fn install_v1_schema_for_test(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::params;
+    use rusqlite::{OptionalExtension, params};
     use std::fs;
 
     fn temp_db() -> (std::path::PathBuf, Connection) {
@@ -2798,6 +2960,23 @@ mod tests {
             .unwrap();
         assert_eq!(title, "A Node");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrate_v34_to_v35_drops_global_obligations() {
+        let (_dir, conn) = temp_db();
+        conn.execute_batch(
+            "CREATE TABLE global_obligations (id BLOB PRIMARY KEY, body TEXT);
+             INSERT INTO global_obligations VALUES (x'00', 'Follow a doc');",
+        )
+        .unwrap();
+        migrate_v34_to_v35(&conn).unwrap();
+        let exists = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'global_obligations'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!exists);
     }
 
     #[test]
@@ -3183,6 +3362,181 @@ mod tests {
         assert_eq!(version, CURRENT_USER_VERSION);
         let _ = fs::remove_dir_all(dir);
     }
+
+    fn insert_node(conn: &Connection, slug: &str) -> uuid::Uuid {
+        let now = chrono::Utc::now().timestamp_millis();
+        let node = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at) VALUES (?1, ?2, ?2, ?3, ?3)",
+            params![node.as_bytes().as_slice(), slug, now],
+        )
+        .unwrap();
+        node
+    }
+
+    fn content(conn: &Connection, node: uuid::Uuid, ty: &str) -> Option<(String, i64)> {
+        conn.query_row(
+            "SELECT body, stale FROM node_extra_content WHERE node_id = ?1 AND content_type = ?2",
+            params![node.as_bytes().as_slice(), ty],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    #[test]
+    fn v34_merges_goals_into_details_and_drops_them() {
+        let (dir, conn) = temp_db();
+        let only_goal = insert_node(&conn, "only-goal");
+        let both = insert_node(&conn, "both");
+        let repeated = insert_node(&conn, "repeated");
+        // Back to the v33 table, which still allowed 'goal'.
+        conn.execute_batch(
+            "
+            DROP TABLE node_extra_content;
+            CREATE TABLE node_extra_content (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details', 'summary')),
+                body         TEXT NOT NULL DEFAULT '',
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (node_id, content_type)
+            );
+            PRAGMA user_version = 33;
+            ",
+        )
+        .unwrap();
+        let put = |node: uuid::Uuid, ty: &str, body: &str| {
+            conn.execute(
+                "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
+                params![
+                    uuid::Uuid::new_v4().as_bytes().as_slice(),
+                    node.as_bytes().as_slice(),
+                    ty,
+                    body
+                ],
+            )
+            .unwrap();
+        };
+        put(only_goal, "goal", "Ship it.");
+        put(both, "goal", "Ship it.");
+        put(both, "details", "Ticket text.");
+        put(repeated, "goal", "Ship it.");
+        put(repeated, "details", "We must Ship it. soon");
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(content(&conn, only_goal, "details").unwrap().0, "Ship it.");
+        assert_eq!(
+            content(&conn, both, "details").unwrap().0,
+            "Ship it.\n\nTicket text."
+        );
+        assert_eq!(
+            content(&conn, repeated, "details").unwrap().0,
+            "We must Ship it. soon"
+        );
+        let goals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM node_extra_content WHERE content_type = 'goal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(goals, 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A store the conversation branch wrote before merging main claims v35
+    /// but never ran main's v34: it has `conversations` and a goal-era
+    /// `node_extra_content` without `stale`. It is wound back so main's v34
+    /// still runs.
+    #[test]
+    fn a_pre_merge_conversation_store_still_gets_mains_v34() {
+        let (dir, conn) = temp_db();
+        let node = insert_node(&conn, "n");
+        conn.execute_batch(
+            "
+            DROP TABLE node_extra_content;
+            CREATE TABLE node_extra_content (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details', 'summary')),
+                body         TEXT NOT NULL DEFAULT '',
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (node_id, content_type)
+            );
+            PRAGMA user_version = 35;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+             VALUES (?1, ?2, 'goal', 'Ship it.', 0)",
+            params![
+                uuid::Uuid::new_v4().as_bytes().as_slice(),
+                node.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(content(&conn, node, "details").unwrap().0, "Ship it.");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+        let conversations: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'conversations'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(conversations);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_summary_goes_stale_when_its_details_or_obligations_change() {
+        let (dir, conn) = temp_db();
+        let node = insert_node(&conn, "n");
+        let repo = crate::outline::repos::NodeRepo::new(&conn);
+        let stale = || content(&conn, node, "summary").unwrap().1 == 1;
+
+        repo.set_extra_content(node, "summary", "What N covers.").unwrap();
+        assert!(!stale());
+        repo.set_extra_content(node, "details", "More about N.").unwrap();
+        assert!(stale(), "writing details marks it");
+
+        repo.set_extra_content(node, "summary", "What N covers now.").unwrap();
+        assert!(!stale(), "rewriting the summary clears it");
+        repo.set_extra_content(node, "details", "More about N.").unwrap();
+        assert!(!stale(), "an unchanged body is no change");
+
+        let obligation = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, body, created_at, updated_at)
+             VALUES (?1, ?2, 'requirement', 0, 'Must work.', 0, 0)",
+            params![obligation.as_bytes().as_slice(), node.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(stale(), "adding an obligation marks it");
+
+        repo.set_extra_content(node, "summary", "What N covers now.").unwrap();
+        conn.execute(
+            "UPDATE node_obligations SET updated_at = 5 WHERE id = ?1",
+            params![obligation.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(!stale(), "a timestamp-only update is no change");
+        conn.execute(
+            "DELETE FROM node_obligations WHERE id = ?1",
+            params![obligation.as_bytes().as_slice()],
+        )
+        .unwrap();
+        assert!(stale(), "deleting an obligation marks it");
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -3337,17 +3691,17 @@ mod plan_step_migration_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A v34 store — drafting tables, obligation mark columns, and the
+    /// A v35 store (main before the conversation view) — drafting tables, obligation mark columns, and the
     /// change-log triggers that read them — upgrades with its obligations and
     /// change log intact and nothing left naming the dropped columns.
     #[test]
-    fn v35_upgrade_drops_drafting_and_obligation_marks() {
+    fn v37_upgrade_drops_drafting_and_obligation_marks() {
         use rusqlite::params;
         let (dir, conn) = temp_db();
-        // Rebuild the v34 shape on top of the fresh store.
+        // Rebuild the v35 shape on top of the fresh store.
         migrate_v24_to_v25(&conn).unwrap();
         migrate_v26_to_v27(&conn).unwrap();
-        conn.pragma_update(None, "user_version", 34).unwrap();
+        conn.pragma_update(None, "user_version", 35).unwrap();
         let node_id = uuid::Uuid::new_v4();
         let obligation_id = uuid::Uuid::new_v4();
         let session_id = uuid::Uuid::new_v4();
@@ -3391,13 +3745,13 @@ mod plan_step_migration_tests {
         };
         assert!(
             mark_refs(&conn).len() >= 5,
-            "the v34 fixture should carry the old schema: {:?}",
+            "the v35 fixture should carry the old schema: {:?}",
             mark_refs(&conn)
         );
 
         apply_migrations(&conn).unwrap();
         // Running the step again (as under a renumbered version) is harmless.
-        migrate_v34_to_v35(&conn).unwrap();
+        migrate_v36_to_v37(&conn).unwrap();
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
