@@ -42,21 +42,14 @@ pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedS
                     .shadow_lg()
                     .items_start()
                     .child(
-                        div().flex_1().min_w_0().child(
+                        // Leave the top-right corner clear: the notification
+                        // wrapper draws its own close button there on hover,
+                        // so this banner must not add a second one.
+                        div().flex_1().min_w_0().pr_5().child(
                             selectable_text("error-banner-text", message.clone(), window, cx)
                                 .text_sm()
                                 .text_color(gpui::white()),
                         ),
-                    )
-                    .child(
-                        Button::new("error-banner-dismiss")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .text_color(gpui::white())
-                            .on_click(cx.listener(|note, _, window, cx| {
-                                note.dismiss(window, cx);
-                            })),
                     )
                     .into_any_element()
             }),
