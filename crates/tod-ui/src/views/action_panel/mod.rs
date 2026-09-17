@@ -9,7 +9,6 @@
 use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
-use tod_agent::{EngagementState, SharedEngagementRegistry};
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
@@ -26,15 +25,16 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_agent::{EngagementState, SharedEngagementRegistry};
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, build_fleet_agent_prompt};
 use tod_core::session_name::session_name;
+use tod_store::fleet::repos::agent_run::RUNTIME_STATUS_ACTIVE;
 use tod_store::fleet::repos::shell::ShellSession;
 use tod_store::fleet::terminal::{
     focus_shell_session, focus_terminal_agent_run, open_shell_for_node,
     open_terminal_agent_for_node, prune_stale_shell_sessions, prune_stale_terminal_agent_runs,
     remove_shell_state,
 };
-use tod_store::fleet::repos::agent_run::RUNTIME_STATUS_ACTIVE;
 use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
     code_editors, open_code_editor_for_node, reconnect_identity,
@@ -329,19 +329,24 @@ impl ActionPanelView {
                 match state {
                     AgentRunState::InFlight(_) => {
                         if let Ok(mut registry) = engagement.lock() {
-                            registry
-                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnAgent);
+                            registry.insert(
+                                flight.fleet_run_id.clone(),
+                                EngagementState::WaitingOnAgent,
+                            );
                         }
                     }
                     AgentRunState::NeedsPermission(request) => {
                         if let Ok(mut registry) = engagement.lock() {
-                            registry
-                                .insert(flight.fleet_run_id.clone(), EngagementState::WaitingOnUser);
+                            registry.insert(
+                                flight.fleet_run_id.clone(),
+                                EngagementState::WaitingOnUser,
+                            );
                         }
                         permission_requests.push(request);
                     }
                     AgentRunState::Success(text) => {
-                        if let Some(session_id) = agent.fleet_run_session_id(flight.provider_run_id) {
+                        if let Some(session_id) = agent.fleet_run_session_id(flight.provider_run_id)
+                        {
                             session_ids.push((flight.fleet_run_id.clone(), session_id));
                         }
                         finished.push((idx, flight.clone(), Ok(text.unwrap_or_default())));

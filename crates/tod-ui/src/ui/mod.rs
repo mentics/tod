@@ -8,4 +8,5 @@ pub mod list;
 pub mod pane_nav;
 pub mod panel_split;
 pub mod selectable_text;
+pub mod style;
 pub mod toast;

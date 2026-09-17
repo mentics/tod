@@ -13,14 +13,16 @@ use crate::app::interactive_agent_window::{
 };
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::cli::LaunchOptions;
-use crate::drafting::{DraftingView, DraftingViewEvent};
+use crate::conversation::{ConversationView, ConversationViewEvent};
 use crate::interview::agent::{AgentBackend, AgentPlatform, SharedAgent};
 use crate::interview::settings::{persist_window_geometry, resolve_open_window_bounds};
 use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, SettingsView};
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
+use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::app_nav::{
-    HasAppNav, ShellGoDatabase, ShellGoSettings, ShellGoTasks, register_app_nav_keyboard_bindings,
+    HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
+    register_app_nav_keyboard_bindings,
 };
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
@@ -42,11 +44,11 @@ use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tod_core::drafting::DraftingMode;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
+use tod_store::conversation::Focus;
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
 use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
 use uuid::Uuid;
@@ -63,8 +65,8 @@ const TASKS_DRAWER_MIN: f32 = 280.0;
 enum ShellView {
     Tasks,
     Interview,
-    /// Capture (`proposed`) and the drafting loop (`design`).
-    Drafting,
+    /// The conversation view (Ctrl+J).
+    Conversation,
     Settings,
     Database,
 }
@@ -87,7 +89,9 @@ pub struct Shell {
     /// Every panel shown to the right of the task tree — see `right_drawer`.
     drawer: RightDrawer,
     sessions: Entity<SessionsView>,
-    drafting: Entity<DraftingView>,
+    conversation: Entity<ConversationView>,
+    /// Where the conversation view's Back goes once its own history is empty.
+    view_before_conversation: ShellView,
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
     fleet: Arc<FleetStore>,
@@ -106,9 +110,13 @@ pub struct Shell {
     /// "Open interview" affordance, validated and routed through
     /// `TaskListView::open_interview_for_task` once `window` is available.
     pending_open_interview_for_task: Option<(String, String)>,
-    /// Node whose pre-v3 obligations the drafter should rewrite (from the
-    /// obligations panel), opened in the drafting view once `window` is available.
-    pending_rewrite_pre_v3: Option<Uuid>,
+    /// A conversation to open once `window` is available (panel events have none).
+    pending_open_conversation: Option<Focus>,
+    /// The conversation view asked to return to where the user came from.
+    pending_leave_conversation: bool,
+    /// The conversation's context panel asked to show a node (and maybe an
+    /// obligation) in the Tasks view.
+    pending_go_to_tasks: Option<(Uuid, Option<Uuid>)>,
     pending_open_lifecycle: Option<PendingOpenLifecycle>,
     pending_return_to_tasks: bool,
     /// Drawer changes queued by event handlers, applied in order on render.
@@ -125,8 +133,15 @@ pub struct Shell {
     _visual_design_panel_subscription: Subscription,
     _action_panel_subscription: Subscription,
     _sessions_subscription: Subscription,
-    _drafting_subscription: Subscription,
+    _conversation_subscription: Subscription,
     _settings_subscription: Subscription,
+}
+
+/// Where "open" goes for a node in `lifecycle`: `proposed` and `design` nodes
+/// are talked through in the conversation view, focused on the node; `None`
+/// leaves the node to the interview (`planning`).
+pub(crate) fn spec_conversation_focus(lifecycle: &str, node_id: Uuid) -> Option<Focus> {
+    matches!(lifecycle, "proposed" | "design").then_some(Focus::Node(node_id))
 }
 
 /// Human-readable summary of background work that would be lost if the
@@ -135,7 +150,7 @@ fn collect_running_work(
     fleet: &FleetStore,
     lifecycle_panel: &Entity<LifecyclePanelView>,
     sessions: &Entity<SessionsView>,
-    drafting: &Entity<DraftingView>,
+    conversation: &Entity<ConversationView>,
     cx: &App,
 ) -> Vec<SharedString> {
     let mut items = Vec::new();
@@ -173,7 +188,7 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
-    for item in drafting.read(cx).running_drafting_work() {
+    for item in conversation.read(cx).running_work() {
         items.push(SharedString::from(item));
     }
     items
@@ -185,8 +200,8 @@ impl Shell {
             .update(cx, |list, _| list.app_nav_mut().close());
         self.sessions
             .update(cx, |sessions, cx| sessions.close_app_nav(cx));
-        self.drafting
-            .update(cx, |drafting, _| drafting.close_app_nav());
+        self.conversation
+            .update(cx, |conversation, _| conversation.close_app_nav());
         self.settings
             .update(cx, |settings, _| settings.app_nav_mut().close());
         self.database
@@ -198,6 +213,9 @@ impl Shell {
                 });
             }
             return;
+        }
+        if view == ShellView::Conversation {
+            self.view_before_conversation = self.active_view;
         }
         self.active_view = view;
         match view {
@@ -213,8 +231,8 @@ impl Shell {
                     sessions.focus(window, cx);
                 });
             }
-            ShellView::Drafting => {
-                let focus = self.drafting.read(cx).focus_handle(cx);
+            ShellView::Conversation => {
+                let focus = self.conversation.read(cx).focus_handle(cx);
                 focus.focus(window, cx);
             }
             ShellView::Settings => {
@@ -237,12 +255,13 @@ impl Shell {
         title: String,
         cx: &mut Context<Self>,
     ) {
-        // Capture and design are drafted; planning keeps its interview.
-        self.active_view = if DraftingMode::for_lifecycle(&lifecycle).is_some() {
-            ShellView::Drafting
-        } else {
-            ShellView::Interview
-        };
+        // `proposed` and `design` nodes are talked through in the conversation
+        // view (D12); `planning` keeps its interview.
+        if let Some(focus) = spec_conversation_focus(&lifecycle, node_id) {
+            self.queue_open_conversation(focus, cx);
+            return;
+        }
+        self.active_view = ShellView::Interview;
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,
             node_id,
@@ -250,27 +269,6 @@ impl Shell {
             title,
         });
         cx.notify();
-    }
-
-    fn drain_pending_rewrite_pre_v3(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node_id) = self.pending_rewrite_pre_v3.take() else {
-            return;
-        };
-        let lifecycle = self
-            .fleet
-            .get_task(&node_id.to_string())
-            .ok()
-            .flatten()
-            .map(|t| t.lifecycle)
-            .unwrap_or_default();
-        let proceed = (!lifecycle.is_empty()).then(|| TaskListProceedContext {
-            task_id: node_id.to_string(),
-            lifecycle,
-        });
-        self.active_view = ShellView::Drafting;
-        self.drafting.update(cx, |drafting, cx| {
-            drafting.open(node_id, proceed, Some(false), window, cx);
-        });
     }
 
     fn drain_pending_return_to_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -285,21 +283,6 @@ impl Shell {
         let Some(pending) = self.pending_open_interview.take() else {
             return;
         };
-        if DraftingMode::for_lifecycle(&pending.lifecycle).is_some() {
-            self.drafting.update(cx, |drafting, cx| {
-                drafting.open(
-                    pending.node_id,
-                    Some(TaskListProceedContext {
-                        task_id: pending.task_id,
-                        lifecycle: pending.lifecycle,
-                    }),
-                    None,
-                    window,
-                    cx,
-                );
-            });
-            return;
-        }
         let phase = interview_phase_for_lifecycle(&pending.lifecycle)
             .unwrap_or("task-requirements-interview");
         let phase_label = interview_phase_label(phase);
@@ -336,6 +319,15 @@ impl Shell {
         let Some((task_id, lifecycle)) = self.pending_open_interview_for_task.take() else {
             return;
         };
+        // The lifecycle panel's "open" for `proposed` / `design` needs no
+        // interview workspace: it opens the node's conversation (D12).
+        if let Some(focus) = Uuid::parse_str(&task_id)
+            .ok()
+            .and_then(|node_id| spec_conversation_focus(&lifecycle, node_id))
+        {
+            self.open_conversation(focus, window, cx);
+            return;
+        }
         self.task_list.update(cx, |list, cx| {
             list.open_interview_for_task(&task_id, &lifecycle, window, cx);
         });
@@ -565,107 +557,82 @@ impl Shell {
         }
     }
 
-    /// Open an agent conversation scoped to the obligations panel.
-    ///
-    /// Sessions are deliberately not reused: every click starts a fresh
-    /// conversation whose first message carries the assembled app context.
-    /// Nothing is sent to the agent until the user submits that message.
-    fn open_obligations_agent_chat(
-        &mut self,
-        node_id: uuid::Uuid,
-        obligation_id: Option<uuid::Uuid>,
-        cx: &mut Context<Self>,
-    ) {
-        let context = match self.build_obligations_agent_context(node_id, obligation_id) {
-            Ok(text) => Some(text),
-            Err(err) => {
-                // Context assembly failing should not block the conversation.
-                tracing::warn!(
-                    event = "agent_chat",
-                    action = "context_unavailable",
-                    error = %err,
-                    "opening agent chat without app context"
-                );
-                None
-            }
-        };
+    /// Show the conversation view on `focus`: its latest conversation, or a
+    /// new, unsaved one.
+    fn open_conversation(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_view(ShellView::Conversation, window, cx);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.open(focus, true, window, cx);
+        });
+        cx.notify();
+    }
 
-        if let Err(err) = self._interactive_agent_window.create_and_open_session(
-            &node_id.to_string(),
-            Some("obligations"),
-            context,
-            cx,
-        ) {
-            self.queue_error_toast(err, cx);
+    /// [`Self::open_conversation`] from an event handler, which has no
+    /// `window` and may run while nested entity leases are still on the stack.
+    fn queue_open_conversation(&mut self, focus: Focus, cx: &mut Context<Self>) {
+        self.pending_open_conversation = Some(focus);
+        cx.notify();
+    }
+
+    fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(focus) = self.pending_open_conversation.take() {
+            self.open_conversation(focus, window, cx);
+        }
+        if std::mem::take(&mut self.pending_leave_conversation) {
+            let view = self.view_before_conversation;
+            self.select_view(view, window, cx);
+        }
+        if let Some((node_id, obligation_id)) = self.pending_go_to_tasks.take() {
+            self.go_to_tasks(node_id, obligation_id, window, cx);
         }
     }
 
-    /// Assemble the agent's first message: bundled context docs plus the live
-    /// selection.
-    fn build_obligations_agent_context(
-        &self,
-        node_id: uuid::Uuid,
-        obligation_id: Option<uuid::Uuid>,
-    ) -> anyhow::Result<String> {
-        use tod_core::agent_context::{
-            ContextRequest, NodeSelection, ObligationSelection, build_first_message,
-        };
-        use tod_core::media::MediaPaths;
-
-        let media = MediaPaths::discover()?;
-        let node = self
+    /// Show `node_id` in the Tasks view with its obligations drawer open,
+    /// highlighting `obligation_id` when given. Tasks has no plan drawer, so
+    /// plan-step targets land on the node's obligations too.
+    fn go_to_tasks(
+        &mut self,
+        node_id: Uuid,
+        obligation_id: Option<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let task_id = node_id.to_string();
+        let Some(title) = self
             .fleet
-            .get_node(&node_id.to_string())
+            .get_node(&task_id)
             .ok()
             .flatten()
-            .ok_or_else(|| anyhow::anyhow!("node {node_id} not found"))?;
-        let body = self
-            .fleet
-            .get_extra_content(node_id, tod_store::outline::EXTRA_CONTENT_DETAILS)
-            .ok()
-            .flatten();
-        let obligation = obligation_id.and_then(|id| {
-            self.fleet
-                .list_obligations_for_node(node_id)
-                .ok()?
-                .into_iter()
-                .find(|o| o.id == id)
-                .map(|o| ObligationSelection {
-                    id: o.id,
-                    kind: o.kind,
-                    body: o.body,
-                    visual_design_path: o.visual_design_path,
-                })
-        });
+            .map(|n| n.title)
+        else {
+            return;
+        };
+        self.select_view(ShellView::Tasks, window, cx);
+        self.task_list
+            .update(cx, |list, cx| list.reveal_node(&task_id, window, cx));
+        self.apply_drawer_request(
+            DrawerRequest::OpenObligations { task_id, title },
+            window,
+            cx,
+        );
+        if let Some(id) = obligation_id {
+            self.drawer
+                .obligations
+                .update(cx, |panel, cx| panel.highlight_item(id, window, cx));
+        }
+        cx.notify();
+    }
 
-        let ancestor_context = self
-            .fleet
-            .read(|conn| {
-                tod_core::node_context::render_inherited_context(
-                    conn,
-                    &tod_store::outline::repos::NodeRepo::new(conn),
-                    node_id,
-                    None,
-                )
-            })
-            .unwrap_or_default();
-
-        build_first_message(
-            &media,
-            &ContextRequest {
-                recipe: tod_core::agent_context::OBLIGATIONS_RECIPE,
-                data_root: self.paths.data_root(),
-                node: NodeSelection {
-                    id: node_id,
-                    slug: Some(node.slug.clone()),
-                    title: node.title,
-                    body,
-                    lifecycle: Some(node.lifecycle),
-                },
-                obligation,
-                ancestor_context,
-            },
-        )
+    /// Ctrl+J that no view handled: the task tree's selection, else the
+    /// whole project.
+    fn on_open_agent_chat(
+        &mut self,
+        _: &OpenAgentChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = fallback_focus(self.task_list.read(cx).selected_node_id());
+        self.open_conversation(focus, window, cx);
     }
 
     fn queue_error_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
@@ -811,10 +778,18 @@ impl Shell {
         }
     }
 
+    /// The status bar's message. `status_line` is the Tasks view's own
+    /// (it comes from the task list), so other views show none rather than a
+    /// stale one; the conversation view reports its activity and last action
+    /// in its header. Returning to Tasks shows its message again.
+    fn status_bar_message(&self) -> SharedString {
+        status_bar_message(self.active_view, &self.status_line)
+    }
+
     fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let status = self.status_line.clone();
+        let status = self.status_bar_message();
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -867,13 +842,41 @@ impl Shell {
             )
     }
 
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         TitleBar::new().child(
             h_flex()
                 .w_full()
                 .items_center()
                 .justify_between()
                 .child("tod")
+                .child(div().flex_1())
+                // The shortcut pill sits beside the button, not under it as
+                // `chrome_control_with_shortcut_in_context` puts it: the
+                // title bar has no room below.
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(crate::ui::style::space::INLINE)
+                        .child(
+                            Button::new("title-talk")
+                                .icon(gpui_component::Icon::new(
+                                    gpui_kit_assets::IconName::MessagesSquare,
+                                ))
+                                .label("Talk about the selection")
+                                .ghost()
+                                .compact()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(OpenAgentChat), cx);
+                                }),
+                        )
+                        .children(render_shortcut_pill_in_context(
+                            window,
+                            &OpenAgentChat,
+                            None,
+                            cx,
+                        )),
+                )
                 .when(always_on_top::is_supported(), |bar| {
                     bar.child(
                         Button::new("always-on-top")
@@ -903,7 +906,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending_open_interview(window, cx);
         self.drain_pending_open_interview_for_task(window, cx);
-        self.drain_pending_rewrite_pre_v3(window, cx);
+        self.drain_pending_conversation(window, cx);
         self.drain_pending_return_to_tasks(window, cx);
         self.drain_pending_open_lifecycle(window, cx);
         self.drain_pending_drawer(window, cx);
@@ -917,6 +920,13 @@ impl Render for Shell {
             .relative()
             .on_action(cx.listener(|this, _: &ShellGoTasks, window, cx| {
                 this.select_view(ShellView::Tasks, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShellGoConversation, window, cx| {
+                this.open_conversation(Focus::Project, window, cx);
+            }))
+            .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
+                this.open_conversation(action.focus, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellGoSettings, window, cx| {
                 this.select_view(ShellView::Settings, window, cx);
@@ -933,7 +943,7 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShellUndo, window, cx| {
                 this.undo_last(window, cx);
             }))
-            .child(self.render_title_bar(cx))
+            .child(self.render_title_bar(window, cx))
             .child(self.render_migration_notice(cx))
             .child(
                 div()
@@ -981,7 +991,7 @@ impl Shell {
         match self.active_view {
             ShellView::Tasks => self.render_tasks_split(cx).into_any_element(),
             ShellView::Interview => self.sessions.clone().into_any_element(),
-            ShellView::Drafting => self.drafting.clone().into_any_element(),
+            ShellView::Conversation => self.conversation.clone().into_any_element(),
             ShellView::Settings => self.settings.clone().into_any_element(),
             ShellView::Database => self.database.clone().into_any_element(),
         }
@@ -1028,10 +1038,10 @@ impl Shell {
     /// for one design-phase obligation, from the "Design"/"+ Design"
     /// affordance on its row in the Obligations panel.
     ///
-    /// Mirrors `open_obligations_agent_chat`, but constructs the chat
-    /// in-process via `InteractiveAgentWindowControl::create_embedded_session`
-    /// instead of opening a standalone window, so it can sit inside the panel
-    /// next to the mockup preview.
+    /// Constructs the chat in-process via
+    /// `InteractiveAgentWindowControl::create_embedded_session` instead of
+    /// opening a standalone window, so it can sit inside the panel next to the
+    /// mockup preview.
     fn open_visual_design_panel(
         &mut self,
         node_id: uuid::Uuid,
@@ -1098,7 +1108,7 @@ impl Shell {
     }
 
     /// Assemble the visual-design agent's first message: bundled context docs
-    /// plus the live obligation selection (see `build_obligations_agent_context`).
+    /// plus the live obligation selection.
     fn build_visual_design_agent_context(
         &self,
         node_id: uuid::Uuid,
@@ -1175,6 +1185,32 @@ impl Shell {
                 list.delete_selected_task(window, cx);
             });
         }
+    }
+}
+
+/// The conversation focus for an obligations-panel selection.
+fn obligation_focus(node_id: Uuid, obligation_id: Option<Uuid>) -> Focus {
+    match obligation_id {
+        Some(id) => Focus::Obligation { node: node_id, id },
+        None => Focus::Node(node_id),
+    }
+}
+
+/// What Ctrl+J talks about when no view claimed it: the task tree's
+/// selected node, else the whole project.
+pub(crate) fn fallback_focus(selected_node: Option<Uuid>) -> Focus {
+    selected_node.map_or(Focus::Project, Focus::Node)
+}
+
+/// The status bar's message in `view`: the Tasks view's `tasks_status`
+/// there, nothing elsewhere.
+fn status_bar_message(view: ShellView, tasks_status: &SharedString) -> SharedString {
+    match view {
+        ShellView::Tasks => tasks_status.clone(),
+        ShellView::Interview
+        | ShellView::Conversation
+        | ShellView::Settings
+        | ShellView::Database => SharedString::default(),
     }
 }
 
@@ -1451,9 +1487,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let sessions = cx.new(|cx| {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
-                        let agent_for_drafting = agent.clone();
-                        let drafting = cx.new(|cx| {
-                            DraftingView::new(window, cx, agent_for_drafting, fleet.clone())
+                        let agent_for_conversation = agent.clone();
+                        let conversation = cx.new(|cx| {
+                            ConversationView::new(window, cx, agent_for_conversation, fleet.clone())
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
@@ -1589,9 +1625,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             node_id,
                                             obligation_id,
                                         } => {
-                                            this.open_obligations_agent_chat(
-                                                *node_id,
-                                                *obligation_id,
+                                            this.queue_open_conversation(
+                                                obligation_focus(*node_id, *obligation_id),
                                                 cx,
                                             );
                                         }
@@ -1606,10 +1641,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 },
                                                 cx,
                                             );
-                                        }
-                                        ObligationsEvent::RewritePreV3 { node_id } => {
-                                            this.pending_rewrite_pre_v3 = Some(*node_id);
-                                            cx.notify();
                                         }
                                     }
                                 });
@@ -1684,68 +1715,34 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         node_id,
                                         obligation_id,
                                     } => {
-                                        // `cx.defer`, not a direct call: this event
-                                        // arrives synchronously through several nested
-                                        // entity updates still on the stack (obligations
-                                        // -> workspace -> sessions -> shell), and opening
-                                        // the chat window here would try to lease those
-                                        // same entities again before they're returned to
-                                        // the app. Deferring runs this once the current
-                                        // effect cycle (and all those leases) has flushed.
-                                        let node_id = *node_id;
-                                        let obligation_id = *obligation_id;
-                                        let weak = cx.weak_entity();
-                                        cx.defer(move |cx| {
-                                            let _ = weak.update(cx, |this, cx| {
-                                                this.open_obligations_agent_chat(
-                                                    node_id,
-                                                    obligation_id,
-                                                    cx,
-                                                );
-                                            });
-                                        });
+                                        // Queued, not opened here: this event arrives
+                                        // through nested entity updates (obligations ->
+                                        // workspace -> sessions -> shell) whose leases are
+                                        // still on the stack, and opening needs `window`.
+                                        this.queue_open_conversation(
+                                            obligation_focus(*node_id, *obligation_id),
+                                            cx,
+                                        );
                                     }
                                 },
                             );
-                            let _drafting_subscription = cx.subscribe(
-                                &drafting,
-                                |this: &mut Shell, _, event, cx| match event {
-                                    DraftingViewEvent::ReturnToTaskList => {
-                                        this.pending_return_to_tasks = true;
-                                        cx.notify();
+                            let _conversation_subscription =
+                                cx.subscribe(&conversation, |this: &mut Shell, _, event, cx| {
+                                    match event {
+                                        ConversationViewEvent::Leave => {
+                                            this.pending_leave_conversation = true;
+                                            cx.notify();
+                                        }
+                                        ConversationViewEvent::GoToTasks {
+                                            node_id,
+                                            obligation_id,
+                                        } => {
+                                            this.pending_go_to_tasks =
+                                                Some((*node_id, *obligation_id));
+                                            cx.notify();
+                                        }
                                     }
-                                    DraftingViewEvent::ProceedToLifecycle {
-                                        task_id,
-                                        lifecycle,
-                                    } => {
-                                        this.pending_open_lifecycle = Some(PendingOpenLifecycle {
-                                            task_id: task_id.clone(),
-                                            lifecycle: lifecycle.clone(),
-                                        });
-                                        this.pending_return_to_tasks = true;
-                                        cx.notify();
-                                    }
-                                    DraftingViewEvent::OpenAgentChat {
-                                        node_id,
-                                        obligation_id,
-                                    } => {
-                                        // Deferred for the same reason as the sessions arm:
-                                        // nested entity leases are still on the stack.
-                                        let node_id = *node_id;
-                                        let obligation_id = *obligation_id;
-                                        let weak = cx.weak_entity();
-                                        cx.defer(move |cx| {
-                                            let _ = weak.update(cx, |this, cx| {
-                                                this.open_obligations_agent_chat(
-                                                    node_id,
-                                                    obligation_id,
-                                                    cx,
-                                                );
-                                            });
-                                        });
-                                    }
-                                },
-                            );
+                                });
                             let _settings_subscription = cx.subscribe(
                                 &settings,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -1768,7 +1765,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     action: action_panel,
                                 },
                                 sessions,
-                                drafting,
+                                conversation,
+                                view_before_conversation: ShellView::Tasks,
                                 settings,
                                 database,
                                 fleet: fleet.clone(),
@@ -1784,7 +1782,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
-                                pending_rewrite_pre_v3: None,
+                                pending_open_conversation: None,
+                                pending_go_to_tasks: None,
+                                pending_leave_conversation: false,
                                 pending_open_lifecycle: None,
                                 pending_return_to_tasks: false,
                                 pending_drawer: Vec::new(),
@@ -1800,7 +1800,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _visual_design_panel_subscription,
                                 _action_panel_subscription,
                                 _sessions_subscription,
-                                _drafting_subscription,
+                                _conversation_subscription,
                                 _settings_subscription,
                             };
                             let poll_entity = cx.weak_entity();
@@ -1826,13 +1826,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let fleet_for_close = fleet.clone();
                         let lifecycle_panel_for_close = view.read(cx).drawer.lifecycle.clone();
                         let sessions_for_close = view.read(cx).sessions.clone();
-                        let drafting_for_close = view.read(cx).drafting.clone();
+                        let conversation_for_close = view.read(cx).conversation.clone();
                         window.on_window_should_close(cx, move |window, cx| {
                             let running = collect_running_work(
                                 &fleet_for_close,
                                 &lifecycle_panel_for_close,
                                 &sessions_for_close,
-                                &drafting_for_close,
+                                &conversation_for_close,
                                 cx,
                             );
                             if running.is_empty() {
@@ -1928,4 +1928,64 @@ pub fn register_shell_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-shift-h", ShellOpenHistory, Some(NOT_INPUT)),
         KeyBinding::new("ctrl-z", ShellUndo, Some(NOT_INPUT)),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ShellView, fallback_focus, obligation_focus, spec_conversation_focus, status_bar_message,
+    };
+    use gpui::SharedString;
+    use tod_store::conversation::Focus;
+    use uuid::Uuid;
+
+    #[test]
+    fn the_tasks_status_shows_only_in_the_tasks_view() {
+        let status = SharedString::from("Edit: Sync server");
+        assert_eq!(status_bar_message(ShellView::Tasks, &status), status);
+        for view in [
+            ShellView::Conversation,
+            ShellView::Interview,
+            ShellView::Settings,
+            ShellView::Database,
+        ] {
+            assert!(status_bar_message(view, &status).is_empty(), "{view:?}");
+        }
+    }
+
+    #[test]
+    fn proposed_and_design_nodes_open_the_conversation_view() {
+        let node = Uuid::new_v4();
+        for lifecycle in ["proposed", "design"] {
+            assert_eq!(
+                spec_conversation_focus(lifecycle, node),
+                Some(Focus::Node(node)),
+                "{lifecycle}"
+            );
+        }
+        for lifecycle in ["planning", "ready", "active", ""] {
+            assert_eq!(
+                spec_conversation_focus(lifecycle, node),
+                None,
+                "{lifecycle}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_j_falls_back_to_the_tree_selection_then_the_project() {
+        let node = Uuid::new_v4();
+        assert_eq!(fallback_focus(Some(node)), Focus::Node(node));
+        assert_eq!(fallback_focus(None), Focus::Project);
+    }
+
+    #[test]
+    fn obligations_panel_selection_becomes_the_focus() {
+        let (node, id) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            obligation_focus(node, Some(id)),
+            Focus::Obligation { node, id }
+        );
+        assert_eq!(obligation_focus(node, None), Focus::Node(node));
+    }
 }

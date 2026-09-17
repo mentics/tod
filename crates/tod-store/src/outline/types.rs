@@ -69,7 +69,9 @@ impl Capability {
             Self::Agent => "Agent platform, model, and effort for chats and coding agents",
             Self::Files => "Workspace directory, branch, and optional worktree",
             Self::Ticket => "Ticket ID and pull request links",
-            Self::Generator => "Automatically produce and manage descendant nodes from an external data source",
+            Self::Generator => {
+                "Automatically produce and manage descendant nodes from an external data source"
+            }
             Self::Tags => "Freeform labels for organizing and filtering nodes",
         }
     }
@@ -86,7 +88,9 @@ impl Capability {
             Self::Files => {
                 "Disabling Files will remove the workspace directory, branch, and worktree settings stored on this node."
             }
-            Self::Ticket => "Disabling Ticket will remove the ticket ID and pull request links stored on this node.",
+            Self::Ticket => {
+                "Disabling Ticket will remove the ticket ID and pull request links stored on this node."
+            }
             Self::Generator => {
                 "Disabling Generator will permanently delete all managed child nodes under this node."
             }
@@ -113,9 +117,8 @@ pub const EXTRA_CONTENT_DETAILS: &str = "details";
 /// summary, written by an agent from the node's details and obligations. It is
 /// the one thing about an ancestor (besides its constraints) that descendants
 /// inherit. Changing the details or obligations marks it stale
-/// (`node_extra_content.stale`); the drafting driver writes a missing or stale
-/// one before a descendant's turn (`tod_core::drafting::summary`), and the
-/// state docs regenerate it on entering `design` and `planning`.
+/// (`node_extra_content.stale`); the state docs regenerate it on entering
+/// `design` and `planning`.
 pub const EXTRA_CONTENT_SUMMARY: &str = "summary";
 
 pub const EXTRA_CONTENT_TYPES: [&str; 5] = ["design", "plan", "notes", "details", "summary"];

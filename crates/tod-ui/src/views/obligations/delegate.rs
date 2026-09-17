@@ -1,18 +1,20 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 
 use crate::ui::drag_payload::ObligationDragPayload;
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
+use crate::views::rows::{
+    ObligationRowEvent, ObligationRowProps, RowHost, RowOptions, obligation_row, op_icon,
+};
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
-    div, prelude::FluentBuilder, px,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    px,
 };
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
-use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
-use tod_store::interview::PHASE_DESIGN;
+use gpui_component::input::{Input, InputState, TextareaState};
+use gpui_component::{ActiveTheme, StyledExt, h_flex};
+use tod_store::conversation::NetOp;
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
+use uuid::Uuid;
 
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
 pub const NO_SECTION: &str = "<no section>";
@@ -105,8 +107,9 @@ impl ObligationRow {
     }
 }
 
+/// What the user did in the list, queued for `ObligationsView` to apply.
 #[derive(Debug, Clone)]
-pub enum RowAction {
+pub enum ListAction {
     TogglePhase {
         phase: String,
     },
@@ -141,45 +144,56 @@ pub enum RowAction {
     },
 }
 
+impl From<ObligationRowEvent> for ListAction {
+    fn from(event: ObligationRowEvent) -> Self {
+        match event {
+            ObligationRowEvent::Select { row_ix } => Self::Select { row_ix },
+            ObligationRowEvent::StartEdit { obligation_id } => Self::StartEdit { obligation_id },
+            ObligationRowEvent::OpenVisualDesign { obligation_id } => {
+                Self::OpenVisualDesign { obligation_id }
+            }
+        }
+    }
+}
+
 pub struct ObligationListDelegate {
     rows: Vec<ObligationRow>,
     selected_index: Option<usize>,
-    action_sink: Rc<RefCell<Vec<RowAction>>>,
-    /// Weak handle to the owning view. Row click handlers only get `&App` (no
-    /// `Context<ObligationsView>`), so pushing to `action_sink` alone doesn't
-    /// schedule a repaint — nothing would ever drain the queue. Handlers use
-    /// this to force one immediately after queuing an action.
-    view: WeakEntity<super::ObligationsView>,
+    host: RowHost<ListAction>,
     editing_id: Option<String>,
     inline_edit_input: Option<Entity<TextareaState>>,
     section_edit_input: Option<Entity<InputState>>,
     /// Provenance by obligation id; `agent` rows get a subtle marker.
-    marks: std::collections::HashMap<uuid::Uuid, tod_store::drafting::ObligationMark>,
+    /// Change-set operations by obligation id, shown as a leading op icon.
+    change_markers: HashMap<Uuid, NetOp>,
+    /// Obligations shown struck through: removed ones the host still shows.
+    struck: HashSet<Uuid>,
 }
 
 impl ObligationListDelegate {
-    pub fn new(
-        rows: Vec<ObligationRow>,
-        action_sink: Rc<RefCell<Vec<RowAction>>>,
-        view: WeakEntity<super::ObligationsView>,
-    ) -> Self {
+    pub fn new(rows: Vec<ObligationRow>, host: RowHost<ListAction>) -> Self {
         Self {
             rows,
             selected_index: None,
-            action_sink,
-            view,
+            host,
             editing_id: None,
             inline_edit_input: None,
             section_edit_input: None,
-            marks: std::collections::HashMap::new(),
+            change_markers: HashMap::new(),
+            struck: HashSet::new(),
         }
     }
 
-    pub fn set_marks(
-        &mut self,
-        marks: std::collections::HashMap<uuid::Uuid, tod_store::drafting::ObligationMark>,
-    ) {
-        self.marks = marks;
+    pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>) {
+        self.change_markers = markers;
+    }
+
+    pub fn set_struck(&mut self, struck: HashSet<Uuid>) {
+        self.struck = struck;
+    }
+
+    pub fn is_struck(&self, id: Uuid) -> bool {
+        self.struck.contains(&id)
     }
 
     pub fn set_rows(&mut self, rows: Vec<ObligationRow>) {
@@ -224,8 +238,7 @@ impl ObligationListDelegate {
         let selected = self.selected_index == Some(row_ix);
         let theme = cx.theme();
         let border = theme.muted_foreground.opacity(0.5);
-        let sink = self.action_sink.clone();
-        let view = self.view.clone();
+        let host = &self.host;
 
         let content = match row {
             ObligationRow::Phase {
@@ -234,10 +247,8 @@ impl ObligationListDelegate {
                 count,
             } => {
                 let phase_owned = phase.clone();
-                let select_sink = sink.clone();
-                let toggle_sink = sink.clone();
-                let select_view = view.clone();
-                let toggle_view = view.clone();
+                let select_host = host.clone();
+                let toggle_host = host.clone();
                 h_flex()
                     .h(GROUP_ROW_HEIGHT)
                     .flex_shrink_0()
@@ -247,11 +258,10 @@ impl ObligationListDelegate {
                     .border_b_1()
                     .border_color(border)
                     .bg(theme.secondary.opacity(0.5))
-                    .when(selected, |el| el.bg(theme.muted))
+                    .when(selected, style::highlighted)
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        select_sink.borrow_mut().push(RowAction::Select { row_ix });
-                        notify(&select_view, cx);
+                        select_host.push(ListAction::Select { row_ix }, cx);
                     })
                     .child(
                         div()
@@ -261,10 +271,12 @@ impl ObligationListDelegate {
                             .text_color(theme.muted_foreground)
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                toggle_sink.borrow_mut().push(RowAction::TogglePhase {
-                                    phase: phase_owned.clone(),
-                                });
-                                notify(&toggle_view, cx);
+                                toggle_host.push(
+                                    ListAction::TogglePhase {
+                                        phase: phase_owned.clone(),
+                                    },
+                                    cx,
+                                );
                                 cx.stop_propagation();
                             })
                             .child(if collapsed { "▸" } else { "▾" }),
@@ -275,6 +287,7 @@ impl ObligationListDelegate {
                             .font_bold()
                             .child(format!("{} ({count})", phase_label(&phase))),
                     )
+                    .into_any_element()
             }
             ObligationRow::Group {
                 phase,
@@ -291,12 +304,9 @@ impl ObligationListDelegate {
                 let kind_owned = kind.to_string();
                 let add_section_phase = phase.clone();
                 let add_section_kind = kind.to_string();
-                let select_sink = sink.clone();
-                let toggle_sink = sink.clone();
-                let add_sink = sink.clone();
-                let select_view = view.clone();
-                let toggle_view = view.clone();
-                let add_view = view.clone();
+                let select_host = host.clone();
+                let toggle_host = host.clone();
+                let add_host = host.clone();
                 h_flex()
                     .h(GROUP_ROW_HEIGHT)
                     .flex_shrink_0()
@@ -306,11 +316,10 @@ impl ObligationListDelegate {
                     .pl_5()
                     .border_b_1()
                     .border_color(border)
-                    .when(selected, |el| el.bg(theme.muted))
+                    .when(selected, style::highlighted)
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        select_sink.borrow_mut().push(RowAction::Select { row_ix });
-                        notify(&select_view, cx);
+                        select_host.push(ListAction::Select { row_ix }, cx);
                     })
                     .child(
                         div()
@@ -320,11 +329,13 @@ impl ObligationListDelegate {
                             .text_color(theme.muted_foreground)
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                toggle_sink.borrow_mut().push(RowAction::ToggleGroup {
-                                    phase: phase_owned.clone(),
-                                    kind: kind_owned.clone(),
-                                });
-                                notify(&toggle_view, cx);
+                                toggle_host.push(
+                                    ListAction::ToggleGroup {
+                                        phase: phase_owned.clone(),
+                                        kind: kind_owned.clone(),
+                                    },
+                                    cx,
+                                );
                                 cx.stop_propagation();
                             })
                             .child(if collapsed { "▸" } else { "▾" }),
@@ -343,15 +354,18 @@ impl ObligationListDelegate {
                             .cursor_pointer()
                             .px_1()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                add_sink.borrow_mut().push(RowAction::AddSection {
-                                    phase: add_section_phase.clone(),
-                                    kind: add_section_kind.clone(),
-                                });
-                                notify(&add_view, cx);
+                                add_host.push(
+                                    ListAction::AddSection {
+                                        phase: add_section_phase.clone(),
+                                        kind: add_section_kind.clone(),
+                                    },
+                                    cx,
+                                );
                                 cx.stop_propagation();
                             })
                             .child("+ Section"),
                     )
+                    .into_any_element()
             }
             ObligationRow::Section {
                 phase,
@@ -364,10 +378,8 @@ impl ObligationListDelegate {
                 let phase_owned = phase.clone();
                 let kind_owned = kind.to_string();
                 let section_owned = section.clone();
-                let select_sink = sink.clone();
-                let toggle_sink = sink.clone();
-                let select_view = view.clone();
-                let toggle_view = view.clone();
+                let select_host = host.clone();
+                let toggle_host = host.clone();
                 let editing = is_new || self.editing_id.as_deref() == Some(row_key.as_str());
                 let mut header = h_flex()
                     .h(GROUP_ROW_HEIGHT)
@@ -378,11 +390,10 @@ impl ObligationListDelegate {
                     .pl_9()
                     .border_b_1()
                     .border_color(border)
-                    .when(selected, |el| el.bg(theme.muted))
+                    .when(selected, style::highlighted)
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        select_sink.borrow_mut().push(RowAction::Select { row_ix });
-                        notify(&select_view, cx);
+                        select_host.push(ListAction::Select { row_ix }, cx);
                     });
                 if !is_new {
                     header = header.child(
@@ -393,12 +404,14 @@ impl ObligationListDelegate {
                             .text_color(theme.muted_foreground)
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                toggle_sink.borrow_mut().push(RowAction::ToggleSection {
-                                    phase: phase_owned.clone(),
-                                    kind: kind_owned.clone(),
-                                    section: section_owned.clone(),
-                                });
-                                notify(&toggle_view, cx);
+                                toggle_host.push(
+                                    ListAction::ToggleSection {
+                                        phase: phase_owned.clone(),
+                                        kind: kind_owned.clone(),
+                                        section: section_owned.clone(),
+                                    },
+                                    cx,
+                                );
                                 cx.stop_propagation();
                             })
                             .child(if collapsed { "▸" } else { "▾" }),
@@ -418,8 +431,7 @@ impl ObligationListDelegate {
                     let phase_owned2 = phase.clone();
                     let kind_owned2 = kind.to_string();
                     let section_owned2 = section.clone();
-                    let edit_sink = self.action_sink.clone();
-                    let edit_view = view.clone();
+                    let edit_host = host.clone();
                     header = header.child(
                         div()
                             .flex_1()
@@ -429,12 +441,14 @@ impl ObligationListDelegate {
                             .when(selected, |el| {
                                 el.on_mouse_down(MouseButton::Left, move |event, _, cx| {
                                     if event.click_count >= 2 {
-                                        edit_sink.borrow_mut().push(RowAction::StartSectionEdit {
-                                            phase: phase_owned2.clone(),
-                                            kind: kind_owned2.clone(),
-                                            section: section_owned2.clone(),
-                                        });
-                                        notify(&edit_view, cx);
+                                        edit_host.push(
+                                            ListAction::StartSectionEdit {
+                                                phase: phase_owned2.clone(),
+                                                kind: kind_owned2.clone(),
+                                                section: section_owned2.clone(),
+                                            },
+                                            cx,
+                                        );
                                         cx.stop_propagation();
                                     }
                                 })
@@ -442,119 +456,25 @@ impl ObligationListDelegate {
                             .child(format!("{section} ({count})")),
                     );
                 }
-                header
+                header.into_any_element()
             }
             ObligationRow::Item { obligation } => {
-                let editing = self.editing_id.as_deref() == Some(&obligation.id.to_string());
-                let is_empty = obligation.body.is_empty();
-                let color = if is_empty {
-                    theme.muted_foreground
-                } else {
-                    theme.foreground
+                let editing = self.editing_id.as_deref() == Some(row_key.as_str());
+                let opts = RowOptions {
+                    leading: self
+                        .change_markers
+                        .get(&obligation.id)
+                        .map(|op| op_icon(("obligation-op", row_ix), *op)),
+                    struck: self.struck.contains(&obligation.id),
+                    ..RowOptions::default()
                 };
-                let marker_color = theme.muted_foreground;
-                let select_sink = sink.clone();
-                let select_view = view.clone();
-                let mut row_el = h_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .items_start()
-                    .gap_2()
-                    .px_2()
-                    .py_1p5()
-                    .pl_12()
-                    .border_b_1()
-                    .border_color(border)
-                    .when(selected, |el| {
-                        el.bg(theme.muted).child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(3.))
-                                .bg(theme.primary),
-                        )
-                    })
-                    .relative()
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        select_sink.borrow_mut().push(RowAction::Select { row_ix });
-                        notify(&select_view, cx);
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .flex_shrink_0()
-                            .pt_0p5()
-                            .child(format!("{}.", obligation.ordinal)),
-                    );
-                if editing {
-                    if let Some(input) = &self.inline_edit_input {
-                        row_el = row_el.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .child(Textarea::new(input).w_full()),
-                        );
-                    }
-                } else {
-                    let id = obligation.id;
-                    let body = if is_empty {
-                        "(new obligation)".to_string()
-                    } else {
-                        obligation.body.clone()
-                    };
-                    let edit_sink = self.action_sink.clone();
-                    let edit_view = view.clone();
-                    row_el = row_el.child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .when(selected, |el| {
-                                el.on_mouse_down(MouseButton::Left, move |event, _, cx| {
-                                    if event.click_count >= 2 {
-                                        edit_sink
-                                            .borrow_mut()
-                                            .push(RowAction::StartEdit { obligation_id: id });
-                                        notify(&edit_view, cx);
-                                        cx.stop_propagation();
-                                    }
-                                })
-                            })
-                            .child(obligation_body(row_ix, &body, color, window, cx)),
-                    );
-                    if self.marks.get(&id).is_some_and(|m| m.is_agent()) {
-                        row_el = row_el.child(
-                            div()
-                                .text_xs()
-                                .text_color(marker_color)
-                                .flex_shrink_0()
-                                .pt_0p5()
-                                .child("agent"),
-                        );
-                    }
-                    if obligation.phase == PHASE_DESIGN {
-                        let has_design = obligation.visual_design_path.is_some();
-                        let design_sink = self.action_sink.clone();
-                        let design_view = view.clone();
-                        row_el = row_el.child(
-                            Button::new(("obligation-visual-design", row_ix))
-                                .label(if has_design { "Design" } else { "+ Design" })
-                                .ghost()
-                                .xsmall()
-                                .flex_shrink_0()
-                                .on_click(move |_, _, cx| {
-                                    design_sink
-                                        .borrow_mut()
-                                        .push(RowAction::OpenVisualDesign { obligation_id: id });
-                                    notify(&design_view, cx);
-                                }),
-                        );
-                    }
-                }
-                row_el
+                let props = ObligationRowProps {
+                    obligation: &obligation,
+                    row_ix,
+                    highlighted: selected,
+                    editor: self.inline_edit_input.as_ref().filter(|_| editing),
+                };
+                obligation_row(props, host, opts, window, cx)
             }
         };
 
@@ -591,28 +511,4 @@ impl Render for ObligationDragPreview {
             .text_color(theme.foreground)
             .child("Obligation")
     }
-}
-
-/// Row click handlers only get `&mut App` (no `Context<ObligationsView>`), so
-/// queuing a `RowAction` alone doesn't schedule a repaint. Call this after
-/// every push to force one, so `drain_row_actions` runs on the next frame.
-fn notify(view: &WeakEntity<super::ObligationsView>, cx: &mut App) {
-    let _ = view.update(cx, |_, cx| cx.notify());
-}
-
-fn obligation_body(
-    row_ix: usize,
-    body: &str,
-    color: gpui::Hsla,
-    window: &mut Window,
-    cx: &mut App,
-) -> AnyElement {
-    let text = SharedString::from(body.to_string());
-    selectable_text(("obligation-body", row_ix), text, window, cx)
-        .text_sm()
-        .text_color(color)
-        .whitespace_normal()
-        .w_full()
-        .min_w_0()
-        .into_any_element()
 }

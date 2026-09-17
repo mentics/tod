@@ -1,6 +1,6 @@
 //! Runtime obligation resolution (root → leaf, additive).
 
-use crate::interview::{PHASES, PHASE_UNKNOWN};
+use crate::interview::{PHASE_UNKNOWN, PHASES};
 use crate::outline::repos::obligations::NodeObligation;
 use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo};
 use crate::outline::types::Capability;

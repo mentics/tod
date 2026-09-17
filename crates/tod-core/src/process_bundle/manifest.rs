@@ -16,9 +16,6 @@ impl ProcessManifest {
     const PHASE_PROPOSED: &'static str = "agents/interview/phases/proposed.md";
     const PHASE_DESIGN: &'static str = "agents/interview/phases/design.md";
     const PHASE_PLANNING: &'static str = "agents/interview/phases/planning.md";
-    const DRAFTING_BASE: &'static str = "agents/drafting/base.md";
-    const DRAFTING_CAPTURE: &'static str = "agents/drafting/capture.md";
-    const DRAFTING_DRAFTER: &'static str = "agents/drafting/drafter.md";
 
     const KNOWN_PHASES: &'static [&'static str] = &[
         "task-requirements-interview",
@@ -36,9 +33,6 @@ impl ProcessManifest {
             Self::PHASE_PROPOSED,
             Self::PHASE_DESIGN,
             Self::PHASE_PLANNING,
-            Self::DRAFTING_BASE,
-            Self::DRAFTING_CAPTURE,
-            Self::DRAFTING_DRAFTER,
         ] {
             let path = root.join(rel);
             if !path.is_file() {
@@ -84,20 +78,6 @@ impl ProcessManifest {
             other => anyhow::bail!("no interview phase doc for {other}"),
         };
         Ok(self.resolve(rel))
-    }
-
-    /// Drafting (v3) conventions shared by capture and the drafting loop.
-    pub fn drafting_base_doc(&self) -> PathBuf {
-        self.resolve(Self::DRAFTING_BASE)
-    }
-
-    /// The drafter's doc for capture (`proposed`) or the drafting loop (`design`).
-    pub fn drafting_mode_doc(&self, capture: bool) -> PathBuf {
-        self.resolve(if capture {
-            Self::DRAFTING_CAPTURE
-        } else {
-            Self::DRAFTING_DRAFTER
-        })
     }
 
     pub fn phase_count(&self) -> usize {

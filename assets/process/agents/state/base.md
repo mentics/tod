@@ -24,7 +24,7 @@ The app fires this turn automatically the moment a node's lifecycle actually
 changes to your state — whether an agent's own gate check passed, or a human
 advanced it after waiving criteria. Do this state's **"On entry"**
 responsibilities (see that heading in your state role doc, e.g. `planning`
-drafting plan steps) now, directly via `tod-cli`, without waiting for a gate
+writing plan steps) now, directly via `tod-cli`, without waiting for a gate
 check or an interview turn to trigger it.
 
 This turn may fire again later for the same node (e.g. after obligations or

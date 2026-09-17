@@ -134,6 +134,41 @@ ln -s /path/to/install/process ~/.cursor/skills/process
 
 Point the target at your **install** `process/` directory (or repo `assets/process/` during development).
 
+## Navigation and shortcuts
+
+- **`** opens the app nav (Tasks, Conversation, Settings); **Ctrl+1** goes to
+  Tasks, **Ctrl+,** to Settings.
+- In multi-column views, **Left/Right** (or **Ctrl+Left/Right** where the panel
+  uses plain arrows itself, like the task tree) move between panels.
+- **Ctrl+J**, from anywhere, opens the **conversation view** about the current
+  selection (a node, obligation, or plan step; with nothing selected, the whole
+  project). Nodes in the `proposed` or `design` lifecycle open it from the
+  lifecycle panel's "Open conversation".
+
+The conversation view has the transcript and direction box on the left and the
+change set (everything the conversation changed, net per item) on the right:
+
+| Key | Action |
+|-----|--------|
+| Enter / click (direction box) | Start writing; **Ctrl+Enter** sends, **Esc** stops writing |
+| Up / Down | Move the highlight in the change set |
+| Space | Select a change |
+| Enter | Expand a change (full text, per-field diff, flag reason) |
+| R / Shift+R | Reverse the selection (or highlighted change) / reverse all |
+| E | Edit the highlighted item inline |
+| F | Clear the unsure flag |
+| 1 / 2 / 3 | All / Unsure / Deleted tabs |
+| Ctrl+J | Talk about the highlighted item (refocus) |
+| Alt+Left | Back to the previous focus (or the view you came from) |
+| Ctrl+N | New conversation about the same focus (the picker lists the others) |
+| Ctrl+. | Toggle the context panel (the item in its obligations or plan list) |
+| G | With the context panel open: show that node in Tasks |
+| Right (on a change) | Move into the change's reference links; Enter opens one |
+
+Reversal never uses Ctrl+Z; it applies inverses from the conversation's own log,
+and asks for confirmation when an item changed since or other changes depend on
+it.
+
 ## Agent control socket (dev / CI only)
 
 Requires a build **with** the default features (`agent-socket`). Not present in `--no-default-features` release builds.
@@ -187,6 +222,15 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 
 See `.local/agent/ui-smoke/BATCH.md` for the full smoke workflow.
 
+The conversation view has its own self-contained smoke test, which builds
+`tod` and `tod-cli`, launches its own mock instance on a random port with a
+fresh data root under `.local/agent/scratchpad/tod/`, and stops only that
+process:
+
+```bash
+python .local/agent/ui-smoke/conversation.py   # --no-build to skip cargo build
+```
+
 ## Project layout
 
 ```text
@@ -199,15 +243,18 @@ crates/tod-ui/          # all GPUI code
   src/cli.rs            # LaunchOptions / CLI parsing
   src/app/              # GPUI application startup / window
   src/views/            # task list, obligations, agent panels, transcripts
+  src/conversation/     # conversation view (transcript, change set, context panel)
   src/agent_socket/     # optional control socket (agent-socket feature)
 crates/tod-cli/         # `tod-cli` binary that agents shell out to
 crates/tod-core/        # policy + orchestration shared by UI and CLI
+  src/conversation/     # conversation driver, agent context, mock agent
   src/interview/        # interview flow
   src/process_bundle/   # install discovery, manifest, scope export, prompts
   src/media.rs          # agent context doc resolution
   src/agent_context.rs  # assembles an agent chat's first message
 crates/tod-agent/       # agent transport (leaf crate; no tod-* deps)
 crates/tod-store/       # persistence (SQLite, credentials, settings, paths)
+  src/conversation/     # conversation log: turns, recorded actions, flags, reversal
 ```
 
 Crates are layered so each depends only on the ones below it: `tod` → `tod-ui`

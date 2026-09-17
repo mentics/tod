@@ -1,7 +1,7 @@
 //! The one place that resolves and renders a node's inherited (ancestor)
 //! obligation context. Every surface that assembles context for a node —
-//! interview snapshots, gate checks, drafting turns, "on entry" hooks, agent
-//! chats, and the lifecycle panel's implementation sessions — calls
+//! interview snapshots, gate checks, "on entry" hooks, agent chats, and the
+//! lifecycle panel's implementation sessions — calls
 //! [`render_inherited_context`] rather than re-deriving this policy locally.
 //!
 //! The policy (per the user's stated design): an ancestor's scope is settled
@@ -162,14 +162,14 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     )
 }
 
-/// Renders what `node_id` inherits: each Spec ancestor, root first, with its title, its generated summary
-/// (`NodeRepo::get_summary`), and its constraint-kind obligations in full. The
-/// summary is the only account of an ancestor's scope a descendant gets: its
-/// details and requirements are never listed, since a deep tree would
-/// otherwise put hundreds of unrelated rows into every context. The drafting
-/// driver writes missing and stale summaries before a turn
-/// (`crate::drafting::summary`); anywhere else, an ancestor still without one
-/// gets a pointer to `tod-cli` instead. This never includes anything of `node_id`'s own — callers show that separately.
+/// Renders what `node_id` inherits: each Spec ancestor, root first, with its
+/// title, its generated summary (`NodeRepo::get_summary`), and its
+/// constraint-kind obligations in full. The summary is the only account of an
+/// ancestor's scope a descendant gets: its details and requirements are never
+/// listed, since a deep tree would otherwise put hundreds of unrelated rows
+/// into every context. An ancestor still without a summary gets a pointer to
+/// `tod-cli` instead. This never includes anything of `node_id`'s
+/// own — callers show that separately.
 pub fn render_inherited_context(
     conn: &Connection,
     nodes: &NodeRepo<'_>,

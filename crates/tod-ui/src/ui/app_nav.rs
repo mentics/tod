@@ -15,6 +15,7 @@ actions!(
     [
         AppNavToggle,
         ShellGoTasks,
+        ShellGoConversation,
         ShellGoSettings,
         ShellGoDatabase,
         AppNavSelectUp,
@@ -25,7 +26,7 @@ actions!(
 );
 
 const APP_NAV_POPUP_CONTEXT: &str = "AppNavPopup";
-const APP_NAV_ITEMS: [&str; 3] = ["Tasks", "Settings", "Database"];
+const APP_NAV_ITEMS: [&str; 4] = ["Tasks", "Conversation", "Settings", "Database"];
 
 /// Shared handler for `` ` `` / app-nav toggle — attach via [`HasAppNav::bind_app_nav_toggle`].
 pub fn on_app_nav_toggle<V: Render + HasAppNav + 'static>(
@@ -54,6 +55,7 @@ pub fn register_app_nav_keyboard_bindings(cx: &mut gpui::App) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppDestination {
     Tasks,
+    Conversation,
     Settings,
     Database,
 }
@@ -76,7 +78,8 @@ impl AppNavPopup {
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let action: Box<dyn gpui::Action> = match self.selected_index {
             0 => Box::new(ShellGoTasks),
-            1 => Box::new(ShellGoSettings),
+            1 => Box::new(ShellGoConversation),
+            2 => Box::new(ShellGoSettings),
             _ => Box::new(ShellGoDatabase),
         };
         self.action_context.focus(window, cx);
@@ -354,8 +357,9 @@ pub trait HasAppNav {
 
 fn nav_item_index(current: Option<AppDestination>) -> usize {
     match current {
-        Some(AppDestination::Settings) => 1,
-        Some(AppDestination::Database) => 2,
+        Some(AppDestination::Conversation) => 1,
+        Some(AppDestination::Settings) => 2,
+        Some(AppDestination::Database) => 3,
         Some(AppDestination::Tasks) | None => 0,
     }
 }

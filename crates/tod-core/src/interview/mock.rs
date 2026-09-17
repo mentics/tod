@@ -1,4 +1,5 @@
-//! `--agent mock` interview agents. They act through [`InterviewClient`],
+//! `--agent mock` interview agents (and the dispatch to the conversation
+//! mock, `crate::conversation::mock`). They act through [`InterviewClient`],
 //! exactly the path `tod-cli` gives real agents, so a mock run exercises the
 //! same writes, attribution, and guards.
 
@@ -20,9 +21,9 @@ pub fn install_mock_interview_handler(data_root: PathBuf) {
 }
 
 fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
-    // A summarizer only replies; it has no session row or actor.
-    if turn.purpose == SessionPurpose::Summarizer {
-        return crate::drafting::summary::mock_summarizer(&turn.blocks.join("\n\n"));
+    // A conversation's actor is `conversation:<uuid>`, not a session id.
+    if turn.purpose == SessionPurpose::Conversation {
+        return crate::conversation::mock::handle_turn(data_root, turn);
     }
     let actor = turn
         .env
@@ -47,8 +48,9 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
     match turn.purpose {
         SessionPurpose::QuestionMaker => question_maker(&client, &row, &text, &received),
         SessionPurpose::AnswerProcessor => answer_processor(&client, &row, &text, &received),
-        SessionPurpose::Drafter => crate::drafting::mock::drafter(&client, &row, &text),
-        SessionPurpose::Chat | SessionPurpose::Summarizer => bail!("not an interview turn"),
+        SessionPurpose::Chat | SessionPurpose::Drafter | SessionPurpose::Conversation => {
+            bail!("not an interview turn")
+        }
     }
 }
 

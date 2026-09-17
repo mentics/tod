@@ -60,13 +60,12 @@ pub fn interview_phase_for_lifecycle(lifecycle: &str) -> Option<&'static str> {
     }
 }
 
-/// What the view that writes a node's spec is called in `lifecycle`: capture
-/// in `proposed`, the drafting loop in `design`, the (v2) interview in
+/// What the view that writes a node's spec is called in `lifecycle`: the
+/// conversation view in `proposed` and `design`, the (v2) interview in
 /// `planning`. `None` where no such view applies.
 pub fn spec_view_label(lifecycle: &str) -> Option<&'static str> {
     match lifecycle {
-        "proposed" => Some("Capture"),
-        "design" => Some("Drafting"),
+        "proposed" | "design" => Some("Conversation"),
         "planning" => Some("Interview"),
         _ => None,
     }

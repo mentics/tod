@@ -800,7 +800,10 @@ fn obligation_crud_and_counts() {
         .find(|o| o.id == req_b)
         .unwrap()
         .node_id;
-    assert_eq!(req_b_node, node_id, "rejected move must leave obligation in place");
+    assert_eq!(
+        req_b_node, node_id,
+        "rejected move must leave obligation in place"
+    );
 
     store
         .enqueue_outline(OutlineMutation::MoveObligation {
@@ -955,10 +958,13 @@ fn gate_criteria_seed_on_migration() {
     let _store = FleetStore::open(&root).unwrap();
     let conn = schema::open_writer_connection(&db).unwrap();
     let repo = GateRepo::new(&conn);
-    // Drafting v3: `buildable` is the only active design → planning criterion.
+    // `buildable` is the only active design → planning criterion.
     let design_planning = repo.list_for_transition("design", "planning").unwrap();
     assert_eq!(design_planning.len(), 1);
-    assert_eq!(design_planning[0].slug, crate::drafting::BUILDABLE_CRITERION_SLUG);
+    assert_eq!(
+        design_planning[0].slug,
+        crate::outline::BUILDABLE_CRITERION_SLUG
+    );
     let superseded = GATE_CRITERIA
         .iter()
         .filter(|c| c.from_state == "design" && c.to_state == "planning")
@@ -1161,7 +1167,9 @@ fn generator_capability_on_empty_node_succeeds() {
     // Direct check: open a fresh connection and query capabilities
     let db_path = root.join("tod.db");
     let fresh_conn = crate::fleet::schema::open_read_connection(&db_path).unwrap();
-    let caps = crate::outline::repos::NodeRepo::new(&fresh_conn).list_capabilities(node_id).unwrap();
+    let caps = crate::outline::repos::NodeRepo::new(&fresh_conn)
+        .list_capabilities(node_id)
+        .unwrap();
     assert!(
         caps.contains(&Capability::Generator),
         "expected Generator in capabilities, got: {:?}",
@@ -1230,8 +1238,7 @@ fn generator_and_lifecycle_are_mutually_exclusive() {
     if result.is_ok() {
         store
             .read(|conn| {
-                let caps =
-                    crate::outline::repos::NodeRepo::new(conn).list_capabilities(node1)?;
+                let caps = crate::outline::repos::NodeRepo::new(conn).list_capabilities(node1)?;
                 assert!(
                     !caps.contains(&Capability::Generator),
                     "Generator should not coexist with Lifecycle"
@@ -1261,8 +1268,7 @@ fn generator_and_lifecycle_are_mutually_exclusive() {
     if result.is_ok() {
         store
             .read(|conn| {
-                let caps =
-                    crate::outline::repos::NodeRepo::new(conn).list_capabilities(node2)?;
+                let caps = crate::outline::repos::NodeRepo::new(conn).list_capabilities(node2)?;
                 assert!(
                     !caps.contains(&Capability::Lifecycle),
                     "Lifecycle should not coexist with Generator"
@@ -1340,7 +1346,9 @@ fn disabling_generator_deletes_managed_children_and_config() {
             let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
             assert!(gen_repo.get_config(generator_id).unwrap().is_none());
             assert!(gen_repo.get_link(managed_id).unwrap().is_none());
-            let node = crate::outline::repos::NodeRepo::new(conn).get(managed_id).unwrap();
+            let node = crate::outline::repos::NodeRepo::new(conn)
+                .get(managed_id)
+                .unwrap();
             assert!(node.is_none(), "managed node should be deleted on disable");
             Ok(())
         })
@@ -1373,7 +1381,9 @@ fn deleting_generator_node_cascades_managed_cleanup() {
         create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Item");
 
     store
-        .enqueue_outline(OutlineMutation::DeleteNode { node_id: generator_id })
+        .enqueue_outline(OutlineMutation::DeleteNode {
+            node_id: generator_id,
+        })
         .unwrap();
     store.writer().flush().unwrap();
 
@@ -1434,7 +1444,10 @@ fn re_enabling_generator_after_disable_starts_with_no_config() {
             let config = crate::outline::repos::GeneratorRepo::new(conn)
                 .get_config(generator_id)
                 .unwrap();
-            assert!(config.is_none(), "re-enabled generator must not retain old config");
+            assert!(
+                config.is_none(),
+                "re-enabled generator must not retain old config"
+            );
             Ok(())
         })
         .unwrap();
@@ -1589,8 +1602,7 @@ fn editing_body_on_linked_node_marks_it_dirty_independently_of_title() {
 #[test]
 fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
     let (store, root, list_id) = setup_store_with_list();
-    let (_generator_id, managed_id, _child_id) =
-        setup_generator_with_managed_tree(&store, list_id);
+    let (_generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
 
     store
@@ -1614,7 +1626,10 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
     let copy_id = store
         .read(|conn| {
             let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(gen_repo.is_greyed_out(managed_id).unwrap(), "original should grey out once a copy exists");
+            assert!(
+                gen_repo.is_greyed_out(managed_id).unwrap(),
+                "original should grey out once a copy exists"
+            );
             let outline = crate::outline::repos::OutlineRepo::new(conn);
             let copy_id = outline
                 .list_for_list(list_id)
@@ -1652,8 +1667,10 @@ fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
     let (store, root, list_id) = setup_store_with_list();
     let gen_a = create_node_in(&store, list_id, None, "Generator A");
     let gen_b = create_node_in(&store, list_id, None, "Generator B");
-    let managed_a = create_managed_node_for_test(&store, list_id, gen_a, gen_a, "SHARED-1", "Item A");
-    let managed_b = create_managed_node_for_test(&store, list_id, gen_b, gen_b, "SHARED-1", "Item B");
+    let managed_a =
+        create_managed_node_for_test(&store, list_id, gen_a, gen_a, "SHARED-1", "Item A");
+    let managed_b =
+        create_managed_node_for_test(&store, list_id, gen_b, gen_b, "SHARED-1", "Item B");
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
 
     store
@@ -1670,7 +1687,10 @@ fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
         .read(|conn| {
             let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
             assert!(gen_repo.is_greyed_out(managed_a).unwrap());
-            assert!(gen_repo.is_greyed_out(managed_b).unwrap(), "sibling generator sharing the external id also greys out");
+            assert!(
+                gen_repo.is_greyed_out(managed_b).unwrap(),
+                "sibling generator sharing the external id also greys out"
+            );
             let outline = crate::outline::repos::OutlineRepo::new(conn);
             let copy_id = outline
                 .list_for_list(list_id)
@@ -1704,8 +1724,7 @@ fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
 #[test]
 fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
     let (store, root, list_id) = setup_store_with_list();
-    let (generator_id, managed_id, _child_id) =
-        setup_generator_with_managed_tree(&store, list_id);
+    let (generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
 
     store
@@ -1732,7 +1751,9 @@ fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
         .unwrap();
 
     store
-        .enqueue_outline(OutlineMutation::DeleteNode { node_id: generator_id })
+        .enqueue_outline(OutlineMutation::DeleteNode {
+            node_id: generator_id,
+        })
         .unwrap();
     store.writer().flush().unwrap();
 
@@ -1740,9 +1761,15 @@ fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
         .read(|conn| {
             let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
             let node_repo = crate::outline::repos::NodeRepo::new(conn);
-            assert!(gen_repo.get_link(copy_id).unwrap().is_none(), "copy must lose its data-source link");
+            assert!(
+                gen_repo.get_link(copy_id).unwrap().is_none(),
+                "copy must lose its data-source link"
+            );
             let copy_node = node_repo.get(copy_id).unwrap().unwrap();
-            assert_eq!(copy_node.title, "EXT-1: Fix the bug", "copy retains its title");
+            assert_eq!(
+                copy_node.title, "EXT-1: Fix the bug",
+                "copy retains its title"
+            );
             Ok(())
         })
         .unwrap();
@@ -1754,8 +1781,7 @@ fn deleting_generator_clears_links_on_copies_but_keeps_their_titles() {
 #[test]
 fn generator_state_survives_store_restart() {
     let (store, root, list_id) = setup_store_with_list();
-    let (generator_id, managed_id, child_id) =
-        setup_generator_with_managed_tree(&store, list_id);
+    let (generator_id, managed_id, child_id) = setup_generator_with_managed_tree(&store, list_id);
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
     store
         .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
@@ -1799,14 +1825,23 @@ fn generator_state_survives_store_restart() {
             let config = gen_repo.get_config(generator_id).unwrap().unwrap();
             assert_eq!(config.data_source_type, "mock");
             assert_eq!(config.last_refresh_status.as_deref(), Some("error"));
-            assert_eq!(config.last_refresh_error.as_deref(), Some("network unreachable"));
+            assert_eq!(
+                config.last_refresh_error.as_deref(),
+                Some("network unreachable")
+            );
 
-            assert!(gen_repo.is_managed(managed_id).unwrap(), "managed node persists across restart");
+            assert!(
+                gen_repo.is_managed(managed_id).unwrap(),
+                "managed node persists across restart"
+            );
             assert!(gen_repo.is_managed(child_id).unwrap());
             assert!(node_repo.get(managed_id).unwrap().is_some());
 
             let copy_link = gen_repo.get_link(copy_id).unwrap().unwrap();
-            assert_eq!(copy_link.external_id, "EXT-1", "copied-out node's data-source link persists");
+            assert_eq!(
+                copy_link.external_id, "EXT-1",
+                "copied-out node's data-source link persists"
+            );
             assert!(!gen_repo.is_managed(copy_id).unwrap());
 
             assert!(
@@ -1841,7 +1876,12 @@ fn setup_generator_with_managed_tree(store: &FleetStore, list_id: Uuid) -> (Uuid
     store.writer().flush().unwrap();
 
     let parent_id = create_managed_node_for_test(
-        store, list_id, generator_id, generator_id, "EXT-1", "Fix the bug",
+        store,
+        list_id,
+        generator_id,
+        generator_id,
+        "EXT-1",
+        "Fix the bug",
     );
     let child_id = Uuid::new_v4();
     store
@@ -1890,33 +1930,53 @@ fn paste_managed_node_copy_deep_copies_and_converts_to_normal() {
                 .iter()
                 .filter(|e| e.parent_id == Some(outside_parent))
                 .collect();
-            assert_eq!(entries.len(), 1, "copy should be placed under the target parent");
+            assert_eq!(
+                entries.len(),
+                1,
+                "copy should be placed under the target parent"
+            );
             let copy_id = entries[0].node_id;
-            assert_ne!(copy_id, managed_id, "copy must be a new node, not the original");
+            assert_ne!(
+                copy_id, managed_id,
+                "copy must be a new node, not the original"
+            );
 
             let copy_node = node_repo.get(copy_id).unwrap().unwrap();
             assert_eq!(copy_node.title, "EXT-1: Fix the bug");
-            assert!(!gen_repo.is_managed(copy_id).unwrap(), "copy must be a normal editable node");
+            assert!(
+                !gen_repo.is_managed(copy_id).unwrap(),
+                "copy must be a normal editable node"
+            );
             let link = gen_repo.get_link(copy_id).unwrap().unwrap();
             assert_eq!(link.external_id, "EXT-1");
             assert_eq!(link.generator_node_id, generator_id);
             assert!(link.user_modified_fields.is_empty());
 
             let original = node_repo.get(managed_id).unwrap().unwrap();
-            assert!(gen_repo.is_managed(managed_id).unwrap(), "original stays managed");
+            assert!(
+                gen_repo.is_managed(managed_id).unwrap(),
+                "original stays managed"
+            );
             let _ = original;
 
             let copy_children: Vec<_> = all_entries
                 .iter()
                 .filter(|e| e.parent_id == Some(copy_id))
                 .collect();
-            assert_eq!(copy_children.len(), 1, "managed descendants must be deep-copied");
+            assert_eq!(
+                copy_children.len(),
+                1,
+                "managed descendants must be deep-copied"
+            );
             let copy_child_id = copy_children[0].node_id;
             assert_ne!(copy_child_id, managed_child_id);
             assert!(!gen_repo.is_managed(copy_child_id).unwrap());
             let child_copy = node_repo.get(copy_child_id).unwrap().unwrap();
             assert_eq!(child_copy.title, "EXT-2: Sub item");
-            assert_eq!(node_repo.get_tags(copy_child_id).unwrap(), vec!["urgent".to_string()]);
+            assert_eq!(
+                node_repo.get_tags(copy_child_id).unwrap(),
+                vec!["urgent".to_string()]
+            );
             assert_eq!(
                 node_repo
                     .get_extra_content(copy_child_id, crate::outline::types::EXTRA_CONTENT_DETAILS)

@@ -7,6 +7,7 @@ pub use tod_core::linear_import;
 pub mod lifecycle_panel;
 pub mod obligations;
 pub mod plan_steps;
+pub mod rows;
 pub mod task_edit;
 pub mod task_list;
 pub mod visual_design_panel;

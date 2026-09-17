@@ -43,7 +43,11 @@ pub(crate) fn seed_node(conn: &rusqlite::Connection) -> String {
     use crate::fleet::repos::task::{FleetTask, TaskRepo};
     let node_id = uuid::Uuid::new_v4().to_string();
     TaskRepo::new(conn)
-        .insert(&FleetTask::new(&node_id, "T", &format!("t-{}", &node_id[..8])))
+        .insert(&FleetTask::new(
+            &node_id,
+            "T",
+            &format!("t-{}", &node_id[..8]),
+        ))
         .unwrap();
     node_id
 }

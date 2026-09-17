@@ -54,7 +54,12 @@ mod tests {
             tx.execute(
                 "INSERT INTO nodes (id, slug, title, created_at, updated_at, managed)
                  VALUES (?1, ?2, ?3, 0, 0, ?4)",
-                params![uuid_to_blob(node_id), slug, format!("Node {i}"), !is_generator],
+                params![
+                    uuid_to_blob(node_id),
+                    slug,
+                    format!("Node {i}"),
+                    !is_generator
+                ],
             )
             .unwrap();
             tx.execute(
@@ -147,8 +152,14 @@ mod tests {
         // Both complete comfortably within a UI frame budget many times over;
         // this asserts the benchmark ran to completion rather than pinning an
         // exact ratio (timings are machine-dependent).
-        assert!(eager_elapsed.as_secs() < 2, "eager join too slow: {eager_elapsed:?}");
-        assert!(on_demand_elapsed.as_secs() < 2, "on-demand queries too slow: {on_demand_elapsed:?}");
+        assert!(
+            eager_elapsed.as_secs() < 2,
+            "eager join too slow: {eager_elapsed:?}"
+        );
+        assert!(
+            on_demand_elapsed.as_secs() < 2,
+            "on-demand queries too slow: {on_demand_elapsed:?}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

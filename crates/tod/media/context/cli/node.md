@@ -7,6 +7,7 @@ UUID everywhere a `<SLUG_OR_UUID>` argument is expected.
 tod-cli --data-root <DATA_ROOT> node list   [--parent <SLUG_OR_UUID>] [--list <SLUG_OR_UUID>]
 tod-cli --data-root <DATA_ROOT> node show   <SLUG_OR_UUID>
 tod-cli --data-root <DATA_ROOT> node search --query <TEXT> [--limit N]
+tod-cli --data-root <DATA_ROOT> node tree   <SLUG_OR_UUID> [--depth N]
 tod-cli --data-root <DATA_ROOT> node create --title <TEXT> (--parent <SLUG_OR_UUID> | --list <SLUG_OR_UUID>) [--after <SLUG_OR_UUID>] [--before]
 tod-cli --data-root <DATA_ROOT> node rename <SLUG_OR_UUID> --title <TEXT>
 tod-cli --data-root <DATA_ROOT> node move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
@@ -29,6 +30,11 @@ there" and you need its id or slug to reference or inspect it. The match is
 fuzzy (typo- and skipped-letter-tolerant), not exact; it returns up to
 `--limit` (default 10) results across every list, best match first, one per
 line as `<NODE_UUID> <slug> <title>`.
+
+Use `tree` to see a node's whole subtree at once: one line per node, indented
+by depth, as `<slug>  <title>  (obligations: <n>, plan steps: <m>)`. `--depth N`
+shows only N levels below the node (`--depth 0` is the node alone); a line
+whose children were cut off says how many are hidden (`, 3 more below`).
 
 `notes` lists a node's notes, oldest first, each headed by its id. Notes are
 the freeform jottings shown in the node's Notes section in the app — distinct

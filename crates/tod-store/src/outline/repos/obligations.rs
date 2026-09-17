@@ -9,10 +9,6 @@ use uuid::Uuid;
 pub const KIND_REQUIREMENT: &str = "requirement";
 pub const KIND_CONSTRAINT: &str = "constraint";
 
-/// SQL for the provenance a write by the current `interview_actor` produces.
-const ACTOR_PROVENANCE: &str =
-    "(CASE WHEN COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user') = 'user' THEN 'user' ELSE 'agent' END)";
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ObligationCounts {
     pub requirements: usize,
@@ -43,16 +39,11 @@ impl<'a> ObligationRepo<'a> {
         Self { conn }
     }
 
-    /// Provenance comes from the acting party recorded for the current write
-    /// (`interview_actor`): the user makes a `user` obligation, anyone else an
-    /// `agent` one.
     pub fn insert(&self, row: &NodeObligation) -> Result<()> {
         let now = now_ms();
         self.conn.execute(
-            &format!(
-                "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, visual_design_path, created_at, updated_at, provenance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, {ACTOR_PROVENANCE})"
-            ),
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase, visual_design_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 uuid_to_blob(row.id),
                 uuid_to_blob(row.node_id),
@@ -89,6 +80,19 @@ impl<'a> ObligationRepo<'a> {
         Ok(rows)
     }
 
+    /// Every node's obligations (not global ones), grouped by node, then
+    /// kind and ordinal. Backs the project-wide `tod-cli obligations list`.
+    pub fn list_all(&self) -> Result<Vec<NodeObligation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, node_id, kind, ordinal, section, body, phase, visual_design_path FROM node_obligations
+             ORDER BY node_id, kind, ordinal",
+        )?;
+        let rows = stmt
+            .query_map([], map_obligation)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_ids_for_kind(&self, node_id: Uuid, kind: &str) -> Result<Vec<Uuid>> {
         let mut stmt = self.conn.prepare(
             "SELECT id FROM node_obligations WHERE node_id = ?1 AND kind = ?2 ORDER BY ordinal",
@@ -102,18 +106,9 @@ impl<'a> ObligationRepo<'a> {
         Ok(rows)
     }
 
-    /// A change of wording is a change of meaning: provenance follows the
-    /// acting party, and the user's edit clears the agent's attention score.
     pub fn update_body(&self, id: Uuid, body: &str) -> Result<()> {
         let n = self.conn.execute(
-            &format!(
-                "UPDATE node_obligations SET
-                    provenance = CASE WHEN body IS ?1 THEN provenance ELSE {ACTOR_PROVENANCE} END,
-                    attention = CASE WHEN body IS NOT ?1 AND {ACTOR_PROVENANCE} = 'user' THEN NULL ELSE attention END,
-                    attention_why = CASE WHEN body IS NOT ?1 AND {ACTOR_PROVENANCE} = 'user' THEN NULL ELSE attention_why END,
-                    body = ?1, updated_at = ?2
-                 WHERE id = ?3"
-            ),
+            "UPDATE node_obligations SET body = ?1, updated_at = ?2 WHERE id = ?3",
             params![body, now_ms(), uuid_to_blob(id)],
         )?;
         if n == 0 {
@@ -234,13 +229,6 @@ impl<'a> ObligationRepo<'a> {
         if row.node_id == target_node_id {
             return Ok(());
         }
-        // A move doesn't change meaning, so provenance and attention travel along.
-        let (provenance, attention, attention_why): (String, Option<String>, Option<String>) =
-            self.conn.query_row(
-                "SELECT provenance, attention, attention_why FROM node_obligations WHERE id = ?1",
-                params![uuid_to_blob(id)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
         self.conn.execute(
             "DELETE FROM node_obligations WHERE id = ?1",
             params![uuid_to_blob(id)],
@@ -257,10 +245,6 @@ impl<'a> ObligationRepo<'a> {
             phase: row.phase,
             visual_design_path: row.visual_design_path,
         })?;
-        self.conn.execute(
-            "UPDATE node_obligations SET provenance = ?1, attention = ?2, attention_why = ?3 WHERE id = ?4",
-            params![provenance, attention, attention_why, uuid_to_blob(id)],
-        )?;
         Ok(())
     }
 
@@ -277,6 +261,15 @@ impl<'a> ObligationRepo<'a> {
         ids.swap(pos, new_pos as usize);
         self.write_ordinals(row.node_id, &row.kind, &ids)?;
         Ok(())
+    }
+
+    /// Move `id` to the 0-based `index` within its node and kind.
+    pub fn place(&self, id: Uuid, index: usize) -> Result<()> {
+        let row = self.get(id)?.context("obligation not found")?;
+        let mut ids = self.list_ids_for_kind(row.node_id, &row.kind)?;
+        ids.retain(|item| *item != id);
+        ids.insert(index.min(ids.len()), id);
+        self.write_ordinals(row.node_id, &row.kind, &ids)
     }
 
     pub fn counts_for_list(&self, list_id: Uuid) -> Result<HashMap<Uuid, ObligationCounts>> {

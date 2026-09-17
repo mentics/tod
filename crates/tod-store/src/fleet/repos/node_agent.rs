@@ -3,8 +3,8 @@
 //! Each value is optional; unset values follow the settings for the launch role.
 
 use crate::agent_launch::{
-    AgentLaunchOptions, coerce_effort, coerce_model, default_model_for, parse_platform,
-    DEFAULT_EFFORT,
+    AgentLaunchOptions, DEFAULT_EFFORT, coerce_effort, coerce_model, default_model_for,
+    parse_platform,
 };
 use crate::fleet::repos::{node_id_blob, node_id_column};
 use crate::outline::uuid_blob::now_ms;
@@ -133,7 +133,8 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let node_id = seed_node(&conn);
         let repo = NodeAgentRepo::new(&conn);
-        repo.upsert(&node_id, Some("cursor"), None, Some("low")).unwrap();
+        repo.upsert(&node_id, Some("cursor"), None, Some("low"))
+            .unwrap();
         let agent = repo.get(&node_id).unwrap().unwrap();
         assert_eq!(agent.platform.as_deref(), Some("cursor"));
         assert_eq!(agent.model, None);

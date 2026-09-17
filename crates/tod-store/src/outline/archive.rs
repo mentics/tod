@@ -42,6 +42,9 @@ pub struct ArchivedNode {
     pub files: Option<ArchivedNodeFiles>,
     #[serde(default)]
     pub agent: Option<ArchivedNodeAgent>,
+    /// Archives written before plan steps were archived have none.
+    #[serde(default)]
+    pub plan_steps: Vec<ArchivedPlanStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +107,22 @@ pub struct ArchivedObligation {
 /// as `unknown` rather than failing.
 fn default_archived_phase() -> String {
     crate::interview::PHASE_UNKNOWN.to_string()
+}
+
+/// A plan step with its outgoing dependencies and obligation links. Edges
+/// whose other end is gone at restore time are skipped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedPlanStep {
+    pub id: Uuid,
+    pub ordinal: i32,
+    pub body: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub depends_on: Vec<Uuid>,
+    #[serde(default)]
+    pub satisfies: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +199,11 @@ pub fn restore_subtree(conn: &Connection, archive_id: Uuid, _media_root: &Path) 
     let depth_order = depth_sort(&archive.nodes);
     for node in &depth_order {
         restore_node(conn, node)?;
+    }
+    // Edges last: a step may depend on a step (or satisfy an obligation) of
+    // another node in the same subtree.
+    for node in &depth_order {
+        restore_plan_step_edges(conn, node)?;
     }
     conn.execute(
         "DELETE FROM node_subtree_archives WHERE id = ?1",
@@ -346,6 +370,7 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
             obligations.push(row?);
         }
     }
+    let plan_steps = snapshot_plan_steps(conn, node_id)?;
     let mut capability_archives = Vec::new();
     {
         let mut stmt = conn.prepare(
@@ -384,7 +409,61 @@ fn snapshot_node(conn: &Connection, node_id: Uuid) -> Result<ArchivedNode> {
         capability_archives,
         files: snapshot_node_files(conn, node_id)?,
         agent: snapshot_node_agent(conn, node_id)?,
+        plan_steps,
     })
+}
+
+fn snapshot_plan_steps(conn: &Connection, node_id: Uuid) -> Result<Vec<ArchivedPlanStep>> {
+    let repo = crate::outline::repos::PlanStepRepo::new(conn);
+    let mut steps = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, ordinal, body, status, created_at, updated_at
+             FROM node_plan_steps WHERE node_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![uuid_to_blob(node_id)], |row| {
+            let id_blob: Vec<u8> = row.get(0)?;
+            Ok(ArchivedPlanStep {
+                id: blob_to_uuid_sql(&id_blob)?,
+                ordinal: row.get(1)?,
+                body: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                depends_on: Vec::new(),
+                satisfies: Vec::new(),
+            })
+        })?;
+        for row in rows {
+            steps.push(row?);
+        }
+    }
+    for step in &mut steps {
+        step.depends_on = repo.list_dependencies(step.id)?;
+        step.satisfies = repo.list_obligations(step.id)?;
+    }
+    Ok(steps)
+}
+
+fn restore_plan_step_edges(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
+    for step in &archived.plan_steps {
+        let from = uuid_to_blob(step.id);
+        for dep in &step.depends_on {
+            conn.execute(
+                "INSERT OR IGNORE INTO node_plan_step_deps (step_id, depends_on_step_id)
+                 SELECT ?1, id FROM node_plan_steps WHERE id = ?2",
+                params![from, uuid_to_blob(*dep)],
+            )?;
+        }
+        for obligation in &step.satisfies {
+            conn.execute(
+                "INSERT OR IGNORE INTO node_plan_step_obligations (step_id, obligation_id)
+                 SELECT ?1, id FROM node_obligations WHERE id = ?2",
+                params![from, uuid_to_blob(*obligation)],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// JSON snapshot of capability-owned data before disable (for undo archives).
@@ -552,7 +631,13 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO node_agent (node_id, platform, model, effort, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![blob, agent.platform, agent.model, agent.effort, agent.updated_at],
+            params![
+                blob,
+                agent.platform,
+                agent.model,
+                agent.effort,
+                agent.updated_at
+            ],
         )?;
     }
     for obl in &archived.obligations {
@@ -569,6 +654,21 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 obl.phase,
                 obl.created_at,
                 obl.updated_at,
+            ],
+        )?;
+    }
+    for step in &archived.plan_steps {
+        conn.execute(
+            "INSERT OR IGNORE INTO node_plan_steps (id, node_id, ordinal, body, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                uuid_to_blob(step.id),
+                blob,
+                step.ordinal,
+                step.body,
+                step.status,
+                step.created_at,
+                step.updated_at,
             ],
         )?;
     }

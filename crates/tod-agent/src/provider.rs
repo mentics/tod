@@ -36,17 +36,19 @@ pub enum SessionPurpose {
     QuestionMaker,
     /// An interview answer processor session.
     AnswerProcessor,
-    /// A drafting (v3) drafter session.
+    /// Legacy: the removed drafter. Kept because the interview still maps
+    /// its legacy `Drafter` role here.
     Drafter,
-    /// A one-turn session that writes a node's summary for its descendants.
-    Summarizer,
+    /// The conversation view's agent: talks with the user, and acts on the
+    /// project through `tod-cli` as the conversation.
+    Conversation,
 }
 
 impl SessionPurpose {
     pub(crate) fn run_kind(self) -> AgentRunKind {
         match self {
-            Self::Chat => AgentRunKind::FleetAgent,
-            Self::QuestionMaker | Self::Drafter | Self::Summarizer => {
+            Self::Chat | Self::Conversation => AgentRunKind::FleetAgent,
+            Self::QuestionMaker | Self::Drafter => {
                 AgentRunKind::QuestionMakerReplenishment
             }
             Self::AnswerProcessor => AgentRunKind::AnswerProcessor,

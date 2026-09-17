@@ -198,7 +198,9 @@ impl InteractiveAgentView {
                 session_run_id.clone(),
                 launch.platform,
                 workspace_cwd.clone(),
-                agent_session_id.clone().expect("Loading implies a session id"),
+                agent_session_id
+                    .clone()
+                    .expect("Loading implies a session id"),
                 cx,
             );
         }

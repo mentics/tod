@@ -28,9 +28,3 @@ The two kinds inherit differently down the outline, and the difference matters:
 So when you are given an ancestor's context, expect its constraints in full and
 only a summary of its requirements. That is deliberate, not truncation.
 
-## Provenance
-
-Every obligation records who wrote it. One written by an agent is marked
-`agent` — in effect, but not confirmed by the user — and carries an
-**attention** level (how likely the user is to want to change it) with a
-one-line reason. Only the user, working in the app, creates a `user` one.

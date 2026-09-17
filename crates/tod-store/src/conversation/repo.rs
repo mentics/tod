@@ -1,0 +1,392 @@
+//! Conversation rows, turns, actions, and flags.
+
+use super::types::*;
+use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
+use anyhow::{Context, Result};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// How many words of the first user turn a picker entry shows.
+const OPENING_WORDS: usize = 8;
+
+const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
+     session_name, platform, model, effort, created_at, updated_at";
+
+const ACTION_COLUMNS: &str = "id, conversation_id, turn_seq, actor, kind, entity, entity_id, \
+     node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
+
+pub struct ConversationRepo<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ConversationRepo<'a> {
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    pub fn create(
+        &self,
+        focus: Focus,
+        platform: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Conversation> {
+        self.create_with_id(Uuid::new_v4(), focus, platform, model, effort)
+    }
+
+    /// [`Self::create`] with a caller-chosen id.
+    pub fn create_with_id(
+        &self,
+        id: Uuid,
+        focus: Focus,
+        platform: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Conversation> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO conversations
+             (id, focus_kind, focus_id, focus_node_id, platform, model, effort, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                uuid_to_blob(id),
+                focus.kind_str(),
+                focus.focus_id().map(uuid_to_blob),
+                focus_node_column(focus).map(uuid_to_blob),
+                platform,
+                model,
+                effort,
+                now
+            ],
+        )?;
+        self.get(id)?.context("conversation vanished after insert")
+    }
+
+    pub fn get(&self, id: Uuid) -> Result<Option<Conversation>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id = ?1"),
+                params![uuid_to_blob(id)],
+                map_conversation,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// The focus's conversations, most recently updated first.
+    pub fn list_for_focus(&self, focus: Focus) -> Result<Vec<ConversationSummary>> {
+        let conversations = self.for_focus(focus, None)?;
+        conversations
+            .into_iter()
+            .map(|conversation| {
+                let change_count = super::project::net_changes(self.conn, conversation.id)?.len();
+                let opening = self.opening(conversation.id)?;
+                Ok(ConversationSummary {
+                    conversation,
+                    change_count,
+                    opening,
+                })
+            })
+            .collect()
+    }
+
+    /// The focus's most recently updated conversation.
+    pub fn latest_for_focus(&self, focus: Focus) -> Result<Option<Conversation>> {
+        Ok(self.for_focus(focus, Some(1))?.into_iter().next())
+    }
+
+    fn for_focus(&self, focus: Focus, limit: Option<i64>) -> Result<Vec<Conversation>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CONVERSATION_COLUMNS} FROM conversations
+             WHERE focus_kind = ?1 AND focus_id IS ?2
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT ?3"
+        ))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    focus.kind_str(),
+                    focus.focus_id().map(uuid_to_blob),
+                    limit.unwrap_or(-1)
+                ],
+                map_conversation,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().collect()
+    }
+
+    fn opening(&self, conversation_id: Uuid) -> Result<String> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM conversation_turns
+                 WHERE conversation_id = ?1 AND role = 'user' ORDER BY seq LIMIT 1",
+                params![uuid_to_blob(conversation_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let body = body.unwrap_or_default();
+        let words: Vec<&str> = body.split_whitespace().collect();
+        let mut opening = words
+            .iter()
+            .take(OPENING_WORDS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if words.len() > OPENING_WORDS {
+            opening.push('…');
+        }
+        Ok(opening)
+    }
+
+    pub fn turns(&self, conversation_id: Uuid) -> Result<Vec<Turn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, role, body, created_at FROM conversation_turns
+             WHERE conversation_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(conversation_id)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(seq, role, body, created_at)| {
+                Ok(Turn {
+                    seq,
+                    role: TurnRole::parse(&role)?,
+                    body,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
+    pub fn append_turn(&self, conversation_id: Uuid, role: TurnRole, body: &str) -> Result<Turn> {
+        let now = now_ms();
+        let seq: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_turns WHERE conversation_id = ?1",
+            params![uuid_to_blob(conversation_id)],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO conversation_turns (id, conversation_id, seq, role, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                uuid_to_blob(Uuid::new_v4()),
+                uuid_to_blob(conversation_id),
+                seq,
+                role.as_str(),
+                body,
+                now
+            ],
+        )?;
+        self.touch(conversation_id, now)?;
+        Ok(Turn {
+            seq,
+            role,
+            body: body.to_string(),
+            created_at: now,
+        })
+    }
+
+    /// Record the provider session the conversation now continues (`None`
+    /// clears it, so the next message starts a fresh one).
+    pub fn set_agent_session(
+        &self,
+        conversation_id: Uuid,
+        agent_session_id: Option<&str>,
+        session_name: Option<&str>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE conversations SET agent_session_id = ?1,
+                    session_name = COALESCE(?2, session_name), updated_at = ?3
+             WHERE id = ?4",
+            params![
+                agent_session_id,
+                session_name,
+                now_ms(),
+                uuid_to_blob(conversation_id)
+            ],
+        )?;
+        anyhow::ensure!(n == 1, "conversation {conversation_id} not found");
+        Ok(())
+    }
+
+    /// The seq of the latest user turn (0 before the first): the turn an
+    /// agent's actions are attributed to.
+    pub fn max_user_seq(&self, conversation_id: Uuid) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM conversation_turns
+             WHERE conversation_id = ?1 AND role = 'user'",
+            params![uuid_to_blob(conversation_id)],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(super) fn touch(&self, conversation_id: Uuid, now: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+            params![now, uuid_to_blob(conversation_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Every action in the conversation, oldest first.
+    pub fn actions(&self, conversation_id: Uuid) -> Result<Vec<ActionRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ACTION_COLUMNS} FROM conversation_actions
+             WHERE conversation_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(conversation_id)], RawAction::read)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(RawAction::parse).collect()
+    }
+
+    pub fn action(&self, id: i64) -> Result<Option<ActionRow>> {
+        self.conn
+            .query_row(
+                &format!("SELECT {ACTION_COLUMNS} FROM conversation_actions WHERE id = ?1"),
+                params![id],
+                RawAction::read,
+            )
+            .optional()?
+            .map(RawAction::parse)
+            .transpose()
+    }
+
+    /// Unsure flags, keyed by item.
+    pub fn flags(&self, conversation_id: Uuid) -> Result<HashMap<(Entity, Uuid), String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT entity, entity_id, reason FROM conversation_flags WHERE conversation_id = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(conversation_id)], |row| {
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    blob_to_uuid_sql(&blob)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(entity, id, reason)| Ok(((Entity::parse(&entity)?, id), reason)))
+            .collect()
+    }
+}
+
+/// `focus_node_id` is stored only for items that live on a node.
+fn focus_node_column(focus: Focus) -> Option<Uuid> {
+    match focus {
+        Focus::Obligation { node, .. } | Focus::PlanStep { node, .. } => Some(node),
+        Focus::Project | Focus::Node(_) => None,
+    }
+}
+
+fn opt_uuid(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<Uuid>> {
+    row.get::<_, Option<Vec<u8>>>(index)?
+        .map(|blob| blob_to_uuid_sql(&blob))
+        .transpose()
+}
+
+fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversation>> {
+    let id_blob: Vec<u8> = row.get(0)?;
+    let id = blob_to_uuid_sql(&id_blob)?;
+    let kind: String = row.get(1)?;
+    let focus_id = opt_uuid(row, 2)?;
+    let focus_node = opt_uuid(row, 3)?;
+    let agent_session_id = row.get(4)?;
+    let session_name = row.get(5)?;
+    let platform = row.get(6)?;
+    let model = row.get(7)?;
+    let effort = row.get(8)?;
+    let created_at = row.get(9)?;
+    let updated_at = row.get(10)?;
+    Ok(
+        Focus::from_columns(&kind, focus_id, focus_node).map(|focus| Conversation {
+            id,
+            focus,
+            agent_session_id,
+            session_name,
+            platform,
+            model,
+            effort,
+            created_at,
+            updated_at,
+        }),
+    )
+}
+
+/// An action row as read, before its text columns are parsed.
+struct RawAction {
+    id: i64,
+    conversation_id: Uuid,
+    turn_seq: i64,
+    actor: String,
+    kind: String,
+    entity: String,
+    entity_id: Uuid,
+    node_id: Option<Uuid>,
+    mutation: String,
+    before: Option<String>,
+    after: Option<String>,
+    archive_id: Option<Uuid>,
+    reverses: Option<i64>,
+    reversed_by: Option<i64>,
+    at: i64,
+}
+
+impl RawAction {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let conversation: Vec<u8> = row.get(1)?;
+        let entity_id: Vec<u8> = row.get(6)?;
+        Ok(Self {
+            id: row.get(0)?,
+            conversation_id: blob_to_uuid_sql(&conversation)?,
+            turn_seq: row.get(2)?,
+            actor: row.get(3)?,
+            kind: row.get(4)?,
+            entity: row.get(5)?,
+            entity_id: blob_to_uuid_sql(&entity_id)?,
+            node_id: opt_uuid(row, 7)?,
+            mutation: row.get(8)?,
+            before: row.get(9)?,
+            after: row.get(10)?,
+            archive_id: opt_uuid(row, 11)?,
+            reverses: row.get(12)?,
+            reversed_by: row.get(13)?,
+            at: row.get(14)?,
+        })
+    }
+
+    fn parse(self) -> Result<ActionRow> {
+        let snapshot = |raw: Option<String>| -> Result<Option<EntitySnapshot>> {
+            raw.map(|s| serde_json::from_str(&s).context("bad action snapshot"))
+                .transpose()
+        };
+        Ok(ActionRow {
+            id: self.id,
+            conversation_id: self.conversation_id,
+            turn_seq: self.turn_seq,
+            actor: ActionActor::parse(&self.actor)?,
+            kind: ActionKind::parse(&self.kind)?,
+            entity: Entity::parse(&self.entity)?,
+            entity_id: self.entity_id,
+            node_id: self.node_id,
+            mutation: serde_json::from_str(&self.mutation).context("bad action mutation")?,
+            before: snapshot(self.before)?,
+            after: snapshot(self.after)?,
+            archive_id: self.archive_id,
+            reverses: self.reverses,
+            reversed_by: self.reversed_by,
+            at: self.at,
+        })
+    }
+}

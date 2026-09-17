@@ -69,6 +69,19 @@ impl<'a> PlanStepRepo<'a> {
         Ok(rows)
     }
 
+    /// Every plan step in the project, grouped by node, in ordinal order.
+    /// Backs the project-wide `tod-cli plan list`.
+    pub fn list_all(&self) -> Result<Vec<PlanStep>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, node_id, ordinal, body, status FROM node_plan_steps
+             ORDER BY node_id, ordinal",
+        )?;
+        let rows = stmt
+            .query_map([], map_plan_step)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_ids_for_node(&self, node_id: Uuid) -> Result<Vec<Uuid>> {
         let mut stmt = self
             .conn
@@ -190,6 +203,15 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
+    /// Move `id` to the 0-based `index` among its node's steps.
+    pub fn place(&self, id: Uuid, index: usize) -> Result<()> {
+        let row = self.get(id)?.context("plan step not found")?;
+        let mut ids = self.list_ids_for_node(row.node_id)?;
+        ids.retain(|item| *item != id);
+        ids.insert(index.min(ids.len()), id);
+        self.write_ordinals(row.node_id, &ids)
+    }
+
     pub fn list_dependencies(&self, step_id: Uuid) -> Result<Vec<Uuid>> {
         let mut stmt = self
             .conn
@@ -264,9 +286,9 @@ impl<'a> PlanStepRepo<'a> {
     }
 
     pub fn list_steps_for_obligation(&self, obligation_id: Uuid) -> Result<Vec<Uuid>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT step_id FROM node_plan_step_obligations WHERE obligation_id = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT step_id FROM node_plan_step_obligations WHERE obligation_id = ?1")?;
         let rows = stmt
             .query_map(params![uuid_to_blob(obligation_id)], |row| {
                 let blob: Vec<u8> = row.get(0)?;
@@ -330,7 +352,12 @@ impl<'a> PlanStepRepo<'a> {
             self.conn.execute(
                 "UPDATE node_plan_steps SET ordinal = ?1, updated_at = ?2
                  WHERE id = ?3 AND node_id = ?4",
-                params![-(i as i32 + 1), now, uuid_to_blob(*id), uuid_to_blob(node_id)],
+                params![
+                    -(i as i32 + 1),
+                    now,
+                    uuid_to_blob(*id),
+                    uuid_to_blob(node_id)
+                ],
             )?;
         }
         for (i, id) in ids.iter().enumerate() {

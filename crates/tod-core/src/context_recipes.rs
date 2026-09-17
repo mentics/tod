@@ -64,33 +64,6 @@ const OWN_OBLIGATIONS_NOTE: &str =
      ancestor context below, whose requirements are settled and whose \
      constraints still bind.";
 
-/// The obligations-panel chat. Interactive, and the one surface with a scoped
-/// exception to "confirm first" — see `surface/obligations.md`, which states
-/// that exception in terms of the stance rather than contradicting it.
-pub const OBLIGATIONS_CHAT: ContextRecipe = ContextRecipe {
-    name: "obligations chat",
-    layers: &[
-        "stance/interactive-chat",
-        "domain/outline",
-        "domain/obligations",
-        "domain/plan",
-        "cli/intro",
-        "cli/node",
-        "cli/obligations",
-        "cli/plan",
-        "surface/obligations",
-    ],
-    blocks: &[
-        DynamicBlock::DataRoot,
-        DynamicBlock::Node,
-        DynamicBlock::AncestorContext,
-        DynamicBlock::SelectedObligation {
-            fallback: "No individual obligation is selected — the user is looking at \
-                       the node's obligations as a whole.",
-        },
-    ],
-};
-
 /// The visual-design chat. It mutates through exactly one command, so it loads
 /// `cli/visual-design` and none of the other nouns. An obligation is always
 /// selected here (the chat is scoped to one), hence no fallback.
@@ -173,7 +146,7 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
 };
 
 /// An on-entry turn. Unlike gate-check this turn does real work (e.g.
-/// `planning` drafting plan steps), so its stance is `autonomous-session` and
+/// `planning` writing plan steps), so its stance is `autonomous-session` and
 /// it loads the CLI nouns it writes through.
 pub const ON_ENTRY: ContextRecipe = ContextRecipe {
     name: "on-entry",
@@ -238,34 +211,38 @@ pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
     blocks: &[],
 };
 
-/// A drafting agent turn (drafter or capture). Dynamic half is
-/// `drafting::context::snapshot`.
-pub const DRAFTING_AGENT: ContextRecipe = ContextRecipe {
-    name: "drafting agent",
+/// The conversation view's agent. Interactive, with the whole project in
+/// scope: `surface/conversation` states its exception to "confirm first"
+/// (every action is recorded and reversible) and its reply rule. The focus is
+/// only where the conversation starts.
+pub const CONVERSATION: ContextRecipe = ContextRecipe {
+    name: "conversation",
     layers: &[
-        "stance/agent-to-agent",
+        "stance/interactive-chat",
         "domain/outline",
         "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
         "cli/intro",
         "cli/node",
         "cli/obligations",
+        "cli/plan",
         "cli/content",
-        "cli/drafting",
-        "cli/visual-design",
+        "cli/changeset",
+        "surface/conversation",
     ],
-    blocks: &[],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
 };
 
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
-    OBLIGATIONS_CHAT,
+    CONVERSATION,
     VISUAL_DESIGN_CHAT,
     IMPLEMENT_SESSION,
     GATE_CHECK,
     ON_ENTRY,
     FLEET_AUTONOMOUS,
     INTERVIEW_AGENT,
-    DRAFTING_AGENT,
 ];
 
 #[cfg(test)]
@@ -337,8 +314,9 @@ mod tests {
     }
 
     /// Behavioural policy lives in exactly one place per prompt. Loading two
-    /// stances is how the obligations chat ended up telling the agent both to
-    /// confirm before editing and to edit without confirming.
+    /// stances is how the (since removed) obligations chat ended up telling
+    /// the agent both to confirm before editing and to edit without
+    /// confirming.
     #[test]
     fn every_recipe_has_exactly_one_stance() {
         for recipe in ALL_RECIPES {
@@ -394,8 +372,8 @@ mod tests {
         }
     }
 
-    /// The same rule over `assets/process/`. The interview and drafting role
-    /// docs each carried their own command table, abbreviated and already
+    /// The same rule over `assets/process/`. The interview role docs (and the
+    /// since-removed ones for the old spec-writing agent) carried their own command table, abbreviated and already
     /// drifted from the binary (the interview one omitted `obligations add
     /// --phase`, which is required). They now point at the `cli/` fragments
     /// their recipes load.
@@ -416,12 +394,12 @@ mod tests {
             "node ",
             "obligations ",
             "plan ",
-            "drafting ",
             "content ",
             "questions ",
             "memory ",
             "interview ",
             "visual-design ",
+            "changeset ",
         ];
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -482,8 +460,7 @@ mod tests {
     /// never says what it is sends it looking for the value.
     ///
     /// Recipes with no blocks render their dynamic half elsewhere (the
-    /// interview and drafting snapshots, which emit their own `Data root:`
-    /// line) and are out of scope here.
+    /// interview snapshots, which emit their own `Data root:` line) and are out of scope here.
     #[test]
     fn recipes_that_load_cli_fragments_render_the_data_root() {
         for recipe in ALL_RECIPES {

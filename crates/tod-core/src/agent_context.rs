@@ -7,7 +7,7 @@
 //! [`crate::context_recipes::build_message`]. This module's job is turning the
 //! caller's request into a [`DynamicContext`].
 
-use crate::context_recipes::{IMPLEMENT_SESSION, OBLIGATIONS_CHAT, VISUAL_DESIGN_CHAT};
+use crate::context_recipes::{IMPLEMENT_SESSION, VISUAL_DESIGN_CHAT};
 use crate::dynamic::DynamicContext;
 use crate::gate::PlanStepWithLinks;
 use crate::media::MediaPaths;
@@ -32,8 +32,6 @@ pub struct ContextRequest<'a> {
     pub ancestor_context: String,
 }
 
-/// The recipe for a chat opened from the obligations panel.
-pub const OBLIGATIONS_RECIPE: &ContextRecipe = &OBLIGATIONS_CHAT;
 /// The recipe for a chat opened from the visual-design panel.
 pub const VISUAL_DESIGN_RECIPE: &ContextRecipe = &VISUAL_DESIGN_CHAT;
 
@@ -109,6 +107,21 @@ mod tests {
     use crate::dynamic::{DynamicBlock, render};
     use uuid::Uuid;
 
+    /// A chat recipe with a selection fallback, standing in for a surface
+    /// that shows a node's obligations as a whole.
+    const NODE_CHAT: &ContextRecipe = &ContextRecipe {
+        name: "test node chat",
+        layers: &[],
+        blocks: &[
+            DynamicBlock::DataRoot,
+            DynamicBlock::Node,
+            DynamicBlock::AncestorContext,
+            DynamicBlock::SelectedObligation {
+                fallback: "No individual obligation is selected",
+            },
+        ],
+    };
+
     fn node() -> NodeSelection {
         NodeSelection {
             id: Uuid::nil(),
@@ -135,7 +148,7 @@ mod tests {
     #[test]
     fn includes_data_root_and_node_identity_and_text() {
         let req = ContextRequest {
-            recipe: OBLIGATIONS_RECIPE,
+            recipe: NODE_CHAT,
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
@@ -152,7 +165,7 @@ mod tests {
     #[test]
     fn a_chat_carries_what_the_node_inherits() {
         let req = ContextRequest {
-            recipe: OBLIGATIONS_RECIPE,
+            recipe: NODE_CHAT,
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: None,
@@ -166,9 +179,9 @@ mod tests {
         );
     }
 
-    /// The obligations-panel remark is the obligations recipe's wording, so a
-    /// different surface must not pick it up. This used to be a
-    /// `surface == "obligations"` branch inside the renderer.
+    /// A selection fallback is one recipe's wording, so a different surface
+    /// must not pick it up. This used to be a `surface == "obligations"`
+    /// branch inside the renderer.
     #[test]
     fn another_surface_omits_the_obligations_panel_wording() {
         let req = ContextRequest {
@@ -184,7 +197,7 @@ mod tests {
     #[test]
     fn selected_obligation_contributes_id_and_body() {
         let req = ContextRequest {
-            recipe: OBLIGATIONS_RECIPE,
+            recipe: NODE_CHAT,
             data_root: Path::new("/data/tod"),
             node: node(),
             obligation: Some(ObligationSelection {

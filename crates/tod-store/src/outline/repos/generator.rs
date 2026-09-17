@@ -125,16 +125,14 @@ impl<'a> GeneratorRepo<'a> {
         // Walk up the parent chain looking for a node with generator capability.
         let mut current = Some(node_id);
         while let Some(nid) = current {
-            let has_gen: bool = self
-                .conn
-                .query_row(
-                    "SELECT EXISTS(
+            let has_gen: bool = self.conn.query_row(
+                "SELECT EXISTS(
                         SELECT 1 FROM node_capabilities
                         WHERE node_id = ?1 AND capability = 'generator'
                     )",
-                    params![uuid_to_blob(nid)],
-                    |row| row.get(0),
-                )?;
+                params![uuid_to_blob(nid)],
+                |row| row.get(0),
+            )?;
             if has_gen {
                 return Ok(true);
             }
@@ -162,16 +160,14 @@ impl<'a> GeneratorRepo<'a> {
     pub fn find_generator_ancestor(&self, node_id: Uuid) -> Result<Option<Uuid>> {
         let mut current = Some(node_id);
         while let Some(nid) = current {
-            let has_gen: bool = self
-                .conn
-                .query_row(
-                    "SELECT EXISTS(
+            let has_gen: bool = self.conn.query_row(
+                "SELECT EXISTS(
                         SELECT 1 FROM node_capabilities
                         WHERE node_id = ?1 AND capability = 'generator'
                     )",
-                    params![uuid_to_blob(nid)],
-                    |row| row.get(0),
-                )?;
+                params![uuid_to_blob(nid)],
+                |row| row.get(0),
+            )?;
             if has_gen {
                 return Ok(Some(nid));
             }
@@ -251,7 +247,11 @@ impl<'a> GeneratorRepo<'a> {
 
     /// List links on copied-out (non-managed) nodes matching a generator and
     /// external id — the set of copies a refresh should push field updates to.
-    pub fn copy_links_for(&self, generator_node_id: Uuid, external_id: &str) -> Result<Vec<ManagedNodeLink>> {
+    pub fn copy_links_for(
+        &self,
+        generator_node_id: Uuid,
+        external_id: &str,
+    ) -> Result<Vec<ManagedNodeLink>> {
         let mut stmt = self.conn.prepare(
             "SELECT l.node_id, l.generator_node_id, l.external_id, l.source_type, l.user_modified_fields
              FROM managed_node_links l
@@ -366,11 +366,7 @@ impl<'a> GeneratorRepo<'a> {
         Ok(result)
     }
 
-    pub fn update_user_modified_fields(
-        &self,
-        node_id: Uuid,
-        fields: &[String],
-    ) -> Result<()> {
+    pub fn update_user_modified_fields(&self, node_id: Uuid, fields: &[String]) -> Result<()> {
         let json = serde_json::to_string(fields)?;
         self.conn.execute(
             "UPDATE managed_node_links SET user_modified_fields = ?2 WHERE node_id = ?1",

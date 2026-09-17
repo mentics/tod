@@ -73,7 +73,7 @@ impl<'a> NotificationRepo<'a> {
         Ok(())
     }
 
-    /// A notification about a run that needs attention. Doesn't touch
+    /// A notification about a run that needs the user. Doesn't touch
     /// `runtime_status` — whether a run is stuck waiting on something is an
     /// `tod_agent::EngagementState` concern (live-only), not a durable one;
     /// this run is still active either way.

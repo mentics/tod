@@ -129,13 +129,11 @@ impl<'a> NodeRepo<'a> {
 
         // Generator cannot be enabled on a node that already has children.
         if cap == Capability::Generator {
-            let has_children: bool = self
-                .conn
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM outline_entries WHERE parent_id = ?1)",
-                    params![&blob],
-                    |row| row.get(0),
-                )?;
+            let has_children: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM outline_entries WHERE parent_id = ?1)",
+                params![&blob],
+                |row| row.get(0),
+            )?;
             if has_children {
                 bail!("Cannot enable Generator on a node that already has children");
             }

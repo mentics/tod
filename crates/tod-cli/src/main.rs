@@ -9,9 +9,9 @@
 //! that changed since the session's context was built.
 
 mod args;
+mod changeset;
 #[cfg(test)]
 mod doc_sync;
-mod drafting;
 mod interview;
 mod node;
 mod obligations;
@@ -36,13 +36,13 @@ GLOBAL OPTIONS:
 NOUNS:
     node                   Outline nodes: create, inspect, search, move, delete
     obligations            Requirements and constraints attached to a node
-    drafting               Dumps, choices, and buildable while a node's spec is drafted
     content                A node's details, design, plan, and summary
     plan                   Structured, dependency-graph plan steps for a node
     questions              Interview questions for a node
     memory                 Interview memory notes for a node
     interview              Interview session state
     visual-design          the UI mockup associated with one obligation
+    changeset              This conversation's net changes and unsure flags
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -126,15 +126,15 @@ fn run(args: &[String]) -> anyhow::Result<String> {
     match noun.as_str() {
         "node" => node::run(invocation),
         "obligations" => obligations::run(invocation),
-        "drafting" => drafting::run(invocation),
         "content" => interview::content(invocation),
         "plan" => plan::run(invocation),
         "questions" => interview::questions(invocation),
         "memory" => interview::memory(invocation),
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
+        "changeset" => changeset::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, drafting, content, plan, questions, memory, interview, visual-design)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset)"
         ),
     }
 }
@@ -283,19 +283,11 @@ Second."), "{listed}");
         let listed = cli(&root, &["obligations", "list", "--node", &node]).unwrap();
         assert_eq!(
             listed,
-            format!("[{short}] requirements/requirement (Core) <agent>: Keep it simple.")
+            format!("[{short}] requirements/requirement (Core): Keep it simple.")
         );
 
-        // Attention needs its reason; both show in listings.
-        let err = cli(&root, &["obligations", "update", &short, "--attention", "high"]).unwrap_err();
-        assert!(err.to_string().contains("--why"), "{err}");
-        cli(
-            &root,
-            &["obligations", "update", &short, "--attention", "high", "--why", "A taste call"],
-        )
-        .unwrap();
-        let listed = cli(&root, &["obligations", "list", "--node", &node]).unwrap();
-        assert!(listed.contains("<agent, high: A taste call>"), "{listed}");
+        // Obligations carry no marks, so listings show none.
+        assert!(!listed.contains('<'), "{listed}");
 
         // References must name a node that exists.
         let err = cli(&root, &["obligations", "add", "--node", &node, "--kind", "req", "--body", "…"])
@@ -327,37 +319,6 @@ Second."), "{listed}");
             cli(&root, &["obligations", "list", "--node", &node]).unwrap(),
             "(none)"
         );
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn drafting_dumps_choices_and_buildable() {
-        let (root, node, _) = data_root();
-        let node = node.to_string();
-        assert_eq!(
-            cli(&root, &["drafting", "dump", "--node", &node, "--body", "Notes sync."]).unwrap(),
-            "ok d-1"
-        );
-        let dumps = cli(&root, &["drafting", "dumps", "--node", &node]).unwrap();
-        assert_eq!(dumps, "d-1 (not routed): Notes sync.");
-
-        assert_eq!(cli(&root, &["drafting", "choices", "--node", &node]).unwrap(), "(none)");
-        let err = cli(
-            &root,
-            &["drafting", "buildable", "--node", &node, "--outcome", "maybe"],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("pass"), "{err}");
-        assert_eq!(
-            cli(
-                &root,
-                &["drafting", "buildable", "--node", &node, "--outcome", "pass", "--detail", "Clear."]
-            )
-            .unwrap(),
-            "ok"
-        );
-        let err = cli(&root, &["drafting", "withdraw-choice", "--node", &node, "c-4"]).unwrap_err();
-        assert!(err.to_string().contains("c-4"), "{err}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -567,6 +528,138 @@ Second."), "{listed}");
             cli(&root, &["plan", "delete", &step_b_short]).unwrap(),
             format!("ok {step_b_short}")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A top-level Spec node titled `title` in the data root's one list, plus
+    /// `children` Spec nodes, each a child of the one before (a chain).
+    fn add_chain(root: &PathBuf, title: &str, children: &[&str]) -> Vec<Uuid> {
+        let fleet = Arc::new(FleetStore::open(root).unwrap());
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let mut ids = Vec::new();
+        let mut parent = None;
+        for title in std::iter::once(&title).chain(children) {
+            let id = Uuid::new_v4();
+            fleet
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(id),
+                    list_id,
+                    parent_id: parent,
+                    anchor_id: None,
+                    position: if parent.is_some() {
+                        CreatePosition::Child
+                    } else {
+                        CreatePosition::Below
+                    },
+                    title: title.to_string(),
+                })
+                .unwrap();
+            fleet
+                .enqueue_outline(OutlineMutation::EnableCapabilities {
+                    node_id: id,
+                    capabilities: vec![Capability::Spec],
+                })
+                .unwrap();
+            ids.push(id);
+            parent = Some(id);
+        }
+        ids
+    }
+
+    fn slug(root: &PathBuf, node: Uuid) -> String {
+        let output = cli(root, &["--json", "node", "show", &node.to_string()]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        json["slug"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn obligations_and_plan_search_the_whole_project_without_a_node() {
+        let (root, first, _) = data_root();
+        let second = add_chain(&root, "Billing", &[])[0];
+        let (first_str, second_str) = (first.to_string(), second.to_string());
+        for (node, body) in [
+            (&first_str, "Passwords are hashed with argon2."),
+            (&second_str, "Invoices list every password reset fee."),
+            (&second_str, "Totals round to the cent."),
+        ] {
+            cli(&root, &["obligations", "add", "--node", node, "--kind", "req", "--body", body])
+                .unwrap();
+            cli(&root, &["plan", "add", "--node", node, "--body", body]).unwrap();
+        }
+
+        // Neither a node nor a search: refused, with the reason.
+        let err = cli(&root, &["obligations", "list"]).unwrap_err();
+        assert!(err.to_string().contains("--search"), "{err}");
+        let err = cli(&root, &["plan", "list"]).unwrap_err();
+        assert!(err.to_string().contains("--search"), "{err}");
+        let err = cli(&root, &["obligations", "list", "--search", "x", "--inherited"]).unwrap_err();
+        assert!(err.to_string().contains("--node"), "{err}");
+
+        let (first_slug, second_slug) = (slug(&root, first), slug(&root, second));
+        let found = cli(&root, &["obligations", "list", "--search", "password"]).unwrap();
+        let lines: Vec<&str> = found.lines().collect();
+        assert_eq!(lines.len(), 2, "{found}");
+        assert!(
+            found.contains(&format!(" on {first_slug}: Passwords are hashed")),
+            "{found}"
+        );
+        assert!(found.contains(&format!(" on {second_slug}: Invoices")), "{found}");
+        assert!(!found.contains("Totals"), "{found}");
+
+        let json = cli(&root, &["--json", "obligations", "list", "--search", "password"]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert!(json[0]["node_slug"].is_string(), "{json}");
+
+        let steps = cli(&root, &["plan", "list", "--search", "password"]).unwrap();
+        assert_eq!(steps.lines().count(), 2, "{steps}");
+        assert!(steps.contains(&format!(" on {first_slug}: Passwords")), "{steps}");
+        assert!(steps.contains(&format!(" on {second_slug}: Invoices")), "{steps}");
+
+        // With a node, a search narrows that node's list and names no node.
+        let steps = cli(&root, &["plan", "list", "--node", &second_str, "--search", "cent"]).unwrap();
+        assert!(steps.ends_with(": Totals round to the cent."), "{steps}");
+        assert!(!steps.contains(" on "), "{steps}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn node_tree_indents_counts_and_respects_depth() {
+        let (root, _, _) = data_root();
+        let chain = add_chain(&root, "Top", &["Middle", "Bottom"]);
+        let top = chain[0].to_string();
+        cli(&root, &["obligations", "add", "--node", &top, "--kind", "req", "--body", "One."]).unwrap();
+        cli(&root, &["obligations", "add", "--node", &top, "--kind", "con", "--body", "Two."]).unwrap();
+        cli(&root, &["plan", "add", "--node", &chain[1].to_string(), "--body", "Step."]).unwrap();
+        let slugs: Vec<String> = chain.iter().map(|id| slug(&root, *id)).collect();
+
+        let full = cli(&root, &["node", "tree", &slugs[0]]).unwrap();
+        assert_eq!(
+            full,
+            format!(
+                "{}  Top  (obligations: 2, plan steps: 0)\n  {}  Middle  (obligations: 0, plan steps: 1)\n    {}  Bottom  (obligations: 0, plan steps: 0)",
+                slugs[0], slugs[1], slugs[2]
+            )
+        );
+
+        let one = cli(&root, &["node", "tree", &top, "--depth", "1"]).unwrap();
+        assert_eq!(
+            one,
+            format!(
+                "{}  Top  (obligations: 2, plan steps: 0)\n  {}  Middle  (obligations: 0, plan steps: 1, 1 more below)",
+                slugs[0], slugs[1]
+            )
+        );
+
+        let zero = cli(&root, &["node", "tree", &top, "--depth", "0"]).unwrap();
+        assert_eq!(zero, format!("{}  Top  (obligations: 2, plan steps: 0, 1 more below)", slugs[0]));
+
+        let json = cli(&root, &["--json", "node", "tree", &slugs[1]]).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 2, "{json}");
+        assert_eq!(json[1]["depth"], 1);
+
+        assert!(cli(&root, &["node", "tree", &top, "--depth", "-1"]).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

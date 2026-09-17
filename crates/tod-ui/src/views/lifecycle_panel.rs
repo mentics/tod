@@ -1120,7 +1120,7 @@ impl LifecyclePanelView {
 
     /// Fire the on-entry turn for `task_id`, which just landed in `lifecycle` —
     /// the new state's own agent doing its state's "On entry" responsibilities
-    /// (e.g. `planning` drafting plan steps), per `assets/process/agents/state/base.md`.
+    /// (e.g. `planning` writing plan steps), per `assets/process/agents/state/base.md`.
     /// Called automatically from every place a lifecycle transition actually
     /// lands: an agent's own gate-check pass, the human Advance button after
     /// waiving criteria, and Force advance. Idempotent by design (the prompt

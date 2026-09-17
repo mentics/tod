@@ -65,8 +65,9 @@ pub const ENTITY_PLAN_STEP: &str = "plan_step";
 pub const ENTITY_PLAN_STEP_DEP: &str = "plan_step_dep";
 pub const ENTITY_PLAN_STEP_OBLIGATION: &str = "plan_step_obligation";
 
-/// An interview agent role. `Drafter` is the drafting (v3) agent; the other
-/// two belong to the v2 question interview.
+/// An interview agent role. `Drafter` is legacy: it named the removed drafting
+/// agent and stays so existing session rows still parse. The other two belong
+/// to the v2 question interview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
@@ -251,9 +252,6 @@ pub struct ObligationPrior {
     pub section: Option<String>,
     pub body: String,
     pub phase: String,
-    pub provenance: String,
-    pub attention: Option<String>,
-    pub attention_why: Option<String>,
     pub visual_design_path: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,

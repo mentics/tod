@@ -13,7 +13,7 @@
 
 ### Implementation interview
 
-The interview is not a required step — it exists only for decisions you genuinely cannot make yourself. After drafting the plan, open an **implementation interview** via the app only if real questions remain: a tradeoff with no obvious right answer, a gap design left open, or a parked item that needs the user's judgment to resolve. If nothing meets that bar, do not open one — proceeding straight to the gate with a self-drafted, fully-traceable plan is the normal, unremarkable path, not something to record as a waiver.
+The interview is not a required step — it exists only for decisions you genuinely cannot make yourself. After writing the plan, open an **implementation interview** via the app only if real questions remain: a tradeoff with no obvious right answer, a gap design left open, or a parked item that needs the user's judgment to resolve. If nothing meets that bar, do not open one — proceeding straight to the gate with a self-drafted, fully-traceable plan is the normal, unremarkable path, not something to record as a waiver.
 
 When an interview does run, it should probe only the genuine unknowns:
 

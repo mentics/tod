@@ -132,54 +132,63 @@ pub enum InterviewCommand {
         text: String,
     },
 
-    // ── Drafting (v3) ───────────────────────────────────────────────────
-    /// Something the user said, aimed at a node (or nowhere in particular).
-    AddDump {
+    // ── Conversation ────────────────────────────────────────────────────
+    /// Start a conversation about `focus` with a caller-chosen id.
+    CreateConversation {
+        id: Uuid,
+        focus: crate::conversation::Focus,
         #[serde(default)]
-        node_id: Option<Uuid>,
+        platform: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    /// Append a transcript entry; returns its `seq`.
+    AppendConversationTurn {
+        conversation_id: Uuid,
+        role: crate::conversation::TurnRole,
+        #[serde(default)]
         body: String,
     },
-    AddChoice {
-        node_id: Uuid,
+    /// Record the provider session the conversation continues (`None` clears
+    /// it, so the next message starts a fresh one).
+    SetConversationSession {
+        conversation_id: Uuid,
         #[serde(default)]
-        context: Option<String>,
-        question: String,
-        options: Vec<crate::drafting::ChoiceOption>,
+        agent_session_id: Option<String>,
+        #[serde(default)]
+        session_name: Option<String>,
     },
-    /// `option: None` delegates the call back to the drafter.
-    AnswerChoice {
-        node_id: Uuid,
-        seq: i64,
-        #[serde(default)]
-        option: Option<i64>,
+    /// A user edit made from the conversation view: recorded as the user's
+    /// action, and it clears the item's unsure flag.
+    ConversationEdit {
+        conversation_id: Uuid,
+        mutation: OutlineMutation,
     },
-    WithdrawChoice {
-        node_id: Uuid,
-        seq: i64,
+    /// Flag an item the conversation changed as unsure.
+    FlagConversationItem {
+        conversation_id: Uuid,
+        entity: crate::conversation::Entity,
+        entity_id: Uuid,
+        reason: String,
     },
-    ConfirmObligation {
-        obligation_id: Uuid,
+    UnflagConversationItem {
+        conversation_id: Uuid,
+        entity: crate::conversation::Entity,
+        entity_id: Uuid,
     },
-    SetAttention {
-        obligation_id: Uuid,
-        attention: String,
+    /// Reverse actions newest-first, as the user. Applies nothing (and
+    /// returns `needs_confirmation`) when an item changed since the
+    /// conversation last touched it, unless `force`, or when unselected
+    /// actions depend on the selection, unless `include_dependents`.
+    ReverseConversationActions {
+        conversation_id: Uuid,
+        action_ids: Vec<i64>,
         #[serde(default)]
-        why: Option<String>,
-    },
-    SetBuildable {
-        node_id: Uuid,
-        outcome: String,
+        include_dependents: bool,
         #[serde(default)]
-        detail: Option<String>,
-    },
-    RecordDraftingTurn {
-        node_id: Uuid,
-        #[serde(default)]
-        summary: Option<String>,
-        #[serde(default)]
-        dump_seqs: Vec<i64>,
-        #[serde(default)]
-        choice_seqs: Vec<i64>,
+        force: bool,
     },
 }
 
@@ -294,7 +303,10 @@ pub fn execute(
             Ok(json!({ "withdrawn": labels }))
         }
 
-        InterviewCommand::ResetQuestions { node_id, session_id } => {
+        InterviewCommand::ResetQuestions {
+            node_id,
+            session_id,
+        } => {
             let open = repo.list_questions(*node_id, &[STATUS_OPEN, STATUS_DEFERRED])?;
             for q in &open {
                 conn.execute(
@@ -338,9 +350,13 @@ pub fn execute(
                 bail!("an answer needs an option or text");
             }
             let applied = match (&q.proposal, option) {
-                (Some(proposal), Some(1)) => {
-                    Some(apply_proposal(conn, media_root, &q, proposal, edited.as_deref())?)
-                }
+                (Some(proposal), Some(1)) => Some(apply_proposal(
+                    conn,
+                    media_root,
+                    &q,
+                    proposal,
+                    edited.as_deref(),
+                )?),
                 _ => None,
             };
             conn.execute(
@@ -473,7 +489,13 @@ pub fn execute(
                 bail!("body cannot be empty");
             }
             guard(&repo, agent.as_ref(), actor, note.id, || {
-                Ok(format!("{} {} ({}): {}", note.label(), note.kind, note.status, note.body))
+                Ok(format!(
+                    "{} {} ({}): {}",
+                    note.label(),
+                    note.kind,
+                    note.status,
+                    note.body
+                ))
             })?;
             conn.execute(
                 "UPDATE interview_memory
@@ -511,8 +533,11 @@ pub fn execute(
                     .optional()?;
                 if let Some(node_blob) = node_id {
                     let node_id = crate::outline::uuid_blob::blob_to_uuid_sql(&node_blob)?;
-                    let open_handoffs =
-                        InterviewRepo::new(conn).list_memory(node_id, Some(MEMORY_HANDOFF), Some(MEMORY_OPEN))?;
+                    let open_handoffs = InterviewRepo::new(conn).list_memory(
+                        node_id,
+                        Some(MEMORY_HANDOFF),
+                        Some(MEMORY_OPEN),
+                    )?;
                     if !open_handoffs.is_empty() {
                         bail!(
                             "cannot declare exhaustion with {} open handoff note(s) — close them first with `memory update --status done`, or address what they ask for",
@@ -622,7 +647,26 @@ pub fn execute(
                 })?;
             }
             if actor != ACTOR_USER {
-                crate::drafting::check_references(conn, mutation)?;
+                crate::outline::check_references(conn, mutation)?;
+            }
+            if let Some(prefixed) = actor.strip_prefix(crate::conversation::ACTOR_PREFIX) {
+                // A conversation's agent: record the write in its action log.
+                let conversation_id = crate::conversation::actor_conversation(actor)
+                    .with_context(|| format!("bad conversation actor id `{prefixed}`"))?;
+                let conversations = crate::conversation::ConversationRepo::new(conn);
+                if conversations.get(conversation_id)?.is_none() {
+                    bail!("conversation {conversation_id} not found");
+                }
+                let turn_seq = conversations.max_user_seq(conversation_id)?;
+                let action = crate::conversation::record_and_execute(
+                    conn,
+                    conversation_id,
+                    crate::conversation::ActionActor::Agent,
+                    turn_seq,
+                    mutation.clone(),
+                    media_root,
+                )?;
+                return Ok(json!({ "action": action }));
             }
             // An agent-driven obligation write always uses its own session's
             // phase — it cannot claim a different one via the CLI arg.
@@ -642,53 +686,91 @@ pub fn execute(
             Ok(json!({}))
         }
 
-        InterviewCommand::AddDump { node_id, body } => crate::drafting::add_dump(conn, *node_id, body),
-        InterviewCommand::AddChoice {
-            node_id,
-            context,
-            question,
-            options,
-        } => crate::drafting::add_choice(
-            conn,
-            agent.as_ref(),
-            *node_id,
-            context.as_deref(),
-            question,
-            options,
-        ),
-        InterviewCommand::AnswerChoice {
-            node_id,
-            seq,
-            option,
-        } => crate::drafting::answer_choice(conn, media_root, *node_id, *seq, *option),
-        InterviewCommand::WithdrawChoice { node_id, seq } => {
-            crate::drafting::withdraw_choice(conn, *node_id, *seq)
+        InterviewCommand::CreateConversation {
+            id,
+            focus,
+            platform,
+            model,
+            effort,
+        } => {
+            let conversation = crate::conversation::ConversationRepo::new(conn).create_with_id(
+                *id,
+                *focus,
+                platform.as_deref(),
+                model.as_deref(),
+                effort.as_deref(),
+            )?;
+            Ok(json!({ "id": conversation.id.to_string() }))
         }
-        InterviewCommand::ConfirmObligation { obligation_id } => {
-            crate::drafting::confirm_obligation(conn, actor, *obligation_id)
+        InterviewCommand::AppendConversationTurn {
+            conversation_id,
+            role,
+            body,
+        } => {
+            let repo = crate::conversation::ConversationRepo::new(conn);
+            if repo.get(*conversation_id)?.is_none() {
+                bail!("conversation {conversation_id} not found");
+            }
+            let turn = repo.append_turn(*conversation_id, *role, body)?;
+            Ok(json!({ "seq": turn.seq }))
         }
-        InterviewCommand::SetAttention {
-            obligation_id,
-            attention,
-            why,
-        } => crate::drafting::set_attention(conn, *obligation_id, attention, why.as_deref()),
-        InterviewCommand::SetBuildable {
-            node_id,
-            outcome,
-            detail,
-        } => crate::drafting::set_buildable(conn, actor, *node_id, outcome, detail.as_deref()),
-        InterviewCommand::RecordDraftingTurn {
-            node_id,
-            summary,
-            dump_seqs,
-            choice_seqs,
-        } => crate::drafting::record_drafting_turn(
-            conn,
-            *node_id,
-            summary.as_deref(),
-            dump_seqs,
-            choice_seqs,
-        ),
+        InterviewCommand::SetConversationSession {
+            conversation_id,
+            agent_session_id,
+            session_name,
+        } => {
+            crate::conversation::ConversationRepo::new(conn).set_agent_session(
+                *conversation_id,
+                agent_session_id.as_deref(),
+                session_name.as_deref(),
+            )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::ConversationEdit {
+            conversation_id,
+            mutation,
+        } => {
+            let action = crate::conversation::apply_user_edit(
+                conn,
+                *conversation_id,
+                mutation.clone(),
+                media_root,
+            )?;
+            Ok(json!({ "action": action }))
+        }
+        InterviewCommand::FlagConversationItem {
+            conversation_id,
+            entity,
+            entity_id,
+            reason,
+        } => {
+            crate::conversation::flag_item(conn, *conversation_id, *entity, *entity_id, reason)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::UnflagConversationItem {
+            conversation_id,
+            entity,
+            entity_id,
+        } => {
+            crate::conversation::clear_flag(conn, *conversation_id, *entity, *entity_id)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::ReverseConversationActions {
+            conversation_id,
+            action_ids,
+            include_dependents,
+            force,
+        } => {
+            let outcome = crate::conversation::reverse_actions(
+                conn,
+                *conversation_id,
+                action_ids,
+                *include_dependents,
+                *force,
+                media_root,
+            )?;
+            Ok(serde_json::to_value(outcome)?)
+        }
         InterviewCommand::AddNote { node_id, text } => {
             let text = text.trim();
             if text.is_empty() {
@@ -793,7 +875,9 @@ fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) ->
             }
         }
         ProposalOp::Update | ProposalOp::Delete => {
-            let raw = p.id.as_deref().context("proposal needs the obligation id")?;
+            let raw =
+                p.id.as_deref()
+                    .context("proposal needs the obligation id")?;
             p.id = Some(repo.resolve_obligation_id(raw)?.to_string());
             if p.op == ProposalOp::Update && !has_text {
                 bail!("proposal update needs text");
@@ -1001,8 +1085,11 @@ mod tests {
 
     fn run(conn: &Connection, actor: &str, cmd: InterviewCommand) -> Result<Value> {
         let tx = conn.unchecked_transaction().unwrap();
-        conn.execute("UPDATE interview_actor SET actor = ?1 WHERE id = 1", [actor])
-            .unwrap();
+        conn.execute(
+            "UPDATE interview_actor SET actor = ?1 WHERE id = 1",
+            [actor],
+        )
+        .unwrap();
         let out = execute(conn, Path::new("."), actor, &cmd);
         conn.execute("UPDATE interview_actor SET actor = 'user' WHERE id = 1", [])
             .unwrap();
@@ -1081,8 +1168,16 @@ mod tests {
         assert_eq!(q.status, STATUS_ANSWERED);
         assert_eq!(repo.unprocessed_answers(node).unwrap().len(), 1);
         let changes = repo.changes_since(&[node], 0, "nobody").unwrap();
-        assert!(changes.iter().any(|c| c.entity == ENTITY_OBLIGATION && c.op == "delete"));
-        assert!(changes.iter().any(|c| c.entity == ENTITY_QUESTION && c.fields.contains(&"status".to_string())));
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.entity == ENTITY_OBLIGATION && c.op == "delete")
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.entity == ENTITY_QUESTION && c.fields.contains(&"status".to_string()))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1119,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_obligations_survive_trimming_and_restore_in_place_with_their_marks() {
+    fn deleted_obligations_survive_trimming_and_restore_in_place() {
         let (dir, conn, node, session) = setup();
         let ids: Vec<Uuid> = ["First.", "Second.", "Third."]
             .iter()
@@ -1127,17 +1222,19 @@ mod tests {
             .map(|(i, body)| {
                 let id = Uuid::new_v4();
                 ObligationRepo::new(&conn)
-                    .insert_at(id, node, KIND_REQUIREMENT, i, Some("Core"), body, PHASE_DESIGN)
+                    .insert_at(
+                        id,
+                        node,
+                        KIND_REQUIREMENT,
+                        i,
+                        Some("Core"),
+                        body,
+                        PHASE_DESIGN,
+                    )
                     .unwrap();
                 id
             })
             .collect();
-        conn.execute(
-            "UPDATE node_obligations SET provenance = 'agent', attention = 'high', attention_why = 'a guess'
-             WHERE id = ?1",
-            [uuid_to_blob(ids[1])],
-        )
-        .unwrap();
 
         // An agent deletes the first two, top-down.
         let agent = agent_session(&conn, node, session);
@@ -1160,12 +1257,20 @@ mod tests {
         );
         assert_eq!(deleted[0].actor, agent.to_string());
         assert_eq!(deleted[0].prior.body, "Second.");
-        assert_eq!(deleted[0].prior.attention.as_deref(), Some("high"));
 
         // Retiring the agent trims the log, but not the deleted rows.
-        run(&conn, ACTOR_USER, InterviewCommand::RetireAgentSession { id: agent }).unwrap();
+        run(
+            &conn,
+            ACTOR_USER,
+            InterviewCommand::RetireAgentSession { id: agent },
+        )
+        .unwrap();
         let plain: i64 = conn
-            .query_row("SELECT COUNT(*) FROM interview_changes WHERE prior IS NULL", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM interview_changes WHERE prior IS NULL",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(plain, 0);
         assert_eq!(repo.deleted_obligations(node).unwrap(), deleted);
@@ -1179,13 +1284,6 @@ mod tests {
         assert_eq!(rows[1].body, "Second.");
         assert_eq!(rows[1].section.as_deref(), Some("Core"));
         assert_eq!(rows[1].phase, PHASE_DESIGN);
-        let mark = crate::drafting::DraftingRepo::new(&conn)
-            .mark(ids[1])
-            .unwrap()
-            .unwrap();
-        assert_eq!(mark.provenance, "agent");
-        assert_eq!(mark.attention.as_deref(), Some("high"));
-        assert_eq!(mark.attention_why.as_deref(), Some("a guess"));
         assert!(repo.deleted_obligations(node).unwrap().is_empty());
 
         let err = restore(&conn, deleted[0].rev).unwrap_err();
@@ -1198,7 +1296,15 @@ mod tests {
         let (dir, conn, node, session) = setup();
         let id = Uuid::new_v4();
         ObligationRepo::new(&conn)
-            .insert_at(id, node, KIND_CONSTRAINT, 0, None, "The user's wording.", PHASE_REQUIREMENTS)
+            .insert_at(
+                id,
+                node,
+                KIND_CONSTRAINT,
+                0,
+                None,
+                "The user's wording.",
+                PHASE_REQUIREMENTS,
+            )
             .unwrap();
         let agent = agent_session(&conn, node, session);
         run(
@@ -1218,13 +1324,10 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].op, "update");
         assert_eq!(history[0].prior.body, "The user's wording.");
-        assert_eq!(history[0].prior.provenance, "user");
 
         restore(&conn, history[0].rev).unwrap();
         let row = ObligationRepo::new(&conn).get(id).unwrap().unwrap();
         assert_eq!(row.body, "The user's wording.");
-        let mark = crate::drafting::DraftingRepo::new(&conn).mark(id).unwrap().unwrap();
-        assert_eq!(mark.provenance, "user");
 
         let history = repo.obligation_history(id).unwrap();
         assert_eq!(history.len(), 2);
@@ -1233,7 +1336,10 @@ mod tests {
         // An edit can't be restored onto an obligation that is gone.
         ObligationRepo::new(&conn).delete(id).unwrap();
         let err = restore(&conn, history[1].rev).unwrap_err();
-        assert!(err.to_string().contains("restore its deletion first"), "{err}");
+        assert!(
+            err.to_string().contains("restore its deletion first"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1243,7 +1349,15 @@ mod tests {
         let id = Uuid::new_v4();
         let obligations = ObligationRepo::new(&conn);
         obligations
-            .insert_at(id, node, KIND_REQUIREMENT, 0, None, "Old.", PHASE_REQUIREMENTS)
+            .insert_at(
+                id,
+                node,
+                KIND_REQUIREMENT,
+                0,
+                None,
+                "Old.",
+                PHASE_REQUIREMENTS,
+            )
             .unwrap();
         obligations.delete(id).unwrap();
         let repo = InterviewRepo::new(&conn);
@@ -1298,7 +1412,10 @@ mod tests {
             append: false,
             replaces: Vec::new(),
         };
-        for (question, proposal) in [("Reword it?", update(target)), ("Reword the other?", update(unrelated))] {
+        for (question, proposal) in [
+            ("Reword it?", update(target)),
+            ("Reword the other?", update(unrelated)),
+        ] {
             run(
                 &conn,
                 ACTOR_USER,
@@ -1368,7 +1485,10 @@ mod tests {
         run(
             &conn,
             ACTOR_USER,
-            InterviewCommand::DeferQuestion { node_id: node, seq: 1 },
+            InterviewCommand::DeferQuestion {
+                node_id: node,
+                seq: 1,
+            },
         )
         .unwrap();
         // …so the agent's withdraw is refused with the current state.

@@ -5,12 +5,15 @@
 
 mod delegate;
 
+use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::key_context;
 use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
-use delegate::{PlanStepListDelegate, PlanStepRow, RowAction};
+use crate::views::rows::RowHost;
+use delegate::{ListAction, PlanStepListDelegate, PlanStepRow};
+use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
@@ -20,9 +23,9 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{InputEvent, TextareaState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tod_store::conversation::{Focus, NetOp};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep, ReorderDirection};
 use uuid::Uuid;
@@ -96,7 +99,14 @@ pub struct PlanStepsView {
     delegate: PlanStepListDelegate,
     scroll_handle: ScrollHandle,
     selected_index: Option<usize>,
-    action_sink: Rc<RefCell<Vec<RowAction>>>,
+    host: RowHost<ListAction>,
+    /// Hosted inside another view (the conversation view's context panel):
+    /// no Close button, and Escape / Ctrl+Left go to the host.
+    embedded: bool,
+    /// Steps no longer on the node that the host still wants shown, struck
+    /// through (the conversation's deleted steps). Merged into `items` on
+    /// every reload and never editable.
+    removed: Vec<PlanStep>,
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
@@ -109,7 +119,7 @@ pub struct PlanStepsView {
 
 impl PlanStepsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
-        let action_sink = Rc::new(RefCell::new(Vec::new()));
+        let host = RowHost::for_entity(cx.weak_entity());
         let inline_edit_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(INLINE_EDIT_ROWS, INLINE_EDIT_ROWS)
@@ -122,7 +132,7 @@ impl PlanStepsView {
             }
         });
 
-        let delegate = PlanStepListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
+        let delegate = PlanStepListDelegate::new(Vec::new(), host.clone());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -157,7 +167,9 @@ impl PlanStepsView {
             delegate,
             scroll_handle: ScrollHandle::new(),
             selected_index: None,
-            action_sink,
+            host,
+            embedded: false,
+            removed: Vec::new(),
             editing_id: None,
             draft_id: None,
             edit_original_body: None,
@@ -171,6 +183,54 @@ impl PlanStepsView {
 
     pub fn is_open(&self) -> bool {
         self.node_id.is_some()
+    }
+
+    /// Host this view inside another: hides Close, and hands Escape and
+    /// Ctrl+Left (`PaneFocusLeft`) to the host instead of closing or emitting
+    /// `FocusTaskList`.
+    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        self.embedded = embedded;
+        cx.notify();
+    }
+
+    /// Scroll to plan step `id` and highlight it. Does nothing if the step is
+    /// not on this node.
+    pub fn highlight_item(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.items.iter().any(|s| s.id == id) {
+            return;
+        }
+        self.selected_key = Some(id.to_string());
+        self.rebuild_visible(window, cx);
+        if let Some(ix) = self.selected_index {
+            self.scroll_handle.scroll_to_item(ix);
+        }
+    }
+
+    /// Show a leading op icon on each plan step in `markers`.
+    pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
+        self.delegate.set_change_markers(markers);
+        cx.notify();
+    }
+
+    /// Also show `steps`, which no longer exist, struck through at their old
+    /// place. Ones that exist again (a reversed deletion) show as normal.
+    /// Whether `id` is shown as a removed (struck-through) row.
+    #[cfg(test)]
+    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
+        self.delegate.is_struck(id)
+    }
+
+    pub fn set_removed_items(
+        &mut self,
+        steps: Vec<PlanStep>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.removed == steps {
+            return;
+        }
+        self.removed = steps;
+        self.reload(window, cx);
     }
 
     pub fn open(
@@ -241,6 +301,20 @@ impl PlanStepsView {
             .fleet
             .list_plan_steps_for_node(node_id)
             .unwrap_or_default();
+        let mut struck = HashSet::new();
+        for ghost in &self.removed {
+            if ghost.node_id != node_id || self.items.iter().any(|s| s.id == ghost.id) {
+                continue;
+            }
+            struck.insert(ghost.id);
+            let at = self
+                .items
+                .iter()
+                .position(|s| s.ordinal > ghost.ordinal)
+                .unwrap_or(self.items.len());
+            self.items.insert(at, ghost.clone());
+        }
+        self.delegate.set_struck(struck);
         self.rebuild_visible(window, cx);
     }
 
@@ -311,6 +385,32 @@ impl PlanStepsView {
         }
     }
 
+    /// Ctrl+J: the conversation about the selected step, or about the node
+    /// when none is selected. Embedded, the host decides.
+    fn on_open_agent_chat(
+        &mut self,
+        _: &OpenAgentChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(focus) = self.conversation_focus().filter(|_| !self.embedded) else {
+            cx.propagate();
+            return;
+        };
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(OpenConversation { focus }), cx);
+    }
+
+    /// The conversation Ctrl+J opens here: the selected step, or the node
+    /// when none (or a removed one) is selected.
+    pub fn conversation_focus(&self) -> Option<Focus> {
+        let node = self.node_id?;
+        Some(match self.selected_live_step() {
+            Some(step) => Focus::PlanStep { node, id: step.id },
+            None => Focus::Node(node),
+        })
+    }
+
     fn selected_step(&self) -> Option<PlanStep> {
         self.delegate
             .selected_row()
@@ -322,6 +422,12 @@ impl PlanStepsView {
                     .find(|s| &s.id.to_string() == key)
                     .cloned()
             })
+    }
+
+    /// The selected step, unless it is a removed one.
+    fn selected_live_step(&self) -> Option<PlanStep> {
+        self.selected_step()
+            .filter(|step| !self.delegate.is_struck(step.id))
     }
 
     fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
@@ -363,6 +469,9 @@ impl PlanStepsView {
     }
 
     fn start_inline_edit(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delegate.is_struck(id) {
+            return;
+        }
         let body = self
             .items
             .iter()
@@ -513,7 +622,7 @@ impl PlanStepsView {
     }
 
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = self.selected_step() else {
+        let Some(step) = self.selected_live_step() else {
             return;
         };
         let id = step.id;
@@ -549,7 +658,7 @@ impl PlanStepsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(step) = self.selected_step() else {
+        let Some(step) = self.selected_live_step() else {
             return;
         };
         let id = step.id;
@@ -570,7 +679,7 @@ impl PlanStepsView {
     }
 
     fn cycle_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = self.selected_step() else {
+        let Some(step) = self.selected_live_step() else {
             return;
         };
         let current_ix = PLAN_STEP_STATUSES
@@ -609,13 +718,12 @@ impl PlanStepsView {
     }
 
     fn drain_row_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let actions: Vec<_> = self.action_sink.borrow_mut().drain(..).collect();
-        for action in actions {
+        for action in self.host.drain() {
             match action {
-                RowAction::StartEdit { step_id } => {
+                ListAction::StartEdit { step_id } => {
                     self.start_inline_edit(step_id, window, cx);
                 }
-                RowAction::Select { row_ix } => {
+                ListAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
                 }
             }
@@ -625,6 +733,10 @@ impl PlanStepsView {
     fn on_close(&mut self, _: &PlanStepsClose, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
+            return;
+        }
+        if self.embedded {
+            cx.propagate();
             return;
         }
         self.close(window, cx);
@@ -643,7 +755,7 @@ impl PlanStepsView {
         if self.is_editing() {
             return;
         }
-        let after = self.selected_step().map(|s| s.id);
+        let after = self.selected_live_step().map(|s| s.id);
         self.create_relative(after, false, window, cx);
     }
 
@@ -656,7 +768,7 @@ impl PlanStepsView {
         if self.is_editing() {
             return;
         }
-        let after = self.selected_step().map(|s| s.id);
+        let after = self.selected_live_step().map(|s| s.id);
         self.create_relative(after, true, window, cx);
     }
 
@@ -775,6 +887,7 @@ impl Render for PlanStepsView {
         let border = theme.border;
         let accent = theme.primary;
         let muted = theme.muted_foreground;
+        let embedded = self.embedded;
 
         v_flex()
             .key_context(PLAN_STEPS_CONTEXT)
@@ -784,13 +897,14 @@ impl Render for PlanStepsView {
             .border_l_2()
             .border_color(accent)
             .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
-                if this.editing_id.is_some() {
+                if this.editing_id.is_some() || this.embedded {
                     cx.propagate();
                     return;
                 }
                 cx.emit(PlanStepsEvent::FocusTaskList);
                 cx.stop_propagation();
             }))
+            .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_create_below))
@@ -809,6 +923,8 @@ impl Render for PlanStepsView {
             .on_action(cx.listener(Self::on_end))
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_2()
                     .px_3()
@@ -821,9 +937,25 @@ impl Render for PlanStepsView {
                             .gap_0p5()
                             .min_w_0()
                             .flex_1()
-                            .child(div().text_sm().font_semibold().child("Plan Steps"))
                             .child(
-                                div().text_xs().text_color(muted).overflow_hidden().child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child("Plan Steps"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(
                                     crate::ui::selectable_text::selectable_text(
                                         "plan-steps-title",
                                         self.title.clone(),
@@ -834,15 +966,17 @@ impl Render for PlanStepsView {
                                 ),
                             ),
                     )
-                    .child(
-                        Button::new("plan-steps-close")
-                            .label("Close")
-                            .ghost()
-                            .compact()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close(window, cx);
-                            })),
-                    ),
+                    .when(!embedded, |row| {
+                        row.child(
+                            Button::new("plan-steps-close")
+                                .label("Close")
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close(window, cx);
+                                })),
+                        )
+                    }),
             )
             .child({
                 let row_count = self.delegate.rows().len();
@@ -890,5 +1024,144 @@ impl Render for PlanStepsView {
                     .child("↑/↓ navigate · Enter edits · N adds · T cycles status · Cmd/Ctrl+↑/↓ reorders · Esc closes"),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::rows::fixture::Fixture;
+    use gpui::{TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Events = Rc<RefCell<Vec<PlanStepsEvent>>>;
+
+    fn open_view<'a>(
+        fixture: &Fixture,
+        embedded: bool,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<PlanStepsView>, Events, &'a mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let slot = Rc::new(RefCell::new(None));
+        let events: Events = Rc::new(RefCell::new(Vec::new()));
+        let (store, node_id) = (fixture.store.clone(), fixture.node_id);
+        let (slot_in, events_in) = (slot.clone(), events.clone());
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| PlanStepsView::new(window, cx, store));
+            cx.subscribe(&view, move |_, _, event: &PlanStepsEvent, _| {
+                events_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+            view.update(cx, |view, cx| {
+                view.set_embedded(embedded, cx);
+                view.open(node_id, "Web client", window, cx);
+            });
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        draw(cx);
+        (view, events, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn selected_step(view: &Entity<PlanStepsView>, cx: &mut VisualTestContext) -> Option<Uuid> {
+        view.read_with(cx, |view, _| view.selected_step().map(|step| step.id))
+    }
+
+    #[gpui::test]
+    fn plan_steps_highlight_item_selects_it_and_markers_render(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        assert_eq!(selected_step(&view, cx), Some(fixture.steps[0]));
+        let target = fixture.steps[1];
+        view.update_in(cx, |view, window, cx| {
+            view.highlight_item(target, window, cx);
+            // Steps on another node are ignored.
+            view.highlight_item(Uuid::new_v4(), window, cx);
+            view.set_change_markers(HashMap::from([(target, NetOp::Moved)]), cx);
+        });
+        draw(cx);
+        assert_eq!(selected_step(&view, cx), Some(target));
+    }
+
+    #[gpui::test]
+    fn plan_steps_embedded_hands_escape_and_left_to_the_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, true, cx);
+        cx.dispatch_action(PlanStepsClose);
+        cx.dispatch_action(PaneFocusLeft);
+        assert!(view.read_with(cx, |view, _| view.is_open()));
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn plan_steps_standalone_closes_and_returns_to_the_tree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, false, cx);
+        cx.dispatch_action(PaneFocusLeft);
+        cx.dispatch_action(PlanStepsClose);
+        assert!(!view.read_with(cx, |view, _| view.is_open()));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [PlanStepsEvent::FocusTaskList, PlanStepsEvent::Close]
+        ));
+    }
+
+    #[gpui::test]
+    fn plan_steps_ctrl_j_opens_the_selected_step(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (_, _, cx) = open_view(&fixture, false, cx);
+        let opened = record_open_conversation(cx);
+        cx.dispatch_action(OpenAgentChat);
+        cx.run_until_parked();
+        assert_eq!(
+            opened.borrow().as_slice(),
+            [Focus::PlanStep {
+                node: fixture.node_id,
+                id: fixture.steps[0],
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn plan_steps_embedded_leaves_ctrl_j_to_the_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (_, _, cx) = open_view(&fixture, true, cx);
+        let opened = record_open_conversation(cx);
+        cx.dispatch_action(OpenAgentChat);
+        cx.run_until_parked();
+        assert!(opened.borrow().is_empty());
+    }
+
+    /// Every `OpenConversation` that reaches the top of the dispatch path, as
+    /// the shell would see it.
+    fn record_open_conversation(cx: &mut VisualTestContext) -> Rc<RefCell<Vec<Focus>>> {
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let sink = opened.clone();
+        cx.update(|_, cx| {
+            cx.on_action(move |action: &OpenConversation, _| {
+                sink.borrow_mut().push(action.focus);
+            });
+        });
+        opened
+    }
+
+    #[gpui::test]
+    fn plan_steps_row_click_selects_through_the_row_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, false, cx);
+        let host = view.read_with(cx, |view, _| view.host.clone());
+        // Row handlers run outside any entity update, with only `&mut App`.
+        cx.update(|_, cx| host.push(ListAction::Select { row_ix: 1 }, cx));
+        draw(cx);
+        assert_eq!(selected_step(&view, cx), Some(fixture.steps[1]));
     }
 }

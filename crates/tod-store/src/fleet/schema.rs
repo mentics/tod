@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 35;
+pub const CURRENT_USER_VERSION: i32 = 37;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -92,6 +92,7 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
             "fleet database user_version {version} is newer than supported {CURRENT_USER_VERSION}"
         );
     }
+    let version = rewind_pre_merge_conversation_store(conn, version)?;
     if (1..34).contains(&version) {
         // v34's staleness triggers write to `node_extra_content`, which older
         // migrations rebuild. A real store below v34 has none; this clears them
@@ -273,12 +274,42 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v34_to_v35(conn)?;
         conn.pragma_update(None, "user_version", 35)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 36 {
+        migrate_v35_to_v36(conn)?;
+        conn.pragma_update(None, "user_version", 36)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 37 {
+        migrate_v36_to_v37(conn)?;
+        conn.pragma_update(None, "user_version", 37)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
     Ok(())
+}
+
+/// Before the conversation view was merged with main, its branch numbered its
+/// own migrations v34 (conversation tables) and v35 (drop drafting and the
+/// obligation marks), the numbers main used for the summary rework and the
+/// global-obligation drop. A store written by that branch has `conversations`
+/// but not main's `node_extra_content.stale`; wind it back to v33 so main's v34
+/// and v35 run, then the (idempotent) v36 and v37 again.
+fn rewind_pre_merge_conversation_store(conn: &Connection, version: i32) -> Result<i32> {
+    if !(34..=35).contains(&version) {
+        return Ok(version);
+    }
+    let has = |sql: &str| -> Result<bool> { Ok(conn.prepare(sql)?.exists([])?) };
+    let branch_store = has("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'")?
+        && !has("SELECT 1 FROM pragma_table_info('node_extra_content') WHERE name = 'stale'")?;
+    if !branch_store {
+        return Ok(version);
+    }
+    conn.pragma_update(None, "user_version", 33)?;
+    Ok(33)
 }
 
 /// Remove action configs: their configuration moves onto node capabilities and
@@ -440,6 +471,157 @@ fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
         "
     ))?;
     tx.commit()?;
+    Ok(())
+}
+
+/// The obligation columns the drafting-era marks used (provenance and
+/// attention). `migrate_v36_to_v37` drops them; unsure flags now live per
+/// conversation in `conversation_flags`.
+const OBLIGATION_MARK_COLUMNS: [&str; 3] = ["attention_why", "attention", "provenance"];
+
+/// Drafting is gone (the conversation view replaced it):
+///
+/// - drop `drafting_dumps`, `drafting_choices`, and `drafting_summaries`;
+/// - retire live `drafter` agent sessions (the role stays valid so old rows
+///   still parse);
+/// - replace the `buildable` reset trigger with one that has no `provenance`
+///   filter (nothing writes such a change row any more);
+/// - recreate the obligation update/delete change-log triggers so their
+///   `prior` JSON no longer reads the mark columns, then drop those columns
+///   (`ALTER TABLE .. DROP COLUMN` refuses while any trigger names them).
+///
+/// Every step checks before it acts, so running it twice is harmless.
+fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    const PRIOR: &str = "json_object(
+                'kind', OLD.kind, 'ordinal', OLD.ordinal, 'section', OLD.section,
+                'body', OLD.body, 'phase', OLD.phase,
+                'visual_design_path', OLD.visual_design_path,
+                'created_at', OLD.created_at, 'updated_at', OLD.updated_at)";
+    let tx = conn.unchecked_transaction()?;
+    let batch = format!(
+        "
+        DROP INDEX IF EXISTS idx_drafting_dumps_target;
+        DROP TABLE IF EXISTS drafting_dumps;
+        DROP INDEX IF EXISTS idx_drafting_choices_node;
+        DROP TABLE IF EXISTS drafting_choices;
+        DROP TABLE IF EXISTS drafting_summaries;
+
+        UPDATE interview_agent_sessions SET state = 'retired'
+         WHERE role = 'drafter' AND state = 'live';
+
+        DROP TRIGGER IF EXISTS trg_drafting_buildable_reset;
+        CREATE TRIGGER IF NOT EXISTS trg_buildable_reset AFTER INSERT ON interview_changes
+        WHEN NEW.entity = 'obligation'
+        BEGIN
+            UPDATE node_gate_evaluations
+               SET outcome = 'pending', detail = NULL, evaluated_at = {NOW}
+             WHERE node_id = NEW.node_id AND outcome != 'pending'
+               AND criterion_id = (SELECT id FROM gate_criteria WHERE slug = 'design-planning.buildable');
+        END;
+
+        DROP TRIGGER IF EXISTS trg_ic_obligation_update;
+        DROP TRIGGER IF EXISTS trg_ic_obligation_delete;
+        CREATE TRIGGER trg_ic_obligation_update AFTER UPDATE ON node_obligations
+        WHEN OLD.node_id = NEW.node_id
+            AND (OLD.body IS NOT NEW.body OR OLD.section IS NOT NEW.section OR OLD.kind IS NOT NEW.kind)
+        BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at, prior)
+            VALUES (NEW.node_id, 'obligation', NEW.id, 'update',
+                rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
+                    || CASE WHEN OLD.section IS NOT NEW.section THEN 'section,' ELSE '' END
+                    || CASE WHEN OLD.kind IS NOT NEW.kind THEN 'kind,' ELSE '' END, ','),
+                {ACTOR}, {NOW}, {PRIOR});
+        END;
+        CREATE TRIGGER trg_ic_obligation_delete AFTER DELETE ON node_obligations BEGIN
+            INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at, prior)
+            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW}, {PRIOR});
+        END;
+        "
+    );
+    tx.execute_batch(&batch)?;
+    for column in OBLIGATION_MARK_COLUMNS {
+        let present = tx
+            .prepare("SELECT 1 FROM pragma_table_info('node_obligations') WHERE name = ?1")?
+            .exists([column])?;
+        if present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE node_obligations DROP COLUMN {column};"
+            ))
+            .with_context(|| format!("failed to drop node_obligations.{column}"))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Conversation log: conversations (each about one focus), their turns, the
+/// outline actions made during them (with enough state to reverse each one),
+/// and the per-conversation unsure flags. See `crate::conversation`.
+fn migrate_v35_to_v36(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS conversations (
+            id               BLOB PRIMARY KEY,
+            focus_kind       TEXT NOT NULL
+                CHECK (focus_kind IN ('project','node','obligation','plan_step')),
+            focus_id         BLOB,
+            focus_node_id    BLOB,
+            agent_session_id TEXT,
+            session_name     TEXT,
+            platform         TEXT,
+            model            TEXT,
+            effort           TEXT,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conversations_focus
+            ON conversations(focus_kind, focus_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS conversation_turns (
+            id              BLOB PRIMARY KEY,
+            conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            seq             INTEGER NOT NULL,
+            role            TEXT NOT NULL CHECK (role IN ('user','agent','error','rotation')),
+            body            TEXT NOT NULL DEFAULT '',
+            created_at      INTEGER NOT NULL,
+            UNIQUE (conversation_id, seq)
+        );
+
+        CREATE TABLE IF NOT EXISTS conversation_actions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            turn_seq        INTEGER NOT NULL,
+            actor           TEXT NOT NULL CHECK (actor IN ('agent','user')),
+            kind            TEXT NOT NULL
+                CHECK (kind IN ('create','edit','move','delete','reverse')),
+            entity          TEXT NOT NULL CHECK (entity IN ('node','obligation','plan_step')),
+            entity_id       BLOB NOT NULL,
+            node_id         BLOB,
+            mutation        TEXT NOT NULL,
+            before          TEXT,
+            after           TEXT,
+            archive_id      BLOB,
+            reverses        INTEGER REFERENCES conversation_actions(id),
+            reversed_by     INTEGER REFERENCES conversation_actions(id),
+            at              INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conversation_actions_conv
+            ON conversation_actions(conversation_id, id);
+        CREATE INDEX IF NOT EXISTS conversation_actions_entity
+            ON conversation_actions(entity_id);
+
+        CREATE TABLE IF NOT EXISTS conversation_flags (
+            conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            entity          TEXT NOT NULL CHECK (entity IN ('node','obligation','plan_step')),
+            entity_id       BLOB NOT NULL,
+            reason          TEXT NOT NULL,
+            flagged_at      INTEGER NOT NULL,
+            PRIMARY KEY (conversation_id, entity, entity_id)
+        );
+        ",
+    )?;
     Ok(())
 }
 
@@ -766,7 +948,9 @@ fn migrate_v28_to_v29(conn: &Connection) -> Result<()> {
             ",
         )?;
         rename("agent_runs_v29", "agent_runs")?;
-        tx.execute_batch("CREATE INDEX IF NOT EXISTS idx_agent_runs_node_id ON agent_runs(node_id);")?;
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_node_id ON agent_runs(node_id);",
+        )?;
     }
 
     // ── 7. shell_sessions keyed by node ──
@@ -902,15 +1086,27 @@ fn migrate_v27_to_v28(conn: &Connection) -> Result<()> {
 fn migrate_v26_to_v27(conn: &Connection) -> Result<()> {
     const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
     const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
-    const PRIOR: &str = "json_object(
-                'kind', OLD.kind, 'ordinal', OLD.ordinal, 'section', OLD.section,
-                'body', OLD.body, 'phase', OLD.phase, 'provenance', OLD.provenance,
-                'attention', OLD.attention, 'attention_why', OLD.attention_why,
-                'visual_design_path', OLD.visual_design_path,
-                'created_at', OLD.created_at, 'updated_at', OLD.updated_at)";
     let has_prior: bool = conn
         .prepare("SELECT 1 FROM pragma_table_info('interview_changes') WHERE name = 'prior'")?
         .exists([])?;
+    // The mark columns were dropped at v37; a replay against a newer store
+    // must not name them, or every obligation edit would fail.
+    let has_marks: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_obligations') WHERE name = 'provenance'")?
+        .exists([])?;
+    let marks = if has_marks {
+        "'provenance', OLD.provenance,
+                'attention', OLD.attention, 'attention_why', OLD.attention_why,"
+    } else {
+        ""
+    };
+    let prior = format!(
+        "json_object(
+                'kind', OLD.kind, 'ordinal', OLD.ordinal, 'section', OLD.section,
+                'body', OLD.body, 'phase', OLD.phase, {marks}
+                'visual_design_path', OLD.visual_design_path,
+                'created_at', OLD.created_at, 'updated_at', OLD.updated_at)"
+    );
     let tx = conn.unchecked_transaction()?;
     if !has_prior {
         tx.execute_batch("ALTER TABLE interview_changes ADD COLUMN prior TEXT;")?;
@@ -928,11 +1124,11 @@ fn migrate_v26_to_v27(conn: &Connection) -> Result<()> {
                 rtrim(CASE WHEN OLD.body IS NOT NEW.body THEN 'body,' ELSE '' END
                     || CASE WHEN OLD.section IS NOT NEW.section THEN 'section,' ELSE '' END
                     || CASE WHEN OLD.kind IS NOT NEW.kind THEN 'kind,' ELSE '' END, ','),
-                {ACTOR}, {NOW}, {PRIOR});
+                {ACTOR}, {NOW}, {prior});
         END;
         CREATE TRIGGER trg_ic_obligation_delete AFTER DELETE ON node_obligations BEGIN
             INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at, prior)
-            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW}, {PRIOR});
+            VALUES (OLD.node_id, 'obligation', OLD.id, 'delete', NULL, {ACTOR}, {NOW}, {prior});
         END;
         "
     );
@@ -1061,7 +1257,7 @@ fn migrate_v24_to_v25(conn: &Connection) -> Result<()> {
         tx.execute(
             "UPDATE node_obligations SET attention = 'medium', attention_why = ?1
              WHERE provenance = 'agent' AND attention IS NULL",
-            [crate::drafting::PRE_V3_ATTENTION_WHY],
+            ["Written before drafting v3"],
         )?;
     }
     tx.execute_batch(
@@ -1410,9 +1606,7 @@ fn migrate_v19_to_v20(conn: &Connection) -> Result<()> {
 /// string-matching convention.
 fn migrate_v17_to_v18(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
-        "ALTER TABLE node_obligations ADD COLUMN visual_design_path TEXT;",
-    )?;
+    tx.execute_batch("ALTER TABLE node_obligations ADD COLUMN visual_design_path TEXT;")?;
     tx.commit()?;
     Ok(())
 }
@@ -2650,7 +2844,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!((slug.as_str(), title.as_str(), created_at, updated_at), ("ref-node", "Ref Node", 3, 4));
+        assert_eq!(
+            (slug.as_str(), title.as_str(), created_at, updated_at),
+            ("ref-node", "Ref Node", 3, 4)
+        );
         let child_parent: Vec<u8> = conn
             .query_row(
                 "SELECT parent_id FROM outline_entries WHERE node_id = ?1",
@@ -2668,9 +2865,11 @@ mod tests {
             .unwrap();
         assert_eq!(caps, 1);
         let managed: i64 = conn
-            .query_row("SELECT managed FROM nodes WHERE slug = 'target'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT managed FROM nodes WHERE slug = 'target'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(managed, 1);
         let health_tables: i64 = conn
@@ -3003,7 +3202,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!((platform.as_str(), model.as_str(), effort.as_str()), ("cursor", "gpt", "high"));
+        assert_eq!(
+            (platform.as_str(), model.as_str(), effort.as_str()),
+            ("cursor", "gpt", "high")
+        );
         let repo: String = conn
             .query_row(
                 "SELECT repo FROM node_fields WHERE node_id = ?1",
@@ -3013,7 +3215,9 @@ mod tests {
             .unwrap();
         assert_eq!(repo, "/repo");
         let caps: Vec<String> = conn
-            .prepare("SELECT capability FROM node_capabilities WHERE node_id = ?1 ORDER BY capability")
+            .prepare(
+                "SELECT capability FROM node_capabilities WHERE node_id = ?1 ORDER BY capability",
+            )
             .unwrap()
             .query_map(params![node], |row| row.get(0))
             .unwrap()
@@ -3043,7 +3247,10 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(shells, [("shell-a".to_string(), 1), ("shell-i".to_string(), 2)]);
+        assert_eq!(
+            shells,
+            [("shell-a".to_string(), 1), ("shell-i".to_string(), 2)]
+        );
         let notified_run: String = conn
             .query_row(
                 "SELECT agent_run_id FROM notification_runs WHERE notification_id = 'n1'",
@@ -3127,7 +3334,11 @@ mod tests {
         conn.execute(
             "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
              VALUES (?1, ?2, 'summary', 'What N covers.', ?3)",
-            params![uuid::Uuid::new_v4().as_bytes().as_slice(), node.as_bytes().as_slice(), now],
+            params![
+                uuid::Uuid::new_v4().as_bytes().as_slice(),
+                node.as_bytes().as_slice(),
+                now
+            ],
         )
         .unwrap();
         let logged: i64 = conn
@@ -3236,6 +3447,55 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// A store the conversation branch wrote before merging main claims v35
+    /// but never ran main's v34: it has `conversations` and a goal-era
+    /// `node_extra_content` without `stale`. It is wound back so main's v34
+    /// still runs.
+    #[test]
+    fn a_pre_merge_conversation_store_still_gets_mains_v34() {
+        let (dir, conn) = temp_db();
+        let node = insert_node(&conn, "n");
+        conn.execute_batch(
+            "
+            DROP TABLE node_extra_content;
+            CREATE TABLE node_extra_content (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details', 'summary')),
+                body         TEXT NOT NULL DEFAULT '',
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (node_id, content_type)
+            );
+            PRAGMA user_version = 35;
+            ",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at)
+             VALUES (?1, ?2, 'goal', 'Ship it.', 0)",
+            params![
+                uuid::Uuid::new_v4().as_bytes().as_slice(),
+                node.as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(content(&conn, node, "details").unwrap().0, "Ship it.");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+        let conversations: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'conversations'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(conversations);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_summary_goes_stale_when_its_details_or_obligations_change() {
         let (dir, conn) = temp_db();
@@ -3287,7 +3547,8 @@ mod plan_step_migration_tests {
     use std::fs;
 
     fn temp_db() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir().join(format!("tod-plan-step-schema-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("tod-plan-step-schema-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tod.db");
         let conn = open_writer_connection(&path).unwrap();
@@ -3318,7 +3579,10 @@ mod plan_step_migration_tests {
             "node_plan_step_obligations",
             "interview_changes",
         ] {
-            assert!(tables.contains(&expected.to_string()), "missing table {expected}");
+            assert!(
+                tables.contains(&expected.to_string()),
+                "missing table {expected}"
+            );
         }
 
         // An obligation insert (the trigger that broke during development)
@@ -3419,8 +3683,204 @@ mod plan_step_migration_tests {
             .unwrap();
         assert_eq!(
             priors,
-            vec![("update".into(), "before".into()), ("delete".into(), "after".into())]
+            vec![
+                ("update".into(), "before".into()),
+                ("delete".into(), "after".into())
+            ]
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A v35 store (main before the conversation view) — drafting tables, obligation mark columns, and the
+    /// change-log triggers that read them — upgrades with its obligations and
+    /// change log intact and nothing left naming the dropped columns.
+    #[test]
+    fn v37_upgrade_drops_drafting_and_obligation_marks() {
+        use rusqlite::params;
+        let (dir, conn) = temp_db();
+        // Rebuild the v35 shape on top of the fresh store.
+        migrate_v24_to_v25(&conn).unwrap();
+        migrate_v26_to_v27(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 35).unwrap();
+        let node_id = uuid::Uuid::new_v4();
+        let obligation_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 0, 0)",
+            params![uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_obligations (id, node_id, kind, ordinal, section, body, phase,
+                 visual_design_path, created_at, updated_at, provenance, attention, attention_why)
+             VALUES (?1, ?2, 'constraint', 1, 'S', 'keep me', 'design', 'm.html', 7, 8,
+                 'agent', 'high', 'unsure')",
+            params![uuid_to_blob(obligation_id), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO drafting_dumps (id, seq, body, created_at) VALUES (?1, 1, 'dump', 0)",
+            params![uuid_to_blob(uuid::Uuid::new_v4())],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO interview_agent_sessions
+                 (id, node_id, phase, role, synced_rev, state, created_at)
+             VALUES (?1, ?2, 'design', 'drafter', 0, 'live', 0)",
+            params![uuid_to_blob(session_id), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        let mark_refs = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT type || ' ' || name FROM sqlite_master
+                 WHERE sql LIKE '%provenance%' OR sql LIKE '%attention%' OR name LIKE '%drafting%'
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert!(
+            mark_refs(&conn).len() >= 5,
+            "the v35 fixture should carry the old schema: {:?}",
+            mark_refs(&conn)
+        );
+
+        apply_migrations(&conn).unwrap();
+        // Running the step again (as under a renumbered version) is harmless.
+        migrate_v36_to_v37(&conn).unwrap();
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_USER_VERSION);
+
+        assert!(mark_refs(&conn).is_empty(), "{:?}", mark_refs(&conn));
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('node_obligations')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for column in OBLIGATION_MARK_COLUMNS {
+            assert!(!columns.iter().any(|c| c == column), "{column} survived");
+        }
+        let fk_problems: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_problems, 0);
+
+        // The obligation is intact.
+        let row: (
+            String,
+            String,
+            i64,
+            Option<String>,
+            String,
+            Option<String>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT kind, body, ordinal, section, phase, visual_design_path, created_at
+                 FROM node_obligations WHERE id = ?1",
+                params![uuid_to_blob(obligation_id)],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "constraint".into(),
+                "keep me".into(),
+                1,
+                Some("S".into()),
+                "design".into(),
+                Some("m.html".into()),
+                7
+            )
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM interview_agent_sessions WHERE id = ?1",
+                params![uuid_to_blob(session_id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "retired");
+
+        // The change-log triggers still fire, and the buildable reset with them.
+        let triggers: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name IN (
+                 'trg_ic_obligation_insert', 'trg_ic_obligation_update',
+                 'trg_ic_obligation_move', 'trg_ic_obligation_delete', 'trg_buildable_reset')
+                 ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(triggers.len(), 5, "{triggers:?}");
+        conn.execute(
+            "INSERT INTO node_gate_evaluations (node_id, criterion_id, outcome, source, evaluated_at)
+             SELECT ?1, id, 'pass', 'agent', 0 FROM gate_criteria WHERE slug = ?2",
+            params![
+                uuid_to_blob(node_id),
+                crate::outline::BUILDABLE_CRITERION_SLUG
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE node_obligations SET body = 'changed' WHERE id = ?1",
+            params![uuid_to_blob(obligation_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM node_obligations WHERE id = ?1",
+            params![uuid_to_blob(obligation_id)],
+        )
+        .unwrap();
+        let priors: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT op, json_extract(prior, '$.body') FROM interview_changes
+                 WHERE entity = 'obligation' AND prior IS NOT NULL ORDER BY rev",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            priors,
+            vec![
+                ("update".into(), "keep me".into()),
+                ("delete".into(), "changed".into())
+            ]
+        );
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM node_gate_evaluations WHERE node_id = ?1",
+                params![uuid_to_blob(node_id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "pending");
         let _ = fs::remove_dir_all(dir);
     }
 }
