@@ -1,5 +1,5 @@
 use crate::agent_launch::AgentLaunchOptions;
-use crate::agent_traffic::InterviewAgentCounts;
+use crate::agent_traffic::{AgentCategory, InterviewAgentCounts};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -23,6 +23,25 @@ pub enum AgentRunKind {
     QuestionMakerReplenishment,
     AnswerProcessor,
     FleetAgent,
+}
+
+impl AgentRunKind {
+    pub(crate) fn traffic_category(self) -> AgentCategory {
+        match self {
+            Self::QuestionMakerReplenishment => AgentCategory::QuestionMaker,
+            Self::AnswerProcessor => AgentCategory::AnswerProcessor,
+            Self::FleetAgent => AgentCategory::Fleet,
+        }
+    }
+
+    /// How a run's traffic is listed when its session has no name.
+    pub(crate) fn traffic_label(self) -> &'static str {
+        match self {
+            Self::QuestionMakerReplenishment => "question-maker",
+            Self::AnswerProcessor => "answer-processor",
+            Self::FleetAgent => "fleet-agent",
+        }
+    }
 }
 
 /// What a long-lived conversation is for. Only affects how its traffic is
@@ -98,9 +117,6 @@ pub struct AgentRunHandle {
 /// What opens a long-lived conversation: sent once, with its first message.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionOpening {
-    /// Human-readable name for the agent-side session, where the platform lets
-    /// a client set one.
-    pub title: String,
     /// Context delivered ahead of the first message.
     pub context: Option<String>,
 }
@@ -115,6 +131,10 @@ pub struct SessionOpening {
 pub struct SessionTurn {
     pub key: String,
     pub owner_id: String,
+    /// Human-readable session name, the same on every turn. A session this
+    /// turn creates is given it (where the platform lets a client name one),
+    /// and the session's traffic is listed under it. Empty means unnamed.
+    pub title: String,
     pub cwd: PathBuf,
     pub options: AgentLaunchOptions,
     /// Agent-side session id the caller recorded from an earlier process.
@@ -150,7 +170,7 @@ pub trait AgentProvider {
     /// Start an autonomous fleet agent run for a saved agent config.
     ///
     /// `session_title` names the agent-side session the same way
-    /// [`SessionOpening::title`] does for chat turns — callers build both with
+    /// [`SessionTurn::title`] does for chat turns — callers build both with
     /// the same naming convention so a session looks the same no matter how it
     /// was started; empty means don't name it. Platforms that expose no rename
     /// mechanism (Cursor) ignore it.
@@ -226,6 +246,7 @@ mod tests {
         SessionTurn {
             key: "run-1".into(),
             owner_id: "config".into(),
+            title: "Chat".into(),
             cwd: PathBuf::from("."),
             options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
             resume_session_id: None,
@@ -239,7 +260,6 @@ mod tests {
     #[test]
     fn opening_context_precedes_the_first_message() {
         let first = turn(Some(SessionOpening {
-            title: "Chat".into(),
             context: Some("CONTEXT".into()),
         }));
         assert_eq!(first.prompt_blocks(), vec!["CONTEXT", "hello"]);
@@ -253,7 +273,6 @@ mod tests {
     #[test]
     fn opening_without_context_sends_only_the_message() {
         let first = turn(Some(SessionOpening {
-            title: "Chat".into(),
             context: None,
         }));
         assert_eq!(first.prompt_blocks(), vec!["hello"]);

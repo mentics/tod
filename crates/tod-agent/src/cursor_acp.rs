@@ -5,7 +5,7 @@ use super::provider::{
 };
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::agent_traffic::{
-    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+    InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
 use crate::ReplyPart;
 use crate::reply::{self, SharedReplyParts};
@@ -34,8 +34,9 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Idle time after which a conversation's agent process is released. The
 /// agent-side session survives, so the next message resumes it.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-/// How long to wait for Claude Code to write a new session's log before naming it.
-const SESSION_LOG_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for Claude Code to start a new session's log before naming
+/// it. The log appears once the first prompt reaches the agent.
+const SESSION_LOG_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum WorkerMessage {
@@ -82,7 +83,8 @@ enum ConversationCommand {
     Turn {
         run_id: RunId,
         blocks: Vec<String>,
-        title: Option<String>,
+        /// Name for the agent-side session, if this turn creates one.
+        title: String,
         reply: Sender<WorkerMessage>,
     },
     Shutdown,
@@ -100,6 +102,7 @@ struct ConversationSpec {
     traffic_log: Option<SharedAgentTrafficLog>,
     env: Arc<Vec<(String, String)>>,
     purpose: SessionPurpose,
+    tag: TrafficTag,
 }
 
 /// A long-lived conversation: a worker thread owning at most one agent process.
@@ -218,7 +221,7 @@ impl ConversationWorker {
                 break;
             }
             self.cancelled.store(false, Ordering::SeqCst);
-            let result = self.turn(&mut live, run_id, &blocks);
+            let result = self.turn(&mut live, run_id, &blocks, &title);
             if result.is_err() {
                 // A failed or cancelled turn can leave the process mid-reply;
                 // the next message starts clean by resuming the session.
@@ -226,15 +229,7 @@ impl ConversationWorker {
                     session.shutdown(self.child.clone());
                 }
             }
-            let succeeded = result.is_ok();
             let _ = reply.send(WorkerMessage::Completed(result));
-            // Naming waits for a successful first turn: only then does the
-            // agent-side session exist anywhere a name can be recorded.
-            if let (true, Some(title), Some(session_id)) =
-                (succeeded, title, self.current_session_id())
-            {
-                name_session(self.spec.host, &session_id, &title);
-            }
         }
         if let Some(session) = live.take() {
             session.shutdown(self.child.clone());
@@ -253,12 +248,14 @@ impl ConversationWorker {
         live: &mut Option<PersistentAcpSession>,
         run_id: RunId,
         blocks: &[String],
+        title: &str,
     ) -> Result<String> {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self
             .pending_permission
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        let mut created = false;
         if live.is_none() {
             let start = match self.current_session_id() {
                 Some(id) => SessionStart::Resume(id),
@@ -278,6 +275,7 @@ impl ConversationWorker {
                 &spec.write_roots,
                 &start,
                 spec.traffic_log.clone(),
+                spec.tag.clone(),
                 spec.purpose.run_kind(),
                 &spec.env,
                 Some(self.context_chars.clone()),
@@ -286,10 +284,12 @@ impl ConversationWorker {
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
             *live = Some(session);
+            created = start == SessionStart::New;
         }
+        let name = created.then_some((self.spec.host, title));
         live.as_mut()
             .expect("connected above")
-            .prompt_blocks(blocks, run_id)
+            .prompt_blocks(blocks, run_id, name)
     }
 }
 
@@ -301,7 +301,8 @@ pub struct CursorAcpProvider {
     /// This crate does not resolve the data root itself.
     extra_write_roots: Arc<Vec<PathBuf>>,
     runs: HashMap<RunId, ActiveRun>,
-    fleet_run_context: HashMap<RunId, String>,
+    /// Where each run's traffic is filed.
+    fleet_run_context: HashMap<RunId, TrafficTag>,
     /// Long-lived conversations by caller key (see [`SessionTurn`]).
     conversations: HashMap<String, LiveConversation>,
     traffic_log: Option<SharedAgentTrafficLog>,
@@ -337,22 +338,6 @@ impl CursorAcpProvider {
         format!("{id:?}")
     }
 
-    fn kind_category(kind: AgentRunKind) -> AgentCategory {
-        match kind {
-            AgentRunKind::QuestionMakerReplenishment => AgentCategory::QuestionMaker,
-            AgentRunKind::AnswerProcessor => AgentCategory::AnswerProcessor,
-            AgentRunKind::FleetAgent => AgentCategory::Fleet,
-        }
-    }
-
-    fn kind_label(kind: AgentRunKind) -> &'static str {
-        match kind {
-            AgentRunKind::QuestionMakerReplenishment => "question-maker",
-            AgentRunKind::AnswerProcessor => "answer-processor",
-            AgentRunKind::FleetAgent => "fleet-agent",
-        }
-    }
-
     fn log_traffic(
         &self,
         kind: AgentRunKind,
@@ -363,18 +348,10 @@ impl CursorAcpProvider {
         let Some(log) = &self.traffic_log else {
             return;
         };
-        let agent_id = self
-            .fleet_run_context
-            .get(&run_id)
-            .cloned()
-            .unwrap_or_else(|| Self::run_id_string(run_id));
-        log.lock().expect("traffic log mutex").record(
-            Self::kind_category(kind),
-            agent_id,
-            Self::kind_label(kind),
-            direction,
-            content,
-        );
+        let tag = self.fleet_run_context.get(&run_id).cloned().unwrap_or_else(|| {
+            TrafficTag::new(Self::run_id_string(run_id), "", kind.traffic_label())
+        });
+        tag.record(log, kind.traffic_category(), direction, content);
     }
 
     pub fn with_agent_bin(host: AcpHost, agent_bin: PathBuf) -> Self {
@@ -392,6 +369,7 @@ impl CursorAcpProvider {
     fn spawn_run(
         &mut self,
         kind: AgentRunKind,
+        owner_id: &str,
         cwd: PathBuf,
         prompt: String,
         model: String,
@@ -425,6 +403,8 @@ impl CursorAcpProvider {
             "starting ACP run"
         );
 
+        let tag = TrafficTag::new(owner_id, &session_title, kind.traffic_label());
+        self.fleet_run_context.insert(id, tag.clone());
         self.log_traffic(kind, id, TrafficDirection::Request, &prompt);
 
         let traffic_log = self.traffic_log.clone();
@@ -445,6 +425,7 @@ impl CursorAcpProvider {
                 pending_permission_for_worker,
                 session_id_for_worker,
                 traffic_log,
+                tag,
                 id,
                 kind,
                 &write_roots,
@@ -525,35 +506,31 @@ impl AgentProvider for CursorAcpProvider {
         options: AgentLaunchOptions,
         session_title: String,
     ) -> Result<AgentRunHandle> {
-        let handle = self.spawn_run(
+        self.spawn_run(
             AgentRunKind::FleetAgent,
+            owner_id,
             cwd,
             prompt,
             options.model,
             options.effort,
             session_title,
-        )?;
-        self.fleet_run_context
-            .insert(handle.id, owner_id.to_string());
-        Ok(handle)
+        )
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {
         let blocks = turn.prompt_blocks();
         let SessionTurn {
             key,
-            owner_id,
+            title,
             cwd,
             options,
             resume_session_id,
-            opening,
             purpose,
             env,
             ..
         } = turn;
-        let title = opening
-            .map(|opening| opening.title)
-            .filter(|title| !title.trim().is_empty());
+        // Keyed by the session, not its owner: one owner can hold several.
+        let tag = TrafficTag::new(key.clone(), &title, purpose.run_kind().traffic_label());
         let spec = ConversationSpec {
             host: self.host,
             agent_bin: self.agent_bin.clone(),
@@ -564,6 +541,7 @@ impl AgentProvider for CursorAcpProvider {
             traffic_log: self.traffic_log.clone(),
             env: Arc::new(env),
             purpose,
+            tag: tag.clone(),
         };
 
         let id = RunId::new();
@@ -589,7 +567,7 @@ impl AgentProvider for CursorAcpProvider {
             self.conversations.insert(key.clone(), fresh);
         }
 
-        self.fleet_run_context.insert(id, owner_id);
+        self.fleet_run_context.insert(id, tag);
         self.log_traffic(
             purpose.run_kind(),
             id,
@@ -877,6 +855,9 @@ fn resume_method(init_result: &Value) -> Option<&'static str> {
 /// in the session log, which `claude --resume` and the adapter's session list
 /// read. Cursor names sessions itself and exposes no way to override it.
 fn name_session(host: AcpHost, session_id: &str, title: &str) {
+    if title.trim().is_empty() {
+        return;
+    }
     match host {
         AcpHost::Claude => {
             let result = claude_config_dir()
@@ -910,6 +891,16 @@ fn name_session(host: AcpHost, session_id: &str, title: &str) {
     }
 }
 
+/// [`name_session`] without holding up the turn: Claude Code starts the
+/// session log as the prompt arrives, so naming waits on it alongside the turn
+/// instead of after it.
+fn name_session_in_background(host: AcpHost, session_id: String, title: String) {
+    if title.trim().is_empty() {
+        return;
+    }
+    thread::spawn(move || name_session(host, &session_id, &title));
+}
+
 use crate::run_state::{claude_config_dir, find_claude_session_log};
 
 fn append_claude_custom_title(
@@ -938,7 +929,8 @@ fn append_claude_custom_title(
         .append(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    writeln!(log, "{record}")?;
+    // One write, so the line cannot interleave with Claude Code's own appends.
+    log.write_all(format!("{record}\n").as_bytes())?;
     Ok(())
 }
 
@@ -949,7 +941,7 @@ fn append_claude_custom_title(
 fn spawn_stderr_logger(
     stderr: std::process::ChildStderr,
     traffic_log: Option<SharedAgentTrafficLog>,
-    run_id: RunId,
+    tag: TrafficTag,
     kind: AgentRunKind,
 ) {
     thread::spawn(move || {
@@ -959,10 +951,9 @@ fn spawn_stderr_logger(
                 continue;
             }
             match &traffic_log {
-                Some(log) => log.lock().expect("traffic log mutex").record(
-                    CursorAcpProvider::kind_category(kind),
-                    CursorAcpProvider::run_id_string(run_id),
-                    format!("{} · acp", CursorAcpProvider::kind_label(kind)),
+                Some(log) => tag.record(
+                    log,
+                    kind.traffic_category(),
                     TrafficDirection::Response,
                     format!("ACP stderr\n{line}"),
                 ),
@@ -985,6 +976,7 @@ fn run_acp_session(
     pending_permission: PendingPermissionSlot,
     session_id_out: Arc<Mutex<Option<String>>>,
     traffic_log: Option<SharedAgentTrafficLog>,
+    tag: TrafficTag,
     run_id: RunId,
     kind: AgentRunKind,
     extra_write_roots: &[PathBuf],
@@ -994,7 +986,7 @@ fn run_acp_session(
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
     let stderr = child.stderr.take().context("agent stderr unavailable")?;
-    spawn_stderr_logger(stderr, traffic_log.clone(), run_id, kind);
+    spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind);
     {
         let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(child);
@@ -1011,6 +1003,7 @@ fn run_acp_session(
         replay_transcript: Vec::new(),
         cancelled: cancelled.clone(),
         traffic_log,
+        tag,
         run_id,
         kind,
         write_roots: acp_write_roots(cwd, extra_write_roots),
@@ -1068,10 +1061,6 @@ fn run_acp_session(
 
         *session_id_out.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
 
-        if !session_title.trim().is_empty() {
-            name_session(host, session_id, session_title);
-        }
-
         apply_session_config_options(
             &mut session,
             session_id,
@@ -1097,6 +1086,7 @@ fn run_acp_session(
                 "prompt": [{ "type": "text", "text": prompt }]
             }),
         )?;
+        name_session_in_background(host, session_id.to_string(), session_title.to_string());
         session.await_response(PROMPT_TIMEOUT)?;
         Ok(session.assistant_text)
     })();
@@ -1127,6 +1117,8 @@ struct AcpClient {
     replay_transcript: Vec<(&'static str, String)>,
     cancelled: Arc<AtomicBool>,
     traffic_log: Option<SharedAgentTrafficLog>,
+    tag: TrafficTag,
+    /// The run a permission request is reported against.
     run_id: RunId,
     kind: AgentRunKind,
     write_roots: Vec<PathBuf>,
@@ -1154,13 +1146,8 @@ impl AcpClient {
         let Some(log) = &self.traffic_log else {
             return;
         };
-        log.lock().expect("traffic log mutex").record(
-            CursorAcpProvider::kind_category(self.kind),
-            CursorAcpProvider::run_id_string(self.run_id),
-            format!("{} · acp", CursorAcpProvider::kind_label(self.kind)),
-            direction,
-            content,
-        );
+        self.tag
+            .record(log, self.kind.traffic_category(), direction, content);
     }
 
     fn update_reply(&self, update: impl FnOnce(&mut Vec<ReplyPart>)) {
@@ -1767,6 +1754,7 @@ impl PersistentAcpSession {
         extra_write_roots: &[PathBuf],
         start: &SessionStart,
         traffic_log: Option<SharedAgentTrafficLog>,
+        tag: TrafficTag,
         kind: AgentRunKind,
         env: &[(String, String)],
         context_chars: Option<Arc<AtomicU64>>,
@@ -1776,8 +1764,7 @@ impl PersistentAcpSession {
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
         let stderr = child.stderr.take().context("agent stderr unavailable")?;
-        let run_id = RunId::new();
-        spawn_stderr_logger(stderr, traffic_log.clone(), run_id, kind);
+        spawn_stderr_logger(stderr, traffic_log.clone(), tag.clone(), kind);
         {
             let mut guard = child_slot.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(child);
@@ -1794,7 +1781,8 @@ impl PersistentAcpSession {
         replay_transcript: Vec::new(),
             cancelled: cancelled.clone(),
             traffic_log,
-            run_id,
+            tag,
+            run_id: RunId::new(),
             kind,
             write_roots: acp_write_roots(cwd, extra_write_roots),
             activity,
@@ -1878,8 +1866,14 @@ impl PersistentAcpSession {
         })
     }
 
-    /// Send one turn made of several text blocks, in order.
-    fn prompt_blocks(&mut self, blocks: &[String], run_id: RunId) -> Result<String> {
+    /// Send one turn made of several text blocks, in order, naming the session
+    /// as the turn starts when `name` is given.
+    fn prompt_blocks(
+        &mut self,
+        blocks: &[String],
+        run_id: RunId,
+        name: Option<(AcpHost, &str)>,
+    ) -> Result<String> {
         self.client.clear_reply();
         self.client.run_id = run_id;
         let content: Vec<Value> = blocks
@@ -1892,6 +1886,9 @@ impl PersistentAcpSession {
             "session/prompt",
             json!({ "sessionId": self.session_id, "prompt": content }),
         )?;
+        if let Some((host, title)) = name {
+            name_session_in_background(host, self.session_id.clone(), title.to_string());
+        }
         self.client.await_response(PROMPT_TIMEOUT)?;
         self.client.count_context(self.client.assistant_text.len());
         Ok(self.client.assistant_text.clone())
@@ -1936,6 +1933,11 @@ pub(crate) fn fetch_transcript(
         &[],
         &SessionStart::Resume(session_id.to_string()),
         traffic_log,
+        TrafficTag::new(
+            format!("transcript-{session_id}"),
+            &format!("Transcript fetch · {session_id}"),
+            "",
+        ),
         AgentRunKind::FleetAgent,
         &[],
         None,
@@ -2099,11 +2101,15 @@ while True:
         // The name marks it as a standalone adapter: no `acp` subcommand, no login.
         let agent_bin = dir.join("fake-claude-code-acp.py");
         std::fs::write(&agent_bin, FAKE_ACP_AGENT).unwrap();
-        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::Claude, agent_bin);
+        let traffic = crate::agent_traffic::shared_log();
+        let mut provider = CursorAcpProvider::with_agent_bin(AcpHost::Claude, agent_bin)
+            .with_traffic_log(traffic.clone());
         let turn =
             |opening: Option<SessionOpening>, resume: Option<String>, message: &str| SessionTurn {
                 key: "run-1".into(),
                 owner_id: "config".into(),
+                // An empty title skips naming, which would touch the real ~/.claude.
+                title: String::new(),
                 cwd: dir.clone(),
                 options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
                 resume_session_id: resume,
@@ -2112,9 +2118,7 @@ while True:
                 purpose: crate::provider::SessionPurpose::Chat,
                 env: Vec::new(),
             };
-        // An empty title skips naming, which would touch the real ~/.claude.
         let opening = SessionOpening {
-            title: String::new(),
             context: Some("CONTEXT".into()),
         };
 
@@ -2164,7 +2168,13 @@ while True:
             Some(&json!(session_id))
         );
 
+        // Every turn, process, and protocol message of the session is one
+        // transcript, keyed by the session.
         drop(provider);
+        let summaries = traffic.lock().unwrap().agent_summaries();
+        let ids: Vec<&str> = summaries.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["run-1"]);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

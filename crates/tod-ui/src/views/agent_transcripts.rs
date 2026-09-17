@@ -203,7 +203,13 @@ impl AgentTranscriptsView {
     fn select_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
         self.selected_agent_id = Some(agent_id.clone());
         self.turns = self.load_turns(&agent_id);
-        self.header = format!("{} · {} turns", agent_id, self.turns.len()).into();
+        let label = self
+            .active_agents
+            .iter()
+            .chain(self.past_agents.iter())
+            .find(|agent| agent.id == agent_id)
+            .map_or(agent_id.as_str(), |agent| agent.label.as_str());
+        self.header = format!("{label} · {}", turn_count(self.turns.len())).into();
         cx.notify();
     }
 
@@ -329,8 +335,12 @@ fn render_agent_section(
             let selected = selected_agent_id.as_deref() == Some(agent.id.as_str());
             let badge = pick_badges.get(&agent.id).cloned();
             let subtitle = match agent.last_activity_ms {
-                Some(ms) => format!("{} turns · {}", agent.entry_count, format_timestamp_ms(ms)),
-                None => format!("{} turns", agent.entry_count),
+                Some(ms) => format!(
+                    "{} · {}",
+                    turn_count(agent.entry_count),
+                    format_timestamp_ms(ms)
+                ),
+                None => turn_count(agent.entry_count),
             };
             div()
                 .id(("agent-pick", index_offset + ix))
@@ -400,6 +410,13 @@ fn agent_row_from_summary(summary: AgentSummary) -> AgentRow {
         entry_count: summary.entry_count,
         last_activity_ms: Some(summary.last_timestamp_ms),
         active: false,
+    }
+}
+
+fn turn_count(count: usize) -> String {
+    match count {
+        1 => "1 turn".to_string(),
+        n => format!("{n} turns"),
     }
 }
 

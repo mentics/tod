@@ -77,6 +77,8 @@ struct Run {
     cold_resume: bool,
     /// Context characters the provider held before this turn.
     chars_at_start: u64,
+    /// The session's name, as sent with the turn.
+    title: String,
 }
 
 pub struct ConversationDriver {
@@ -306,7 +308,7 @@ impl ConversationDriver {
                 let first = fleet
                     .read(|conn| ConversationRepo::new(conn).get(id))?
                     .is_some_and(|c| c.session_name.is_none());
-                let name = first.then(|| self.session_title(fleet)).transpose()?;
+                let name = first.then(|| run.title.clone());
                 fleet.interview(
                     ACTOR_USER,
                     InterviewCommand::SetConversationSession {
@@ -458,13 +460,14 @@ impl ConversationDriver {
     ) -> Result<()> {
         let id = conversation.id;
         let key = Self::session_key(id);
-        let opening = match &context {
-            Some(context) => Some(SessionOpening {
-                title: self.session_title(fleet)?,
-                context: Some(context.clone()),
-            }),
-            None => None,
+        // Named once, when first sent; every later turn reuses that name.
+        let title = match &conversation.session_name {
+            Some(name) => name.clone(),
+            None => self.session_title(fleet)?,
         };
+        let opening = context.as_ref().map(|context| SessionOpening {
+            context: Some(context.clone()),
+        });
         let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
@@ -472,6 +475,7 @@ impl ConversationDriver {
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
+            title: title.clone(),
             cwd: self.scratch_dir()?,
             options: self.config.launch.clone(),
             resume_session_id: resume,
@@ -497,6 +501,7 @@ impl ConversationDriver {
             user_seq,
             cold_resume,
             chars_at_start,
+            title,
         });
         Ok(())
     }

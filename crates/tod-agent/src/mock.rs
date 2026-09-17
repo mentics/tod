@@ -5,7 +5,7 @@ use super::provider::{
 use crate::ReplyPart;
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{
-    AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
+    InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -56,7 +56,8 @@ pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
     /// Runs the handler is still playing: kind, session key, and the result.
     pending: HashMap<RunId, (AgentRunKind, String, mpsc::Receiver<Result<MockReply, String>>)>,
-    run_agent: HashMap<RunId, String>,
+    /// Where each run's traffic is filed.
+    run_agent: HashMap<RunId, TrafficTag>,
     fleet_run_sessions: HashMap<RunId, String>,
     sessions: HashMap<String, MockSession>,
     traffic_log: Option<SharedAgentTrafficLog>,
@@ -105,30 +106,21 @@ impl MockAgentProvider {
         let Some(log) = &self.traffic_log else {
             return;
         };
-        let (category, label) = match kind {
-            AgentRunKind::QuestionMakerReplenishment => {
-                (AgentCategory::QuestionMaker, "question-maker")
-            }
-            AgentRunKind::AnswerProcessor => (AgentCategory::AnswerProcessor, "answer-processor"),
-            AgentRunKind::FleetAgent => (AgentCategory::Fleet, "fleet-agent"),
-        };
-        let agent_id = self
-            .run_agent
-            .get(&run_id)
-            .cloned()
-            .unwrap_or_else(|| format!("{run_id:?}"));
-        log.lock()
-            .expect("traffic log mutex")
-            .record(category, agent_id, label, direction, content);
+        let tag = self.run_agent.get(&run_id).cloned().unwrap_or_else(|| {
+            TrafficTag::new(format!("{run_id:?}"), "", kind.traffic_label())
+        });
+        tag.record(log, kind.traffic_category(), direction, content);
     }
 
     fn finish(
         &mut self,
         kind: AgentRunKind,
+        tag: TrafficTag,
         request: Option<&str>,
         state: AgentRunState,
     ) -> AgentRunHandle {
         let id = RunId::new();
+        self.run_agent.insert(id, tag);
         if let Some(req) = request {
             self.log_traffic(kind, id, TrafficDirection::Request, req);
         }
@@ -189,7 +181,7 @@ impl AgentProvider for MockAgentProvider {
         session_title: String,
     ) -> Result<AgentRunHandle> {
         self.last_fleet_options = Some(options);
-        self.last_fleet_session_title = Some(session_title);
+        self.last_fleet_session_title = Some(session_title.clone());
         let preview: String = prompt.chars().take(200).collect();
         let reply = format!(
             "Fleet agent run complete (mock).\n\n\
@@ -198,13 +190,14 @@ impl AgentProvider for MockAgentProvider {
              Prompt preview:\n{preview}…",
             cwd.display()
         );
+        let kind = AgentRunKind::FleetAgent;
+        let tag = TrafficTag::new(owner_id, &session_title, kind.traffic_label());
         let handle = self.finish(
-            AgentRunKind::FleetAgent,
+            kind,
+            tag,
             Some(&prompt),
             AgentRunState::Success(Some(reply)),
         );
-        self.run_agent
-            .insert(handle.id, owner_id.to_string());
         self.fleet_run_sessions
             .insert(handle.id, format!("mock-fleet-session-{:?}", handle.id));
         Ok(handle)
@@ -230,13 +223,17 @@ impl AgentProvider for MockAgentProvider {
         session.reply_parts = None;
         session.context_chars += request.len() as u64;
         let kind = turn.purpose.run_kind();
+        let tag = TrafficTag::new(turn.key.clone(), &turn.title, kind.traffic_label());
 
         if turn.purpose == SessionPurpose::Chat {
             let reply = mock_session_reply(session.messages, &turn);
             session.context_chars += reply.len() as u64;
-            let handle = self.finish(kind, Some(&request), AgentRunState::Success(Some(reply)));
-            self.run_agent.insert(handle.id, turn.owner_id);
-            return Ok(handle);
+            return Ok(self.finish(
+                kind,
+                tag,
+                Some(&request),
+                AgentRunState::Success(Some(reply)),
+            ));
         }
 
         let handler = handler_slot()
@@ -246,12 +243,13 @@ impl AgentProvider for MockAgentProvider {
         let Some(handler) = handler else {
             return Ok(self.finish(
                 kind,
+                tag,
                 Some(&request),
                 AgentRunState::Failure("no mock interview handler registered".into()),
             ));
         };
         let id = RunId::new();
-        self.run_agent.insert(id, turn.owner_id.clone());
+        self.run_agent.insert(id, tag);
         self.log_traffic(kind, id, TrafficDirection::Request, &request);
         let (tx, rx) = mpsc::channel();
         let mock_turn = MockInterviewTurn {
@@ -347,7 +345,7 @@ fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
     let mut reply = format!("Mock session reply · message {message_number}\n\n");
     match &turn.opening {
         Some(opening) => {
-            reply.push_str(&format!("- Session named **{}**\n", opening.title));
+            reply.push_str(&format!("- Session named **{}**\n", turn.title));
             match opening.context.as_deref() {
                 Some(context) => reply.push_str(&format!(
                     "- Received {} lines of context ahead of this message\n",
@@ -420,6 +418,7 @@ mod tests {
         SessionTurn {
             key: key.into(),
             owner_id: "config".into(),
+            title: format!("Session {key}"),
             cwd: PathBuf::from("."),
             options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
             resume_session_id: resume_session_id.map(str::to_string),
@@ -436,7 +435,6 @@ mod tests {
 
         let mut mock = MockAgentProvider::new();
         let opening = SessionOpening {
-            title: "Obligations · Demo".into(),
             context: Some("line one\nline two".into()),
         };
         let first = mock
@@ -451,7 +449,7 @@ mod tests {
         let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, first.id) else {
             panic!("first message failed");
         };
-        assert!(reply.contains("Obligations · Demo"), "{reply}");
+        assert!(reply.contains("Session named **Session run-7**"), "{reply}");
         assert!(reply.contains("2 lines of context"), "{reply}");
         let session_id = mock
             .session_id("run-7")
@@ -466,6 +464,44 @@ mod tests {
         assert!(reply.contains("Nothing re-sent"), "{reply}");
         assert_eq!(mock.session_id("run-7"), Some(session_id));
         assert!(mock.session_context_chars("run-7").unwrap() > 0);
+    }
+
+    #[test]
+    fn a_session_is_one_transcript_listed_under_its_name() {
+        let traffic = crate::agent_traffic::shared_log();
+        let mut mock = MockAgentProvider::new().with_traffic_log(traffic.clone());
+        for message in ["first", "second"] {
+            let run = mock
+                .send_session_turn(session_turn("run-7", None, None, message, SessionPurpose::Chat))
+                .unwrap();
+            poll_run(&mut mock, run.id);
+        }
+        let run = mock
+            .start_fleet_agent(
+                "task-1",
+                PathBuf::from("."),
+                "go".into(),
+                AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+                "Fleet · Fix login".into(),
+            )
+            .unwrap();
+        poll_run(&mut mock, run.id);
+
+        let mut summaries: Vec<_> = traffic
+            .lock()
+            .unwrap()
+            .agent_summaries()
+            .into_iter()
+            .map(|s| (s.id, s.label, s.entry_count))
+            .collect();
+        summaries.sort();
+        assert_eq!(
+            summaries,
+            [
+                ("run-7".to_string(), "Session run-7".to_string(), 4),
+                ("task-1".to_string(), "Fleet · Fix login".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
@@ -484,10 +520,7 @@ mod tests {
         let run = mock
             .send_session_turn(session_turn(
                 "gate-1",
-                Some(crate::provider::SessionOpening {
-                    title: "design-to-planning gate".into(),
-                    context: None,
-                }),
+                Some(crate::provider::SessionOpening { context: None }),
                 None,
                 message,
                 SessionPurpose::Chat,

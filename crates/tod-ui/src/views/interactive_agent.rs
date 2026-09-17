@@ -360,12 +360,11 @@ impl InteractiveAgentView {
         self.pending.is_some()
     }
 
-    /// What opens the agent session — its name and the app context. Only the
-    /// session's first message carries it; the agent keeps it from then on.
+    /// What opens the agent session — the app context. Only the session's
+    /// first message carries it; the agent keeps it from then on.
     fn opening(&self) -> Option<SessionOpening> {
         let first_message = self.conversation.is_empty() && self.agent_session_id.is_none();
         first_message.then(|| SessionOpening {
-            title: self.session_name.clone(),
             context: self.context_prefix.clone(),
         })
     }
@@ -421,6 +420,7 @@ impl InteractiveAgentView {
                 provider.send_session_turn(SessionTurn {
                     key: session_run_id,
                     owner_id: self.node_id.clone(),
+                    title: self.session_name.clone(),
                     cwd: self.workspace_cwd.clone(),
                     options,
                     resume_session_id: self.agent_session_id.clone(),
