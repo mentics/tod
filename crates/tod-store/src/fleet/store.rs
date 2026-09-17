@@ -9,7 +9,8 @@ use crate::fleet::migration::{
     recover_incomplete_storage_migration,
 };
 use crate::fleet::node_actions::{
-    ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
+    ResolvedAgent, ResolvedFiles, capability_sources_for_list, resolve_agent_for_node,
+    resolve_files_for_node,
 };
 use crate::fleet::notices::FleetNoticeHooks;
 use crate::fleet::paths::FleetPaths;
@@ -296,6 +297,42 @@ impl FleetStore {
     pub fn resolve_agent_for_node(&self, node_id: &str) -> Result<Option<ResolvedAgent>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         resolve_agent_for_node(&guard.connection(), node_id)
+    }
+
+    /// For every node in `list_id`, the node whose `cap` it resolves to —
+    /// itself, or the nearest ancestor with the capability. Nodes that resolve
+    /// to nothing are absent. The list-scoped form of
+    /// [`Self::resolve_agent_for_node`] / [`Self::resolve_files_for_node`] for
+    /// callers that only need to know whether a capability resolves.
+    pub fn capability_sources_for_list(
+        &self,
+        list_id: uuid::Uuid,
+        cap: Capability,
+    ) -> Result<HashMap<uuid::Uuid, uuid::Uuid>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        capability_sources_for_list(&guard.connection(), list_id, cap)
+    }
+
+    /// Live agent run counts keyed by node for one outline list.
+    pub fn live_run_counts_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<HashMap<uuid::Uuid, usize>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .live_counts_for_list(list_id)
+            .map_err(Into::into)
+    }
+
+    /// Shell sessions keyed by node for one outline list.
+    pub fn shells_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<HashMap<uuid::Uuid, Vec<ShellSession>>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ShellRepo::new(&guard.connection())
+            .list_for_list(list_id)
+            .map_err(Into::into)
     }
 
     /// The node's ready Files directory, else the data root — where agent

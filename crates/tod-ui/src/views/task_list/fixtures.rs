@@ -12,9 +12,20 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
         return Vec::new();
     };
     let rows = store.flatten_outline(list_id).unwrap_or_default();
+    // One list-scoped query per column instead of four per row: agent runtime
+    // commits reload this list often, and each per-row call takes the
+    // projection mutex.
     let counts = store
         .obligation_counts_for_list(list_id)
         .unwrap_or_default();
+    let agent_sources = store
+        .capability_sources_for_list(list_id, Capability::Agent)
+        .unwrap_or_default();
+    let files_sources = store
+        .capability_sources_for_list(list_id, Capability::Files)
+        .unwrap_or_default();
+    let live_run_counts = store.live_run_counts_for_list(list_id).unwrap_or_default();
+    let mut shells_by_node = store.shells_for_list(list_id).unwrap_or_default();
     rows.into_iter()
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
@@ -29,23 +40,13 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 String::new()
             };
             let node_id = row.node.id.to_string();
-            // Agent and Files inherit from the nearest ancestor that has them.
-            let has_agent = store
-                .resolve_agent_for_node(&node_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let has_files = store
-                .resolve_files_for_node(&node_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let live_run_count = store
-                .list_runs_for_node(&node_id)
-                .map(|runs| runs.iter().filter(|run| run.is_live()).count())
-                .unwrap_or(0);
-            let shells = store
-                .list_shells_for_node(&node_id)
+            // Agent and Files inherit from the nearest ancestor that has them;
+            // the maps already carry that resolution.
+            let has_agent = agent_sources.contains_key(&row.node.id);
+            let has_files = files_sources.contains_key(&row.node.id);
+            let live_run_count = live_run_counts.get(&row.node.id).copied().unwrap_or(0);
+            let shells = shells_by_node
+                .remove(&row.node.id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|shell| ShellInfo {
@@ -136,6 +137,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
 mod tests {
     use super::*;
     use std::fs;
+    use tod_store::fleet::FleetMutation;
     use tod_store::outline::types::Capability;
     use tod_store::outline::{CreatePosition, OutlineMutation};
 
@@ -177,6 +179,99 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(node.slug, "root-task");
+        drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The list-scoped loader must still show a child the Agent and Files its
+    /// parent owns, and the child's own shells and live runs.
+    #[test]
+    fn inherits_agent_and_files_and_reports_shells_and_runs() {
+        let root = std::env::temp_dir().join(format!("tod-fixtures-inherit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FleetStore::open(&root).unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateList {
+                slug: "inherit".into(),
+                title: "Inherit".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let list_id = store.list_outline_lists().unwrap()[0].id;
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(parent),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Parent".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(child),
+                list_id,
+                parent_id: Some(parent),
+                anchor_id: Some(parent),
+                position: CreatePosition::Child,
+                title: "Child".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: parent,
+                capabilities: vec![Capability::Agent, Capability::Files],
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::CreateShellSession {
+                id: "shell-1".into(),
+                node_id: child.to_string(),
+                reconnect: None,
+            })
+            .unwrap();
+        store
+            .enqueue(FleetMutation::CreateAgentRun {
+                node_id: child.to_string(),
+                run_kind: None,
+                session_name: None,
+                launch: None,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        store.reload_if_stale().ok();
+
+        let items = load_tasks_from_store(&store, Some(list_id));
+        let by_title = |title: &str| {
+            items
+                .iter()
+                .find(|item| item.title == title)
+                .expect("row")
+                .clone()
+        };
+        let parent_row = by_title("Parent");
+        assert!(parent_row.has_agent && parent_row.has_files);
+        assert_eq!(parent_row.live_run_count, 0);
+        assert!(parent_row.shells.is_empty());
+
+        let child_row = by_title("Child");
+        assert!(child_row.has_agent, "child inherits the parent's Agent");
+        assert!(child_row.has_files, "child inherits the parent's Files");
+        assert!(child_row.has_actions);
+        assert_eq!(child_row.live_run_count, 1);
+        assert_eq!(
+            child_row
+                .shells
+                .iter()
+                .map(|shell| shell.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shell 1"]
+        );
         drop(store);
         let _ = fs::remove_dir_all(root);
     }
