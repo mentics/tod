@@ -13,6 +13,7 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
     div, px,
 };
+use gpui_component::Disableable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
@@ -54,6 +55,23 @@ pub(crate) fn display_title(selection: &FocusSelection) -> String {
         }
         Some(line) => line,
         None => selection.title.clone(),
+    }
+}
+
+/// Most characters a path crumb's button shows; the full title is its
+/// tooltip.
+const CRUMB_CHARS: usize = 24;
+
+/// A node title as a crumb label: one line, cut to [`CRUMB_CHARS`].
+pub(crate) fn crumb_label(title: &str) -> String {
+    let line = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > CRUMB_CHARS {
+        let mut cut: String = line.chars().take(CRUMB_CHARS).collect();
+        cut.truncate(cut.trim_end().len());
+        cut.push('…');
+        cut
+    } else {
+        line
     }
 }
 
@@ -134,6 +152,7 @@ impl ConversationView {
         let stop = (self.pane == Pane::Transcript && self.picker.is_none() && !self.text_editing())
             .then_some(self.stop);
         let (kind, kind_icon) = kind_of(self.focus);
+        let crumbs = self.data.path.clone();
         let updated = self
             .conversation_id
             .and_then(|id| {
@@ -143,12 +162,6 @@ impl ConversationView {
                     .find(|c| c.conversation.id == id)
             })
             .map(|c| format_time(c.conversation.updated_at));
-        let path = self.data.path.clone();
-        let path = match self.focus {
-            // A node's path ends with its own title, which is the title.
-            Focus::Node(_) => path[..path.len().saturating_sub(1)].to_vec(),
-            _ => path,
-        };
         let status: Option<SharedString> = if self.status.running {
             Some(
                 self.status
@@ -182,6 +195,16 @@ impl ConversationView {
                     .tooltip("Back (Alt+Left)")
                     .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
             )
+            .child(
+                Button::new("conversation-forward")
+                    .icon(Icon::new(IconName::ArrowRight))
+                    .ghost()
+                    .small()
+                    .disabled(!self.history.can_go_forward())
+                    .selected(stop == Some(Stop::Forward))
+                    .tooltip("Forward (Alt+Right)")
+                    .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
+            )
             .child(picker)
             .child(
                 div()
@@ -191,41 +214,69 @@ impl ConversationView {
                     .bg(style::color::divider()),
             )
             .child(
-                style::text_muted(div())
-                    .id("conversation-kind")
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .child(Icon::new(kind_icon).small())
-                    .tooltip(move |window, cx| Tooltip::new(kind).build(window, cx)),
+                Button::new("conversation-focus-project")
+                    .icon(Icon::new(IconName::Layers))
+                    .ghost()
+                    .small()
+                    .selected(self.focus == Focus::Project)
+                    .tooltip("Everything, across every list")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open(Focus::Project, true, window, cx)
+                    })),
             )
-            .when(!path.is_empty(), |el| {
-                el.child(
-                    style::text_muted(selectable_text(
-                        "conversation-path",
-                        format!("{} ›", path.join(" › ")),
-                        window,
-                        cx,
-                    ))
-                    .flex_shrink(1.)
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .overflow_hidden(),
-                )
+            .children(crumbs.into_iter().enumerate().map(|(ix, crumb)| {
+                let node = crumb.node;
+                let title = SharedString::from(crumb.title.clone());
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .child(style::text_muted(div()).child("›"))
+                    .child(
+                        Button::new(ElementId::Name(format!("conversation-crumb-{ix}").into()))
+                            .label(crumb_label(&crumb.title))
+                            .ghost()
+                            .small()
+                            .tooltip(title)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open(Focus::Node(node), true, window, cx)
+                            })),
+                    )
+            }))
+            // The project button is itself the project crumb, so the kind
+            // icon would only repeat it.
+            .when(self.focus != Focus::Project, |el| {
+                el.child(style::text_muted(div()).flex_shrink_0().child("›"))
+                    .child(
+                        style::text_muted(div())
+                            .id("conversation-kind")
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(Icon::new(kind_icon).small())
+                            .tooltip(move |window, cx| Tooltip::new(kind).build(window, cx)),
+                    )
             })
+            // The drill-down belongs beside the title, so the pair share the
+            // row's spare width rather than the title taking all of it.
             .child(
-                style::text_title(selectable_text(
-                    "conversation-title",
-                    self.data.title.clone(),
-                    window,
-                    cx,
-                ))
-                .flex_1()
-                .min_w_0()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .overflow_hidden(),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .child(
+                        style::text_title(selectable_text(
+                            "conversation-title",
+                            self.data.title.clone(),
+                            window,
+                            cx,
+                        ))
+                        .flex_shrink(1.)
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .overflow_hidden(),
+                    )
+                    .child(self.render_drill_down(window, cx)),
             )
             .when_some(status, |el, status| {
                 let text = selectable_text("conversation-status", status, window, cx)
@@ -249,6 +300,44 @@ impl ConversationView {
                     .tooltip("Context panel (Ctrl+I)")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_context(window, cx))),
             )
+            .into_any_element()
+    }
+
+    /// The chevron beside the title: the focused item's children, as a tree
+    /// to drill into. Absent when it has none.
+    fn render_drill_down(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.nav.is_none() && !self.data.has_children {
+            return div().into_any_element();
+        }
+        let menu = self.nav.is_some().then(|| self.render_nav_menu(window, cx));
+        div()
+            .id("conversation-drill-down")
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new("conversation-drill-down-button")
+                    .icon(Icon::new(IconName::ChevronDown))
+                    .ghost()
+                    .small()
+                    .selected(self.nav.is_some())
+                    .tooltip("Go to something under this item")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.close_nav_menu(cx) {
+                            this.open_nav_menu(cx);
+                        }
+                    })),
+            )
+            .when_some(menu, |el, menu| {
+                el.child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopRight)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(div().occlude().mt_1().child(menu)),
+                    )
+                    .with_priority(1),
+                )
+            })
             .into_any_element()
     }
 

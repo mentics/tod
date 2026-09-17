@@ -41,6 +41,8 @@ actions!(
         ConversationEscape,
         /// Back to the previous focus.
         ConversationBack,
+        /// Forward again along the trail Back came down.
+        ConversationForward,
         /// Start a new conversation about the current focus.
         ConversationNew,
         /// Send the message, or save the inline edit.
@@ -73,6 +75,7 @@ pub fn register_conversation_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("3", ConversationTabDeleted, nav),
         KeyBinding::new("escape", ConversationEscape, nav),
         KeyBinding::new("alt-left", ConversationBack, nav),
+        KeyBinding::new("alt-right", ConversationForward, nav),
         KeyBinding::new("ctrl-n", ConversationNew, nav),
         KeyBinding::new("ctrl-enter", ConversationSubmit, input),
         KeyBinding::new("escape", ConversationEscape, input),

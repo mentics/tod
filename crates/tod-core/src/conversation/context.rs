@@ -74,6 +74,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: Vec::new(),
+                node: None,
                 title: "The whole project".into(),
                 slug: None,
                 text: None,
@@ -103,6 +104,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path,
+                node: Some(id),
                 title,
                 slug: slug_of(id)?,
                 text: None,
@@ -119,6 +121,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: path_to(node)?,
+                node: Some(node),
                 title: match &obligation {
                     Some(o) => format!("{} {}", o.kind, short_id(id)),
                     None => format!("obligation {} (deleted)", short_id(id)),
@@ -134,6 +137,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: path_to(node)?,
+                node: Some(node),
                 title: match &step {
                     Some(s) => format!("plan step {} ({})", short_id(id), s.status),
                     None => format!("plan step {} (deleted)", short_id(id)),
