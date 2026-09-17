@@ -115,7 +115,6 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::SetNodeCollapsed { .. }
         | M::EnableCapabilities { .. }
         | M::DisableCapability { .. }
-        | M::ImportDocProcess { .. }
         | M::RenameObligationSection { .. }
         | M::RestoreObligation { .. }
         | M::RestoreNodeSubtree { .. }

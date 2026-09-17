@@ -681,17 +681,6 @@ impl FleetStore {
         f(&conn)
     }
 
-    /// Bootstrap-import `doc/process` from `repo_root`.
-    pub fn import_doc_process(
-        &self,
-        repo_root: impl AsRef<std::path::Path>,
-    ) -> Result<(), FleetWriterError> {
-        self.enqueue_outline(OutlineMutation::ImportDocProcess {
-            repo_root: repo_root.as_ref().to_string_lossy().into_owned(),
-        })?;
-        self.writer.flush()
-    }
-
     /// Reload projection if the on-disk store changed externally.
     pub fn reload_if_stale(&self) -> Result<bool> {
         self.projection

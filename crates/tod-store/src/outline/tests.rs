@@ -3,8 +3,7 @@
 use crate::fleet::store::FleetStore;
 use crate::interview::PHASE_REQUIREMENTS;
 use crate::outline::types::Capability;
-use crate::outline::{CreatePosition, OutlineMutation, resolve_obligations};
-use crate::paths::{clear_data_root_override, set_data_root};
+use crate::outline::{CreatePosition, OutlineMutation};
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -128,113 +127,6 @@ fn obligation_text_cannot_reference_files() {
         .unwrap();
     assert_eq!(bodies, vec!["Row controls activate on Enter and on click.".to_string()]);
 
-    drop(store);
-    let _ = fs::remove_dir_all(root);
-}
-
-#[test]
-fn import_skips_obligations_that_link_to_files() {
-    let repo = std::env::temp_dir().join(format!("tod-import-links-{}", Uuid::new_v4()));
-    let task = repo.join("doc/process/projects/demo/tasks/one");
-    fs::create_dir_all(&task).unwrap();
-    fs::write(repo.join("doc/process/projects/demo/user.md"), "# Demo\n").unwrap();
-    fs::write(task.join("state.md"), "- State: design\n").unwrap();
-    fs::write(
-        task.join("user.md"),
-        "# One\n\n## Constraints\n\n\
-         1. Stays fast.\n\n\
-         2. Row control activation — Follow [`doc/process/shared/constraints/row-control-activation-constraints.md`](../../../../shared/constraints/row-control-activation-constraints.md).\n",
-    )
-    .unwrap();
-    let data = repo.join("data");
-    fs::create_dir_all(&data).unwrap();
-    let store = FleetStore::open(&data).unwrap();
-    store.import_doc_process(&repo).unwrap();
-    store.reload_if_stale().ok();
-    let bodies: Vec<String> = store
-        .read(|conn| {
-            let mut stmt = conn.prepare("SELECT body FROM node_obligations")?;
-            let rows = stmt.query_map([], |r| r.get(0))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
-        .unwrap();
-    assert_eq!(bodies, vec!["Stays fast.".to_string()]);
-    drop(store);
-    let _ = fs::remove_dir_all(repo);
-}
-
-#[test]
-fn import_from_git_repo_while_data_root_is_sandboxed() {
-    let git_root = std::env::current_dir().unwrap();
-    if !git_root.join("doc").join("process").is_dir() {
-        return;
-    }
-    let data = std::env::temp_dir().join(format!("tod-import-sandbox-{}", Uuid::new_v4()));
-    fs::create_dir_all(&data).unwrap();
-    set_data_root(data.clone());
-    let store = FleetStore::open(&data).unwrap();
-    store.import_doc_process(&git_root).unwrap();
-    store.reload_if_stale().unwrap();
-    let lists = store.list_outline_lists().unwrap();
-    assert!(!lists.is_empty());
-    let rows = store.flatten_outline(lists[0].id).unwrap();
-    assert!(
-        !rows.is_empty(),
-        "import should read doc/process from git checkout, not --data-root"
-    );
-    clear_data_root_override();
-    drop(store);
-    let _ = fs::remove_dir_all(data);
-}
-
-#[test]
-#[ignore = "manual: reimport doc/process into repo .local/data"]
-fn reimport_local_data() {
-    let git_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("repo root");
-    let data = git_root.join(".local").join("data");
-    fs::create_dir_all(&data).unwrap();
-    set_data_root(data.clone());
-    let store = FleetStore::open(&data).unwrap();
-    store.import_doc_process(&git_root).unwrap();
-    store.projection().lock().unwrap().reload().unwrap();
-    let lists = store.list_outline_lists().unwrap();
-    let rows = store.flatten_outline(lists[0].id).unwrap();
-    eprintln!(
-        "reimported {} outline rows into {}",
-        rows.len(),
-        data.display()
-    );
-    assert!(!rows.is_empty());
-    clear_data_root_override();
-}
-
-#[test]
-fn import_and_resolve_obligations_round_trip() {
-    let root = std::env::temp_dir().join(format!("tod-outline-it-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let store = FleetStore::open(&root).unwrap();
-    store.import_doc_process(&root).ok();
-    store.reload_if_stale().ok();
-    let lists = store.list_outline_lists().unwrap();
-    if lists.is_empty() {
-        drop(store);
-        let _ = fs::remove_dir_all(root);
-        return;
-    }
-    let rows = store.flatten_outline(lists[0].id).unwrap();
-    if let Some(row) = rows
-        .iter()
-        .find(|r| r.capabilities.contains(&Capability::Spec))
-    {
-        let projection = store.projection();
-        let guard = projection.lock().unwrap();
-        let conn = guard.connection();
-        let resolved = resolve_obligations(&conn, row.node.id, None).unwrap();
-        assert!(resolved.is_empty() || !resolved[0].obligation.body.is_empty());
-    }
     drop(store);
     let _ = fs::remove_dir_all(root);
 }

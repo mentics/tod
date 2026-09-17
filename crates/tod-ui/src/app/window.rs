@@ -1437,28 +1437,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             app_settings,
                         );
                         let _ = crate::interview::bootstrap(fleet.clone());
-                        if opts.import_process {
-                            let repo = paths.repo_root().to_path_buf();
-                            match fleet.import_doc_process(&repo) {
-                                Ok(()) => {
-                                    if let Ok(lists) = fleet.list_outline_lists() {
-                                        for list in lists {
-                                            if let Ok(rows) = fleet.flatten_outline(list.id) {
-                                                tracing::info!(
-                                                    event = "doc_process_import",
-                                                    outline_rows = rows.len(),
-                                                    repo = %repo.display(),
-                                                    "doc/process import finished"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::error!("doc/process import failed: {err:#}");
-                                }
-                            }
-                        }
                         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
                         let task_edit = cx
                             .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
