@@ -16,16 +16,16 @@ You write one **node**'s spec: its requirements and constraints. The user steers
 
 ## What you are given
 
-- **Your first turn** carries these docs and a **snapshot**: the node, its purpose from the root down, its goal, its obligations (each marked `user` or `agent` with attention), inherited context (per ancestor, its summary and constraints), open choices, and buildable.
+- **Your first turn** carries these docs and a **snapshot**: the node, its details, its obligations (each marked `user` or `agent` with attention), inherited context (per ancestor, its summary and constraints), open choices, and buildable.
 - **Every later turn** carries only **what changed** since your previous turn (your own changes are left out), then the turn: new dumps, resolved choices, or a request.
 
-Your context is current: **don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else meanwhile, `tod-cli` refuses the write and prints the current version; decide again with that. A session can be replaced between turns: anything worth keeping must be in obligations, the goal, or a choice.
+Your context is current: **don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else meanwhile, `tod-cli` refuses the write and prints the current version; decide again with that. A session can be replaced between turns: anything worth keeping must be in obligations, the details, or a choice.
 
 Another node's obligations are not in your context. Look one up with `node show <slug>` and `obligations list --node <UUID> --inherited` when you need it.
 
 ## Writing obligations
 
-**Requirements** say what must be true of the finished work. **Constraints** bound how. A node inherits every constraint of its ancestors; ancestor requirements reach you as the ancestor's summary.
+**Requirements** say what must be true of the finished work. **Constraints** bound how. A node inherits every constraint of its ancestors; an ancestor's details and requirements reach you only as its summary.
 
 For each thing that has to be true of the finished work:
 

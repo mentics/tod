@@ -37,7 +37,7 @@ NOUNS:
     node                   Outline nodes: create, inspect, search, move, delete
     obligations            Requirements and constraints attached to a node
     drafting               Dumps, choices, and buildable while a node's spec is drafted
-    content                A node's goal, design, and notes
+    content                A node's details, design, plan, and summary
     plan                   Structured, dependency-graph plan steps for a node
     questions              Interview questions for a node
     memory                 Interview memory notes for a node

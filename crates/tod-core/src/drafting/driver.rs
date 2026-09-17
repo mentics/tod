@@ -67,6 +67,10 @@ struct SummaryRun {
     node_id: Uuid,
     title: String,
     key: String,
+    /// The request as sent. A reply to one that no longer matches the node
+    /// was written from details or obligations since changed, so it is
+    /// dropped and the summary stays stale for the next tick to redo.
+    request: String,
 }
 
 #[derive(Default)]
@@ -229,6 +233,10 @@ impl DraftingDriver {
             let run = self.summaries.remove(i);
             agent.close_session(&run.key);
             let stored = outcome.and_then(|body| {
+                let (_, request) = fleet.read(|conn| summary::request(conn, run.node_id))?;
+                if request != run.request {
+                    return Ok(());
+                }
                 fleet.interview(
                     ACTOR_AGENT,
                     InterviewCommand::Outline {
@@ -408,10 +416,10 @@ impl DraftingDriver {
             self.kickoff_checked = true;
             return Ok(());
         }
-        // Ancestors' requirements reach the drafter only as their summaries, so
-        // the turn waits until every one it needs is written. Nothing is taken
-        // off the due list meanwhile: the next tick finds the same work.
-        let missing = fleet.read(|conn| summary::missing(conn, node, Some(phase)))?;
+        // Ancestors reach the drafter only as their summaries, so the turn
+        // waits until every one it needs is written and current. Nothing is
+        // taken off the due list meanwhile: the next tick finds the same work.
+        let missing = fleet.read(|conn| summary::missing(conn, node))?;
         if !missing.is_empty() {
             return self.start_summaries(fleet, agent, missing);
         }
@@ -447,7 +455,7 @@ impl DraftingDriver {
                                 title: format!("{title} · summary"),
                                 context: None,
                             }),
-                            message,
+                            message: message.clone(),
                             purpose: SessionPurpose::Summarizer,
                             env: Vec::new(),
                         })?;
@@ -456,6 +464,7 @@ impl DraftingDriver {
                             node_id,
                             title,
                             key,
+                            request: message,
                         })
                     });
             match started {
@@ -743,7 +752,7 @@ mod tests {
     use std::sync::Arc;
     use tod_agent::agent_traffic::InterviewAgentCounts;
     use tod_agent::{AgentPlatform, AgentRunHandle};
-    use tod_store::outline::{KIND_REQUIREMENT, OutlineMutation};
+    use tod_store::outline::{EXTRA_CONTENT_DETAILS, KIND_REQUIREMENT, OutlineMutation};
 
     /// Plays the mock drafter synchronously against the fixture's open store;
     /// every run finishes at once.
@@ -1134,6 +1143,74 @@ mod tests {
         assert!(!context.contains("nobody below"), "{context}");
         assert!(!context.contains("No summary yet"), "{context}");
         assert!(driver.status().summarizing.is_empty());
+    }
+
+    /// Editing an ancestor's details makes its summary stale; the next turn
+    /// below it waits for a fresh one, and a reply written from details that
+    /// changed again meanwhile is dropped rather than stored as current.
+    #[test]
+    fn a_stale_ancestor_summary_is_rewritten_before_the_turn() {
+        let fx = fixture();
+        let set_details = |body: &str| {
+            fx.outline(OutlineMutation::SetExtraContent {
+                node_id: fx.node,
+                content_type: EXTRA_CONTENT_DETAILS.into(),
+                body: body.into(),
+            })
+        };
+        set_details("The parent, as first described.");
+        let child = Uuid::new_v4();
+        fx.outline(OutlineMutation::CreateNode {
+            node_id: Some(child),
+            list_id: fx.fleet.list_outline_lists().unwrap()[0].id,
+            parent_id: Some(fx.node),
+            anchor_id: None,
+            position: tod_store::outline::CreatePosition::Child,
+            title: "Child".into(),
+        });
+        fx.outline(OutlineMutation::EnableCapabilities {
+            node_id: child,
+            capabilities: vec![tod_store::outline::Capability::Spec],
+        });
+        fx.fleet.writer().flush().unwrap();
+        let summary = |fx: &Fixture| fx.fleet.get_summary(fx.node).unwrap();
+        let (mut driver, mut agent) = driver(&fx, DraftingMode::Capture);
+        driver.config.node_id = child;
+        let dump = |body: &str| {
+            fx.user(InterviewCommand::AddDump {
+                node_id: Some(child),
+                body: body.into(),
+            })
+        };
+
+        dump("First.");
+        driver.tick(&fx.fleet, &mut agent);
+        assert_eq!(agent.turns[0].purpose, SessionPurpose::Summarizer);
+        assert!(agent.turns[0].message.contains("as first described"));
+        driver.tick(&fx.fleet, &mut agent);
+        assert!(!summary(&fx).unwrap().stale);
+        assert_eq!(agent.turns.len(), 2);
+        driver.tick(&fx.fleet, &mut agent);
+
+        set_details("The parent, as redescribed.");
+        assert!(summary(&fx).unwrap().stale);
+        dump("Second.");
+        driver.tick(&fx.fleet, &mut agent);
+        let asked = agent.turns.len();
+        assert_eq!(agent.turns[asked - 1].purpose, SessionPurpose::Summarizer);
+        assert!(agent.turns[asked - 1].message.contains("as redescribed"));
+
+        set_details("The parent, redescribed again.");
+        driver.tick(&fx.fleet, &mut agent);
+        assert!(
+            summary(&fx).unwrap().stale,
+            "a reply to superseded details is not stored"
+        );
+        assert_eq!(agent.turns[asked].purpose, SessionPurpose::Summarizer);
+        assert!(agent.turns[asked].message.contains("redescribed again"));
+        driver.tick(&fx.fleet, &mut agent);
+        assert!(!summary(&fx).unwrap().stale);
+        assert_eq!(agent.turns[asked + 1].purpose, SessionPurpose::Drafter);
     }
 
     #[test]

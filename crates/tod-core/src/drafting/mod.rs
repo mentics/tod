@@ -15,7 +15,7 @@ use tod_store::interview::{PHASE_DESIGN, PHASE_REQUIREMENTS};
 /// Which drafter a node gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DraftingMode {
-    /// `proposed`: shape dumps into a goal and requirements; list gaps.
+    /// `proposed`: shape dumps into details and requirements; list gaps.
     Capture,
     /// `design`, and rewriting obligations on nodes past it: the drafting loop.
     Drafting,
