@@ -10,6 +10,11 @@ directly to one node:
 They are ordered within their kind, and that order is meaningful: it is the
 order shown to the user in the app.
 
+An obligation's text must stand on its own. It is stored with the outline, not
+beside any repository, so it cannot link to or name a file (a repo doc, a
+relative markdown link, a local path) — state what the file says instead. Such
+text is refused. URLs and `[[slug]]` node references are fine.
+
 ## Inheritance
 
 The two kinds inherit differently down the outline, and the difference matters:

@@ -33,9 +33,6 @@ pub(crate) fn one_line(text: &str) -> String {
 }
 
 pub(crate) fn node_title(nodes: &NodeRepo<'_>, id: Uuid) -> String {
-    if id.is_nil() {
-        return "global".into();
-    }
     nodes
         .get(id)
         .ok()
@@ -165,17 +162,14 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     )
 }
 
-/// Renders what `node_id` inherits: global obligations, then each Spec
-/// ancestor, root first, with its title, its generated summary
+/// Renders what `node_id` inherits: each Spec ancestor, root first, with its title, its generated summary
 /// (`NodeRepo::get_summary`), and its constraint-kind obligations in full. The
 /// summary is the only account of an ancestor's scope a descendant gets: its
 /// details and requirements are never listed, since a deep tree would
 /// otherwise put hundreds of unrelated rows into every context. The drafting
 /// driver writes missing and stale summaries before a turn
 /// (`crate::drafting::summary`); anywhere else, an ancestor still without one
-/// gets a pointer to `tod-cli` instead. Global (no owning node) obligations
-/// always show in full; there is nothing to summarize about them. This never
-/// includes anything of `node_id`'s own — callers show that separately.
+/// gets a pointer to `tod-cli` instead. This never includes anything of `node_id`'s own — callers show that separately.
 pub fn render_inherited_context(
     conn: &Connection,
     nodes: &NodeRepo<'_>,
@@ -190,8 +184,6 @@ pub fn render_inherited_context(
             .or_default()
             .push(item.obligation);
     }
-    let global = groups.remove(&Uuid::nil()).unwrap_or_default();
-
     let mut ancestors = String::new();
     for source_id in ancestor_chain(conn, node_id)?
         .into_iter()
@@ -224,7 +216,7 @@ pub fn render_inherited_context(
             }
         }
     }
-    if global.is_empty() && ancestors.is_empty() {
+    if ancestors.is_empty() {
         return Ok(String::new());
     }
 
@@ -236,12 +228,6 @@ pub fn render_inherited_context(
          *this* node; a gap in an ancestor's own scope belongs on that \
          ancestor, not as a question or obligation on this node.\n",
     );
-    if !global.is_empty() {
-        out.push_str("\n### Global\n");
-        for o in &global {
-            writeln!(out, "- {}", obligation_line(o))?;
-        }
-    }
     out.push_str(&ancestors);
     Ok(out)
 }

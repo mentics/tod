@@ -6,7 +6,7 @@ use crate::interview::{ACTOR_USER, AgentSessionRow, ENTITY_OBLIGATION, PHASE_DES
 use crate::outline::repos::GateRepo;
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 use crate::outline::{
-    KIND_CONSTRAINT, KIND_REQUIREMENT, NodeGateEvaluation, OUTCOME_FAIL, OUTCOME_PASS,
+    KIND_CONSTRAINT, KIND_REQUIREMENT, check_no_file_references, NodeGateEvaluation, OUTCOME_FAIL, OUTCOME_PASS,
     OUTCOME_PENDING, OutlineMutation, SOURCE_AGENT, SOURCE_HUMAN,
 };
 use anyhow::{Context, Result, bail};
@@ -66,6 +66,7 @@ pub fn add_choice(
             if ob.body.trim().is_empty() {
                 bail!("option obligations need a body");
             }
+            check_no_file_references(&ob.body)?;
             let missing = repo.missing_slugs(&ob.body)?;
             if !missing.is_empty() {
                 bail!("no node has slug {}", missing.join(", "));
