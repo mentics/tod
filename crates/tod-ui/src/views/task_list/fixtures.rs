@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use tod_store::fleet::FleetStore;
-use tod_store::outline::types::Capability;
+use tod_store::outline::types::{Capability, FlatNodeRow};
 
 use super::model::{ShellInfo, TaskItem};
 
@@ -12,9 +13,15 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
         return Vec::new();
     };
     let rows = store.flatten_outline(list_id).unwrap_or_default();
-    let counts = store
-        .obligation_counts_for_list(list_id)
-        .unwrap_or_default();
+    let counts = store.obligation_counts_for_list(list_id).unwrap_or_default();
+    // Everything below is loaded once for the whole list. Doing any of it per
+    // row costs a prepared statement and a projection-mutex acquisition each,
+    // which is what made a few hundred rows take hundreds of milliseconds on
+    // the UI thread.
+    let live_run_counts = store.live_run_counts().unwrap_or_default();
+    let mut shells_by_node = store.shells_by_node().unwrap_or_default();
+    let inherits = InheritedCapabilities::from_rows(&rows);
+
     rows.into_iter()
         .map(|row| {
             let is_work = !row.capabilities.is_empty();
@@ -30,22 +37,11 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
             };
             let node_id = row.node.id.to_string();
             // Agent and Files inherit from the nearest ancestor that has them.
-            let has_agent = store
-                .resolve_agent_for_node(&node_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let has_files = store
-                .resolve_files_for_node(&node_id)
-                .ok()
-                .flatten()
-                .is_some();
-            let live_run_count = store
-                .list_runs_for_node(&node_id)
-                .map(|runs| runs.iter().filter(|run| run.is_live()).count())
-                .unwrap_or(0);
-            let shells = store
-                .list_shells_for_node(&node_id)
+            let has_agent = inherits.has(row.node.id, Capability::Agent);
+            let has_files = inherits.has(row.node.id, Capability::Files);
+            let live_run_count = live_run_counts.get(&node_id).copied().unwrap_or(0);
+            let shells = shells_by_node
+                .remove(&node_id)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|shell| ShellInfo {
@@ -85,6 +81,52 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
             }
         })
         .collect()
+}
+
+/// Whether Agent / Files is enabled on a node or any ancestor, resolved once
+/// for a whole flattened list instead of one ancestor walk per row per
+/// capability.
+///
+/// The flattened rows are enough on their own: a row is only visible when
+/// every one of its ancestors is expanded, so each row's ancestors are also
+/// in the set. Walking `parent_id` in memory is therefore exactly what the
+/// per-node store lookup used to compute.
+struct InheritedCapabilities {
+    /// Node → (agent, files), each true when the node or an ancestor has it.
+    resolved: HashMap<Uuid, (bool, bool)>,
+}
+
+impl InheritedCapabilities {
+    fn from_rows(rows: &[FlatNodeRow]) -> Self {
+        let mut resolved: HashMap<Uuid, (bool, bool)> = HashMap::with_capacity(rows.len());
+        // Rows arrive in tree order, so a parent is always resolved before
+        // its children and each row is a single lookup.
+        for row in rows {
+            let (parent_agent, parent_files) = row
+                .parent_id
+                .and_then(|parent| resolved.get(&parent).copied())
+                .unwrap_or((false, false));
+            resolved.insert(
+                row.node.id,
+                (
+                    parent_agent || row.capabilities.contains(&Capability::Agent),
+                    parent_files || row.capabilities.contains(&Capability::Files),
+                ),
+            );
+        }
+        Self { resolved }
+    }
+
+    fn has(&self, node_id: Uuid, cap: Capability) -> bool {
+        let Some((agent, files)) = self.resolved.get(&node_id).copied() else {
+            return false;
+        };
+        match cap {
+            Capability::Agent => agent,
+            Capability::Files => files,
+            _ => false,
+        }
+    }
 }
 
 fn node_scratchpad_path(node_id: &str) -> PathBuf {

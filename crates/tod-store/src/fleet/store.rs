@@ -405,6 +405,33 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// Live agent-run counts keyed by node id, for every node at once.
+    ///
+    /// Rendering a list must not call [`Self::list_runs_for_node`] per row —
+    /// that is one prepared statement and one mutex acquisition each, which
+    /// is what made a few hundred rows take hundreds of milliseconds.
+    pub fn live_run_counts(&self) -> Result<HashMap<String, usize>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let runs = AgentRunRepo::new(&guard.connection()).list_live_all()?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for run in runs {
+            *counts.entry(run.node_id).or_default() += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Shell sessions grouped by node id, for every node at once. Same
+    /// reasoning as [`Self::live_run_counts`].
+    pub fn shells_by_node(&self) -> Result<HashMap<String, Vec<ShellSession>>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        let shells = ShellRepo::new(&guard.connection()).list_all()?;
+        let mut by_node: HashMap<String, Vec<ShellSession>> = HashMap::new();
+        for shell in shells {
+            by_node.entry(shell.node_id.clone()).or_default().push(shell);
+        }
+        Ok(by_node)
+    }
+
     /// Every shell session, across all nodes.
     pub fn list_all_shells(&self) -> Result<Vec<ShellSession>> {
         let guard = self.projection.lock().expect("fleet projection mutex");

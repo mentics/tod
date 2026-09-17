@@ -246,6 +246,23 @@ impl<'a> AgentRunRepo<'a> {
     }
 
     /// Live runs recorded on this node.
+    /// Every live run, across all nodes, in one query. The per-node variant
+    /// costs a statement each; list views need the whole set at once and must
+    /// not pay that per row.
+    pub fn list_live_all(&self) -> Result<Vec<AgentRun>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE ended_at IS NULL AND runtime_status != ?1
+             ORDER BY run_number DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![RUNTIME_STATUS_DONE], row_to_run)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn list_live_for_node(&self, node_id: &str) -> Result<Vec<AgentRun>, AgentRunRepoError> {
         Ok(self
             .list_for_node(node_id)?
