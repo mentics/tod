@@ -241,7 +241,7 @@ fn parse_user_md_into_node(conn: &Connection, node_id: Uuid, body: &str) -> Resu
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            insert_extra_content(conn, node_id, "goal", rest)?;
+            insert_extra_content(conn, node_id, "details", rest)?;
             continue;
         }
         let Some(num_end) = trimmed.find('.') else {

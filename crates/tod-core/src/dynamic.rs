@@ -56,8 +56,6 @@ pub struct ObligationSelection {
 pub enum DynamicBlock {
     /// The data root, and the instruction to pass it to every `tod-cli` call.
     DataRoot,
-    /// Inherited purpose, most general first. Omitted when there is none.
-    PurposeChain,
     /// Node id, title, lifecycle state, and details.
     Node,
     /// `mode` and `phase_purpose` lines, for the state-agent surfaces whose
@@ -70,8 +68,8 @@ pub enum DynamicBlock {
     /// This node's own obligations. `note` explains how this surface should
     /// read them relative to the inherited ones.
     NodeObligations { note: &'static str },
-    /// Pre-rendered ancestor context (see
-    /// `crate::node_context::render_inherited_context`).
+    /// Pre-rendered ancestor context — what the node inherits (see
+    /// `crate::node_context::render_inherited_context`). Omitted when empty.
     AncestorContext,
     /// This node's plan steps with their dependency and `satisfies` links.
     Plan,
@@ -87,7 +85,6 @@ pub struct DynamicContext<'a> {
     pub node: Option<&'a NodeSelection>,
     /// `(mode, phase_purpose)` for [`DynamicBlock::NodeProcessFields`].
     pub process_fields: Option<(&'a str, &'a str)>,
-    pub purposes: &'a [String],
     pub obligation: Option<&'a ObligationSelection>,
     pub obligations: &'a [NodeObligation],
     pub ancestor_context: &'a str,
@@ -113,20 +110,6 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                  Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
                 root.display()
             ));
-        }
-
-        DynamicBlock::PurposeChain => {
-            if ctx.purposes.is_empty() {
-                return;
-            }
-            out.push_str("## Purpose\n\n");
-            out.push_str(
-                "From the top of the tree down to the selected node, most general first:\n\n",
-            );
-            for purpose in ctx.purposes {
-                out.push_str(purpose);
-                out.push_str("\n\n");
-            }
         }
 
         DynamicBlock::Node => {
@@ -267,29 +250,24 @@ mod tests {
     #[test]
     fn blocks_render_in_the_order_listed() {
         let node = node();
-        let purposes = vec!["Ship the product.".into(), "Ship this feature.".into()];
         let ctx = DynamicContext {
             data_root: Some(Path::new("/data/tod")),
             node: Some(&node),
-            purposes: &purposes,
+            ancestor_context: "\n## Inherited context (ancestors)\n",
             ..Default::default()
         };
         let text = render(
             &[
                 DynamicBlock::DataRoot,
-                DynamicBlock::PurposeChain,
+                DynamicBlock::AncestorContext,
                 DynamicBlock::Node,
             ],
             &ctx,
         );
         let root = text.find("Data root").unwrap();
-        let purpose = text.find("## Purpose").unwrap();
-        let general = text.find("Ship the product.").unwrap();
-        let specific = text.find("Ship this feature.").unwrap();
+        let ancestors = text.find("## Inherited context").unwrap();
         let node_idx = text.find("## Selected node").unwrap();
-        assert!(root < purpose && purpose < general);
-        assert!(general < specific, "purposes must go general to specific");
-        assert!(specific < node_idx);
+        assert!(root < ancestors && ancestors < node_idx);
         assert!(text.contains(&Uuid::nil().to_string()));
         assert!(text.contains("Panel for editing direct obligations."));
     }
@@ -297,7 +275,7 @@ mod tests {
     #[test]
     fn a_block_whose_data_is_absent_renders_nothing() {
         let text = render(
-            &[DynamicBlock::DataRoot, DynamicBlock::PurposeChain],
+            &[DynamicBlock::DataRoot, DynamicBlock::AncestorContext],
             &DynamicContext::default(),
         );
         assert_eq!(text, "# Current context\n\n");

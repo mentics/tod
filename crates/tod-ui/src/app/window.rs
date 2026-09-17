@@ -638,7 +638,17 @@ impl Shell {
                 })
         });
 
-        let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
+        let ancestor_context = self
+            .fleet
+            .read(|conn| {
+                tod_core::node_context::render_inherited_context(
+                    conn,
+                    &tod_store::outline::repos::NodeRepo::new(conn),
+                    node_id,
+                    None,
+                )
+            })
+            .unwrap_or_default();
 
         build_first_message(
             &media,
@@ -653,7 +663,7 @@ impl Shell {
                     lifecycle: Some(node.lifecycle),
                 },
                 obligation,
-                purposes,
+                ancestor_context,
             },
         )
     }
@@ -1117,7 +1127,17 @@ impl Shell {
             .ok()
             .flatten()
             .ok_or_else(|| anyhow::anyhow!("obligation {obligation_id} not found"))?;
-        let purposes = self.fleet.ancestor_purposes(node_id).unwrap_or_default();
+        let ancestor_context = self
+            .fleet
+            .read(|conn| {
+                tod_core::node_context::render_inherited_context(
+                    conn,
+                    &tod_store::outline::repos::NodeRepo::new(conn),
+                    node_id,
+                    None,
+                )
+            })
+            .unwrap_or_default();
 
         build_first_message(
             &media,
@@ -1137,7 +1157,7 @@ impl Shell {
                     body: obligation.body,
                     visual_design_path: obligation.visual_design_path,
                 }),
-                purposes,
+                ancestor_context,
             },
         )
     }

@@ -8,6 +8,9 @@ Every node has a stable, unique **slug** shown alongside its title, and a UUID.
 Either addresses the node. Prefer the slug once you know it: it survives a
 rename, where a title does not.
 
-A node inherits context from its ancestors. What is settled on a parent bounds
-what its children may do, and a child's work is understood as serving its
-parent's purpose.
+A node may carry freeform **details** describing it, written by the user or
+an agent.
+
+A node inherits context from its ancestors: each Spec ancestor's summary and
+constraints. What is settled on a parent bounds what its children may do, and
+a child's work is understood as serving its parent's scope.

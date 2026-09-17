@@ -10,7 +10,7 @@ Some or all of the following appear in your prompt:
 |--|--|
 | Node metadata | Always — `node_id`, title, lifecycle, `mode` (interactive \| autonomous), `phase_purpose` |
 | Obligations | Always — resolved obligations (inherited + local), with source when inherited; includes design-phase obligations once the node has passed `design` |
-| Phase content | When present — goal, plan steps (dependency graph, see `tod-cli plan`) |
+| Phase content | When present — details, plan steps (dependency graph, see `tod-cli plan`) |
 | Parked items | When present — open `parked` interview memory (later-phase detail volunteered during interviews) |
 | On entry | When `phase_purpose: on_entry` — see below |
 | Gate check | When `phase_purpose: gate_check` — see below |

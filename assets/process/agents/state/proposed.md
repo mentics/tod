@@ -4,14 +4,14 @@
 
 ## On entry
 
-1. Read the node's lifecycle state, resolved obligations (including inherited), goal, and open choices.
+1. Read the node's lifecycle state, resolved obligations (including inherited), details, and open choices.
 2. If obligations already satisfy the gate and the human has directed design → verify preconditions and proceed to exit.
 
 ## Responsibilities
 
 ### Capture
 
-The user captures what they want in the app's **capture** view: any number of dumps, each shaped by the drafter into the node's goal and requirements-phase obligations (`agent/drafting/capture.md`). This session does not run sequential Q&A.
+The user captures what they want in the app's **capture** view: any number of dumps, each shaped by the drafter into requirements-phase obligations (and the node's details, when it has none) (`agent/drafting/capture.md`). This session does not run sequential Q&A.
 
 - Obligations the drafter writes are `agent`: in effect at once, with attention and a reason. Only the user touching one makes it `user`. Never ask the user to confirm obligations.
 - **Inherit, do not duplicate** — nodes inherit ancestor constraints automatically. Record only node-specific obligations and exceptions. Never copy or paraphrase inherited obligations at this node.

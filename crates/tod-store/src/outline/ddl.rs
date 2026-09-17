@@ -86,9 +86,10 @@ CREATE TABLE IF NOT EXISTS global_obligations (
 CREATE TABLE IF NOT EXISTS node_extra_content (
     id           BLOB PRIMARY KEY NOT NULL,
     node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-    content_type TEXT NOT NULL CHECK (content_type IN ('goal', 'design', 'plan', 'notes', 'details', 'summary')),
+    content_type TEXT NOT NULL CHECK (content_type IN ('design', 'plan', 'notes', 'details', 'summary')),
     body         TEXT NOT NULL DEFAULT '',
     updated_at   INTEGER NOT NULL,
+    stale        INTEGER NOT NULL DEFAULT 0,
     UNIQUE (node_id, content_type)
 );
 

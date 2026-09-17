@@ -14,7 +14,7 @@ Neither agent talks to the user. Everything flows through **questions**, **oblig
 
 Your context is given once and then only added to.
 
-- **Your first turn** carries these docs and a **snapshot** of the node: purpose from the root down, this node's obligations by section, inherited obligations by source node, content, the memory your role sees, open and deferred questions, and one line per answered question.
+- **Your first turn** carries these docs and a **snapshot** of the node: this node's obligations by section, inherited context (each ancestor's summary and constraints), its details, the memory your role sees, open and deferred questions, and one line per answered question.
 - **Every later turn** carries only **what changed** since your previous turn, then the instruction. Your own changes are left out — you made them. Anything new to you arrives in full once; after that, only its changed fields.
 
 Your context is therefore current. **Don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else in the meantime, `tod-cli` refuses the write and prints the current version — decide again with that.

@@ -7,8 +7,9 @@ off by default and turned on per node:
   without it has no agent surface at all.
 - **Files** — binds the node to a repository and working directory (a worktree,
   when one is set up), so work on it has somewhere to land.
-- **Spec** — gives the node a stated `goal`, which descendants inherit as
-  purpose.
+- **Spec** — gives the node obligations and a generated `summary` of its
+  details and obligations, which is what descendants inherit of its scope
+  (along with its constraints).
 
 (Others exist — `Lifecycle`, `Tags` — but these three are the ones that change
 what an agent can do.)
