@@ -9,7 +9,8 @@ use crate::fleet::migration::{
     recover_incomplete_storage_migration,
 };
 use crate::fleet::node_actions::{
-    ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
+    ResolvedAgent, ResolvedFiles, capability_sources_for_list, resolve_agent_for_node,
+    resolve_files_for_node,
 };
 use crate::fleet::notices::FleetNoticeHooks;
 use crate::fleet::paths::FleetPaths;
@@ -298,6 +299,42 @@ impl FleetStore {
         resolve_agent_for_node(&guard.connection(), node_id)
     }
 
+    /// For every node in `list_id`, the node whose `cap` it resolves to —
+    /// itself, or the nearest ancestor with the capability. Nodes that resolve
+    /// to nothing are absent. The list-scoped form of
+    /// [`Self::resolve_agent_for_node`] / [`Self::resolve_files_for_node`] for
+    /// callers that only need to know whether a capability resolves.
+    pub fn capability_sources_for_list(
+        &self,
+        list_id: uuid::Uuid,
+        cap: Capability,
+    ) -> Result<HashMap<uuid::Uuid, uuid::Uuid>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        capability_sources_for_list(&guard.connection(), list_id, cap)
+    }
+
+    /// Live agent run counts keyed by node for one outline list.
+    pub fn live_run_counts_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<HashMap<uuid::Uuid, usize>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentRunRepo::new(&guard.connection())
+            .live_counts_for_list(list_id)
+            .map_err(Into::into)
+    }
+
+    /// Shell sessions keyed by node for one outline list.
+    pub fn shells_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<HashMap<uuid::Uuid, Vec<ShellSession>>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        ShellRepo::new(&guard.connection())
+            .list_for_list(list_id)
+            .map_err(Into::into)
+    }
+
     /// The node's ready Files directory, else the data root — where agent
     /// turns that don't need a workspace (chat, interview, gate checks) run.
     pub fn files_dir_or_data_root(&self, node_id: &str) -> std::path::PathBuf {
@@ -403,33 +440,6 @@ impl FleetStore {
         ShellRepo::new(&guard.connection())
             .list_for_node(node_id)
             .map_err(Into::into)
-    }
-
-    /// Live agent-run counts keyed by node id, for every node at once.
-    ///
-    /// Rendering a list must not call [`Self::list_runs_for_node`] per row —
-    /// that is one prepared statement and one mutex acquisition each, which
-    /// is what made a few hundred rows take hundreds of milliseconds.
-    pub fn live_run_counts(&self) -> Result<HashMap<String, usize>> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        let runs = AgentRunRepo::new(&guard.connection()).list_live_all()?;
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for run in runs {
-            *counts.entry(run.node_id).or_default() += 1;
-        }
-        Ok(counts)
-    }
-
-    /// Shell sessions grouped by node id, for every node at once. Same
-    /// reasoning as [`Self::live_run_counts`].
-    pub fn shells_by_node(&self) -> Result<HashMap<String, Vec<ShellSession>>> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        let shells = ShellRepo::new(&guard.connection()).list_all()?;
-        let mut by_node: HashMap<String, Vec<ShellSession>> = HashMap::new();
-        for shell in shells {
-            by_node.entry(shell.node_id.clone()).or_default().push(shell);
-        }
-        Ok(by_node)
     }
 
     /// Every shell session, across all nodes.
