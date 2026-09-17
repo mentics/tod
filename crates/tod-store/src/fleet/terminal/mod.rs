@@ -372,12 +372,20 @@ fn join_windows_args(args: &[String]) -> String {
 #[cfg(windows)]
 fn shell_execute_new_console(program: &str, cwd: &Path, params: &str) -> Result<()> {
     use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
     use windows::core::PCWSTR;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
+
+    // Tests launch real consoles and must not take focus from whoever is
+    // using the machine. Only a hidden window reliably avoids it: a
+    // default-terminal handoff to Windows Terminal ignores minimized/
+    // no-activate requests (hidden skips the handoff), and so does
+    // `conhost.exe` launched directly. The hidden console still exists, so
+    // callers can still check that a console window was created.
+    let show = if cfg!(test) { SW_HIDE } else { SW_SHOWNORMAL };
 
     let file = wide(program);
     let params_w = wide(params);
@@ -389,7 +397,7 @@ fn shell_execute_new_console(program: &str, cwd: &Path, params: &str) -> Result<
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params_w.as_ptr()),
         lpDirectory: PCWSTR(dir.as_ptr()),
-        nShow: SW_SHOWNORMAL.0,
+        nShow: show.0,
         ..Default::default()
     };
 

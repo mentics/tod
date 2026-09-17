@@ -34,6 +34,7 @@ pub fn run() {
             std::process::exit(2);
         }
     };
+    app::no_focus::set_enabled(opts.no_focus);
     if let Some(root) = interview::paths::resolve_startup_data_root(opts.data_root.as_deref()) {
         if let Err(err) = std::fs::create_dir_all(&root) {
             eprintln!("tod: failed to create data root {}: {err}", root.display());

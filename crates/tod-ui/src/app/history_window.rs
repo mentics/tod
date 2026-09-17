@@ -49,7 +49,7 @@ impl HistoryWindowControl {
     fn focus_handle(&self, cx: &mut App, handle: AnyWindowHandle) -> Result<(), String> {
         handle
             .update(cx, |_, window, _| {
-                window.activate_window();
+                super::no_focus::activate(window);
                 Ok(())
             })
             .map_err(|err| format!("focus history window failed: {err}"))?
@@ -76,6 +76,7 @@ impl HistoryWindowControl {
                         origin: point(px(120.), px(120.)),
                         size: size(px(640.), px(480.)),
                     })),
+                    focus: super::no_focus::window_focus(),
                     ..Default::default()
                 },
                 move |window, cx| {

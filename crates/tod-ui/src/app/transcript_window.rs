@@ -70,7 +70,7 @@ impl TranscriptWindowControl {
     fn focus_handle(&self, cx: &mut App, handle: AnyWindowHandle) -> Result<(), String> {
         handle
             .update(cx, |_, window, _| {
-                window.activate_window();
+                super::no_focus::activate(window);
                 Ok(())
             })
             .map_err(|err| format!("focus transcript window failed: {err}"))?
@@ -104,6 +104,7 @@ impl TranscriptWindowControl {
                         origin: point(px(80.), px(80.)),
                         size: size(px(1100.), px(720.)),
                     })),
+                    focus: super::no_focus::window_focus(),
                     ..Default::default()
                 },
                 move |window, cx| {
