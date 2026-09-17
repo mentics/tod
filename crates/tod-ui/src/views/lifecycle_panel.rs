@@ -1063,13 +1063,11 @@ impl LifecyclePanelView {
             let turn = SessionTurn {
                 key: format!("gate-check-{}", uuid::Uuid::new_v4()),
                 owner_id: task_id.to_string(),
+                title: session_title,
                 cwd,
                 options,
                 resume_session_id: None,
-                opening: Some(SessionOpening {
-                    title: session_title,
-                    context: None,
-                }),
+                opening: Some(SessionOpening { context: None }),
                 message,
                 purpose: SessionPurpose::Chat,
                 env: Vec::new(),
@@ -1228,13 +1226,11 @@ impl LifecyclePanelView {
             Ok(SessionTurn {
                 key: format!("on-entry-{}", uuid::Uuid::new_v4()),
                 owner_id: task_id.to_string(),
+                title: format!("On entry: {title} ({lifecycle})"),
                 cwd,
                 options,
                 resume_session_id: None,
-                opening: Some(SessionOpening {
-                    title: format!("On entry: {title} ({lifecycle})"),
-                    context: None,
-                }),
+                opening: Some(SessionOpening { context: None }),
                 message,
                 purpose: SessionPurpose::Chat,
                 env: Vec::new(),

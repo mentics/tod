@@ -200,6 +200,43 @@ impl Default for AgentTrafficLog {
     }
 }
 
+/// Where one agent session's traffic is filed. Everything the session
+/// produces — the prompt and reply, the raw protocol, the process's stderr —
+/// shares `id`, so the session reads as one transcript listed as `label`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrafficTag {
+    pub id: String,
+    pub label: String,
+}
+
+impl TrafficTag {
+    /// Tag a session by `id`, listed under its human-readable `name`, or under
+    /// what kind of agent it is when it has none.
+    pub fn new(id: impl Into<String>, name: &str, fallback_label: &str) -> Self {
+        let name = name.trim();
+        Self {
+            id: id.into(),
+            label: if name.is_empty() { fallback_label } else { name }.to_string(),
+        }
+    }
+
+    pub fn record(
+        &self,
+        log: &SharedAgentTrafficLog,
+        category: AgentCategory,
+        direction: TrafficDirection,
+        content: impl Into<String>,
+    ) {
+        log.lock().expect("traffic log mutex").record(
+            category,
+            self.id.clone(),
+            self.label.clone(),
+            direction,
+            content,
+        );
+    }
+}
+
 pub type SharedAgentTrafficLog = Arc<Mutex<AgentTrafficLog>>;
 
 pub fn shared_log() -> SharedAgentTrafficLog {

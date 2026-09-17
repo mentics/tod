@@ -671,20 +671,9 @@ impl InterviewDriver {
                         snapshot_tokens: estimate_tokens(&context),
                     },
                 )?;
-                let title = format!(
-                    "{} · {} · {}",
-                    self.config.node_title,
-                    match role {
-                        Role::QuestionMaker => "question maker",
-                        Role::AnswerProcessor => "answer processor",
-                        Role::Drafter => "drafter",
-                    },
-                    self.phase
-                );
                 (
                     id,
                     Some(SessionOpening {
-                        title,
                         context: Some(context),
                     }),
                     None,
@@ -695,9 +684,20 @@ impl InterviewDriver {
 
         let key = session_key(session_id);
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
+        let title = format!(
+            "{} · {} · {}",
+            self.config.node_title,
+            match role {
+                Role::QuestionMaker => "question maker",
+                Role::AnswerProcessor => "answer processor",
+                Role::Drafter => "drafter",
+            },
+            self.phase
+        );
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
             owner_id: self.config.node_id.to_string(),
+            title,
             cwd: self.cwd()?,
             options: self.config.launch.clone(),
             resume_session_id: resume,

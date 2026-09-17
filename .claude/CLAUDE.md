@@ -126,8 +126,11 @@ before then. A chat window holds one long-lived agent session
 (`AgentProvider::send_session_turn`):
 the first message opens it — the context and the message go out together as one
 turn, and the session is given its name (for Claude, a `custom-title` record
-written once that first turn has created the session log; Cursor names its own
-sessions) — and every later message sends only itself.
+written as soon as that first prompt has started the session log; Cursor names
+its own sessions) — and every later message sends only itself. The name
+(`SessionTurn::title`) goes with every turn: all of a session's agent traffic
+is filed under its key and listed under that name in the agent transcripts
+window.
 The provider keeps the agent process alive between messages; when the window
 closes or the process idles out, the next message resumes the recorded
 agent-side session id (`agent_runs.agent_session_id`) instead of replaying

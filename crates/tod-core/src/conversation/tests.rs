@@ -238,14 +238,12 @@ fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     assert_eq!(turn.key, format!("conversation-{id}"));
     assert_eq!(turn.env, [(ACTOR_ENV.to_string(), actor_for(id))]);
     assert_eq!(turn.resume_session_id, None);
-    let opening = turn.opening.as_ref().unwrap();
     assert!(
-        opening
-            .title
-            .starts_with("Conversation · Interview node · "),
+        turn.title.starts_with("Conversation · Interview node · "),
         "{}",
-        opening.title
+        turn.title
     );
+    let opening = turn.opening.as_ref().unwrap();
     let context = opening.context.as_deref().unwrap();
     assert!(
         context.contains("This surface: the conversation view"),
@@ -280,12 +278,8 @@ fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     assert_eq!(conversation.focus, Focus::Node(fx.node));
     assert_eq!(conversation.platform.as_deref(), Some("claude"));
     assert_eq!(conversation.agent_session_id, agent.session_id(&turn.key));
-    assert!(
-        conversation
-            .session_name
-            .unwrap()
-            .starts_with("Conversation · ")
-    );
+    // The name the session was given is the one recorded.
+    assert_eq!(conversation.session_name.as_deref(), Some(turn.title.as_str()));
 }
 
 #[test]
@@ -327,6 +321,14 @@ fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
         turn.opening.is_none(),
         "the session already has its context"
     );
+    let name = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).get(id))
+        .unwrap()
+        .unwrap()
+        .session_name
+        .unwrap();
+    assert_eq!(turn.title, name, "later turns keep the session's name");
     assert_eq!(turn.resume_session_id, None, "the live process is reused");
     assert!(turn.message.starts_with(DELTA_HEADING), "{}", turn.message);
     assert!(
