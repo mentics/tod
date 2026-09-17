@@ -15,7 +15,9 @@ use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tod_store::agent_traffic::{AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry};
+use tod_store::agent_traffic::{
+    AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
+};
 use tod_store::fleet::FleetStore;
 
 /// A single row in the agent picker list, unified across fleet agent runs and

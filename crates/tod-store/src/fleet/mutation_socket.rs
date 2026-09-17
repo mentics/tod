@@ -15,8 +15,8 @@ use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::outline::OutlineMutation;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Deletes the port file on drop so a stale file isn't mistaken for a live

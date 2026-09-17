@@ -1,7 +1,7 @@
 ## `tod-cli plan`
 
 ```
-tod-cli --data-root <DATA_ROOT> plan list      --node <NODE_UUID>
+tod-cli --data-root <DATA_ROOT> plan list      [--node <NODE_UUID>] [--search <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan show      <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
 tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|blocked]
@@ -12,6 +12,10 @@ tod-cli --data-root <DATA_ROOT> plan satisfy   <STEP_ID> --obligation <OBLIGATIO
 tod-cli --data-root <DATA_ROOT> plan unsatisfy <STEP_ID> --obligation <OBLIGATION_UUID>
 tod-cli --data-root <DATA_ROOT> plan ready     --node <NODE_UUID>
 ```
+
+`list` needs `--node` or `--search`. Without `--node` it searches every node's
+plan steps, best match first, and each line names the step's node as
+`on <slug>`.
 
 Step and obligation ids may be given in full or as the 8-character prefix
 shown in listings. `satisfy`/`unsatisfy` link a step to the requirement or

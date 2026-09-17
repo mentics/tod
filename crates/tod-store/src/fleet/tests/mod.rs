@@ -500,7 +500,12 @@ fn capability_disable_blockers_reflect_running_work() {
 
     // Nothing running — nothing to block on.
     for cap in [Capability::Agent, Capability::Files] {
-        assert!(store.capability_disable_blocker(&task_id, cap).unwrap().is_none());
+        assert!(
+            store
+                .capability_disable_blocker(&task_id, cap)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // A live run blocks disabling Agent, not Files.

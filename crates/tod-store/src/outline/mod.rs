@@ -6,6 +6,7 @@ pub mod gate_criteria_seed;
 pub mod import;
 pub mod migrate_interview;
 pub mod mutations;
+pub mod references;
 pub mod repos;
 pub mod resolve;
 pub mod slug;
@@ -16,9 +17,11 @@ pub mod workspace;
 pub use gate_criteria_seed::{GATE_CRITERIA, seed_gate_criteria};
 pub use import::import_doc_process;
 pub use mutations::{CreatePosition, OutlineMutation, ReorderDirection};
+pub use references::{BrokenReference, broken_references, check_references, referenced_slugs};
 pub use repos::gate::{
-    GateCriterion, GateRepo, NodeGateEvaluation, OUTCOME_FAIL, OUTCOME_PASS, OUTCOME_PENDING,
-    OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG, SOURCE_AGENT, SOURCE_DERIVED, SOURCE_HUMAN,
+    BUILDABLE_CRITERION_SLUG, GateCriterion, GateRepo, NodeGateEvaluation, OUTCOME_FAIL,
+    OUTCOME_PASS, OUTCOME_PENDING, OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG, SOURCE_AGENT,
+    SOURCE_DERIVED, SOURCE_HUMAN,
 };
 pub use repos::obligations::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ObligationCounts, ObligationRepo,

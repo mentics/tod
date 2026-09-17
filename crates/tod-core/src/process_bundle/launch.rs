@@ -1,7 +1,7 @@
 //! Agent prompt assembly from bundled process docs.
 
 use super::manifest::ProcessManifest;
-use crate::context_recipes::{self, DRAFTING_AGENT, FLEET_AUTONOMOUS, INTERVIEW_AGENT};
+use crate::context_recipes::{self, FLEET_AUTONOMOUS, INTERVIEW_AGENT};
 use crate::dynamic::{DynamicContext, NodeSelection, Workspace};
 use crate::interview::phase::base_interview_phase;
 use crate::media::{MediaPaths, load_static_context};
@@ -42,7 +42,7 @@ pub fn interview_session_prefix(
     let role_doc = match role {
         Role::QuestionMaker => manifest.question_maker_doc(base)?,
         Role::AnswerProcessor => manifest.answer_processor_doc(base)?,
-        Role::Drafter => anyhow::bail!("the drafter's opening comes from drafting_session_prefix"),
+        Role::Drafter => anyhow::bail!("the drafter role is no longer used"),
     };
     with_static_context(
         media,
@@ -52,25 +52,6 @@ pub fn interview_session_prefix(
             read_doc(&role_doc)?.trim(),
             read_doc(&manifest.interview_phase_doc(base)?)?.trim(),
             read_doc(&manifest.base_doc(base)?)?.trim(),
-        ),
-    )
-}
-
-/// The byte-stable opening of every drafter session in `mode`: the mode's
-/// doc, then the drafting conventions shared by capture and drafting.
-pub fn drafting_session_prefix(
-    manifest: &ProcessManifest,
-    media: &MediaPaths,
-    mode: crate::drafting::DraftingMode,
-) -> Result<String> {
-    with_static_context(
-        media,
-        &DRAFTING_AGENT,
-        format!(
-            "## Role\n\n{}\n\n## Drafting conventions\n\n{}\n",
-            read_doc(&manifest.drafting_mode_doc(mode == crate::drafting::DraftingMode::Capture))?
-                .trim(),
-            read_doc(&manifest.drafting_base_doc())?.trim(),
         ),
     )
 }
@@ -184,7 +165,9 @@ mod tests {
         let prefix =
             interview_session_prefix(&manifest, &media, Role::AnswerProcessor, "design-interview")
                 .unwrap();
-        let stance = prefix.find("Your counterpart is **another agent**").unwrap();
+        let stance = prefix
+            .find("Your counterpart is **another agent**")
+            .unwrap();
         let cli = prefix.find("tod-cli --data-root").unwrap();
         let role = prefix.find("# Answer processor").unwrap();
         assert!(

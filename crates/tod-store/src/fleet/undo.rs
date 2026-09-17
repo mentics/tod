@@ -389,6 +389,12 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::UpdateObligationSection { .. }
         | OutlineMutation::UpdateObligationPhase { .. }
         | OutlineMutation::ReorderObligation { .. }
+        // Conversation reversal only; never on the Ctrl+Z history.
+        | OutlineMutation::RestoreObligationRow { .. }
+        | OutlineMutation::PlaceObligation { .. }
+        | OutlineMutation::RestorePlanStep { .. }
+        | OutlineMutation::PlacePlanStep { .. }
+        | OutlineMutation::PlaceNode { .. }
         | OutlineMutation::CreatePlanStep { .. }
         | OutlineMutation::UpdatePlanStepBody { .. }
         | OutlineMutation::UpdatePlanStepStatus { .. }

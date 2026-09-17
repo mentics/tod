@@ -29,7 +29,10 @@ pub fn code_editors() -> &'static [&'static dyn CodeEditor] {
 
 /// Look up a code editor by [`CodeEditor::id`].
 pub fn code_editor(id: &str) -> Option<&'static dyn CodeEditor> {
-    code_editors().iter().copied().find(|editor| editor.id() == id)
+    code_editors()
+        .iter()
+        .copied()
+        .find(|editor| editor.id() == id)
 }
 
 /// Open the node's resolved Files directory in `editor`.

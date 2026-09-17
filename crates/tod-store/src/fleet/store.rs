@@ -8,13 +8,13 @@ use crate::fleet::migration::{
     FleetMigrationError, HeldWrites, HeldWritesApplyResult, MigrationMode, StorageMigration,
     recover_incomplete_storage_migration,
 };
+use crate::fleet::node_actions::{
+    ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
+};
 use crate::fleet::notices::FleetNoticeHooks;
 use crate::fleet::paths::FleetPaths;
 use crate::fleet::projection::FleetProjection;
 use crate::fleet::reattach;
-use crate::fleet::node_actions::{
-    ResolvedAgent, ResolvedFiles, resolve_agent_for_node, resolve_files_for_node,
-};
 use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
@@ -22,6 +22,7 @@ use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness};
 use crate::fleet::writer::{FleetMutation, FleetWriter, FleetWriterError};
 use crate::outline::OutlineMutation;
+use crate::outline::PlanStep;
 use crate::outline::repos::gate::{GateCriterion, GateRepo, NodeGateEvaluation};
 use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
@@ -29,7 +30,6 @@ use crate::outline::repos::plan_steps::PlanStepRepo;
 use crate::outline::repos::{
     GeneratorConfig, GeneratorRepo, ListRepo, ManagedNodeLink, OutlineRepo, tree::TreeLoader,
 };
-use crate::outline::PlanStep;
 use crate::outline::types::Capability;
 use crate::outline::types::{FlatNodeRow, OutlineList};
 use anyhow::Result;
@@ -494,7 +494,6 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
-
     /// List all outline lists.
     pub fn list_outline_lists(&self) -> Result<Vec<OutlineList>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
@@ -562,10 +561,12 @@ impl FleetStore {
     /// rows — use this instead of `list_obligations_for_node` there.
     pub fn resolve_obligations_for_node(&self, node_id: uuid::Uuid) -> Result<Vec<NodeObligation>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
-        Ok(crate::outline::resolve_obligations(&guard.connection(), node_id, None)?
-            .into_iter()
-            .map(|r| r.obligation)
-            .collect())
+        Ok(
+            crate::outline::resolve_obligations(&guard.connection(), node_id, None)?
+                .into_iter()
+                .map(|r| r.obligation)
+                .collect(),
+        )
     }
 
     /// Plan steps for a node, in display order.
@@ -650,7 +651,9 @@ impl FleetStore {
             if !node_repo.list_capabilities(id)?.contains(&Capability::Spec) {
                 continue;
             }
-            if let Some(purpose) = node_repo.get_extra_content(id, crate::outline::EXTRA_CONTENT_GOAL)? {
+            if let Some(purpose) =
+                node_repo.get_extra_content(id, crate::outline::EXTRA_CONTENT_GOAL)?
+            {
                 let purpose = purpose.trim();
                 if !purpose.is_empty() {
                     purposes.push(purpose.to_string());
@@ -686,7 +689,8 @@ impl FleetStore {
         if self.migration.is_some() {
             return Err(FleetWriterError::MigrationBlocked);
         }
-        self.writer.enqueue_as(actor, FleetMutation::Outline(mutation))
+        self.writer
+            .enqueue_as(actor, FleetMutation::Outline(mutation))
     }
 
     /// Run an interview command as `actor` and return its JSON result.

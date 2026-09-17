@@ -18,12 +18,12 @@ pub(crate) fn nouns() -> Vec<(&'static str, &'static str)> {
         ("node", crate::node::USAGE),
         ("obligations", crate::obligations::USAGE),
         ("plan", crate::plan::USAGE),
-        ("drafting", crate::drafting::USAGE),
         ("visual-design", crate::visual_design::USAGE),
         ("content", crate::interview::CONTENT_USAGE),
         ("questions", crate::interview::QUESTIONS_USAGE),
         ("memory", crate::interview::MEMORY_USAGE),
         ("interview", crate::interview::INTERVIEW_USAGE),
+        ("changeset", crate::changeset::USAGE),
     ]
 }
 

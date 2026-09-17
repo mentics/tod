@@ -490,17 +490,21 @@ mod tests {
         assert_eq!(mock.session_id("run-8"), None);
     }
 
+    /// The one handler these tests register. The slot is process-wide and
+    /// tests run in parallel, so every test must register the same behavior.
+    fn echo_handler(turn: &MockInterviewTurn) -> Result<String> {
+        let actor = turn
+            .env
+            .iter()
+            .find(|(k, _)| k == "TOD_INTERVIEW_ACTOR")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        Ok(format!("{:?} {actor} {}", turn.purpose, turn.blocks.join("|")))
+    }
+
     #[test]
     fn interview_turns_run_the_registered_handler_with_env() {
-        set_mock_interview_handler(Arc::new(|turn: &MockInterviewTurn| {
-            let actor = turn
-                .env
-                .iter()
-                .find(|(k, _)| k == "TOD_INTERVIEW_ACTOR")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
-            Ok(format!("{:?} {actor} {}", turn.purpose, turn.blocks.join("|")))
-        }));
+        set_mock_interview_handler(Arc::new(echo_handler));
         let mut mock = MockAgentProvider::new();
         let run = mock
             .send_session_turn(session_turn(
@@ -515,5 +519,30 @@ mod tests {
             panic!("interview turn failed");
         };
         assert_eq!(reply, "QuestionMaker actor-1 Target open questions: 8.");
+    }
+
+    /// Conversation turns are played by the registered handler, like the
+    /// interview purposes, not by the canned chat reply.
+    #[test]
+    fn conversation_turns_run_the_registered_handler() {
+        set_mock_interview_handler(Arc::new(echo_handler));
+        let mut mock = MockAgentProvider::new();
+        let run = mock
+            .send_session_turn(session_turn(
+                "conversation-1",
+                None,
+                None,
+                "add obligation x: y",
+                SessionPurpose::Conversation,
+            ))
+            .unwrap();
+        let AgentRunState::Success(Some(reply)) = poll_run(&mut mock, run.id) else {
+            panic!("conversation turn failed");
+        };
+        assert_eq!(reply, "Conversation actor-1 add obligation x: y");
+        assert_eq!(
+            SessionPurpose::Conversation.run_kind(),
+            AgentRunKind::FleetAgent
+        );
     }
 }

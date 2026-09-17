@@ -1,6 +1,6 @@
 //! The one place that resolves and renders a node's inherited (ancestor)
 //! obligation context. Every surface that assembles context for a node —
-//! interview snapshots, gate checks, drafting turns, "on entry" hooks, and
+//! interview snapshots, gate checks, "on entry" hooks, and
 //! the lifecycle panel's implementation sessions — calls
 //! [`render_inherited_context`] rather than re-deriving this policy locally.
 //!
@@ -195,9 +195,7 @@ pub fn obligation_line(o: &NodeObligation) -> String {
 /// contributes its title, its generated summary (`EXTRA_CONTENT_SUMMARY`),
 /// and its constraint-kind obligations in full. Its requirements are never
 /// listed: the summary stands in for them, and a deep tree would otherwise
-/// put hundreds into every context. The drafting driver writes missing
-/// summaries before a turn (`crate::drafting::summary`); anywhere else, an
-/// ancestor still without one gets a pointer to `tod-cli` instead. Global
+/// put hundreds into every context. An ancestor still without one gets a pointer to `tod-cli` instead. Global
 /// (no owning node) obligations always show in full; there is nothing to
 /// summarize about them. This never includes `node_id`'s own obligations —
 /// callers show those separately, in full.

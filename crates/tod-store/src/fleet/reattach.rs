@@ -245,7 +245,10 @@ mod tests {
             .unwrap();
         let notices = crate::fleet::notices::FleetNoticeHooks::new();
 
-        assert_eq!(clear_missing_worktrees(&conn, &writer, &notices).unwrap(), 1);
+        assert_eq!(
+            clear_missing_worktrees(&conn, &writer, &notices).unwrap(),
+            1
+        );
         let files = NodeFilesRepo::new(&conn).get(&node_id).unwrap().unwrap();
         assert!(files.worktree_path().is_none());
         assert!(files.use_worktree);

@@ -101,7 +101,9 @@ impl<'a> ShellRepo<'a> {
     }
 
     pub fn find(&self, id: &str) -> Result<Option<ShellSession>, ShellRepoError> {
-        let mut stmt = self.conn.prepare(&format!("{SHELL_SELECT} WHERE id = ?1"))?;
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SHELL_SELECT} WHERE id = ?1"))?;
         let mut rows = stmt.query_map(params![id], row_to_session)?;
         Ok(rows.next().transpose()?)
     }

@@ -121,9 +121,9 @@ impl<'a> NodeFilesRepo<'a> {
     /// Nodes other than `node_id` whose recorded worktree is `path`.
     pub fn other_nodes_using_worktree(&self, node_id: &str, path: &str) -> Result<Vec<String>> {
         let blob = node_id_blob(node_id)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT node_id FROM node_files WHERE worktree_path = ?1 AND node_id != ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT node_id FROM node_files WHERE worktree_path = ?1 AND node_id != ?2")?;
         let rows = stmt
             .query_map(params![path, blob], |row| node_id_column(row, 0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -165,10 +165,17 @@ mod tests {
         let files = repo.get(&a).unwrap().unwrap();
         assert_eq!(files.worktree_path(), Some("/wt/a"));
         assert_eq!(files.worktree_lease_id.as_deref(), Some("lease"));
-        assert_eq!(repo.other_nodes_using_worktree(&a, "/wt/a").unwrap(), vec![b.clone()]);
+        assert_eq!(
+            repo.other_nodes_using_worktree(&a, "/wt/a").unwrap(),
+            vec![b.clone()]
+        );
 
         repo.update_worktree(&b, None, None, None).unwrap();
-        assert!(repo.other_nodes_using_worktree(&a, "/wt/a").unwrap().is_empty());
+        assert!(
+            repo.other_nodes_using_worktree(&a, "/wt/a")
+                .unwrap()
+                .is_empty()
+        );
         cleanup_test_dir(&dir);
     }
 }

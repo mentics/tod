@@ -3,8 +3,10 @@
 
 use crate::Invocation;
 use crate::args::Args;
+use std::collections::HashMap;
+use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
-use tod_store::outline::repos::PlanStepRepo;
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
 use uuid::Uuid;
 
@@ -12,9 +14,11 @@ pub(crate) const USAGE: &str = "\
 tod-cli plan — structured plan steps on a node
 
 Plan step ids may be given in full or as the 8-character prefix shown in listings.
+Without --node, `list` searches every node's plan steps (--search is then
+required) and names each row's node as `on <slug>`.
 
 COMMANDS:
-    list      --node <UUID>
+    list      [--node <UUID>] [--search <TEXT>]
     show      <ID>
     add       --node <UUID> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
 
@@ -116,23 +120,65 @@ fn step_line(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
     )
 }
 
+type StepRow = (PlanStep, Vec<Uuid>, Vec<Uuid>);
+
 fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
-    let node = args.node()?;
-    let rows: Vec<(PlanStep, Vec<Uuid>, Vec<Uuid>)> = inv.client().read(|conn| {
-        let repo = PlanStepRepo::new(conn);
-        repo.list_for_node(node)?
-            .into_iter()
-            .map(|step| {
-                let deps = repo.list_dependencies(step.id)?;
-                let obligations = repo.list_obligations(step.id)?;
-                Ok((step, deps, obligations))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-    })?;
+    let node = args.uuid("--node")?;
+    let search = args.get("--search");
+    if node.is_none() && search.is_none() {
+        anyhow::bail!("--node <UUID> or --search <TEXT> is required");
+    }
+    // Project-wide listings name each row's node, since no one node frames them.
+    let (rows, slugs): (Vec<StepRow>, Option<HashMap<Uuid, String>>) =
+        inv.client().read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+            let steps = match node {
+                Some(node) => repo.list_for_node(node)?,
+                None => repo.list_all()?,
+            };
+            let slugs = match node {
+                Some(_) => None,
+                None => Some(
+                    NodeRepo::new(conn)
+                        .list_all()?
+                        .into_iter()
+                        .map(|n| (n.id, n.slug))
+                        .collect(),
+                ),
+            };
+            let rows = steps
+                .into_iter()
+                .filter(|step| search.is_none_or(|q| fuzzy_score(&step.body, q).is_some()))
+                .map(|step| {
+                    let deps = repo.list_dependencies(step.id)?;
+                    let obligations = repo.list_obligations(step.id)?;
+                    Ok((step, deps, obligations))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok((rows, slugs))
+        })?;
+    let mut rows = rows;
+    if let Some(query) = search {
+        // Stable, so equal scores keep their node/ordinal order.
+        rows.sort_by_cached_key(|(step, _, _)| {
+            std::cmp::Reverse(fuzzy_score(&step.body, query).unwrap_or_default())
+        });
+    }
+    let slug_of = |id: Uuid| {
+        slugs
+            .as_ref()
+            .map(|s| s.get(&id).cloned().unwrap_or_else(|| id.to_string()))
+    };
     if inv.json {
         let items: Vec<_> = rows
             .iter()
-            .map(|(row, deps, obligations)| step_json(row, deps, obligations))
+            .map(|(row, deps, obligations)| {
+                let mut item = step_json(row, deps, obligations);
+                if let (Some(obj), Some(slug)) = (item.as_object_mut(), slug_of(row.node_id)) {
+                    obj.insert("node_slug".into(), slug.into());
+                }
+                item
+            })
             .collect();
         return Ok(serde_json::Value::Array(items).to_string());
     }
@@ -141,7 +187,15 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     }
     Ok(rows
         .iter()
-        .map(|(row, deps, obligations)| step_line(row, deps, obligations))
+        .map(|(row, deps, obligations)| match slug_of(row.node_id) {
+            Some(slug) => {
+                let line = step_line(row, deps, obligations);
+                // `[id] status on <slug>...: body`
+                let (head, body) = line.split_once(": ").unwrap_or((&line, ""));
+                format!("{head} on {slug}: {body}")
+            }
+            None => step_line(row, deps, obligations),
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }

@@ -6,8 +6,8 @@
 
 pub mod agent_context;
 pub mod context_recipes;
+pub mod conversation;
 pub mod dynamic;
-pub mod drafting;
 pub mod fuzzy;
 pub mod gate;
 pub mod generator;

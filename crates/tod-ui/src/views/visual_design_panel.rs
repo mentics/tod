@@ -50,8 +50,7 @@ pub enum VisualDesignPanelEvent {
 }
 
 /// Everything needed to construct the embedded chat, assembled by the shell
-/// (mirroring `open_obligations_agent_chat`'s call into
-/// `InteractiveAgentWindowControl`).
+/// through `InteractiveAgentWindowControl::create_embedded_session`.
 pub struct EmbeddedChatParams {
     /// Node the chat is launched from.
     pub node_id: String,

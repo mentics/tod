@@ -7,7 +7,8 @@ use crate::Invocation;
 use crate::args::Args;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::InterviewCommand;
-use tod_store::outline::repos::{ListRepo, NodeRepo, OutlineRepo};
+use std::collections::HashMap;
+use tod_store::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo, PlanStepRepo};
 use tod_store::outline::{CreatePosition, Node, OutlineMutation};
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ COMMANDS:
     list   [--parent <SLUG_OR_UUID>] [--list <SLUG_OR_UUID>]
     show   <SLUG_OR_UUID>
     search --query <TEXT> [--limit N]
+    tree   <SLUG_OR_UUID> [--depth N]
     create --title <TEXT> (--parent <SLUG_OR_UUID> | --list <SLUG_OR_UUID>) [--after <SLUG_OR_UUID>] [--before]
     rename <SLUG_OR_UUID> --title <TEXT>
     move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
@@ -30,7 +32,9 @@ relative to an existing node (its list is used automatically), or --list for a
 top-level node with no parent. `delete` removes the node and its entire
 subtree (archived for undo, same as the app). `search` looks up a node by an
 approximate/fuzzy title across every list, for when you only have a misheard
-or partial title rather than a slug or id.
+or partial title rather than a slug or id. `tree` prints the node and its
+descendants indented, each with its obligation and plan-step counts; --depth
+limits how many levels below the node are shown (default: all).
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -44,6 +48,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
         "list" => list(&inv, &args),
         "show" => show(&inv, &args),
         "search" => search(&inv, &args),
+        "tree" => tree(&inv, &args),
         "create" => create(&inv, &args),
         "rename" => rename(&inv, &args),
         "move" => move_node(&inv, &args),
@@ -53,7 +58,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
 }
 
 /// Resolve a `<SLUG_OR_UUID>` argument to a node id.
-fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
+pub(crate) fn resolve(inv: &Invocation, raw: &str) -> anyhow::Result<Uuid> {
     if let Ok(id) = Uuid::parse_str(raw) {
         return Ok(id);
     }
@@ -194,6 +199,102 @@ fn search(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     Ok(scored
         .into_iter()
         .map(|(_, n)| format!("{}  {}  {}", n.id, n.slug, n.title))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// One line of `node tree`.
+struct TreeLine {
+    depth: usize,
+    node: Node,
+    obligations: usize,
+    plan_steps: usize,
+    /// Children not shown because of `--depth`.
+    hidden_children: usize,
+}
+
+fn tree(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
+    let root = resolve(inv, args.target("a node")?)?;
+    let max_depth: Option<usize> = args
+        .get("--depth")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| anyhow::anyhow!("--depth: `{v}` is not a non-negative number"))
+        })
+        .transpose()?;
+    let lines: Vec<TreeLine> = inv.client().read(move |conn| {
+        let outline = OutlineRepo::new(conn);
+        let nodes = NodeRepo::new(conn);
+        let plan = PlanStepRepo::new(conn);
+        let list_id = outline
+            .get_entry(root)?
+            .ok_or_else(|| anyhow::anyhow!("node not found in outline"))?
+            .list_id;
+        let mut children: HashMap<Option<Uuid>, Vec<(i32, Uuid)>> = HashMap::new();
+        for entry in outline.list_for_list(list_id)? {
+            children
+                .entry(entry.parent_id)
+                .or_default()
+                .push((entry.ordinal, entry.node_id));
+        }
+        for kids in children.values_mut() {
+            kids.sort();
+        }
+        let counts = ObligationRepo::new(conn).counts_for_list(list_id)?;
+        let mut lines = Vec::new();
+        // Depth-first, children in sibling order.
+        let mut stack = vec![(root, 0usize)];
+        while let Some((id, depth)) = stack.pop() {
+            let Some(node) = nodes.get(id)? else { continue };
+            let kids = children.get(&Some(id)).map(Vec::as_slice).unwrap_or_default();
+            let expand = max_depth.is_none_or(|max| depth < max);
+            let c = counts.get(&id).copied().unwrap_or_default();
+            lines.push(TreeLine {
+                depth,
+                node,
+                obligations: c.requirements + c.constraints,
+                plan_steps: plan.list_ids_for_node(id)?.len(),
+                hidden_children: if expand { 0 } else { kids.len() },
+            });
+            if expand {
+                stack.extend(kids.iter().rev().map(|(_, kid)| (*kid, depth + 1)));
+            }
+        }
+        Ok::<_, anyhow::Error>(lines)
+    })?;
+    if inv.json {
+        let items: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "id": l.node.id.to_string(),
+                    "slug": l.node.slug,
+                    "title": l.node.title,
+                    "depth": l.depth,
+                    "obligations": l.obligations,
+                    "plan_steps": l.plan_steps,
+                    "hidden_children": l.hidden_children,
+                })
+            })
+            .collect();
+        return Ok(serde_json::Value::Array(items).to_string());
+    }
+    Ok(lines
+        .iter()
+        .map(|l| {
+            let hidden = match l.hidden_children {
+                0 => String::new(),
+                n => format!(", {n} more below"),
+            };
+            format!(
+                "{}{}  {}  (obligations: {}, plan steps: {}{hidden})",
+                "  ".repeat(l.depth),
+                l.node.slug,
+                l.node.title,
+                l.obligations,
+                l.plan_steps
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }

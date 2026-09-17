@@ -1,4 +1,5 @@
 mod always_on_top;
+pub(crate) mod assets;
 mod data_root_setup;
 mod fleet_blocked;
 mod history_window;
@@ -9,7 +10,7 @@ pub mod transcript_window;
 pub mod window;
 
 use crate::cli::LaunchOptions;
-use crate::drafting::register_drafting_keyboard_bindings;
+use crate::conversation::register_conversation_keyboard_bindings;
 use crate::interview::views::{
     register_sessions_keyboard_bindings, register_settings_keyboard_bindings,
 };
@@ -43,7 +44,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_lifecycle_panel_keyboard_bindings(cx);
     register_action_panel_keyboard_bindings(cx);
     register_sessions_keyboard_bindings(cx);
-    register_drafting_keyboard_bindings(cx);
+    register_conversation_keyboard_bindings(cx);
     register_settings_keyboard_bindings(cx);
     register_database_keyboard_bindings(cx);
     register_agent_transcripts_keyboard_bindings(cx);
@@ -82,7 +83,7 @@ fn register_app_lifecycle(cx: &mut gpui::App) {
 
 impl App {
     pub fn run(opts: LaunchOptions, needs_data_root_setup: bool) {
-        let app = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
+        let app = gpui_platform::application().with_assets(assets::AppAssets);
 
         app.run(move |cx| {
             gpui_component::init(cx);

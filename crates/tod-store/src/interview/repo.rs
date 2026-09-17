@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use uuid::Uuid;
 
-const QUESTION_COLUMNS: &str = "id, node_id, session_id, seq, phase, author, status, covers, context,
+const QUESTION_COLUMNS: &str =
+    "id, node_id, session_id, seq, phase, author, status, covers, context,
     question, intent, recommend, options, proposal, answer_option, answer_text, answer_edited_text,
     applied, processed_at, processed_summary, withdrawn_by, withdrawn_reason, created_at,
     answered_at, updated_at";
@@ -20,7 +21,8 @@ const AGENT_SESSION_COLUMNS: &str = "id, node_id, interview_session_id, phase, r
 const SNAPSHOT_COLUMNS: &str = "rev, node_id, entity_id, op, actor, at, prior";
 
 /// A change-log row that kept an obligation's prior row.
-const IS_SNAPSHOT: &str = "entity = 'obligation' AND op IN ('delete', 'update') AND prior IS NOT NULL";
+const IS_SNAPSHOT: &str =
+    "entity = 'obligation' AND op IN ('delete', 'update') AND prior IS NOT NULL";
 
 pub struct InterviewRepo<'a> {
     conn: &'a Connection,
@@ -32,10 +34,13 @@ impl<'a> InterviewRepo<'a> {
     }
 
     /// Questions for a node, oldest first, optionally limited to `statuses`.
-    pub fn list_questions(&self, node_id: Uuid, statuses: &[&str]) -> Result<Vec<InterviewQuestion>> {
-        let mut sql = format!(
-            "SELECT {QUESTION_COLUMNS} FROM interview_questions WHERE node_id = ?1"
-        );
+    pub fn list_questions(
+        &self,
+        node_id: Uuid,
+        statuses: &[&str],
+    ) -> Result<Vec<InterviewQuestion>> {
+        let mut sql =
+            format!("SELECT {QUESTION_COLUMNS} FROM interview_questions WHERE node_id = ?1");
         if !statuses.is_empty() {
             let marks = (0..statuses.len())
                 .map(|i| format!("?{}", i + 2))
@@ -45,7 +50,11 @@ impl<'a> InterviewRepo<'a> {
         }
         sql.push_str(" ORDER BY seq");
         let mut values: Vec<rusqlite::types::Value> = vec![uuid_to_blob(node_id).into()];
-        values.extend(statuses.iter().map(|s| rusqlite::types::Value::from(s.to_string())));
+        values.extend(
+            statuses
+                .iter()
+                .map(|s| rusqlite::types::Value::from(s.to_string())),
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(values), map_question)?
@@ -156,9 +165,11 @@ impl<'a> InterviewRepo<'a> {
 
     /// Head of the change log (0 when empty).
     pub fn head_rev(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COALESCE(MAX(rev), 0) FROM interview_changes", [], |r| r.get(0))?)
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(MAX(rev), 0) FROM interview_changes",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Changes after `rev` owned by any of `node_ids`, excluding `exclude_actor`.
@@ -179,8 +190,13 @@ impl<'a> InterviewRepo<'a> {
             "SELECT rev, node_id, entity, entity_id, op, fields, actor FROM interview_changes
              WHERE rev > ?1 AND actor != ?2 AND node_id IN ({marks}) ORDER BY rev"
         );
-        let mut values: Vec<rusqlite::types::Value> = vec![rev.into(), exclude_actor.to_string().into()];
-        values.extend(node_ids.iter().map(|id| rusqlite::types::Value::from(uuid_to_blob(*id))));
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![rev.into(), exclude_actor.to_string().into()];
+        values.extend(
+            node_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::from(uuid_to_blob(*id))),
+        );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_from_iter(values), |row| {
@@ -252,7 +268,10 @@ impl<'a> InterviewRepo<'a> {
     }
 
     /// `(question_maker_state, exhausted_reason)` for an interview session.
-    pub fn question_maker_state(&self, session_id: Uuid) -> Result<Option<(String, Option<String>)>> {
+    pub fn question_maker_state(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<(String, Option<String>)>> {
         self.conn
             .query_row(
                 "SELECT question_maker_state, exhausted_reason FROM interview_sessions WHERE id = ?1",

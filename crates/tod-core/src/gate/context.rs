@@ -91,7 +91,7 @@ pub fn build_gate_check_message(
 
 /// Build the on-entry message: static layers, the state agent's own role doc,
 /// then the live node context with no gate-check block — this turn is about
-/// doing the state's own "On entry" work (e.g. drafting plan steps), not
+/// doing the state's own "On entry" work (e.g. writing plan steps), not
 /// evaluating a forward gate.
 pub fn build_on_entry_message(
     paths: &MediaPaths,
@@ -106,7 +106,7 @@ pub fn build_on_entry_message(
         &dynamic_context(request, "on_entry", &node),
         "\nYou have just entered this lifecycle state. Perform this state's \
          **\"On entry\"** responsibilities from your role doc now, directly \
-         via `tod-cli` (e.g. drafting or refining plan steps) — do not wait \
+         via `tod-cli` (e.g. writing or refining plan steps) — do not wait \
          for a gate check or an interview turn to do this piecemeal. This \
          turn may run again later as obligations or plan steps change; check \
          what already exists first and add only what's missing, don't \

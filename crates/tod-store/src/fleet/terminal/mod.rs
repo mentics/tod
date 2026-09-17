@@ -5,10 +5,10 @@ mod init;
 pub(crate) mod path_util;
 mod state;
 
+use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::reconnect_identity::{self};
 use crate::fleet::repos::agent_run::{AgentRun, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::shell::ShellSession;
-use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::{FleetMutation, FleetStore, resolve_launch_cwd};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
@@ -334,11 +334,7 @@ fn spawn_powershell(
 
 #[cfg(windows)]
 fn quote_windows_arg(arg: &str) -> String {
-    if !arg.is_empty()
-        && !arg
-            .chars()
-            .any(|c| c == ' ' || c == '\t' || c == '"')
-    {
+    if !arg.is_empty() && !arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
         return arg.to_string();
     }
     // https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw

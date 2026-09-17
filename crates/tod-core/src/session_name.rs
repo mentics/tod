@@ -14,6 +14,10 @@ const MAX_SUBJECT_CHARS: usize = 48;
 /// name renders cleanly in the platform's own session picker.
 const MAX_TOTAL_CHARS: usize = 100;
 
+/// The surface label conversation-view sessions are named with
+/// (`Conversation · <focus title> · <time>`).
+pub const CONVERSATION_SURFACE: &str = "conversation";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see
@@ -122,6 +126,14 @@ mod tests {
             "Chat · Fix login · Sep 10, 9:05 AM"
         );
         assert!(session_name(Some("tasks/edit"), "x", at(9, 5)).starts_with("Tasks edit · "));
+    }
+
+    #[test]
+    fn conversation_sessions_are_labeled_conversation() {
+        assert_eq!(
+            session_name(Some(CONVERSATION_SURFACE), "Auth", at(9, 5)),
+            "Conversation · Auth · Sep 10, 9:05 AM"
+        );
     }
 
     #[test]

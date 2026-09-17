@@ -66,7 +66,9 @@ impl ResolvedFiles {
         };
         if self.use_worktree {
             return match self.worktree_path() {
-                Some(path) if Path::new(path).is_dir() => FilesDirectory::Ready(PathBuf::from(path)),
+                Some(path) if Path::new(path).is_dir() => {
+                    FilesDirectory::Ready(PathBuf::from(path))
+                }
                 _ => FilesDirectory::NeedsWorktreeSetup,
             };
         }
@@ -98,7 +100,8 @@ pub struct ResolvedAgent {
 impl ResolvedAgent {
     /// Launch options with unset values following the settings for `role`.
     pub fn launch_options(&self, settings: &TodSettings, role: AgentRole) -> AgentLaunchOptions {
-        self.agent.launch_options(&settings.launch_options_for(role))
+        self.agent
+            .launch_options(&settings.launch_options_for(role))
     }
 }
 

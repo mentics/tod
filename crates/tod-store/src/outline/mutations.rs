@@ -146,6 +146,19 @@ pub enum OutlineMutation {
         obligation_id: Uuid,
         direction: ReorderDirection,
     },
+    /// Put a deleted obligation back from a conversation snapshot, with its
+    /// id, at the snapshot's position (later siblings shift down).
+    RestoreObligationRow {
+        obligation_id: Uuid,
+        snapshot: crate::conversation::EntitySnapshot,
+    },
+    /// Move an obligation onto `node_id` (if it is not there) and to exactly
+    /// the 1-based `ordinal` within its kind.
+    PlaceObligation {
+        id: Uuid,
+        node_id: Uuid,
+        ordinal: i32,
+    },
     CreatePlanStep {
         step_id: Option<Uuid>,
         node_id: Uuid,
@@ -188,6 +201,27 @@ pub enum OutlineMutation {
         step_id: Uuid,
         obligation_id: Uuid,
     },
+    /// Put a deleted plan step back from a conversation snapshot: the row
+    /// (same id, status, and position), its dependencies, and its obligation
+    /// links. Dependencies and links whose other end is gone are skipped.
+    RestorePlanStep {
+        step_id: Uuid,
+        snapshot: crate::conversation::EntitySnapshot,
+    },
+    /// Move a plan step to exactly the 1-based `ordinal` on its node.
+    PlacePlanStep {
+        id: Uuid,
+        ordinal: i32,
+    },
+    /// Move a node under `parent_id` (in its current list) to exactly the
+    /// 0-based `index` among that parent's children. Unlike
+    /// [`OutlineMutation::ReparentNode`], the position is an index, not a raw
+    /// ordinal, so it is exact even after siblings were renumbered.
+    PlaceNode {
+        node_id: Uuid,
+        parent_id: Option<Uuid>,
+        index: i32,
+    },
     SetExtraContent {
         node_id: Uuid,
         content_type: String,
@@ -217,7 +251,6 @@ pub enum OutlineMutation {
     },
 
     // ── Generator mutations ─────────────────────────────────────────────
-
     /// Save or update the generator configuration for a node.
     SetGeneratorConfig {
         node_id: Uuid,
@@ -325,6 +358,11 @@ impl OutlineMutation {
                 | OutlineMutation::DeleteNode { .. }
                 | OutlineMutation::RestoreNodeSubtree { .. }
                 | OutlineMutation::ReorderObligation { .. }
+                | OutlineMutation::RestoreObligationRow { .. }
+                | OutlineMutation::PlaceObligation { .. }
+                | OutlineMutation::RestorePlanStep { .. }
+                | OutlineMutation::PlacePlanStep { .. }
+                | OutlineMutation::PlaceNode { .. }
                 | OutlineMutation::CreatePlanStep { .. }
                 | OutlineMutation::UpdatePlanStepBody { .. }
                 | OutlineMutation::UpdatePlanStepStatus { .. }
@@ -530,6 +568,25 @@ impl OutlineMutation {
                 };
                 ObligationRepo::new(conn).reorder(*obligation_id, delta)?;
             }
+            OutlineMutation::RestoreObligationRow {
+                obligation_id,
+                snapshot,
+            } => {
+                restore_obligation_row(conn, *obligation_id, snapshot)?;
+            }
+            OutlineMutation::PlaceObligation {
+                id,
+                node_id,
+                ordinal,
+            } => {
+                let repo = ObligationRepo::new(conn);
+                let row = repo.get(*id)?.context("obligation not found")?;
+                if row.node_id != *node_id {
+                    require_spec(conn, *node_id)?;
+                    repo.move_to_node(*id, *node_id)?;
+                }
+                repo.place(*id, index_from_ordinal(*ordinal))?;
+            }
             OutlineMutation::CreatePlanStep {
                 step_id,
                 node_id,
@@ -579,6 +636,20 @@ impl OutlineMutation {
             } => {
                 PlanStepRepo::new(conn).unlink_obligation(*step_id, *obligation_id)?;
             }
+            OutlineMutation::RestorePlanStep { step_id, snapshot } => {
+                restore_plan_step(conn, *step_id, snapshot)?;
+            }
+            OutlineMutation::PlacePlanStep { id, ordinal } => {
+                PlanStepRepo::new(conn).place(*id, index_from_ordinal(*ordinal))?;
+            }
+            OutlineMutation::PlaceNode {
+                node_id,
+                parent_id,
+                index,
+            } => {
+                guard_not_in_generator_subtree(conn, *parent_id)?;
+                place_node(conn, *node_id, *parent_id, *index)?;
+            }
             OutlineMutation::SetExtraContent {
                 node_id,
                 content_type,
@@ -609,7 +680,6 @@ impl OutlineMutation {
             }
 
             // ── Generator mutations ─────────────────────────────────────
-
             OutlineMutation::SetGeneratorConfig {
                 node_id,
                 data_source_type,
@@ -712,11 +782,7 @@ impl OutlineMutation {
                 status,
                 error,
             } => {
-                GeneratorRepo::new(conn).set_refresh_status(
-                    *node_id,
-                    status,
-                    error.as_deref(),
-                )?;
+                GeneratorRepo::new(conn).set_refresh_status(*node_id, status, error.as_deref())?;
             }
         }
         Ok(None)
@@ -771,14 +837,16 @@ fn create_obligation(
 }
 
 /// See [`OutlineMutation::RestoreObligation`]. The row goes back exactly as it
-/// was, provenance included — restoring undoes a change, it asserts nothing new.
+/// was — restoring undoes a change, it asserts nothing new.
 fn restore_obligation(conn: &Connection, rev: i64) -> Result<Uuid> {
     use crate::interview::{InterviewRepo, short_id};
     use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
 
-    let snapshot = InterviewRepo::new(conn).obligation_snapshot(rev)?.with_context(|| {
-        format!("change r-{rev} kept no obligation to restore (or it is past retention)")
-    })?;
+    let snapshot = InterviewRepo::new(conn)
+        .obligation_snapshot(rev)?
+        .with_context(|| {
+            format!("change r-{rev} kept no obligation to restore (or it is past retention)")
+        })?;
     let id = snapshot.obligation_id;
     let prior = &snapshot.prior;
     let repo = ObligationRepo::new(conn);
@@ -809,17 +877,9 @@ fn restore_obligation(conn: &Connection, rev: i64) -> Result<Uuid> {
                 &prior.phase,
             )?;
             conn.execute(
-                "UPDATE node_obligations SET provenance = ?1, attention = ?2, attention_why = ?3,
-                        visual_design_path = ?4, created_at = ?5
-                 WHERE id = ?6",
-                params![
-                    prior.provenance,
-                    prior.attention,
-                    prior.attention_why,
-                    prior.visual_design_path,
-                    prior.created_at,
-                    uuid_to_blob(id)
-                ],
+                "UPDATE node_obligations SET visual_design_path = ?1, created_at = ?2
+                 WHERE id = ?3",
+                params![prior.visual_design_path, prior.created_at, uuid_to_blob(id)],
             )?;
         }
         _ => {
@@ -830,22 +890,147 @@ fn restore_obligation(conn: &Connection, rev: i64) -> Result<Uuid> {
                 );
             }
             conn.execute(
-                "UPDATE node_obligations SET body = ?1, section = ?2, provenance = ?3,
-                        attention = ?4, attention_why = ?5, updated_at = ?6
-                 WHERE id = ?7",
-                params![
-                    prior.body,
-                    prior.section,
-                    prior.provenance,
-                    prior.attention,
-                    prior.attention_why,
-                    now_ms(),
-                    uuid_to_blob(id)
-                ],
+                "UPDATE node_obligations SET body = ?1, section = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![prior.body, prior.section, now_ms(), uuid_to_blob(id)],
             )?;
         }
     }
     Ok(id)
+}
+
+/// 0-based index for a 1-based stored ordinal.
+fn index_from_ordinal(ordinal: i32) -> usize {
+    usize::try_from(ordinal - 1).unwrap_or(0)
+}
+
+/// See [`OutlineMutation::RestoreObligationRow`].
+fn restore_obligation_row(
+    conn: &Connection,
+    id: Uuid,
+    snapshot: &crate::conversation::EntitySnapshot,
+) -> Result<()> {
+    use crate::conversation::EntitySnapshot;
+    use crate::interview::short_id;
+    let EntitySnapshot::Obligation {
+        node_id,
+        kind,
+        section,
+        body,
+        phase,
+        ordinal,
+        visual_design_path,
+    } = snapshot
+    else {
+        anyhow::bail!("not an obligation snapshot");
+    };
+    let repo = ObligationRepo::new(conn);
+    if repo.get(id)?.is_some() {
+        anyhow::bail!("obligation {} already exists", short_id(id));
+    }
+    NodeRepo::new(conn)
+        .get(*node_id)?
+        .with_context(|| format!("node {node_id} no longer exists"))?;
+    guard_not_managed(conn, *node_id)?;
+    require_spec(conn, *node_id)?;
+    let kind = parse_obligation_kind(kind)?;
+    repo.insert_at(
+        id,
+        *node_id,
+        kind,
+        index_from_ordinal(*ordinal),
+        section.as_deref(),
+        body,
+        phase,
+    )?;
+    if visual_design_path.is_some() {
+        repo.update_visual_design_path(id, visual_design_path.as_deref())?;
+    }
+    Ok(())
+}
+
+/// See [`OutlineMutation::RestorePlanStep`].
+fn restore_plan_step(
+    conn: &Connection,
+    id: Uuid,
+    snapshot: &crate::conversation::EntitySnapshot,
+) -> Result<()> {
+    use crate::conversation::EntitySnapshot;
+    use crate::interview::short_id;
+    use crate::outline::uuid_blob::uuid_to_blob;
+    let EntitySnapshot::PlanStep {
+        node_id,
+        ordinal,
+        body,
+        status,
+        depends_on,
+        satisfies,
+    } = snapshot
+    else {
+        anyhow::bail!("not a plan step snapshot");
+    };
+    let repo = PlanStepRepo::new(conn);
+    if repo.get(id)?.is_some() {
+        anyhow::bail!("plan step {} already exists", short_id(id));
+    }
+    NodeRepo::new(conn)
+        .get(*node_id)?
+        .with_context(|| format!("node {node_id} no longer exists"))?;
+    require_spec(conn, *node_id)?;
+    anyhow::ensure!(
+        crate::outline::PLAN_STEP_STATUSES.contains(&status.as_str()),
+        "unknown plan step status `{status}`"
+    );
+    repo.insert_at(id, *node_id, index_from_ordinal(*ordinal), body)?;
+    // Set directly: restoring is not a status change, so nothing is promoted.
+    conn.execute(
+        "UPDATE node_plan_steps SET status = ?1 WHERE id = ?2",
+        params![status, uuid_to_blob(id)],
+    )?;
+    for dep in depends_on {
+        if repo.get(*dep)?.is_some() {
+            repo.add_dependency(id, *dep)?;
+        }
+    }
+    let obligations = ObligationRepo::new(conn);
+    for obligation in satisfies {
+        if obligations.get(*obligation)?.is_some() {
+            repo.link_obligation(id, *obligation)?;
+        }
+    }
+    Ok(())
+}
+
+/// See [`OutlineMutation::PlaceNode`]. Renumbers the target parent's
+/// children compactly with the node at `index`.
+fn place_node(conn: &Connection, node_id: Uuid, parent_id: Option<Uuid>, index: i32) -> Result<()> {
+    let outline = OutlineRepo::new(conn);
+    let entry = outline
+        .get_entry(node_id)?
+        .context("node missing from outline")?;
+    let mut ancestor = parent_id;
+    while let Some(current) = ancestor {
+        anyhow::ensure!(
+            current != node_id,
+            "a node cannot move under its own subtree"
+        );
+        ancestor = outline.get_entry(current)?.and_then(|e| e.parent_id);
+    }
+    let mut siblings: Vec<OutlineEntry> = outline
+        .list_for_list(entry.list_id)?
+        .into_iter()
+        .filter(|e| e.parent_id == parent_id && e.node_id != node_id)
+        .collect();
+    siblings.sort_by_key(|e| e.ordinal);
+    let index = usize::try_from(index).unwrap_or(0).min(siblings.len());
+    siblings.insert(index, OutlineEntry { parent_id, ..entry });
+    for (ord, sibling) in siblings.iter().enumerate() {
+        let ord = ord as i32;
+        if sibling.node_id == node_id || sibling.ordinal != ord {
+            outline.set_parent(sibling.node_id, parent_id, ord)?;
+        }
+    }
+    Ok(())
 }
 
 fn create_plan_step(
@@ -1035,7 +1220,10 @@ fn create_text_node(
     node_id: Option<Uuid>,
 ) -> Result<Uuid> {
     // The slug is fixed at creation, so it must come from a real title.
-    anyhow::ensure!(!title.trim().is_empty(), "a node needs a title before it can be created");
+    anyhow::ensure!(
+        !title.trim().is_empty(),
+        "a node needs a title before it can be created"
+    );
     let node_repo = NodeRepo::new(conn);
     let outline = OutlineRepo::new(conn);
     let node_id = node_id.unwrap_or_else(Uuid::new_v4);
@@ -1169,7 +1357,11 @@ fn create_managed_node(
 /// Persist tags for a generator-managed node, enabling the Tags capability
 /// on first write since Tags is independent of Agent/Generator.
 fn write_managed_tags(node_repo: &NodeRepo<'_>, node_id: Uuid, tags: &[String]) -> Result<()> {
-    if !tags.is_empty() && !node_repo.list_capabilities(node_id)?.contains(&Capability::Tags) {
+    if !tags.is_empty()
+        && !node_repo
+            .list_capabilities(node_id)?
+            .contains(&Capability::Tags)
+    {
         node_repo.enable_capability(node_id, Capability::Tags)?;
     }
     node_repo.set_tags(node_id, tags)
@@ -1207,8 +1399,14 @@ fn paste_managed_node_copy(
         .context("source node has no data-source link — not a managed node")?;
 
     bump_ordinals_after(conn, list_id, parent_id, ordinal)?;
-    let new_root_id =
-        copy_managed_node_recursive(conn, source_node_id, &link, list_id, parent_id, Some(ordinal))?;
+    let new_root_id = copy_managed_node_recursive(
+        conn,
+        source_node_id,
+        &link,
+        list_id,
+        parent_id,
+        Some(ordinal),
+    )?;
 
     Ok(new_root_id)
 }
@@ -1288,7 +1486,14 @@ fn copy_managed_node_recursive(
         let child_link = gen_repo
             .get_link(child_id)?
             .context("managed child has no data-source link")?;
-        copy_managed_node_recursive(conn, child_id, &child_link, list_id, Some(new_node.id), None)?;
+        copy_managed_node_recursive(
+            conn,
+            child_id,
+            &child_link,
+            list_id,
+            Some(new_node.id),
+            None,
+        )?;
     }
 
     Ok(new_node.id)

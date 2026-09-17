@@ -1,6 +1,6 @@
+use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
-use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::node_agent::NodeAgentRepo;
 use crate::fleet::repos::node_files::NodeFilesRepo;
@@ -8,10 +8,10 @@ use crate::fleet::repos::notification::NotificationRepo;
 use crate::fleet::repos::shell::ShellRepo;
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::schema;
-use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::fleet::undo::{
     capture_inverse_after_delete, capture_inverse_after_restore, capture_inverse_before,
 };
+use crate::interview::{ACTOR_USER, InterviewCommand};
 use crate::outline::OutlineMutation;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -791,7 +791,10 @@ fn flush_batch(
 /// Record who is writing, for the interview change-log triggers. Always
 /// reset to the user before the transaction commits.
 fn set_actor(conn: &Connection, actor: &str) -> Result<()> {
-    conn.execute("UPDATE interview_actor SET actor = ?1 WHERE id = 1", [actor])?;
+    conn.execute(
+        "UPDATE interview_actor SET actor = ?1 WHERE id = 1",
+        [actor],
+    )?;
     Ok(())
 }
 
@@ -927,12 +930,7 @@ mod tests {
     #[test]
     fn mutation_immediate_classification() {
         assert!(FleetMutation::DeleteTask { id: "x".into() }.is_immediate());
-        assert!(
-            FleetMutation::EndAgentRun {
-                run_id: "r".into(),
-            }
-            .is_immediate()
-        );
+        assert!(FleetMutation::EndAgentRun { run_id: "r".into() }.is_immediate());
         assert!(
             !FleetMutation::UpdateTaskTitle {
                 id: "x".into(),

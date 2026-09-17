@@ -69,7 +69,9 @@ impl Capability {
             Self::Agent => "Agent platform, model, and effort for chats and coding agents",
             Self::Files => "Workspace directory, branch, and optional worktree",
             Self::Ticket => "Ticket ID and pull request links",
-            Self::Generator => "Automatically produce and manage descendant nodes from an external data source",
+            Self::Generator => {
+                "Automatically produce and manage descendant nodes from an external data source"
+            }
             Self::Tags => "Freeform labels for organizing and filtering nodes",
         }
     }
@@ -86,7 +88,9 @@ impl Capability {
             Self::Files => {
                 "Disabling Files will remove the workspace directory, branch, and worktree settings stored on this node."
             }
-            Self::Ticket => "Disabling Ticket will remove the ticket ID and pull request links stored on this node.",
+            Self::Ticket => {
+                "Disabling Ticket will remove the ticket ID and pull request links stored on this node."
+            }
             Self::Generator => {
                 "Disabling Generator will permanently delete all managed child nodes under this node."
             }
@@ -112,12 +116,12 @@ pub const EXTRA_CONTENT_DETAILS: &str = "details";
 
 /// `node_extra_content.content_type` value for the node's generated summary.
 /// Ancestor context shows this plus constraints in place of the ancestor's
-/// requirements. The drafting driver writes a missing one before a
-/// descendant's turn (`tod_core::drafting::summary`); the state docs
-/// regenerate it on entering `design` and `planning`.
+/// requirements. The state docs regenerate it on entering `design` and
+/// `planning`.
 pub const EXTRA_CONTENT_SUMMARY: &str = "summary";
 
-pub const EXTRA_CONTENT_TYPES: [&str; 6] = ["goal", "design", "plan", "notes", "details", "summary"];
+pub const EXTRA_CONTENT_TYPES: [&str; 6] =
+    ["goal", "design", "plan", "notes", "details", "summary"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineList {

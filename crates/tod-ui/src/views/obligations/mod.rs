@@ -2,17 +2,16 @@
 
 mod delegate;
 
-use crate::ui::actionable::{
-    chrome_control_with_shortcut, chrome_control_with_shortcut_in_context, render_shortcut_pill,
-};
+use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::key_context;
 use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::views::rows::RowHost;
 use delegate::{
-    NO_SECTION, ObligationListDelegate, ObligationRow, RowAction, SECTION_EDIT_TAG, group_row_key,
+    ListAction, NO_SECTION, ObligationListDelegate, ObligationRow, SECTION_EDIT_TAG, group_row_key,
     new_section_row_key, obligation_section, phase_row_key, section_row_key,
 };
 use gpui::prelude::FluentBuilder;
@@ -21,15 +20,13 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
     Styled, Subscription, Window, actions, div, px,
 };
-use gpui_component::IconName;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::sync::Arc;
+use tod_store::conversation::{Focus, NetOp};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
 use tod_store::outline::{
@@ -124,8 +121,8 @@ pub enum ObligationsEvent {
     FocusTaskList,
     /// Delete key with no obligation item selected — delete the task in the tree.
     DeleteSelectedTask,
-    /// Chat icon — open an agent conversation scoped to this panel. Carries the
-    /// live selection so the shell can assemble the agent's first message.
+    /// Ctrl+J — open the conversation about the selected obligation, or about
+    /// the node when no obligation is selected.
     OpenAgentChat {
         node_id: Uuid,
         /// The specific obligation selected, when one is.
@@ -136,11 +133,6 @@ pub enum ObligationsEvent {
     OpenVisualDesign {
         node_id: Uuid,
         obligation_id: Uuid,
-    },
-    /// "Rewrite pre-v3" — have the drafter rewrite this node's obligations
-    /// written before drafting v3.
-    RewritePreV3 {
-        node_id: Uuid,
     },
 }
 
@@ -166,7 +158,14 @@ pub struct ObligationsView {
     delegate: ObligationListDelegate,
     scroll_handle: ScrollHandle,
     selected_index: Option<usize>,
-    action_sink: Rc<RefCell<Vec<RowAction>>>,
+    host: RowHost<ListAction>,
+    /// Hosted inside another view (the conversation view's context panel):
+    /// no Close or chat button, and Escape / Ctrl+Left go to the host.
+    embedded: bool,
+    /// Items no longer on the node that the host still wants shown, struck
+    /// through (the conversation's deleted items). Merged into `items` on
+    /// every reload and never editable.
+    removed: Vec<NodeObligation>,
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
@@ -181,18 +180,13 @@ pub struct ObligationsView {
     pending_abandon_section_edit: bool,
     pending_live_refresh: bool,
     selected_key: Option<String>,
-    /// Whether the current node has the Agent capability. Cached because
-    /// `render` consults it every frame and the lookup hits SQLite.
-    node_has_agent: bool,
-    /// Obligations on this node still marked as written before drafting v3.
-    pre_v3_count: usize,
     _inline_edit_subscription: Subscription,
     _section_edit_subscription: Subscription,
 }
 
 impl ObligationsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
-        let action_sink = Rc::new(RefCell::new(Vec::new()));
+        let host = RowHost::for_entity(cx.weak_entity());
         let inline_edit_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(INLINE_EDIT_ROWS, INLINE_EDIT_ROWS)
@@ -218,8 +212,7 @@ impl ObligationsView {
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search obligations…"));
 
-        let delegate =
-            ObligationListDelegate::new(Vec::new(), action_sink.clone(), cx.weak_entity());
+        let delegate = ObligationListDelegate::new(Vec::new(), host.clone());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -260,7 +253,9 @@ impl ObligationsView {
             delegate,
             scroll_handle: ScrollHandle::new(),
             selected_index: None,
-            action_sink,
+            host,
+            embedded: false,
+            removed: Vec::new(),
             editing_id: None,
             draft_id: None,
             edit_original_body: None,
@@ -272,8 +267,6 @@ impl ObligationsView {
             pending_abandon_section_edit: false,
             pending_live_refresh: false,
             selected_key: None,
-            node_has_agent: false,
-            pre_v3_count: 0,
             _inline_edit_subscription,
             _section_edit_subscription,
         }
@@ -281,6 +274,86 @@ impl ObligationsView {
 
     pub fn is_open(&self) -> bool {
         self.node_id.is_some()
+    }
+
+    /// Host this view inside another: hides Close and the chat button, and
+    /// hands Escape and Ctrl+Left (`PaneFocusLeft`) to the host instead of
+    /// closing or emitting `FocusTaskList`.
+    pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
+        self.embedded = embedded;
+        cx.notify();
+    }
+
+    /// Scroll to obligation `id` and highlight it, expanding its phase, kind,
+    /// and section, and clearing a search that hides it. Does nothing if the
+    /// obligation is not on this node.
+    pub fn highlight_item(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.iter().find(|o| o.id == id) else {
+            return;
+        };
+        let (phase, kind, section) = (
+            item.phase.clone(),
+            item.kind.clone(),
+            obligation_section(item).to_string(),
+        );
+        self.phase_collapsed.remove(&phase_row_key(&phase));
+        self.kind_collapsed.remove(&group_row_key(&phase, &kind));
+        self.section_collapsed
+            .remove(&section_row_key(&phase, &kind, &section));
+        let key = id.to_string();
+        if !self.search_matches().iter().any(|o| o.id == id) {
+            self.search_query.clear();
+            self.search_input.update(cx, |input, cx| {
+                input.set_value("", window, cx);
+            });
+        }
+        self.selected_key = Some(key);
+        self.rebuild_visible(window, cx);
+        if let Some(ix) = self.selected_index {
+            self.scroll_handle.scroll_to_item(ix);
+        }
+    }
+
+    /// Show a leading op icon on each obligation in `markers`.
+    pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
+        self.delegate.set_change_markers(markers);
+        cx.notify();
+    }
+
+    /// Also show `items`, which no longer exist, struck through at their old
+    /// place. Ones that exist again (a reversed deletion) show as normal.
+    /// Whether `id` is shown as a removed (struck-through) row.
+    #[cfg(test)]
+    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
+        self.delegate.is_struck(id)
+    }
+
+    pub fn set_removed_items(
+        &mut self,
+        items: Vec<NodeObligation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.removed == items {
+            return;
+        }
+        self.removed = items;
+        self.reload(window, cx);
+    }
+
+    /// The conversation Ctrl+J opens here: the selected obligation, or the
+    /// node when none (or a removed one) is selected.
+    pub fn conversation_focus(&self) -> Option<Focus> {
+        let node = self.node_id?;
+        Some(
+            match self
+                .selected_obligation_id()
+                .filter(|id| !self.delegate.is_struck(*id))
+            {
+                Some(id) => Focus::Obligation { node, id },
+                None => Focus::Node(node),
+            },
+        )
     }
 
     pub fn open(
@@ -292,7 +365,6 @@ impl ObligationsView {
         cx: &mut Context<Self>,
     ) {
         self.node_id = Some(node_id);
-        self.refresh_node_has_agent();
         self.title = title.to_string();
         self.active_phase = active_phase.map(str::to_string);
         self.kind_collapsed.clear();
@@ -326,7 +398,6 @@ impl ObligationsView {
             return;
         }
         self.node_id = Some(node_id);
-        self.refresh_node_has_agent();
         self.title = title.to_string();
         self.active_phase = active_phase.map(str::to_string);
         self.kind_collapsed.clear();
@@ -359,7 +430,6 @@ impl ObligationsView {
         }
         self.clear_inline_edit_state(window, cx);
         self.node_id = None;
-        self.node_has_agent = false;
         self.title.clear();
         self.items.clear();
         self.selected_key = None;
@@ -374,17 +444,6 @@ impl ObligationsView {
     fn focus_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
         cx.notify();
-    }
-
-    /// Refresh the cached Agent flag (own or inherited), which gates the chat icon.
-    fn refresh_node_has_agent(&mut self) {
-        self.node_has_agent = self.node_id.is_some_and(|node_id| {
-            self.fleet
-                .resolve_agent_for_node(&node_id.to_string())
-                .ok()
-                .flatten()
-                .is_some()
-        });
     }
 
     /// Id of the selected obligation, when the selection is an item rather than
@@ -410,19 +469,25 @@ impl ObligationsView {
         let Some(node_id) = self.node_id else {
             return;
         };
-        // The capability can be toggled elsewhere while this panel is open.
-        self.refresh_node_has_agent();
         let _ = self.fleet.reload_if_stale();
         self.items = self
             .fleet
             .list_obligations_for_node(node_id)
             .unwrap_or_default();
-        let marks = self
-            .fleet
-            .read(|conn| tod_store::drafting::DraftingRepo::new(conn).marks_for_node(node_id))
-            .unwrap_or_default();
-        self.pre_v3_count = marks.values().filter(|m| m.is_pre_v3()).count();
-        self.delegate.set_marks(marks);
+        let mut struck = HashSet::new();
+        for ghost in &self.removed {
+            if ghost.node_id != node_id || self.items.iter().any(|o| o.id == ghost.id) {
+                continue;
+            }
+            struck.insert(ghost.id);
+            let at = self
+                .items
+                .iter()
+                .position(|o| o.kind == ghost.kind && o.ordinal > ghost.ordinal)
+                .unwrap_or(self.items.len());
+            self.items.insert(at, ghost.clone());
+        }
+        self.delegate.set_struck(struck);
         self.rebuild_visible(window, cx);
     }
 
@@ -744,6 +809,9 @@ impl ObligationsView {
     }
 
     fn start_inline_edit(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delegate.is_struck(id) {
+            return;
+        }
         let body = self
             .items
             .iter()
@@ -1112,14 +1180,9 @@ impl ObligationsView {
             }
             Some(ObligationRow::Item { obligation }) => {
                 let phase = obligation.phase.clone();
-                self.create_in_kind(
-                    &phase,
-                    &obligation.kind,
-                    Some(obligation.id),
-                    before,
-                    window,
-                    cx,
-                );
+                // A removed item is no anchor: add at the end of its kind.
+                let anchor = Some(obligation.id).filter(|id| !self.delegate.is_struck(*id));
+                self.create_in_kind(&phase, &obligation.kind, anchor, before, window, cx);
             }
             Some(ObligationRow::Phase { phase, .. }) => {
                 self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
@@ -1267,6 +1330,9 @@ impl ObligationsView {
         let Some(ObligationRow::Item { obligation }) = self.selected_row() else {
             return;
         };
+        if self.delegate.is_struck(obligation.id) {
+            return;
+        }
         let id = obligation.id;
         let phase = obligation.phase.clone();
         let kind = obligation.kind.clone();
@@ -1314,6 +1380,9 @@ impl ObligationsView {
         let Some(ObligationRow::Item { obligation }) = self.selected_row() else {
             return;
         };
+        if self.delegate.is_struck(obligation.id) {
+            return;
+        }
         let id = obligation.id;
         if let Err(err) = self
             .fleet
@@ -1346,26 +1415,25 @@ impl ObligationsView {
     }
 
     fn drain_row_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let actions: Vec<_> = self.action_sink.borrow_mut().drain(..).collect();
-        for action in actions {
+        for action in self.host.drain() {
             match action {
-                RowAction::TogglePhase { phase } => {
+                ListAction::TogglePhase { phase } => {
                     self.toggle_phase(&phase, window, cx);
                 }
-                RowAction::ToggleGroup { phase, kind } => {
+                ListAction::ToggleGroup { phase, kind } => {
                     self.toggle_group(&phase, &kind, window, cx);
                 }
-                RowAction::ToggleSection {
+                ListAction::ToggleSection {
                     phase,
                     kind,
                     section,
                 } => {
                     self.toggle_section(&phase, &kind, &section, window, cx);
                 }
-                RowAction::StartEdit { obligation_id } => {
+                ListAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
                 }
-                RowAction::StartSectionEdit {
+                ListAction::StartSectionEdit {
                     phase,
                     kind,
                     section,
@@ -1377,7 +1445,7 @@ impl ObligationsView {
                     };
                     self.start_section_edit(&phase, kind, &section, window, cx);
                 }
-                RowAction::AddSection { phase, kind } => {
+                ListAction::AddSection { phase, kind } => {
                     let kind = if kind == KIND_REQUIREMENT {
                         KIND_REQUIREMENT
                     } else {
@@ -1385,10 +1453,10 @@ impl ObligationsView {
                     };
                     self.add_section(&phase, kind, window, cx);
                 }
-                RowAction::Select { row_ix } => {
+                ListAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
                 }
-                RowAction::OpenVisualDesign { obligation_id } => {
+                ListAction::OpenVisualDesign { obligation_id } => {
                     if let Some(node_id) = self.node_id {
                         cx.emit(ObligationsEvent::OpenVisualDesign {
                             node_id,
@@ -1407,6 +1475,10 @@ impl ObligationsView {
         }
         if self.is_editing_section() {
             self.abandon_section_edit(window, cx);
+            return;
+        }
+        if self.embedded {
+            cx.propagate();
             return;
         }
         self.close(window, cx);
@@ -1799,7 +1871,7 @@ impl Render for ObligationsView {
         let border = theme.border;
         let accent = theme.primary;
         let muted = theme.muted_foreground;
-        let pre_v3_count = self.pre_v3_count;
+        let embedded = self.embedded;
 
         v_flex()
             .key_context(OBLIGATIONS_CONTEXT)
@@ -1809,7 +1881,7 @@ impl Render for ObligationsView {
             .border_l_2()
             .border_color(accent)
             .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
-                if this.editing_id.is_some() {
+                if this.editing_id.is_some() || this.embedded {
                     cx.propagate();
                     return;
                 }
@@ -1817,7 +1889,8 @@ impl Render for ObligationsView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &OpenAgentChat, window, cx| {
-                if !this.node_has_agent {
+                // Embedded, the host owns the conversation it opens.
+                if this.embedded {
                     cx.propagate();
                     return;
                 }
@@ -1847,6 +1920,8 @@ impl Render for ObligationsView {
             .on_action(cx.listener(Self::on_end))
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_2()
                     .px_3()
@@ -1859,9 +1934,25 @@ impl Render for ObligationsView {
                             .gap_0p5()
                             .min_w_0()
                             .flex_1()
-                            .child(div().text_sm().font_semibold().child("Obligations"))
                             .child(
-                                div().text_xs().text_color(muted).overflow_hidden().child(
+                                div()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child("Obligations"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(
                                     crate::ui::selectable_text::selectable_text(
                                         "obligations-title",
                                         self.title.clone(),
@@ -1874,7 +1965,10 @@ impl Render for ObligationsView {
                     )
                     .child({
                         let mut search =
-                            Input::new(&self.search_input).cleanable(true).w(px(220.));
+                            Input::new(&self.search_input)
+                            .cleanable(true)
+                            .w(px(220.))
+                            .flex_shrink_0();
                         if let Some(pill) = render_shortcut_pill(
                             window,
                             &ObligationsFocusSearch,
@@ -1885,42 +1979,8 @@ impl Render for ObligationsView {
                         }
                         search
                     })
-                    .when(pre_v3_count > 0, |row| {
-                        row.child(
-                            Button::new("obligations-rewrite-pre-v3")
-                                .label(format!("Rewrite pre-v3 ({pre_v3_count})"))
-                                .ghost()
-                                .compact()
-                                .tooltip("Have the drafter rewrite obligations written before drafting v3")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(node_id) = this.node_id {
-                                        cx.emit(ObligationsEvent::RewritePreV3 { node_id });
-                                    }
-                                })),
-                        )
-                    })
-                    .when(self.node_has_agent, |row| {
-                        row.child(
-                            div()
-                                .relative()
-                                .child(chrome_control_with_shortcut_in_context(
-                                    Button::new("obligations-agent-chat")
-                                        .icon(IconName::Bot)
-                                        .label("Chat")
-                                        .outline()
-                                        .compact()
-                                        .tooltip("Chat with an agent about these obligations")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_agent_chat(window, cx);
-                                        })),
-                                    window,
-                                    &OpenAgentChat,
-                                    None,
-                                    cx,
-                                )),
-                        )
-                    })
-                    .child(chrome_control_with_shortcut(
+                    .when(!embedded, |row| {
+                        row.child(chrome_control_with_shortcut(
                         Button::new("obligations-close")
                             .label("Close")
                             .ghost()
@@ -1932,7 +1992,8 @@ impl Render for ObligationsView {
                         &ObligationsClose,
                         OBLIGATIONS_CONTEXT,
                         cx,
-                    )),
+                    ))
+                    }),
             )
             .child({
                 let row_count = self.delegate.rows().len();
@@ -1977,8 +2038,199 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Del deletes · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J chats · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Del deletes · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J talks about it · Esc closes"),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::rows::fixture::Fixture;
+    use gpui::{TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Events = Rc<RefCell<Vec<ObligationsEvent>>>;
+
+    fn open_view<'a>(
+        fixture: &Fixture,
+        embedded: bool,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<ObligationsView>, Events, &'a mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let slot = Rc::new(RefCell::new(None));
+        let events: Events = Rc::new(RefCell::new(Vec::new()));
+        let (store, node_id) = (fixture.store.clone(), fixture.node_id);
+        let (slot_in, events_in) = (slot.clone(), events.clone());
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| ObligationsView::new(window, cx, store));
+            cx.subscribe(&view, move |_, _, event: &ObligationsEvent, _| {
+                events_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+            view.update(cx, |view, cx| {
+                view.set_embedded(embedded, cx);
+                view.open(node_id, "Web client", None, window, cx);
+            });
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        draw(cx);
+        (view, events, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    fn selected_obligation(
+        view: &Entity<ObligationsView>,
+        cx: &mut VisualTestContext,
+    ) -> Option<Uuid> {
+        view.read_with(cx, |view, _| view.selected_obligation_id())
+    }
+
+    #[gpui::test]
+    fn obligations_highlight_item_expands_and_selects_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        let target = fixture.offline_obligation;
+        view.update_in(cx, |view, window, cx| {
+            view.phase_collapsed
+                .insert(phase_row_key(PHASE_REQUIREMENTS));
+            view.kind_collapsed
+                .insert(group_row_key(PHASE_REQUIREMENTS, KIND_REQUIREMENT));
+            view.section_collapsed.insert(section_row_key(
+                PHASE_REQUIREMENTS,
+                KIND_REQUIREMENT,
+                "Offline",
+            ));
+            view.search_input.update(cx, |input, cx| {
+                input.set_value("nothing matches this", window, cx);
+            });
+            view.sync_search_from_input(window, cx);
+            assert!(
+                view.delegate
+                    .rows()
+                    .iter()
+                    .all(|row| row.key() != target.to_string())
+            );
+            view.highlight_item(target, window, cx);
+        });
+        assert_eq!(selected_obligation(&view, cx), Some(target));
+        view.read_with(cx, |view, cx| {
+            assert!(view.search_query.is_empty());
+            assert!(view.search_input.read(cx).text().to_string().is_empty());
+        });
+
+        // Items on another node are ignored.
+        view.update_in(cx, |view, window, cx| {
+            view.highlight_item(Uuid::new_v4(), window, cx);
+        });
+        assert_eq!(selected_obligation(&view, cx), Some(target));
+    }
+
+    #[gpui::test]
+    fn obligations_change_markers_render(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.highlight_item(fixture.design_obligation, window, cx);
+            view.set_change_markers(
+                HashMap::from([
+                    (fixture.offline_obligation, NetOp::Edited),
+                    (fixture.design_obligation, NetOp::Added),
+                ]),
+                cx,
+            );
+        });
+        draw(cx);
+        assert_eq!(
+            selected_obligation(&view, cx),
+            Some(fixture.design_obligation)
+        );
+    }
+
+    #[gpui::test]
+    fn obligations_embedded_hands_escape_and_left_to_the_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, true, cx);
+        cx.dispatch_action(ObligationsClose);
+        cx.dispatch_action(PaneFocusLeft);
+        assert!(view.read_with(cx, |view, _| view.is_open()));
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn obligations_standalone_closes_and_returns_to_the_tree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, false, cx);
+        cx.dispatch_action(PaneFocusLeft);
+        cx.dispatch_action(ObligationsClose);
+        assert!(!view.read_with(cx, |view, _| view.is_open()));
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [ObligationsEvent::FocusTaskList, ObligationsEvent::Close]
+        ));
+    }
+
+    #[gpui::test]
+    fn obligations_ctrl_j_opens_the_selection_without_an_agent_capability(cx: &mut TestAppContext) {
+        // The fixture node has no Agent capability: Ctrl+J is not gated on it.
+        let fixture = Fixture::new();
+        let (view, events, cx) = open_view(&fixture, false, cx);
+        let target = fixture.offline_obligation;
+        view.update_in(cx, |view, window, cx| {
+            view.highlight_item(target, window, cx)
+        });
+        draw(cx);
+        let selected = selected_obligation(&view, cx);
+        assert_eq!(selected, Some(target));
+        cx.dispatch_action(OpenAgentChat);
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [ObligationsEvent::OpenAgentChat { node_id, obligation_id }]
+                if *node_id == fixture.node_id && *obligation_id == selected
+        ));
+    }
+
+    #[gpui::test]
+    fn obligations_embedded_leaves_ctrl_j_to_the_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (_, events, cx) = open_view(&fixture, true, cx);
+        cx.dispatch_action(OpenAgentChat);
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn obligations_row_click_selects_through_the_row_host(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, false, cx);
+        // The row a click would report: the first obligation, which is not
+        // the one selected on open.
+        let (host, target_ix, target) = view.read_with(cx, |view, _| {
+            let (ix, id) = view
+                .delegate
+                .rows()
+                .iter()
+                .enumerate()
+                .find_map(|(ix, row)| match row {
+                    ObligationRow::Item { obligation } => Some((ix, obligation.id)),
+                    _ => None,
+                })
+                .unwrap();
+            (view.host.clone(), ix, id)
+        });
+        assert_ne!(selected_obligation(&view, cx), Some(target));
+        // Row handlers run outside any entity update, with only `&mut App`.
+        cx.update(|_, cx| host.push(ListAction::Select { row_ix: target_ix }, cx));
+        draw(cx);
+        assert_eq!(selected_obligation(&view, cx), Some(target));
     }
 }

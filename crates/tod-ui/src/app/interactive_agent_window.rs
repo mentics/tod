@@ -12,11 +12,11 @@ use gpui_component::Root;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tod_agent::{SharedEngagementRegistry, shared_engagement_registry};
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::terminal::open_terminal_agent_for_node;
 use tod_store::fleet::writer::FleetMutation;
 use tod_store::{AgentLaunchOptions, AgentRole};
-use tod_agent::{SharedEngagementRegistry, shared_engagement_registry};
 
 #[derive(Debug, Clone)]
 pub struct InteractiveAgentOpenParams {

@@ -12,6 +12,7 @@
 use crate::gate::PlanStepWithLinks;
 use crate::node_context::{obligation_line, plan_step_line};
 use std::path::Path;
+use tod_store::conversation::Focus;
 use tod_store::outline::NodeObligation;
 use uuid::Uuid;
 
@@ -51,6 +52,25 @@ pub struct ObligationSelection {
     pub visual_design_path: Option<String>,
 }
 
+/// What a conversation is about, loaded for [`DynamicBlock::Focus`]. The
+/// block renders whatever is here; it does not know who assembled it.
+#[derive(Debug, Clone)]
+pub struct FocusSelection {
+    pub focus: Focus,
+    /// Titles of the nodes above the focused item, root first. For an
+    /// obligation or plan step this ends with the node it lives on.
+    pub path: Vec<String>,
+    /// A node's title; an obligation's or plan step's short label.
+    pub title: String,
+    /// The focused node's slug, or the slug of the node an item lives on.
+    pub slug: Option<String>,
+    /// An obligation's or plan step's full text.
+    pub text: Option<String>,
+    /// Listings under the focus, each with its heading: a node's obligations
+    /// and plan steps, or the project's top-level nodes. Lines carry ids.
+    pub sections: Vec<(String, Vec<String>)>,
+}
+
 /// One section of the dynamic block. A surface lists the ones it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicBlock {
@@ -77,6 +97,9 @@ pub enum DynamicBlock {
     Plan,
     /// Repo, branch, working directory, and task notes.
     Workspace,
+    /// What a conversation is about: its kind, path, title, and (by kind) its
+    /// full text, its obligations and plan steps, or the top-level nodes.
+    Focus,
 }
 
 /// Everything any block might need. A surface fills in what its blocks use and
@@ -93,6 +116,7 @@ pub struct DynamicContext<'a> {
     pub ancestor_context: &'a str,
     pub plan_steps: &'a [PlanStepWithLinks],
     pub workspace: Option<&'a Workspace>,
+    pub focus: Option<&'a FocusSelection>,
 }
 
 /// Render `blocks`, in order, under a single `# Current context` heading.
@@ -226,6 +250,55 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
             }
         }
 
+        DynamicBlock::Focus => {
+            let Some(focus) = ctx.focus else { return };
+            let kind = match focus.focus {
+                Focus::Project => "the whole project",
+                Focus::Node(_) => "node",
+                Focus::Obligation { .. } => "obligation",
+                Focus::PlanStep { .. } => "plan step",
+            };
+            out.push_str("\n## Focus\n\n");
+            out.push_str(
+                "What this conversation is about. It is a starting point, not a \
+                 boundary.\n\n",
+            );
+            out.push_str(&format!("- **Kind:** {kind}\n"));
+            if let Some(id) = focus.focus.focus_id() {
+                out.push_str(&format!("- **Id:** `{id}`\n"));
+            }
+            if let Some(node) = focus
+                .focus
+                .node_id()
+                .filter(|n| Some(*n) != focus.focus.focus_id())
+            {
+                out.push_str(&format!("- **Node id:** `{node}`\n"));
+            }
+            if !focus.path.is_empty() {
+                out.push_str(&format!("- **Path:** {}\n", focus.path.join(" › ")));
+            }
+            out.push_str(&format!("- **Title:** {}\n", focus.title.trim()));
+            if let Some(slug) = focus.slug.as_deref().filter(|s| !s.trim().is_empty()) {
+                out.push_str(&format!("- **Slug:** `{}`\n", slug.trim()));
+            }
+            if let Some(text) = focus.text.as_deref().map(str::trim) {
+                out.push_str("\n**Text:**\n\n");
+                out.push_str(text);
+                out.push('\n');
+            }
+            for (heading, lines) in &focus.sections {
+                out.push_str(&format!("\n### {heading}\n\n"));
+                if lines.is_empty() {
+                    out.push_str("(none)\n");
+                }
+                for line in lines {
+                    out.push_str("- ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+
         DynamicBlock::Workspace => {
             let Some(workspace) = ctx.workspace else { return };
             out.push_str("\n## Workspace\n\n");
@@ -295,9 +368,59 @@ mod tests {
     }
 
     #[test]
+    fn focus_renders_kind_path_title_text_and_listings() {
+        let step = Uuid::from_u128(9);
+        let node = Uuid::from_u128(3);
+        let focus = FocusSelection {
+            focus: Focus::PlanStep { node, id: step },
+            path: vec!["Root".into(), "Auth".into()],
+            title: "Plan step 00000000".into(),
+            slug: Some("auth".into()),
+            text: Some("Hash passwords with argon2.".into()),
+            sections: Vec::new(),
+        };
+        let ctx = DynamicContext {
+            focus: Some(&focus),
+            ..Default::default()
+        };
+        let text = render(&[DynamicBlock::Focus], &ctx);
+        assert!(text.contains("**Kind:** plan step"), "{text}");
+        assert!(text.contains(&step.to_string()));
+        assert!(text.contains(&node.to_string()));
+        assert!(text.contains("Root › Auth"));
+        assert!(text.contains("Hash passwords with argon2."));
+
+        let project = FocusSelection {
+            focus: Focus::Project,
+            path: Vec::new(),
+            title: "The whole project".into(),
+            slug: None,
+            text: None,
+            sections: vec![("Top-level nodes".into(), vec!["`id` Auth".into()])],
+        };
+        let text = render(
+            &[DynamicBlock::Focus],
+            &DynamicContext {
+                focus: Some(&project),
+                ..Default::default()
+            },
+        );
+        assert!(text.contains("**Kind:** the whole project"), "{text}");
+        assert!(!text.contains("**Id:**"), "{text}");
+        assert!(
+            text.contains("### Top-level nodes\n\n- `id` Auth"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn a_block_whose_data_is_absent_renders_nothing() {
         let text = render(
-            &[DynamicBlock::DataRoot, DynamicBlock::PurposeChain],
+            &[
+                DynamicBlock::DataRoot,
+                DynamicBlock::PurposeChain,
+                DynamicBlock::Focus,
+            ],
             &DynamicContext::default(),
         );
         assert_eq!(text, "# Current context\n\n");

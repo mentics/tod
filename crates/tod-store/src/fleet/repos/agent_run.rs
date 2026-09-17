@@ -65,8 +65,7 @@ impl AgentRun {
     }
 }
 
-const RUN_SELECT: &str =
-    "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
+const RUN_SELECT: &str = "SELECT id, node_id, run_number, runtime_status, started_at, ended_at,
                     reconnect_pid, reconnect_birth_token, run_kind, session_name, agent_session_id,
                     platform, model, effort, location, cached_transcript, transcript_fingerprint";
 
@@ -413,10 +412,19 @@ mod tests {
         let (dir, conn) = test_writer_conn();
         let node_id = seed_node(&conn);
         let repo = AgentRunRepo::new(&conn);
-        let first = repo.create_run(&node_id, RUNTIME_STATUS_ACTIVE, "auto").unwrap();
-        let launch = AgentLaunchOptions::from_settings(AgentPlatform::Cursor, "composer-2.5", "high");
+        let first = repo
+            .create_run(&node_id, RUNTIME_STATUS_ACTIVE, "auto")
+            .unwrap();
+        let launch =
+            AgentLaunchOptions::from_settings(AgentPlatform::Cursor, "composer-2.5", "high");
         let second = repo
-            .create_named_run(&node_id, RUNTIME_STATUS_ACTIVE, "interactive", Some("chat"), Some(&launch))
+            .create_named_run(
+                &node_id,
+                RUNTIME_STATUS_ACTIVE,
+                "interactive",
+                Some("chat"),
+                Some(&launch),
+            )
             .unwrap();
         assert_eq!(first, format!("{node_id}-run-1"));
         assert_eq!(second, format!("{node_id}-run-2"));
@@ -424,7 +432,13 @@ mod tests {
         let run = repo.get(&second).unwrap().unwrap();
         assert_eq!(run.node_id, node_id);
         assert_eq!(run.launch_options(), Some(launch));
-        assert!(repo.get(&first).unwrap().unwrap().launch_options().is_none());
+        assert!(
+            repo.get(&first)
+                .unwrap()
+                .unwrap()
+                .launch_options()
+                .is_none()
+        );
 
         assert_eq!(repo.list_live_for_node(&node_id).unwrap().len(), 2);
         repo.end_run(&first).unwrap();

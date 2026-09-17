@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`tod` is a desktop task/agent management application built with **GPUI** (GPU-accelerated UI, Rust) and **gpui-component**. It manages "obligations", an interview-style workflow for turning conversation into tasks, and a "fleet" of coding agents (Claude, Cursor) working in worktrees.
+`tod` is a desktop task/agent management application built with **GPUI** (GPU-accelerated UI, Rust) and **gpui-component**. It manages "obligations", a conversation view where the user directs an agent that edits the outline (with every change reversible), an interview-style workflow for turning conversation into tasks, and a "fleet" of coding agents (Claude, Cursor) working in worktrees.
 
 ## Commands
 
@@ -58,9 +58,9 @@ The dependency direction is deliberate: **policy depends on transport, never the
 reverse.**
 
 - `crates/tod` — thin launcher binary. Owns `build.rs` (which installs the `process/` and `media/` bundles next to the executable) and little else.
-- `crates/tod-ui` — all GPUI code: views, app shell, input/focus primitives, interview views, and the dev-only agent control socket.
+- `crates/tod-ui` — all GPUI code: views, app shell, input/focus primitives, the conversation view, interview views, and the dev-only agent control socket.
 - `crates/tod-cli` — the `tod-cli` binary that agents shell out to. Depends on `tod-core` + `tod-store` only (no GPUI, no agent transport) so it starts fast.
-- `crates/tod-core` — policy and orchestration shared by the UI and the CLI: interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
+- `crates/tod-core` — policy and orchestration shared by the UI and the CLI: conversation and interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
 - `crates/tod-agent` — agent transport: the provider interface and its implementations across platforms (Cursor, Claude, mock) and environments. **A leaf crate with no `tod-*` dependencies by design** — it knows how to hold conversations and sessions, and nothing about paths, settings, process docs, or persistence. It is told what to say and reports back.
 - `crates/tod-store` — durable persistence. SQLite-backed (`rusqlite`) storage for **fleet** (agents/tasks/worktrees) and **outline** (task tree) data, plus credentials (OS keyring + `chacha20poly1305` encryption), settings, paths, and Linear API integration. Depends on `tod-agent` for the agent types it persists (`AgentPlatform`, `AgentLaunchOptions`).
 - `crates/nov-viz` — a separate visualization crate (layout/nav/keyboard model), not part of the main app binary path.
@@ -87,18 +87,43 @@ Bundled agent docs resolve separately via `TodInstallPaths` (`TOD_PROCESS_ROOT` 
 
 ### Agent chat context
 
-A chat icon appears in the upper-right of a context panel when the node has the
-Agent capability, and opens an agent conversation scoped to that panel. Sessions
-are **not** reused — every click starts a fresh one.
+**Ctrl+J** opens the conversation view (`crates/tod-ui/src/conversation/`) from
+anywhere, focused on the selection. `crates/tod-ui/src/ui/agent_chat.rs` owns the
+app-wide `OpenAgentChat` action (bound with no key context) and the
+`OpenConversation { focus }` action the shell handles. A view that knows its
+selection handles `OpenAgentChat` with `on_action` and dispatches
+`OpenConversation`, propagating when it has nothing to offer; the shell root is
+the fallback (the task tree's selection, else the whole project). The badge sits
+in the title bar (`render_shortcut_pill_in_context(.., &OpenAgentChat, None, ..)`).
+`proposed` and `design` nodes open the same view from the lifecycle panel, and
+the app nav's "Conversation" opens it on the project.
 
-**Ctrl+J** opens an agent chat everywhere. `crates/tod-ui/src/ui/agent_chat.rs`
-owns the app-wide `OpenAgentChat` action (bound with no key context); any surface
-that offers a chat handles it with `on_action`, propagating when it can't open one,
-and shows the badge via `chrome_control_with_shortcut_in_context(.., &OpenAgentChat, None, ..)`.
+Every conversation has a **focus** (project, node, obligation, or plan step) and
+the view lists only that focus's conversations. Ctrl+J opens the focus's most
+recent one, or an empty one that is saved on its first send; new conversations
+start only from the picker (Ctrl+N). The view always says **reverse**, never
+"undo" — reversal is built from the conversation's own action log, not the
+Ctrl+Z history. See the conversation section below and
+`doc/conversation/spec.md`.
 
-The context is assembled by `tod_core::agent_context` and held until the user
-submits their first message — nothing reaches the agent before then. A chat
-window holds one long-lived agent session (`AgentProvider::send_session_turn`):
+A conversation holds **one agent session at a time**, keyed
+`conversation-<id>`, with its resume id stored on the conversation row
+(`conversations.agent_session_id`, not `agent_runs`). The first message sends
+the opening context and the message as one turn; every later message sends only
+the *delta* (the user's own edits and reversals since the previous turn, and
+items changed elsewhere) plus the message. When the session outgrows
+`context_budget_tokens`, or can no longer be resumed, the driver rotates to a fresh session seeded with a snapshot, and
+the transcript shows a "Started a fresh agent session" marker. **Reply rule:**
+the agent never describes what it changed — the user sees the change set — so
+an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
+states this, and that the agent acts without confirming because everything is
+reversible.
+
+Other agent chats (the `A` key's agent chat and the visual-design chat) still use
+`InteractiveAgentWindow`. Their context is assembled by `tod_core::agent_context`
+and held until the user submits their first message — nothing reaches the agent
+before then. A chat window holds one long-lived agent session
+(`AgentProvider::send_session_turn`):
 the first message opens it — the context and the message go out together as one
 turn, and the session is given its name (for Claude, a `custom-title` record
 written once that first turn has created the session log; Cursor names its own
@@ -107,7 +132,7 @@ The provider keeps the agent process alive between messages; when the window
 closes or the process idles out, the next message resumes the recorded
 agent-side session id (`agent_runs.agent_session_id`) instead of replaying
 history. Session names come from `tod_core::session_name` (surface, task title,
-start time). The context is:
+start time) for both kinds. For every surface, the context is:
 
 1. **Static fragments** from `crates/tod/media/context/`, named by an explicit
    ordered list — there is **no** implicit ancestor chain. Fragments are
@@ -168,6 +193,31 @@ that need it. Three sets of tests hold this together:
 - `context_recipes::tests::process_docs_do_not_carry_their_own_command_tables`
   keeps it out of `assets/process/` too. Those role docs may still say *which*
   noun applies in prose; they must not restate how to call it.
+
+### `tod-core::conversation` / `tod-store::conversation` — the conversation view's agent and log
+
+`tod_store::conversation` (schema v34+) holds `conversations`, their transcript
+`conversation_turns` (`user` / `agent` / `error` / `rotation`), the
+`conversation_actions` each made, and per-conversation `conversation_flags` (the
+unsure flag belongs to the change set, not the item). An agent writing as
+`TOD_INTERVIEW_ACTOR=conversation:<uuid>` goes through the ordinary
+`InterviewCommand::Outline` path; `record_and_execute` records each node,
+obligation, and plan-step mutation with its before/after state **in the same
+transaction** (only inside `run_interview`, never the batched flush).
+`net_changes` projects the change set (net per item, never by turn; created then
+deleted is hidden), `reverse_actions` applies inverse mutations and reports
+conflicts and dependents for confirmation, and user edits from the view go
+through `ConversationEdit`. Content and lifecycle mutations are not recorded.
+
+`tod_core::conversation` runs it: `driver.rs` (`ConversationDriver`: send, tick,
+resume, rotation), `context.rs` (opening message, per-turn delta, rotation
+snapshot, the `Focus` block's loader), and `mock.rs`, which plays the agent for
+`--agent mock` with one directive per line (`add obligation <slug>: <text>`,
+`add plan …`, `add node …`, `rename <id>: …`, `delete <id>`,
+`move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>`). The agent reads
+its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
+(schema v35); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
+stay only for the interview.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 

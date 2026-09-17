@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use crate::interview::TodPaths;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
+use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
 use crate::ui::list::{
@@ -1121,7 +1122,8 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Capture in `proposed`, drafting in `design`, the interview in `planning`.
+        // The shell opens `proposed` / `design` nodes in the conversation view
+        // before it gets here; this path is the interview's (`planning`).
         let label = tod_core::process::spec_view_label(lifecycle).unwrap_or("Interview");
         if interview_phase_for_lifecycle(lifecycle).is_none() {
             self.show_error(
@@ -1209,6 +1211,12 @@ impl TaskListView {
         self.focus_handle.focus(window, cx);
     }
 
+    /// Select `task_id` in the tree, if its row is visible (a row under a
+    /// collapsed ancestor or filtered out by search is left unselected).
+    pub fn reveal_node(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_task_by_id(task_id, window, cx);
+    }
+
     fn select_task_by_id(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let visible = Self::visible_tasks(&self.all_tasks, &self.search_query, &self.working_set);
         if let Some(row) = visible.iter().position(|t| t.id == task_id) {
@@ -1289,6 +1297,32 @@ impl TaskListView {
     pub fn request_live_refresh(&mut self, cx: &mut Context<Self>) {
         self.pending_live_refresh = true;
         cx.notify();
+    }
+
+    /// The selected node, when a saved (not draft) row is selected.
+    pub fn selected_node_id(&self) -> Option<uuid::Uuid> {
+        let id = self.working_set.selected_id.as_deref()?;
+        if self.is_draft_id(id) {
+            return None;
+        }
+        uuid::Uuid::parse_str(id).ok()
+    }
+
+    /// Ctrl+J: the conversation about the selected node, or about the whole
+    /// project when nothing is selected.
+    fn on_open_agent_chat(
+        &mut self,
+        _: &OpenAgentChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self
+            .selected_node_id()
+            .map_or(tod_store::conversation::Focus::Project, |id| {
+                tod_store::conversation::Focus::Node(id)
+            });
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(OpenConversation { focus }), cx);
     }
 
     fn selected_task(&self, cx: &Context<Self>) -> Option<TaskItem> {
@@ -2594,6 +2628,7 @@ impl Render for TaskListView {
             .size_full()
             .relative()
             .on_action(cx.listener(Self::on_focus_drawer))
+            .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))

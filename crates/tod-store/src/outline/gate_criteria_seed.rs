@@ -25,11 +25,11 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         id_str: "a1000001-0001-4001-8001-00000000000c",
         from_state: "design",
         to_state: "planning",
-        slug: crate::drafting::BUILDABLE_CRITERION_SLUG,
-        label: "Buildable: no choice is open, and a competent implementer given the context, obligations, referenced nodes, mockups, and codebase would build it correctly?",
+        slug: crate::outline::BUILDABLE_CRITERION_SLUG,
+        label: "Buildable: would a competent implementer given the context, obligations, referenced nodes, mockups, and codebase build it correctly?",
         sort_order: 0,
     },
-    // Superseded by `buildable` (drafting v3); deactivated in `seed_gate_criteria`.
+    // Superseded by `buildable`; deactivated in `seed_gate_criteria`.
     GateCriterionSeed {
         id_str: "a1000001-0001-4001-8001-000000000001",
         from_state: "design",
@@ -353,11 +353,11 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
         "UPDATE gate_criteria SET active = 0, updated_at = ?1 WHERE slug = 'planning-ready.human-lookover' AND active = 1",
         params![now],
     )?;
-    // Drafting v3: design → planning requires `buildable` only.
+    // design → planning requires `buildable` only.
     conn.execute(
         "UPDATE gate_criteria SET active = 0, updated_at = ?1
          WHERE from_state = 'design' AND to_state = 'planning' AND slug != ?2 AND active = 1",
-        params![now, crate::drafting::BUILDABLE_CRITERION_SLUG],
+        params![now, crate::outline::BUILDABLE_CRITERION_SLUG],
     )?;
     Ok(())
 }
