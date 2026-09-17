@@ -142,6 +142,33 @@ impl<'a> TaskRepo<'a> {
         Ok(())
     }
 
+    /// A node's notes, oldest first. Unlike [`Self::get`], this does not require
+    /// the node to have the Agent capability.
+    pub fn notes(&self, node_id: Uuid) -> Result<Vec<NoteItem>, TaskRepoError> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT notes FROM node_fields WHERE node_id = ?1",
+                params![uuid_to_blob(node_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(parse_notes(raw.flatten()))
+    }
+
+    /// Append one note to a node's list. Read and write happen together on the
+    /// writer, so a concurrent append is never lost.
+    pub fn append_note(&self, node_id: Uuid, text: &str) -> Result<NoteItem, TaskRepoError> {
+        if NodeRepo::new(self.conn).get(node_id)?.is_none() {
+            return Err(TaskRepoError::Other(anyhow::anyhow!("node not found")));
+        }
+        let mut notes = self.notes(node_id)?;
+        let note = NoteItem::new(text);
+        notes.push(note.clone());
+        self.update_notes(&node_id.to_string(), &notes)?;
+        Ok(note)
+    }
+
     pub fn update_lifecycle(&self, id: &str, lifecycle: &str) -> Result<(), TaskRepoError> {
         let node_id = Self::parse_node_id(id)?;
         let now = now_ms();
