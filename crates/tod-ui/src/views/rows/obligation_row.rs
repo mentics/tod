@@ -56,6 +56,8 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
     let key = id.to_string();
     let group = row_group(&key);
     let compact = opts.compact;
+    // One line, truncated; a wrapped compact row shows all of its text.
+    let one_line_text = compact && !opts.wrap;
     let hoverable = opts.hoverable();
     let muted = cx.theme().muted_foreground;
     let divider = muted.opacity(0.5);
@@ -75,8 +77,10 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             select_host.push(ObligationRowEvent::Select { row_ix }.into(), cx);
         });
-    row = if compact {
+    row = if one_line_text {
         style::row(row).items_center()
+    } else if compact {
+        style::row_wrapped(row).items_start()
     } else {
         let row = row
             .items_start()
@@ -121,7 +125,7 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
     } else {
         let body = if is_empty {
             "(new obligation)".to_string()
-        } else if compact {
+        } else if one_line_text {
             one_line(&obligation.body)
         } else {
             obligation.body.clone()
@@ -137,7 +141,7 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
         .text_color(text_color)
         .w_full()
         .min_w_0();
-        let text = if compact {
+        let text = if one_line_text {
             text.whitespace_nowrap().text_ellipsis().overflow_hidden()
         } else {
             text.whitespace_normal()
@@ -146,7 +150,7 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
             div()
                 .flex_1()
                 .min_w_0()
-                .when(compact, |el| el.overflow_hidden())
+                .when(one_line_text, |el| el.overflow_hidden())
                 .when(opts.struck, |el| el.line_through())
                 .when(highlighted, |el| {
                     el.on_mouse_down(MouseButton::Left, move |event, _, cx| {

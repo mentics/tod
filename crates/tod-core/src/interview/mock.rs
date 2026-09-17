@@ -7,7 +7,7 @@ use crate::interview::client::InterviewClient;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tod_agent::{MockInterviewTurn, SessionPurpose, set_mock_interview_handler};
+use tod_agent::{MockInterviewTurn, MockReply, SessionPurpose, set_mock_interview_handler};
 use tod_store::interview::*;
 use uuid::Uuid;
 
@@ -20,11 +20,15 @@ pub fn install_mock_interview_handler(data_root: PathBuf) {
     }));
 }
 
-fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
+fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> {
     // A conversation's actor is `conversation:<uuid>`, not a session id.
     if turn.purpose == SessionPurpose::Conversation {
         return crate::conversation::mock::handle_turn(data_root, turn);
     }
+    interview_turn(data_root, turn).map(MockReply::from)
+}
+
+fn interview_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
     let actor = turn
         .env
         .iter()

@@ -13,19 +13,25 @@
 //! move <id> under <node-slug>
 //! flag <id>: <reason>
 //! ask <text>
+//! think <text>
 //! ```
 //!
 //! `<id>` is a node slug or UUID, or an obligation or plan-step id (full or
 //! 8-character prefix). The reply is empty, except that `ask` echoes its text
 //! and a line the mock cannot carry out gets a one-line note, each note its
 //! own markdown paragraph.
+//!
+//! Like a real agent, the mock also reports the reply's parts
+//! ([`MockReply::parts`]): when there is work, a note that it is working, a
+//! thought for each `think`, and a tool call for each carried-out directive;
+//! then the reply.
 
 use crate::interview::client::InterviewClient;
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::path::Path;
-use tod_agent::MockInterviewTurn;
+use tod_agent::{MockInterviewTurn, MockReply, ReplyPart};
 use tod_store::conversation::{Entity, actor_conversation};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_ENV, InterviewCommand, InterviewRepo, PHASE_REQUIREMENTS};
@@ -82,7 +88,7 @@ impl Access for Direct<'_> {
 }
 
 /// Play one conversation turn for the registered mock handler.
-pub fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String> {
+pub fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> {
     let actor = turn
         .env
         .iter()
@@ -95,7 +101,7 @@ pub fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<String>
 
 /// Carry out the directives in the user's message (the last prompt block)
 /// and return the agent's reply.
-pub fn reply(client: &impl Access, blocks: &[String]) -> Result<String> {
+pub fn reply(client: &impl Access, blocks: &[String]) -> Result<MockReply> {
     let conversation = actor_conversation(client.actor())
         .context("mock conversation actor is not `conversation:<uuid>`")?;
     let last = blocks.last().map(String::as_str).unwrap_or_default();
@@ -104,16 +110,45 @@ pub fn reply(client: &impl Access, blocks: &[String]) -> Result<String> {
         None => last,
     };
     let mut notes = Vec::new();
-    for line in message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+    let mut parts = Vec::new();
+    let lines = message.lines().map(str::trim).filter(|l| !l.is_empty());
+    for (ix, line) in lines.enumerate() {
+        if let Some(thought) = line.strip_prefix("think ") {
+            parts.push(ReplyPart::Thought {
+                text: thought.trim().to_string(),
+            });
+            continue;
+        }
+        let tool = |status: &str| ReplyPart::Tool {
+            id: format!("mock-{ix}"),
+            title: format!("tod-cli: {line}"),
+            status: status.into(),
+        };
         match directive(client, conversation, line) {
             Ok(Some(text)) => notes.push(text),
-            Ok(None) => {}
-            Err(err) => notes.push(format!("Mock: could not do `{line}`: {err:#}")),
+            Ok(None) => parts.push(tool("completed")),
+            Err(err) => {
+                parts.push(tool("failed"));
+                notes.push(format!("Mock: could not do `{line}`: {err:#}"));
+            }
         }
     }
     // The transcript renders replies as markdown, where single newlines run
     // together: give each note its own paragraph.
-    Ok(notes.join("\n\n"))
+    let text = notes.join("\n\n");
+    if !parts.is_empty() {
+        let narration = ReplyPart::Text {
+            text: "Working through the message.".into(),
+        };
+        parts.insert(0, narration);
+    }
+    if !text.is_empty() {
+        parts.push(ReplyPart::Text { text: text.clone() });
+    }
+    Ok(MockReply {
+        text,
+        parts: Some(parts),
+    })
 }
 
 /// Carry out one line. `Ok(Some(text))` is something to say.

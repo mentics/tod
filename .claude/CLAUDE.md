@@ -214,7 +214,8 @@ resume, rotation), `context.rs` (opening message, per-turn delta, rotation
 snapshot, the `Focus` block's loader), and `mock.rs`, which plays the agent for
 `--agent mock` with one directive per line (`add obligation <slug>: <text>`,
 `add plan …`, `add node …`, `rename <id>: …`, `delete <id>`,
-`move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>`). The agent reads
+`move <id> under <slug>`, `flag <id>: <reason>`, `ask <text>`, and
+`think <text>`, which adds a thinking step to the reply). The agent reads
 its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
 (schema v37); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
 stay only for the interview.

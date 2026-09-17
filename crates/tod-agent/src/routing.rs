@@ -110,6 +110,12 @@ impl AgentProvider for RoutingAgentProvider {
             .or_else(|| self.claude.session_context_chars(key))
     }
 
+    fn session_reply_parts(&self, key: &str) -> Option<Vec<crate::ReplyPart>> {
+        self.cursor
+            .session_reply_parts(key)
+            .or_else(|| self.claude.session_reply_parts(key))
+    }
+
     fn close_session(&mut self, key: &str) {
         self.cursor.close_session(key);
         self.claude.close_session(key);

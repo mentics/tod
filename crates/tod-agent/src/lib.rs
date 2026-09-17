@@ -12,6 +12,7 @@ mod cursor_acp;
 mod mock;
 pub mod platform;
 mod provider;
+mod reply;
 mod routing;
 pub mod run_state;
 pub mod util;
@@ -29,12 +30,14 @@ use agent_traffic::SharedAgentTrafficLog;
 #[allow(unused_imports)]
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::{
-    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, set_mock_interview_handler,
+    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply,
+    set_mock_interview_handler,
 };
 pub use provider::{
     AgentProvider, AgentRunHandle, AgentRunState, PermissionOption, PermissionRequest, RunId,
     SessionOpening, SessionPurpose, SessionTurn,
 };
+pub use reply::ReplyPart;
 pub use routing::RoutingAgentProvider;
 
 use std::sync::{Arc, Mutex};

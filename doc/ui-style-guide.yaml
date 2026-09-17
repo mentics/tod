@@ -148,6 +148,9 @@ styles:
     overflow: truncate-end
     hover: hover-row
     highlighted: highlighted
+  row-wrapped:
+    extends: row
+    overflow: wrap
   field:
     radius: control
     hover: hover-row
@@ -160,6 +163,30 @@ styles:
     extends: row
     hover: hover-menu
     highlighted: hover-menu
+
+  # Chunks: a block of content under a header that expands and collapses
+  chunk:
+    border: divider
+    radius: control
+  chunk-header:
+    font: dense
+    radius: control
+    padding-x: related
+    padding-y: inline
+    gap: inline
+    overflow: truncate-end
+    icon: icon-set
+    hover: hover-row
+    highlighted: highlighted
+  chunk-label:
+    extends: text-dense-muted
+    text-case: sentence
+    text-end: no-period
+  chunk-body:
+    padding-x: related
+    padding-bottom: related
+  chunk-children:
+    padding-left: section
 
   # Overlays and notices
   toast:
@@ -235,6 +262,8 @@ properties:
   padding: space token, all sides
   padding-x: space token
   padding-y: space token
+  padding-left: space token
+  padding-bottom: space token
   gap: space token
   height: size token
   min-width: size token

@@ -52,11 +52,16 @@ pub fn node_row<A: From<NodeRowEvent> + 'static>(
     let key = node_id.to_string();
     let group = row_group(&key);
 
+    let wrap = opts.wrap;
     let select_host = host.clone();
-    let mut row = style::row(h_flex())
+    let row = if wrap {
+        style::row_wrapped(h_flex()).items_start()
+    } else {
+        style::row(h_flex()).items_center()
+    };
+    let mut row = row
         .w_full()
         .flex_shrink_0()
-        .items_center()
         .group(group.clone())
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -79,22 +84,24 @@ pub fn node_row<A: From<NodeRowEvent> + 'static>(
         );
     } else {
         let edit_host = host.clone();
-        let text = selectable_text(
-            ("node-title", row_ix),
-            SharedString::from(one_line(title)),
-            window,
-            cx,
-        )
-        .w_full()
-        .min_w_0()
-        .whitespace_nowrap()
-        .text_ellipsis()
-        .overflow_hidden();
+        let text = if wrap {
+            title.to_string()
+        } else {
+            one_line(title)
+        };
+        let text = selectable_text(("node-title", row_ix), SharedString::from(text), window, cx)
+            .w_full()
+            .min_w_0();
+        let text = if wrap {
+            text.whitespace_normal()
+        } else {
+            text.whitespace_nowrap().text_ellipsis().overflow_hidden()
+        };
         row = row.child(
             div()
                 .flex_1()
                 .min_w_0()
-                .overflow_hidden()
+                .when(!wrap, |el| el.overflow_hidden())
                 .when(opts.struck, |el| el.line_through())
                 .when(highlighted, |el| {
                     el.on_mouse_down(MouseButton::Left, move |event, _, cx| {

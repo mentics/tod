@@ -14,7 +14,9 @@ gpui_kit_assets::icon_assets!(
         MessagesSquare,
         FlagOff,
         Layers,
-        ListChecks
+        ListChecks,
+        Brain,
+        Wrench
     ]
 );
 

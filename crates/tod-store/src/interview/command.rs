@@ -150,6 +150,9 @@ pub enum InterviewCommand {
         role: crate::conversation::TurnRole,
         #[serde(default)]
         body: String,
+        /// An agent reply's streamed parts, when the provider reported them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<crate::conversation::ReplyPart>,
     },
     /// Record the provider session the conversation continues (`None` clears
     /// it, so the next message starts a fresh one).
@@ -706,12 +709,13 @@ pub fn execute(
             conversation_id,
             role,
             body,
+            parts,
         } => {
             let repo = crate::conversation::ConversationRepo::new(conn);
             if repo.get(*conversation_id)?.is_none() {
                 bail!("conversation {conversation_id} not found");
             }
-            let turn = repo.append_turn(*conversation_id, *role, body)?;
+            let turn = repo.append_turn_with_parts(*conversation_id, *role, body, parts)?;
             Ok(json!({ "seq": turn.seq }))
         }
         InterviewCommand::SetConversationSession {

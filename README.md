@@ -161,7 +161,7 @@ change set (everything the conversation changed, net per item) on the right:
 | Ctrl+J | Talk about the highlighted item (refocus) |
 | Alt+Left | Back to the previous focus (or the view you came from) |
 | Ctrl+N | New conversation about the same focus (the picker lists the others) |
-| Ctrl+. | Toggle the context panel (the item in its obligations or plan list) |
+| Ctrl+I | Toggle the context panel (the item in its obligations or plan list) |
 | G | With the context panel open: show that node in Tasks |
 | Right (on a change) | Move into the change's reference links; Enter opens one |
 

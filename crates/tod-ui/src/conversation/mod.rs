@@ -8,9 +8,10 @@
 //! follows the change-set cursor ([`ConversationView::set_cursor`]).
 //!
 //! Keyboard: one focus handle for the whole view, and [`Pane`] says which
-//! pane Up/Down act on. The transcript pane's stops are [`Stop`]s; the change
-//! set's are its rows. Text fields follow the navigation/edit-mode
-//! convention (`ui::key_context`).
+//! pane Up/Down act on. The transcript pane's stops are [`Stop`]s, the last of
+//! which hands Up/Down to the transcript panel's own stops; the change set's
+//! are its rows. Text fields follow the navigation/edit-mode convention
+//! (`ui::key_context`).
 
 mod change_set;
 mod context_panel;
@@ -26,6 +27,7 @@ pub use keyboard::register_conversation_keyboard_bindings;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context::set_input_tab_stop;
@@ -38,8 +40,8 @@ use context_panel::{ContextPanel, ContextTab};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, Task, Window,
-    div, px,
+    IntoElement, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, Subscription,
+    Task, Window, div, px,
 };
 use gpui_component::input::TextareaState;
 use gpui_component::resizable::{h_resizable, resizable_panel};
@@ -92,9 +94,9 @@ pub(crate) enum Pane {
 pub(crate) enum Stop {
     Back,
     Picker,
-    Input,
-    /// Stop the turn in flight (only while one runs).
-    Stop,
+    /// The transcript panel, whose own highlight (a chunk, the input, or
+    /// Stop) Up/Down move.
+    Transcript,
 }
 
 /// Where Back returns to.
@@ -129,6 +131,8 @@ pub(crate) enum ChangeAction {
     /// Clicked the row for `changes[ix]`.
     Select(usize),
     Toggle(ChangeKey),
+    /// Show all of the row, or back to one line.
+    Expand(ChangeKey),
     Edit(ChangeKey),
     Reverse(ChangeKey),
     ClearFlag(ChangeKey),
@@ -222,8 +226,11 @@ pub struct ConversationView {
 
     pane: Pane,
     stop: Stop,
-    input: Entity<TextareaState>,
+    transcript: Entity<AgentConversationPanel>,
+    /// Whether the transcript's input is being written in; mirrors the
+    /// panel, so navigation can check it without the app.
     input_editing: bool,
+    _transcript_events: Subscription,
     /// The highlighted picker entry while the picker is open. The last entry
     /// (`conversations.len()`) is "New conversation".
     picker: Option<usize>,
@@ -242,9 +249,6 @@ pub struct ConversationView {
     change_scroll: ScrollHandle,
     /// Scroll the cursor's row into view on the next render.
     scroll_to_cursor: bool,
-    transcript_scroll: ScrollHandle,
-    /// Turns shown last render; more means scroll to the newest.
-    rendered_turns: usize,
     context: ContextPanel,
 
     error: Option<SharedString>,
@@ -262,11 +266,7 @@ impl ConversationView {
         agent: SharedAgent,
         fleet: Arc<FleetStore>,
     ) -> Self {
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(4)
-                .placeholder("Give direction — Enter to write, Ctrl+Enter to send")
-        });
+        let (transcript, transcript_events) = Self::new_transcript(window, cx);
         let edit_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(2)
@@ -317,9 +317,10 @@ impl ConversationView {
             status: ConversationStatus::default(),
             data: Snapshot::default(),
             pane: Pane::Transcript,
-            stop: Stop::Input,
-            input,
+            stop: Stop::Transcript,
+            transcript,
             input_editing: false,
+            _transcript_events: transcript_events,
             picker: None,
             tab: Tab::All,
             cursor: None,
@@ -331,8 +332,6 @@ impl ConversationView {
             confirm: None,
             change_scroll: ScrollHandle::new(),
             scroll_to_cursor: false,
-            transcript_scroll: ScrollHandle::new(),
-            rendered_turns: 0,
             context,
             error: None,
             status_line: SharedString::default(),
@@ -374,7 +373,9 @@ impl ConversationView {
             .map(|c| c.id);
         self.show(focus, latest, record, cx);
         self.pane = Pane::Transcript;
-        self.stop = Stop::Input;
+        self.stop = Stop::Transcript;
+        self.transcript
+            .update(cx, |panel, cx| panel.set_highlight(PanelStop::Input, cx));
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -410,7 +411,7 @@ impl ConversationView {
             self.error = None;
             self.status_line = SharedString::default();
             self.tab = Tab::All;
-            self.rendered_turns = 0;
+            self.transcript.update(cx, |panel, cx| panel.reset(cx));
         }
         self.reload();
         self.status = self
@@ -696,23 +697,24 @@ impl ConversationView {
 
     fn enter_input_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pane = Pane::Transcript;
-        self.stop = Stop::Input;
+        self.stop = Stop::Transcript;
         self.input_editing = true;
         self.picker = None;
+        self.transcript
+            .update(cx, |panel, cx| panel.start_editing(window, cx));
         cx.notify();
-        cx.on_next_frame(window, |this, window, cx| {
-            this.input.update(cx, |input, cx| input.focus(window, cx));
-        });
     }
 
     fn exit_input_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.input_editing = false;
+        self.transcript
+            .update(cx, |panel, cx| panel.stop_editing(window, cx));
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_string();
+    fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -735,8 +737,8 @@ impl ConversationView {
                 self.error = None;
                 self.conversation_id = self.drivers[ix].conversation_id();
                 self.status = self.drivers[ix].status();
-                self.input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.transcript
+                    .update(cx, |panel, cx| panel.clear_input(window, cx));
             }
             Err(err) => self.error = Some(err.into()),
         }
@@ -762,11 +764,7 @@ impl ConversationView {
 
     /// The transcript pane's stops, top to bottom.
     pub(crate) fn stops(&self) -> Vec<Stop> {
-        let mut stops = vec![Stop::Back, Stop::Picker, Stop::Input];
-        if self.status.running {
-            stops.push(Stop::Stop);
-        }
-        stops
+        vec![Stop::Back, Stop::Picker, Stop::Transcript]
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -781,9 +779,25 @@ impl ConversationView {
         }
         match self.pane {
             Pane::Transcript => {
+                if self.stop == Stop::Transcript {
+                    let moved = self
+                        .transcript
+                        .update(cx, |panel, cx| panel.move_highlight(delta, cx));
+                    if moved || delta > 0 {
+                        return;
+                    }
+                }
                 let stops = self.stops();
                 let ix = stops.iter().position(|s| *s == self.stop).unwrap_or(0) as isize;
                 let ix = (ix + delta).clamp(0, stops.len() as isize - 1) as usize;
+                if stops[ix] == Stop::Transcript && self.stop != Stop::Transcript {
+                    // Entering the panel from above lands on its first stop.
+                    self.transcript.update(cx, |panel, cx| {
+                        if let Some(first) = panel.stops().first().copied() {
+                            panel.set_highlight(first, cx);
+                        }
+                    });
+                }
                 self.stop = stops[ix];
                 cx.notify();
             }
@@ -817,8 +831,14 @@ impl ConversationView {
             Pane::Transcript => match self.stop {
                 Stop::Back => self.go_back(window, cx),
                 Stop::Picker => self.open_picker(cx),
-                Stop::Input => self.enter_input_edit(window, cx),
-                Stop::Stop => self.stop_turn(cx),
+                Stop::Transcript => {
+                    if self.transcript.read(cx).highlight() == PanelStop::Input {
+                        self.enter_input_edit(window, cx);
+                    } else {
+                        self.transcript
+                            .update(cx, |panel, cx| panel.activate(window, cx));
+                    }
+                }
             },
             Pane::Context => {}
             Pane::ChangeSet => {
@@ -826,13 +846,17 @@ impl ConversationView {
                     return;
                 }
                 if let Some(key) = self.cursor {
-                    if !self.expanded.remove(&key) {
-                        self.expanded.insert(key);
-                    }
-                    cx.notify();
+                    self.toggle_expanded(key, cx);
                 }
             }
         }
+    }
+
+    fn toggle_expanded(&mut self, key: ChangeKey, cx: &mut Context<Self>) {
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+        cx.notify();
     }
 
     fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -860,7 +884,7 @@ impl ConversationView {
         if self.editing.is_some() {
             self.save_edit(window, cx);
         } else if self.input_editing {
-            self.send(window, cx);
+            self.transcript.update(cx, |panel, cx| panel.submit(cx));
         }
     }
 
@@ -951,6 +975,7 @@ impl ConversationView {
                     }
                 }
                 ChangeAction::Toggle(key) => self.toggle_selected(key, cx),
+                ChangeAction::Expand(key) => self.toggle_expanded(key, cx),
                 ChangeAction::Edit(key) => {
                     self.set_cursor(Some(key), cx);
                     self.start_edit(window, cx);
@@ -1014,7 +1039,6 @@ impl Render for ConversationView {
             self.pane = Pane::ChangeSet;
         }
         self.sync_context(window, cx);
-        set_input_tab_stop(&self.input, self.input_editing, cx);
         set_input_tab_stop(&self.edit_input, self.editing.is_some(), cx);
 
         let root = div()
@@ -1038,12 +1062,9 @@ impl Render for ConversationView {
                 this.cancel_edit(window, cx);
                 this.new_conversation(window, cx)
             }))
+            // Works from anywhere in the view, text fields included.
             .on_action(
                 cx.listener(|this, _: &ConversationToggleContext, window, cx| {
-                    if this.text_editing() {
-                        cx.propagate();
-                        return;
-                    }
                     this.toggle_context(window, cx);
                 }),
             )
