@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 33;
+pub const CURRENT_USER_VERSION: i32 = 34;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -256,6 +256,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v32_to_v33(conn)?;
         conn.pragma_update(None, "user_version", 33)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 34 {
+        migrate_v33_to_v34(conn)?;
+        conn.pragma_update(None, "user_version", 34)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -299,6 +304,14 @@ fn migrate_v29_to_v30(conn: &Connection) -> Result<()> {
         UPDATE agent_runs SET location = 'terminal' WHERE run_kind = 'terminal';
         ",
     )?;
+    Ok(())
+}
+
+/// Drop `global_obligations`: every obligation lives on a node in the outline.
+/// The table only ever held copies of the repo's shared constraint docs,
+/// written by the `doc/process` bootstrap import.
+fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DROP TABLE IF EXISTS global_obligations;")?;
     Ok(())
 }
 
@@ -2620,6 +2633,23 @@ mod tests {
             .unwrap();
         assert_eq!(title, "A Node");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrate_v33_to_v34_drops_global_obligations() {
+        let (_dir, conn) = temp_db();
+        conn.execute_batch(
+            "CREATE TABLE global_obligations (id BLOB PRIMARY KEY, body TEXT);
+             INSERT INTO global_obligations VALUES (x'00', 'Follow a doc');",
+        )
+        .unwrap();
+        migrate_v33_to_v34(&conn).unwrap();
+        let exists = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'global_obligations'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!exists);
     }
 
     #[test]

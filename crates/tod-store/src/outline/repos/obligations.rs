@@ -1,6 +1,5 @@
 //! Obligations repository.
 
-use crate::interview::PHASE_UNKNOWN;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -307,29 +306,6 @@ impl<'a> ObligationRepo<'a> {
             }
         }
         Ok(out)
-    }
-
-    pub fn list_global_adopted(&self) -> Result<Vec<NodeObligation>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, slug, kind, ordinal, body FROM global_obligations
-             WHERE adopted = 1 ORDER BY slug, kind, ordinal",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                let id_blob: Vec<u8> = row.get(0)?;
-                Ok(NodeObligation {
-                    id: blob_to_uuid_sql(&id_blob)?,
-                    node_id: Uuid::nil(),
-                    kind: row.get(2)?,
-                    ordinal: row.get(3)?,
-                    section: Some(row.get::<_, String>(1)?),
-                    body: row.get(4)?,
-                    phase: PHASE_UNKNOWN.to_string(),
-                    visual_design_path: None,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
     }
 
     fn rewrite_ordinals(&self, node_id: Uuid, kind: &str) -> Result<()> {

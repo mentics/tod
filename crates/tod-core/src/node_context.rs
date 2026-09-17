@@ -191,15 +191,14 @@ pub fn obligation_line(o: &NodeObligation) -> String {
     )
 }
 
-/// Renders `node_id`'s ancestor (and global) obligations. Each ancestor
+/// Renders `node_id`'s ancestor obligations. Each ancestor
 /// contributes its title, its generated summary (`EXTRA_CONTENT_SUMMARY`),
 /// and its constraint-kind obligations in full. Its requirements are never
 /// listed: the summary stands in for them, and a deep tree would otherwise
 /// put hundreds into every context. The drafting driver writes missing
 /// summaries before a turn (`crate::drafting::summary`); anywhere else, an
-/// ancestor still without one gets a pointer to `tod-cli` instead. Global
-/// (no owning node) obligations always show in full; there is nothing to
-/// summarize about them. This never includes `node_id`'s own obligations —
+/// ancestor still without one gets a pointer to `tod-cli` instead. This never
+/// includes `node_id`'s own obligations —
 /// callers show those separately, in full.
 pub fn render_inherited_context(
     conn: &Connection,
@@ -240,13 +239,6 @@ pub fn render_inherited_context(
 
     for source_id in order {
         let items = groups.remove(&source_id).unwrap_or_default();
-        if source_id.is_nil() {
-            out.push_str("\n### Global\n");
-            for o in &items {
-                writeln!(out, "- {}", obligation_line(o))?;
-            }
-            continue;
-        }
         let title = node_title(nodes, source_id);
         writeln!(out, "\n### From \"{title}\"")?;
         let summary = nodes

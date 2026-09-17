@@ -32,8 +32,7 @@ pub fn phase_visible(phase: &str, max_phase: &str) -> bool {
     }
 }
 
-/// Resolve the obligations visible to `node_id`: global-adopted obligations,
-/// then every ancestor's (root → leaf, inclusive) obligations that carry the
+/// Resolve the obligations visible to `node_id`: every ancestor's (root → leaf, inclusive) obligations that carry the
 /// `Spec` capability. When `max_phase` is `Some`, only obligations at or
 /// before that phase (plus any still-`unknown`-phase ones) are included —
 /// pass `None` to see everything regardless of phase, as the UI does.
@@ -47,13 +46,6 @@ pub fn resolve_obligations(
         .context("node not in outline")?;
 
     let mut out = Vec::new();
-    let global = ObligationRepo::new(conn).list_global_adopted()?;
-    for g in global {
-        out.push(ResolvedObligation {
-            obligation: g,
-            source_node_id: Uuid::nil(),
-        });
-    }
 
     let ancestors = ancestor_chain(conn, node_id)?;
     let node_repo = NodeRepo::new(conn);

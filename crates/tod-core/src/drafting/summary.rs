@@ -38,7 +38,6 @@ pub fn missing(conn: &Connection, node_id: Uuid, max_phase: Option<&str>) -> Res
     for item in resolve_obligations(conn, node_id, max_phase)? {
         let source = item.source_node_id;
         if source == node_id
-            || source.is_nil()
             || item.obligation.kind == KIND_CONSTRAINT
             || out.contains(&source)
         {

@@ -16,7 +16,7 @@ You write one **node**'s spec: its requirements and constraints. The user steers
 
 ## What you are given
 
-- **Your first turn** carries these docs and a **snapshot**: the node, its purpose from the root down, its goal, its obligations (each marked `user` or `agent` with attention), inherited context (global obligations, then per ancestor its summary and constraints), open choices, and buildable.
+- **Your first turn** carries these docs and a **snapshot**: the node, its purpose from the root down, its goal, its obligations (each marked `user` or `agent` with attention), inherited context (per ancestor, its summary and constraints), open choices, and buildable.
 - **Every later turn** carries only **what changed** since your previous turn (your own changes are left out), then the turn: new dumps, resolved choices, or a request.
 
 Your context is current: **don't re-read with `tod-cli` what you were given.** If something you change was modified by someone else meanwhile, `tod-cli` refuses the write and prints the current version; decide again with that. A session can be replaced between turns: anything worth keeping must be in obligations, the goal, or a choice.

@@ -53,6 +53,117 @@ fn create_node_requires_title_and_slugs_it() {
 }
 
 #[test]
+fn obligation_text_cannot_reference_files() {
+    use crate::outline::KIND_CONSTRAINT;
+
+    let root = std::env::temp_dir().join(format!("tod-obl-files-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(OutlineMutation::CreateList {
+            slug: "files".into(),
+            title: "Files".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    let node_id = Uuid::new_v4();
+    for mutation in [
+        OutlineMutation::CreateNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Spec node".into(),
+        },
+        OutlineMutation::EnableCapabilities {
+            node_id,
+            capabilities: vec![Capability::Spec],
+        },
+    ] {
+        store.enqueue_outline(mutation).unwrap();
+        store.writer().flush().unwrap();
+    }
+
+    let create = |body: &str| {
+        let id = Uuid::new_v4();
+        let result = store
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: Some(id),
+                node_id,
+                kind: KIND_CONSTRAINT.into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: body.into(),
+                phase: crate::interview::PHASE_DESIGN.into(),
+            })
+            .and_then(|_| store.writer().flush());
+        (id, result)
+    };
+
+    let (_, linked) = create(
+        "Row control activation — Follow [`doc/process/shared/constraints/row-control-activation-constraints.md`](../../shared/constraints/row-control-activation-constraints.md).",
+    );
+    assert!(linked.is_err(), "a file link must not become an obligation");
+
+    let (kept, result) = create("Row controls activate on Enter and on click.");
+    result.unwrap();
+    let edited = store
+        .enqueue_outline(OutlineMutation::UpdateObligationBody {
+            obligation_id: kept,
+            body: "Row controls activate as described in doc/row-controls.md.".into(),
+        })
+        .and_then(|_| store.writer().flush());
+    assert!(edited.is_err(), "an edit must not add a file reference");
+
+    store.reload_if_stale().ok();
+    let bodies: Vec<String> = store
+        .read(|conn| {
+            let mut stmt = conn.prepare("SELECT body FROM node_obligations")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(bodies, vec!["Row controls activate on Enter and on click.".to_string()]);
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn import_skips_obligations_that_link_to_files() {
+    let repo = std::env::temp_dir().join(format!("tod-import-links-{}", Uuid::new_v4()));
+    let task = repo.join("doc/process/projects/demo/tasks/one");
+    fs::create_dir_all(&task).unwrap();
+    fs::write(repo.join("doc/process/projects/demo/user.md"), "# Demo\n").unwrap();
+    fs::write(task.join("state.md"), "- State: design\n").unwrap();
+    fs::write(
+        task.join("user.md"),
+        "# One\n\n## Constraints\n\n\
+         1. Stays fast.\n\n\
+         2. Row control activation — Follow [`doc/process/shared/constraints/row-control-activation-constraints.md`](../../../../shared/constraints/row-control-activation-constraints.md).\n",
+    )
+    .unwrap();
+    let data = repo.join("data");
+    fs::create_dir_all(&data).unwrap();
+    let store = FleetStore::open(&data).unwrap();
+    store.import_doc_process(&repo).unwrap();
+    store.reload_if_stale().ok();
+    let bodies: Vec<String> = store
+        .read(|conn| {
+            let mut stmt = conn.prepare("SELECT body FROM node_obligations")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap();
+    assert_eq!(bodies, vec!["Stays fast.".to_string()]);
+    drop(store);
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
 fn import_from_git_repo_while_data_root_is_sandboxed() {
     let git_root = std::env::current_dir().unwrap();
     if !git_root.join("doc").join("process").is_dir() {

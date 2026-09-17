@@ -72,17 +72,6 @@ CREATE TABLE IF NOT EXISTS node_obligations (
 );
 CREATE INDEX IF NOT EXISTS idx_obligations_node ON node_obligations(node_id, kind, ordinal);
 
-CREATE TABLE IF NOT EXISTS global_obligations (
-    id          BLOB PRIMARY KEY NOT NULL,
-    slug        TEXT NOT NULL UNIQUE,
-    title       TEXT NOT NULL,
-    kind        TEXT NOT NULL CHECK (kind IN ('requirement', 'constraint')),
-    ordinal     INTEGER NOT NULL,
-    body        TEXT NOT NULL,
-    adopted     INTEGER NOT NULL DEFAULT 1,
-    UNIQUE (slug, kind, ordinal)
-);
-
 CREATE TABLE IF NOT EXISTS node_extra_content (
     id           BLOB PRIMARY KEY NOT NULL,
     node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,

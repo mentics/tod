@@ -153,16 +153,12 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 .into_iter()
                 .map(|r| {
                     let source = (r.source_node_id != node).then(|| {
-                        if r.source_node_id.is_nil() {
-                            "global".to_string()
-                        } else {
-                            nodes
-                                .get(r.source_node_id)
-                                .ok()
-                                .flatten()
-                                .map(|n| n.title)
-                                .unwrap_or_default()
-                        }
+                        nodes
+                            .get(r.source_node_id)
+                            .ok()
+                            .flatten()
+                            .map(|n| n.title)
+                            .unwrap_or_default()
                     });
                     (r.obligation, source)
                 })
