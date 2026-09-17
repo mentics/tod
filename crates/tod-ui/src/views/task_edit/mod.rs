@@ -26,6 +26,7 @@ use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
 };
+use tod_core::generator::ConfigFieldType;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
@@ -52,6 +53,14 @@ fn input_text<M: InputModeKind>(input: &Entity<InputBaseState<M>>, cx: &App) -> 
     input.read(cx).text().to_string()
 }
 
+fn any_input_text(input: &AnyInputState, cx: &App) -> String {
+    match input {
+        AnyInputState::Input(state) => input_text(state, cx),
+        AnyInputState::Textarea(state) => input_text(state, cx),
+        _ => String::new(),
+    }
+}
+
 fn field_anchor_id(field: TaskEditField) -> &'static str {
     match field {
         TaskEditField::Title => "task-edit-field-title",
@@ -74,6 +83,10 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::Capability(Capability::Lifecycle) => "task-edit-field-cap-lifecycle",
         TaskEditField::Capability(Capability::Generator) => "task-edit-field-cap-generator",
         TaskEditField::Capability(Capability::Tags) => "task-edit-field-cap-tags",
+        TaskEditField::GeneratorSource => "task-edit-field-gen-source",
+        TaskEditField::GeneratorField(_) => "task-edit-field-gen-field",
+        TaskEditField::GeneratorSave => "task-edit-field-gen-save",
+        TaskEditField::GeneratorRefresh => "task-edit-field-gen-refresh",
     }
 }
 
@@ -108,10 +121,24 @@ enum TaskEditField {
     UseWorktree,
     /// Files capability "Set up worktree" / "Release worktree" button.
     WorktreeAction,
+    /// Generator capability: pick the data source (only until one is saved).
+    GeneratorSource,
+    /// One field of the generator's configuration form, by index into
+    /// `generator_fields`. Text kinds edit like any other input; Boolean and
+    /// Select kinds cycle on Enter / click instead.
+    GeneratorField(usize),
+    /// Generator "Save configuration" button — configuration is never saved
+    /// on blur, only from here.
+    GeneratorSave,
+    /// Generator "Refresh now" button.
+    GeneratorRefresh,
     Capability(Capability),
 }
 
 impl TaskEditField {
+    /// Whether entering this stop puts the view into text-edit mode. Generator
+    /// fields only ever set `editing` for their text kinds, so reporting the
+    /// whole variant as text is accurate for every state it is consulted in.
     fn is_text(self) -> bool {
         !matches!(
             self,
@@ -121,6 +148,9 @@ impl TaskEditField {
                 | Self::AgentEffort
                 | Self::UseWorktree
                 | Self::WorktreeAction
+                | Self::GeneratorSource
+                | Self::GeneratorSave
+                | Self::GeneratorRefresh
                 | Self::Capability(_)
         )
     }
@@ -136,6 +166,31 @@ pub enum TaskEditEvent {
         task_id: String,
         title: String,
     },
+}
+
+/// One row of the generator configuration form, built from the selected data
+/// source's [`tod_core::generator::ConfigSchema`]. The user fills these in
+/// rather than writing the config JSON by hand; the JSON is assembled from
+/// them on save.
+struct GeneratorConfigField {
+    schema: tod_core::generator::ConfigField,
+    /// Backing state for the `Text` / `TextArea` kinds; `None` for the rest.
+    input: Option<AnyInputState>,
+    /// Current value of a `Boolean` field.
+    toggle: bool,
+    /// Current value of a `Select` field.
+    choice: Option<String>,
+}
+
+impl GeneratorConfigField {
+    /// Trimmed contents of a `Text` / `TextArea` field; empty for the kinds
+    /// that have no input.
+    fn text_value(&self, cx: &App) -> String {
+        self.input
+            .as_ref()
+            .map(|input| any_input_text(input, cx).trim().to_string())
+            .unwrap_or_default()
+    }
 }
 
 struct PendingLinearApply {
@@ -187,9 +242,19 @@ pub struct TaskEditView {
     body_scroll_handle: ScrollHandle,
     scroll_anchor: ScrollAnchor,
     linear_fetch_generation: u64,
+    linear_busy: bool,
     pending_linear_ticket: Option<String>,
     pending_linear_apply: Option<PendingLinearApply>,
-    generator_config_input: Entity<TextareaState>,
+    generator_fields: Vec<GeneratorConfigField>,
+    /// Keys in the stored config that the schema does not describe, kept so a
+    /// save through the form never silently drops them.
+    generator_extra_config: serde_json::Map<String, serde_json::Value>,
+    /// The config as last persisted, in the same shape the form produces, so
+    /// "unsaved changes" is an exact comparison.
+    generator_saved_config: Option<serde_json::Value>,
+    generator_invalid_fields: HashSet<usize>,
+    /// Label of the background save/refresh in flight, if any.
+    generator_busy: Option<String>,
     generator_data_source_type: Option<String>,
     generator_pending_source_type: Option<String>,
     generator_last_status: Option<String>,
@@ -211,7 +276,6 @@ pub struct TaskEditView {
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
     _note_edit_subscription: Subscription,
-    _generator_config_subscription: Subscription,
 }
 
 impl TaskEditView {
@@ -241,11 +305,6 @@ impl TaskEditView {
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
-        let generator_config_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .rows(6)
-                .placeholder("Enter to edit · Configuration JSON…")
-        });
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -313,13 +372,6 @@ impl TaskEditView {
                 this.commit_tag_draft(cx);
             }
         });
-        let _generator_config_subscription =
-            cx.subscribe(&generator_config_input, |this, _, event, cx| {
-                if matches!(event, InputEvent::Blur) {
-                    this.save_generator_config(cx);
-                }
-            });
-
         Self {
             fleet,
             paths,
@@ -333,7 +385,11 @@ impl TaskEditView {
             details_input,
             tag_draft_input,
             note_edit_input,
-            generator_config_input,
+            generator_fields: Vec::new(),
+            generator_extra_config: serde_json::Map::new(),
+            generator_saved_config: None,
+            generator_invalid_fields: HashSet::new(),
+            generator_busy: None,
             generator_data_source_type: None,
             generator_pending_source_type: None,
             generator_last_status: None,
@@ -373,6 +429,7 @@ impl TaskEditView {
             body_scroll_handle,
             scroll_anchor,
             linear_fetch_generation: 0,
+            linear_busy: false,
             pending_linear_ticket: None,
             pending_linear_apply: None,
             _title_subscription,
@@ -383,7 +440,6 @@ impl TaskEditView {
             _details_subscription,
             _tag_draft_subscription,
             _note_edit_subscription,
-            _generator_config_subscription,
         }
     }
 
@@ -474,6 +530,20 @@ impl TaskEditView {
         if self.capability_enabled(Capability::Spec) {
             stops.push(TaskEditField::Obligations);
         }
+        if self.capability_enabled(Capability::Generator) {
+            if self.generator_data_source_type.is_none() {
+                stops.push(TaskEditField::GeneratorSource);
+            }
+            if self.generator_source_key().is_some() {
+                stops.extend(
+                    (0..self.generator_fields.len()).map(TaskEditField::GeneratorField),
+                );
+                stops.push(TaskEditField::GeneratorSave);
+            }
+            if self.generator_data_source_type.is_some() {
+                stops.push(TaskEditField::GeneratorRefresh);
+            }
+        }
         for cap in Capability::ALL {
             stops.push(TaskEditField::Capability(cap));
         }
@@ -537,6 +607,12 @@ impl TaskEditView {
 
     fn input_for_field(&self, field: TaskEditField) -> Option<AnyInputState> {
         Some(match field {
+            TaskEditField::GeneratorField(index) => {
+                return self
+                    .generator_fields
+                    .get(index)
+                    .and_then(|field| field.input.clone());
+            }
             TaskEditField::Title => self.title_input.clone().into(),
             TaskEditField::LinearLink => self.linear_input.clone().into(),
             TaskEditField::GithubPr => self.github_pr_input.clone().into(),
@@ -550,8 +626,31 @@ impl TaskEditView {
             | TaskEditField::AgentEffort
             | TaskEditField::UseWorktree
             | TaskEditField::WorktreeAction
+            | TaskEditField::GeneratorSource
+            | TaskEditField::GeneratorSave
+            | TaskEditField::GeneratorRefresh
             | TaskEditField::Capability(_) => return None,
         })
+    }
+
+    /// Every input that is also a navigation stop, including the generator
+    /// form's, which vary with the selected data source.
+    fn nav_inputs(&self) -> Vec<(TaskEditField, AnyInputState)> {
+        let mut inputs: Vec<(TaskEditField, AnyInputState)> = vec![
+            (TaskEditField::Title, self.title_input.clone().into()),
+            (TaskEditField::LinearLink, self.linear_input.clone().into()),
+            (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
+            (TaskEditField::Tags, self.tag_draft_input.clone().into()),
+            (TaskEditField::Repo, self.repo_input.clone().into()),
+            (TaskEditField::Branch, self.branch_input.clone().into()),
+            (TaskEditField::Details, self.details_input.clone().into()),
+        ];
+        for (index, field) in self.generator_fields.iter().enumerate() {
+            if let Some(input) = field.input.clone() {
+                inputs.push((TaskEditField::GeneratorField(index), input));
+            }
+        }
+        inputs
     }
 
     fn enter_field_edit(
@@ -564,9 +663,29 @@ impl TaskEditView {
         if let Some(index) = self.field_stops().iter().position(|stop| *stop == field) {
             self.focus_index = index;
         }
+        // Non-text generator fields (Boolean / Select) act on activation
+        // instead of entering edit mode.
+        if let TaskEditField::GeneratorField(index) = field
+            && !self.generator_field_is_text(index)
+        {
+            self.cycle_generator_field(index, cx);
+            return;
+        }
         match field {
             TaskEditField::Obligations => {
                 self.open_obligations(cx);
+                return;
+            }
+            TaskEditField::GeneratorSource => {
+                self.cycle_generator_source(window, cx);
+                return;
+            }
+            TaskEditField::GeneratorSave => {
+                self.save_generator_config(cx);
+                return;
+            }
+            TaskEditField::GeneratorRefresh => {
+                self.refresh_generator_now(cx);
                 return;
             }
             TaskEditField::Capability(cap) => {
@@ -642,16 +761,7 @@ impl TaskEditView {
     }
 
     fn sync_input_tab_stops(&self, cx: &mut Context<Self>) {
-        let inputs: [(TaskEditField, AnyInputState); 7] = [
-            (TaskEditField::Title, self.title_input.clone().into()),
-            (TaskEditField::LinearLink, self.linear_input.clone().into()),
-            (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
-            (TaskEditField::Tags, self.tag_draft_input.clone().into()),
-            (TaskEditField::Repo, self.repo_input.clone().into()),
-            (TaskEditField::Branch, self.branch_input.clone().into()),
-            (TaskEditField::Details, self.details_input.clone().into()),
-        ];
-        for (field, input) in inputs {
+        for (field, input) in self.nav_inputs() {
             key_context::set_any_input_tab_stop(&input, self.field_editing(field), cx);
         }
     }
@@ -660,16 +770,7 @@ impl TaskEditView {
         if self.text_editing() {
             return;
         }
-        let inputs: [(TaskEditField, AnyInputState); 7] = [
-            (TaskEditField::Title, self.title_input.clone().into()),
-            (TaskEditField::LinearLink, self.linear_input.clone().into()),
-            (TaskEditField::GithubPr, self.github_pr_input.clone().into()),
-            (TaskEditField::Tags, self.tag_draft_input.clone().into()),
-            (TaskEditField::Repo, self.repo_input.clone().into()),
-            (TaskEditField::Branch, self.branch_input.clone().into()),
-            (TaskEditField::Details, self.details_input.clone().into()),
-        ];
-        for (field, input) in inputs {
+        for (field, input) in self.nav_inputs() {
             if input.focus_handle(cx).is_focused(window) {
                 if let Some(index) = self.field_stops().iter().position(|stop| *stop == field) {
                     self.focus_index = index;
@@ -778,6 +879,8 @@ impl TaskEditView {
         self.tags = task.tags.clone();
         self.capabilities = self.load_capabilities(&task_id).into_iter().collect();
         self.worktree_status = None;
+        // Any fetch still in flight was started for the node we just left.
+        self.linear_busy = false;
         self.load_action_capabilities();
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
@@ -1078,29 +1181,190 @@ impl TaskEditView {
         }
     }
 
+    fn generator_source_key(&self) -> Option<String> {
+        self.generator_data_source_type
+            .clone()
+            .or_else(|| self.generator_pending_source_type.clone())
+    }
+
+    fn generator_field_is_text(&self, index: usize) -> bool {
+        self.generator_fields.get(index).is_some_and(|field| {
+            matches!(
+                field.schema.field_type,
+                ConfigFieldType::Text | ConfigFieldType::TextArea
+            )
+        })
+    }
+
+    /// Build one input per field in `source_key`'s configuration schema,
+    /// seeded from `config`. Keys `config` carries that the schema does not
+    /// describe are set aside in `generator_extra_config` and merged back in
+    /// on save.
+    fn build_generator_fields(
+        &mut self,
+        source_key: &str,
+        config: &serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let schema = tod_core::generator::config_schema_for_type(source_key);
+        let stored = config.as_object().cloned().unwrap_or_default();
+        let mut described = HashSet::new();
+        let mut fields = Vec::new();
+
+        for schema_field in schema.map(|schema| schema.fields).unwrap_or_default() {
+            described.insert(schema_field.name.clone());
+            let stored_value = stored.get(&schema_field.name);
+            let placeholder = format!(
+                "Enter to edit · {}",
+                if schema_field.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            );
+            let (input, toggle, choice) = match &schema_field.field_type {
+                ConfigFieldType::Text => {
+                    let text = stored_value
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let state =
+                        cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.clone()));
+                    state.update(cx, |input, cx| input.set_value(text, window, cx));
+                    (Some(state.into()), false, None)
+                }
+                ConfigFieldType::TextArea => {
+                    let text = stored_value
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let state = cx.new(|cx| {
+                        TextareaState::new(window, cx)
+                            .rows(4)
+                            .placeholder(placeholder.clone())
+                    });
+                    state.update(cx, |input, cx| input.set_value(text, window, cx));
+                    (Some(state.into()), false, None)
+                }
+                ConfigFieldType::Boolean => (
+                    None,
+                    stored_value
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
+                    None,
+                ),
+                ConfigFieldType::Select { options } => {
+                    let choice = stored_value
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                        .filter(|value| options.contains(value))
+                        .or_else(|| {
+                            schema_field
+                                .required
+                                .then(|| options.first().cloned())
+                                .flatten()
+                        });
+                    (None, false, choice)
+                }
+            };
+            fields.push(GeneratorConfigField {
+                schema: schema_field,
+                input,
+                toggle,
+                choice,
+            });
+        }
+
+        self.generator_extra_config = stored
+            .into_iter()
+            .filter(|(key, _)| !described.contains(key))
+            .collect();
+        self.generator_fields = fields;
+        self.generator_invalid_fields.clear();
+    }
+
+    /// The config JSON the form currently describes.
+    fn generator_config_value(&self, cx: &App) -> serde_json::Value {
+        let mut map = self.generator_extra_config.clone();
+        for field in &self.generator_fields {
+            let name = field.schema.name.clone();
+            match &field.schema.field_type {
+                ConfigFieldType::Text | ConfigFieldType::TextArea => {
+                    let text = field.text_value(cx);
+                    // An untouched optional field is absent from the config,
+                    // not present and empty — data sources treat the two
+                    // differently.
+                    if text.is_empty() && !field.schema.required {
+                        map.remove(&name);
+                    } else {
+                        map.insert(name, serde_json::Value::String(text));
+                    }
+                }
+                ConfigFieldType::Boolean => {
+                    map.insert(name, serde_json::Value::Bool(field.toggle));
+                }
+                ConfigFieldType::Select { .. } => match &field.choice {
+                    Some(choice) => {
+                        map.insert(name, serde_json::Value::String(choice.clone()));
+                    }
+                    None => {
+                        map.remove(&name);
+                    }
+                },
+            }
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Whether the form differs from what is stored — drives the "unsaved
+    /// changes" hint and whether Save has anything to do.
+    fn generator_dirty(&self, cx: &App) -> bool {
+        match &self.generator_saved_config {
+            Some(saved) => *saved != self.generator_config_value(cx),
+            None => true,
+        }
+    }
+
     fn load_generator_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generator_pending_source_type = None;
         self.generator_config_error = None;
+        self.generator_busy = None;
         let config = self
             .node_uuid()
             .and_then(|node_id| self.fleet.get_generator_config(node_id).ok().flatten());
         match config {
             Some(config) => {
-                self.generator_data_source_type = Some(config.data_source_type);
+                let stored = serde_json::from_str(&config.config_json)
+                    .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+                self.generator_data_source_type = Some(config.data_source_type.clone());
                 self.generator_last_status = config.last_refresh_status;
                 self.generator_last_error = config.last_refresh_error;
-                self.generator_config_input.update(cx, |input, cx| {
-                    input.set_value(config.config_json, window, cx);
-                });
+                self.build_generator_fields(&config.data_source_type, &stored, window, cx);
+                // Compare against the form's own rendering of the stored
+                // config, so a round trip alone never reads as dirty.
+                self.generator_saved_config = Some(self.generator_config_value(cx));
             }
             None => {
                 self.generator_data_source_type = None;
                 self.generator_last_status = None;
                 self.generator_last_error = None;
-                self.generator_config_input.update(cx, |input, cx| {
-                    input.set_value("", window, cx);
-                });
+                self.generator_fields.clear();
+                self.generator_extra_config.clear();
+                self.generator_invalid_fields.clear();
+                self.generator_saved_config = None;
             }
+        }
+        self.clamp_focus_index();
+    }
+
+    fn reload_generator_status(&mut self) {
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        if let Ok(Some(config)) = self.fleet.get_generator_config(node_id) {
+            self.generator_last_status = config.last_refresh_status;
+            self.generator_last_error = config.last_refresh_error;
         }
     }
 
@@ -1110,58 +1374,189 @@ impl TaskEditView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.generator_data_source_type.is_some() {
+        if self.generator_data_source_type.is_some()
+            || self.generator_pending_source_type.as_deref() == Some(data_source_type.as_str())
+        {
             return;
         }
-        self.generator_pending_source_type = Some(data_source_type);
         self.generator_config_error = None;
-        self.generator_config_input.update(cx, |input, cx| {
-            input.set_value("{}", window, cx);
-        });
+        self.build_generator_fields(
+            &data_source_type,
+            &serde_json::Value::Object(serde_json::Map::new()),
+            window,
+            cx,
+        );
+        self.generator_pending_source_type = Some(data_source_type);
+        self.clamp_focus_index();
         cx.notify();
     }
 
+    /// Keyboard equivalent of clicking through the data-source buttons.
+    fn cycle_generator_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.generator_data_source_type.is_some() {
+            return;
+        }
+        let sources = tod_core::generator::available_data_sources();
+        let options: Vec<&str> = sources.iter().map(|(key, _, _)| *key).collect();
+        let next = cycle_option(self.generator_pending_source_type.as_deref(), &options)
+            .or_else(|| options.first().map(|key| (*key).to_string()));
+        let Some(next) = next else {
+            return;
+        };
+        self.generator_pending_source_type = None;
+        self.select_generator_data_source(next, window, cx);
+    }
+
+    fn cycle_generator_field(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(field) = self.generator_fields.get_mut(index) else {
+            return;
+        };
+        match field.schema.field_type.clone() {
+            ConfigFieldType::Boolean => field.toggle = !field.toggle,
+            ConfigFieldType::Select { options } => {
+                let choices: Vec<&str> = options.iter().map(String::as_str).collect();
+                let next = cycle_option(field.choice.as_deref(), &choices);
+                field.choice = match next {
+                    None if field.schema.required => options.first().cloned(),
+                    next => next,
+                };
+            }
+            ConfigFieldType::Text | ConfigFieldType::TextArea => return,
+        }
+        self.generator_invalid_fields.remove(&index);
+        cx.notify();
+    }
+
+    /// Persist the form. Validation runs here — on an explicit save — never on
+    /// blur, and the store write plus any initial refresh run on the
+    /// background executor so the UI stays responsive throughout.
     fn save_generator_config(&mut self, cx: &mut Context<Self>) {
+        if self.generator_busy.is_some() {
+            return;
+        }
         let Some(node_id) = self.node_uuid() else {
             return;
         };
-        let Some(data_source_type) = self
-            .generator_data_source_type
-            .clone()
-            .or_else(|| self.generator_pending_source_type.clone())
-        else {
+        let Some(data_source_type) = self.generator_source_key() else {
             return;
         };
-        let config_json = input_text(&self.generator_config_input, cx)
-            .trim()
-            .to_string();
-        let config_json = if config_json.is_empty() {
-            "{}".to_string()
-        } else {
-            config_json
-        };
-        match tod_core::generator::set_generator_config(
-            &self.fleet,
-            node_id,
-            &data_source_type,
-            &config_json,
-        ) {
-            Ok(()) => {
-                self.generator_config_error = None;
-                self.generator_data_source_type = Some(data_source_type);
-                self.generator_pending_source_type = None;
-                let _ = self.fleet.reload_if_stale();
-                if let Some(config) = self.fleet.get_generator_config(node_id).ok().flatten() {
-                    self.generator_last_status = config.last_refresh_status;
-                    self.generator_last_error = config.last_refresh_error;
-                }
-                self.notify_changed(cx);
-            }
-            Err(err) => {
-                self.generator_config_error = Some(err);
-                cx.notify();
-            }
+
+        let missing: HashSet<usize> = self
+            .generator_fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.schema.required && field.text_value(cx).is_empty())
+            .map(|(index, _)| index)
+            .collect();
+        if !missing.is_empty() {
+            let labels = self
+                .generator_fields
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| missing.contains(index))
+                .map(|(_, field)| field.schema.label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.generator_config_error = Some(format!("Fill in required fields: {labels}"));
+            self.generator_invalid_fields = missing;
+            cx.notify();
+            return;
         }
+
+        let config_json = self.generator_config_value(cx).to_string();
+        self.generator_invalid_fields.clear();
+        self.generator_config_error = None;
+        self.generator_busy = Some("Saving…".into());
+        cx.notify();
+
+        let fleet = self.fleet.clone();
+        let source_for_task = data_source_type.clone();
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = cx
+                .background_spawn(async move {
+                    let refresh_due = tod_core::generator::save_generator_config(
+                        &fleet,
+                        node_id,
+                        &source_for_task,
+                        &config_json,
+                    )?;
+                    if refresh_due {
+                        // The save already succeeded; a failed first refresh is
+                        // recorded on the generator's refresh status instead.
+                        let _ = tod_core::generator::refresh_generator(&fleet, node_id);
+                    }
+                    Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // The panel may have moved to another node while this ran; the
+                // store write still stands, but none of the view state below
+                // belongs to whatever is open now.
+                if this.node_uuid() != Some(node_id) {
+                    let _ = this.fleet.reload_if_stale();
+                    this.notify_changed(cx);
+                    return;
+                }
+                this.generator_busy = None;
+                match result {
+                    Ok(()) => {
+                        this.generator_data_source_type = Some(data_source_type);
+                        this.generator_pending_source_type = None;
+                        this.generator_config_error = None;
+                        let _ = this.fleet.reload_if_stale();
+                        this.reload_generator_status();
+                        this.generator_saved_config = Some(this.generator_config_value(cx));
+                        this.clamp_focus_index();
+                        this.notify_changed(cx);
+                    }
+                    Err(err) => {
+                        this.generator_config_error = Some(err);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Fetch from the configured data source on the background executor. The
+    /// tree shows the generator as "refreshing…" meanwhile, and the user can
+    /// keep working.
+    fn refresh_generator_now(&mut self, cx: &mut Context<Self>) {
+        if self.generator_busy.is_some() || self.generator_data_source_type.is_none() {
+            return;
+        }
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        self.generator_busy = Some("Refreshing…".into());
+        self.generator_config_error = None;
+        cx.notify();
+
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(
+                    async move { tod_core::generator::refresh_generator(&fleet, node_id) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let _ = this.fleet.reload_if_stale();
+                if this.node_uuid() != Some(node_id) {
+                    // Still surface the failure, just not against a node this
+                    // panel is no longer showing.
+                    this.notify_changed(cx);
+                    return;
+                }
+                this.generator_busy = None;
+                this.reload_generator_status();
+                if let Err(err) = result {
+                    this.pending_toast = Some(format!("Refresh failed: {err}"));
+                }
+                this.notify_changed(cx);
+            });
+        })
+        .detach();
     }
 
     fn enable_capability(&mut self, cap: Capability, window: &mut Window, cx: &mut Context<Self>) {
@@ -1440,21 +1835,24 @@ impl TaskEditView {
         let generation = self.linear_fetch_generation;
         let tags = tags_with_linear(&self.tags);
         let ticket_for_fetch = ticket.clone();
+        self.linear_busy = true;
+        cx.notify();
         let entity = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            let fetch = std::thread::spawn(move || {
-                tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
-            })
-            .join();
-            let issue = match fetch {
-                Ok(Ok(issue)) => Ok(issue),
-                Ok(Err(err)) => Err(err.to_string()),
-                Err(_) => Err("Linear fetch thread panicked".into()),
-            };
+            // `background_spawn`, never a thread we join here: this future runs
+            // on the foreground executor, so blocking in it would freeze the UI
+            // for the whole round trip.
+            let issue = cx
+                .background_spawn(async move {
+                    tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
+                        .map_err(|err| err.to_string())
+                })
+                .await;
             let _ = entity.update(cx, |this, cx| {
                 if this.linear_fetch_generation != generation {
                     return;
                 }
+                this.linear_busy = false;
                 this.pending_linear_apply = Some(PendingLinearApply {
                     generation,
                     node_id,
@@ -1477,6 +1875,10 @@ impl TaskEditView {
         if self.linear_fetch_generation != pending.generation {
             return;
         }
+        // The import belongs to the node it was started for. If the panel has
+        // since moved on, still write the fetched fields to that node, but
+        // leave this node's inputs alone.
+        let still_open = self.node_uuid() == Some(pending.node_id);
         match pending.issue {
             Ok(issue) => {
                 if let Err(err) = apply_linear_fields_to_node(
@@ -1491,22 +1893,26 @@ impl TaskEditView {
                     self.pending_toast =
                         Some(format!("Failed to import {}: {err}", pending.ticket));
                 } else {
-                    if let Some(description) = issue.description {
-                        self.loaded_details = description.clone();
-                        self.details_input.update(cx, |input, cx| {
-                            input.set_value(description, window, cx);
-                        });
+                    if still_open {
+                        if let Some(description) = issue.description {
+                            self.loaded_details = description.clone();
+                            self.details_input.update(cx, |input, cx| {
+                                input.set_value(description, window, cx);
+                            });
+                        }
+                        if !self.capabilities.contains(&Capability::Spec) {
+                            self.capabilities.insert(Capability::Spec);
+                            self.capabilities.insert(Capability::Lifecycle);
+                        }
+                        self.tags = tags_with_linear(&self.tags);
                     }
-                    if !self.capabilities.contains(&Capability::Spec) {
-                        self.capabilities.insert(Capability::Spec);
-                        self.capabilities.insert(Capability::Lifecycle);
-                    }
-                    self.tags = tags_with_linear(&self.tags);
                     cx.emit(TaskEditEvent::Changed);
                 }
-                self.linear_input.update(cx, |input, cx| {
-                    input.set_value(issue.identifier, window, cx);
-                });
+                if still_open {
+                    self.linear_input.update(cx, |input, cx| {
+                        input.set_value(issue.identifier, window, cx);
+                    });
+                }
             }
             Err(err) => {
                 let _ = self.fleet.enqueue(FleetMutation::UpdateTaskLinkedIssues {
@@ -2237,28 +2643,43 @@ impl TaskEditView {
     }
 
     fn render_ticket_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().gap_2().px_3().pb_3().child(
-            h_flex()
-                .gap_2()
-                .items_end()
-                .flex_wrap()
-                .child(self.render_link_field(
-                    TaskEditField::LinearLink,
-                    "Ticket ID",
-                    120.,
-                    &self.linear_input,
-                    window,
-                    cx,
-                ))
-                .child(self.render_link_field(
-                    TaskEditField::GithubPr,
-                    "GitHub PR",
-                    110.,
-                    &self.github_pr_input,
-                    window,
-                    cx,
-                )),
-        )
+        let muted = cx.theme().muted_foreground;
+        v_flex()
+            .gap_2()
+            .px_3()
+            .pb_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_end()
+                    .flex_wrap()
+                    .child(self.render_link_field(
+                        TaskEditField::LinearLink,
+                        "Ticket ID",
+                        120.,
+                        &self.linear_input,
+                        window,
+                        cx,
+                    ))
+                    .child(self.render_link_field(
+                        TaskEditField::GithubPr,
+                        "GitHub PR",
+                        110.,
+                        &self.github_pr_input,
+                        window,
+                        cx,
+                    )),
+            )
+            // The fetch runs in the background, so say so rather than leaving
+            // the panel looking idle while the description is on its way.
+            .when(self.linear_busy, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Fetching from Linear…"),
+                )
+            })
     }
 
     /// Read-only summary of Agent / Files values inherited from an ancestor,
@@ -2648,101 +3069,27 @@ impl TaskEditView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let _ = background;
+        let danger = cx.theme().danger;
         let mut col = v_flex().gap_2().px_3().pb_3();
 
-        match &self.generator_data_source_type {
-            None => {
-                let selected = self.generator_pending_source_type.clone();
-                col = col
-                    .child(Self::render_field_label("Data source", cx))
-                    .child(
-                        h_flex().gap_1p5().flex_wrap().children(
-                            tod_core::generator::available_data_sources()
-                                .into_iter()
-                                .enumerate()
-                                .map(|(idx, (key, name, description))| {
-                                    let is_selected = selected.as_deref() == Some(key);
-                                    let key_owned = key.to_string();
-                                    Button::new(("task-edit-gen-source", idx))
-                                        .label(name)
-                                        .compact()
-                                        .selected(is_selected)
-                                        .tooltip(description)
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.select_generator_data_source(
-                                                key_owned.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                }),
-                        ),
-                    );
-                if selected.is_none() {
-                    return col;
-                }
-            }
-            Some(data_source_type) => {
-                col = col.child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(Self::render_field_label("Data source", cx))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(data_source_type.clone()),
-                        ),
-                );
-            }
-        }
+        col = col.child(self.render_generator_source_row(muted, cx));
 
-        col = col
-            .child(Self::render_field_label("Configuration (JSON)", cx))
-            .child(
+        if self.generator_source_key().is_none() {
+            return col.child(
                 div()
-                    .w_full()
-                    .rounded_md()
-                    .cursor_text()
-                    .bg(background)
-                    .child(
-                        Textarea::new(&self.generator_config_input)
-                            .w_full()
-                            .h(window.line_height() * 6.),
-                    ),
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Pick a data source to configure it."),
             );
-
-        if let Some(schema_hint) = self
-            .generator_data_source_type
-            .clone()
-            .or_else(|| self.generator_pending_source_type.clone())
-            .and_then(|key| tod_core::generator::data_source_for_type(&key))
-            .map(|ds| {
-                ds.configuration_schema()
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        format!(
-                            "{} ({}){}",
-                            f.name,
-                            f.help,
-                            if f.required { " *" } else { "" }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            })
-        {
-            col = col.child(div().text_xs().text_color(muted).child(selectable_text(
-                "task-edit-gen-schema-hint",
-                schema_hint,
-                window,
-                cx,
-            )));
         }
 
-        let danger = cx.theme().danger;
+        for index in 0..self.generator_fields.len() {
+            col = col.child(self.render_generator_field(index, muted, window, cx));
+        }
+
+        col = col.child(self.render_generator_actions(muted, cx));
+
         if let Some(err) = &self.generator_config_error {
             col = col.child(div().text_xs().text_color(danger).child(selectable_text(
                 "task-edit-gen-config-error",
@@ -2771,6 +3118,257 @@ impl TaskEditView {
         }
 
         col
+    }
+
+    /// The data source picker, or — once a config is saved — the source it is
+    /// bound to. A generator's source cannot be changed after the fact.
+    fn render_generator_source_row(
+        &self,
+        muted: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let sources = tod_core::generator::available_data_sources();
+        if let Some(saved) = &self.generator_data_source_type {
+            let name = sources
+                .iter()
+                .find(|(key, _, _)| key == saved)
+                .map(|(_, name, _)| name.clone())
+                .unwrap_or_else(|| saved.clone());
+            return h_flex()
+                .items_center()
+                .justify_between()
+                .child(Self::render_field_label("Data source", cx))
+                .child(div().text_xs().text_color(muted).child(name))
+                .into_any_element();
+        }
+
+        let selected = self.generator_pending_source_type.clone();
+        let focused = self.field_nav_focused(TaskEditField::GeneratorSource);
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        self.apply_focus_scroll_anchor(
+            TaskEditField::GeneratorSource,
+            v_flex()
+                .id(field_anchor_id(TaskEditField::GeneratorSource))
+                .gap_1()
+                .child(Self::render_field_label("Data source", cx))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .flex_wrap()
+                        .p_1()
+                        .rounded_md()
+                        .when(focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .children(sources.into_iter().enumerate().map(
+                            |(idx, (key, name, description))| {
+                                let is_selected = selected.as_deref() == Some(key);
+                                let key_owned = key.to_string();
+                                Button::new(("task-edit-gen-source", idx))
+                                    .label(name)
+                                    .compact()
+                                    .selected(is_selected)
+                                    .tooltip(description)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_generator_data_source(
+                                            key_owned.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                            },
+                        )),
+                ),
+        )
+        .into_any_element()
+    }
+
+    /// One schema field: an input for the text kinds, a cycling button for the
+    /// rest, with its help text and any "required" marker underneath.
+    fn render_generator_field(
+        &self,
+        index: usize,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(field) = self.generator_fields.get(index) else {
+            return div().into_any_element();
+        };
+        let stop = TaskEditField::GeneratorField(index);
+        let invalid = self.generator_invalid_fields.contains(&index);
+        let danger = cx.theme().danger;
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        let label = if field.schema.required {
+            format!("{} *", field.schema.label)
+        } else {
+            field.schema.label.clone()
+        };
+
+        let control = match &field.schema.field_type {
+            ConfigFieldType::Text => self
+                .render_nav_input(
+                    stop,
+                    field.input.clone().expect("text field has an input"),
+                    None,
+                    window,
+                    cx,
+                )
+                .into_any_element(),
+            ConfigFieldType::TextArea => self
+                .render_nav_input(
+                    stop,
+                    field.input.clone().expect("textarea field has an input"),
+                    Some(4.),
+                    window,
+                    cx,
+                )
+                .into_any_element(),
+            ConfigFieldType::Boolean => self
+                .render_generator_choice_button(
+                    index,
+                    if field.toggle { "On" } else { "Off" }.to_string(),
+                    cx,
+                )
+                .into_any_element(),
+            ConfigFieldType::Select { .. } => self
+                .render_generator_choice_button(
+                    index,
+                    field
+                        .choice
+                        .clone()
+                        .unwrap_or_else(|| "Not set".to_string()),
+                    cx,
+                )
+                .into_any_element(),
+        };
+
+        let mut row = v_flex()
+            .id(("task-edit-gen-field", index))
+            .gap_1()
+            .p_1()
+            .rounded_md()
+            .when(self.field_nav_focused(stop), |el| {
+                el.bg(active).border_1().border_color(active_border)
+            })
+            .child(Self::render_field_label(&label, cx))
+            .child(control);
+
+        if !field.schema.help.is_empty() {
+            row = row.child(div().text_xs().text_color(muted).child(selectable_text(
+                ("task-edit-gen-field-help", index),
+                field.schema.help.clone(),
+                window,
+                cx,
+            )));
+        }
+        if invalid {
+            row = row
+                .child(div().text_xs().text_color(danger).child("Required"));
+        }
+
+        self.apply_focus_scroll_anchor(stop, row).into_any_element()
+    }
+
+    fn render_generator_choice_button(
+        &self,
+        index: usize,
+        value: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        Button::new(("task-edit-gen-choice", index))
+            .label(value)
+            .outline()
+            .compact()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.enter_field_edit(TaskEditField::GeneratorField(index), window, cx);
+            }))
+    }
+
+    /// Save / Refresh. Nothing in this section is ever written on blur — the
+    /// config only reaches the store from here.
+    fn render_generator_actions(
+        &self,
+        muted: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let busy = self.generator_busy.clone();
+        let dirty = self.generator_dirty(cx);
+        let configured = self.generator_data_source_type.is_some();
+        let active = cx.theme().list_active;
+        let active_border = cx.theme().list_active_border;
+        let save_focused = self.field_nav_focused(TaskEditField::GeneratorSave);
+        let refresh_focused = self.field_nav_focused(TaskEditField::GeneratorRefresh);
+
+        let save_label = match (busy.as_deref(), configured) {
+            (Some(label), _) => label.to_string(),
+            (None, false) => "Save configuration".to_string(),
+            (None, true) => "Save changes".to_string(),
+        };
+
+        let mut row = h_flex().gap_2().items_center().flex_wrap().child(
+            self.apply_focus_scroll_anchor(
+                TaskEditField::GeneratorSave,
+                div()
+                    .id(field_anchor_id(TaskEditField::GeneratorSave))
+                    .rounded_md()
+                    .when(save_focused, |el| {
+                        el.bg(active).border_1().border_color(active_border)
+                    })
+                    .child(
+                        Button::new("task-edit-gen-save")
+                            .label(save_label)
+                            .primary()
+                            .compact()
+                            .disabled(busy.is_some() || !dirty)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.enter_field_edit(TaskEditField::GeneratorSave, window, cx);
+                            })),
+                    ),
+            ),
+        );
+
+        if configured {
+            row = row.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::GeneratorRefresh,
+                    div()
+                        .id(field_anchor_id(TaskEditField::GeneratorRefresh))
+                        .rounded_md()
+                        .when(refresh_focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .child(
+                            Button::new("task-edit-gen-refresh")
+                                .label("Refresh now")
+                                .outline()
+                                .compact()
+                                .disabled(busy.is_some())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_field_edit(
+                                        TaskEditField::GeneratorRefresh,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                ),
+            );
+        }
+
+        let hint = match (&busy, dirty, configured) {
+            (Some(label), _, _) => label.clone(),
+            (None, true, true) => "Unsaved changes".to_string(),
+            (None, false, _) => "Saved".to_string(),
+            (None, true, false) => String::new(),
+        };
+        if !hint.is_empty() {
+            row = row.child(div().text_xs().text_color(muted).child(hint));
+        }
+
+        row
     }
 
     fn render_managed_detail(

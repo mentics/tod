@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use tod_integration::{
     CredentialRequirement, DataSource, DataSourceItem, LinearDataSource, MockDataSource,
 };
+
+pub use tod_integration::{ConfigField, ConfigFieldType, ConfigSchema};
 use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
@@ -46,21 +48,28 @@ pub fn available_data_sources() -> Vec<(&'static str, String, String)> {
         .collect()
 }
 
-/// Validate `config_json` against the named data source, then persist it via
-/// [`OutlineMutation::SetGeneratorConfig`]. Rejects unknown data source types
-/// and configs that fail [`DataSource::validate_config`] without enqueuing
-/// anything.
+/// The configuration form a data source expects, for UIs that render a field
+/// per entry rather than asking the user to write the config JSON by hand.
+pub fn config_schema_for_type(data_source_type: &str) -> Option<ConfigSchema> {
+    data_source_for_type(data_source_type).map(|ds| ds.configuration_schema())
+}
+
+/// Validate `config_json` against the named data source and persist it via
+/// [`OutlineMutation::SetGeneratorConfig`], **without** refreshing. Rejects
+/// unknown data source types and configs that fail
+/// [`DataSource::validate_config`] without enqueuing anything.
 ///
-/// The very first successful save for a generator node (i.e. one with no
-/// prior config) triggers an automatic initial refresh. Every save after
-/// that only persists the config — refreshing again is always a separate,
-/// user-triggered call to [`refresh_generator`].
-pub fn set_generator_config(
+/// Returns `true` when this was the node's first config, meaning an initial
+/// refresh is due. Saving is local and fast; refreshing reaches the network,
+/// so the two are separate calls and the caller decides where the refresh
+/// runs — a UI caller must run [`refresh_generator`] off its main thread.
+/// See [`set_generator_config`] for the combined, fully blocking version.
+pub fn save_generator_config(
     fleet: &FleetStore,
     node_id: Uuid,
     data_source_type: &str,
     config_json: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let data_source = data_source_for_type(data_source_type)
         .ok_or_else(|| format!("unknown data source type: {data_source_type}"))?;
 
@@ -83,7 +92,24 @@ pub fn set_generator_config(
         .map_err(|err| err.to_string())?;
     fleet.writer().flush().map_err(|err| err.to_string())?;
 
-    if !had_existing_config {
+    Ok(!had_existing_config)
+}
+
+/// [`save_generator_config`] plus the initial refresh it reports as due, run
+/// inline. Blocks on the network for that first save, so only callers that
+/// are already off a UI thread (tests, the CLI) should use it.
+///
+/// The very first successful save for a generator node (i.e. one with no
+/// prior config) triggers an automatic initial refresh. Every save after
+/// that only persists the config — refreshing again is always a separate,
+/// user-triggered call to [`refresh_generator`].
+pub fn set_generator_config(
+    fleet: &FleetStore,
+    node_id: Uuid,
+    data_source_type: &str,
+    config_json: &str,
+) -> Result<(), String> {
+    if save_generator_config(fleet, node_id, data_source_type, config_json)? {
         // The config save itself has already succeeded; a failed initial
         // refresh (e.g. blocked on a missing credential) is recorded on the
         // generator's refresh status by `refresh_generator` itself and does
@@ -1124,6 +1150,47 @@ mod tests {
             config.last_refresh_status.as_deref(),
             Some(REFRESH_SUCCESS),
             "first save should have triggered an automatic refresh"
+        );
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_reports_initial_refresh_due_without_running_it() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+
+        let refresh_due = save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+        assert!(refresh_due, "the first save leaves an initial refresh due");
+
+        let config = read_config(&root, node_id).unwrap();
+        assert_eq!(config.config_json, "{}", "config is persisted by the save");
+        assert_eq!(
+            config.last_refresh_status, None,
+            "save must not refresh — the caller runs it off its own thread"
+        );
+
+        let refresh_due =
+            save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query":"x"}"#).unwrap();
+        assert!(!refresh_due, "only the very first save is owed a refresh");
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_without_persisting() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+
+        let result = save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"invalid":true}"#);
+        assert!(result.is_err(), "invalid config must be rejected");
+        assert!(
+            read_config(&root, node_id).is_none(),
+            "a rejected config must not reach storage"
         );
 
         drop(fleet);
