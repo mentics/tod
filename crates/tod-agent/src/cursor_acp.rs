@@ -7,6 +7,8 @@ use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::agent_traffic::{
     AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
 };
+use crate::ReplyPart;
+use crate::reply::{self, SharedReplyParts};
 use crate::util::normalize_absolute;
 use crate::util::path_is_under;
 use anyhow::{Context, Result, bail};
@@ -116,6 +118,9 @@ struct LiveConversation {
     /// Characters that entered this conversation's context (see
     /// [`AgentProvider::session_context_chars`]).
     context_chars: Arc<AtomicU64>,
+    /// The parts of the latest turn (see
+    /// [`AgentProvider::session_reply_parts`]).
+    reply_parts: SharedReplyParts,
 }
 
 impl LiveConversation {
@@ -131,6 +136,7 @@ impl LiveConversation {
             activity: Arc::new(Mutex::new(None)),
             pending_permission: Arc::new(Mutex::new(None)),
             context_chars: Arc::new(AtomicU64::new(0)),
+            reply_parts: SharedReplyParts::default(),
         };
         let conversation = Self {
             cmd_tx,
@@ -142,6 +148,7 @@ impl LiveConversation {
             pending_permission: worker.pending_permission.clone(),
             purpose,
             context_chars: worker.context_chars.clone(),
+            reply_parts: worker.reply_parts.clone(),
         };
         thread::spawn(move || worker.run(cmd_rx));
         conversation
@@ -172,6 +179,7 @@ struct ConversationWorker {
     activity: Arc<Mutex<Option<String>>>,
     pending_permission: PendingPermissionSlot,
     context_chars: Arc<AtomicU64>,
+    reply_parts: SharedReplyParts,
 }
 
 impl ConversationWorker {
@@ -273,6 +281,7 @@ impl ConversationWorker {
                 spec.purpose.run_kind(),
                 &spec.env,
                 Some(self.context_chars.clone()),
+                Some(self.reply_parts.clone()),
             )?;
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
@@ -644,6 +653,16 @@ impl AgentProvider for CursorAcpProvider {
             .map(|conversation| conversation.context_chars.load(Ordering::Relaxed))
     }
 
+    fn session_reply_parts(&self, key: &str) -> Option<Vec<ReplyPart>> {
+        self.conversations.get(key).map(|conversation| {
+            conversation
+                .reply_parts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+    }
+
     fn close_session(&mut self, key: &str) {
         if let Some(conversation) = self.conversations.remove(key) {
             conversation.close();
@@ -998,6 +1017,7 @@ fn run_acp_session(
         activity,
         pending_permission,
         context_chars: None,
+        reply_parts: None,
     };
 
     let client_name = host.client_name();
@@ -1119,6 +1139,8 @@ struct AcpClient {
     /// Running count of characters entering the session's context, when the
     /// caller tracks it.
     context_chars: Option<Arc<AtomicU64>>,
+    /// The current turn's reply, part by part, when the caller keeps it.
+    reply_parts: Option<SharedReplyParts>,
 }
 
 impl AcpClient {
@@ -1139,6 +1161,18 @@ impl AcpClient {
             direction,
             content,
         );
+    }
+
+    fn update_reply(&self, update: impl FnOnce(&mut Vec<ReplyPart>)) {
+        if let Some(parts) = &self.reply_parts {
+            update(&mut parts.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    /// Forget the reply so far: a new turn starts, or a replay ended.
+    fn clear_reply(&mut self) {
+        self.assistant_text.clear();
+        self.update_reply(Vec::clear);
     }
 
     fn set_activity(&self, activity: Option<String>) {
@@ -1305,6 +1339,7 @@ impl AcpClient {
                             .and_then(Value::as_str)
                         {
                             self.assistant_text.push_str(text);
+                            self.update_reply(|parts| reply::push_text(parts, false, text));
                             self.push_replay_chunk("assistant", text);
                         }
                         self.set_activity(Some("Writing reply…".to_string()));
@@ -1317,10 +1352,22 @@ impl AcpClient {
                             self.push_replay_chunk("user", text);
                         }
                     } else if kind == "agent_thought_chunk" {
+                        if let Some(text) = update
+                            .get("content")
+                            .and_then(|c| c.get("text"))
+                            .and_then(Value::as_str)
+                        {
+                            self.update_reply(|parts| reply::push_text(parts, true, text));
+                        }
                         self.set_activity(Some("Thinking…".to_string()));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
                         let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                        let call_id = update
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        self.update_reply(|parts| reply::push_tool(parts, call_id, title, status));
                         // Tool input and output stay in the agent's context.
                         let tool_chars: usize = ["content", "rawInput", "rawOutput"]
                             .iter()
@@ -1723,6 +1770,7 @@ impl PersistentAcpSession {
         kind: AgentRunKind,
         env: &[(String, String)],
         context_chars: Option<Arc<AtomicU64>>,
+        reply_parts: Option<SharedReplyParts>,
     ) -> Result<Self> {
         let mut child = spawn_acp_process(host, agent_bin, env)?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
@@ -1752,6 +1800,7 @@ impl PersistentAcpSession {
             activity,
             pending_permission,
             context_chars,
+            reply_parts,
         };
 
         let client_name = host.client_name();
@@ -1809,7 +1858,7 @@ impl PersistentAcpSession {
                 let result = client.await_response(AUTH_TIMEOUT)?;
                 // `session/load` replays the history as message updates; none of
                 // it is a reply to anything this process sends.
-                client.assistant_text.clear();
+                client.clear_reply();
                 (session_id.clone(), result)
             }
         };
@@ -1831,7 +1880,7 @@ impl PersistentAcpSession {
 
     /// Send one turn made of several text blocks, in order.
     fn prompt_blocks(&mut self, blocks: &[String], run_id: RunId) -> Result<String> {
-        self.client.assistant_text.clear();
+        self.client.clear_reply();
         self.client.run_id = run_id;
         let content: Vec<Value> = blocks
             .iter()
@@ -1889,6 +1938,7 @@ pub(crate) fn fetch_transcript(
         traffic_log,
         AgentRunKind::FleetAgent,
         &[],
+        None,
         None,
     )?;
     let text = session.client.replay_transcript_text();

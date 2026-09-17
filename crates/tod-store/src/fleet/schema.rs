@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 37;
+pub const CURRENT_USER_VERSION: i32 = 38;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -284,6 +284,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v36_to_v37(conn)?;
         conn.pragma_update(None, "user_version", 37)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 38 {
+        migrate_v37_to_v38(conn)?;
+        conn.pragma_update(None, "user_version", 38)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -553,6 +558,19 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// `conversation_turns.parts`: an agent reply as it was streamed (JSON
+/// `tod_agent::ReplyPart`s), so the transcript can show the answer apart from
+/// the narration, thoughts, and tool calls around it.
+fn migrate_v37_to_v38(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'parts'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN parts TEXT;")?;
+    }
     Ok(())
 }
 

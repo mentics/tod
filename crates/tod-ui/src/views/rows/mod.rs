@@ -119,6 +119,9 @@ impl RowAction {
 pub struct RowOptions {
     /// One line, the text truncated at the end.
     pub compact: bool,
+    /// With `compact`: the text wraps instead, so the row grows to show all
+    /// of it (`styles.row-wrapped`).
+    pub wrap: bool,
     /// Shown first; the op icon ([`op_icon`]).
     pub leading: Option<AnyElement>,
     /// Shown last. Never covered and never shrunk: the text truncates first.

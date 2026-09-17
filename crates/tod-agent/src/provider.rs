@@ -193,6 +193,13 @@ pub trait AgentProvider {
     /// agent reported. A size estimate for callers deciding when to rotate.
     fn session_context_chars(&self, key: &str) -> Option<u64>;
 
+    /// The latest turn of conversation `key`, part by part — text, thoughts,
+    /// and tool calls in the order the agent streamed them. `None` when the
+    /// provider does not report parts; callers then have only the reply text.
+    fn session_reply_parts(&self, _key: &str) -> Option<Vec<crate::ReplyPart>> {
+        None
+    }
+
     /// Stop the live process behind conversation `key`. The agent-side session
     /// is left intact, so a later turn can resume it.
     fn close_session(&mut self, key: &str);

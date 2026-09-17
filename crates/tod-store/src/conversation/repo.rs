@@ -142,7 +142,7 @@ impl<'a> ConversationRepo<'a> {
 
     pub fn turns(&self, conversation_id: Uuid) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, body, created_at FROM conversation_turns
+            "SELECT seq, role, body, parts, created_at FROM conversation_turns
              WHERE conversation_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt
@@ -151,16 +151,22 @@ impl<'a> ConversationRepo<'a> {
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(seq, role, body, created_at)| {
+            .map(|(seq, role, body, parts, created_at)| {
+                // Parts are for display; a row that does not parse shows its body.
+                let parts = parts
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
                 Ok(Turn {
                     seq,
                     role: TurnRole::parse(&role)?,
                     body,
+                    parts,
                     created_at,
                 })
             })
@@ -168,6 +174,17 @@ impl<'a> ConversationRepo<'a> {
     }
 
     pub fn append_turn(&self, conversation_id: Uuid, role: TurnRole, body: &str) -> Result<Turn> {
+        self.append_turn_with_parts(conversation_id, role, body, &[])
+    }
+
+    /// [`Self::append_turn`] for an agent reply that came with its parts.
+    pub fn append_turn_with_parts(
+        &self,
+        conversation_id: Uuid,
+        role: TurnRole,
+        body: &str,
+        parts: &[ReplyPart],
+    ) -> Result<Turn> {
         let now = now_ms();
         let seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_turns WHERE conversation_id = ?1",
@@ -175,14 +192,17 @@ impl<'a> ConversationRepo<'a> {
             |row| row.get(0),
         )?;
         self.conn.execute(
-            "INSERT INTO conversation_turns (id, conversation_id, seq, role, body, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO conversation_turns (id, conversation_id, seq, role, body, parts, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 uuid_to_blob(Uuid::new_v4()),
                 uuid_to_blob(conversation_id),
                 seq,
                 role.as_str(),
                 body,
+                (!parts.is_empty())
+                    .then(|| serde_json::to_string(parts))
+                    .transpose()?,
                 now
             ],
         )?;
@@ -191,6 +211,7 @@ impl<'a> ConversationRepo<'a> {
             seq,
             role,
             body: body.to_string(),
+            parts: parts.to_vec(),
             created_at: now,
         })
     }

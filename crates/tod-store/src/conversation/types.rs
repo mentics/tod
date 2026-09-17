@@ -3,6 +3,7 @@
 use crate::outline::OutlineMutation;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+pub use tod_agent::ReplyPart;
 use uuid::Uuid;
 
 /// What a conversation is about. A starting point only: the agent may act
@@ -205,9 +206,31 @@ pub struct ConversationSummary {
 pub struct Turn {
     pub seq: i64,
     pub role: TurnRole,
-    /// An empty agent body means "done, no notes".
+    /// An empty agent body means "done, no notes". For an agent turn with
+    /// [`Self::parts`], the reply's answer (see [`reply_answer`]).
     pub body: String,
+    /// An agent turn as the agent streamed it: narration, thoughts, tool
+    /// calls, and the answer. Empty when the provider reported none.
+    pub parts: Vec<ReplyPart>,
     pub created_at: i64,
+}
+
+/// The answer in a streamed reply: the text after the agent's last thought
+/// or tool call. Text before that is narration of the work.
+pub fn reply_answer(parts: &[ReplyPart]) -> String {
+    let start = parts
+        .iter()
+        .rposition(|part| !matches!(part, ReplyPart::Text { .. }))
+        .map_or(0, |ix| ix + 1);
+    parts[start..]
+        .iter()
+        .filter_map(|part| match part {
+            ReplyPart::Text { text } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// One `conversation_actions` row.

@@ -23,7 +23,9 @@ use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
     SessionPurpose, SessionTurn,
 };
-use tod_store::conversation::{Conversation, ConversationRepo, Focus, TurnRole, actor_for};
+use tod_store::conversation::{
+    Conversation, ConversationRepo, Focus, ReplyPart, TurnRole, actor_for, reply_answer,
+};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_ENV, ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
@@ -296,6 +298,7 @@ impl ConversationDriver {
             .unwrap_or(run.chars_at_start);
         match outcome {
             Ok(reply) => {
+                let parts = agent.session_reply_parts(&run.key).unwrap_or_default();
                 let reply = reply.trim();
                 let added = (chars.saturating_sub(run.chars_at_start) / 4) as i64;
                 self.session_tokens =
@@ -312,7 +315,14 @@ impl ConversationDriver {
                         session_name: name,
                     },
                 )?;
-                self.append(fleet, id, TurnRole::Agent, reply)?;
+                // With parts, the turn's body is the answer alone: the
+                // narration around the work stays in the parts.
+                let body = if parts.is_empty() {
+                    reply.to_string()
+                } else {
+                    reply_answer(&parts)
+                };
+                self.append_with_parts(fleet, id, TurnRole::Agent, &body, parts)?;
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
             Err(message) if run.cold_resume => {
@@ -367,12 +377,24 @@ impl ConversationDriver {
     }
 
     fn append(&self, fleet: &FleetStore, id: Uuid, role: TurnRole, body: &str) -> Result<i64> {
+        self.append_with_parts(fleet, id, role, body, Vec::new())
+    }
+
+    fn append_with_parts(
+        &self,
+        fleet: &FleetStore,
+        id: Uuid,
+        role: TurnRole,
+        body: &str,
+        parts: Vec<ReplyPart>,
+    ) -> Result<i64> {
         let value = fleet.interview(
             ACTOR_USER,
             InterviewCommand::AppendConversationTurn {
                 conversation_id: id,
                 role,
                 body: body.to_string(),
+                parts,
             },
         )?;
         value["seq"].as_i64().context("turn seq missing")

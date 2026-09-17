@@ -60,6 +60,8 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     let key = id.to_string();
     let group = row_group(&key);
     let compact = opts.compact;
+    // One line, truncated; a wrapped compact row shows all of its text.
+    let one_line_text = compact && !opts.wrap;
     let hoverable = opts.hoverable();
     let theme = cx.theme();
     let muted = theme.muted_foreground;
@@ -73,7 +75,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     } else {
         let text = if is_empty {
             "(new plan step)".to_string()
-        } else if compact {
+        } else if one_line_text {
             one_line(&step.body)
         } else {
             step.body.clone()
@@ -89,7 +91,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         .text_color(text_color)
         .w_full()
         .min_w_0();
-        let text = if compact {
+        let text = if one_line_text {
             text.whitespace_nowrap().text_ellipsis().overflow_hidden()
         } else {
             text.whitespace_normal()
@@ -97,7 +99,8 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         Some(
             div()
                 .min_w_0()
-                .when(compact, |el| el.flex_1().overflow_hidden())
+                .when(compact, |el| el.flex_1())
+                .when(one_line_text, |el| el.overflow_hidden())
                 .when(!compact, |el| el.w_full())
                 .when(opts.struck, |el| el.line_through())
                 .when(highlighted, |el| {
@@ -125,10 +128,14 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     };
 
     if compact {
-        let row = style::row(h_flex())
+        let row = if one_line_text {
+            style::row(h_flex()).items_center()
+        } else {
+            style::row_wrapped(h_flex()).items_start()
+        };
+        let row = row
             .w_full()
             .flex_shrink_0()
-            .items_center()
             .group(group.clone())
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, on_select)

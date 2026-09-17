@@ -32,6 +32,7 @@ struct FakeAgent {
     runs: HashMap<RunId, AgentRunState>,
     sessions: HashMap<String, String>,
     chars: HashMap<String, u64>,
+    parts: HashMap<String, Vec<tod_agent::ReplyPart>>,
     /// Refuse to resume a recorded session (as after it expired).
     fail_resume: bool,
 }
@@ -44,6 +45,7 @@ impl FakeAgent {
             runs: HashMap::new(),
             sessions: HashMap::new(),
             chars: HashMap::new(),
+            parts: HashMap::new(),
             fail_resume: false,
         }
     }
@@ -92,7 +94,11 @@ impl AgentProvider for FakeAgent {
                 actor,
             };
             match reply(&client, &blocks) {
-                Ok(text) => AgentRunState::Success(Some(text)),
+                Ok(reply) => {
+                    self.parts
+                        .insert(turn.key.clone(), reply.parts.unwrap_or_default());
+                    AgentRunState::Success(Some(reply.text))
+                }
                 Err(err) => AgentRunState::Failure(format!("{err:#}")),
             }
         };
@@ -120,6 +126,10 @@ impl AgentProvider for FakeAgent {
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.chars.get(key).copied()
+    }
+
+    fn session_reply_parts(&self, key: &str) -> Option<Vec<tod_agent::ReplyPart>> {
+        self.parts.get(key).cloned()
     }
 
     fn close_session(&mut self, key: &str) {
@@ -714,4 +724,38 @@ fn the_focus_block_describes_each_kind() {
         text.contains(&format!("`{}`", fx.root.display())),
         "data root: {text}"
     );
+}
+
+#[test]
+fn a_reply_keeps_its_parts_and_its_body_is_the_answer() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node));
+    let message = format!(
+        "think Which node?\nadd obligation {}: Passwords are hashed.\nask Anything else?",
+        slug(&fx)
+    );
+    assert_eq!(say(&mut driver, &fx, &mut agent, &message), [DONE]);
+    let id = driver.conversation_id().unwrap();
+
+    let turns = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).turns(id))
+        .unwrap();
+    let reply = turns.last().unwrap();
+    assert_eq!(reply.role, TurnRole::Agent);
+    // The narration before the work is not the answer.
+    assert_eq!(reply.body, "Anything else?");
+    let kinds: Vec<&str> = reply
+        .parts
+        .iter()
+        .map(|part| match part {
+            tod_agent::ReplyPart::Text { .. } => "text",
+            tod_agent::ReplyPart::Thought { .. } => "thought",
+            tod_agent::ReplyPart::Tool { .. } => "tool",
+        })
+        .collect();
+    assert_eq!(kinds, ["text", "thought", "tool", "text"]);
+    // The user's turn has none.
+    assert!(turns[0].parts.is_empty());
 }

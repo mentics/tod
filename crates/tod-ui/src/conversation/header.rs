@@ -246,7 +246,7 @@ impl ConversationView {
                     .ghost()
                     .small()
                     .selected(self.context.open)
-                    .tooltip("Context panel (Ctrl+.)")
+                    .tooltip("Context panel (Ctrl+I)")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_context(window, cx))),
             )
             .into_any_element()

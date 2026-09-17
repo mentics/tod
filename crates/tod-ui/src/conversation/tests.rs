@@ -2,6 +2,7 @@
 
 use super::change_set::{DisplayRow, Tab, display_rows, tab_counts};
 use super::keyboard::*;
+use crate::ui::agent_conversation::PanelStop;
 use super::*;
 use crate::views::rows::fixture::Fixture;
 use gpui::{TestAppContext, VisualTestContext};
@@ -264,7 +265,13 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let (view, _, cx) = open_view(&fixture, Focus::Project, cx);
     let tab_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
-        view.read_with(cx, |view, cx| view.input.read(cx).focus_handle(cx).tab_stop)
+        view.read_with(cx, |view, cx| {
+            let panel = view.transcript.read(cx);
+            panel.input().read(cx).focus_handle(cx).tab_stop
+        })
+    };
+    let panel_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| view.transcript.read(cx).highlight())
     };
     assert!(!view.read_with(cx, |v, _| v.input_editing));
     assert!(!tab_stop(&view, cx));
@@ -280,7 +287,8 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     assert!(!view.read_with(cx, |v, _| v.input_editing));
     assert!(!tab_stop(&view, cx));
 
-    // Stops run Back, Picker, Input and stop at the ends.
+    // With no turns, stops run Back, Picker, then the transcript's input,
+    // and stop at the ends.
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
@@ -288,7 +296,184 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
-    assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Input);
+    assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Transcript);
+    assert_eq!(panel_stop(&view, cx), PanelStop::Input);
+}
+
+fn append_turn(
+    fixture: &Fixture,
+    conversation: Uuid,
+    role: tod_store::conversation::TurnRole,
+    body: &str,
+    parts: Vec<tod_agent::ReplyPart>,
+) {
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::AppendConversationTurn {
+                conversation_id: conversation,
+                role,
+                body: body.into(),
+                parts,
+            },
+        )
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
+    use crate::ui::agent_conversation::ChunkId;
+    use tod_agent::ReplyPart;
+    use tod_store::conversation::TurnRole;
+
+    let fixture = Fixture::new();
+    let conversation = create_conversation(&fixture, Focus::Project);
+    append_turn(&fixture, conversation, TurnRole::User, "Tidy it up", Vec::new());
+    append_turn(
+        &fixture,
+        conversation,
+        TurnRole::Agent,
+        "Done.",
+        vec![
+            ReplyPart::Text {
+                text: "Let me look at the outline.".into(),
+            },
+            ReplyPart::Thought {
+                text: "Two nodes overlap.".into(),
+            },
+            ReplyPart::Tool {
+                id: "t1".into(),
+                title: "tod-cli node move".into(),
+                status: "completed".into(),
+            },
+            ReplyPart::Text {
+                text: "Done.".into(),
+            },
+        ],
+    );
+    let (view, _, cx) = open_view(&fixture, Focus::Project, cx);
+    let chunk = |part| ChunkId { entry: 1, part };
+    let expanded = |view: &Entity<ConversationView>, id, cx: &mut VisualTestContext| {
+        view.read_with(cx, |v, cx| v.transcript.read(cx).is_expanded(id))
+    };
+
+    // The messages and the answer are open; narration, thinking, and the
+    // tool call are one line each.
+    assert!(expanded(&view, ChunkId { entry: 0, part: None }, cx));
+    assert!(expanded(&view, chunk(None), cx));
+    assert!(!expanded(&view, chunk(Some(0)), cx));
+    assert!(!expanded(&view, chunk(Some(1)), cx));
+    assert!(!expanded(&view, chunk(Some(2)), cx));
+    assert!(expanded(&view, chunk(Some(3)), cx));
+
+    // Up from the input walks the chunks, bottom first; Enter opens one.
+    cx.dispatch_action(ConversationUp);
+    cx.dispatch_action(ConversationUp);
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
+        PanelStop::Chunk(chunk(Some(2)))
+    );
+    cx.dispatch_action(ConversationActivate);
+    draw(cx);
+    assert!(expanded(&view, chunk(Some(2)), cx));
+
+    // Collapsing the reply hides its pieces from the keyboard too.
+    for _ in 0..3 {
+        cx.dispatch_action(ConversationUp);
+    }
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
+        PanelStop::Chunk(chunk(None))
+    );
+    cx.dispatch_action(ConversationActivate);
+    draw(cx);
+    assert!(!expanded(&view, chunk(None), cx));
+    cx.dispatch_action(ConversationDown);
+    assert_eq!(
+        view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
+        PanelStop::Input
+    );
+    // Above the first message is the picker.
+    cx.dispatch_action(ConversationUp);
+    cx.dispatch_action(ConversationUp);
+    cx.dispatch_action(ConversationUp);
+    assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Picker);
+}
+
+#[gpui::test]
+fn ctrl_i_toggles_the_context_panel_while_writing(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let (view, _, cx) = open_view(&fixture, Focus::Project, cx);
+    cx.dispatch_action(ConversationActivate);
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.input_editing));
+    // The panel focuses the input on a later frame; do it now, so the keys
+    // below start from inside the text field.
+    let input = view.read_with(cx, |v, cx| v.transcript.read(cx).input().clone());
+    cx.update(|window, cx| {
+        let handle = input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    draw(cx);
+    let input_focused = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.update_in(cx, |v, window, cx| {
+            let panel = v.transcript.read(cx);
+            panel.input().read(cx).focus_handle(cx).is_focused(window)
+        })
+    };
+    assert!(input_focused(&view, cx));
+
+    cx.simulate_keystrokes("ctrl-i");
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.context.open));
+    // Still writing.
+    assert!(view.read_with(cx, |v, _| v.input_editing));
+    assert!(input_focused(&view, cx));
+
+    cx.simulate_keystrokes("ctrl-i");
+    draw(cx);
+    assert!(!view.read_with(cx, |v, _| v.context.open));
+
+    // And from the transcript's navigation mode.
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert!(!view.read_with(cx, |v, _| v.input_editing));
+    cx.simulate_keystrokes("ctrl-i");
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.context.open));
+}
+
+#[gpui::test]
+fn an_expanded_change_row_shows_all_of_its_text(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let conversation = create_conversation(&fixture, node);
+    agent_edit(
+        &fixture,
+        conversation,
+        reword(
+            fixture.offline_obligation,
+            "Works offline for a day,\nand syncs when it is back",
+        ),
+    );
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let key = (ItemEntity::Obligation, fixture.offline_obligation);
+    view.update_in(cx, |view, window, cx| {
+        view.focus_pane(Pane::ChangeSet, window, cx);
+        view.set_cursor(Some(key), cx);
+    });
+    draw(cx);
+
+    cx.dispatch_action(ConversationActivate);
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.expanded.contains(&key)));
+
+    // The row's disclosure does the same.
+    let host = view.read_with(cx, |v, _| v.host.clone());
+    cx.update(|_, cx| host.push(ChangeAction::Expand(key), cx));
+    draw(cx);
+    assert!(!view.read_with(cx, |v, _| v.expanded.contains(&key)));
 }
 
 #[gpui::test]
@@ -621,7 +806,7 @@ mod context {
         let step = (ItemEntity::PlanStep, fixture.steps[1]);
         select(&view, offline, cx);
 
-        cx.simulate_keystrokes("ctrl-.");
+        cx.simulate_keystrokes("ctrl-i");
         draw(cx);
         assert!(view.read_with(cx, |v, _| v.context.open));
         assert_eq!(
@@ -678,7 +863,7 @@ mod context {
         draw(cx);
 
         // Closed, it still tracks the highlight; reopened, it shows it.
-        cx.simulate_keystrokes("ctrl-.");
+        cx.simulate_keystrokes("ctrl-i");
         draw(cx);
         assert!(!view.read_with(cx, |v, _| v.context.open));
         cx.dispatch_action(ConversationUp);

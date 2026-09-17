@@ -247,7 +247,7 @@ impl ConversationView {
         }
     }
 
-    /// Ctrl+. or the header button.
+    /// Ctrl+I or the header button.
     pub(super) fn toggle_context(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context.open = !self.context.open;
         if self.context.open {
@@ -522,7 +522,7 @@ impl ConversationView {
                     .icon(Icon::new(IconName::Close))
                     .ghost()
                     .small()
-                    .tooltip("Close (Ctrl+.)")
+                    .tooltip("Close (Ctrl+I)")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_context(window, cx))),
             );
 
@@ -567,7 +567,7 @@ impl ConversationView {
                         .text_ellipsis()
                         .overflow_hidden()
                         .child(
-                            "1 Obligations · 2 Plan · G Go to Tasks · Ctrl+Left back to changes · Ctrl+. closes",
+                            "1 Obligations · 2 Plan · G Go to Tasks · Ctrl+Left back to changes · Ctrl+I closes",
                         ),
                 ),
             )

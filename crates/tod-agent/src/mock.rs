@@ -2,6 +2,7 @@ use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId, SessionPurpose,
     SessionTurn,
 };
+use crate::ReplyPart;
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{
     AgentCategory, InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection,
@@ -21,9 +22,24 @@ pub struct MockInterviewTurn {
     pub blocks: Vec<String>,
 }
 
+/// What a mock handler replies: the text, and optionally the parts a real
+/// agent would have streamed (see [`AgentProvider::session_reply_parts`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MockReply {
+    pub text: String,
+    pub parts: Option<Vec<ReplyPart>>,
+}
+
+impl From<String> for MockReply {
+    fn from(text: String) -> Self {
+        Self { text, parts: None }
+    }
+}
+
 /// Plays an interview agent for `--agent mock`. The transport cannot know how
 /// interview data is stored, so the caller supplies the behavior.
-pub type MockInterviewHandler = Arc<dyn Fn(&MockInterviewTurn) -> Result<String> + Send + Sync>;
+pub type MockInterviewHandler =
+    Arc<dyn Fn(&MockInterviewTurn) -> Result<MockReply> + Send + Sync>;
 
 fn handler_slot() -> &'static Mutex<Option<MockInterviewHandler>> {
     static SLOT: OnceLock<Mutex<Option<MockInterviewHandler>>> = OnceLock::new();
@@ -38,7 +54,8 @@ pub fn set_mock_interview_handler(handler: MockInterviewHandler) {
 /// Fast in-process agent backend for UI tests; never calls an external process.
 pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
-    pending: HashMap<RunId, (AgentRunKind, mpsc::Receiver<Result<String, String>>)>,
+    /// Runs the handler is still playing: kind, session key, and the result.
+    pending: HashMap<RunId, (AgentRunKind, String, mpsc::Receiver<Result<MockReply, String>>)>,
     run_agent: HashMap<RunId, String>,
     fleet_run_sessions: HashMap<RunId, String>,
     sessions: HashMap<String, MockSession>,
@@ -55,6 +72,8 @@ struct MockSession {
     messages: u32,
     purpose: SessionPurpose,
     context_chars: u64,
+    /// The latest turn's parts, when the handler gave any.
+    reply_parts: Option<Vec<ReplyPart>>,
 }
 
 impl MockAgentProvider {
@@ -127,17 +146,22 @@ impl MockAgentProvider {
     }
 
     fn drain_pending(&mut self) {
-        let done: Vec<(RunId, AgentRunKind, Result<String, String>)> = self
+        let done: Vec<(RunId, AgentRunKind, String, Result<MockReply, String>)> = self
             .pending
             .iter()
-            .filter_map(|(id, (kind, rx))| rx.try_recv().ok().map(|r| (*id, *kind, r)))
+            .filter_map(|(id, (kind, key, rx))| {
+                rx.try_recv().ok().map(|r| (*id, *kind, key.clone(), r))
+            })
             .collect();
-        for (id, kind, result) in done {
+        for (id, kind, key, result) in done {
             self.pending.remove(&id);
             let state = match result {
-                Ok(text) => {
-                    self.log_traffic(kind, id, TrafficDirection::Response, &text);
-                    AgentRunState::Success(Some(text))
+                Ok(reply) => {
+                    self.log_traffic(kind, id, TrafficDirection::Response, &reply.text);
+                    if let Some(session) = self.sessions.get_mut(&key) {
+                        session.reply_parts = reply.parts;
+                    }
+                    AgentRunState::Success(Some(reply.text))
                 }
                 Err(err) => {
                     self.log_traffic(kind, id, TrafficDirection::Response, &err);
@@ -200,8 +224,10 @@ impl AgentProvider for MockAgentProvider {
                 messages: 0,
                 purpose: turn.purpose,
                 context_chars: 0,
+                reply_parts: None,
             });
         session.messages += 1;
+        session.reply_parts = None;
         session.context_chars += request.len() as u64;
         let kind = turn.purpose.run_kind();
 
@@ -237,7 +263,7 @@ impl AgentProvider for MockAgentProvider {
             let _ = tx.send(handler(&mock_turn).map_err(|err| format!("{err:#}")));
         });
         self.runs.insert(id, AgentRunState::InFlight(None));
-        self.pending.insert(id, (kind, rx));
+        self.pending.insert(id, (kind, turn.key, rx));
         Ok(AgentRunHandle { id })
     }
 
@@ -266,6 +292,10 @@ impl AgentProvider for MockAgentProvider {
         self.sessions.get(key).map(|session| session.context_chars)
     }
 
+    fn session_reply_parts(&self, key: &str) -> Option<Vec<ReplyPart>> {
+        self.sessions.get(key)?.reply_parts.clone()
+    }
+
     fn close_session(&mut self, key: &str) {
         self.sessions.remove(key);
     }
@@ -288,7 +318,7 @@ impl AgentProvider for MockAgentProvider {
 
     fn interview_status_counts(&self) -> InterviewAgentCounts {
         let mut counts = InterviewAgentCounts::default();
-        for (kind, _) in self.pending.values() {
+        for (kind, _, _) in self.pending.values() {
             match kind {
                 AgentRunKind::QuestionMakerReplenishment => counts.question_maker_in_flight += 1,
                 AgentRunKind::AnswerProcessor => counts.answer_active += 1,
@@ -492,14 +522,14 @@ mod tests {
 
     /// The one handler these tests register. The slot is process-wide and
     /// tests run in parallel, so every test must register the same behavior.
-    fn echo_handler(turn: &MockInterviewTurn) -> Result<String> {
+    fn echo_handler(turn: &MockInterviewTurn) -> Result<MockReply> {
         let actor = turn
             .env
             .iter()
             .find(|(k, _)| k == "TOD_INTERVIEW_ACTOR")
             .map(|(_, v)| v.clone())
             .unwrap_or_default();
-        Ok(format!("{:?} {actor} {}", turn.purpose, turn.blocks.join("|")))
+        Ok(format!("{:?} {actor} {}", turn.purpose, turn.blocks.join("|")).into())
     }
 
     #[test]

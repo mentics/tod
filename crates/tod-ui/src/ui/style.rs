@@ -223,16 +223,67 @@ pub fn panel_footer<E: Styled>(el: E) -> E {
 /// gap, text truncated at the end, and the `hover-row` state. Apply
 /// [`highlighted`] on top for the highlighted row.
 pub fn row<E: Styled + InteractiveElement>(el: E) -> E {
+    row_base(el)
+        .whitespace_nowrap()
+        .text_ellipsis()
+        .overflow_hidden()
+}
+
+/// `styles.row-wrapped`: [`row`] with its text wrapping, so the row grows to
+/// show all of it. Not built on [`row`]: GPUI truncates any text under an
+/// ellipsis, wrapped or not, and a child cannot unset it.
+pub fn row_wrapped<E: Styled + InteractiveElement>(el: E) -> E {
+    row_base(el).whitespace_normal()
+}
+
+fn row_base<E: Styled + InteractiveElement>(el: E) -> E {
     hover_row(
         text(el)
             .rounded(radius::CONTROL)
             .px(space::RELATED)
             .py(space::INLINE)
+            .gap(space::INLINE),
+    )
+}
+
+/// `styles.chunk`: a bordered block that expands and collapses under a
+/// [`chunk_header`].
+pub fn chunk<E: Styled>(el: E) -> E {
+    el.w_full()
+        .border(size::BORDER)
+        .border_color(color::divider())
+        .rounded(radius::CONTROL)
+}
+
+/// `styles.chunk-header`: one line, truncated, with the `hover-row` state.
+/// Apply [`highlighted`] on top for the highlighted chunk.
+pub fn chunk_header<E: Styled + InteractiveElement>(el: E) -> E {
+    hover_row(
+        text_dense(el)
+            .rounded(radius::CONTROL)
+            .px(space::RELATED)
+            .py(space::INLINE)
             .gap(space::INLINE)
+            .items_center()
+            .cursor_pointer()
             .whitespace_nowrap()
-            .text_ellipsis()
             .overflow_hidden(),
     )
+}
+
+/// `styles.chunk-label`.
+pub fn chunk_label<E: Styled>(el: E) -> E {
+    text_dense_muted(el)
+}
+
+/// `styles.chunk-body`.
+pub fn chunk_body<E: Styled>(el: E) -> E {
+    el.w_full().px(space::RELATED).pb(space::RELATED)
+}
+
+/// `styles.chunk-children`: the chunks inside another chunk, indented.
+pub fn chunk_children<E: Styled>(el: E) -> E {
+    el.w_full().pl(space::SECTION)
 }
 
 /// `styles.menu-item`: a row whose hover and highlighted states are both

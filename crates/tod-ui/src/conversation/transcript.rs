@@ -1,193 +1,92 @@
-//! The transcript pane: the conversation's turns and the message input.
+//! The transcript pane: the conversation's turns and the message input, shown
+//! by the general-purpose [`AgentConversationPanel`].
 
 use super::{ConversationView, Pane, Stop};
-use crate::ui::selectable_text::{selectable_markdown, selectable_text};
-use crate::ui::style;
-use gpui::prelude::FluentBuilder;
-use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, px,
+use crate::ui::agent_conversation::{
+    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind,
 };
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::Textarea;
-use gpui_component::scroll::Scrollbar;
-use gpui_component::{Selectable, Sizable, h_flex, v_flex};
-use tod_core::conversation::ROTATION_NOTE;
-use tod_store::conversation::TurnRole;
+use gpui::{AnyElement, AppContext, Context, Entity, IntoElement, Subscription, Window};
+use tod_store::conversation::{Turn, TurnRole};
 
-const INPUT_HEIGHT: f32 = 104.;
+pub(super) fn entry_of(turn: &Turn) -> Entry {
+    Entry {
+        kind: match turn.role {
+            TurnRole::User => EntryKind::User,
+            TurnRole::Agent => EntryKind::Agent,
+            TurnRole::Error => EntryKind::Error,
+            TurnRole::Rotation => EntryKind::Marker,
+        },
+        body: turn.body.clone(),
+        parts: turn.parts.clone(),
+    }
+}
 
 impl ConversationView {
-    pub(super) fn render_transcript(
-        &mut self,
+    pub(super) fn new_transcript(
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let active = self.pane == Pane::Transcript;
-        let stop = (active && self.picker.is_none() && !self.text_editing()).then_some(self.stop);
-        if self.data.turns.len() != self.rendered_turns {
-            self.rendered_turns = self.data.turns.len();
-            self.transcript_scroll.scroll_to_bottom();
-        }
+    ) -> (Entity<AgentConversationPanel>, Subscription) {
+        let panel = cx.new(|cx| {
+            let mut panel = AgentConversationPanel::new(
+                "Conversation",
+                "Give direction — Enter to write, Ctrl+Enter to send",
+                window,
+                cx,
+            );
+            panel.set_extra_hint("Ctrl+N new conversation");
+            panel
+        });
+        let subscription = cx.subscribe_in(&panel, window, Self::on_transcript_event);
+        (panel, subscription)
+    }
 
-        let mut turns: Vec<AnyElement> = Vec::new();
-        for (ix, turn) in self.data.turns.iter().enumerate() {
-            let id = ("turn", ix);
-            turns.push(match turn.role {
-                TurnRole::User => style::text(div())
-                    .rounded(style::radius::CONTROL)
-                    .px(style::space::RELATED)
-                    .py(style::space::INLINE)
-                    .bg(style::color::badge_fill())
-                    .child(selectable_text(id, turn.body.clone(), window, cx).w_full())
-                    .into_any_element(),
-                TurnRole::Agent if turn.body.trim().is_empty() => style::text_muted(div())
-                    .px(style::space::RELATED)
-                    .child("Done, no notes")
-                    .into_any_element(),
-                TurnRole::Agent => style::text(div())
-                    .px(style::space::RELATED)
-                    .child(selectable_markdown(id, turn.body.clone(), window, cx).w_full())
-                    .into_any_element(),
-                TurnRole::Error => div()
-                    .px(style::space::RELATED)
-                    .child(style::text_error(
-                        selectable_text(id, turn.body.clone(), window, cx).w_full(),
-                    ))
-                    .into_any_element(),
-                TurnRole::Rotation => h_flex()
-                    .items_center()
-                    .gap(style::space::RELATED)
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(style::size::BORDER)
-                            .bg(style::color::divider()),
-                    )
-                    .child(style::text_dense_muted(div()).child(ROTATION_NOTE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(style::size::BORDER)
-                            .bg(style::color::divider()),
-                    )
-                    .into_any_element(),
-            });
+    fn on_transcript_event(
+        &mut self,
+        _: &Entity<AgentConversationPanel>,
+        event: &AgentConversationEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            AgentConversationEvent::Send(text) => self.send(text, window, cx),
+            AgentConversationEvent::Stop => self.stop_turn(cx),
+            AgentConversationEvent::Activated => {
+                self.pane = Pane::Transcript;
+                self.stop = Stop::Transcript;
+                self.picker = None;
+                cx.notify();
+            }
+            AgentConversationEvent::EditingChanged(editing) => {
+                self.input_editing = *editing;
+                if *editing {
+                    self.pane = Pane::Transcript;
+                    self.stop = Stop::Transcript;
+                    self.picker = None;
+                }
+                cx.notify();
+            }
         }
-        if self.status.running {
-            turns.push(
-                style::text_muted(div())
-                    .px(style::space::RELATED)
-                    .child("Working…")
-                    .into_any_element(),
-            );
-        }
-        if turns.is_empty() {
-            let message = format!(
-                "No conversation about {} yet. Give direction below.",
-                self.data.title
-            );
-            turns.push(
-                style::empty_message(div())
-                    .p(style::space::INSET)
-                    .child(selectable_text("transcript-empty", message, window, cx))
-                    .into_any_element(),
-            );
-        }
+    }
 
-        let input_highlighted = stop == Some(Stop::Input);
-        let field = div()
-            .id("conversation-input")
-            .w_full()
-            .h(px(INPUT_HEIGHT))
-            .overflow_hidden()
-            .rounded(style::radius::CONTROL)
-            .when(input_highlighted, style::highlighted)
-            .on_click(cx.listener(|this, _, window, cx| this.enter_input_edit(window, cx)))
-            .child(
-                Textarea::new(&self.input)
-                    .disabled(!self.input_editing)
-                    .w_full()
-                    .h(px(INPUT_HEIGHT)),
-            );
-
-        let running = self.status.running;
-        v_flex()
-            .size_full()
-            .min_w_0()
-            .overflow_hidden()
-            .child(
-                style::panel_header(h_flex()).items_center().child(
-                    if active {
-                        style::text_title(div())
-                    } else {
-                        style::text_muted(div())
-                    }
-                    .child("Conversation"),
-                ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        v_flex()
-                            .id("transcript-list")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.transcript_scroll)
-                            .p(style::space::INSET)
-                            .gap(style::space::RELATED)
-                            // Turns keep their natural height; the list scrolls instead.
-                            .children(
-                                turns
-                                    .into_iter()
-                                    .map(|turn| div().w_full().flex_shrink_0().child(turn)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .occlude()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.))
-                            .child(Scrollbar::vertical(&self.transcript_scroll)),
-                    ),
-            )
-            .child(
-                style::panel_footer(v_flex()).child(field).child(
-                    h_flex()
-                        .items_center()
-                        .gap(style::space::RELATED)
-                        .child(style::text_dense_muted(div()).flex_1().min_w_0().child(
-                            if self.input_editing {
-                                "Ctrl+Enter sends · Esc stops writing"
-                            } else {
-                                "Enter to write · Ctrl+N new conversation"
-                            },
-                        ))
-                        .when(running, |el| {
-                            el.child(
-                                Button::new("conversation-stop")
-                                    .label("Stop")
-                                    .ghost()
-                                    .small()
-                                    .selected(stop == Some(Stop::Stop))
-                                    .on_click(cx.listener(|this, _, _, cx| this.stop_turn(cx))),
-                            )
-                        })
-                        .child(
-                            Button::new("conversation-send")
-                                .label("Send")
-                                .primary()
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
-                        ),
-                ),
-            )
-            .into_any_element()
+    /// Bring the panel up to date and return it for the layout.
+    pub(super) fn render_transcript(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let active = self.pane == Pane::Transcript
+            && self.stop == Stop::Transcript
+            && self.picker.is_none();
+        let entries = self.data.turns.iter().map(entry_of).collect();
+        let empty = format!(
+            "No conversation about {} yet. Give direction below.",
+            self.data.title
+        );
+        let status = self.status.clone();
+        let return_focus = self.focus_handle.clone();
+        self.transcript.update(cx, |panel, cx| {
+            panel.set_return_focus(return_focus);
+            panel.set_entries(entries, cx);
+            panel.set_empty_message(empty, cx);
+            panel.set_status(status.running, status.activity, cx);
+            panel.set_active(active, cx);
+        });
+        self.transcript.clone().into_any_element()
     }
 }

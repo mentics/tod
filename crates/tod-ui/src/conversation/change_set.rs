@@ -19,6 +19,7 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tab::Tab as TabItem;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::collections::HashMap;
@@ -600,7 +601,7 @@ impl ConversationView {
         let hint: SharedString = if selected > 0 {
             format!("{selected} selected").into()
         } else {
-            "Space select · Enter expand · R reverse · E edit · F clear flag · → links · Ctrl+. context · Ctrl+J talk about it"
+            "Enter show all · Space select · R reverse · E edit · F clear flag · → links · Ctrl+I context · Ctrl+J talk about it"
                 .into()
         };
 
@@ -699,10 +700,37 @@ impl ConversationView {
                 let host = host.clone();
                 move |_, _, cx| host.push(ChangeAction::Toggle(key), cx)
             });
+        let expanded = self.expanded.contains(&key);
+        let disclosure = style::text_muted(div())
+            .id(("change-expand", ix))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall(),
+            )
+            .tooltip(|window, cx| {
+                Tooltip::new("Show all of it (Enter)").build(window, cx)
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let host = host.clone();
+                move |_, _, cx| {
+                    host.push(ChangeAction::Select(ix), cx);
+                    host.push(ChangeAction::Expand(key), cx);
+                    cx.stop_propagation();
+                }
+            });
         let leading = h_flex()
             .flex_shrink_0()
             .items_center()
             .gap(style::space::INLINE)
+            .child(disclosure)
             .child(checkbox)
             .child(op_icon(("change-op", ix), change.op))
             .into_any_element();
@@ -753,7 +781,7 @@ impl ConversationView {
                 IconName::PanelRight,
                 ChangeAction::Context(key),
             )
-            .tooltip("Show it in its list (Ctrl+.)"),
+            .tooltip("Show it in its list (Ctrl+I)"),
         );
         actions.push(
             action(
@@ -767,6 +795,7 @@ impl ConversationView {
 
         let opts = RowOptions {
             compact: true,
+            wrap: expanded,
             leading: Some(leading),
             trailing_context: self.render_context_refs(ix, &change, window, cx),
             actions,
@@ -824,14 +853,17 @@ impl ConversationView {
                 None => div().into_any_element(),
             },
         };
-        if !self.expanded.contains(&key) {
-            return row;
+        match expanded
+            .then(|| self.render_detail(ix, &change, window, cx))
+            .flatten()
+        {
+            Some(detail) => v_flex()
+                .w_full()
+                .child(row)
+                .child(detail)
+                .into_any_element(),
+            None => row,
         }
-        v_flex()
-            .w_full()
-            .child(row)
-            .child(self.render_detail(ix, &change, window, cx))
-            .into_any_element()
     }
 
     /// The short context after a row: "from *Web client*". Each label is a
@@ -882,31 +914,31 @@ impl ConversationView {
         Some(el.into_any_element())
     }
 
-    /// Enter on a row: the full text, what changed field by field, and why
-    /// the agent was unsure.
+    /// Under an expanded row (whose own text now wraps in full): what
+    /// changed field by field, and why the agent was unsure. `None` when
+    /// there is neither.
     fn render_detail(
         &self,
         ix: usize,
         change: &NetChange,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let text = snapshot_of(change)
-            .map(|s| s.text().to_string())
-            .unwrap_or_default();
+    ) -> Option<AnyElement> {
         let diffs = field_diffs(
             change.before.as_ref(),
             change.current.as_ref(),
             &self.data.node_titles,
         );
+        if diffs.is_empty() && change.flag.is_none() {
+            return None;
+        }
         let mut detail = v_flex()
             .w_full()
             .pl(style::space::SECTION)
             .pr(style::space::RELATED)
             .pb(style::space::RELATED)
             .gap(style::space::INLINE)
-            .child(style::text_dense_muted(div()).child(super::header::op_summary(change.op)))
-            .child(selectable_text(("change-full-text", ix), text, window, cx).w_full());
+            .child(style::text_dense_muted(div()).child(super::header::op_summary(change.op)));
         for (n, diff) in diffs.into_iter().enumerate() {
             detail = detail.child(
                 v_flex()
@@ -959,7 +991,7 @@ impl ConversationView {
                     )),
             );
         }
-        detail.into_any_element()
+        Some(detail.into_any_element())
     }
 
     /// The confirmation for a reversal that needs one, over the whole view.

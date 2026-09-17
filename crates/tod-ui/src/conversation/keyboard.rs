@@ -2,9 +2,12 @@
 //!
 //! Navigation keys are bound with `excluding_input`, so they never fire while
 //! a text field is being edited; the few that must reach a text field
-//! (Ctrl+Enter, Escape, Ctrl+N) are also bound with `including_input`.
+//! (Ctrl+Enter, Escape, Ctrl+N, Ctrl+I) are also bound with `including_input`.
+//! The transcript panel's own bindings (`ui::agent_conversation`) are
+//! registered after these, so they are tried first.
 //! Ctrl+J is the app-wide `OpenAgentChat` (see `ui::agent_chat`).
 
+use crate::ui::agent_conversation::register_agent_conversation_bindings;
 use crate::ui::key_context;
 use crate::ui::pane_nav::bind_pane_nav;
 use gpui::{App, KeyBinding, actions};
@@ -76,10 +79,13 @@ pub fn register_conversation_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-n", ConversationNew, input),
     ]);
     bind_pane_nav(cx, CONVERSATION_CONTEXT);
+    register_agent_conversation_bindings(cx);
     // Registered after pane nav so they are tried first; they propagate to
     // pane nav when there is no link to move to.
     cx.bind_keys([
-        KeyBinding::new("ctrl-.", ConversationToggleContext, nav),
+        // Also while writing; text fields leave Ctrl+I unbound.
+        KeyBinding::new("ctrl-i", ConversationToggleContext, nav),
+        KeyBinding::new("ctrl-i", ConversationToggleContext, input),
         KeyBinding::new("g", ConversationGoToTasks, nav),
         KeyBinding::new("left", ConversationLinkLeft, nav),
         KeyBinding::new("right", ConversationLinkRight, nav),
