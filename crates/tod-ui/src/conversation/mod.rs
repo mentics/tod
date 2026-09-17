@@ -17,6 +17,7 @@ mod change_set;
 mod context_panel;
 mod header;
 mod keyboard;
+mod nav;
 mod transcript;
 
 #[cfg(test)]
@@ -46,6 +47,7 @@ use gpui::{
 use gpui_component::input::TextareaState;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use keyboard::*;
+use nav::NavMenu;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +95,7 @@ pub(crate) enum Pane {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stop {
     Back,
+    Forward,
     Picker,
     /// The transcript panel, whose own highlight (a chunk, the input, or
     /// Stop) Up/Down move.
@@ -107,21 +110,41 @@ pub(crate) struct HistoryEntry {
     pub conversation: Option<Uuid>,
 }
 
-/// The focuses the user came through, most recent last.
+/// The focuses the user came through, most recent last, and the trail they
+/// stepped back out of.
 #[derive(Debug, Default)]
 pub(crate) struct FocusHistory {
     entries: Vec<HistoryEntry>,
+    /// Where Forward goes, the next one last. Filled by stepping back and
+    /// abandoned by navigating somewhere new.
+    ahead: Vec<HistoryEntry>,
 }
 
 impl FocusHistory {
+    /// Record `entry` as where a fresh navigation started from.
     pub fn push(&mut self, entry: HistoryEntry) {
         if self.entries.last() != Some(&entry) {
             self.entries.push(entry);
         }
+        self.ahead.clear();
     }
 
-    pub fn pop(&mut self) -> Option<HistoryEntry> {
-        self.entries.pop()
+    /// Step back out of `here`, which becomes the head of the forward trail.
+    pub fn back(&mut self, here: HistoryEntry) -> Option<HistoryEntry> {
+        let entry = self.entries.pop()?;
+        self.ahead.push(here);
+        Some(entry)
+    }
+
+    /// Step forward again, `here` going back onto the back trail.
+    pub fn forward(&mut self, here: HistoryEntry) -> Option<HistoryEntry> {
+        let entry = self.ahead.pop()?;
+        self.entries.push(here);
+        Some(entry)
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.ahead.is_empty()
     }
 }
 
@@ -177,11 +200,25 @@ impl From<NodeRowEvent> for ChangeAction {
     }
 }
 
+/// One step of the header path: a node the user can click to focus on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Crumb {
+    pub node: Uuid,
+    pub title: String,
+}
+
 /// Everything the view shows that comes from the database.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Snapshot {
-    /// Titles from the root down to the focus's node; empty for the project.
-    pub path: Vec<String>,
+    /// The clickable steps above the focused item, root first: the nodes
+    /// above a focused node, or the chain down to the node an obligation or
+    /// plan step lives on. Empty for the project.
+    pub path: Vec<Crumb>,
+    /// The node whose children the header's drill-down lists; `None` for the
+    /// project, whose children are the top-level nodes of every list.
+    pub focus_node: Option<Uuid>,
+    /// Whether the drill-down has anything to show.
+    pub has_children: bool,
     pub title: String,
     /// Conversations about the focus, newest first.
     pub conversations: Vec<ConversationSummary>,
@@ -234,6 +271,8 @@ pub struct ConversationView {
     /// The highlighted picker entry while the picker is open. The last entry
     /// (`conversations.len()`) is "New conversation".
     picker: Option<usize>,
+    /// The header's drill-down into the focused item's children, when open.
+    nav: Option<NavMenu>,
 
     tab: Tab,
     cursor: Option<ChangeKey>,
@@ -322,6 +361,7 @@ impl ConversationView {
             input_editing: false,
             _transcript_events: transcript_events,
             picker: None,
+            nav: None,
             tab: Tab::All,
             cursor: None,
             link: None,
@@ -388,10 +428,7 @@ impl ConversationView {
         record: bool,
         cx: &mut Context<Self>,
     ) {
-        let here = HistoryEntry {
-            focus: self.focus,
-            conversation: self.conversation_id,
-        };
+        let here = self.here();
         if record && self.opened && here.focus != focus {
             self.history.push(here);
         }
@@ -408,6 +445,7 @@ impl ConversationView {
             self.editing = None;
             self.confirm = None;
             self.picker = None;
+            self.nav = None;
             self.error = None;
             self.status_line = SharedString::default();
             self.tab = Tab::All;
@@ -421,14 +459,31 @@ impl ConversationView {
         cx.notify();
     }
 
+    /// Where the view is now, as the history records it.
+    fn here(&self) -> HistoryEntry {
+        HistoryEntry {
+            focus: self.focus,
+            conversation: self.conversation_id,
+        }
+    }
+
     /// Back to the previous focus, or leave the view when there is none.
     fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.history.pop() {
+        match self.history.back(self.here()) {
             Some(entry) => {
                 self.show(entry.focus, entry.conversation, false, cx);
                 self.focus_handle.focus(window, cx);
             }
             None => cx.emit(ConversationViewEvent::Leave),
+        }
+    }
+
+    /// Forward again along the trail Back came down; nothing when there is
+    /// none.
+    fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(entry) = self.history.forward(self.here()) {
+            self.show(entry.focus, entry.conversation, false, cx);
+            self.focus_handle.focus(window, cx);
         }
     }
 
@@ -591,8 +646,22 @@ impl ConversationView {
                 node_titles.insert(node_id, title);
             }
             let title = header::display_title(&selection);
+            // Ids for the path the header makes clickable. A focused node's
+            // own title is the header title, so `selection.path` is one step
+            // shorter than its chain and the zip drops the node itself.
+            let chain = match selection.node {
+                Some(node) => tod_store::outline::ancestor_chain(conn, node)?,
+                None => Vec::new(),
+            };
+            let path = chain
+                .into_iter()
+                .zip(selection.path)
+                .map(|(node, title)| Crumb { node, title })
+                .collect();
             Ok(Snapshot {
-                path: selection.path,
+                path,
+                has_children: nav::has_children(conn, selection.node)?,
+                focus_node: selection.node,
                 title,
                 conversations,
                 turns,
@@ -764,11 +833,11 @@ impl ConversationView {
 
     /// The transcript pane's stops, top to bottom.
     pub(crate) fn stops(&self) -> Vec<Stop> {
-        vec![Stop::Back, Stop::Picker, Stop::Transcript]
+        vec![Stop::Back, Stop::Forward, Stop::Picker, Stop::Transcript]
     }
 
     fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.confirm.is_some() {
+        if self.confirm.is_some() || self.nav_move(delta, cx) {
             return;
         }
         if let Some(ix) = self.picker {
@@ -823,6 +892,9 @@ impl ConversationView {
             self.confirm_reverse(cx);
             return;
         }
+        if self.nav_activate(window, cx) {
+            return;
+        }
         if let Some(ix) = self.picker {
             self.choose_picker_entry(ix, window, cx);
             return;
@@ -830,6 +902,7 @@ impl ConversationView {
         match self.pane {
             Pane::Transcript => match self.stop {
                 Stop::Back => self.go_back(window, cx),
+                Stop::Forward => self.go_forward(window, cx),
                 Stop::Picker => self.open_picker(cx),
                 Stop::Transcript => {
                     if self.transcript.read(cx).highlight() == PanelStop::Input {
@@ -862,6 +935,7 @@ impl ConversationView {
     fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.confirm.take().is_some() {
             cx.notify();
+        } else if self.close_nav_menu(cx) {
         } else if self.picker.take().is_some() {
             cx.notify();
         } else if self.pane == Pane::Context {
@@ -1090,11 +1164,17 @@ impl Render for ConversationView {
             // Plain Left/Right walk the highlighted row's links first, and
             // move panes (the next binding) when they have nowhere to go.
             .on_action(cx.listener(|this, _: &ConversationLinkLeft, _, cx| {
+                if this.nav_collapse(cx) {
+                    return;
+                }
                 if this.text_editing() || !this.link_left(cx) {
                     cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &ConversationLinkRight, _, cx| {
+                if this.nav_expand(cx) {
+                    return;
+                }
                 if this.text_editing() || !this.link_right(cx) {
                     cx.propagate();
                 }
@@ -1107,6 +1187,8 @@ impl Render for ConversationView {
             .activate(window, cx));
         let root = nav_action!(root, cx, ConversationBack, |this, window, cx| this
             .go_back(window, cx));
+        let root = nav_action!(root, cx, ConversationForward, |this, window, cx| this
+            .go_forward(window, cx));
         let root = nav_action!(root, cx, ConversationToggleSelect, |this, window, cx| {
             if this.pane == Pane::ChangeSet
                 && let Some(key) = this.cursor

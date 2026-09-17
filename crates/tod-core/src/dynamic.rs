@@ -60,6 +60,9 @@ pub struct FocusSelection {
     /// Titles of the nodes above the focused item, root first. For an
     /// obligation or plan step this ends with the node it lives on.
     pub path: Vec<String>,
+    /// The node the focus is on: the focused node itself, or the node an
+    /// obligation or plan step lives on. `None` for the project.
+    pub node: Option<Uuid>,
     /// A node's title; an obligation's or plan step's short label.
     pub title: String,
     /// The focused node's slug, or the slug of the node an item lives on.
@@ -352,6 +355,7 @@ mod tests {
         let focus = FocusSelection {
             focus: Focus::PlanStep { node, id: step },
             path: vec!["Root".into(), "Auth".into()],
+            node: Some(node),
             title: "Plan step 00000000".into(),
             slug: Some("auth".into()),
             text: Some("Hash passwords with argon2.".into()),
@@ -371,6 +375,7 @@ mod tests {
         let project = FocusSelection {
             focus: Focus::Project,
             path: Vec::new(),
+            node: None,
             title: "The whole project".into(),
             slug: None,
             text: None,

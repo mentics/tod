@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Mutex;
 use tod_agent::MockAgentProvider;
 use tod_store::conversation::{NetOp, actor_for};
-use tod_store::outline::OutlineMutation;
+use tod_store::outline::{CreatePosition, OutlineMutation};
 
 type Events = Rc<RefCell<Vec<ConversationViewEvent>>>;
 
@@ -126,13 +126,134 @@ fn focus_history_skips_repeats_and_pops_newest_first() {
         focus,
         conversation: None,
     };
+    let here = entry(Focus::Node(Uuid::new_v4()));
     let mut history = FocusHistory::default();
     history.push(entry(Focus::Project));
     history.push(entry(Focus::Node(node)));
     history.push(entry(Focus::Node(node)));
-    assert_eq!(history.pop(), Some(entry(Focus::Node(node))));
-    assert_eq!(history.pop(), Some(entry(Focus::Project)));
-    assert_eq!(history.pop(), None);
+    assert_eq!(history.back(here), Some(entry(Focus::Node(node))));
+    assert_eq!(
+        history.back(entry(Focus::Node(node))),
+        Some(entry(Focus::Project))
+    );
+    assert_eq!(history.back(entry(Focus::Project)), None);
+}
+
+#[test]
+fn forward_retraces_the_trail_back_came_down_until_a_new_step() {
+    let (a, b) = (Focus::Node(Uuid::new_v4()), Focus::Node(Uuid::new_v4()));
+    let entry = |focus| HistoryEntry {
+        focus,
+        conversation: None,
+    };
+    let mut history = FocusHistory::default();
+    history.push(entry(Focus::Project));
+    history.push(entry(a));
+    // Project <- a <- b, now standing on b.
+    assert!(!history.can_go_forward());
+    assert_eq!(history.back(entry(b)), Some(entry(a)));
+    assert_eq!(history.back(entry(a)), Some(entry(Focus::Project)));
+    assert!(history.can_go_forward());
+    assert_eq!(history.forward(entry(Focus::Project)), Some(entry(a)));
+    assert_eq!(history.forward(entry(a)), Some(entry(b)));
+    assert!(!history.can_go_forward());
+
+    // Stepping somewhere new abandons the forward trail.
+    assert_eq!(history.back(entry(b)), Some(entry(a)));
+    history.push(entry(a));
+    assert!(!history.can_go_forward());
+}
+
+/// A child node of `parent` (or a top-level one), returning its id.
+fn add_node(fixture: &Fixture, parent: Option<Uuid>, title: &str) -> Uuid {
+    let node_id = Uuid::new_v4();
+    let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::CreateNode {
+            node_id: Some(node_id),
+            list_id,
+            parent_id: parent,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: title.into(),
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    node_id
+}
+
+fn crumbs(view: &Entity<ConversationView>, cx: &mut VisualTestContext) -> Vec<String> {
+    view.read_with(cx, |view, _| {
+        view.data.path.iter().map(|c| c.title.clone()).collect()
+    })
+}
+
+#[gpui::test]
+fn the_header_path_runs_from_the_root_to_the_focus(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let auth = add_node(&fixture, Some(fixture.node_id), "Auth");
+    let login = add_node(&fixture, Some(auth), "Login");
+
+    // A node's own title is the header title; every node above it is a crumb.
+    let (view, _, cx) = open_view(&fixture, Focus::Node(login), cx);
+    assert_eq!(crumbs(&view, cx), vec!["Web client", "Auth"]);
+    view.read_with(cx, |view, _| assert_eq!(view.data.title, "Login"));
+
+    // An obligation lives on a node, so its path ends with that node.
+    view.update(cx, |view, cx| {
+        let focus = Focus::Obligation {
+            node: fixture.node_id,
+            id: fixture.offline_obligation,
+        };
+        view.show(focus, None, true, cx);
+    });
+    assert_eq!(crumbs(&view, cx), vec!["Web client"]);
+}
+
+#[gpui::test]
+fn the_drill_down_walks_into_the_tree_and_refocuses(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let auth = add_node(&fixture, Some(fixture.node_id), "Auth");
+    let login = add_node(&fixture, Some(auth), "Login");
+    let (view, _, cx) = open_view(&fixture, Focus::Project, cx);
+
+    // From the project, the drill-down starts at the top-level nodes.
+    view.update(cx, |view, cx| view.open_nav_menu(cx));
+    let titles = |view: &ConversationView| -> Vec<String> {
+        view.nav_rows().into_iter().map(|row| row.title).collect()
+    };
+    view.read_with(cx, |view, _| {
+        assert_eq!(titles(view), vec!["Web client"]);
+    });
+
+    // Right expands, Down moves, and Enter focuses the node two levels down.
+    view.update(cx, |view, cx| {
+        assert!(view.nav_expand(cx));
+        assert_eq!(titles(view), vec!["Web client", "Auth"]);
+        assert!(view.nav_move(1, cx));
+        assert!(view.nav_expand(cx));
+        assert_eq!(titles(view), vec!["Web client", "Auth", "Login"]);
+        assert!(view.nav_move(1, cx));
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| assert!(view.nav_activate(window, cx)));
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.focus(), Focus::Node(login));
+        assert!(view.nav.is_none());
+    });
+    assert_eq!(crumbs(&view, cx), vec!["Web client", "Auth"]);
+
+    // The drill-down is a normal navigation: Back returns to the project,
+    // Forward comes here again.
+    cx.dispatch_action(ConversationBack);
+    view.read_with(cx, |view, _| assert_eq!(view.focus(), Focus::Project));
+    cx.dispatch_action(ConversationForward);
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.focus(), Focus::Node(login));
+        assert!(!view.history.can_go_forward());
+    });
 }
 
 #[gpui::test]
@@ -287,8 +408,9 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     assert!(!view.read_with(cx, |v, _| v.input_editing));
     assert!(!tab_stop(&view, cx));
 
-    // With no turns, stops run Back, Picker, then the transcript's input,
-    // and stop at the ends.
+    // With no turns, stops run Back, Forward, Picker, then the transcript's
+    // input, and stop at the ends.
+    cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
@@ -329,7 +451,13 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
 
     let fixture = Fixture::new();
     let conversation = create_conversation(&fixture, Focus::Project);
-    append_turn(&fixture, conversation, TurnRole::User, "Tidy it up", Vec::new());
+    append_turn(
+        &fixture,
+        conversation,
+        TurnRole::User,
+        "Tidy it up",
+        Vec::new(),
+    );
     append_turn(
         &fixture,
         conversation,
@@ -360,7 +488,14 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
 
     // The messages and the answer are open; narration, thinking, and the
     // tool call are one line each.
-    assert!(expanded(&view, ChunkId { entry: 0, part: None }, cx));
+    assert!(expanded(
+        &view,
+        ChunkId {
+            entry: 0,
+            part: None
+        },
+        cx
+    ));
     assert!(expanded(&view, chunk(None), cx));
     assert!(!expanded(&view, chunk(Some(0)), cx));
     assert!(!expanded(&view, chunk(Some(1)), cx));
@@ -394,11 +529,13 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
         view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
         PanelStop::Input
     );
-    // Above the first message is the picker.
+    // Above the first message is the picker, then Forward and Back.
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Picker);
+    cx.dispatch_action(ConversationUp);
+    assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Forward);
 }
 
 #[gpui::test]
@@ -1111,6 +1248,7 @@ fn display_title_is_one_line_and_bounded() {
     let item = |text: Option<&str>| FocusSelection {
         focus: Focus::PlanStep { node, id },
         path: Vec::new(),
+        node: Some(node),
         title: "plan step 1234abcd (pending)".into(),
         slug: None,
         text: text.map(str::to_string),
@@ -1123,10 +1261,7 @@ fn display_title_is_one_line_and_bounded() {
     let long = display_title(&item(Some(&"word ".repeat(100))));
     assert!(long.ends_with('…') && long.chars().count() <= 201, "{long}");
     // A deleted item has no text; the ids label is all there is.
-    assert_eq!(
-        display_title(&item(None)),
-        "plan step 1234abcd (pending)"
-    );
+    assert_eq!(display_title(&item(None)), "plan step 1234abcd (pending)");
     let node_focus = FocusSelection {
         focus: Focus::Node(node),
         title: "Auth".into(),
