@@ -473,29 +473,44 @@ impl TaskListView {
             this.focus_handle.focus(window, cx);
         });
 
+        // Only this process writes the store, and every commit broadcasts a
+        // change, so the view never reloads on a timer -- it reloads when (and
+        // only when) something actually changed. The reload itself runs on the
+        // background executor and its result is diffed against what is already
+        // in memory, so an unrelated commit costs nothing and a changed row
+        // patches just that row (see `apply_live_snapshot`).
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
         cx.spawn(async move |_, cx| {
             let mut fleet_rx = fleet_for_poll.subscribe_changes();
-            let mut ticks = 0u32;
             loop {
                 cx.background_executor()
-                    .timer(std::time::Duration::from_millis(500))
+                    .timer(std::time::Duration::from_millis(200))
                     .await;
                 let mut changed = false;
                 while fleet_rx.try_recv().is_ok() {
                     changed = true;
                 }
-                ticks = ticks.saturating_add(1);
-                if changed || ticks >= 6 {
-                    ticks = 0;
-                    let Ok(()) = poll_entity.update(cx, |this, cx| {
-                        this.pending_live_refresh = true;
-                        cx.notify();
-                    }) else {
-                        break;
-                    };
+                if !changed {
+                    continue;
                 }
+                let Ok(list_id) = poll_entity.update(cx, |this, _| this.active_list_id) else {
+                    break;
+                };
+                let fleet = fleet_for_poll.clone();
+                let snapshot = cx
+                    .background_spawn(async move {
+                        LiveSnapshot {
+                            lists: fleet.list_outline_lists().unwrap_or_default(),
+                            tasks: load_tasks_from_store(&fleet, list_id),
+                        }
+                    })
+                    .await;
+                let Ok(()) = poll_entity.update(cx, |this, cx| {
+                    this.apply_live_snapshot(list_id, snapshot, cx);
+                }) else {
+                    break;
+                };
             }
         })
         .detach();
@@ -546,6 +561,7 @@ impl TaskListView {
             .and_then(|id| visible.iter().position(|t| &t.id == id))
             .map(IndexPath::new);
 
+        let selection_moved_from = self.last_selected;
         self.list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(visible);
             state
@@ -561,7 +577,10 @@ impl TaskListView {
                 .delegate_mut()
                 .set_recently_updated(self.recently_updated_copy_ids.clone());
             state.set_selected_index(selected_ix, window, cx);
-            if selected_ix.is_some() {
+            // Only chase the selection when it actually moved. A rebuild the
+            // user did not ask for (a background change to the tree) must not
+            // yank the viewport back from wherever they scrolled to.
+            if selected_ix.is_some() && selected_ix != selection_moved_from {
                 state.scroll_to_selected_item(window, cx);
             }
             cx.notify();
@@ -1480,6 +1499,49 @@ impl TaskListView {
             }
         }
         self.all_tasks = tasks;
+    }
+
+    /// Apply a reload that the change watcher read off the UI thread.
+    ///
+    /// The common case -- a commit that changed some rows' fields but not the
+    /// shape of the tree -- replaces just those rows and leaves selection,
+    /// scroll position and the persisted working set untouched. A commit that
+    /// changed nothing this view shows costs a comparison and no redraw at
+    /// all. Anything that adds, removes or moves a visible row falls back to
+    /// `live_refresh`, which fixes up selection and needs a `Window`, so it
+    /// runs on the next render.
+    fn apply_live_snapshot(
+        &mut self,
+        loaded_for: Option<uuid::Uuid>,
+        mut snapshot: LiveSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        // A draft row lives only in memory, and the active list may have moved
+        // on while the read was in flight; neither is this path's to reconcile.
+        if self.draft.is_some()
+            || self.active_list_id != loaded_for
+            || snapshot.lists != self.outline_lists
+        {
+            self.request_live_refresh(cx);
+            return;
+        }
+        for task in &mut snapshot.tasks {
+            task.in_flight_activity = self.agent_activity.get(&task.id).cloned();
+        }
+        if snapshot.tasks == self.all_tasks {
+            return;
+        }
+        let visible = Self::visible_tasks(&snapshot.tasks, &self.search_query, &self.working_set);
+        if !same_visible_rows(self.list_state.read(cx).delegate().items(), &visible) {
+            self.request_live_refresh(cx);
+            return;
+        }
+        self.all_tasks = snapshot.tasks;
+        self.list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_items(visible);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2567,6 +2629,20 @@ impl TaskListView {
     }
 }
 
+/// Whether two ordered row sets show the same rows in the same places -- only
+/// their field values may differ. An added, removed or moved row is not a
+/// match: fixing up the selection for one is `live_refresh`'s job.
+fn same_visible_rows(shown: &[TaskItem], next: &[TaskItem]) -> bool {
+    shown.len() == next.len() && shown.iter().zip(next).all(|(a, b)| a.id == b.id)
+}
+
+/// One reload of everything this view draws, read on the background
+/// executor so the store queries never run on the UI thread.
+struct LiveSnapshot {
+    lists: Vec<tod_store::outline::types::OutlineList>,
+    tasks: Vec<TaskItem>,
+}
+
 enum BodyState {
     Empty,
     NoMatches,
@@ -2762,6 +2838,21 @@ mod tests {
     use super::model::filter_and_sort_tasks;
     use super::model::selection_after_delete;
     use super::model::{SortDirection, SortKey};
+
+    #[test]
+    fn same_visible_rows_ignores_field_changes_but_not_shape_changes() {
+        let rows = large_fixture_set(3);
+        let mut retitled = rows.clone();
+        retitled[1].title = "Renamed".into();
+        assert!(super::same_visible_rows(&rows, &retitled));
+
+        let removed: Vec<_> = rows.iter().skip(1).cloned().collect();
+        assert!(!super::same_visible_rows(&rows, &removed));
+
+        let mut reordered = rows.clone();
+        reordered.swap(0, 1);
+        assert!(!super::same_visible_rows(&rows, &reordered));
+    }
 
     #[test]
     fn large_fixture_set_reaches_scale_target() {
