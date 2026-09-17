@@ -166,6 +166,13 @@ pub enum TaskEditEvent {
         task_id: String,
         title: String,
     },
+    /// A generator refresh stopped before fetching anything because the
+    /// Linear API key is not stored. The panel has no prompt of its own; the
+    /// shell routes this to the task list, which collects the key and
+    /// resumes the refresh.
+    LinearCredentialsRequired {
+        node_id: uuid::Uuid,
+    },
 }
 
 /// One row of the generator configuration form, built from the selected data
@@ -489,6 +496,19 @@ impl TaskEditView {
             self.close(cx);
             return;
         }
+        cx.notify();
+    }
+
+    /// Pick up a generator refresh that ran somewhere else (the tree's own
+    /// refresh action, or the credential prompt resuming one this panel
+    /// blocked on). Does nothing unless the panel is showing that generator.
+    pub fn reload_generator_for(&mut self, node_id: uuid::Uuid, cx: &mut Context<Self>) {
+        if self.node_uuid() != Some(node_id) {
+            return;
+        }
+        let _ = self.fleet.reload_if_stale();
+        self.generator_busy = None;
+        self.reload_generator_status();
         cx.notify();
     }
 
@@ -1480,7 +1500,9 @@ impl TaskEditView {
         let fleet = self.fleet.clone();
         let source_for_task = data_source_type.clone();
         cx.spawn(async move |this, cx| {
-            let result: Result<(), String> = cx
+            // `bool`: the save landed but its first refresh stopped for want
+            // of the Linear API key, which the panel turns into a prompt below.
+            let result: Result<bool, String> = cx
                 .background_spawn(async move {
                     let refresh_due = tod_core::generator::save_generator_config(
                         &fleet,
@@ -1488,12 +1510,16 @@ impl TaskEditView {
                         &source_for_task,
                         &config_json,
                     )?;
-                    if refresh_due {
-                        // The save already succeeded; a failed first refresh is
-                        // recorded on the generator's refresh status instead.
-                        let _ = tod_core::generator::refresh_generator(&fleet, node_id);
+                    if !refresh_due {
+                        return Ok(false);
                     }
-                    Ok(())
+                    // The save already succeeded; any other failed first
+                    // refresh is recorded on the generator's refresh status
+                    // instead.
+                    match tod_core::generator::refresh_generator(&fleet, node_id) {
+                        Err(err) => Ok(err.needs_linear_api_key()),
+                        Ok(_) => Ok(false),
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1507,7 +1533,7 @@ impl TaskEditView {
                 }
                 this.generator_busy = None;
                 match result {
-                    Ok(()) => {
+                    Ok(needs_credentials) => {
                         this.generator_data_source_type = Some(data_source_type);
                         this.generator_pending_source_type = None;
                         this.generator_config_error = None;
@@ -1516,6 +1542,9 @@ impl TaskEditView {
                         this.generator_saved_config = Some(this.generator_config_value(cx));
                         this.clamp_focus_index();
                         this.notify_changed(cx);
+                        if needs_credentials {
+                            cx.emit(TaskEditEvent::LinearCredentialsRequired { node_id });
+                        }
                     }
                     Err(err) => {
                         this.generator_config_error = Some(err);
@@ -1558,8 +1587,17 @@ impl TaskEditView {
                 }
                 this.generator_busy = None;
                 this.reload_generator_status();
-                if let Err(err) = result {
-                    this.pending_toast = Some(format!("Refresh failed: {err}"));
+                match result {
+                    Ok(_) => {}
+                    // Nothing was fetched and there is a key to collect, so
+                    // ask for it rather than leaving the user with an error
+                    // and nowhere to enter one.
+                    Err(err) if err.needs_linear_api_key() => {
+                        cx.emit(TaskEditEvent::LinearCredentialsRequired { node_id });
+                    }
+                    Err(err) => {
+                        this.pending_toast = Some(format!("Refresh failed: {err}"));
+                    }
                 }
                 this.notify_changed(cx);
             });
