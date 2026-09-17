@@ -1,5 +1,6 @@
 mod compose;
 mod credential_prompt;
+use credential_prompt::PendingCredentialRequest;
 mod delegate;
 mod edit;
 pub(crate) mod fixtures;
@@ -209,6 +210,12 @@ pub enum TaskListEvent {
         #[allow(dead_code)]
         lifecycle: String,
     },
+    /// A generator refresh finished and rewrote its managed subtree. The
+    /// edit panel reloads from it, so its refresh status and error do not go
+    /// stale when the refresh was driven from anywhere but that panel.
+    GeneratorRefreshed {
+        node_id: uuid::Uuid,
+    },
     /// The tree selection changed (`None`: nothing selected). The right
     /// drawer follows it, whichever panel it is showing.
     SelectionChanged {
@@ -256,7 +263,7 @@ pub struct TaskListView {
     compose_title_input: Entity<InputState>,
     credential_prompt_open: bool,
     credential_input: Entity<InputState>,
-    pending_credential_request: Option<credential_prompt::PendingCredentialRequest>,
+    pending_credential_request: Option<PendingCredentialRequest>,
     pending_credential_submit: bool,
     selection_before_compose: Option<String>,
     open_row_menu: Option<(RowMenuKind, String)>,
@@ -821,6 +828,18 @@ impl TaskListView {
         let Ok(node_id) = uuid::Uuid::parse_str(&generator_id) else {
             return;
         };
+        self.start_generator_refresh(node_id, window, cx);
+    }
+
+    /// Refresh one generator node, whoever asked for it: the tree's own
+    /// action, the credential prompt resuming a refresh it blocked, or the
+    /// edit panel routing through the shell.
+    pub(super) fn start_generator_refresh(
+        &mut self,
+        node_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The fetch reaches the network, so it runs on the background executor
         // and the user keeps working; the row shows "refreshing…" meanwhile,
         // off the generator's own in-progress status.
@@ -836,6 +855,17 @@ impl TaskListView {
                     Ok(updated_ids) => {
                         this.recently_updated_copy_ids
                             .extend(updated_ids.into_iter().map(|id| id.to_string()));
+                        cx.emit(TaskListEvent::GeneratorRefreshed { node_id });
+                    }
+                    // Nothing was fetched and there is a key to collect, so
+                    // ask for it and pick the refresh back up, rather than
+                    // reporting a failure the user has no way to act on.
+                    Err(err) if err.needs_linear_api_key() => {
+                        this.open_linear_credential_prompt(
+                            PendingCredentialRequest::GeneratorRefresh { node_id },
+                            window,
+                            cx,
+                        );
                     }
                     Err(err) => this.show_error(format!("Refresh failed: {err}"), window, cx),
                 }
@@ -844,6 +874,22 @@ impl TaskListView {
         })
         .detach();
         self.live_refresh(window, cx);
+    }
+
+    /// Open the Linear API key prompt on behalf of another view (the edit
+    /// panel, routed through the shell), resuming that generator's refresh
+    /// once the key is saved.
+    pub fn prompt_linear_credentials_for_generator(
+        &mut self,
+        node_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_linear_credential_prompt(
+            PendingCredentialRequest::GeneratorRefresh { node_id },
+            window,
+            cx,
+        );
     }
 
     fn set_collapsed(

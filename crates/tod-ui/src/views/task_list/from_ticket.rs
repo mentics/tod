@@ -55,7 +55,7 @@ impl TaskListView {
         let store = CredentialStore::from_data_root(&self.config_dir);
         let Some(api_key) = resolve_linear_api_key(&store) else {
             self.open_linear_credential_prompt(
-                PendingCredentialRequest {
+                PendingCredentialRequest::TicketImport {
                     ticket: ticket.to_string(),
                     draft_node_id: draft_node_id.map(str::to_string),
                 },
@@ -113,7 +113,7 @@ impl TaskListView {
             let store = CredentialStore::from_data_root(&self.config_dir);
             let _ = store.delete(tod_store::CredentialKind::LinearApiKey);
             self.open_linear_credential_prompt(
-                PendingCredentialRequest {
+                PendingCredentialRequest::TicketImport {
                     ticket: pending.ticket.clone(),
                     draft_node_id: pending.draft_node_id.clone(),
                 },
