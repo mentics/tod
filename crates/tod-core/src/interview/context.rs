@@ -4,7 +4,7 @@
 
 use crate::node_context::{
     node_title, obligation_line, one_line, plan_step_line, render_inherited_context,
-    write_obligations_by_kind, write_purpose_chain, write_snapshot_header,
+    write_obligations_by_kind, write_snapshot_header,
 };
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -13,7 +13,7 @@ use std::path::Path;
 use tod_store::interview::*;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, KIND_CONSTRAINT, NodeObligation, ancestor_chain, phase_visible,
+    EXTRA_CONTENT_DETAILS, EXTRA_CONTENT_SUMMARY, KIND_CONSTRAINT, NodeObligation, ancestor_chain, phase_visible,
     uuid_to_blob,
 };
 use uuid::Uuid;
@@ -37,9 +37,9 @@ pub fn estimate_tokens(text: &str) -> i64 {
 
 /// Content types part of a phase's context. Design decisions live as
 /// design-phase obligations now (see `resolve_obligations`), not as an extra
-/// content blob, so every phase only ever needs `goal` here.
+/// content blob, so every phase only ever needs `details` here.
 fn phase_content_types(_phase: &str) -> &'static [&'static str] {
-    &["goal"]
+    &[EXTRA_CONTENT_DETAILS]
 }
 
 fn indent(text: &str, prefix: &str) -> String {
@@ -70,8 +70,6 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>) -> Result<String> {
         "You are the {}.",
         scope.role.as_str().replace('-', " ")
     )?;
-
-    write_purpose_chain(&mut out, conn, &nodes, scope.node_id)?;
 
     let local: Vec<NodeObligation> = ObligationRepo::new(conn)
         .list_for_node(scope.node_id)?
@@ -285,10 +283,10 @@ pub fn delta(
                 };
                 let node = tod_store::outline::blob_to_uuid(&node_blob)?;
                 if node != scope.node_id {
-                    if ty == EXTRA_CONTENT_GOAL {
+                    if ty == EXTRA_CONTENT_SUMMARY {
                         writeln!(
                             content_lines,
-                            "~ purpose of \"{}\": {}",
+                            "~ summary of \"{}\": {}",
                             node_title(&nodes, node),
                             one_line(&body)
                         )?;
@@ -730,7 +728,7 @@ mod tests {
         let set = |body: &str| {
             fx.outline(OutlineMutation::SetExtraContent {
                 node_id: fx.node,
-                content_type: "goal".into(),
+                content_type: "details".into(),
                 body: body.into(),
             })
         };
@@ -739,7 +737,7 @@ mod tests {
         set("First decision.\n\nSecond decision.");
 
         let changes = fx.delta(Role::AnswerProcessor, PHASE_REQUIREMENTS, base, AGENT);
-        assert!(changes.contains("+ goal (appended):"), "{changes}");
+        assert!(changes.contains("+ details (appended):"), "{changes}");
         assert!(changes.contains("Second decision."), "{changes}");
         assert!(!changes.contains("First decision."), "{changes}");
     }

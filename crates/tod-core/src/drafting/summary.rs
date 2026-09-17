@@ -1,7 +1,8 @@
-//! Node summaries: the few sentences that stand in for an ancestor's
-//! requirements in its descendants' context. The drafting driver writes any
-//! that are missing before a turn, so context never lists an ancestor's
-//! requirements instead.
+//! Node summaries: the few sentences, generated from a Spec node's details and
+//! obligations, that are all its descendants inherit of its scope. The
+//! drafting driver writes any that are missing or stale before a turn, so
+//! context never lists an ancestor's requirements instead, nor an account of
+//! it that no longer holds.
 
 use crate::drafting::driver::tagged_block;
 use anyhow::Result;
@@ -11,7 +12,7 @@ use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use tod_store::outline::{
-    EXTRA_CONTENT_GOAL, EXTRA_CONTENT_SUMMARY, KIND_CONSTRAINT, ancestor_chain, resolve_obligations,
+    Capability, EXTRA_CONTENT_DETAILS, KIND_CONSTRAINT, ancestor_chain,
 };
 use uuid::Uuid;
 
@@ -21,31 +22,43 @@ pub(crate) const NODE_SUMMARY_CLOSE: &str = "</node-summary>";
 
 use crate::node_context::one_line;
 
-pub fn has_summary(nodes: &NodeRepo<'_>, node_id: Uuid) -> bool {
+/// True when the node has a summary written since its details and
+/// obligations last changed.
+pub fn is_current(nodes: &NodeRepo<'_>, node_id: Uuid) -> bool {
     nodes
-        .get_extra_content(node_id, EXTRA_CONTENT_SUMMARY)
+        .get_summary(node_id)
         .ok()
         .flatten()
-        .is_some_and(|s| !s.trim().is_empty())
+        .is_some_and(|s| !s.stale)
 }
 
-/// Ancestors whose requirements reach `node_id`'s context and that have no
-/// summary to stand in for them, root first. An ancestor with only
-/// constraints needs none: constraints are shown in full.
-pub fn missing(conn: &Connection, node_id: Uuid, max_phase: Option<&str>) -> Result<Vec<Uuid>> {
+/// True when the node has something to summarize: details, or requirements.
+/// A node with only constraints needs no summary, since constraints are
+/// inherited in full.
+fn needs_summary(conn: &Connection, nodes: &NodeRepo<'_>, node_id: Uuid) -> Result<bool> {
+    let has_details = nodes
+        .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)?
+        .is_some_and(|d| !d.trim().is_empty());
+    Ok(has_details
+        || ObligationRepo::new(conn)
+            .list_for_node(node_id)?
+            .iter()
+            .any(|o| o.kind != KIND_CONSTRAINT))
+}
+
+/// Spec ancestors of `node_id` whose summary is missing or stale, root first.
+pub fn missing(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
     let nodes = NodeRepo::new(conn);
     let mut out = Vec::new();
-    for item in resolve_obligations(conn, node_id, max_phase)? {
-        let source = item.source_node_id;
-        if source == node_id
-            || source.is_nil()
-            || item.obligation.kind == KIND_CONSTRAINT
-            || out.contains(&source)
+    for id in ancestor_chain(conn, node_id)?
+        .into_iter()
+        .filter(|id| *id != node_id)
+    {
+        if nodes.list_capabilities(id)?.contains(&Capability::Spec)
+            && !is_current(&nodes, id)
+            && needs_summary(conn, &nodes, id)?
         {
-            continue;
-        }
-        if !has_summary(&nodes, source) {
-            out.push(source);
+            out.push(id);
         }
     }
     Ok(out)
@@ -58,9 +71,9 @@ pub fn request(conn: &Connection, node_id: Uuid) -> Result<(String, String)> {
     let mut out = String::from(
         "# Summarize a node\n\n\
          Agents working on this node's descendants see your summary in place of its \
-         requirements; its constraints reach them in full. In 1 to 3 sentences, say what \
-         the node is and what it covers, so a descendant knows what is already settled \
-         above it. No constraints, implementation detail, or ids.\n\n\
+         details and requirements; its constraints reach them in full. In 1 to 3 \
+         sentences, say what the node is and what it covers, so a descendant knows what \
+         is already settled above it. No constraints, implementation detail, or ids.\n\n\
          Everything you need is below: don't run tools or read files. Reply with only \
          the summary inside <node-summary> tags.\n\n",
     );
@@ -73,11 +86,11 @@ pub fn request(conn: &Connection, node_id: Uuid) -> Result<(String, String)> {
     if !path.is_empty() {
         writeln!(out, "Part of: {}", path.join(" › "))?;
     }
-    if let Some(goal) = nodes
-        .get_extra_content(node_id, EXTRA_CONTENT_GOAL)?
-        .filter(|g| !g.trim().is_empty())
+    if let Some(details) = nodes
+        .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)?
+        .filter(|d| !d.trim().is_empty())
     {
-        writeln!(out, "Goal: {}", one_line(&goal))?;
+        write!(out, "\n## Details\n\n{}\n", details.trim())?;
     }
     out.push_str("\n## Requirements\n\n");
     for o in ObligationRepo::new(conn)

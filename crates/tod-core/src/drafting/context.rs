@@ -5,8 +5,7 @@
 use crate::drafting::DraftingMode;
 use crate::interview::context::ContextScope;
 use crate::node_context::{
-    one_line, render_inherited_context, write_obligations_by_kind, write_purpose_chain,
-    write_snapshot_header,
+    one_line, render_inherited_context, write_obligations_by_kind, write_snapshot_header,
 };
 use anyhow::Result;
 use rusqlite::Connection;
@@ -14,7 +13,7 @@ use std::fmt::Write as _;
 use tod_store::drafting::*;
 use tod_store::interview::short_id;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::{EXTRA_CONTENT_GOAL, phase_visible};
+use tod_store::outline::{EXTRA_CONTENT_DETAILS, phase_visible};
 
 /// One obligation as the drafter sees it: id, kind, provenance, and (for
 /// `agent` ones) attention with its reason. Its section is the heading it is
@@ -79,13 +78,12 @@ pub fn snapshot(conn: &Connection, scope: &ContextScope<'_>, mode: DraftingMode)
     )?;
     writeln!(out, "Phase: {}", scope.phase)?;
 
-    write_purpose_chain(&mut out, conn, &nodes, scope.node_id)?;
-    out.push_str("\n## Goal\n\n");
+    out.push_str("\n## Details\n\n");
     match nodes
-        .get_extra_content(scope.node_id, EXTRA_CONTENT_GOAL)?
-        .filter(|g| !g.trim().is_empty())
+        .get_extra_content(scope.node_id, EXTRA_CONTENT_DETAILS)?
+        .filter(|d| !d.trim().is_empty())
     {
-        Some(goal) => writeln!(out, "{}", goal.trim())?,
+        Some(details) => writeln!(out, "{}", details.trim())?,
         None => out.push_str("(none yet)\n"),
     }
 

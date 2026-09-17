@@ -12,7 +12,7 @@ use tod_store::drafting::*;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::*;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::{EXTRA_CONTENT_GOAL, KIND_REQUIREMENT, OutlineMutation};
+use tod_store::outline::{EXTRA_CONTENT_DETAILS, KIND_REQUIREMENT, OutlineMutation};
 use uuid::Uuid;
 
 /// How the mock reaches the data: through [`InterviewClient`] in the app, or
@@ -136,14 +136,14 @@ pub(crate) fn drafter(client: &impl Access, row: &AgentSessionRow, text: &str) -
         };
         let parts = pieces(&dump.body);
         if capture {
-            let goal = client
-                .read(|conn| NodeRepo::new(conn).get_extra_content(node, EXTRA_CONTENT_GOAL))?;
-            if goal.is_none_or(|g| g.trim().is_empty()) {
+            let details = client
+                .read(|conn| NodeRepo::new(conn).get_extra_content(node, EXTRA_CONTENT_DETAILS))?;
+            if details.is_none_or(|d| d.trim().is_empty()) {
                 if let Some(first) = parts.first() {
                     client.interview(InterviewCommand::Outline {
                         mutation: OutlineMutation::SetExtraContent {
                             node_id: node,
-                            content_type: EXTRA_CONTENT_GOAL.into(),
+                            content_type: EXTRA_CONTENT_DETAILS.into(),
                             body: sentence(first),
                         },
                         target: None,

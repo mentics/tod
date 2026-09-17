@@ -787,8 +787,8 @@ fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) ->
         }
         ProposalOp::Content => {
             let ty = p.content_type.as_deref().unwrap_or_default();
-            if !["goal", "design", "plan"].contains(&ty) {
-                bail!("proposal content needs type: goal|design|plan");
+            if !["details", "design", "plan"].contains(&ty) {
+                bail!("proposal content needs type: details|design|plan");
             }
             if !has_text {
                 bail!("proposal content needs text");

@@ -131,7 +131,7 @@ pub struct Proposal {
     /// the question is added and stored as the full id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    /// `goal` | `design` | `plan` (content).
+    /// `details` | `design` | `plan` (content).
     #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

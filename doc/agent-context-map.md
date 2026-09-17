@@ -166,7 +166,7 @@ process-bundle role doc plays this part and stays where it is.
 `render_dynamic` currently hard-codes `if request.surface == "obligations"`.
 Replace with a list of block renderers the recipe names:
 
-`DataRoot`, `PurposeChain`, `Node`, `SelectedObligation`, `NodeObligations`,
+`DataRoot`, `Node`, `SelectedObligation`, `NodeObligations`,
 `AncestorObligations`, `Plan`, `GateCriteria`, `Workspace`.
 
 Each surface lists the blocks it wants, in order. No renderer needs to know
@@ -178,12 +178,12 @@ which surface it is serving.
 1 Obligations chat
   stance/interactive-chat, domain/outline, domain/obligations, domain/plan,
   cli/intro, cli/node, cli/obligations, cli/plan, surface/obligations
-  dyn: DataRoot, PurposeChain, Node, SelectedObligation
+  dyn: DataRoot, Node, AncestorObligations, SelectedObligation
 
 2 Visual-design chat
   stance/interactive-chat, domain/outline, domain/obligations,
   cli/intro, cli/visual-design, surface/visual-design
-  dyn: DataRoot, PurposeChain, Node, SelectedObligation
+  dyn: DataRoot, Node, AncestorObligations, SelectedObligation
 
 3 Implementation session
   stance/autonomous-session, domain/outline, domain/obligations, domain/plan,
@@ -321,8 +321,10 @@ session's change-log watermark, not the current state, so it has no block
 counterpart either way. Line formats stay consistent across snapshot, delta,
 and blocks because all three use `node_context`'s line renderers
 (`obligation_line`, `plan_step_line`). What the two snapshots have in common
-(header, purpose chain, obligations by kind) also lives there
-(`write_snapshot_header`, `write_purpose_chain`, `write_obligations_by_kind`).
+(header, obligations by kind) also lives there
+(`write_snapshot_header`, `write_obligations_by_kind`). A node inherits one
+thing of each Spec ancestor besides its constraints — the ancestor's summary —
+and `render_inherited_context` is the only place that renders it.
 
 **Role docs may name a `tod-cli` noun in prose.** The prose says *which* noun
 applies, and the `cli/` fragment says how to call it. Command tables are what

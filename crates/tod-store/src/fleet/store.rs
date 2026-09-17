@@ -27,7 +27,7 @@ use crate::outline::repos::node::NodeRepo;
 use crate::outline::repos::obligations::{NodeObligation, ObligationCounts, ObligationRepo};
 use crate::outline::repos::plan_steps::PlanStepRepo;
 use crate::outline::repos::{
-    GeneratorConfig, GeneratorRepo, ListRepo, ManagedNodeLink, OutlineRepo, tree::TreeLoader,
+    GeneratorConfig, GeneratorRepo, ListRepo, ManagedNodeLink, tree::TreeLoader,
 };
 use crate::outline::PlanStep;
 use crate::outline::types::Capability;
@@ -611,7 +611,7 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
-    /// Spec extra content for a node (e.g. `goal` = purpose statement).
+    /// Extra content for a node (e.g. `details`, `summary`).
     pub fn get_extra_content(
         &self,
         node_id: uuid::Uuid,
@@ -623,41 +623,12 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
-    /// Purpose (`goal` extra content) for `node_id` and every ancestor with the
-    /// Spec capability enabled, ordered from the root of the tree down to
-    /// `node_id` itself. Nodes without a purpose set are skipped.
-    pub fn ancestor_purposes(&self, node_id: uuid::Uuid) -> Result<Vec<String>> {
+    /// The node's generated summary and whether it is stale.
+    pub fn get_summary(&self, node_id: uuid::Uuid) -> Result<Option<crate::outline::NodeSummary>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        let outline = OutlineRepo::new(&conn);
-        let node_repo = NodeRepo::new(&conn);
-
-        let mut chain = vec![node_id];
-        let mut current = node_id;
-        while let Some(entry) = outline.get_entry(current)? {
-            match entry.parent_id {
-                Some(parent) => {
-                    chain.push(parent);
-                    current = parent;
-                }
-                None => break,
-            }
-        }
-        chain.reverse();
-
-        let mut purposes = Vec::new();
-        for id in chain {
-            if !node_repo.list_capabilities(id)?.contains(&Capability::Spec) {
-                continue;
-            }
-            if let Some(purpose) = node_repo.get_extra_content(id, crate::outline::EXTRA_CONTENT_GOAL)? {
-                let purpose = purpose.trim();
-                if !purpose.is_empty() {
-                    purposes.push(purpose.to_string());
-                }
-            }
-        }
-        Ok(purposes)
+        NodeRepo::new(&guard.connection())
+            .get_summary(node_id)
+            .map_err(Into::into)
     }
 
     /// Build JSON archive payload before disabling a capability.
