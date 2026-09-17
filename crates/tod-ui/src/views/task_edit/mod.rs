@@ -250,6 +250,9 @@ pub struct TaskEditView {
     scroll_anchor: ScrollAnchor,
     linear_fetch_generation: u64,
     linear_busy: bool,
+    /// Default launch options from settings, read from disk once per task load
+    /// rather than on every frame that renders an agent row.
+    cached_settings_launch: AgentLaunchOptions,
     pending_linear_ticket: Option<String>,
     pending_linear_apply: Option<PendingLinearApply>,
     generator_fields: Vec<GeneratorConfigField>,
@@ -292,6 +295,9 @@ impl TaskEditView {
         fleet: Arc<FleetStore>,
         paths: TodPaths,
     ) -> Self {
+        let cached_settings_launch = TodSettings::load(&paths)
+            .unwrap_or_default()
+            .launch_options_for(AgentRole::Default);
         let title_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Task title"));
         let linear_input =
@@ -437,6 +443,7 @@ impl TaskEditView {
             scroll_anchor,
             linear_fetch_generation: 0,
             linear_busy: false,
+            cached_settings_launch,
             pending_linear_ticket: None,
             pending_linear_apply: None,
             _title_subscription,
@@ -901,6 +908,9 @@ impl TaskEditView {
         self.worktree_status = None;
         // Any fetch still in flight was started for the node we just left.
         self.linear_busy = false;
+        self.cached_settings_launch = TodSettings::load(&self.paths)
+            .unwrap_or_default()
+            .launch_options_for(AgentRole::Default);
         self.load_action_capabilities();
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
@@ -1003,9 +1013,7 @@ impl TaskEditView {
 
     /// What unset Agent values fall back to.
     fn settings_launch(&self) -> AgentLaunchOptions {
-        TodSettings::load(&self.paths)
-            .unwrap_or_default()
-            .launch_options_for(AgentRole::Default)
+        self.cached_settings_launch.clone()
     }
 
     fn cycle_agent_field(&mut self, field: TaskEditField, cx: &mut Context<Self>) {
