@@ -731,6 +731,11 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.load_summary();
         self.load_obligation_counts(&task_id);
+        if self.editing_note_id.is_none()
+            && let Ok(Some(task)) = self.fleet.get_node(&task_id)
+        {
+            self.notes = task.notes;
+        }
         let unedited = !self.field_editing(TaskEditField::Details)
             && input_text(&self.details_input, cx) == self.loaded_details;
         if unedited {

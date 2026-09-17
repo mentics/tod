@@ -126,6 +126,12 @@ pub enum InterviewCommand {
         target: Option<Uuid>,
     },
 
+    /// Append a note to a node's notes list.
+    AddNote {
+        node_id: Uuid,
+        text: String,
+    },
+
     // ── Drafting (v3) ───────────────────────────────────────────────────
     /// Something the user said, aimed at a node (or nowhere in particular).
     AddDump {
@@ -683,6 +689,14 @@ pub fn execute(
             dump_seqs,
             choice_seqs,
         ),
+        InterviewCommand::AddNote { node_id, text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                bail!("note text is required");
+            }
+            let note = crate::fleet::repos::task::TaskRepo::new(conn).append_note(*node_id, text)?;
+            Ok(json!({ "id": note.id.to_string() }))
+        }
     }
 }
 

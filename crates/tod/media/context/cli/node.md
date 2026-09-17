@@ -11,6 +11,8 @@ tod-cli --data-root <DATA_ROOT> node create --title <TEXT> (--parent <SLUG_OR_UU
 tod-cli --data-root <DATA_ROOT> node rename <SLUG_OR_UUID> --title <TEXT>
 tod-cli --data-root <DATA_ROOT> node move   <SLUG_OR_UUID> --parent <SLUG_OR_UUID|root> [--after <SLUG_OR_UUID>] [--before]
 tod-cli --data-root <DATA_ROOT> node delete <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node notes    <SLUG_OR_UUID>
+tod-cli --data-root <DATA_ROOT> node add-note <SLUG_OR_UUID> --body <TEXT>
 ```
 
 `list` and `create` need to know which outline list to act on: pass `--parent`
@@ -27,3 +29,8 @@ there" and you need its id or slug to reference or inspect it. The match is
 fuzzy (typo- and skipped-letter-tolerant), not exact; it returns up to
 `--limit` (default 10) results across every list, best match first, one per
 line as `<NODE_UUID> <slug> <title>`.
+
+`notes` lists a node's notes, oldest first, each headed by its id. Notes are
+the freeform jottings shown in the node's Notes section in the app — distinct
+from its `details` (see `content`) and from obligations. When asked to add a
+note, use `add-note`: it appends one note and never changes existing ones.
