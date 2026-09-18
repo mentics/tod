@@ -599,12 +599,15 @@ impl ListDelegate for TaskListDelegate {
             })
             .when(has_spec, |el| {
                 el.can_drop(|any, _, _| any.downcast_ref::<ObligationDragPayload>().is_some())
-                    .on_drop::<ObligationDragPayload>(move |payload, _window, _cx| {
-                        drop_sink.borrow_mut().push(RowAction::DropObligation {
-                            task_id: drop_task_id.clone(),
-                            obligation_id: payload.obligation_id,
-                        });
-                    })
+                    .on_drop::<ObligationDragPayload>(cx.listener(
+                        move |_, payload: &ObligationDragPayload, _, cx| {
+                            drop_sink.borrow_mut().push(RowAction::DropObligation {
+                                task_id: drop_task_id.clone(),
+                                obligation_id: payload.obligation_id,
+                            });
+                            cx.notify();
+                        },
+                    ))
                     .drag_over::<ObligationDragPayload>(move |style, _, _, _| {
                         style.cursor_pointer().bg(primary.opacity(0.15))
                     })
