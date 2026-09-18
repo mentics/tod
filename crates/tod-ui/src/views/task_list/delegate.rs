@@ -214,6 +214,7 @@ impl ListDelegate for TaskListDelegate {
                         sink_toggle.borrow_mut().push(RowAction::ToggleCollapsed {
                             task_id: task_id_toggle.clone(),
                         });
+                        cx.notify();
                     }),
                 )
             })
@@ -680,6 +681,7 @@ fn title_label(
                             task_id: task_id.clone(),
                         });
                     }
+                    cx.notify();
                 })
             })
         })
@@ -798,6 +800,7 @@ fn tag_chip(
             cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
                 on_click();
+                cx.notify();
             }),
         )
         .child(
