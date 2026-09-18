@@ -104,9 +104,35 @@ str_enum!(
 );
 
 str_enum!(
-    /// A transcript entry. `Rotation` marks where a fresh agent session started.
-    TurnRole { User => "user", Agent => "agent", Error => "error", Rotation => "rotation" }
+    /// A transcript entry. `Rotation` marks where a fresh agent session
+    /// started; `Continuation` marks where the protocol's loop sent another
+    /// turn without the user.
+    TurnRole {
+        User => "user",
+        Agent => "agent",
+        Error => "error",
+        Rotation => "rotation",
+        Continuation => "continuation",
+    }
 );
+
+str_enum!(
+    /// Which protocol runs a conversation: what context its agent gets, where
+    /// it runs, how its reply is read, and whether the app loops it. See
+    /// `tod_core::conversation::protocol`.
+    ProtocolKind {
+        Outline => "outline",
+        Implementation => "implementation",
+        Chat => "chat",
+        VisualDesign => "visual_design",
+    }
+);
+
+impl Default for ProtocolKind {
+    fn default() -> Self {
+        ProtocolKind::Outline
+    }
+}
 
 /// The recorded state of one item, enough to compare, diff, and restore it.
 ///
@@ -183,6 +209,11 @@ impl EntitySnapshot {
 pub struct Conversation {
     pub id: Uuid,
     pub focus: Focus,
+    /// Which protocol runs this conversation.
+    pub protocol: ProtocolKind,
+    /// The fleet run this conversation's agent process belongs to, for
+    /// protocols that need a worktree and reattach; `None` otherwise.
+    pub agent_run_id: Option<String>,
     /// The current provider session; `None` until the first reply.
     pub agent_session_id: Option<String>,
     pub session_name: Option<String>,

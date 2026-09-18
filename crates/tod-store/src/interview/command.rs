@@ -137,6 +137,9 @@ pub enum InterviewCommand {
     CreateConversation {
         id: Uuid,
         focus: crate::conversation::Focus,
+        /// Which protocol runs it.
+        #[serde(default)]
+        protocol: crate::conversation::ProtocolKind,
         #[serde(default)]
         platform: Option<String>,
         #[serde(default)]
@@ -180,6 +183,18 @@ pub enum InterviewCommand {
         conversation_id: Uuid,
         entity: crate::conversation::Entity,
         entity_id: Uuid,
+    },
+    /// Store a protocol's parsed report for a turn, replacing any earlier one.
+    SetConversationReport {
+        conversation_id: Uuid,
+        turn_seq: i64,
+        body: Value,
+    },
+    /// Point a conversation at the fleet run its agent process belongs to.
+    SetConversationAgentRun {
+        conversation_id: Uuid,
+        #[serde(default)]
+        agent_run_id: Option<String>,
     },
     /// Reverse actions newest-first, as the user. Applies nothing (and
     /// returns `needs_confirmation`) when an item changed since the
@@ -692,6 +707,7 @@ pub fn execute(
         InterviewCommand::CreateConversation {
             id,
             focus,
+            protocol,
             platform,
             model,
             effort,
@@ -699,6 +715,7 @@ pub fn execute(
             let conversation = crate::conversation::ConversationRepo::new(conn).create_with_id(
                 *id,
                 *focus,
+                *protocol,
                 platform.as_deref(),
                 model.as_deref(),
                 effort.as_deref(),
@@ -728,6 +745,26 @@ pub fn execute(
                 agent_session_id.as_deref(),
                 session_name.as_deref(),
             )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationReport {
+            conversation_id,
+            turn_seq,
+            body,
+        } => {
+            crate::conversation::ConversationRepo::new(conn).set_report(
+                *conversation_id,
+                *turn_seq,
+                body,
+            )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationAgentRun {
+            conversation_id,
+            agent_run_id,
+        } => {
+            crate::conversation::ConversationRepo::new(conn)
+                .set_agent_run(*conversation_id, agent_run_id.as_deref())?;
             Ok(json!({}))
         }
         InterviewCommand::ConversationEdit {

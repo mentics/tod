@@ -59,8 +59,7 @@ pub fn build_message(
 /// Wording shared by the surfaces that inline a node's own obligations
 /// alongside summarized ancestor context, so the distinction is stated the
 /// same way everywhere it matters.
-const OWN_OBLIGATIONS_NOTE: &str =
-    "This node's own. They define what is in scope here — not the summarized \
+const OWN_OBLIGATIONS_NOTE: &str = "This node's own. They define what is in scope here — not the summarized \
      ancestor context below, whose requirements are settled and whose \
      constraints still bind.";
 
@@ -234,9 +233,33 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
 };
 
+/// A general conversation: whatever the user asks, on any focus. It has the
+/// outline conversation's nouns, change set included — its outline writes are
+/// recorded and reversible the same way — and `surface/chat` says what makes
+/// it different: the user sets the job, not the surface.
+pub const CHAT: ContextRecipe = ContextRecipe {
+    name: "chat",
+    layers: &[
+        "stance/interactive-chat",
+        "domain/outline",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/node",
+        "cli/obligations",
+        "cli/plan",
+        "cli/content",
+        "cli/changeset",
+        "surface/chat",
+    ],
+    blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     CONVERSATION,
+    CHAT,
     VISUAL_DESIGN_CHAT,
     IMPLEMENT_SESSION,
     GATE_CHECK,

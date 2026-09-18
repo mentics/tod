@@ -40,16 +40,16 @@ use crate::views::visual_design_panel::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_agent::EngagementState;
 use tod_core::run_transcript;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
-use tod_store::conversation::Focus;
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
 use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
 use uuid::Uuid;
@@ -124,6 +124,10 @@ pub struct Shell {
     pending_drawer: Vec<DrawerRequest>,
     pending_delete_selected_task: bool,
     pending_refocus_task_list: bool,
+    /// A generator whose refresh stopped for want of the Linear API key.
+    /// Queued by the edit panel's event, applied on render, where there is a
+    /// window to open the task list's credential prompt with.
+    pending_linear_credentials_for: Option<Uuid>,
     pending_error_toast: Option<String>,
     always_on_top: bool,
     tasks_split_state: Entity<PanelSplitState>,
@@ -561,9 +565,23 @@ impl Shell {
     /// Show the conversation view on `focus`: its latest conversation, or a
     /// new, unsaved one.
     fn open_conversation(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_conversation_with(focus, ProtocolKind::Outline, false, window, cx);
+    }
+
+    fn open_conversation_with(
+        &mut self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_view(ShellView::Conversation, window, cx);
         self.conversation.update(cx, |conversation, cx| {
-            conversation.open(focus, true, window, cx);
+            conversation.open_with(focus, protocol, true, window, cx);
+            if start {
+                conversation.start(window, cx);
+            }
         });
         cx.notify();
     }
@@ -935,7 +953,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
-                this.open_conversation(action.focus, window, cx);
+                this.open_conversation_with(action.focus, action.protocol, action.start, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellGoSettings, window, cx| {
                 this.select_view(ShellView::Settings, window, cx);
@@ -1194,6 +1212,11 @@ impl Shell {
                 list.delete_selected_task(window, cx);
             });
         }
+        if let Some(node_id) = self.pending_linear_credentials_for.take() {
+            self.task_list.update(cx, |list, cx| {
+                list.prompt_linear_credentials_for_generator(node_id, window, cx);
+            });
+        }
     }
 }
 
@@ -1420,13 +1443,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
-                            LifecyclePanelView::new(
-                                cx,
-                                fleet.clone(),
-                                agent.clone(),
-                                paths.clone(),
-                                interactive_agent_window.clone(),
-                            )
+                            LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
@@ -1454,6 +1471,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     match event {
                                         TaskListEvent::FocusDrawer => {
                                             this.queue_drawer(DrawerRequest::Focus, cx);
+                                        }
+                                        TaskListEvent::GeneratorRefreshed { node_id } => {
+                                            let node_id = *node_id;
+                                            this.drawer.task_edit.update(cx, |edit, cx| {
+                                                edit.reload_generator_for(node_id, cx);
+                                            });
                                         }
                                         TaskListEvent::OpenInterview {
                                             task_id,
@@ -1544,6 +1567,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                         TaskEditEvent::FocusTaskList => {
                                             this.pending_refocus_task_list = true;
+                                            cx.notify();
+                                        }
+                                        // The edit panel has no credential
+                                        // prompt of its own; the task list
+                                        // owns the one prompt, collects the
+                                        // key and resumes the refresh.
+                                        TaskEditEvent::LinearCredentialsRequired { node_id } => {
+                                            this.pending_linear_credentials_for = Some(*node_id);
                                             cx.notify();
                                         }
                                         TaskEditEvent::Changed => {
@@ -1745,6 +1776,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_drawer: Vec::new(),
                                 pending_delete_selected_task: false,
                                 pending_refocus_task_list: false,
+                                pending_linear_credentials_for: None,
                                 pending_error_toast: None,
                                 always_on_top: restore_always_on_top,
                                 tasks_split_state,

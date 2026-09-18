@@ -254,6 +254,41 @@ impl<'a> AgentRunRepo<'a> {
             .collect())
     }
 
+    /// Live run counts for every node in one outline list, keyed by node.
+    /// Nodes with no live runs are absent from the map.
+    ///
+    /// The SQL filter is the cheap half of [`AgentRun::is_live`]; the rest is
+    /// applied in Rust so the predicate stays defined in one place.
+    pub fn live_counts_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, usize>, AgentRunRepoError> {
+        let sql = format!(
+            "{RUN_SELECT}
+             FROM agent_runs
+             WHERE ended_at IS NULL
+               AND node_id IN (SELECT node_id FROM outline_entries WHERE list_id = ?1)"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![crate::outline::uuid_blob::uuid_to_blob(list_id)],
+            row_to_run,
+        )?;
+        let mut out: std::collections::HashMap<uuid::Uuid, usize> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let run = row?;
+            if !run.is_live() {
+                continue;
+            }
+            let Ok(node_id) = uuid::Uuid::parse_str(&run.node_id) else {
+                continue;
+            };
+            *out.entry(node_id).or_default() += 1;
+        }
+        Ok(out)
+    }
+
     pub fn latest_auto_run(&self, node_id: &str) -> Result<Option<AgentRun>, AgentRunRepoError> {
         Ok(self.list_auto_for_node(node_id)?.into_iter().next())
     }

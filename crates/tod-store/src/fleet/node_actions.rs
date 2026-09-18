@@ -8,10 +8,11 @@ use crate::fleet::repos::node_agent::{NodeAgent, NodeAgentRepo};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::outline::repos::NodeRepo;
 use crate::outline::types::Capability;
-use crate::outline::uuid_blob::uuid_to_blob;
+use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
 use crate::settings::{AgentRole, TodSettings};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -175,6 +176,82 @@ pub fn resolve_agent_for_node(conn: &Connection, node_id: &str) -> Result<Option
     }))
 }
 
+/// For every node in `list_id`, the node that owns `cap` for it — itself when
+/// it has the capability, else the nearest ancestor that does. Nodes with no
+/// owner in their chain are absent from the map.
+///
+/// The list-scoped counterpart of [`nearest_with_capability`]: two queries for
+/// the whole list instead of an ancestor walk per node.
+pub fn capability_sources_for_list(
+    conn: &Connection,
+    list_id: Uuid,
+    cap: Capability,
+) -> Result<HashMap<Uuid, Uuid>> {
+    let mut parents: HashMap<Uuid, Option<Uuid>> = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT node_id, parent_id FROM outline_entries WHERE list_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![uuid_to_blob(list_id)], |row| {
+            let node: Vec<u8> = row.get(0)?;
+            let parent: Option<Vec<u8>> = row.get(1)?;
+            Ok((
+                blob_to_uuid_sql(&node)?,
+                parent.as_deref().map(blob_to_uuid_sql).transpose()?,
+            ))
+        })?;
+        for row in rows {
+            let (node, parent) = row?;
+            parents.insert(node, parent);
+        }
+    }
+
+    let mut owners: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT c.node_id
+             FROM node_capabilities c
+             INNER JOIN outline_entries e ON e.node_id = c.node_id
+             WHERE e.list_id = ?1 AND c.capability = ?2",
+        )?;
+        let rows = stmt.query_map(params![uuid_to_blob(list_id), cap.as_str()], |row| {
+            let node: Vec<u8> = row.get(0)?;
+            blob_to_uuid_sql(&node)
+        })?;
+        for row in rows {
+            owners.insert(row?);
+        }
+    }
+
+    let mut sources: HashMap<Uuid, Uuid> = HashMap::new();
+    for &node in parents.keys() {
+        // Walk up to the nearest owner, memoizing every node on the way so a
+        // deep tree still costs one pass.
+        let mut chain = Vec::new();
+        let mut cursor = Some(node);
+        let mut source = None;
+        while let Some(id) = cursor {
+            if let Some(hit) = sources.get(&id) {
+                source = Some(*hit);
+                break;
+            }
+            if owners.contains(&id) {
+                source = Some(id);
+                break;
+            }
+            chain.push(id);
+            cursor = parents.get(&id).copied().flatten();
+        }
+        if let Some(source) = source {
+            for id in chain {
+                sources.insert(id, source);
+            }
+            sources.entry(node).or_insert(source);
+        }
+    }
+    Ok(sources)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,6 +406,78 @@ mod tests {
                 .resolve_agent_for_node(&tree.child.to_string())
                 .unwrap()
                 .is_none()
+        );
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn list_scoped_sources_match_per_node_resolution() {
+        let tree = setup_tree();
+        // Agent on the grandparent, Files on the parent: the child inherits
+        // Agent across the parent (which lacks it) and Files from the parent.
+        enable(&tree.store, tree.grandparent, vec![Capability::Agent]);
+        enable(&tree.store, tree.parent, vec![Capability::Files]);
+        tree.store.reload_if_stale().ok();
+        let list_id = tree.store.list_outline_lists().unwrap()[0].id;
+
+        let agents = tree
+            .store
+            .capability_sources_for_list(list_id, Capability::Agent)
+            .unwrap();
+        assert_eq!(agents.get(&tree.grandparent), Some(&tree.grandparent));
+        assert_eq!(agents.get(&tree.parent), Some(&tree.grandparent));
+        assert_eq!(agents.get(&tree.child), Some(&tree.grandparent));
+
+        let files = tree
+            .store
+            .capability_sources_for_list(list_id, Capability::Files)
+            .unwrap();
+        // The grandparent is above the owner, so Files resolve to nothing there.
+        assert_eq!(files.get(&tree.grandparent), None);
+        assert_eq!(files.get(&tree.parent), Some(&tree.parent));
+        assert_eq!(files.get(&tree.child), Some(&tree.parent));
+
+        // A node's own capability wins over the ancestor's.
+        enable(&tree.store, tree.child, vec![Capability::Files]);
+        tree.store.reload_if_stale().ok();
+        let files = tree
+            .store
+            .capability_sources_for_list(list_id, Capability::Files)
+            .unwrap();
+        assert_eq!(files.get(&tree.child), Some(&tree.child));
+
+        // And it agrees with the per-node resolution it replaces.
+        for node in [tree.grandparent, tree.parent, tree.child] {
+            let id = node.to_string();
+            assert_eq!(
+                files.get(&node).copied().map(|id| id.to_string()),
+                tree.store
+                    .resolve_files_for_node(&id)
+                    .unwrap()
+                    .map(|f| f.source_node_id),
+            );
+            assert_eq!(
+                agents.get(&node).copied().map(|id| id.to_string()),
+                tree.store
+                    .resolve_agent_for_node(&id)
+                    .unwrap()
+                    .map(|a| a.source_node_id),
+            );
+        }
+        drop(tree.store);
+        cleanup_fleet_root(&tree.root);
+    }
+
+    #[test]
+    fn no_capability_anywhere_yields_an_empty_source_map() {
+        let tree = setup_tree();
+        let list_id = tree.store.list_outline_lists().unwrap()[0].id;
+        assert!(
+            tree.store
+                .capability_sources_for_list(list_id, Capability::Agent)
+                .unwrap()
+                .is_empty()
         );
         drop(tree.store);
         cleanup_fleet_root(&tree.root);

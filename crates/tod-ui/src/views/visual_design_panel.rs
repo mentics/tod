@@ -1,3 +1,9 @@
+//! **Slated for deletion.** The visual designer is being rebuilt as a
+//! conversation protocol (`ProtocolKind::VisualDesign`), with the designer as
+//! the conversation view's side pane instead of a panel that hosts its own
+//! chat. Delete this file once that lands. Until then it stays the working
+//! designer. See `doc/conversation/protocols.md` §6.
+//!
 //! Visual design panel — a mockup `WebView` (left) next to an embedded agent
 //! chat (right), opened from the "Design"/"+ Design" affordance on a
 //! design-phase obligation's row in the Obligations panel. Each panel

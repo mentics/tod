@@ -8,6 +8,7 @@ use crate::agent_traffic::{
     InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
 use crate::ReplyPart;
+use crate::process_tree::AgentProcess;
 use crate::reply::{self, SharedReplyParts};
 use crate::util::normalize_absolute;
 use crate::util::path_is_under;
@@ -16,15 +17,11 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Idle bound on a prompt turn — reset by every notification the agent sends
@@ -55,7 +52,7 @@ type PendingPermissionSlot = Arc<Mutex<Option<PendingPermission>>>;
 struct ActiveRun {
     kind: AgentRunKind,
     state: AgentRunState,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AgentProcess>>>,
     cancelled: Arc<AtomicBool>,
     /// Latest human-readable activity reported by the agent, shared with the
     /// `AcpClient` driving this run.
@@ -108,7 +105,7 @@ struct ConversationSpec {
 /// A long-lived conversation: a worker thread owning at most one agent process.
 struct LiveConversation {
     cmd_tx: Sender<ConversationCommand>,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AgentProcess>>>,
     cancelled: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
@@ -175,7 +172,7 @@ impl LiveConversation {
 
 struct ConversationWorker {
     spec: ConversationSpec,
-    child: Arc<Mutex<Option<Child>>>,
+    child: Arc<Mutex<Option<AgentProcess>>>,
     cancelled: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
@@ -380,7 +377,7 @@ impl CursorAcpProvider {
         let (tx, rx) = mpsc::channel();
         let agent_bin = self.agent_bin.clone();
         let host = self.host;
-        let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let child_slot: Arc<Mutex<Option<AgentProcess>>> = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let activity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let pending_permission: PendingPermissionSlot = Arc::new(Mutex::new(None));
@@ -481,7 +478,7 @@ impl Drop for CursorAcpProvider {
                 .unwrap_or_else(|e| e.into_inner())
                 .take();
             if let Some(mut child) = child {
-                kill_child_tree(&mut child);
+                child.kill_tree();
             }
         }
     }
@@ -702,7 +699,7 @@ impl AgentProvider for CursorAcpProvider {
             run.cancelled.store(true, Ordering::SeqCst);
             if let Ok(mut guard) = run.child.lock() {
                 if let Some(mut child) = guard.take() {
-                    kill_child_tree(&mut child);
+                    child.kill_tree();
                 }
             }
             if let Some(worker) = run.worker.take() {
@@ -736,32 +733,6 @@ impl AgentProvider for CursorAcpProvider {
         counts
     }
 }
-
-/// Terminate `child` and, on Windows, its entire process tree.
-///
-/// Spawning `*.cmd`/`*.bat` via `cmd /C` makes `Child::kill` only stop the
-/// wrapper; the real agent is often a grandchild and would otherwise orphan.
-fn kill_child_tree(child: &mut Child) {
-    #[cfg(windows)]
-    {
-        let pid = child.id();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status();
-        let _ = child.wait();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn auth_method_from_initialize(
     init_result: &Value,
@@ -956,7 +927,7 @@ fn run_acp_session(
     model: &str,
     effort: &str,
     prompt: &str,
-    child_slot: Arc<Mutex<Option<Child>>>,
+    child_slot: Arc<Mutex<Option<AgentProcess>>>,
     cancelled: Arc<AtomicBool>,
     activity: Arc<Mutex<Option<String>>>,
     pending_permission: PendingPermissionSlot,
@@ -1078,7 +1049,7 @@ fn run_acp_session(
 
     if let Ok(mut guard) = child_slot.lock() {
         if let Some(mut child) = guard.take() {
-            kill_child_tree(&mut child);
+            child.kill_tree();
         }
     }
     let _ = reader_handle.join();
@@ -1697,7 +1668,7 @@ impl PersistentAcpSession {
         cwd: &Path,
         model: &str,
         effort: &str,
-        child_slot: Arc<Mutex<Option<Child>>>,
+        child_slot: Arc<Mutex<Option<AgentProcess>>>,
         cancelled: Arc<AtomicBool>,
         activity: Arc<Mutex<Option<String>>>,
         pending_permission: PendingPermissionSlot,
@@ -1843,10 +1814,10 @@ impl PersistentAcpSession {
         Ok(self.client.assistant_text.clone())
     }
 
-    fn shutdown(self, child_slot: Arc<Mutex<Option<Child>>>) {
+    fn shutdown(self, child_slot: Arc<Mutex<Option<AgentProcess>>>) {
         if let Ok(mut guard) = child_slot.lock() {
             if let Some(mut child) = guard.take() {
-                kill_child_tree(&mut child);
+                child.kill_tree();
             }
         }
         let _ = self._reader_handle.join();
@@ -1856,6 +1827,7 @@ impl PersistentAcpSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn skips_authenticate_for_claude_code_acp_adapter() {
@@ -2108,73 +2080,5 @@ while True:
         );
 
         assert!(pick_effort_option(Some(&json!([]))).is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn kill_child_tree_terminates_cmd_and_grandchild() {
-        // Mimic ACP spawn: cmd /C wraps a long-running child (ping). Plain
-        // Child::kill would leave ping; taskkill /T must clear the tree.
-        let mut child = Command::new("cmd")
-            .args(["/C", "ping", "-n", "60", "127.0.0.1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cmd wrapper");
-        let wrapper_pid = child.id();
-        thread::sleep(Duration::from_millis(400));
-
-        let child_pids = windows_child_pids(wrapper_pid);
-        assert!(
-            !child_pids.is_empty(),
-            "expected grandchild under cmd wrapper pid {wrapper_pid}"
-        );
-
-        kill_child_tree(&mut child);
-        thread::sleep(Duration::from_millis(300));
-
-        assert!(
-            !process_alive(wrapper_pid),
-            "cmd wrapper pid {wrapper_pid} still alive after kill_child_tree"
-        );
-        for pid in child_pids {
-            assert!(
-                !process_alive(pid),
-                "grandchild pid {pid} still alive after kill_child_tree"
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    fn windows_child_pids(parent_pid: u32) -> Vec<u32> {
-        let filter = format!("ParentProcessId={parent_pid}");
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("(Get-CimInstance Win32_Process -Filter '{filter}').ProcessId"),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .expect("powershell child query");
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .filter_map(|tok| tok.parse().ok())
-            .collect()
-    }
-
-    #[cfg(windows)]
-    fn process_alive(pid: u32) -> bool {
-        let output = Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .expect("tasklist");
-        let text = String::from_utf8_lossy(&output.stdout);
-        text.contains(&pid.to_string())
     }
 }

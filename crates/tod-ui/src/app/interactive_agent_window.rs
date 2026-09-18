@@ -1,3 +1,11 @@
+//! **Slated for deletion.** Nothing opens a chat window any more — Implement
+//! and the action panel's Chat run in the conversation view. What still
+//! depends on this module is the visual design panel's embedded chat and the
+//! engagement registry (`InteractiveAgentWindowControl::engagement`), which the
+//! action panel reads for its background runs' status labels. Delete it once
+//! the visual-design protocol lands and the registry has another home. See
+//! `doc/conversation/protocols.md` §6.
+//!
 //! Per-session interactive agent chat windows.
 
 use crate::interview::TodPaths;
@@ -321,54 +329,6 @@ impl InteractiveAgentWindowControl {
         Ok(session_run_id)
     }
 
-    /// Create and open a special `implementation`-kind session for the node —
-    /// launched only from the lifecycle panel's Active-phase "Implement" button,
-    /// never reused, and distinguishable from ordinary `interactive` sessions on
-    /// the same node via `run_kind`. Ignores the terminal chat-launch-mode
-    /// setting: an implementation run always needs the in-window first-turn path
-    /// so `initial_context` goes out with the first message (see CLAUDE.md's
-    /// "Agent chat context"). Clicking "Implement" already states the user's
-    /// intent, so the first turn's message is submitted automatically instead
-    /// of waiting on the user to type one (`IMPLEMENT_START_MESSAGE`).
-    pub fn create_and_open_implementation_session(
-        &self,
-        node_id: &str,
-        context_key: &str,
-        initial_context: String,
-        cx: &mut App,
-    ) -> Result<String, String> {
-        let (fleet, _, paths, bound_settings) = self.bound_resources()?;
-        let settings = TodSettings::load(&paths).unwrap_or(bound_settings);
-        let session_name = Self::session_name_for(&fleet, node_id, Some(context_key));
-        let (_, launch) =
-            chat_launch_for_node(&fleet, &paths, &settings, node_id, AgentRole::Default);
-        let session_run_id =
-            Self::create_run(&fleet, node_id, "implementation", session_name, launch)
-                .map_err(|err| format!("implementation: {err}"))?;
-        self.open_session(
-            InteractiveAgentOpenParams {
-                node_id: node_id.to_string(),
-                session_run_id: session_run_id.clone(),
-                initial_context: Some(initial_context),
-                auto_submit_message: Some(
-                    tod_core::agent_context::IMPLEMENT_START_MESSAGE.to_string(),
-                ),
-            },
-            cx,
-        )?;
-        Ok(session_run_id)
-    }
-
-    /// Create a new session (same bookkeeping as [`Self::create_and_open_session`])
-    /// without opening a standalone window — returns everything needed to
-    /// construct an embedded [`InteractiveAgentView`] directly inside a
-    /// caller's own panel. Used by panels that host the chat inline (e.g. the
-    /// visual design panel) rather than a separate OS window.
-    ///
-    /// Deliberately ignores `ChatLaunchMode::Terminal`: an embedded panel is
-    /// always embedded, regardless of the "Chat with agent" launch-mode
-    /// setting, since the whole point of embedding is one integrated view.
-    #[allow(clippy::type_complexity)]
     pub fn create_embedded_session(
         &self,
         node_id: &str,

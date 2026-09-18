@@ -6,9 +6,9 @@
 //! [`set_generator_config`] never touches `last_refresh_*` fields.
 
 use std::collections::HashMap;
-use tod_integration::{
-    CredentialRequirement, DataSource, DataSourceItem, LinearDataSource, MockDataSource,
-};
+use tod_integration::{DataSource, DataSourceItem, LinearDataSource, MockDataSource};
+
+pub use tod_integration::{ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement};
 use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
@@ -21,6 +21,12 @@ const REFRESH_ERROR: &str = "error";
 
 pub const DATA_SOURCE_LINEAR: &str = "linear";
 pub const DATA_SOURCE_MOCK: &str = "mock";
+
+/// Credential key the Linear data source declares. The UI matches a missing
+/// requirement against this to decide which credential prompt to open, so it
+/// must stay in step with `LinearDataSource::credential_requirements` (see
+/// `linear_data_source_declares_the_known_credential_key`).
+pub const CREDENTIAL_LINEAR_API_KEY: &str = "linear_api_key";
 
 /// Resolve a data source implementation by its persisted `data_source_type`.
 pub fn data_source_for_type(data_source_type: &str) -> Option<Box<dyn DataSource>> {
@@ -46,21 +52,28 @@ pub fn available_data_sources() -> Vec<(&'static str, String, String)> {
         .collect()
 }
 
-/// Validate `config_json` against the named data source, then persist it via
-/// [`OutlineMutation::SetGeneratorConfig`]. Rejects unknown data source types
-/// and configs that fail [`DataSource::validate_config`] without enqueuing
-/// anything.
+/// The configuration form a data source expects, for UIs that render a field
+/// per entry rather than asking the user to write the config JSON by hand.
+pub fn config_schema_for_type(data_source_type: &str) -> Option<ConfigSchema> {
+    data_source_for_type(data_source_type).map(|ds| ds.configuration_schema())
+}
+
+/// Validate `config_json` against the named data source and persist it via
+/// [`OutlineMutation::SetGeneratorConfig`], **without** refreshing. Rejects
+/// unknown data source types and configs that fail
+/// [`DataSource::validate_config`] without enqueuing anything.
 ///
-/// The very first successful save for a generator node (i.e. one with no
-/// prior config) triggers an automatic initial refresh. Every save after
-/// that only persists the config — refreshing again is always a separate,
-/// user-triggered call to [`refresh_generator`].
-pub fn set_generator_config(
+/// Returns `true` when this was the node's first config, meaning an initial
+/// refresh is due. Saving is local and fast; refreshing reaches the network,
+/// so the two are separate calls and the caller decides where the refresh
+/// runs — a UI caller must run [`refresh_generator`] off its main thread.
+/// See [`set_generator_config`] for the combined, fully blocking version.
+pub fn save_generator_config(
     fleet: &FleetStore,
     node_id: Uuid,
     data_source_type: &str,
     config_json: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let data_source = data_source_for_type(data_source_type)
         .ok_or_else(|| format!("unknown data source type: {data_source_type}"))?;
 
@@ -83,7 +96,24 @@ pub fn set_generator_config(
         .map_err(|err| err.to_string())?;
     fleet.writer().flush().map_err(|err| err.to_string())?;
 
-    if !had_existing_config {
+    Ok(!had_existing_config)
+}
+
+/// [`save_generator_config`] plus the initial refresh it reports as due, run
+/// inline. Blocks on the network for that first save, so only callers that
+/// are already off a UI thread (tests, the CLI) should use it.
+///
+/// The very first successful save for a generator node (i.e. one with no
+/// prior config) triggers an automatic initial refresh. Every save after
+/// that only persists the config — refreshing again is always a separate,
+/// user-triggered call to [`refresh_generator`].
+pub fn set_generator_config(
+    fleet: &FleetStore,
+    node_id: Uuid,
+    data_source_type: &str,
+    config_json: &str,
+) -> Result<(), String> {
+    if save_generator_config(fleet, node_id, data_source_type, config_json)? {
         // The config save itself has already succeeded; a failed initial
         // refresh (e.g. blocked on a missing credential) is recorded on the
         // generator's refresh status by `refresh_generator` itself and does
@@ -112,7 +142,7 @@ fn resolve_credential(
     requirement: &CredentialRequirement,
 ) -> Option<String> {
     match requirement.key.as_str() {
-        "linear_api_key" => resolve_linear_api_key(store),
+        CREDENTIAL_LINEAR_API_KEY => resolve_linear_api_key(store),
         _ => None,
     }
 }
@@ -144,17 +174,74 @@ pub fn missing_credentials(
         .collect()
 }
 
+/// Why a generator refresh did not run.
+///
+/// [`RefreshError::MissingCredentials`] is split out from the rest so callers
+/// can act on it instead of parsing the message: the UI prompts for the named
+/// credentials and retries. `Display` renders both variants as the plain
+/// message that is also recorded on the generator's refresh status, so a
+/// caller that only wants to report the failure can still use `to_string`.
+#[derive(Debug, Clone)]
+pub enum RefreshError {
+    /// Credentials the data source declared have no resolved value. Nothing
+    /// was fetched, and the generator's existing managed nodes are untouched.
+    MissingCredentials(Vec<CredentialRequirement>),
+    /// Anything else: an absent or unknown configuration, or a failed fetch.
+    Other(String),
+}
+
+impl RefreshError {
+    /// The missing requirements, or an empty slice for any other failure.
+    pub fn missing_credentials(&self) -> &[CredentialRequirement] {
+        match self {
+            Self::MissingCredentials(missing) => missing,
+            Self::Other(_) => &[],
+        }
+    }
+
+    /// Whether this failure is a blocked refresh waiting on the one
+    /// credential the UI has a prompt for.
+    pub fn needs_linear_api_key(&self) -> bool {
+        self.missing_credentials()
+            .iter()
+            .any(|req| req.key == CREDENTIAL_LINEAR_API_KEY)
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingCredentials(missing) => {
+                let labels = missing
+                    .iter()
+                    .map(|req| req.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "missing credentials: {labels}")
+            }
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for RefreshError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
 /// Refresh a generator node: fetch from its configured data source, resolve
 /// credentials, and reconcile the result against existing managed nodes.
 /// Looks up the data source implementation and credentials for the caller;
 /// see [`refresh_generator_with`] for the injectable version used in tests.
 ///
 /// Blocked before any fetch is attempted if a required credential (e.g. a
-/// Linear API key) has no resolved value — the caller is expected to prompt
-/// for it (reusing the same credential-prompt entry point the Linear ticket
-/// import flow already uses, see `tod-ui`'s `views::task_list::from_ticket`)
-/// and retry once it's supplied.
-pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>, String> {
+/// Linear API key) has no resolved value, and reported as
+/// [`RefreshError::MissingCredentials`] so the caller can prompt for it
+/// (reusing the same credential prompt the Linear ticket import flow uses,
+/// see `tod-ui`'s `views::task_list::credential_prompt`) and retry once it is
+/// supplied.
+pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>, RefreshError> {
     let config = {
         let node_id = node_id;
         fleet
@@ -162,25 +249,27 @@ pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>,
             .map_err(|err| err.to_string())?
     };
     let Some(config) = config else {
-        return Err("node has no generator configuration".into());
+        return Err(RefreshError::Other(
+            "node has no generator configuration".into(),
+        ));
     };
-    let data_source = data_source_for_type(&config.data_source_type)
-        .ok_or_else(|| format!("unknown data source type: {}", config.data_source_type))?;
+    let data_source = data_source_for_type(&config.data_source_type).ok_or_else(|| {
+        RefreshError::Other(format!(
+            "unknown data source type: {}",
+            config.data_source_type
+        ))
+    })?;
     let credentials = resolve_credentials(fleet.paths().root(), data_source.as_ref());
 
     let missing = missing_credentials(data_source.as_ref(), &credentials);
     if !missing.is_empty() {
-        let labels = missing
-            .iter()
-            .map(|req| req.label.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let msg = format!("missing credentials: {labels}");
-        set_refresh_error(fleet, node_id, &msg)?;
-        return Err(msg);
+        let err = RefreshError::MissingCredentials(missing);
+        set_refresh_error(fleet, node_id, &err.to_string())?;
+        return Err(err);
     }
 
     refresh_generator_with(fleet, node_id, data_source.as_ref(), &credentials)
+        .map_err(RefreshError::Other)
 }
 
 /// Reconcile a generator node's managed subtree against a fetched item tree.
@@ -1131,6 +1220,47 @@ mod tests {
     }
 
     #[test]
+    fn save_reports_initial_refresh_due_without_running_it() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+
+        let refresh_due = save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+        assert!(refresh_due, "the first save leaves an initial refresh due");
+
+        let config = read_config(&root, node_id).unwrap();
+        assert_eq!(config.config_json, "{}", "config is persisted by the save");
+        assert_eq!(
+            config.last_refresh_status, None,
+            "save must not refresh — the caller runs it off its own thread"
+        );
+
+        let refresh_due =
+            save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query":"x"}"#).unwrap();
+        assert!(!refresh_due, "only the very first save is owed a refresh");
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn save_rejects_invalid_config_without_persisting() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+
+        let result = save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"invalid":true}"#);
+        assert!(result.is_err(), "invalid config must be rejected");
+        assert!(
+            read_config(&root, node_id).is_none(),
+            "a rejected config must not reach storage"
+        );
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn subsequent_config_save_does_not_trigger_refresh() {
         let (root, fleet) = setup();
         let list_id = fleet.list_outline_lists().unwrap()[0].id;
@@ -1151,6 +1281,46 @@ mod tests {
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// The UI decides which prompt a blocked refresh maps to by matching the
+    /// missing requirement's key against [`CREDENTIAL_LINEAR_API_KEY`]. If the
+    /// data source ever renamed its key, that match would silently stop firing
+    /// and the user would be back to an error with no way to act on it.
+    #[test]
+    fn linear_data_source_declares_the_known_credential_key() {
+        let keys: Vec<String> = LinearDataSource::new()
+            .credential_requirements()
+            .into_iter()
+            .map(|req| req.key)
+            .collect();
+        assert_eq!(keys, vec![CREDENTIAL_LINEAR_API_KEY.to_string()]);
+    }
+
+    /// A blocked refresh has to be distinguishable from every other failure
+    /// without parsing the message, while still rendering as that message.
+    #[test]
+    fn missing_credential_refresh_error_carries_requirements_and_renders_message() {
+        let err = RefreshError::MissingCredentials(vec![CredentialRequirement {
+            key: CREDENTIAL_LINEAR_API_KEY.into(),
+            label: "Linear API key".into(),
+        }]);
+        assert_eq!(err.to_string(), "missing credentials: Linear API key");
+        assert_eq!(err.missing_credentials().len(), 1);
+        assert!(err.needs_linear_api_key());
+
+        let other = RefreshError::Other("boom".into());
+        assert_eq!(other.to_string(), "boom");
+        assert!(other.missing_credentials().is_empty());
+        assert!(!other.needs_linear_api_key());
+
+        // A data source can declare a credential nothing knows how to
+        // collect; that must not be mistaken for the Linear key.
+        let unknown = RefreshError::MissingCredentials(vec![CredentialRequirement {
+            key: "some_other_key".into(),
+            label: "Some other key".into(),
+        }]);
+        assert!(!unknown.needs_linear_api_key());
     }
 
     #[test]

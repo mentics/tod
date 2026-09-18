@@ -2,7 +2,7 @@
 //! `CONVERSATION` recipe), the per-turn delta of the user's corrections, and
 //! the snapshot a fresh session gets when the driver rotates.
 
-use crate::context_recipes::{CONVERSATION, build_message};
+use crate::context_recipes::{CONVERSATION, ContextRecipe, build_message};
 use crate::dynamic::{DynamicContext, FocusSelection};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
@@ -74,6 +74,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: Vec::new(),
+                node: None,
                 title: "The whole project".into(),
                 slug: None,
                 text: None,
@@ -103,6 +104,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path,
+                node: Some(id),
                 title,
                 slug: slug_of(id)?,
                 text: None,
@@ -119,6 +121,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: path_to(node)?,
+                node: Some(node),
                 title: match &obligation {
                     Some(o) => format!("{} {}", o.kind, short_id(id)),
                     None => format!("obligation {} (deleted)", short_id(id)),
@@ -134,6 +137,7 @@ pub fn focus_selection(conn: &Connection, focus: Focus) -> Result<FocusSelection
             FocusSelection {
                 focus,
                 path: path_to(node)?,
+                node: Some(node),
                 title: match &step {
                     Some(s) => format!("plan step {} ({})", short_id(id), s.status),
                     None => format!("plan step {} (deleted)", short_id(id)),
@@ -154,13 +158,26 @@ pub fn opening(
     data_root: &Path,
     conversation_id: Uuid,
 ) -> Result<String> {
+    opening_with(conn, media, data_root, conversation_id, &CONVERSATION)
+}
+
+/// [`opening`] for a protocol that assembles its first message from a
+/// different recipe. Every conversation opens the same way — the data root and
+/// the focus — so only the fragment list differs.
+pub fn opening_with(
+    conn: &Connection,
+    media: &MediaPaths,
+    data_root: &Path,
+    conversation_id: Uuid,
+    recipe: &ContextRecipe,
+) -> Result<String> {
     let conversation = ConversationRepo::new(conn)
         .get(conversation_id)?
         .with_context(|| format!("conversation {conversation_id} not found"))?;
     let focus = focus_selection(conn, conversation.focus)?;
     build_message(
         media,
-        &CONVERSATION,
+        recipe,
         None,
         &DynamicContext {
             data_root: Some(data_root),
@@ -429,7 +446,28 @@ pub fn resume_snapshot(
     budget_tokens: i64,
     before_seq: Option<i64>,
 ) -> Result<String> {
-    let mut out = opening(conn, media, data_root, conversation_id)?;
+    resume_snapshot_with(
+        conn,
+        media,
+        data_root,
+        conversation_id,
+        budget_tokens,
+        before_seq,
+        &CONVERSATION,
+    )
+}
+
+/// [`resume_snapshot`] for a protocol that opens from a different recipe.
+pub fn resume_snapshot_with(
+    conn: &Connection,
+    media: &MediaPaths,
+    data_root: &Path,
+    conversation_id: Uuid,
+    budget_tokens: i64,
+    before_seq: Option<i64>,
+    recipe: &ContextRecipe,
+) -> Result<String> {
+    let mut out = opening_with(conn, media, data_root, conversation_id, recipe)?;
     let changes = net_changes(conn, conversation_id)?;
     out.push_str(
         "\n\n---\n\n# Continuing a conversation\n\n\
@@ -443,6 +481,21 @@ pub fn resume_snapshot(
         writeln!(out, "- {line}")?;
     }
 
+    append_recent_turns(conn, conversation_id, budget_tokens, before_seq, &mut out)?;
+    Ok(out)
+}
+
+/// Append the tail of the transcript to a resume snapshot: as many of the last
+/// [`RESUME_TURNS`] turns as fit in half of `budget_tokens`, with a count of
+/// what was left out. Markers (rotation, continuation) are not turns the agent
+/// needs to see.
+fn append_recent_turns(
+    conn: &Connection,
+    conversation_id: Uuid,
+    budget_tokens: i64,
+    before_seq: Option<i64>,
+    out: &mut String,
+) -> Result<()> {
     let turns: Vec<String> = ConversationRepo::new(conn)
         .turns(conversation_id)?
         .into_iter()
@@ -452,7 +505,7 @@ pub fn resume_snapshot(
                 TurnRole::User => "User",
                 TurnRole::Agent => "You",
                 TurnRole::Error => "Error",
-                TurnRole::Rotation => return None,
+                TurnRole::Rotation | TurnRole::Continuation => return None,
             };
             let body = match (t.role, t.body.trim()) {
                 (TurnRole::Agent, "") => "(no reply)",
@@ -461,7 +514,7 @@ pub fn resume_snapshot(
             Some(format!("**{who}:** {body}\n"))
         })
         .collect();
-    let room = (budget_tokens / 2 - estimate_tokens(&out)).max(0);
+    let room = (budget_tokens / 2 - estimate_tokens(&*out)).max(0);
     let mut kept: Vec<&String> = Vec::new();
     let mut used = 0;
     for turn in turns.iter().rev().take(RESUME_TURNS) {
@@ -485,5 +538,5 @@ pub fn resume_snapshot(
         out.push_str(turn);
         out.push('\n');
     }
-    Ok(out)
+    Ok(())
 }

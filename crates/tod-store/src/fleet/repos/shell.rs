@@ -108,6 +108,35 @@ impl<'a> ShellRepo<'a> {
         Ok(rows.next().transpose()?)
     }
 
+    /// Shell sessions for every node in one outline list, keyed by node.
+    /// Nodes with no shells are absent from the map.
+    pub fn list_for_list(
+        &self,
+        list_id: uuid::Uuid,
+    ) -> Result<std::collections::HashMap<uuid::Uuid, Vec<ShellSession>>, ShellRepoError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.node_id, s.reconnect_pid, s.reconnect_birth_token, s.label_number
+             FROM shell_sessions s
+             INNER JOIN outline_entries e ON e.node_id = s.node_id
+             WHERE e.list_id = ?1
+             ORDER BY s.label_number, s.id",
+        )?;
+        let rows = stmt.query_map(
+            params![crate::outline::uuid_blob::uuid_to_blob(list_id)],
+            row_to_session,
+        )?;
+        let mut out: std::collections::HashMap<uuid::Uuid, Vec<ShellSession>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let session = row?;
+            let Ok(node_id) = uuid::Uuid::parse_str(&session.node_id) else {
+                continue;
+            };
+            out.entry(node_id).or_default().push(session);
+        }
+        Ok(out)
+    }
+
     pub fn list_for_node(&self, node_id: &str) -> Result<Vec<ShellSession>, ShellRepoError> {
         let blob = node_id_blob(node_id)?;
         let mut stmt = self.conn.prepare(&format!(

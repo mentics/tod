@@ -1,4 +1,4 @@
-use gpui::{Context, ParentElement, Styled, Window, div, px};
+use gpui::{AppContext, Context, ParentElement, Styled, Window, div, px};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
 use gpui_component::{ActiveTheme, StyledExt, v_flex};
@@ -7,10 +7,18 @@ use tod_store::CredentialKind;
 use super::TaskListView;
 use super::from_ticket::PendingTicketImport;
 
+/// What the prompt should resume once the key has been stored. The prompt
+/// itself only knows how to collect and save a credential; each entry point
+/// says here what it was in the middle of doing.
 #[derive(Clone, Debug)]
-pub(super) struct PendingCredentialRequest {
-    pub ticket: String,
-    pub draft_node_id: Option<String>,
+pub(super) enum PendingCredentialRequest {
+    /// Import a Linear ticket, from the compose field or an inline edit.
+    TicketImport {
+        ticket: String,
+        draft_node_id: Option<String>,
+    },
+    /// Refresh a generator node whose data source declared the key.
+    GeneratorRefresh { node_id: uuid::Uuid },
 }
 
 impl TaskListView {
@@ -80,13 +88,23 @@ impl TaskListView {
                     }
                     tod_store::CredentialBackend::Environment => "Saved Linear API key".into(),
                 };
-                self.start_linear_ticket_fetch(
-                    &secret,
-                    &request.ticket,
-                    request.draft_node_id.as_deref(),
-                    window,
-                    cx,
-                );
+                match request {
+                    PendingCredentialRequest::TicketImport {
+                        ticket,
+                        draft_node_id,
+                    } => {
+                        self.start_linear_ticket_fetch(
+                            &secret,
+                            &ticket,
+                            draft_node_id.as_deref(),
+                            window,
+                            cx,
+                        );
+                    }
+                    PendingCredentialRequest::GeneratorRefresh { node_id } => {
+                        self.start_generator_refresh(node_id, window, cx);
+                    }
+                }
             }
             Err(err) => {
                 crate::ui::toast::error_toast(
@@ -137,7 +155,7 @@ impl TaskListView {
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
                                     .child(
-                                        "Used to fetch issue titles from Linear. Stored in your OS keyring when available, otherwise an encrypted local credentials file.",
+                                        "Used to reach Linear on your behalf — importing tickets, and refreshing generator nodes. Stored in your OS keyring when available, otherwise an encrypted local credentials file.",
                                     ),
                             )
                             .child(Input::new(&self.credential_input).w_full())
@@ -188,12 +206,16 @@ impl TaskListView {
 
         let entity = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            let fetch = std::thread::spawn(move || {
-                tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
-            })
-            .join();
+            // `background_spawn`, never a thread we join here: this future runs
+            // on the foreground executor, so blocking in it would freeze the UI
+            // for the whole round trip.
+            let fetch = cx
+                .background_spawn(async move {
+                    tod_store::linear::fetch_issue(&api_key, &ticket_for_fetch)
+                })
+                .await;
             let pending = match fetch {
-                Ok(Ok(issue)) => PendingTicketImport {
+                Ok(issue) => PendingTicketImport {
                     generation,
                     ticket: issue.identifier,
                     title: Some(issue.title),
@@ -202,7 +224,7 @@ impl TaskListView {
                     draft_node_id: draft_node_id.clone(),
                     auth_failure: false,
                 },
-                Ok(Err(err)) => PendingTicketImport {
+                Err(err) => PendingTicketImport {
                     generation,
                     ticket: ticket_owned.clone(),
                     title: None,
@@ -214,15 +236,6 @@ impl TaskListView {
                         tod_store::linear::LinearError::Api(ref msg)
                             if msg.contains("Invalid Linear API key")
                     ),
-                },
-                Err(_) => PendingTicketImport {
-                    generation,
-                    ticket: ticket_owned.clone(),
-                    title: None,
-                    description: None,
-                    error: Some("Linear fetch thread panicked".into()),
-                    draft_node_id: draft_node_id.clone(),
-                    auth_failure: false,
                 },
             };
             let _ = entity.update(cx, |this, cx| {

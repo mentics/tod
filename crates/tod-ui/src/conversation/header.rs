@@ -13,12 +13,13 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
     div, px,
 };
+use gpui_component::Disableable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::dynamic::FocusSelection;
-use tod_store::conversation::{Focus, NetOp};
+use tod_store::conversation::{Focus, NetOp, ProtocolKind};
 
 /// The focus kind's name and icon.
 pub(crate) fn kind_of(focus: Focus) -> (&'static str, IconName) {
@@ -54,6 +55,23 @@ pub(crate) fn display_title(selection: &FocusSelection) -> String {
         }
         Some(line) => line,
         None => selection.title.clone(),
+    }
+}
+
+/// Most characters a path crumb's button shows; the full title is its
+/// tooltip.
+const CRUMB_CHARS: usize = 24;
+
+/// A node title as a crumb label: one line, cut to [`CRUMB_CHARS`].
+pub(crate) fn crumb_label(title: &str) -> String {
+    let line = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > CRUMB_CHARS {
+        let mut cut: String = line.chars().take(CRUMB_CHARS).collect();
+        cut.truncate(cut.trim_end().len());
+        cut.push('…');
+        cut
+    } else {
+        line
     }
 }
 
@@ -105,11 +123,20 @@ impl ConversationView {
                 .iter()
                 .position(|c| c.conversation.id == id)
         });
-        self.picker = Some(current.unwrap_or(self.data.conversations.len()));
+        // Unsaved: highlight the "New …" entry for the kind being started.
+        let new_ix = self.data.conversations.len()
+            + self
+                .data
+                .new_kinds
+                .iter()
+                .position(|k| *k == self.data.protocol)
+                .unwrap_or(0);
+        self.picker = Some(current.unwrap_or(new_ix));
         cx.notify();
     }
 
-    /// Open picker entry `ix`; the last one is "New conversation".
+    /// Open picker entry `ix`. Past the saved conversations come the "New …"
+    /// entries, one per kind this focus can start.
     pub(super) fn choose_picker_entry(
         &mut self,
         ix: usize,
@@ -122,7 +149,15 @@ impl ConversationView {
                 self.show(self.focus, Some(id), false, cx);
                 self.focus_handle.focus(window, cx);
             }
-            None => self.new_conversation(window, cx),
+            None => {
+                let kind = ix
+                    .checked_sub(self.data.conversations.len())
+                    .and_then(|i| self.data.new_kinds.get(i).copied());
+                if let Some(kind) = kind {
+                    self.protocol = kind;
+                }
+                self.new_conversation(window, cx)
+            }
         }
     }
 
@@ -134,6 +169,7 @@ impl ConversationView {
         let stop = (self.pane == Pane::Transcript && self.picker.is_none() && !self.text_editing())
             .then_some(self.stop);
         let (kind, kind_icon) = kind_of(self.focus);
+        let crumbs = self.data.path.clone();
         let updated = self
             .conversation_id
             .and_then(|id| {
@@ -143,12 +179,6 @@ impl ConversationView {
                     .find(|c| c.conversation.id == id)
             })
             .map(|c| format_time(c.conversation.updated_at));
-        let path = self.data.path.clone();
-        let path = match self.focus {
-            // A node's path ends with its own title, which is the title.
-            Focus::Node(_) => path[..path.len().saturating_sub(1)].to_vec(),
-            _ => path,
-        };
         let status: Option<SharedString> = if self.status.running {
             Some(
                 self.status
@@ -182,6 +212,16 @@ impl ConversationView {
                     .tooltip("Back (Alt+Left)")
                     .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx))),
             )
+            .child(
+                Button::new("conversation-forward")
+                    .icon(Icon::new(IconName::ArrowRight))
+                    .ghost()
+                    .small()
+                    .disabled(!self.history.can_go_forward())
+                    .selected(stop == Some(Stop::Forward))
+                    .tooltip("Forward (Alt+Right)")
+                    .on_click(cx.listener(|this, _, window, cx| this.go_forward(window, cx))),
+            )
             .child(picker)
             .child(
                 div()
@@ -191,41 +231,69 @@ impl ConversationView {
                     .bg(style::color::divider()),
             )
             .child(
-                style::text_muted(div())
-                    .id("conversation-kind")
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .child(Icon::new(kind_icon).small())
-                    .tooltip(move |window, cx| Tooltip::new(kind).build(window, cx)),
+                Button::new("conversation-focus-project")
+                    .icon(Icon::new(IconName::Layers))
+                    .ghost()
+                    .small()
+                    .selected(self.focus == Focus::Project)
+                    .tooltip("Everything, across every list")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open(Focus::Project, true, window, cx)
+                    })),
             )
-            .when(!path.is_empty(), |el| {
-                el.child(
-                    style::text_muted(selectable_text(
-                        "conversation-path",
-                        format!("{} ›", path.join(" › ")),
-                        window,
-                        cx,
-                    ))
-                    .flex_shrink(1.)
-                    .min_w_0()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .overflow_hidden(),
-                )
+            .children(crumbs.into_iter().enumerate().map(|(ix, crumb)| {
+                let node = crumb.node;
+                let title = SharedString::from(crumb.title.clone());
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .child(style::text_muted(div()).child("›"))
+                    .child(
+                        Button::new(ElementId::Name(format!("conversation-crumb-{ix}").into()))
+                            .label(crumb_label(&crumb.title))
+                            .ghost()
+                            .small()
+                            .tooltip(title)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open(Focus::Node(node), true, window, cx)
+                            })),
+                    )
+            }))
+            // The project button is itself the project crumb, so the kind
+            // icon would only repeat it.
+            .when(self.focus != Focus::Project, |el| {
+                el.child(style::text_muted(div()).flex_shrink_0().child("›"))
+                    .child(
+                        style::text_muted(div())
+                            .id("conversation-kind")
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .child(Icon::new(kind_icon).small())
+                            .tooltip(move |window, cx| Tooltip::new(kind).build(window, cx)),
+                    )
             })
+            // The drill-down belongs beside the title, so the pair share the
+            // row's spare width rather than the title taking all of it.
             .child(
-                style::text_title(selectable_text(
-                    "conversation-title",
-                    self.data.title.clone(),
-                    window,
-                    cx,
-                ))
-                .flex_1()
-                .min_w_0()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .overflow_hidden(),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .child(
+                        style::text_title(selectable_text(
+                            "conversation-title",
+                            self.data.title.clone(),
+                            window,
+                            cx,
+                        ))
+                        .flex_shrink(1.)
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .overflow_hidden(),
+                    )
+                    .child(self.render_drill_down(window, cx)),
             )
             .when_some(status, |el, status| {
                 let text = selectable_text("conversation-status", status, window, cx)
@@ -249,6 +317,44 @@ impl ConversationView {
                     .tooltip("Context panel (Ctrl+I)")
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_context(window, cx))),
             )
+            .into_any_element()
+    }
+
+    /// The chevron beside the title: the focused item's children, as a tree
+    /// to drill into. Absent when it has none.
+    fn render_drill_down(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.nav.is_none() && !self.data.has_children {
+            return div().into_any_element();
+        }
+        let menu = self.nav.is_some().then(|| self.render_nav_menu(window, cx));
+        div()
+            .id("conversation-drill-down")
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new("conversation-drill-down-button")
+                    .icon(Icon::new(IconName::ChevronDown))
+                    .ghost()
+                    .small()
+                    .selected(self.nav.is_some())
+                    .tooltip("Go to something under this item")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.close_nav_menu(cx) {
+                            this.open_nav_menu(cx);
+                        }
+                    })),
+            )
+            .when_some(menu, |el, menu| {
+                el.child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopRight)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(div().occlude().mt_1().child(menu)),
+                    )
+                    .with_priority(1),
+                )
+            })
             .into_any_element()
     }
 
@@ -353,6 +459,16 @@ impl ConversationView {
                             .flex_shrink_0()
                             .child(change_count_label(summary.change_count)),
                     )
+                    .when(
+                        summary.conversation.protocol != ProtocolKind::Outline,
+                        |el| {
+                            el.child(
+                                style::badge(div())
+                                    .flex_shrink_0()
+                                    .child(kind_label(summary.conversation.protocol)),
+                            )
+                        },
+                    )
                     .child(
                         selectable_text(
                             ElementId::Name(format!("picker-opening-{ix}").into()),
@@ -368,29 +484,57 @@ impl ConversationView {
                     ),
             );
         }
-        let new_ix = self.data.conversations.len();
-        menu.child(
-            style::menu_item(h_flex(), highlighted == new_ix)
-                .id("picker-entry-new")
-                .w_full()
-                .items_center()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.choose_picker_entry(new_ix, window, cx);
+        let first_new = self.data.conversations.len();
+        for (i, kind) in self.data.new_kinds.iter().copied().enumerate() {
+            let ix = first_new + i;
+            menu = menu.child(
+                style::menu_item(h_flex(), highlighted == ix)
+                    .id(ElementId::Name(
+                        format!("picker-entry-new-{}", kind.as_str()).into(),
+                    ))
+                    .w_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.choose_picker_entry(ix, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .child(Icon::new(IconName::Plus).xsmall()),
+                    )
+                    .child(div().flex_1().child(new_label(kind)))
+                    // Ctrl+N starts another of the kind that is open.
+                    .when(kind == self.data.protocol, |el| {
+                        el.child(style::badge(div()).child("Ctrl+N"))
                     }),
-                )
-                .child(
-                    div()
-                        .w(px(16.))
-                        .flex_shrink_0()
-                        .child(Icon::new(IconName::Plus).xsmall()),
-                )
-                .child(div().flex_1().child("New conversation"))
-                .child(style::badge(div()).child("Ctrl+N")),
-        )
-        .into_any_element()
+            );
+        }
+        menu.into_any_element()
+    }
+}
+
+/// A kind of conversation, as the picker badges it.
+fn kind_label(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Outline => "outline",
+        ProtocolKind::Implementation => "implementation",
+        ProtocolKind::Chat => "chat",
+        ProtocolKind::VisualDesign => "visual design",
+    }
+}
+
+/// The picker entry that starts a conversation of `kind`.
+fn new_label(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Outline => "New conversation",
+        ProtocolKind::Implementation => "New implementation",
+        ProtocolKind::Chat => "New chat",
+        ProtocolKind::VisualDesign => "New visual design",
     }
 }

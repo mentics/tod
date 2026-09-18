@@ -18,6 +18,12 @@ const MAX_TOTAL_CHARS: usize = 100;
 /// (`Conversation · <focus title> · <time>`).
 pub const CONVERSATION_SURFACE: &str = "conversation";
 
+/// The surface label a plain node chat is named with.
+pub const CHAT_SURFACE: &str = "chat";
+
+/// The surface label an implementation session is named with.
+pub const IMPLEMENT_SURFACE: &str = "implement";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see
