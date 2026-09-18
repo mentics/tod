@@ -21,7 +21,7 @@
 use crate::ui::key_context;
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::style;
-use crate::ui::transcript_list::{self, TranscriptList, TranscriptListEvent};
+use crate::ui::transcript_list::{self, StartState, TranscriptList, TranscriptListEvent};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
@@ -242,12 +242,13 @@ impl AgentConversationPanel {
     // ----- chunks ------------------------------------------------------------
 
     pub fn is_expanded(&self, id: ChunkId) -> bool {
-        transcript_list::is_expanded(&self.entries, &self.toggled, id)
+        transcript_list::is_expanded(&self.entries, &self.toggled, id, StartState::Reading)
     }
 
     pub fn toggle(&mut self, id: ChunkId, cx: &mut Context<Self>) {
         let expanded = !self.is_expanded(id);
-        if expanded == transcript_list::expanded_by_default(&self.entries, id) {
+        if expanded == transcript_list::expanded_by_default(&self.entries, id, StartState::Reading)
+        {
             self.toggled.remove(&id);
         } else {
             self.toggled.insert(id, expanded);
@@ -257,10 +258,11 @@ impl AgentConversationPanel {
 
     /// The panel's stops, top to bottom.
     pub fn stops(&self) -> Vec<PanelStop> {
-        let mut stops: Vec<PanelStop> = transcript_list::chunks(&self.entries, &self.toggled)
-            .into_iter()
-            .map(PanelStop::Chunk)
-            .collect();
+        let mut stops: Vec<PanelStop> =
+            transcript_list::chunks(&self.entries, &self.toggled, StartState::Reading)
+                .into_iter()
+                .map(PanelStop::Chunk)
+                .collect();
         stops.push(PanelStop::Input);
         if self.running {
             stops.push(PanelStop::Stop);
