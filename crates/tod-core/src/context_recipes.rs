@@ -89,8 +89,9 @@ pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
 /// Agent and Files before a node can reach `active` at all).
 ///
 /// Stance is `autonomous-session`, not `interactive-chat`: nobody is waiting at
-/// a prompt, so the agent must act without confirming and may be as verbose as
-/// the work needs.
+/// a prompt, so the agent must act without confirming. The surface narrows the
+/// stance's reporting: the app shows plan steps and the recorded test run, so
+/// the reply is a sentence or two at most.
 pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
     name: "implementation session",
     layers: &[
@@ -102,6 +103,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/intro",
         "cli/obligations",
         "cli/plan",
+        "cli/tests",
         "surface/implement",
     ],
     blocks: &[

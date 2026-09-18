@@ -1,19 +1,21 @@
 //! The implementation protocol: an agent working a node's plan steps in its
 //! worktree, looped by the app until the plan is done.
 //!
-//! Its replies are structured (see [`Report`]) rather than prose, because the
-//! app reads them: test status comes from the report, and plan-step progress
-//! comes from the store, where the agent closes steps through
-//! `tod-cli plan update --status` as it goes. When a turn ends with work left,
-//! the driver sends another one without the user — the habit this protocol
-//! exists to fix is an agent stopping early with a list of what it skipped.
+//! Nothing in the agent's reply is parsed. What the app reads is what the
+//! agent wrote as it worked: plan steps it closed or blocked through
+//! `tod-cli plan update --status`, and the test run it recorded through
+//! `tod-cli tests record` (stored as the turn's report, a [`TestRun`]). The
+//! reply is only a short note for the user — usually why it stopped — so none
+//! of that is repeated in it. When a turn ends with work left, the driver
+//! sends another one without the user: the habit this protocol exists to fix
+//! is an agent stopping early with a list of what it skipped.
 //!
 //! Spec: `doc/conversation/protocols.md` §4.
 
-use super::protocol::{Next, Protocol, ProtocolEnv, Reading, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_implement_message};
 use crate::gate::PlanStepWithLinks;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -27,154 +29,53 @@ use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use uuid::Uuid;
 
-/// Where the agent is in the work, as it reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReportStatus {
-    /// More to do; the app may send another turn.
-    Working,
-    /// The agent believes the plan is finished.
-    Complete,
-    /// Something needs the user. Always hands back.
-    Blocked,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TestReport {
-    /// Tests were added or updated for this turn's work.
-    #[serde(default)]
-    pub written: bool,
-    #[serde(default)]
-    pub ran: bool,
-    #[serde(default)]
-    pub green: bool,
-    #[serde(default)]
-    pub detail: String,
-}
-
+/// One test run, as the agent records it with `tod-cli tests record`. The
+/// latest one a turn records is that turn's report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StepReport {
-    /// The plan step's slug or uuid, as `tod-cli plan` addresses it.
-    pub id: String,
-    pub status: String,
+pub struct TestRun {
+    /// The command that ran them.
+    pub command: String,
+    pub passed: u32,
     #[serde(default)]
-    pub note: String,
+    pub failed: u32,
+    /// Tests that could not run to a verdict (a panic in setup, a timeout).
+    #[serde(default)]
+    pub errors: u32,
 }
 
-/// One implementation reply. The whole reply is this document — there is no
-/// prose around it; [`Self::notes`] is where prose goes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Report {
-    pub status: ReportStatus,
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub steps: Vec<StepReport>,
-    #[serde(default)]
-    pub tests: TestReport,
-    /// What this turn did not finish.
-    #[serde(default)]
-    pub remaining: Vec<String>,
-    /// What needs the user. Empty unless `status` is `blocked`.
-    #[serde(default)]
-    pub blockers: Vec<String>,
-    #[serde(default)]
-    pub notes: String,
-}
-
-impl Report {
-    /// Everything the agent itself has to report for the work to be finished.
-    /// Plan-step state is checked separately, against the store.
-    fn claims_done(&self) -> bool {
-        self.status == ReportStatus::Complete
-            && self.tests.written
-            && self.tests.ran
-            && self.tests.green
+impl TestRun {
+    /// Something ran, and nothing failed.
+    pub fn green(&self) -> bool {
+        self.passed > 0 && self.failed == 0 && self.errors == 0
     }
 
-    /// The report as the transcript shows it: the summary as the headline,
-    /// then what the turn touched, the tests, what is left, and the notes.
-    /// The structured form is kept separately (`conversation_reports`), so
-    /// this only has to read well.
-    pub fn to_markdown(&self) -> String {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        let status = match self.status {
-            ReportStatus::Working => "Working",
-            ReportStatus::Complete => "Complete",
-            ReportStatus::Blocked => "Blocked",
-        };
-        let summary = self.summary.trim();
-        if summary.is_empty() {
-            let _ = writeln!(out, "**{status}**");
-        } else {
-            let _ = writeln!(out, "**{status}** — {summary}");
+    /// "24 passed", or "22 passed, 2 failed, 1 error".
+    pub fn label(&self) -> String {
+        let mut parts = vec![format!("{} passed", self.passed)];
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
         }
-        if !self.steps.is_empty() {
-            out.push_str("\n**Steps**\n\n");
-            for step in &self.steps {
-                let _ = write!(out, "- `{}` {}", step.id, step.status);
-                if !step.note.trim().is_empty() {
-                    let _ = write!(out, " — {}", step.note.trim());
-                }
-                out.push('\n');
-            }
+        match self.errors {
+            0 => {}
+            1 => parts.push("1 error".to_string()),
+            n => parts.push(format!("{n} errors")),
         }
-        let tests = match (self.tests.written, self.tests.ran, self.tests.green) {
-            (_, false, _) => "not run",
-            (_, true, true) => "green",
-            (_, true, false) => "red",
-        };
-        let _ = write!(out, "\n**Tests** {tests}");
-        if !self.tests.written {
-            out.push_str(" (none written)");
-        }
-        out.push('\n');
-        let detail = self.tests.detail.trim();
-        if !detail.is_empty() {
-            let _ = writeln!(out, "\n```\n{detail}\n```");
-        }
-        for (heading, items) in [("Remaining", &self.remaining), ("Blockers", &self.blockers)] {
-            if items.is_empty() {
-                continue;
-            }
-            let _ = writeln!(out, "\n**{heading}**\n");
-            for item in items {
-                let _ = writeln!(out, "- {}", item.trim());
-            }
-        }
-        let notes = self.notes.trim();
-        if !notes.is_empty() {
-            let _ = writeln!(out, "\n{notes}");
-        }
-        out.trim_end().to_string()
+        parts.join(", ")
+    }
+
+    /// A stored report, when it is one.
+    pub fn from_report(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
     }
 }
-
-/// The schema every implementation reply must match, quoted back to the agent
-/// when a reply does not parse.
-pub const REPLY_SCHEMA: &str = "\
-status: working        # working | complete | blocked
-summary: One line on what this turn did.
-steps:
-  - id: <plan step slug or uuid>
-    status: in_progress | implemented | blocked
-    note: optional
-tests:
-  written: true
-  ran: true
-  green: true
-  detail: the command you ran and its result
-remaining:
-  - what this turn did not finish
-blockers:
-  - what needs the user; omit unless status is blocked
-notes: |
-  Optional prose.";
 
 /// The node being implemented, passed to the agent's process so a tool that
 /// needs it does not have to parse the context back out.
 pub const IMPLEMENT_NODE_ENV: &str = "TOD_IMPLEMENT_NODE";
+
+/// The implementation conversation, passed to the agent's process so
+/// `tod-cli tests record` knows which conversation the run belongs to.
+pub const IMPLEMENT_CONVERSATION_ENV: &str = "TOD_IMPLEMENT_CONVERSATION";
 
 pub struct ImplementationProtocol;
 
@@ -199,10 +100,14 @@ impl Protocol for ImplementationProtocol {
     /// Its writes are not a reversible change set, so no conversation actor:
     /// plan-step and file changes are the agent's own, like any other caller.
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
-        match node_id(env) {
-            Ok(node) => vec![(IMPLEMENT_NODE_ENV.to_string(), node.to_string())],
-            Err(_) => Vec::new(),
+        let mut vars = vec![(
+            IMPLEMENT_CONVERSATION_ENV.to_string(),
+            env.conversation_id.to_string(),
+        )];
+        if let Ok(node) = node_id(env) {
+            vars.push((IMPLEMENT_NODE_ENV.to_string(), node.to_string()));
         }
+        vars
     }
 
     /// The node's worktree — this agent edits files, not just the outline.
@@ -271,28 +176,6 @@ impl Protocol for ImplementationProtocol {
         Ok(out)
     }
 
-    fn read_reply(&self, body: &str) -> Reading {
-        match parse_report(body) {
-            Ok(report) => {
-                let value = serde_json::to_value(&report).unwrap_or(Value::Null);
-                // The transcript shows the report readably; its structured
-                // form is the stored report.
-                Reading::Accepted {
-                    body: report.to_markdown(),
-                    report: Some(value),
-                }
-            }
-            Err(reason) => Reading::Malformed {
-                reason: reason.to_string(),
-                correction: format!(
-                    "Your reply could not be read: {reason}\n\n\
-                     Reply with the implementation report and nothing else — \
-                     no prose outside it, no code fence around it:\n\n{REPLY_SCHEMA}"
-                ),
-            },
-        }
-    }
-
     fn loops(&self) -> bool {
         true
     }
@@ -312,25 +195,25 @@ impl Protocol for ImplementationProtocol {
         Ok(Some(marks.join("\n")))
     }
 
+    /// Done when every plan step is closed and this turn recorded a green
+    /// test run; handed back when a step is blocked, since that needs the
+    /// user. Otherwise another turn goes out, until the cap or a turn that
+    /// changed nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
-        let Some(report) = turn.report.and_then(from_value) else {
-            // No readable report: the driver's correction path owns this.
-            return Ok(Next::Done);
-        };
         let node = node_id(turn.env)?;
         let steps = plan_steps(turn.env.fleet, node);
-        let blocked: Vec<&PlanStepWithLinks> = steps
+        if steps
             .iter()
-            .filter(|linked| linked.step.status == STATUS_BLOCKED)
-            .collect();
-        if report.status == ReportStatus::Blocked || !blocked.is_empty() {
+            .any(|linked| linked.step.status == STATUS_BLOCKED)
+        {
             return Ok(Next::Done);
         }
         let open: Vec<&PlanStepWithLinks> = steps
             .iter()
             .filter(|linked| !step_is_done(&linked.step.status))
             .collect();
-        if open.is_empty() && report.claims_done() {
+        let tests = turn.report.and_then(TestRun::from_report);
+        if open.is_empty() && tests.as_ref().is_some_and(TestRun::green) {
             return Ok(Next::Done);
         }
         if turn.continuations >= super::protocol::CONTINUATION_CAP {
@@ -341,7 +224,7 @@ impl Protocol for ImplementationProtocol {
         }
         Ok(Next::Continue {
             note: continuation_note(open.len()),
-            message: continuation_message(&report, &open),
+            message: continuation_message(&open, tests.as_ref()),
         })
     }
 }
@@ -349,26 +232,19 @@ impl Protocol for ImplementationProtocol {
 /// Why the loop sent another turn, as the transcript shows it.
 fn continuation_note(open: usize) -> String {
     match open {
-        0 => "Asked the agent to finish the remaining work".to_string(),
+        0 => "Asked the agent to run the tests".to_string(),
         1 => "Asked the agent to finish the last open plan step".to_string(),
         n => format!("Asked the agent to finish {n} open plan steps"),
     }
 }
 
-/// What the loop sends: the work the agent itself said was left, plus the
-/// plan steps the store still shows open.
-fn continuation_message(report: &Report, open: &[&PlanStepWithLinks]) -> String {
+/// What the loop sends: the plan steps the store still shows open, and what
+/// the tests still need.
+fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) -> String {
     let mut out = String::from(
         "Keep going. This turn is not finished — do not stop to report \
          progress, and do not ask whether to continue.\n\n",
     );
-    if !report.remaining.is_empty() {
-        out.push_str("You said this was left:\n\n");
-        for item in &report.remaining {
-            out.push_str(&format!("- {item}\n"));
-        }
-        out.push('\n');
-    }
     if !open.is_empty() {
         out.push_str("These plan steps are still open:\n\n");
         for linked in open {
@@ -379,13 +255,22 @@ fn continuation_message(report: &Report, open: &[&PlanStepWithLinks]) -> String 
         }
         out.push('\n');
     }
-    if !report.tests.green {
-        out.push_str(
-            "Unit tests for this work must be written, run, and green before \
-             the plan is complete.\n\n",
-        );
+    match tests {
+        None => out.push_str(
+            "No test run was recorded this turn. Run the tests for this work \
+             and record the result.\n\n",
+        ),
+        Some(run) if !run.green() => out.push_str(&format!(
+            "The recorded test run is not green ({}). Fix it, run the tests \
+             again, and record the result.\n\n",
+            run.label()
+        )),
+        Some(_) => {}
     }
-    out.push_str("Reply with the implementation report, as before.");
+    out.push_str(
+        "If something needs the user, mark the plan steps it holds up \
+         `blocked` and say why in a sentence or two.",
+    );
     out
 }
 
@@ -445,231 +330,97 @@ fn worktree_fingerprint(cwd: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
-/// Read a reply as a report. The whole reply is the document; a code fence
-/// around it is tolerated because agents add them reflexively.
-///
-/// Models are asked for a bare document but routinely wrap it: a line of prose
-/// ("All done — here is the report:") and a fenced block. Rejecting that
-/// costs a correction turn every time for no gain, so this reads, in order,
-/// the whole reply, the last fenced block in it, and the reply from its first
-/// `status:` line — and takes the first that parses. The error reported is the
-/// whole reply's, since that is the one the agent was asked to send.
-pub fn parse_report(body: &str) -> Result<Report> {
-    let whole = strip_fence(body.trim());
-    if whole.is_empty() {
-        bail!("the reply was empty");
-    }
-    let first = serde_yaml::from_str::<Report>(whole).map_err(|err| anyhow::anyhow!("{err}"));
-    if first.is_ok() {
-        return first;
-    }
-    let candidates = [last_fenced_block(body), from_status_line(body)];
-    for text in candidates.into_iter().flatten() {
-        if let Ok(report) = serde_yaml::from_str::<Report>(text) {
-            return Ok(report);
-        }
-    }
-    first
-}
-
-/// The body of the last ``` fenced block in `text`, when there is one.
-fn last_fenced_block(text: &str) -> Option<&str> {
-    let close = text.rfind("```")?;
-    let open = text[..close].rfind("```")?;
-    let block = &text[open + 3..close];
-    // Drop the info string (`yaml`) on the opening fence's line.
-    let body = block.split_once('\n').map_or("", |(_, rest)| rest);
-    Some(body.trim()).filter(|b| !b.is_empty())
-}
-
-/// `text` from its first line that starts a report, to the end or to a
-/// closing fence.
-fn from_status_line(text: &str) -> Option<&str> {
-    let start = text
-        .match_indices("status:")
-        .map(|(ix, _)| ix)
-        .find(|&ix| ix == 0 || text[..ix].ends_with('\n'))?;
-    let rest = &text[start..];
-    let end = rest.find("```").unwrap_or(rest.len());
-    Some(rest[..end].trim()).filter(|b| !b.is_empty())
-}
-
-fn strip_fence(text: &str) -> &str {
-    let Some(rest) = text.strip_prefix("```") else {
-        return text;
-    };
-    let rest = rest.split_once('\n').map_or("", |(_, rest)| rest);
-    rest.trim_end()
-        .strip_suffix("```")
-        .unwrap_or(rest)
-        .trim_end()
-}
-
-fn from_value(value: &Value) -> Option<Report> {
-    serde_json::from_value(value.clone()).ok()
-}
-
 /// Plays the implementation agent for `--agent mock`: closes the first open
-/// plan step, then reports. It takes two turns on a two-step plan, so the
-/// app's loop is what carries it to the end — which is the point of running
-/// it under the mock at all.
-pub fn mock_turn(access: &impl super::mock::Access, node_id: Uuid) -> Result<String> {
+/// plan step and records a green test run. It takes two turns on a two-step
+/// plan, so the app's loop is what carries it to the end — which is the point
+/// of running it under the mock at all. Like a real agent, it has nothing to
+/// say while the work goes to plan.
+pub fn mock_turn(
+    access: &impl super::mock::Access,
+    node_id: Uuid,
+    conversation_id: Uuid,
+) -> Result<String> {
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
     })?;
-    let open: Vec<_> = steps
-        .iter()
-        .filter(|step| !step_is_done(&step.status))
-        .collect();
-    let closing = open.first().map(|step| step.id);
-    if let Some(step_id) = closing {
+    if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status)) {
         access.interview(tod_store::interview::InterviewCommand::Outline {
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
-                step_id,
+                step_id: step.id,
                 status: STATUS_IMPLEMENTED.to_string(),
             },
             target: None,
         })?;
     }
-    let left = open.len().saturating_sub(1);
-    let report = Report {
-        status: if left == 0 {
-            ReportStatus::Complete
-        } else {
-            ReportStatus::Working
-        },
-        summary: match closing {
-            Some(id) => format!("Implemented plan step {id}."),
-            None => "Nothing left to implement.".to_string(),
-        },
-        steps: closing
-            .map(|id| StepReport {
-                id: id.to_string(),
-                status: STATUS_IMPLEMENTED.to_string(),
-                note: String::new(),
-            })
-            .into_iter()
-            .collect(),
-        tests: TestReport {
-            written: true,
-            ran: true,
-            green: true,
-            detail: "mock agent — no tests were really run".to_string(),
-        },
-        remaining: (left > 0)
-            .then(|| vec![format!("{left} plan step(s) still open")])
-            .unwrap_or_default(),
-        blockers: Vec::new(),
-        notes: String::new(),
+    let run = TestRun {
+        command: "mock agent — no tests were really run".to_string(),
+        passed: 1,
+        failed: 0,
+        errors: 0,
     };
-    Ok(serde_yaml::to_string(&report)?)
+    access.interview(
+        tod_store::interview::InterviewCommand::RecordConversationReport {
+            conversation_id,
+            body: serde_json::to_value(&run)?,
+        },
+    )?;
+    Ok(String::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const GOOD: &str = "\
-status: complete
-summary: Wired the side pane.
-steps:
-  - id: side-pane
-    status: implemented
-tests:
-  written: true
-  ran: true
-  green: true
-  detail: cargo test -p tod-store
-remaining: []
-notes: |
-  Nothing surprising.";
-
-    #[test]
-    fn reads_a_conforming_report() {
-        let report = parse_report(GOOD).expect("parses");
-        assert_eq!(report.status, ReportStatus::Complete);
-        assert!(report.claims_done());
-        assert_eq!(report.steps.len(), 1);
+    fn run(passed: u32, failed: u32, errors: u32) -> TestRun {
+        TestRun {
+            command: "cargo test -p tod-store".into(),
+            passed,
+            failed,
+            errors,
+        }
     }
 
-    /// What Claude actually sent in a real run: a line of prose, then the
-    /// report in a fenced block. It reads without a correction turn.
     #[test]
-    fn reads_a_report_behind_prose_and_a_fence() {
-        let reply =
-            format!("Perfect! All work is complete. Here is the report:\n\n```yaml\n{GOOD}\n```\n");
+    fn a_test_run_is_green_only_when_something_passed_and_nothing_failed() {
+        assert!(run(24, 0, 0).green());
+        assert!(!run(22, 2, 0).green());
+        assert!(!run(24, 0, 1).green());
+        assert!(!run(0, 0, 0).green(), "nothing ran");
+    }
+
+    /// The side pane shows counts, not a verdict word.
+    #[test]
+    fn a_test_run_reads_as_counts() {
+        assert_eq!(run(24, 0, 0).label(), "24 passed");
+        assert_eq!(run(22, 2, 1).label(), "22 passed, 2 failed, 1 error");
+        assert_eq!(run(3, 0, 2).label(), "3 passed, 2 errors");
+    }
+
+    #[test]
+    fn a_stored_run_round_trips() {
+        let value = serde_json::to_value(run(5, 1, 0)).unwrap();
+        assert_eq!(TestRun::from_report(&value), Some(run(5, 1, 0)));
+        // A report from before test runs were recorded is not one.
         assert_eq!(
-            parse_report(&reply).expect("parses").status,
-            ReportStatus::Complete
-        );
-    }
-
-    /// No fence at all: prose, then the document from its `status:` line.
-    #[test]
-    fn reads_a_report_behind_prose_without_a_fence() {
-        let reply = format!("Done.\n\n{GOOD}");
-        assert_eq!(
-            parse_report(&reply).expect("parses").status,
-            ReportStatus::Complete
-        );
-    }
-
-    /// The transcript gets readable text, not the raw document: the summary
-    /// leads, and the test status is a word rather than three booleans.
-    #[test]
-    fn a_report_renders_as_readable_markdown() {
-        let md = parse_report(GOOD).expect("parses").to_markdown();
-        assert!(md.starts_with("**Complete**"), "{md}");
-        assert!(md.contains("**Tests** green"), "{md}");
-        assert!(!md.contains("written: true"), "{md}");
-    }
-
-    /// Prose alone still fails, so the correction turn still happens.
-    #[test]
-    fn prose_alone_is_still_malformed() {
-        assert!(parse_report("I finished everything, all tests pass.").is_err());
-    }
-
-    #[test]
-    fn tolerates_a_code_fence() {
-        let fenced = format!("```yaml\n{GOOD}\n```");
-        assert_eq!(
-            parse_report(&fenced).expect("parses").status,
-            ReportStatus::Complete
+            TestRun::from_report(&serde_json::json!({ "status": "complete" })),
+            None
         );
     }
 
     #[test]
-    fn prose_is_not_a_report() {
-        assert!(parse_report("I finished the work, but a few things remain.").is_err());
-        assert!(parse_report("").is_err());
-    }
-
-    #[test]
-    fn a_complete_report_with_red_tests_is_not_done() {
-        let text = GOOD.replace("green: true", "green: false");
-        assert!(!parse_report(&text).expect("parses").claims_done());
-    }
-
-    #[test]
-    fn a_working_report_is_not_done_however_green() {
-        let text = GOOD.replace("status: complete", "status: working");
-        assert!(!parse_report(&text).expect("parses").claims_done());
-    }
-
-    #[test]
-    fn the_continuation_message_carries_remaining_work_and_open_steps() {
-        let mut report = parse_report(GOOD).expect("parses");
-        report.remaining = vec!["Wire the header strip.".into()];
-        report.tests.green = false;
-        let message = continuation_message(&report, &[]);
-        assert!(message.contains("Wire the header strip."));
-        assert!(message.contains("must be written, run, and green"));
-        assert!(message.contains("Keep going"));
+    fn the_continuation_message_asks_for_a_missing_or_red_test_run() {
+        let missing = continuation_message(&[], None);
+        assert!(missing.contains("No test run was recorded"), "{missing}");
+        assert!(missing.contains("Keep going"), "{missing}");
+        let red = continuation_message(&[], Some(&run(22, 2, 0)));
+        assert!(red.contains("not green (22 passed, 2 failed)"), "{red}");
+        let green = continuation_message(&[], Some(&run(24, 0, 0)));
+        assert!(!green.contains("test run"), "{green}");
     }
 
     #[test]
     fn the_continuation_note_counts_open_steps() {
+        assert!(continuation_note(0).contains("run the tests"));
         assert!(continuation_note(1).contains("last open plan step"));
         assert!(continuation_note(3).contains("3 open plan steps"));
     }
@@ -715,7 +466,20 @@ notes: |
             fx
         }
 
-        fn decide(fx: &Fixture, report: &Report, continuations: u32, progressed: bool) -> Next {
+        /// Plan step `n` of `fx`'s node.
+        fn step(fx: &Fixture, n: usize) -> uuid::Uuid {
+            fx.fleet
+                .read(|conn| Ok(PlanStepRepo::new(conn).list_for_node(fx.node)?))
+                .unwrap()[n]
+                .id
+        }
+
+        fn decide(
+            fx: &Fixture,
+            tests: Option<TestRun>,
+            continuations: u32,
+            progressed: bool,
+        ) -> Next {
             let media = MediaPaths::discover().expect("media paths");
             let env = ProtocolEnv {
                 fleet: &fx.fleet,
@@ -724,38 +488,25 @@ notes: |
                 conversation_id: Uuid::new_v4(),
                 focus: Focus::Node(fx.node),
             };
+            let report = tests.map(|run| serde_json::to_value(run).unwrap());
             ImplementationProtocol
                 .next(&TurnContext {
                     env: &env,
-                    report: Some(&serde_json::to_value(report).unwrap()),
+                    report: report.as_ref(),
                     continuations,
                     progressed,
                 })
                 .expect("a decision")
         }
 
-        fn report(status: ReportStatus, green: bool) -> Report {
-            Report {
-                status,
-                summary: "did some".into(),
-                steps: Vec::new(),
-                tests: TestReport {
-                    written: true,
-                    ran: true,
-                    green,
-                    detail: String::new(),
-                },
-                remaining: Vec::new(),
-                blockers: Vec::new(),
-                notes: String::new(),
-            }
+        fn green() -> Option<TestRun> {
+            Some(run(24, 0, 0))
         }
 
         #[test]
-        fn an_open_plan_step_keeps_the_loop_going_however_complete_the_agent_says_it_is() {
+        fn an_open_plan_step_keeps_the_loop_going_however_green_the_tests() {
             let fx = planned(2, 1);
-            let next = decide(&fx, &report(ReportStatus::Complete, true), 0, true);
-            let Next::Continue { note, message } = next else {
+            let Next::Continue { note, message } = decide(&fx, green(), 0, true) else {
                 panic!("an open plan step should continue");
             };
             assert!(note.contains("last open plan step"), "{note}");
@@ -765,42 +516,48 @@ notes: |
         #[test]
         fn a_closed_plan_and_green_tests_hand_back() {
             let fx = planned(2, 2);
-            assert!(matches!(
-                decide(&fx, &report(ReportStatus::Complete, true), 0, true),
-                Next::Done
-            ));
+            assert!(matches!(decide(&fx, green(), 0, true), Next::Done));
         }
 
         #[test]
         fn red_tests_keep_the_loop_going_even_with_every_step_closed() {
             let fx = planned(2, 2);
-            let Next::Continue { message, .. } =
-                decide(&fx, &report(ReportStatus::Complete, false), 0, true)
+            let Next::Continue { message, .. } = decide(&fx, Some(run(22, 2, 0)), 0, true)
             else {
                 panic!("red tests should continue");
             };
-            assert!(message.contains("green"), "{message}");
+            assert!(message.contains("not green"), "{message}");
         }
 
+        /// A closed plan is not done until this turn has recorded its tests.
         #[test]
-        fn a_blocked_report_hands_back_with_work_left() {
-            let fx = planned(2, 0);
-            assert!(matches!(
-                decide(&fx, &report(ReportStatus::Blocked, false), 0, true),
-                Next::Done
-            ));
+        fn no_recorded_test_run_keeps_the_loop_going() {
+            let fx = planned(2, 2);
+            let Next::Continue { note, .. } = decide(&fx, None, 0, true) else {
+                panic!("an unrecorded test run should continue");
+            };
+            assert!(note.contains("run the tests"), "{note}");
+        }
+
+        /// Blocking is done on the plan: a blocked step hands back, whatever
+        /// else is open.
+        #[test]
+        fn a_blocked_step_hands_back_with_work_left() {
+            let fx = planned(3, 0);
+            fx.fleet
+                .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                    step_id: step(&fx, 1),
+                    status: STATUS_BLOCKED.to_string(),
+                })
+                .unwrap();
+            assert!(matches!(decide(&fx, None, 0, true), Next::Done));
         }
 
         #[test]
         fn the_cap_stops_the_loop() {
             let fx = planned(2, 0);
             assert!(matches!(
-                decide(
-                    &fx,
-                    &report(ReportStatus::Working, false),
-                    CONTINUATION_CAP,
-                    true
-                ),
+                decide(&fx, None, CONTINUATION_CAP, true),
                 Next::Done
             ));
         }
@@ -808,10 +565,7 @@ notes: |
         #[test]
         fn a_turn_that_changed_nothing_stops_the_loop() {
             let fx = planned(2, 0);
-            assert!(matches!(
-                decide(&fx, &report(ReportStatus::Working, false), 1, false),
-                Next::Done
-            ));
+            assert!(matches!(decide(&fx, None, 1, false), Next::Done));
         }
     }
 }

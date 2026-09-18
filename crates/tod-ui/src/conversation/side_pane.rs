@@ -3,10 +3,10 @@
 //! The transcript is the same for every conversation; this is where they
 //! differ. An outline conversation shows its reversible change set
 //! ([`super::change_set`]); an implementation conversation shows the plan it
-//! is working, the test status from the latest report, and the files its
+//! is working, the latest test run its agent recorded, and the files its
 //! worktree has changed. A plain chat has nothing to show.
 //!
-//! Spec: `doc/conversation/protocols.md` §4.6.
+//! Spec: `doc/conversation/protocols.md` §4.5.
 
 use super::{ConversationView, Pane};
 use crate::ui::selectable_text::selectable_text;
@@ -17,7 +17,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div,
 };
 use gpui_component::{h_flex, v_flex};
-use tod_core::conversation::implement::Report;
+use tod_core::conversation::implement::TestRun;
 use tod_store::conversation::ProtocolKind;
 use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
 
@@ -73,11 +73,9 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.pane == Pane::ChangeSet;
-        let report: Option<Report> = self
-            .data
-            .report
-            .clone()
-            .and_then(|value| serde_json::from_value(value).ok());
+        // Nothing until the agent records a run: before that there is no
+        // test status to show.
+        let tests: Option<TestRun> = self.data.report.as_ref().and_then(TestRun::from_report);
 
         let done = self
             .data
@@ -181,8 +179,13 @@ impl ConversationView {
                         .child("Implementation"),
                     )
                     .child(style::text_dense_muted(div()).child(format!("{done}/{total} steps")))
-                    .when_some(report.as_ref(), |el, report| {
-                        el.child(style::badge(div()).child(test_label(report)))
+                    .when_some(tests, |el, run| {
+                        let label = run.label();
+                        el.child(if run.green() {
+                            style::badge(div()).child(label)
+                        } else {
+                            style::text_error(style::badge(div())).child(label)
+                        })
                     })
                     .when(self.loop_turns > 0, |el| {
                         el.child(
@@ -201,16 +204,6 @@ impl ConversationView {
                     .pb(style::space::RELATED)
                     .children(rows),
             )
-            .when_some(report, |el, report| {
-                el.when(!report.summary.trim().is_empty(), |el| {
-                    el.child(style::panel_footer(div()).child(selectable_text(
-                        "implementation-summary",
-                        report.summary.clone(),
-                        window,
-                        cx,
-                    )))
-                })
-            })
             .into_any_element()
     }
 
@@ -225,17 +218,5 @@ impl ConversationView {
                     .child(message),
             )
             .into_any_element()
-    }
-}
-
-/// The report's test status, as one badge.
-fn test_label(report: &Report) -> String {
-    if !report.tests.ran {
-        return "tests not run".to_string();
-    }
-    if report.tests.green {
-        "tests green".to_string()
-    } else {
-        "tests red".to_string()
     }
 }

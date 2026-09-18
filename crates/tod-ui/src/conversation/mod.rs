@@ -254,7 +254,8 @@ pub(crate) struct Snapshot {
     pub protocol: ProtocolKind,
     /// The focus node's plan steps, for protocols whose side pane shows them.
     pub plan: Vec<PlanStep>,
-    /// The latest report a reply-parsing protocol stored.
+    /// The latest report the conversation's agent recorded (for
+    /// implementation, its test run).
     pub report: Option<serde_json::Value>,
     /// The kinds of conversation the picker offers to start on this focus.
     pub new_kinds: Vec<ProtocolKind>,

@@ -184,12 +184,9 @@ pub enum InterviewCommand {
         entity: crate::conversation::Entity,
         entity_id: Uuid,
     },
-    /// Store a protocol's parsed report for a turn, replacing any earlier one.
-    SetConversationReport {
-        conversation_id: Uuid,
-        turn_seq: i64,
-        body: Value,
-    },
+    /// Store a report against the conversation's turn in progress,
+    /// replacing any earlier one for that turn.
+    RecordConversationReport { conversation_id: Uuid, body: Value },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -747,17 +744,13 @@ pub fn execute(
             )?;
             Ok(json!({}))
         }
-        InterviewCommand::SetConversationReport {
+        InterviewCommand::RecordConversationReport {
             conversation_id,
-            turn_seq,
             body,
         } => {
-            crate::conversation::ConversationRepo::new(conn).set_report(
-                *conversation_id,
-                *turn_seq,
-                body,
-            )?;
-            Ok(json!({}))
+            let turn_seq = crate::conversation::ConversationRepo::new(conn)
+                .record_report(*conversation_id, body)?;
+            Ok(json!({ "turn_seq": turn_seq }))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,

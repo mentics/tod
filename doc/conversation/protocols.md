@@ -43,7 +43,7 @@ ConversationView
 └─ side pane                         (protocol)
 
 ConversationDriver
-└─ protocol: context recipe, turn envelope, reply parsing, done-check, loop policy
+└─ protocol: context recipe, turn envelope, done-check, loop policy
 ```
 
 Swapping the protocol turns the same view into a different tool. That is the
@@ -57,7 +57,6 @@ whole design.
 | Working directory | `scratch_dir()` | protocol (scratch, or the node's worktree) |
 | `SessionPurpose` | `Conversation` | protocol |
 | Actor env (`TOD_INTERVIEW_ACTOR`) | always set | protocol (only outline-mutating protocols set it) |
-| Reply parsing | none — body is markdown | protocol |
 | Answer rendering | markdown | protocol |
 | Done-check | none; every turn ends the exchange | protocol |
 | Loop | none | protocol |
@@ -95,14 +94,16 @@ ALTER TABLE conversations ADD COLUMN agent_run_id TEXT REFERENCES agent_runs(id)
 CREATE TABLE conversation_reports (
     conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     turn_seq        INTEGER NOT NULL,
-    body            TEXT NOT NULL,      -- the parsed report, as JSON
+    body            TEXT NOT NULL,      -- the report, as JSON
     PRIMARY KEY (conversation_id, turn_seq)
 );
 ```
 
-A protocol that parses replies stores the parsed form here, so the side pane
-and the done-check read structured data instead of re-parsing text. The raw
-reply stays in `conversation_turns.body` either way.
+A report is structured data the agent records through `tod-cli` while it
+works — never parsed out of its reply — so the side pane and the done-check
+read it directly. It is filed against the turn in progress (the latest turn
+in the transcript: the agent's own turn is appended only when it ends), and a
+second record in the same turn replaces the first.
 
 ### 3.1 Conversations and fleet runs
 
@@ -173,62 +174,43 @@ agent-judged rule on `planning` → `ready`
 criterion on `ready` → `active` stays the action-config check in
 `tod_core::gate::derived`.
 
-### 4.2 The reply is a document
+### 4.2 What the agent records, and what it says
 
-The stance mandates that every implementation reply is a single YAML document
-and nothing else — no prose outside it, no code fence around it.
+Nothing in an implementation reply is parsed. The app reads what the agent
+wrote as it worked, through `tod-cli`:
 
-```yaml
-status: working        # working | complete | blocked
-summary: One line on what this turn did.
-steps:                 # every plan step this turn touched
-  - id: <plan step slug or uuid>
-    status: in_progress | implemented | verified | blocked
-    note: optional
-tests:
-  written: true        # tests were added or updated for this turn's work
-  ran: true
-  green: true
-  detail: cargo test -p tod-store — 84 passed
-remaining:             # what this turn did not finish
-  - Wire the side pane to the report.
-blockers:              # needs the user; empty unless status is blocked
-  - Should the cap be configurable?
-notes: |
-  Free prose, optional. Rendered as the answer body.
-```
+- **Plan steps.** It closes each finished step (`plan update --status
+  implemented`), and marks every step something holds up `blocked`.
+- **The test run.** After its last change in a turn it runs the tests and
+  records the counts: `tests record --command <cmd> --passed N [--failed N]
+  [--errors N]`, stored in `conversation_reports` as a `TestRun`. The latest
+  record in a turn is that turn's.
 
-`notes` is the only free-text field and it is optional; everything else is
-structured.
+The reply is only what the user needs that those do not already show —
+usually nothing when the plan is done, and a sentence or two saying what
+needs the user when it is blocked. The context says so as a scoped exception
+to the autonomous stance (`surface/implement.md`): no summary of the work, no
+list of steps, no test results. One reason covers every step it blocks.
 
-Models asked for a bare document routinely wrap it anyway — a line of prose
-and a fenced block (a real Claude run did exactly this). So the parser reads
-the whole reply, then the last fenced block, then the reply from its first
-`status:` line, and takes the first that parses; only a reply with no readable
-report at all gets a correction turn (§4.5).
-
-An accepted reply is stored in `conversation_turns.body` as readable markdown
-(`Report::to_markdown`: the summary as the headline, then steps, tests,
-what remains, and the notes) and in `conversation_reports` as the structured
-report. The raw text of an accepted reply is not kept; a rejected one is, in
-its error turn.
+This replaced a YAML report the whole reply had to be. It restated what the
+plan steps already said, models wrapped it in prose anyway, and the user got
+the whole document back as the reply.
 
 ### 4.3 Done
 
-A turn ends the exchange when **all** of:
+A turn ends the exchange when **both**:
 
-1. `status: complete`.
-2. No plan step on the node is `pending`, `ready`, `in_progress`, or
+1. No plan step on the node is `pending`, `ready`, `in_progress`, or
    `blocked` — every one is `implemented` or `verified`
    (`tod_store::outline::repos::plan_steps`).
-3. `tests.written`, `tests.ran`, and `tests.green` are all true.
+2. The turn recorded a test run with at least one pass and no failures or
+   errors. A run from an earlier turn does not count: the code may have
+   changed since.
 
-Condition 2 is read from the store, not the reply — the agent closes steps
-through `tod-cli plan update --status` as it goes, and the app checks what
-landed. Condition 3 is agent-reported and trusted.
+Both are read from the store. Test counts are agent-recorded and trusted.
 
-`status: blocked`, or any plan step in `blocked`, stops the loop and hands
-back to the user regardless of the other conditions.
+Any plan step in `blocked` stops the loop and hands back to the user
+regardless.
 
 ### 4.4 The loop
 
@@ -239,7 +221,7 @@ carrying the remaining work — without the user.
 Stops on any of:
 
 - **Done** (§4.3).
-- **Blocked** — `status: blocked` or a blocked plan step.
+- **Blocked** — a blocked plan step.
 - **Cap** — 10 continuations per user message.
 - **No progress** — a continuation that closes no plan step and changes no
   file in the worktree. Checked against the step statuses and `git status
@@ -253,21 +235,14 @@ A `continuation` turn is a one-line transcript marker, exactly as
 `TurnRole::Rotation` already is — *not* a synthesized user turn. The user can
 always see that the loop ran and how often.
 
-### 4.5 Malformed replies
-
-A reply that does not parse gets **one** correction turn quoting the schema
-and asking again. If the second reply also fails to parse, the driver records
-an error turn holding the raw text, marks it in the transcript as a protocol
-error (distinct styling, so it is obvious while troubleshooting), and hands
-back to the user. Malformed replies do not count against the continuation cap.
-
-### 4.6 Side pane
+### 4.5 Side pane
 
 Plan steps first, with live status, in plan order — the same data the
 done-check reads, so the user sees what the gate sees. Below them, the files
 changed in the worktree (`git status --porcelain`, refreshed when a turn
-finishes). A header strip carries test status from the latest report and the
-loop's continuation count.
+finishes). A header strip carries the latest recorded test run's counts
+("24 passed", "22 passed, 2 failed" in the error color) — nothing until the
+agent records one — and the loop's continuation count.
 
 ## 5. View changes
 
@@ -298,8 +273,8 @@ loop's continuation count.
    protocol-chosen side pane (`tod_ui::conversation::side_pane`). `outline`
    keeps today's behavior and its tests pass untouched.
 2. **Schema v39** and the report table. *Done.*
-3. **The implementation protocol.** *Done.* Reply schema, done-check, loop,
-   side pane, `--agent mock` support. **Implement** opens the conversation
+3. **The implementation protocol.** *Done.* Recorded test runs, done-check,
+   loop, side pane, `--agent mock` support. **Implement** opens the conversation
    view instead of the interactive agent window.
 4. **The `chat` protocol.** *Done.* `ChatProtocol` with its own
    `surface/chat.md` and `CHAT` recipe. A chat has no fixed job — the user sets
@@ -340,5 +315,5 @@ loop's continuation count.
 - The `verifying` lifecycle phase gets its own protocol and conversation
   later. Unit tests shipping green is an `active`-phase obligation and is
   covered by §4.3; end-to-end and manual verification are a separate phase.
-- Capturing test output in the app. Test status is agent-reported (§4.3).
+- Capturing test output in the app. Test counts are agent-recorded (§4.2).
 - Terminal sessions and prompt queuing for implementation runs (§3.1).

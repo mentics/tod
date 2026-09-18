@@ -2,8 +2,8 @@
 //!
 //! The conversation view is a transcript plus a side pane. The transcript is
 //! the same everywhere; everything else — where the agent runs, what context
-//! it is given, how its reply is read, what "done" means, and whether the app
-//! loops it without the user — is a [`Protocol`].
+//! it is given, what "done" means, and whether the app loops it without the
+//! user — is a [`Protocol`].
 //!
 //! [`ConversationDriver`](super::driver::ConversationDriver) holds one and
 //! calls through it. [`protocol_for`] is the registry: one match, every kind.
@@ -35,15 +35,6 @@ pub struct ProtocolEnv<'a> {
     pub focus: Focus,
 }
 
-/// A reply, as the protocol reads it.
-pub enum Reading {
-    /// Keep this body, and the report the protocol parsed out of it.
-    Accepted { body: String, report: Option<Value> },
-    /// The reply did not conform. The driver sends `correction` once; a
-    /// second failure records an error turn holding the raw reply.
-    Malformed { reason: String, correction: String },
-}
-
 /// What the driver does once a reply has landed.
 pub enum Next {
     /// Hand back to the user.
@@ -57,7 +48,8 @@ pub enum Next {
 /// What [`Protocol::next`] decides from.
 pub struct TurnContext<'a> {
     pub env: &'a ProtocolEnv<'a>,
-    /// The report from this turn, when the protocol parsed one.
+    /// The report the agent recorded during this turn (through `tod-cli`),
+    /// if it recorded one.
     pub report: Option<&'a Value>,
     /// Continuations already sent for the user message being answered.
     pub continuations: u32,
@@ -117,14 +109,6 @@ pub trait Protocol: Send + Sync {
         budget_tokens: i64,
         before_seq: Option<i64>,
     ) -> Result<String>;
-
-    /// Read the agent's reply. The default keeps it as-is.
-    fn read_reply(&self, body: &str) -> Reading {
-        Reading::Accepted {
-            body: body.to_string(),
-            report: None,
-        }
-    }
 
     /// Whether this protocol loops without the user.
     fn loops(&self) -> bool {
