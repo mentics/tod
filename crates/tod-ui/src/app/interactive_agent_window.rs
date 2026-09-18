@@ -1,3 +1,11 @@
+//! **Slated for deletion.** Nothing opens a chat window any more — Implement
+//! and the action panel's Chat run in the conversation view. What still
+//! depends on this module is the visual design panel's embedded chat and the
+//! engagement registry (`InteractiveAgentWindowControl::engagement`), which the
+//! action panel reads for its background runs' status labels. Delete it once
+//! the visual-design protocol lands and the registry has another home. See
+//! `doc/conversation/protocols.md` §6.
+//!
 //! Per-session interactive agent chat windows.
 
 use crate::interview::TodPaths;

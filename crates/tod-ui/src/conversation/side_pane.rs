@@ -31,7 +31,15 @@ impl ConversationView {
         match self.data.protocol {
             ProtocolKind::Outline => self.render_change_set(window, cx),
             ProtocolKind::Implementation => self.render_implementation_pane(window, cx),
-            ProtocolKind::Chat | ProtocolKind::VisualDesign => self.render_empty_pane(),
+            ProtocolKind::Chat => {
+                self.render_empty_pane("Chat", "This conversation keeps no change set.")
+            }
+            // A stub until the designer is rebuilt as this pane. The working
+            // designer is still `views::visual_design_panel`.
+            ProtocolKind::VisualDesign => self.render_empty_pane(
+                "Visual design",
+                "The visual designer is not available in conversations yet.",
+            ),
         }
     }
 
@@ -162,15 +170,15 @@ impl ConversationView {
             .into_any_element()
     }
 
-    fn render_empty_pane(&self) -> AnyElement {
+    fn render_empty_pane(&self, title: &'static str, message: &'static str) -> AnyElement {
         v_flex()
             .size_full()
             .min_w_0()
-            .child(style::panel_header(div()).child(style::text_muted(div()).child("Chat")))
+            .child(style::panel_header(div()).child(style::text_muted(div()).child(title)))
             .child(
                 style::empty_message(div())
                     .p(style::space::INSET)
-                    .child("This conversation keeps no change set."),
+                    .child(message),
             )
             .into_any_element()
     }

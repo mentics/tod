@@ -119,10 +119,13 @@ an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
 
-Other agent chats (the `A` key's agent chat and the visual-design chat) still use
-`InteractiveAgentWindow`. Their context is assembled by `tod_core::agent_context`
-and held until the user submits their first message — nothing reaches the agent
-before then. A chat window holds one long-lived agent session
+Implement and the action panel's Chat now run in the conversation view (see
+**Protocols** below). The one chat left on the old path is the visual-design
+panel's embedded chat, which uses `InteractiveAgentView`; it, the view, and
+`InteractiveAgentWindow` are slated for deletion once visual design is rebuilt
+as a protocol. What follows describes that old path. Its context is assembled by
+`tod_core::agent_context` and held until the user submits their first message —
+nothing reaches the agent before then. A chat window holds one long-lived agent session
 (`AgentProvider::send_session_turn`):
 the first message opens it — the context and the message go out together as one
 turn, and the session is given its name (for Claude, a `custom-title` record
