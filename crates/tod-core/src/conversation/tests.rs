@@ -2,6 +2,7 @@ use super::context::{
     DELTA_HEADING, RESUME_HEADING, ReportedStale, delta, focus_selection, opening,
 };
 use super::driver::*;
+use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun};
 use super::mock::{Direct, reply};
 use crate::interview::test_support::{Fixture, fixture};
 use crate::media::MediaPaths;
@@ -19,7 +20,7 @@ use tod_store::conversation::{
     net_changes,
 };
 use tod_store::fleet::FleetStore;
-use tod_store::interview::{ACTOR_ENV, InterviewCommand, short_id};
+use tod_store::interview::{ACTOR_ENV, ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo};
 use tod_store::settings::InterviewContextSettings;
@@ -84,17 +85,29 @@ impl AgentProvider for FakeAgent {
             let blocks = turn.prompt_blocks();
             *self.chars.entry(turn.key.clone()).or_default() +=
                 blocks.iter().map(|b| b.len() as u64).sum::<u64>();
-            let actor = turn
-                .env
-                .iter()
-                .find(|(k, _)| k == ACTOR_ENV)
-                .map(|(_, v)| v.clone())
-                .unwrap();
+            let env = |name: &str| {
+                turn.env
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+            };
+            // An implementation turn carries its node and conversation, not
+            // a conversation actor.
+            let implementing = env(IMPLEMENT_NODE_ENV).zip(env(IMPLEMENT_CONVERSATION_ENV));
             let client = Direct {
                 fleet: &self.fleet,
-                actor,
+                actor: env(ACTOR_ENV).unwrap_or_else(|| ACTOR_USER.to_string()),
             };
-            match reply(&client, &blocks) {
+            let reply = match implementing {
+                Some((node, conversation)) => super::implement::mock_turn(
+                    &client,
+                    node.parse().unwrap(),
+                    conversation.parse().unwrap(),
+                )
+                .map(|text| tod_agent::MockReply::from(text)),
+                None => reply(&client, &blocks),
+            };
+            match reply {
                 Ok(reply) => {
                     self.parts
                         .insert(turn.key.clone(), reply.parts.unwrap_or_default());
@@ -781,4 +794,84 @@ fn a_reply_keeps_its_parts_and_its_body_is_the_answer() {
     assert_eq!(kinds, ["text", "thought", "tool", "text"]);
     // The user's turn has none.
     assert!(turns[0].parts.is_empty());
+}
+
+/// The implementation loop end to end: the mock closes one plan step a turn
+/// and records a green test run, so a two-step plan takes one continuation.
+/// Its replies are empty — the steps and the test run are the report — and
+/// nothing is parsed out of them.
+#[test]
+fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
+            id: fx.node.to_string(),
+            repo: Some(workspace.display().to_string()),
+        })
+        .unwrap();
+    for n in 0..2 {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: None,
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: format!("Step {n}"),
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Implementation,
+    );
+    driver.send(&fx.fleet, &mut agent, "Implement the plan.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    assert!(
+        agent
+            .last()
+            .env
+            .contains(&(IMPLEMENT_CONVERSATION_ENV.to_string(), id.to_string())),
+        "the agent is told which conversation to record its tests against"
+    );
+
+    // One step closed and green tests: the other step is still open.
+    assert_eq!(
+        driver.tick(&fx.fleet, &mut agent),
+        [ConversationEvent::Continued]
+    );
+    assert!(agent.last().message.contains("Step 1"), "{}", agent.last().message);
+    // Both closed and green tests, recorded this turn: done.
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+
+    assert_eq!(
+        turns(&fx, id),
+        [
+            (TurnRole::User, "Implement the plan.".to_string()),
+            (TurnRole::Agent, String::new()),
+            (
+                TurnRole::Continuation,
+                "Asked the agent to finish the last open plan step".to_string()
+            ),
+            (TurnRole::Agent, String::new()),
+        ]
+    );
+    let run = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).latest_report(id))
+        .unwrap()
+        .and_then(|value| TestRun::from_report(&value))
+        .expect("a recorded test run");
+    assert!(run.green(), "{run:?}");
 }

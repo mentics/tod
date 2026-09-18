@@ -16,6 +16,7 @@ mod interview;
 mod node;
 mod obligations;
 mod plan;
+mod test_runs;
 mod visual_design;
 
 use std::path::PathBuf;
@@ -43,6 +44,7 @@ NOUNS:
     interview              Interview session state
     visual-design          the UI mockup associated with one obligation
     changeset              This conversation's net changes and unsure flags
+    tests                  Record a test run for this implementation
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -133,8 +135,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
         "changeset" => changeset::run(invocation),
+        "tests" => test_runs::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests)"
         ),
     }
 }

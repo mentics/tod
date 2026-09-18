@@ -217,13 +217,14 @@ through `ConversationEdit`. Content and lifecycle mutations are not recorded.
 
 **Protocols.** A conversation's `protocol` (schema v39) decides what kind of
 conversation it is: the context recipe, the working directory, the turn
-envelope, how the reply is read, what "done" means, whether the app loops it
-without the user, and which side pane the view shows.
+envelope, what "done" means, whether the app loops it without the user, and
+which side pane the view shows. Replies are never parsed: structured state
+the app needs, the agent records through `tod-cli` as it works.
 `tod_core::conversation::protocol` holds the `Protocol` trait and
 `protocol_for`, the one registry; `implement.rs` is the implementation
-protocol, whose replies are structured reports and whose loop keeps sending
-the agent back to open plan steps until the plan is done and its tests are
-green. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
+protocol, whose loop keeps sending the agent back to open plan steps until
+the plan is done and a test run it recorded (`tod-cli tests record`) is
+green; a `blocked` plan step hands back to the user. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
 `doc/conversation/protocols.md`.

@@ -12,9 +12,7 @@
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
 use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
-use crate::conversation::protocol::{
-    Next, Protocol, ProtocolEnv, Reading, TurnContext, protocol_for,
-};
+use crate::conversation::protocol::{Next, Protocol, ProtocolEnv, TurnContext, protocol_for};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
 use crate::session_name::session_name;
@@ -88,14 +86,11 @@ struct Run {
 pub struct ConversationDriver {
     config: ConversationConfig,
     focus: Focus,
-    /// What kind of conversation this is: context, cwd, reply reading, and
-    /// whether the app loops it without the user.
+    /// What kind of conversation this is: context, cwd, what "done" means,
+    /// and whether the app loops it without the user.
     protocol: &'static dyn Protocol,
     /// Turns sent without the user since the last user message.
     continuations: u32,
-    /// Correction turns sent for the reply in flight. Reset per turn; a
-    /// second malformed reply gives up (see `read_reply`).
-    corrections: u32,
     /// The protocol's progress fingerprint before the turn in flight started.
     progress_before: Option<String>,
     /// `None` until the first send creates the row.
@@ -118,7 +113,6 @@ impl ConversationDriver {
             focus,
             protocol: protocol_for(protocol),
             continuations: 0,
-            corrections: 0,
             progress_before: None,
             conversation_id: None,
             run: None,
@@ -365,7 +359,7 @@ impl ConversationDriver {
                 } else {
                     reply_answer(&parts)
                 };
-                self.land_reply(fleet, agent, id, body, parts, events)?;
+                self.land_reply(fleet, agent, id, &body, parts, run.user_seq, events)?;
             }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
@@ -398,99 +392,49 @@ impl ConversationDriver {
         Ok(())
     }
 
-    /// Read a finished reply through the protocol, record it, and decide
-    /// whether the exchange is over or another turn goes out without the user.
+    /// Record a finished reply, and decide from what the agent recorded
+    /// during the turn whether the exchange is over or another turn goes out
+    /// without the user.
+    #[allow(clippy::too_many_arguments)]
     fn land_reply(
         &mut self,
         fleet: &FleetStore,
         agent: &mut dyn AgentProvider,
         id: Uuid,
-        body: String,
+        body: &str,
         parts: Vec<ReplyPart>,
+        turn_seq: i64,
         events: &mut Vec<ConversationEvent>,
     ) -> Result<()> {
-        match self.protocol.read_reply(&body) {
-            Reading::Malformed { reason, correction } => {
-                self.record_malformed(fleet, agent, id, &body, &reason, correction, events)
+        self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
+        let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
+        let next = {
+            let env = self.env(fleet, id);
+            let after = self.protocol.progress(&env).ok().flatten();
+            let progressed = match (&self.progress_before, &after) {
+                (Some(before), Some(after)) => before != after,
+                // Nothing to compare: never stop the loop for it.
+                _ => true,
+            };
+            self.protocol.next(&TurnContext {
+                env: &env,
+                report: report.as_ref(),
+                continuations: self.continuations,
+                progressed,
+            })?
+        };
+        match next {
+            Next::Done => {
+                self.continuations = 0;
+                events.push(ConversationEvent::TurnFinished { error: None });
             }
-            Reading::Accepted { body, report } => {
-                let seq = self.append_with_parts(fleet, id, TurnRole::Agent, &body, parts)?;
-                self.corrections = 0;
-                if let Some(report) = &report {
-                    fleet.interview(
-                        ACTOR_USER,
-                        InterviewCommand::SetConversationReport {
-                            conversation_id: id,
-                            turn_seq: seq,
-                            body: report.clone(),
-                        },
-                    )?;
-                }
-                let next = {
-                    let env = self.env(fleet, id);
-                    let after = self.protocol.progress(&env).ok().flatten();
-                    let progressed = match (&self.progress_before, &after) {
-                        (Some(before), Some(after)) => before != after,
-                        // Nothing to compare: never stop the loop for it.
-                        _ => true,
-                    };
-                    self.protocol.next(&TurnContext {
-                        env: &env,
-                        report: report.as_ref(),
-                        continuations: self.continuations,
-                        progressed,
-                    })?
-                };
-                match next {
-                    Next::Done => {
-                        self.continuations = 0;
-                        events.push(ConversationEvent::TurnFinished { error: None });
-                    }
-                    Next::Continue { note, message } => {
-                        self.continuations += 1;
-                        self.append(fleet, id, TurnRole::Continuation, &note)?;
-                        self.resend(fleet, agent, id, message)?;
-                        events.push(ConversationEvent::Continued);
-                    }
-                }
-                Ok(())
+            Next::Continue { note, message } => {
+                self.continuations += 1;
+                self.append(fleet, id, TurnRole::Continuation, &note)?;
+                self.resend(fleet, agent, id, message)?;
+                events.push(ConversationEvent::Continued);
             }
         }
-    }
-
-    /// A reply the protocol could not read. The raw text is kept as an error
-    /// turn either way, so it can be looked at; the first one also asks the
-    /// agent to try again.
-    #[allow(clippy::too_many_arguments)]
-    fn record_malformed(
-        &mut self,
-        fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
-        id: Uuid,
-        raw: &str,
-        reason: &str,
-        correction: String,
-        events: &mut Vec<ConversationEvent>,
-    ) -> Result<()> {
-        let note = format!(
-            "The agent's reply did not match the protocol: {reason}
-
-{raw}"
-        );
-        self.append(fleet, id, TurnRole::Error, &note)?;
-        if self.corrections == 0 {
-            self.corrections += 1;
-            self.resend(fleet, agent, id, correction)?;
-            events.push(ConversationEvent::Continued);
-            return Ok(());
-        }
-        self.corrections = 0;
-        self.continuations = 0;
-        let message = format!("The agent's reply did not match the protocol: {reason}");
-        self.last_error = Some(message.clone());
-        events.push(ConversationEvent::TurnFinished {
-            error: Some(message),
-        });
         Ok(())
     }
 

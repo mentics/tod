@@ -1520,3 +1520,33 @@ fn the_v33_to_v34_migration_runs_twice_cleanly() {
     drop(conn);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A report recorded mid-turn belongs to the turn in progress: the agent's
+/// own turn is appended only after it, so reading "since the turn started"
+/// finds it, and a later turn does not see an earlier one's.
+#[test]
+fn a_report_is_recorded_against_the_turn_in_progress() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let first = repo.max_user_seq(fx.conv).unwrap();
+    repo.record_report(fx.conv, &serde_json::json!({ "passed": 1 }))
+        .unwrap();
+    repo.record_report(fx.conv, &serde_json::json!({ "passed": 2 }))
+        .unwrap();
+    repo.append_turn(fx.conv, TurnRole::Agent, "").unwrap();
+    assert_eq!(
+        repo.report_since(fx.conv, first).unwrap(),
+        Some(serde_json::json!({ "passed": 2 })),
+        "the turn's last record replaces its earlier one"
+    );
+
+    let second = repo
+        .append_turn(fx.conv, TurnRole::Continuation, "Keep going")
+        .unwrap()
+        .seq;
+    assert_eq!(repo.report_since(fx.conv, second).unwrap(), None);
+    assert_eq!(
+        repo.latest_report(fx.conv).unwrap(),
+        Some(serde_json::json!({ "passed": 2 }))
+    );
+}

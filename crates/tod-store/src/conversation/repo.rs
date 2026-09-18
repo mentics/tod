@@ -94,29 +94,38 @@ impl<'a> ConversationRepo<'a> {
             .transpose()
     }
 
-    /// Store a protocol's parsed report for a turn, replacing any earlier one.
-    pub fn set_report(
-        &self,
-        conversation_id: Uuid,
-        turn_seq: i64,
-        body: &serde_json::Value,
-    ) -> Result<()> {
+    /// Store a report against the turn in progress — the latest turn in the
+    /// transcript, since the agent's own turn is appended only when it ends —
+    /// replacing any earlier one for that turn. The agent records it through
+    /// `tod-cli` while it works.
+    pub fn record_report(&self, conversation_id: Uuid, body: &serde_json::Value) -> Result<i64> {
+        let turn_seq: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM conversation_turns WHERE conversation_id = ?1",
+            params![uuid_to_blob(conversation_id)],
+            |row| row.get(0),
+        )?;
         self.conn.execute(
             "INSERT INTO conversation_reports (conversation_id, turn_seq, body)
              VALUES (?1, ?2, ?3)
              ON CONFLICT (conversation_id, turn_seq) DO UPDATE SET body = excluded.body",
             params![uuid_to_blob(conversation_id), turn_seq, body.to_string()],
         )?;
-        Ok(())
+        Ok(turn_seq)
     }
 
-    /// The report stored for a turn, if the protocol stored one.
-    pub fn report(&self, conversation_id: Uuid, turn_seq: i64) -> Result<Option<serde_json::Value>> {
+    /// The latest report recorded at or after `turn_seq`: what a turn that
+    /// started there reported.
+    pub fn report_since(
+        &self,
+        conversation_id: Uuid,
+        turn_seq: i64,
+    ) -> Result<Option<serde_json::Value>> {
         let body: Option<String> = self
             .conn
             .query_row(
                 "SELECT body FROM conversation_reports
-                 WHERE conversation_id = ?1 AND turn_seq = ?2",
+                 WHERE conversation_id = ?1 AND turn_seq >= ?2
+                 ORDER BY turn_seq DESC LIMIT 1",
                 params![uuid_to_blob(conversation_id), turn_seq],
                 |row| row.get(0),
             )
