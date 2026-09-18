@@ -9,9 +9,9 @@
 //! calls through it. [`protocol_for`] is the registry: one match, every kind.
 //! Spec: `doc/conversation/protocols.md`.
 
-use crate::context_recipes::NODE_CHAT;
+use crate::context_recipes::CHAT;
 use crate::conversation::context::{
-    ReportedStale, append_recent_turns, delta, opening, opening_with, resume_snapshot,
+    ReportedStale, delta, opening, opening_with, resume_snapshot, resume_snapshot_with,
 };
 use crate::media::MediaPaths;
 use anyhow::Result;
@@ -206,10 +206,10 @@ impl Protocol for OutlineProtocol {
     }
 }
 
-/// Thinking out loud about one item: the agent reads the project and answers,
-/// and changes nothing. There is no change set, so there is nothing for the
-/// side pane to show and nothing to reverse — which is why `surface/chat`
-/// makes this surface read-only.
+/// A general conversation. The user sets the job — a question, a document to
+/// write, research, a change to the outline — so the agent may do anything the
+/// user asks. Its outline writes are attributed to the conversation like
+/// [`OutlineProtocol`]'s, so they show in its change set and can be reversed.
 pub struct ChatProtocol;
 
 impl Protocol for ChatProtocol {
@@ -221,27 +221,38 @@ impl Protocol for ChatProtocol {
         crate::session_name::CHAT_SURFACE
     }
 
-    /// An empty directory, as [`OutlineProtocol`] uses: the agent reaches the
-    /// project through `tod-cli` and has no repository to work in.
+    /// The focus node's working directory when it has one, so "write this
+    /// down" lands in the project's files; an empty directory otherwise.
     fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+        if let Some(node) = env.focus.node_id() {
+            if let Ok(dir) =
+                tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string())
+            {
+                return Ok(dir);
+            }
+        }
         scratch_dir(env.data_root, "chat")
     }
 
-    fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
-        env.fleet.read(|conn| {
-            opening_with(
-                conn,
-                env.media,
-                env.data_root,
-                env.conversation_id,
-                &NODE_CHAT,
-            )
-        })
+    fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
+        vec![(ACTOR_ENV.to_string(), actor_for(env.conversation_id))]
     }
 
-    /// Opening context plus the tail of the transcript. Unlike
-    /// [`OutlineProtocol`] there is no change set to summarize — the turns are
-    /// the whole of what this conversation did.
+    fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
+        env.fleet
+            .read(|conn| opening_with(conn, env.media, env.data_root, env.conversation_id, &CHAT))
+    }
+
+    fn delta(
+        &self,
+        env: &ProtocolEnv<'_>,
+        since_action_id: i64,
+        reported: &mut ReportedStale,
+    ) -> Result<String> {
+        env.fleet
+            .read(|conn| delta(conn, env.conversation_id, since_action_id, reported))
+    }
+
     fn resume_snapshot(
         &self,
         env: &ProtocolEnv<'_>,
@@ -249,18 +260,15 @@ impl Protocol for ChatProtocol {
         before_seq: Option<i64>,
     ) -> Result<String> {
         env.fleet.read(|conn| {
-            let mut out = opening_with(
+            resume_snapshot_with(
                 conn,
                 env.media,
                 env.data_root,
                 env.conversation_id,
-                &NODE_CHAT,
-            )?;
-            out.push_str(
-                "\n\n---\n\n# Continuing a chat\n\nThis chat started in an earlier agent session. Its most recent turns are below.\n",
-            );
-            append_recent_turns(conn, env.conversation_id, budget_tokens, before_seq, &mut out)?;
-            Ok(out)
+                budget_tokens,
+                before_seq,
+                &CHAT,
+            )
         })
     }
 }
@@ -296,12 +304,12 @@ mod tests {
         );
     }
 
-    /// The chat recipe must not hand the agent the change-set noun: there is
-    /// no change set behind a chat to read or flag.
+    /// A chat's outline writes are recorded, so its agent gets the
+    /// change-set noun to read and flag them, like the outline protocol's.
     #[test]
-    fn the_chat_recipe_carries_no_change_set() {
-        assert!(!NODE_CHAT.layers.contains(&"cli/changeset"));
-        assert!(NODE_CHAT.layers.contains(&"surface/chat"));
+    fn the_chat_recipe_carries_the_change_set() {
+        assert!(CHAT.layers.contains(&"cli/changeset"));
+        assert!(CHAT.layers.contains(&"surface/chat"));
     }
 
     /// Chat and implementation loop differently: only implementation sends a

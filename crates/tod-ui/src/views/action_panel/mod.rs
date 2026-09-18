@@ -779,8 +779,8 @@ impl ActionPanelView {
         );
 
         // Chat — a conversation about this node, with its own picker for the
-        // node's earlier chats. It needs no Files: the agent reads the project
-        // through `tod-cli` and changes nothing.
+        // node's earlier chats. It needs no Files: without them the agent runs
+        // in an empty directory and reaches the project through `tod-cli`.
         let chat_node = self.task_id.clone();
         section = section.child(
             h_flex().child(

@@ -233,12 +233,12 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
 };
 
-/// A chat opened on one item from the action panel. Read-only: it loads the
-/// same nouns as `CONVERSATION` so the agent can look anything up, and
-/// `surface/chat` states the exception that it must not write with them. It
-/// has no change set, so it loads no `cli/changeset` either.
-pub const NODE_CHAT: ContextRecipe = ContextRecipe {
-    name: "node chat",
+/// A general conversation: whatever the user asks, on any focus. It has the
+/// outline conversation's nouns, change set included — its outline writes are
+/// recorded and reversible the same way — and `surface/chat` says what makes
+/// it different: the user sets the job, not the surface.
+pub const CHAT: ContextRecipe = ContextRecipe {
+    name: "chat",
     layers: &[
         "stance/interactive-chat",
         "domain/outline",
@@ -250,6 +250,7 @@ pub const NODE_CHAT: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/plan",
         "cli/content",
+        "cli/changeset",
         "surface/chat",
     ],
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
@@ -258,7 +259,7 @@ pub const NODE_CHAT: ContextRecipe = ContextRecipe {
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
     CONVERSATION,
-    NODE_CHAT,
+    CHAT,
     VISUAL_DESIGN_CHAT,
     IMPLEMENT_SESSION,
     GATE_CHECK,

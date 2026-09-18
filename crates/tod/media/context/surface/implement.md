@@ -37,9 +37,8 @@ changed underneath you.
 ## Scope
 
 - Work from the plan. Do not invent scope the plan and obligations don't cover.
-- This session is tracked as a distinct "implementation" run on this node —
-  only one runs at a time per node, so finish or hand off cleanly rather than
-  assuming another one will pick up silently.
+- This conversation is the node's implementation record. Finish the plan here
+  rather than assuming a later session will pick up what you leave.
 
 ## Tests ship with the code
 
@@ -55,9 +54,11 @@ Your reply is not read by a person as it arrives — the app reads it, decides
 whether the plan is finished, and sends you straight back to the remaining work
 if it is not. So:
 
-- **Close plan steps as you go**, through the `plan` noun. The app takes
-  plan-step status from the database, not from your reply: a step you finished
-  but left open will be sent back to you.
+- **Close plan steps as you go**, through the `plan` noun, by marking each
+  finished step `implemented`. The app takes plan-step status from the
+  database, not from your reply: a step you finished but left open will be
+  sent back to you. Don't mark steps `verified` — that status belongs to the
+  verification phase that follows this one, not to you.
 - **Do not stop to report progress and wait.** There is nobody to answer. If
   work remains, keep going until it is done or something genuinely needs the
   user's decision, and say so with `status: blocked`.
@@ -72,7 +73,7 @@ status: working        # working | complete | blocked
 summary: One line on what this turn did.
 steps:                 # every plan step this turn touched
   - id: <plan step slug or uuid>
-    status: in_progress | implemented | verified | blocked
+    status: in_progress | implemented | blocked
     note: optional
 tests:
   written: true        # tests were added or updated for this turn's work

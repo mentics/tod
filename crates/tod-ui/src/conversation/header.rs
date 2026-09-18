@@ -19,7 +19,7 @@ use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::dynamic::FocusSelection;
-use tod_store::conversation::{Focus, NetOp};
+use tod_store::conversation::{Focus, NetOp, ProtocolKind};
 
 /// The focus kind's name and icon.
 pub(crate) fn kind_of(focus: Focus) -> (&'static str, IconName) {
@@ -123,11 +123,20 @@ impl ConversationView {
                 .iter()
                 .position(|c| c.conversation.id == id)
         });
-        self.picker = Some(current.unwrap_or(self.data.conversations.len()));
+        // Unsaved: highlight the "New …" entry for the kind being started.
+        let new_ix = self.data.conversations.len()
+            + self
+                .data
+                .new_kinds
+                .iter()
+                .position(|k| *k == self.data.protocol)
+                .unwrap_or(0);
+        self.picker = Some(current.unwrap_or(new_ix));
         cx.notify();
     }
 
-    /// Open picker entry `ix`; the last one is "New conversation".
+    /// Open picker entry `ix`. Past the saved conversations come the "New …"
+    /// entries, one per kind this focus can start.
     pub(super) fn choose_picker_entry(
         &mut self,
         ix: usize,
@@ -140,7 +149,15 @@ impl ConversationView {
                 self.show(self.focus, Some(id), false, cx);
                 self.focus_handle.focus(window, cx);
             }
-            None => self.new_conversation(window, cx),
+            None => {
+                let kind = ix
+                    .checked_sub(self.data.conversations.len())
+                    .and_then(|i| self.data.new_kinds.get(i).copied());
+                if let Some(kind) = kind {
+                    self.protocol = kind;
+                }
+                self.new_conversation(window, cx)
+            }
         }
     }
 
@@ -442,6 +459,16 @@ impl ConversationView {
                             .flex_shrink_0()
                             .child(change_count_label(summary.change_count)),
                     )
+                    .when(
+                        summary.conversation.protocol != ProtocolKind::Outline,
+                        |el| {
+                            el.child(
+                                style::badge(div())
+                                    .flex_shrink_0()
+                                    .child(kind_label(summary.conversation.protocol)),
+                            )
+                        },
+                    )
                     .child(
                         selectable_text(
                             ElementId::Name(format!("picker-opening-{ix}").into()),
@@ -457,29 +484,57 @@ impl ConversationView {
                     ),
             );
         }
-        let new_ix = self.data.conversations.len();
-        menu.child(
-            style::menu_item(h_flex(), highlighted == new_ix)
-                .id("picker-entry-new")
-                .w_full()
-                .items_center()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.choose_picker_entry(new_ix, window, cx);
+        let first_new = self.data.conversations.len();
+        for (i, kind) in self.data.new_kinds.iter().copied().enumerate() {
+            let ix = first_new + i;
+            menu = menu.child(
+                style::menu_item(h_flex(), highlighted == ix)
+                    .id(ElementId::Name(
+                        format!("picker-entry-new-{}", kind.as_str()).into(),
+                    ))
+                    .w_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.choose_picker_entry(ix, window, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .child(Icon::new(IconName::Plus).xsmall()),
+                    )
+                    .child(div().flex_1().child(new_label(kind)))
+                    // Ctrl+N starts another of the kind that is open.
+                    .when(kind == self.data.protocol, |el| {
+                        el.child(style::badge(div()).child("Ctrl+N"))
                     }),
-                )
-                .child(
-                    div()
-                        .w(px(16.))
-                        .flex_shrink_0()
-                        .child(Icon::new(IconName::Plus).xsmall()),
-                )
-                .child(div().flex_1().child("New conversation"))
-                .child(style::badge(div()).child("Ctrl+N")),
-        )
-        .into_any_element()
+            );
+        }
+        menu.into_any_element()
+    }
+}
+
+/// A kind of conversation, as the picker badges it.
+fn kind_label(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Outline => "outline",
+        ProtocolKind::Implementation => "implementation",
+        ProtocolKind::Chat => "chat",
+        ProtocolKind::VisualDesign => "visual design",
+    }
+}
+
+/// The picker entry that starts a conversation of `kind`.
+fn new_label(kind: ProtocolKind) -> &'static str {
+    match kind {
+        ProtocolKind::Outline => "New conversation",
+        ProtocolKind::Implementation => "New implementation",
+        ProtocolKind::Chat => "New chat",
+        ProtocolKind::VisualDesign => "New visual design",
     }
 }

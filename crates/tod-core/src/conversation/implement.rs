@@ -91,6 +91,64 @@ impl Report {
             && self.tests.ran
             && self.tests.green
     }
+
+    /// The report as the transcript shows it: the summary as the headline,
+    /// then what the turn touched, the tests, what is left, and the notes.
+    /// The structured form is kept separately (`conversation_reports`), so
+    /// this only has to read well.
+    pub fn to_markdown(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let status = match self.status {
+            ReportStatus::Working => "Working",
+            ReportStatus::Complete => "Complete",
+            ReportStatus::Blocked => "Blocked",
+        };
+        let summary = self.summary.trim();
+        if summary.is_empty() {
+            let _ = writeln!(out, "**{status}**");
+        } else {
+            let _ = writeln!(out, "**{status}** — {summary}");
+        }
+        if !self.steps.is_empty() {
+            out.push_str("\n**Steps**\n\n");
+            for step in &self.steps {
+                let _ = write!(out, "- `{}` {}", step.id, step.status);
+                if !step.note.trim().is_empty() {
+                    let _ = write!(out, " — {}", step.note.trim());
+                }
+                out.push('\n');
+            }
+        }
+        let tests = match (self.tests.written, self.tests.ran, self.tests.green) {
+            (_, false, _) => "not run",
+            (_, true, true) => "green",
+            (_, true, false) => "red",
+        };
+        let _ = write!(out, "\n**Tests** {tests}");
+        if !self.tests.written {
+            out.push_str(" (none written)");
+        }
+        out.push('\n');
+        let detail = self.tests.detail.trim();
+        if !detail.is_empty() {
+            let _ = writeln!(out, "\n```\n{detail}\n```");
+        }
+        for (heading, items) in [("Remaining", &self.remaining), ("Blockers", &self.blockers)] {
+            if items.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "\n**{heading}**\n");
+            for item in items {
+                let _ = writeln!(out, "- {}", item.trim());
+            }
+        }
+        let notes = self.notes.trim();
+        if !notes.is_empty() {
+            let _ = writeln!(out, "\n{notes}");
+        }
+        out.trim_end().to_string()
+    }
 }
 
 /// The schema every implementation reply must match, quoted back to the agent
@@ -100,7 +158,7 @@ status: working        # working | complete | blocked
 summary: One line on what this turn did.
 steps:
   - id: <plan step slug or uuid>
-    status: in_progress | implemented | verified | blocked
+    status: in_progress | implemented | blocked
     note: optional
 tests:
   written: true
@@ -213,8 +271,10 @@ impl Protocol for ImplementationProtocol {
         match parse_report(body) {
             Ok(report) => {
                 let value = serde_json::to_value(&report).unwrap_or(Value::Null);
+                // The transcript shows the report readably; its structured
+                // form is the stored report.
                 Reading::Accepted {
-                    body: body.to_string(),
+                    body: report.to_markdown(),
                     report: Some(value),
                 }
             }
@@ -383,12 +443,51 @@ fn worktree_fingerprint(cwd: &std::path::Path) -> String {
 
 /// Read a reply as a report. The whole reply is the document; a code fence
 /// around it is tolerated because agents add them reflexively.
+///
+/// Models are asked for a bare document but routinely wrap it: a line of prose
+/// ("All done — here is the report:") and a fenced block. Rejecting that
+/// costs a correction turn every time for no gain, so this reads, in order,
+/// the whole reply, the last fenced block in it, and the reply from its first
+/// `status:` line — and takes the first that parses. The error reported is the
+/// whole reply's, since that is the one the agent was asked to send.
 pub fn parse_report(body: &str) -> Result<Report> {
-    let text = strip_fence(body.trim());
-    if text.is_empty() {
+    let whole = strip_fence(body.trim());
+    if whole.is_empty() {
         bail!("the reply was empty");
     }
-    serde_yaml::from_str::<Report>(text).map_err(|err| anyhow::anyhow!("{err}"))
+    let first = serde_yaml::from_str::<Report>(whole).map_err(|err| anyhow::anyhow!("{err}"));
+    if first.is_ok() {
+        return first;
+    }
+    let candidates = [last_fenced_block(body), from_status_line(body)];
+    for text in candidates.into_iter().flatten() {
+        if let Ok(report) = serde_yaml::from_str::<Report>(text) {
+            return Ok(report);
+        }
+    }
+    first
+}
+
+/// The body of the last ``` fenced block in `text`, when there is one.
+fn last_fenced_block(text: &str) -> Option<&str> {
+    let close = text.rfind("```")?;
+    let open = text[..close].rfind("```")?;
+    let block = &text[open + 3..close];
+    // Drop the info string (`yaml`) on the opening fence's line.
+    let body = block.split_once('\n').map_or("", |(_, rest)| rest);
+    Some(body.trim()).filter(|b| !b.is_empty())
+}
+
+/// `text` from its first line that starts a report, to the end or to a
+/// closing fence.
+fn from_status_line(text: &str) -> Option<&str> {
+    let start = text
+        .match_indices("status:")
+        .map(|(ix, _)| ix)
+        .find(|&ix| ix == 0 || text[..ix].ends_with('\n'))?;
+    let rest = &text[start..];
+    let end = rest.find("```").unwrap_or(rest.len());
+    Some(rest[..end].trim()).filter(|b| !b.is_empty())
 }
 
 fn strip_fence(text: &str) -> &str {
@@ -487,6 +586,44 @@ notes: |
         assert_eq!(report.status, ReportStatus::Complete);
         assert!(report.claims_done());
         assert_eq!(report.steps.len(), 1);
+    }
+
+    /// What Claude actually sent in a real run: a line of prose, then the
+    /// report in a fenced block. It reads without a correction turn.
+    #[test]
+    fn reads_a_report_behind_prose_and_a_fence() {
+        let reply =
+            format!("Perfect! All work is complete. Here is the report:\n\n```yaml\n{GOOD}\n```\n");
+        assert_eq!(
+            parse_report(&reply).expect("parses").status,
+            ReportStatus::Complete
+        );
+    }
+
+    /// No fence at all: prose, then the document from its `status:` line.
+    #[test]
+    fn reads_a_report_behind_prose_without_a_fence() {
+        let reply = format!("Done.\n\n{GOOD}");
+        assert_eq!(
+            parse_report(&reply).expect("parses").status,
+            ReportStatus::Complete
+        );
+    }
+
+    /// The transcript gets readable text, not the raw document: the summary
+    /// leads, and the test status is a word rather than three booleans.
+    #[test]
+    fn a_report_renders_as_readable_markdown() {
+        let md = parse_report(GOOD).expect("parses").to_markdown();
+        assert!(md.starts_with("**Complete**"), "{md}");
+        assert!(md.contains("**Tests** green"), "{md}");
+        assert!(!md.contains("written: true"), "{md}");
+    }
+
+    /// Prose alone still fails, so the correction turn still happens.
+    #[test]
+    fn prose_alone_is_still_malformed() {
+        assert!(parse_report("I finished everything, all tests pass.").is_err());
     }
 
     #[test]

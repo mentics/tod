@@ -223,7 +223,8 @@ without the user, and which side pane the view shows.
 `protocol_for`, the one registry; `implement.rs` is the implementation
 protocol, whose replies are structured reports and whose loop keeps sending
 the agent back to open plan steps until the plan is done and its tests are
-green. `tod_ui::conversation::side_pane` picks the pane. Adding a kind means a
+green. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
+"New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
 `doc/conversation/protocols.md`.
 

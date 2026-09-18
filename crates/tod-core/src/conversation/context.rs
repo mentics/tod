@@ -446,7 +446,28 @@ pub fn resume_snapshot(
     budget_tokens: i64,
     before_seq: Option<i64>,
 ) -> Result<String> {
-    let mut out = opening(conn, media, data_root, conversation_id)?;
+    resume_snapshot_with(
+        conn,
+        media,
+        data_root,
+        conversation_id,
+        budget_tokens,
+        before_seq,
+        &CONVERSATION,
+    )
+}
+
+/// [`resume_snapshot`] for a protocol that opens from a different recipe.
+pub fn resume_snapshot_with(
+    conn: &Connection,
+    media: &MediaPaths,
+    data_root: &Path,
+    conversation_id: Uuid,
+    budget_tokens: i64,
+    before_seq: Option<i64>,
+    recipe: &ContextRecipe,
+) -> Result<String> {
+    let mut out = opening_with(conn, media, data_root, conversation_id, recipe)?;
     let changes = net_changes(conn, conversation_id)?;
     out.push_str(
         "\n\n---\n\n# Continuing a conversation\n\n\
@@ -468,7 +489,7 @@ pub fn resume_snapshot(
 /// [`RESUME_TURNS`] turns as fit in half of `budget_tokens`, with a count of
 /// what was left out. Markers (rotation, continuation) are not turns the agent
 /// needs to see.
-pub fn append_recent_turns(
+fn append_recent_turns(
     conn: &Connection,
     conversation_id: Uuid,
     budget_tokens: i64,

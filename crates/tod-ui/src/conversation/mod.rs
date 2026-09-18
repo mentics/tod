@@ -21,6 +21,26 @@ mod nav;
 mod side_pane;
 mod transcript;
 
+/// What the picker offers to start on `focus`. An outline conversation and a
+/// chat work anywhere; an implementation conversation needs a node that is
+/// `active` and has a plan to work through — the same conditions the lifecycle
+/// panel's Implement checks. Visual design is not offered until its protocol
+/// exists.
+fn new_kinds(
+    conn: &rusqlite::Connection,
+    node: Option<Uuid>,
+    focus: Focus,
+) -> anyhow::Result<Vec<ProtocolKind>> {
+    let mut kinds = vec![ProtocolKind::Outline, ProtocolKind::Chat];
+    if let (Focus::Node(_), Some(node)) = (focus, node) {
+        let active = NodeRepo::new(conn).get_lifecycle(node)?.as_deref() == Some("active");
+        if active && !PlanStepRepo::new(conn).list_for_node(node)?.is_empty() {
+            kinds.push(ProtocolKind::Implementation);
+        }
+    }
+    Ok(kinds)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -236,6 +256,8 @@ pub(crate) struct Snapshot {
     pub plan: Vec<PlanStep>,
     /// The latest report a reply-parsing protocol stored.
     pub report: Option<serde_json::Value>,
+    /// The kinds of conversation the picker offers to start on this focus.
+    pub new_kinds: Vec<ProtocolKind>,
 }
 
 /// An underline tab bar whose underline moves in the same frame as the
@@ -291,6 +313,11 @@ pub struct ConversationView {
     side_files: Vec<String>,
     /// Turns the protocol's loop has sent since the last user message.
     loop_turns: u32,
+    /// The highlighted row of a side pane other than the change set: plan
+    /// steps first, then changed files.
+    side_cursor: Option<usize>,
+    side_scroll: ScrollHandle,
+    side_scroll_pending: bool,
 
     tab: Tab,
     cursor: Option<ChangeKey>,
@@ -411,6 +438,9 @@ impl ConversationView {
             edit_input,
             confirm: None,
             change_scroll: ScrollHandle::new(),
+            side_cursor: None,
+            side_scroll: ScrollHandle::new(),
+            side_scroll_pending: false,
             scroll_to_cursor: false,
             context,
             error: None,
@@ -500,6 +530,7 @@ impl ConversationView {
         if switching {
             self.data = Snapshot::default();
             self.cursor = None;
+            self.side_cursor = None;
             self.link = None;
             self.selected.clear();
             self.expanded.clear();
@@ -763,7 +794,9 @@ impl ConversationView {
                 ),
                 _ => (Vec::new(), None),
             };
+            let new_kinds = new_kinds(conn, selection.node, focus)?;
             Ok(Snapshot {
+                new_kinds,
                 path,
                 has_children: nav::has_children(conn, selection.node)?,
                 focus_node: selection.node,
@@ -949,7 +982,7 @@ impl ConversationView {
             return;
         }
         if let Some(ix) = self.picker {
-            let last = self.data.conversations.len() as isize;
+            let last = (self.data.conversations.len() + self.data.new_kinds.len()) as isize - 1;
             self.picker = Some((ix as isize + delta).clamp(0, last) as usize);
             cx.notify();
             return;
@@ -979,6 +1012,9 @@ impl ConversationView {
                 cx.notify();
             }
             Pane::Context => {}
+            Pane::ChangeSet if self.data.protocol == ProtocolKind::Implementation => {
+                self.move_side_cursor(delta, cx);
+            }
             Pane::ChangeSet => {
                 let keys = self.visible_keys();
                 if keys.is_empty() {
@@ -1242,6 +1278,8 @@ impl Render for ConversationView {
             )
             .on_action(cx.listener(|this, _: &ConversationNew, window, cx| {
                 this.cancel_edit(window, cx);
+                // Another of whatever kind is open.
+                this.protocol = this.data.protocol;
                 this.new_conversation(window, cx)
             }))
             // Works from anywhere in the view, text fields included.

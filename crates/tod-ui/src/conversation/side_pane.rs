@@ -29,17 +29,39 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match self.data.protocol {
-            ProtocolKind::Outline => self.render_change_set(window, cx),
+            // A chat's outline writes are recorded like an outline
+            // conversation's, so it has a change set too.
+            ProtocolKind::Outline | ProtocolKind::Chat => self.render_change_set(window, cx),
             ProtocolKind::Implementation => self.render_implementation_pane(window, cx),
-            ProtocolKind::Chat => {
-                self.render_empty_pane("Chat", "This conversation keeps no change set.")
-            }
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => self.render_empty_pane(
                 "Visual design",
                 "The visual designer is not available in conversations yet.",
             ),
+        }
+    }
+
+    /// Rows Up/Down move among in the implementation pane.
+    fn side_row_count(&self) -> usize {
+        self.data.plan.len() + self.side_files.len()
+    }
+
+    /// Move the implementation pane's highlight; entering an unhighlighted
+    /// pane lands on its first row.
+    pub(super) fn move_side_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let count = self.side_row_count();
+        if count == 0 {
+            return;
+        }
+        let next = match self.side_cursor {
+            None => 0,
+            Some(ix) => (ix as isize + delta).clamp(0, count as isize - 1) as usize,
+        };
+        if self.side_cursor != Some(next) {
+            self.side_cursor = Some(next);
+            self.side_scroll_pending = true;
+            cx.notify();
         }
     }
 
@@ -64,11 +86,31 @@ impl ConversationView {
             .filter(|step| step.status == STATUS_IMPLEMENTED || step.status == STATUS_VERIFIED)
             .count();
         let total = self.data.plan.len();
+        let count = self.side_row_count();
+        let cursor = self.side_cursor.filter(|ix| *ix < count);
+        let lit = |row: usize| active && cursor == Some(row);
+
+        // The scroll container's children, as `scroll_to_item` counts them:
+        // plan rows (or the one "no plan steps" line), then the "Changed
+        // files" heading, then file rows.
+        let child_of = |row: usize, plan: usize| {
+            if row < plan {
+                row
+            } else {
+                plan.max(1) + 1 + (row - plan)
+            }
+        };
+        if std::mem::take(&mut self.side_scroll_pending) {
+            if let Some(row) = cursor {
+                self.side_scroll.scroll_to_item(child_of(row, total));
+            }
+        }
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        for step in &self.data.plan {
+        for (n, step) in self.data.plan.iter().enumerate() {
             rows.push(
                 h_flex()
+                    .when(lit(n), style::highlighted)
                     .gap(style::space::INLINE)
                     .px(style::space::RELATED)
                     .py(style::space::INLINE)
@@ -104,9 +146,10 @@ impl ConversationView {
                     .child("Changed files")
                     .into_any_element(),
             );
-            for line in &self.side_files {
+            for (i, line) in self.side_files.iter().enumerate() {
                 rows.push(
                     div()
+                        .when(lit(total + i), style::highlighted)
                         .px(style::space::RELATED)
                         .py(style::space::INLINE)
                         .child(selectable_text(
@@ -151,6 +194,7 @@ impl ConversationView {
             .child(
                 v_flex()
                     .id("implementation-pane")
+                    .track_scroll(&self.side_scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

@@ -1499,30 +1499,27 @@ impl Render for LifecyclePanelView {
                 } else {
                     "Implement"
                 };
-                body =
-                    body.child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .items_center()
-                            .child(div().flex_1().text_xs().text_color(muted).child(
-                                selectable_text(
-                                    "lifecycle-panel-implement-detail",
-                                    detail,
-                                    window,
-                                    cx,
-                                ),
-                            ))
-                            .child(
-                                Button::new("lifecycle-panel-implement")
-                                    .label(label)
-                                    .ghost()
-                                    .disabled(blocked)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.launch_implementation(window, cx);
-                                    })),
-                            ),
-                    );
+                body = body.child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        // `min_w_0` so a long directory wraps instead of
+                        // pushing the button out of the panel.
+                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
+                            selectable_text("lifecycle-panel-implement-detail", detail, window, cx),
+                        ))
+                        .child(
+                            Button::new("lifecycle-panel-implement")
+                                .label(label)
+                                .ghost()
+                                .flex_shrink_0()
+                                .disabled(blocked)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.launch_implementation(window, cx);
+                                })),
+                        ),
+                );
                 if let Some(status) = implement_status {
                     body = body.child(div().text_xs().text_color(muted).child(selectable_text(
                         "lifecycle-panel-implement-status",
