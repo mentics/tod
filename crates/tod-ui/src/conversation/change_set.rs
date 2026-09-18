@@ -5,6 +5,7 @@ use super::context_panel::link_label;
 use super::{ChangeAction, ConversationView, Pane};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
+use tod_store::outline::repos::plan_steps::HandoffReason;
 use crate::views::rows::{
     NodeRowProps, ObligationRowProps, PlanStepRowProps, RowAction, RowOptions, node_row,
     obligation_row, op_icon, plan_step_row,
@@ -251,6 +252,7 @@ pub(crate) fn field_diffs(
                 body: b0,
                 status: st0,
                 note: no0,
+                reason: r0,
                 depends_on: d0,
                 satisfies: sa0,
             }),
@@ -260,6 +262,7 @@ pub(crate) fn field_diffs(
                 body: b1,
                 status: st1,
                 note: no1,
+                reason: r1,
                 depends_on: d1,
                 satisfies: sa1,
             }),
@@ -267,6 +270,8 @@ pub(crate) fn field_diffs(
             field("Text", b0.clone(), b1.clone());
             field("Status", st0.clone(), st1.clone());
             field("Note", opt(no0), opt(no1));
+            let reason = |r: &Option<HandoffReason>| opt(&r.as_ref().map(HandoffReason::describe));
+            field("Reason", reason(r0), reason(r1));
             field("Depends on", ids(d0), ids(d1));
             field("Satisfies", ids(sa0), ids(sa1));
             field("Node", node(n0), node(n1));
@@ -309,6 +314,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             body,
             status,
             note,
+            reason,
             ..
         } => Some(PlanStep {
             id: change.id,
@@ -317,6 +323,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             body: body.clone(),
             status: status.clone(),
             note: note.clone(),
+            reason: reason.clone(),
         }),
         _ => None,
     }

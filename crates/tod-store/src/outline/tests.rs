@@ -979,6 +979,7 @@ fn plan_step_dependency_graph_and_obligation_links() {
             step_id: step_a,
             status: "implemented".into(),
             note: None,
+            reason: None,
         })
         .unwrap();
     store.writer().flush().unwrap();

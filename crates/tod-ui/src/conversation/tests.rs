@@ -1440,3 +1440,57 @@ fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
         "the status change is in the change set: {changed:?}"
     );
 }
+
+/// A step the agent handed back loads with its reason and renders its
+/// answers. An answer only reopens the step once it has reached the agent:
+/// one that could not be sent (here, no data root to run the agent in) leaves
+/// the step as it was, with the error showing. What a sent answer says is
+/// `implement::handoff_answer_message`'s test.
+#[gpui::test]
+fn an_answer_that_is_not_sent_leaves_the_step_handed_back(cx: &mut TestAppContext) {
+    use tod_core::conversation::implement::HandoffAnswer;
+    use tod_store::outline::repos::plan_steps::{HandoffReason, STATUS_BLOCKED};
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let step = fixture.steps[0];
+    let reason = HandoffReason::Decision {
+        options: vec!["Generic form".into(), "Linear-specific form".into()],
+    };
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::Outline {
+                mutation: OutlineMutation::UpdatePlanStepStatus {
+                    step_id: step,
+                    status: STATUS_BLOCKED.into(),
+                    note: Some("Two ways to build the form.".into()),
+                    reason: Some(reason.clone()),
+                },
+                target: None,
+            },
+        )
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Implementation, false, window, cx)
+    });
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| v.data.plan[0].reason.clone()),
+        Some(reason.clone())
+    );
+
+    view.update(cx, |view, cx| {
+        view.answer_handoff(step, HandoffAnswer::Choose(1), cx)
+    });
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.error.is_some()));
+    let step = fixture
+        .store
+        .read(|conn| Ok(PlanStepRepo::new(conn).get(step)?.unwrap()))
+        .unwrap();
+    assert_eq!(step.status, STATUS_BLOCKED);
+    assert_eq!(step.reason, Some(reason));
+}

@@ -119,6 +119,9 @@ pub struct ArchivedPlanStep {
     pub status: String,
     #[serde(default)]
     pub note: Option<String>,
+    /// The step's `reason` column, as stored (JSON).
+    #[serde(default)]
+    pub reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
@@ -420,7 +423,7 @@ fn snapshot_plan_steps(conn: &Connection, node_id: Uuid) -> Result<Vec<ArchivedP
     let mut steps = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT id, ordinal, body, status, created_at, updated_at, note
+            "SELECT id, ordinal, body, status, created_at, updated_at, note, reason
              FROM node_plan_steps WHERE node_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![uuid_to_blob(node_id)], |row| {
@@ -431,6 +434,7 @@ fn snapshot_plan_steps(conn: &Connection, node_id: Uuid) -> Result<Vec<ArchivedP
                 body: row.get(2)?,
                 status: row.get(3)?,
                 note: row.get(6)?,
+                reason: row.get(7)?,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
                 depends_on: Vec::new(),
@@ -663,8 +667,8 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
     for step in &archived.plan_steps {
         conn.execute(
             "INSERT OR IGNORE INTO node_plan_steps
-                (id, node_id, ordinal, body, status, note, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (id, node_id, ordinal, body, status, note, reason, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 uuid_to_blob(step.id),
                 blob,
@@ -672,6 +676,7 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 step.body,
                 step.status,
                 step.note,
+                step.reason,
                 step.created_at,
                 step.updated_at,
             ],

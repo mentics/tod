@@ -165,6 +165,9 @@ pub enum EntitySnapshot {
         /// Why a `partial` or `blocked` step stopped short.
         #[serde(default)]
         note: Option<String>,
+        /// Why such a step needs the user.
+        #[serde(default)]
+        reason: Option<crate::outline::repos::plan_steps::HandoffReason>,
         /// Sorted.
         depends_on: Vec<Uuid>,
         /// Obligations this step is linked to. Sorted.

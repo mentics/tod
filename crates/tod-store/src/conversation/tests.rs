@@ -1,6 +1,7 @@
 use super::*;
 use crate::fleet::schema;
 use crate::interview::{ACTOR_USER, InterviewCommand, PHASE_REQUIREMENTS};
+use crate::outline::repos::plan_steps::HandoffReason;
 use crate::outline::repos::{ListRepo, NodeRepo, ObligationRepo, OutlineRepo, PlanStepRepo};
 use crate::outline::types::{Capability, OutlineEntry};
 use crate::outline::uuid_blob::uuid_to_blob;
@@ -212,6 +213,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         body: String::new(),
         status: "pending".into(),
         note: None,
+        reason: None,
         depends_on: vec![],
         satisfies: vec![],
     };
@@ -394,6 +396,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
                 step_id: id(),
                 status: "ready".into(),
                 note: None,
+                reason: None,
             },
             Some(Edit),
         ),
@@ -970,6 +973,15 @@ fn plan_steps_round_trip_through_reversal() {
             step_id: s2,
             status: "in_progress".into(),
             note: None,
+            reason: None,
+        },
+        M::UpdatePlanStepStatus {
+            step_id: s2,
+            status: "blocked".into(),
+            note: Some("Pick one.".into()),
+            reason: Some(HandoffReason::Decision {
+                options: vec!["This".into(), "That".into()],
+            }),
         },
         M::AddPlanStepDependency {
             step_id: s3,
@@ -995,6 +1007,34 @@ fn plan_steps_round_trip_through_reversal() {
         };
         round_trip(&fx, Entity::PlanStep, step, mutation, NetOp::Edited);
     }
+    // Reopening a step the agent handed back, then reversing that, gives the
+    // step back its reason and note.
+    steps
+        .update_status(
+            s3,
+            "blocked",
+            Some("Obligations disagree."),
+            Some(&HandoffReason::Conflict {
+                obligations: vec![o, Uuid::new_v4()],
+            }),
+        )
+        .unwrap();
+    round_trip(
+        &fx,
+        Entity::PlanStep,
+        s3,
+        M::UpdatePlanStepStatus {
+            step_id: s3,
+            status: "in_progress".into(),
+            note: None,
+            reason: None,
+        },
+        NetOp::Edited,
+    );
+    assert!(matches!(
+        steps.get(s3).unwrap().unwrap().reason,
+        Some(HandoffReason::Conflict { .. })
+    ));
     round_trip(
         &fx,
         Entity::PlanStep,

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 41;
+pub const CURRENT_USER_VERSION: i32 = 42;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -303,6 +303,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 41 {
         migrate_v40_to_v41(conn)?;
         conn.pragma_update(None, "user_version", 41)?;
+    }
+    if version < 42 {
+        migrate_v41_to_v42(conn)?;
+        conn.pragma_update(None, "user_version", 42)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -740,6 +744,21 @@ fn migrate_v40_to_v41(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+/// Plan steps: the `reason` a `partial` or `blocked` step needs the user
+/// (`HandoffReason`, as JSON). Steps handed back before this keep their note
+/// and have no reason.
+fn migrate_v41_to_v42(conn: &Connection) -> Result<()> {
+    let has_reason: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('node_plan_steps') WHERE name = 'reason'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_reason {
+        conn.execute_batch("ALTER TABLE node_plan_steps ADD COLUMN reason TEXT;")?;
+    }
     Ok(())
 }
 
@@ -3952,6 +3971,8 @@ mod plan_step_migration_tests {
         migrate_v40_to_v41(&conn).unwrap();
         // Running it again is harmless.
         migrate_v40_to_v41(&conn).unwrap();
+        migrate_v41_to_v42(&conn).unwrap();
+        migrate_v41_to_v42(&conn).unwrap();
 
         assert_eq!(dependents(&conn), before);
         let row: (String, String, Option<String>) = conn

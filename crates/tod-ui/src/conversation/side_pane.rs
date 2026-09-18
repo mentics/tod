@@ -16,15 +16,17 @@ use gpui::{
     Anchor, AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
     ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
+use gpui_component::button::Button;
 use gpui_component::{Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
-use tod_core::conversation::implement::TestRun;
+use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
 use tod_store::conversation::ProtocolKind;
-use tod_store::interview::InterviewCommand;
-use tod_store::outline::OutlineMutation;
+use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::{
-    PLAN_STEP_STATUSES, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
+    HandoffReason, PLAN_STEP_STATUSES, STATUS_IN_PROGRESS, STATUS_IMPLEMENTED, STATUS_VERIFIED,
+    needs_user,
 };
+use tod_store::outline::{OutlineMutation, PlanStep};
 use uuid::Uuid;
 
 /// The status dropdown open on one plan step.
@@ -73,16 +75,16 @@ impl ConversationView {
             .iter()
             .any(|s| s.id == step && s.status == status);
         if !unchanged {
-            // A step left for the user keeps the note saying why; any other
+            // A step left for the user keeps the note and reason saying why; any other
             // status has none.
-            let note = needs_user(status)
+            let kept = needs_user(status)
                 .then(|| self.data.plan.iter().find(|s| s.id == step))
-                .flatten()
-                .and_then(|s| s.note.clone());
+                .flatten();
             let mutation = OutlineMutation::UpdatePlanStepStatus {
                 step_id: step,
                 status: status.to_string(),
-                note,
+                note: kept.and_then(|s| s.note.clone()),
+                reason: kept.and_then(|s| s.reason.clone()),
             };
             self.command(match self.conversation_id {
                 Some(conversation_id) => InterviewCommand::ConversationEdit {
@@ -97,6 +99,118 @@ impl ConversationView {
             self.reload();
         }
         cx.notify();
+    }
+
+    /// Answer a step the agent left for the user: send the agent the answer
+    /// and, once it has gone out, set the step back to `in_progress`.
+    pub(super) fn answer_handoff(
+        &mut self,
+        step: Uuid,
+        answer: HandoffAnswer,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(step) = self.data.plan.iter().find(|s| s.id == step).cloned() else {
+            return;
+        };
+        if self.deliver(&handoff_answer_message(&step, &answer), cx) {
+            self.choose_status(step.id, STATUS_IN_PROGRESS, cx);
+        }
+    }
+
+    /// Under a step left for the user: why, what is left, and a way to answer
+    /// for each reason — keep one of the conflicting obligations, choose an
+    /// option, or retry once the access or outside thing is in place.
+    fn render_handoff(
+        &self,
+        step: &PlanStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !needs_user(&step.status) {
+            return None;
+        }
+        let id = step.id;
+        let answer_button = |key: String, label: &'static str, answer: HandoffAnswer, cx: &mut Context<Self>| {
+            Button::new(ElementId::Name(key.into()))
+                .label(label)
+                .small()
+                .flex_shrink_0()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.answer_handoff(id, answer.clone(), cx);
+                }))
+        };
+        let mut col = v_flex().gap(style::space::HAIRLINE).pt(style::space::HAIRLINE);
+        if let Some(reason) = &step.reason {
+            col = col.child(style::text_dense(div()).child(reason.label()));
+        }
+        if let Some(note) = &step.note {
+            col = col.child(style::text_dense_muted(div()).child(selectable_text(
+                format!("plan-step-note-{id}"),
+                note.clone(),
+                window,
+                cx,
+            )));
+        }
+        match &step.reason {
+            Some(HandoffReason::Conflict { obligations }) => {
+                for obligation in obligations {
+                    let text = match self.data.cited.get(obligation) {
+                        Some(body) => format!("[{}] {body}", short_id(*obligation)),
+                        None => format!("[{}] (no longer exists)", short_id(*obligation)),
+                    };
+                    col = col.child(
+                        h_flex()
+                            .gap(style::space::INLINE)
+                            .items_start()
+                            .child(div().flex_1().min_w_0().child(selectable_text(
+                                format!("plan-step-cites-{id}-{obligation}"),
+                                text,
+                                window,
+                                cx,
+                            )))
+                            .child(answer_button(
+                                format!("plan-step-keep-{id}-{obligation}"),
+                                "Keep",
+                                HandoffAnswer::Keep(*obligation),
+                                cx,
+                            )),
+                    );
+                }
+            }
+            Some(HandoffReason::Decision { options }) => {
+                for (ix, option) in options.iter().enumerate() {
+                    col = col.child(
+                        h_flex()
+                            .gap(style::space::INLINE)
+                            .items_start()
+                            .child(div().flex_1().min_w_0().child(selectable_text(
+                                format!("plan-step-option-{id}-{ix}"),
+                                option.clone(),
+                                window,
+                                cx,
+                            )))
+                            .child(answer_button(
+                                format!("plan-step-choose-{id}-{ix}"),
+                                "Choose",
+                                HandoffAnswer::Choose(ix),
+                                cx,
+                            )),
+                    );
+                }
+            }
+            Some(HandoffReason::Access | HandoffReason::External) => {
+                col = col.child(h_flex().child(answer_button(
+                    format!("plan-step-retry-{id}"),
+                    "Retry",
+                    HandoffAnswer::Retry,
+                    cx,
+                )));
+            }
+            // Handed back before reasons existed: the note is all there is,
+            // and the message input answers it.
+            None => {}
+        }
+        Some(col.into_any_element())
     }
 
     /// A plan step's status badge: click it for the dropdown of the others.
@@ -253,6 +367,12 @@ impl ConversationView {
             .filter(|step| step.status == STATUS_IMPLEMENTED || step.status == STATUS_VERIFIED)
             .count();
         let total = self.data.plan.len();
+        let waiting = self
+            .data
+            .plan
+            .iter()
+            .filter(|step| needs_user(&step.status))
+            .count();
         let count = self.side_row_count();
         let cursor = self.side_cursor.filter(|ix| *ix < count);
         let lit = |row: usize| active && cursor == Some(row);
@@ -282,14 +402,11 @@ impl ConversationView {
         }
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        let steps: Vec<(Uuid, String, String, Option<String>)> = self
-            .data
-            .plan
-            .iter()
-            .map(|s| (s.id, s.status.clone(), s.body.clone(), s.note.clone()))
-            .collect();
-        for (n, (id, status, body, note)) in steps.into_iter().enumerate() {
-            let badge = self.render_status_badge(id, &status, cx);
+        let steps: Vec<PlanStep> = self.data.plan.clone();
+        for (n, step) in steps.into_iter().enumerate() {
+            let id = step.id;
+            let badge = self.render_status_badge(id, &step.status, cx);
+            let handoff = self.render_handoff(&step, window, cx);
             rows.push(
                 h_flex()
                     .when(lit(n), style::highlighted)
@@ -304,20 +421,11 @@ impl ConversationView {
                             .min_w_0()
                             .child(selectable_text(
                                 format!("plan-step-{id}"),
-                                body,
+                                step.body,
                                 window,
                                 cx,
                             ))
-                            // Why a partial or blocked step stopped, and how
-                            // to unblock it: what the user acts on.
-                            .children(note.map(|note| {
-                                style::text_dense_muted(div()).child(selectable_text(
-                                    format!("plan-step-note-{id}"),
-                                    note,
-                                    window,
-                                    cx,
-                                ))
-                            })),
+                            .children(handoff),
                     )
                     .into_any_element(),
             );
@@ -373,7 +481,11 @@ impl ConversationView {
                         .flex_shrink_0()
                         .child("Implementation"),
                     )
-                    .child(style::text_dense_muted(div()).child(format!("{done}/{total} steps")))
+                    .child(style::text_dense_muted(div()).child(if waiting == 0 {
+                        format!("{done}/{total} steps")
+                    } else {
+                        format!("{done}/{total} steps, {waiting} need you")
+                    }))
                     .when_some(tests, |el, run| {
                         let label = run.label();
                         el.child(if run.green() {
