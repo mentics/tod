@@ -283,8 +283,13 @@ impl ActionPanelView {
         if let Some(name) = session.session_name.as_deref() {
             return name.to_string();
         }
-        if let Some(cached) = session.cached_transcript.as_deref() {
-            if let Some(first_line) = cached.lines().find(|line| !line.trim().is_empty()) {
+        if let Some(transcript) = tod_core::run_transcript::stored(session) {
+            let opening = transcript
+                .turns
+                .first()
+                .map(tod_agent::TranscriptTurn::text)
+                .unwrap_or_default();
+            if let Some(first_line) = opening.lines().find(|line| !line.trim().is_empty()) {
                 let preview: String = first_line.chars().take(48).collect();
                 let suffix = if first_line.chars().count() > 48 {
                     "…"

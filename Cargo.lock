@@ -8492,6 +8492,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -8529,6 +8530,7 @@ dependencies = [
  "tod-agent",
  "tod-integration",
  "tod-store",
+ "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-appender",

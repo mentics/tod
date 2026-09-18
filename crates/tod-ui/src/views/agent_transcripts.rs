@@ -3,22 +3,28 @@ use crate::ui::actionable::{
     chrome_control_with_shortcut, render_label_badge, render_shortcut_pill,
 };
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::transcript_list::{
+    self, ChunkId, Entry, EntryKind, TranscriptList, TranscriptListEvent,
+};
 use chrono::{Local, TimeZone};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding, MouseButton,
-    ParentElement, Pixels, Render, SharedString, Styled, Window, actions, div, px,
+    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
+    Window, actions, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use tod_agent::{FormatProblem, Transcript, TranscriptTurn};
+use tod_core::run_transcript;
 use tod_store::agent_traffic::{
     AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
 };
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::{AgentRun, FleetStore};
 
 /// A single row in the agent picker list, unified across fleet agent runs and
 /// traffic-log-only agents (question maker / answer processor).
@@ -90,8 +96,25 @@ pub struct AgentTranscriptsView {
     active_agents: Vec<AgentRow>,
     past_agents: Vec<AgentRow>,
     selected_agent_id: Option<String>,
+    /// The selected run's transcript as stored, read after the fact from
+    /// the platform's own record of the session.
+    history: Option<Transcript>,
+    /// Why the selected run's transcript could not be read.
+    read_error: Option<String>,
+    /// What in the platform's record of the selected run the reader did not
+    /// know, and so left out.
+    format_problems: Vec<FormatProblem>,
+    /// Runs whose transcript is being read.
+    reading: HashSet<String>,
+    /// Raw traffic this process logged for the selected agent.
     turns: Vec<TurnRow>,
     header: SharedString,
+    /// The selected agent's turns, rendered by the same component the
+    /// conversation view uses.
+    transcript: Entity<TranscriptList>,
+    /// Chunks the user toggled away from how they start.
+    toggled: HashMap<ChunkId, bool>,
+    _transcript_subscription: Subscription,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +133,10 @@ impl AgentTranscriptsView {
         traffic_log: SharedAgentTrafficLog,
         window_control: TranscriptWindowControl,
     ) -> Self {
+        let transcript = cx.new(|_| TranscriptList::new());
+        let subscription = cx.subscribe(&transcript, |this, _, event, cx| match event {
+            TranscriptListEvent::ChunkClicked(id) => this.toggle(*id, cx),
+        });
         let mut this = Self {
             fleet,
             traffic_log,
@@ -118,8 +145,15 @@ impl AgentTranscriptsView {
             active_agents: Vec::new(),
             past_agents: Vec::new(),
             selected_agent_id: None,
+            history: None,
+            read_error: None,
+            format_problems: Vec::new(),
+            reading: HashSet::new(),
             turns: Vec::new(),
             header: "Agent transcripts".into(),
+            transcript,
+            toggled: HashMap::new(),
+            _transcript_subscription: subscription,
         };
         this.reload_agents();
         if let Some(first) = this.first_agent_id() {
@@ -155,7 +189,7 @@ impl AgentTranscriptsView {
 
         if let Ok(runs) = self.fleet.list_all_runs() {
             for run in runs {
-                let turn_count = run.cached_transcript.is_some() as usize;
+                let turn_count = run_transcript::stored(&run).map_or(0, |t| t.turns.len());
                 let title = self
                     .fleet
                     .get_node(&run.node_id)
@@ -200,16 +234,131 @@ impl AgentTranscriptsView {
         self.past_agents = past;
     }
 
-    fn select_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
-        self.selected_agent_id = Some(agent_id.clone());
-        self.turns = self.load_turns(&agent_id);
+    /// Expand or collapse one chunk.
+    fn toggle(&mut self, id: ChunkId, cx: &mut Context<Self>) {
+        let entries = self.entries();
+        let expanded = !transcript_list::is_expanded(&entries, &self.toggled, id);
+        if expanded == transcript_list::expanded_by_default(&entries, id) {
+            self.toggled.remove(&id);
+        } else {
+            self.toggled.insert(id, expanded);
+        }
+        cx.notify();
+    }
+
+    /// The selected agent's transcript entries: the run's stored transcript,
+    /// read as the conversation view reads a conversation, then any raw
+    /// traffic this process logged for it. A request carries what we sent,
+    /// so it reads as the outgoing side.
+    fn entries(&self) -> Vec<Entry> {
+        let history = self.history.iter().flat_map(|transcript| &transcript.turns);
+        let format_problems = (!self.format_problems.is_empty()).then(|| Entry {
+            kind: EntryKind::Error,
+            body: format!(
+                "The transcript format has changed, so parts of this transcript are left                  out until the reader is updated: {}.",
+                self.format_problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            parts: Vec::new(),
+            label: None,
+        });
+        let read_error = self.read_error.iter().map(|err| Entry {
+            kind: EntryKind::Error,
+            body: format!("Couldn't read the transcript: {err}"),
+            parts: Vec::new(),
+            label: None,
+        });
+        format_problems
+            .into_iter()
+            .chain(history.map(entry_of_turn))
+            .chain(read_error)
+            .chain(self.turns.iter().map(|turn| {
+                Entry::raw(
+                    turn.direction == TrafficDirection::Request,
+                    turn.label.clone(),
+                    turn.content.to_string(),
+                )
+            }))
+            .collect()
+    }
+
+    /// How many turns the selected agent shows.
+    fn shown_turns(&self) -> usize {
+        self.history.as_ref().map_or(0, |t| t.turns.len()) + self.turns.len()
+    }
+
+    fn set_header(&mut self, agent_id: &str) {
         let label = self
             .active_agents
             .iter()
             .chain(self.past_agents.iter())
             .find(|agent| agent.id == agent_id)
-            .map_or(agent_id.as_str(), |agent| agent.label.as_str());
-        self.header = format!("{label} · {}", turn_count(self.turns.len())).into();
+            .map_or(agent_id, |agent| agent.label.as_str());
+        self.header = format!("{label} · {}", turn_count(self.shown_turns())).into();
+    }
+
+    /// Read the run's transcript when nothing usable is stored or its
+    /// session has moved on since it was. Both the check and the read touch
+    /// the platform's files, so they run on a background thread.
+    fn refresh_history(&mut self, run: AgentRun, cx: &mut Context<Self>) {
+        if !self.reading.insert(run.id.clone()) {
+            return;
+        }
+        let fleet = self.fleet.clone();
+        let run_id = run.id.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = if run_transcript::needs_capture(&run) {
+                run_transcript::capture(&fleet, &run).map_err(|err| format!("{err:#}"))
+            } else {
+                Ok(None)
+            };
+            let _ = tx.send_blocking(result);
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err("the transcript read panicked".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.reading.remove(&run_id);
+                this.reload_agents();
+                if this.selected_agent_id.as_deref() == Some(run_id.as_str()) {
+                    match result {
+                        Ok(Some(read)) => {
+                            this.history = Some(read.transcript);
+                            this.format_problems = read.problems;
+                            this.read_error = None;
+                        }
+                        Ok(None) => {}
+                        Err(err) => this.read_error = Some(err),
+                    }
+                    this.set_header(&run_id);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn select_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        if self.selected_agent_id.as_deref() != Some(agent_id.as_str()) {
+            self.toggled.clear();
+            self.transcript.update(cx, |list, cx| list.reset(cx));
+        }
+        self.selected_agent_id = Some(agent_id.clone());
+        self.turns = self.load_turns(&agent_id);
+        let run = self.fleet.get_run(&agent_id).ok().flatten();
+        self.history = run.as_ref().and_then(run_transcript::stored);
+        self.read_error = None;
+        self.format_problems.clear();
+        self.set_header(&agent_id);
+        if let Some(run) = run.filter(|run| run.agent_session_id.is_some() && !run.is_live()) {
+            self.refresh_history(run, cx);
+        }
         cx.notify();
     }
 
@@ -222,27 +371,16 @@ impl AgentTranscriptsView {
             }
         }
 
-        if let Some(cached) = self
-            .fleet
-            .get_run(agent_id)
-            .ok()
-            .flatten()
-            .and_then(|run| run.cached_transcript)
-        {
-            rows.push(TurnRow {
-                sequence: u64::MAX,
-                direction: TrafficDirection::Response,
-                label: "cached transcript".into(),
-                content: cached.into(),
-            });
-        }
-
         rows.sort_by_key(|row| row.sequence);
         rows
     }
 
     fn copy_transcript(&mut self, cx: &mut Context<Self>) {
         let mut text = String::new();
+        if let Some(history) = &self.history {
+            text.push_str(&history.to_text());
+            text.push_str("\n\n");
+        }
         for turn in &self.turns {
             text.push_str(&turn.label);
             text.push('\n');
@@ -261,6 +399,9 @@ impl AgentTranscriptsView {
             self.select_agent(first, cx);
         } else {
             self.turns.clear();
+            self.history = None;
+            self.read_error = None;
+            self.format_problems.clear();
             self.header = "Agent transcripts · no agents yet".into();
             cx.notify();
         }
@@ -413,6 +554,21 @@ fn agent_row_from_summary(summary: AgentSummary) -> AgentRow {
     }
 }
 
+/// A stored transcript turn as a transcript entry, the same shape the
+/// conversation view gives its own turns.
+fn entry_of_turn(turn: &TranscriptTurn) -> Entry {
+    let (kind, parts) = match turn {
+        TranscriptTurn::User { .. } => (EntryKind::User, Vec::new()),
+        TranscriptTurn::Agent { parts } => (EntryKind::Agent, parts.clone()),
+    };
+    Entry {
+        kind,
+        body: turn.text(),
+        parts,
+        label: None,
+    }
+}
+
 fn turn_count(count: usize) -> String {
     match count {
         1 => "1 turn".to_string(),
@@ -449,6 +605,26 @@ impl Render for AgentTranscriptsView {
         let muted_bg = cx.theme().muted;
         let accent = cx.theme().primary;
         let pick_badges = self.agent_pick_badges();
+
+        // Bring the transcript up to date. This window has no chunk
+        // highlight of its own — the agent list owns the keyboard — so the
+        // list is fed entries and what the user toggled, nothing more.
+        let entries = self.entries();
+        let toggled = self.toggled.clone();
+        let reading = self
+            .selected_agent_id
+            .as_ref()
+            .is_some_and(|id| self.reading.contains(id));
+        self.transcript.update(cx, |list, cx| {
+            list.set_entries(entries, cx);
+            list.set_toggled(toggled, cx);
+            list.set_status(
+                reading,
+                reading.then(|| "reading the transcript".to_string()),
+                cx,
+            );
+            list.set_empty_message("No transcript turns for this agent yet.", cx);
+        });
 
         h_flex()
             .key_context(AGENT_TRANSCRIPTS_CONTEXT)
@@ -664,7 +840,7 @@ impl Render for AgentTranscriptsView {
                                                     .label("Copy transcript")
                                                     .outline()
                                                     .compact()
-                                                    .disabled(self.turns.is_empty())
+                                                    .disabled(self.shown_turns() == 0)
                                                     .on_click(cx.listener(|this, _, _, cx| {
                                                         this.copy_transcript(cx);
                                                     })),
@@ -674,49 +850,7 @@ impl Render for AgentTranscriptsView {
                                         div()
                                             .flex_1()
                                             .min_h_0()
-                                            .overflow_y_scrollbar()
-                                            .p_4()
-                                            .gap_3()
-                                            .v_flex()
-                                            .when(self.turns.is_empty(), |el| {
-                                                el.child(div().text_sm().text_color(muted).child(
-                                                    "No transcript turns for this agent yet.",
-                                                ))
-                                            })
-                                            .children(self.turns.iter().map(|turn| {
-                                                let turn_accent = match turn.direction {
-                                                    TrafficDirection::Request => cx.theme().primary,
-                                                    TrafficDirection::Response => cx.theme().accent,
-                                                };
-                                                v_flex()
-                                                    .id(("turn", turn.sequence))
-                                                    .gap_1()
-                                                    .p_3()
-                                                    .rounded_md()
-                                                    .border_1()
-                                                    .border_color(border)
-                                                    .bg(muted_bg)
-                                                    .child(
-                                                        selectable_text(
-                                                            ("turn-label", turn.sequence),
-                                                            turn.label.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .text_xs()
-                                                        .text_color(turn_accent),
-                                                    )
-                                                    .child(
-                                                        selectable_text(
-                                                            ("turn-content", turn.sequence),
-                                                            turn.content.clone(),
-                                                            window,
-                                                            cx,
-                                                        )
-                                                        .text_sm()
-                                                        .text_color(foreground),
-                                                    )
-                                            })),
+                                            .child(self.transcript.clone()),
                                     ),
                             ),
                     ),

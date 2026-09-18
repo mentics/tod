@@ -44,6 +44,7 @@ use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_core::run_transcript;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
@@ -635,8 +636,16 @@ impl Shell {
         self.open_conversation(focus, window, cx);
     }
 
+    /// Show `message` as an error banner on the next render; messages that
+    /// arrive before then are shown together.
     fn queue_error_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.pending_error_toast = Some(message.into());
+        let message = message.into();
+        self.pending_error_toast = Some(match self.pending_error_toast.take() {
+            Some(earlier) => format!("{earlier}
+
+{message}"),
+            None => message,
+        });
         cx.notify();
     }
 
@@ -1251,55 +1260,18 @@ fn open_fleet_store(
     Ok(Arc::new(store))
 }
 
-/// One-time fetch-and-cache for runs `run_launch_hooks` just found dead (or
-/// that ended in an earlier process) with a resumable agent-side session but
-/// no cached transcript yet. Read-only (no prompt sent) and best-effort: a
-/// run whose worktree is gone or whose agent process can't be reached is
-/// skipped silently, since a live open of the transcript window will retry.
-fn backfill_missing_transcripts(fleet: &Arc<FleetStore>, agent: &SharedAgent) {
-    let runs = match fleet.list_all_runs() {
-        Ok(runs) => runs,
-        Err(err) => {
-            tracing::error!("backfill_missing_transcripts: listing runs failed: {err:#}");
-            return;
-        }
-    };
-    for run in runs {
-        if run.is_live() || run.cached_transcript.is_some() {
-            continue;
-        }
-        let (Some(agent_session_id), Some(platform_str)) =
-            (run.agent_session_id.clone(), run.platform.clone())
-        else {
-            continue;
-        };
-        let Some(platform) = tod_store::parse_platform(&platform_str) else {
-            continue;
-        };
-        let Ok(cwd) = tod_store::fleet::resolve_launch_cwd(fleet, &run.node_id) else {
-            continue;
-        };
-        let transcript = {
-            let agent = agent.lock().unwrap_or_else(|e| e.into_inner());
-            agent.fetch_full_transcript(platform, &cwd, &agent_session_id)
-        };
-        match transcript {
-            Ok(text) => {
-                let _ = fleet.enqueue(tod_store::fleet::FleetMutation::CacheAgentRunTranscript {
-                    run_id: run.id,
-                    transcript: text,
-                    fingerprint: None,
-                });
-            }
-            Err(err) => {
-                tracing::warn!(
-                    run_id = %run.id,
-                    "backfill_missing_transcripts: fetch failed: {err:#}"
-                );
-            }
-        }
-    }
-    let _ = fleet.writer().flush();
+/// The banner for a transcript format the reader does not know.
+fn transcript_format_message(notice: &run_transcript::FormatNotice) -> String {
+    let problems = notice
+        .problems
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{}'s transcript format has changed: {problems}.          Transcripts were read as far as possible; the reader needs updating.",
+        notice.platform.label()
+    )
 }
 
 pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
@@ -1400,14 +1372,19 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         // powershell.exe per row) — none of it needs to finish before the window
                         // is visible, so it must never sit on the path to `cx.open_window`.
                         let reattach_fleet = fleet.clone();
-                        let reattach_agent = agent.clone();
+                        let (format_tx, format_rx) =
+                            async_channel::unbounded::<run_transcript::FormatNotice>();
                         std::thread::spawn(move || {
                             if let Err(err) = reattach_fleet
                                 .run_launch_hooks(&tod_store::fleet::NoopGuestLiveness)
                             {
                                 tracing::error!("background launch-time reattach failed: {err:#}");
                             }
-                            backfill_missing_transcripts(&reattach_fleet, &reattach_agent);
+                            // Started once reattach has settled which runs are
+                            // still live, so none of them is read mid-run.
+                            run_transcript::spawn_capture(reattach_fleet, move |notice| {
+                                let _ = format_tx.send_blocking(notice);
+                            });
                         });
                         // Only the one long-lived GUI process should run this listener, so it
                         // starts here rather than inside `FleetStore::open` (which `tod-cli`
@@ -1790,6 +1767,21 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     let _ = poll_entity.update(cx, |shell, cx| {
                                         shell.refresh_agent_status(cx);
                                     });
+                                }
+                            })
+                            .detach();
+                            // A transcript format the reader does not know is shown
+                            // at once, so the reader can be brought up to date.
+                            let notice_entity = cx.weak_entity();
+                            cx.spawn(async move |_, cx| {
+                                while let Ok(notice) = format_rx.recv().await {
+                                    let message = transcript_format_message(&notice);
+                                    let shown = notice_entity.update(cx, |shell, cx| {
+                                        shell.queue_error_toast(message, cx);
+                                    });
+                                    if shown.is_err() {
+                                        break;
+                                    }
                                 }
                             })
                             .detach();
