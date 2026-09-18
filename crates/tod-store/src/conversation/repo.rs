@@ -1,7 +1,7 @@
 //! Conversation rows, turns, actions, and flags.
 
 use super::types::*;
-use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
+use crate::outline::uuid_blob::{blob_to_uuid, blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
@@ -307,6 +307,29 @@ impl<'a> ConversationRepo<'a> {
             parts: parts.to_vec(),
             created_at: now,
         })
+    }
+
+    /// Close every turn that was left waiting on an agent when the app last
+    /// stopped: a conversation whose last entry is a user message or a
+    /// continuation gets an error turn saying so. Run once at startup, before
+    /// any turn can be in flight. Returns the conversations it closed.
+    pub fn close_interrupted_turns(&self, body: &str) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.conversation_id FROM conversation_turns t
+             WHERE t.role IN ('user', 'continuation')
+               AND t.seq = (SELECT MAX(seq) FROM conversation_turns
+                            WHERE conversation_id = t.conversation_id)",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|blob| blob_to_uuid(&blob))
+            .collect::<Result<Vec<_>>>()?;
+        for id in &ids {
+            self.append_turn(*id, TurnRole::Error, body)?;
+        }
+        Ok(ids)
     }
 
     /// Record the provider session the conversation now continues (`None`

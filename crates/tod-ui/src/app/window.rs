@@ -44,8 +44,8 @@ use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBa
 use std::path::PathBuf;
 use std::sync::Arc;
 use tod_agent::EngagementState;
-use tod_core::run_transcript;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
+use tod_core::run_transcript;
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
@@ -659,9 +659,11 @@ impl Shell {
     fn queue_error_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
         let message = message.into();
         self.pending_error_toast = Some(match self.pending_error_toast.take() {
-            Some(earlier) => format!("{earlier}
+            Some(earlier) => format!(
+                "{earlier}
 
-{message}"),
+{message}"
+            ),
             None => message,
         });
         cx.notify();
@@ -953,7 +955,13 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
-                this.open_conversation_with(action.focus, action.protocol, action.start, window, cx);
+                this.open_conversation_with(
+                    action.focus,
+                    action.protocol,
+                    action.start,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &ShellGoSettings, window, cx| {
                 this.select_view(ShellView::Settings, window, cx);
@@ -982,6 +990,11 @@ impl Render for Shell {
                     .child(self.render_content(window, cx)),
             )
             .child(self.render_status_bar(window, cx))
+            // Without this layer `window.open_dialog` queues a dialog nobody
+            // sees — the agent permission prompt among them.
+            .when_some(Root::render_dialog_layer(window, cx), |el, layer| {
+                el.child(layer)
+            })
             .when_some(notification_overlay(window, cx), |el, layer| {
                 el.child(layer)
             })
@@ -1389,6 +1402,39 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         cx.new(|cx| Root::new(view, window, cx))
                     }
                     Ok(fleet) => {
+                        // No turn is in flight yet, so any conversation still
+                        // waiting on its agent was cut off when the app last
+                        // stopped. Before the window opens, so no new turn is
+                        // mistaken for one.
+                        if let Err(err) = fleet.interview(
+                            tod_store::interview::ACTOR_USER,
+                            tod_store::interview::InterviewCommand::CloseInterruptedConversationTurns {
+                                body: "Interrupted: the app stopped before the agent replied"
+                                    .to_string(),
+                            },
+                        ) {
+                            tracing::error!("closing interrupted conversation turns failed: {err:#}");
+                        }
+                        // Every agent session is recorded as soon as the agent
+                        // reports its id, so the transcripts window can read
+                        // its transcript later, whatever started it.
+                        let observer_fleet = fleet.clone();
+                        if let Ok(mut provider) = agent.lock() {
+                        provider.set_session_observer(Arc::new(move |started| {
+                            let session = tod_store::fleet::NewAgentSession {
+                                agent_session_id: started.agent_session_id,
+                                platform: started.platform.label().to_string(),
+                                session_key: started.key,
+                                title: started.title,
+                                cwd: started.cwd.display().to_string(),
+                            };
+                            if let Err(err) = observer_fleet
+                                .enqueue(tod_store::fleet::FleetMutation::RecordAgentSession(session))
+                            {
+                                tracing::warn!("recording agent session failed: {err}");
+                            }
+                        }));
+                        }
                         // Reconcile stale agent/shell runtime status off the main thread. This
                         // probes OS process liveness for every reconnect-tracked row, which is
                         // unbounded work (and, on Windows, previously shelled out to

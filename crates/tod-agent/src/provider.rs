@@ -1,7 +1,27 @@
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{AgentCategory, InterviewAgentCounts};
+use crate::platform::AgentPlatform;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// An agent session a provider started or resumed, reported as soon as the
+/// agent gives its id — before its first turn ends, so a turn that never
+/// ends still leaves its session findable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStarted {
+    pub platform: AgentPlatform,
+    pub agent_session_id: String,
+    /// The caller's key for the session: a [`SessionTurn::key`], or the owner
+    /// id of a fleet-agent run. Its traffic is filed under the same key.
+    pub key: String,
+    pub title: String,
+    pub cwd: PathBuf,
+}
+
+/// Hears of every session a provider starts or resumes, on the thread that
+/// learned of it. Keep it quick: that thread is driving the agent.
+pub type SessionObserver = Arc<dyn Fn(SessionStarted) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(Uuid);
@@ -226,6 +246,10 @@ pub trait AgentProvider {
 
     /// Live in-flight counts for the global agent status bar.
     fn interview_status_counts(&self) -> InterviewAgentCounts;
+
+    /// Report every session started or resumed from now on to `observer`.
+    /// Providers with no agent-side sessions (the mock) ignore it.
+    fn set_session_observer(&mut self, _observer: SessionObserver) {}
 }
 
 #[cfg(test)]

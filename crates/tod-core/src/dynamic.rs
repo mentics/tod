@@ -98,6 +98,9 @@ pub enum DynamicBlock {
     Plan,
     /// Repo, branch, working directory, and task notes.
     Workspace,
+    /// The directory the agent was launched in, for a surface whose code
+    /// work must stay there.
+    WorkingDirectory,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -116,6 +119,7 @@ pub struct DynamicContext<'a> {
     pub ancestor_context: &'a str,
     pub plan_steps: &'a [PlanStepWithLinks],
     pub workspace: Option<&'a Workspace>,
+    pub working_dir: Option<&'a Path>,
     pub focus: Option<&'a FocusSelection>,
 }
 
@@ -136,6 +140,15 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                 "**Data root:** `{}`\n\n\
                  Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
                 root.display()
+            ));
+        }
+
+        DynamicBlock::WorkingDirectory => {
+            let Some(dir) = ctx.working_dir else { return };
+            out.push_str(&format!(
+                "**Working directory:** `{}`\n\n\
+                 All code work happens here.\n\n",
+                dir.display()
             ));
         }
 

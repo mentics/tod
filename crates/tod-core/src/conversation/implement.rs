@@ -139,10 +139,12 @@ impl Protocol for ImplementationProtocol {
             })
             .unwrap_or_default();
         let lifecycle = Some(node.lifecycle.clone());
+        let working_dir = self.cwd(env)?;
         build_implement_message(
             env.media,
             &ImplementRequest {
                 data_root: env.data_root,
+                working_dir: &working_dir,
                 node: NodeSelection {
                     id: node_id,
                     slug: Some(node.slug.clone()),

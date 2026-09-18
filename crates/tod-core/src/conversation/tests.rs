@@ -875,3 +875,32 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
         .expect("a recorded test run");
     assert!(run.green(), "{run:?}");
 }
+
+/// The session's id is stored as soon as the agent reports it, so a turn
+/// that never finishes still leaves the session to resume.
+#[test]
+fn the_session_id_is_stored_while_the_first_turn_runs() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    driver.send(&fx.fleet, &mut agent, "ask Hi?").unwrap();
+    let run = *agent.runs.keys().next().unwrap();
+    agent.runs.insert(run, AgentRunState::InFlight(None));
+    assert!(driver.tick(&fx.fleet, &mut agent).is_empty());
+    assert!(driver.status().running);
+
+    let id = driver.conversation_id().unwrap();
+    let conversation = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).get(id))
+        .unwrap()
+        .unwrap();
+    let key = ConversationDriver::session_key(id);
+    assert!(agent.session_id(&key).is_some());
+    assert_eq!(conversation.agent_session_id, agent.session_id(&key));
+    assert_eq!(
+        conversation.session_name.as_deref(),
+        Some(agent.last().title.as_str())
+    );
+}

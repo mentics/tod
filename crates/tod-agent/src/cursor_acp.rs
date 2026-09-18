@@ -1,7 +1,7 @@
 use super::acp_host::{AcpHost, is_standalone_acp_server, spawn_acp_process};
 use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, PermissionOption,
-    PermissionRequest, RunId, SessionPurpose, SessionTurn,
+    PermissionRequest, RunId, SessionObserver, SessionPurpose, SessionStarted, SessionTurn,
 };
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
 use crate::agent_traffic::{
@@ -100,6 +100,7 @@ struct ConversationSpec {
     env: Arc<Vec<(String, String)>>,
     purpose: SessionPurpose,
     tag: TrafficTag,
+    session_observer: Option<SessionObserver>,
 }
 
 /// A long-lived conversation: a worker thread owning at most one agent process.
@@ -280,6 +281,14 @@ impl ConversationWorker {
             )?;
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
+            report_session(
+                spec.session_observer.as_ref(),
+                spec.host,
+                &session.session_id,
+                &spec.tag.id,
+                title,
+                &spec.cwd,
+            );
             *live = Some(session);
             created = start == SessionStart::New;
         }
@@ -303,6 +312,7 @@ pub struct CursorAcpProvider {
     /// Long-lived conversations by caller key (see [`SessionTurn`]).
     conversations: HashMap<String, LiveConversation>,
     traffic_log: Option<SharedAgentTrafficLog>,
+    session_observer: Option<SessionObserver>,
 }
 
 impl CursorAcpProvider {
@@ -323,6 +333,7 @@ impl CursorAcpProvider {
             fleet_run_context: HashMap::new(),
             conversations: HashMap::new(),
             traffic_log: None,
+            session_observer: None,
         })
     }
 
@@ -360,6 +371,7 @@ impl CursorAcpProvider {
             fleet_run_context: HashMap::new(),
             conversations: HashMap::new(),
             traffic_log: None,
+            session_observer: None,
         }
     }
 
@@ -408,6 +420,7 @@ impl CursorAcpProvider {
         let write_roots = self.extra_write_roots.clone();
         let session_id_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let session_id_for_worker = session_id_slot.clone();
+        let session_observer = self.session_observer.clone();
         let worker = thread::spawn(move || {
             let result = run_acp_session(
                 host,
@@ -427,6 +440,7 @@ impl CursorAcpProvider {
                 kind,
                 &write_roots,
                 &session_title,
+                session_observer.as_ref(),
             );
             match &result {
                 Ok(text) => tracing::info!(
@@ -539,6 +553,7 @@ impl AgentProvider for CursorAcpProvider {
             env: Arc::new(env),
             purpose,
             tag: tag.clone(),
+            session_observer: self.session_observer.clone(),
         };
 
         let id = RunId::new();
@@ -708,6 +723,10 @@ impl AgentProvider for CursorAcpProvider {
             self.fleet_run_context.remove(&id);
         }
         Ok(())
+    }
+
+    fn set_session_observer(&mut self, observer: SessionObserver) {
+        self.session_observer = Some(observer);
     }
 
     fn interview_status_counts(&self) -> InterviewAgentCounts {
@@ -938,6 +957,7 @@ fn run_acp_session(
     kind: AgentRunKind,
     extra_write_roots: &[PathBuf],
     session_title: &str,
+    session_observer: Option<&SessionObserver>,
 ) -> Result<String> {
     let mut child = spawn_acp_process(host, agent_bin, &[])?;
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
@@ -1016,6 +1036,14 @@ fn run_acp_session(
             .context("session/new missing sessionId")?;
 
         *session_id_out.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.to_string());
+        report_session(
+            session_observer,
+            host,
+            session_id,
+            &session.tag.id,
+            session_title,
+            cwd,
+        );
 
         apply_session_config_options(
             &mut session,
@@ -1058,6 +1086,26 @@ fn run_acp_session(
         bail!("ACP run cancelled");
     }
     result
+}
+
+/// Tell `observer` about a session the agent has just given an id.
+fn report_session(
+    observer: Option<&SessionObserver>,
+    host: AcpHost,
+    agent_session_id: &str,
+    key: &str,
+    title: &str,
+    cwd: &Path,
+) {
+    if let Some(observer) = observer {
+        observer(SessionStarted {
+            platform: host.platform(),
+            agent_session_id: agent_session_id.to_string(),
+            key: key.to_string(),
+            title: title.to_string(),
+            cwd: cwd.to_path_buf(),
+        });
+    }
 }
 
 struct AcpClient {

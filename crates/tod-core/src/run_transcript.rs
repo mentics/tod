@@ -9,6 +9,10 @@
 //! A stored transcript is read again only when its fingerprint (the
 //! session's latest message) has moved on.
 //!
+//! Every agent session tod started is recorded too (`agent_sessions`, not
+//! just fleet runs), and is read and kept the same way: [`session_capture`]
+//! reads one, and the sweep covers them all.
+//!
 //! The platforms' formats are their own and change without notice. A read
 //! that meets something it does not know keeps what it could read, and
 //! reports the rest ([`FormatProblem`]) so the reader can be updated; the
@@ -25,7 +29,7 @@ use tod_agent::{
     AgentPlatform, FormatProblem, Transcript, TranscriptRead, read_transcript,
     transcript_fingerprint,
 };
-use tod_store::fleet::{AgentRun, FleetMutation, FleetStore};
+use tod_store::fleet::{AgentRun, AgentSession, FleetMutation, FleetStore};
 use tokio::sync::broadcast::error::RecvError;
 
 /// How often every run is checked again while the app stays open, for
@@ -96,6 +100,64 @@ pub fn capture(fleet: &FleetStore, run: &AgentRun) -> Result<Option<TranscriptRe
     Ok(Some(read))
 }
 
+/// The platforms `session`'s record may be on: the one recorded, or each of
+/// them for a session recorded before tod kept it.
+pub fn session_platforms(session: &AgentSession) -> Vec<AgentPlatform> {
+    match session.platform.as_deref().and_then(tod_store::parse_platform) {
+        Some(platform) => vec![platform],
+        None => vec![AgentPlatform::Claude, AgentPlatform::Cursor],
+    }
+}
+
+/// Whether `session`'s transcript should be read: nothing usable is stored,
+/// or the session has moved on since it was. Reads the platform's record for
+/// the fingerprint, so call it off the UI thread.
+pub fn session_needs_capture(session: &AgentSession) -> bool {
+    let stored = session
+        .cached_transcript
+        .as_deref()
+        .and_then(Transcript::from_stored);
+    if stored.is_none() {
+        return true;
+    }
+    session_platforms(session).into_iter().any(|platform| {
+        transcript_fingerprint(platform, &session.agent_session_id).is_some_and(|now| {
+            session.transcript_fingerprint.as_deref() != Some(now.as_str())
+        })
+    })
+}
+
+/// Read `session`'s transcript from its platform's record and keep it.
+/// `Ok(None)` when no platform has a record of it.
+pub fn session_capture(
+    fleet: &FleetStore,
+    session: &AgentSession,
+) -> Result<Option<(AgentPlatform, TranscriptRead)>> {
+    for platform in session_platforms(session) {
+        let id = &session.agent_session_id;
+        let fingerprint = transcript_fingerprint(platform, id);
+        let Some(read) = read_transcript(platform, id)? else {
+            continue;
+        };
+        for problem in &read.problems {
+            tracing::warn!(
+                agent_session_id = %id,
+                platform = platform.label(),
+                "transcript format not recognized: {problem}"
+            );
+        }
+        fleet.enqueue(FleetMutation::CacheAgentSessionTranscript {
+            agent_session_id: id.clone(),
+            platform: tod_store::platform_storage(platform).to_string(),
+            transcript: read.transcript.to_stored(),
+            // Read again until the reader knows the format.
+            fingerprint: fingerprint.filter(|_| read.problems.is_empty()),
+        })?;
+        return Ok(Some((platform, read)));
+    }
+    Ok(None)
+}
+
 /// What a capture met in a platform's record that the reader does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatNotice {
@@ -145,6 +207,7 @@ pub fn spawn_capture(
                     on_format_change(FormatNotice { platform, problems });
                 }
             };
+            sweep_sessions(&fleet, &mut report);
             let mut report = |run: &AgentRun, problems| {
                 if let Some(platform) = platform(run) {
                     report(platform, problems);
@@ -187,6 +250,33 @@ pub fn spawn_capture(
         });
     if let Err(err) = spawned {
         tracing::error!("transcript capture: could not start: {err}");
+    }
+}
+
+/// Capture every recorded session whose transcript is missing or behind.
+/// Only at startup: a session is read again when someone looks at it.
+fn sweep_sessions(fleet: &FleetStore, report: &mut impl FnMut(AgentPlatform, Vec<FormatProblem>)) {
+    let sessions = match fleet.list_agent_sessions() {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::error!("transcript capture: listing agent sessions failed: {err:#}");
+            return;
+        }
+    };
+    for session in &sessions {
+        if !session_needs_capture(session) {
+            continue;
+        }
+        match session_capture(fleet, session) {
+            Ok(Some((platform, read))) if !read.problems.is_empty() => {
+                report(platform, read.problems)
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                agent_session_id = %session.agent_session_id,
+                "transcript capture failed: {err:#}"
+            ),
+        }
     }
 }
 

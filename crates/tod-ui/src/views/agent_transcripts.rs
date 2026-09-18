@@ -24,17 +24,22 @@ use tod_core::run_transcript;
 use tod_store::agent_traffic::{
     AgentSummary, SharedAgentTrafficLog, TrafficDirection, TrafficEntry,
 };
-use tod_store::fleet::{AgentRun, FleetStore};
+use tod_store::fleet::{AgentSession, FleetStore};
 
-/// A single row in the agent picker list, unified across fleet agent runs and
-/// traffic-log-only agents (question maker / answer processor).
+/// A row in the agent picker: a recorded agent session, whatever started it,
+/// or traffic this process logged under a key no session was recorded for.
 #[derive(Debug, Clone)]
 struct AgentRow {
+    /// The agent session id, or the traffic key for traffic alone.
     id: String,
     label: String,
-    entry_count: usize,
+    detail: String,
     last_activity_ms: Option<i64>,
-    active: bool,
+    /// A recorded session, whose transcript is read from its platform's
+    /// record.
+    session: bool,
+    /// The key this process logged the row's raw traffic under.
+    traffic_key: Option<String>,
 }
 
 fn format_timestamp_ms(ms: i64) -> String {
@@ -93,8 +98,7 @@ pub struct AgentTranscriptsView {
     traffic_log: SharedAgentTrafficLog,
     window_control: TranscriptWindowControl,
     focus_handle: FocusHandle,
-    active_agents: Vec<AgentRow>,
-    past_agents: Vec<AgentRow>,
+    agents: Vec<AgentRow>,
     selected_agent_id: Option<String>,
     /// The selected run's transcript as stored, read after the fact from
     /// the platform's own record of the session.
@@ -147,8 +151,7 @@ impl AgentTranscriptsView {
             traffic_log,
             window_control,
             focus_handle: cx.focus_handle(),
-            active_agents: Vec::new(),
-            past_agents: Vec::new(),
+            agents: Vec::new(),
             selected_agent_id: None,
             history: None,
             read_error: None,
@@ -182,62 +185,46 @@ impl AgentTranscriptsView {
     }
 
     fn first_agent_id(&self) -> Option<String> {
-        self.active_agents
-            .iter()
-            .chain(self.past_agents.iter())
-            .next()
-            .map(|a| a.id.clone())
+        self.agents.first().map(|a| a.id.clone())
     }
 
+    /// Every recorded agent session, newest first. A session's live
+    /// traffic, logged under its key, goes with the newest session that has
+    /// the key; traffic under a key no session has gets a row of its own.
     fn reload_agents(&mut self) {
-        let mut rows: Vec<AgentRow> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let sessions = self
+            .fleet
+            .list_agent_sessions_without_transcripts()
+            .unwrap_or_else(|err| {
+                tracing::error!("listing agent sessions failed: {err:#}");
+                Vec::new()
+            });
+        let mut traffic: HashMap<String, AgentSummary> = self
+            .traffic_log
+            .lock()
+            .map(|log| log.agent_summaries())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|summary| (summary.id.clone(), summary))
+            .collect();
 
-        if let Ok(runs) = self.fleet.list_all_runs() {
-            for run in runs {
-                let turn_count = run_transcript::stored(&run).map_or(0, |t| t.turns.len());
-                let title = self
-                    .fleet
-                    .get_node(&run.node_id)
-                    .ok()
-                    .flatten()
-                    .map(|node| node.title)
-                    .unwrap_or_else(|| run.node_id.clone());
-                if seen.insert(run.id.clone()) {
-                    rows.push(AgentRow {
-                        id: run.id.clone(),
-                        label: format!("{title} · run {} · {}", run.run_number, run.run_kind),
-                        entry_count: turn_count,
-                        last_activity_ms: Some(run.ended_at.unwrap_or(run.started_at)),
-                        active: run.is_live(),
-                    });
-                }
-            }
-        }
-
-        if let Ok(log) = self.traffic_log.lock() {
-            for summary in log.agent_summaries() {
-                if seen.insert(summary.id.clone()) {
-                    rows.push(agent_row_from_summary(summary));
-                }
-            }
-        }
-
-        let (mut active, mut past): (Vec<AgentRow>, Vec<AgentRow>) =
-            rows.into_iter().partition(|row| row.active);
-        active.sort_by(|a, b| {
+        let mut rows: Vec<AgentRow> = sessions
+            .into_iter()
+            .map(|session| {
+                let summary = session
+                    .session_key
+                    .as_ref()
+                    .and_then(|key| traffic.remove(key));
+                agent_row_from_session(session, summary)
+            })
+            .collect();
+        rows.extend(traffic.into_values().map(agent_row_from_summary));
+        rows.sort_by(|a, b| {
             b.last_activity_ms
                 .cmp(&a.last_activity_ms)
                 .then_with(|| a.label.cmp(&b.label))
         });
-        past.sort_by(|a, b| {
-            b.last_activity_ms
-                .cmp(&a.last_activity_ms)
-                .then_with(|| a.label.cmp(&b.label))
-        });
-
-        self.active_agents = active;
-        self.past_agents = past;
+        self.agents = rows;
     }
 
     /// Expand or collapse one chunk.
@@ -277,7 +264,7 @@ impl AgentTranscriptsView {
         });
     }
 
-    /// The selected agent's transcript entries: the run's stored transcript,
+    /// The selected agent's transcript entries: the session's stored transcript,
     /// read as the conversation view reads a conversation, then any raw
     /// traffic this process logged for it. A request carries what we sent,
     /// so it reads as the outgoing side.
@@ -323,27 +310,28 @@ impl AgentTranscriptsView {
 
     fn set_header(&mut self, agent_id: &str) {
         let label = self
-            .active_agents
+            .agents
             .iter()
-            .chain(self.past_agents.iter())
             .find(|agent| agent.id == agent_id)
             .map_or(agent_id, |agent| agent.label.as_str());
         self.header = format!("{label} · {}", turn_count(self.shown_turns())).into();
     }
 
-    /// Read the run's transcript when nothing usable is stored or its
+    /// Read the session's transcript when nothing usable is stored or the
     /// session has moved on since it was. Both the check and the read touch
     /// the platform's files, so they run on a background thread.
-    fn refresh_history(&mut self, run: AgentRun, cx: &mut Context<Self>) {
-        if !self.reading.insert(run.id.clone()) {
+    fn refresh_history(&mut self, session: AgentSession, cx: &mut Context<Self>) {
+        let id = session.agent_session_id.clone();
+        if !self.reading.insert(id.clone()) {
             return;
         }
         let fleet = self.fleet.clone();
-        let run_id = run.id.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let result = if run_transcript::needs_capture(&run) {
-                run_transcript::capture(&fleet, &run).map_err(|err| format!("{err:#}"))
+            let result = if run_transcript::session_needs_capture(&session) {
+                run_transcript::session_capture(&fleet, &session)
+                    .map(|read| read.map(|(_, read)| read))
+                    .map_err(|err| format!("{err:#}"))
             } else {
                 Ok(None)
             };
@@ -355,9 +343,9 @@ impl AgentTranscriptsView {
                 .await
                 .unwrap_or_else(|_| Err("the transcript read panicked".into()));
             let _ = this.update(cx, |this, cx| {
-                this.reading.remove(&run_id);
+                this.reading.remove(&id);
                 this.reload_agents();
-                if this.selected_agent_id.as_deref() == Some(run_id.as_str()) {
+                if this.selected_agent_id.as_deref() == Some(id.as_str()) {
                     match result {
                         Ok(Some(read)) => {
                             this.history = Some(read.transcript);
@@ -367,7 +355,7 @@ impl AgentTranscriptsView {
                         Ok(None) => {}
                         Err(err) => this.read_error = Some(err),
                     }
-                    this.set_header(&run_id);
+                    this.set_header(&id);
                 }
                 this.sync_transcript(cx);
                 cx.notify();
@@ -382,14 +370,28 @@ impl AgentTranscriptsView {
             self.transcript.update(cx, |list, cx| list.reset(cx));
         }
         self.selected_agent_id = Some(agent_id.clone());
-        self.turns = self.load_turns(&agent_id);
-        let run = self.fleet.get_run(&agent_id).ok().flatten();
-        self.history = run.as_ref().and_then(run_transcript::stored);
+        let row = self
+            .agents
+            .iter()
+            .find(|agent| agent.id == agent_id)
+            .cloned();
+        self.turns = row
+            .as_ref()
+            .and_then(|row| row.traffic_key.as_deref())
+            .map(|key| self.load_turns(key))
+            .unwrap_or_default();
+        let session = row
+            .filter(|row| row.session)
+            .and_then(|_| self.fleet.get_agent_session(&agent_id).ok().flatten());
+        self.history = session
+            .as_ref()
+            .and_then(|session| session.cached_transcript.as_deref())
+            .and_then(Transcript::from_stored);
         self.read_error = None;
         self.format_problems.clear();
         self.set_header(&agent_id);
-        if let Some(run) = run.filter(|run| run.agent_session_id.is_some() && !run.is_live()) {
-            self.refresh_history(run, cx);
+        if let Some(session) = session {
+            self.refresh_history(session, cx);
         }
         self.sync_transcript(cx);
         cx.notify();
@@ -442,11 +444,7 @@ impl AgentTranscriptsView {
     }
 
     fn flat_agent_ids(&self) -> Vec<String> {
-        self.active_agents
-            .iter()
-            .chain(self.past_agents.iter())
-            .map(|agent| agent.id.clone())
-            .collect()
+        self.agents.iter().map(|agent| agent.id.clone()).collect()
     }
 
     fn select_adjacent(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -510,12 +508,8 @@ fn render_agent_section(
             let selected = selected_agent_id.as_deref() == Some(agent.id.as_str());
             let badge = pick_badges.get(&agent.id).cloned();
             let subtitle = match agent.last_activity_ms {
-                Some(ms) => format!(
-                    "{} · {}",
-                    turn_count(agent.entry_count),
-                    format_timestamp_ms(ms)
-                ),
-                None => turn_count(agent.entry_count),
+                Some(ms) => format!("{} · {}", agent.detail, format_timestamp_ms(ms)),
+                None => agent.detail.clone(),
             };
             div()
                 .id(("agent-pick", index_offset + ix))
@@ -578,13 +572,43 @@ fn render_agent_section(
         }))
 }
 
+fn agent_row_from_session(session: AgentSession, traffic: Option<AgentSummary>) -> AgentRow {
+    let label = [session.title.as_deref(), session.session_key.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|label| !label.is_empty())
+        .unwrap_or(&session.agent_session_id)
+        .to_string();
+    let platform = session
+        .platform
+        .as_deref()
+        .and_then(tod_store::parse_platform)
+        .map_or("agent session", |platform| platform.label());
+    let detail = match &traffic {
+        Some(summary) => format!("{platform} · {} logged", summary.entry_count),
+        None => platform.to_string(),
+    };
+    let last_activity_ms = traffic.as_ref().map_or(session.started_at, |summary| {
+        summary.last_timestamp_ms.max(session.started_at)
+    });
+    AgentRow {
+        id: session.agent_session_id,
+        label,
+        detail,
+        last_activity_ms: Some(last_activity_ms),
+        session: true,
+        traffic_key: traffic.map(|summary| summary.id),
+    }
+}
+
 fn agent_row_from_summary(summary: AgentSummary) -> AgentRow {
     AgentRow {
-        id: summary.id,
+        detail: format!("{} logged", summary.entry_count),
         label: summary.label,
-        entry_count: summary.entry_count,
         last_activity_ms: Some(summary.last_timestamp_ms),
-        active: false,
+        session: false,
+        traffic_key: Some(summary.id.clone()),
+        id: summary.id,
     }
 }
 
@@ -775,40 +799,20 @@ impl Render for AgentTranscriptsView {
                                             .p_2()
                                             .v_flex()
                                             .gap_2()
-                                            .when(
-                                                self.active_agents.is_empty()
-                                                    && self.past_agents.is_empty(),
-                                                |el| {
-                                                    el.child(
-                                                        div()
-                                                            .px_2()
-                                                            .text_xs()
-                                                            .text_color(muted)
-                                                            .child("No agent traffic logged yet."),
-                                                    )
-                                                },
-                                            )
-                                            .when(!self.active_agents.is_empty(), |el| {
-                                                el.child(render_agent_section(
-                                                    "Currently active",
-                                                    &self.active_agents,
-                                                    0,
-                                                    &self.selected_agent_id,
-                                                    &pick_badges,
-                                                    window,
-                                                    cx,
-                                                    border,
-                                                    muted,
-                                                    muted_bg,
-                                                    foreground,
-                                                    accent,
-                                                ))
+                                            .when(self.agents.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .px_2()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child("No agent sessions recorded yet."),
+                                                )
                                             })
-                                            .when(!self.past_agents.is_empty(), |el| {
+                                            .when(!self.agents.is_empty(), |el| {
                                                 el.child(render_agent_section(
-                                                    "Past transcripts",
-                                                    &self.past_agents,
-                                                    self.active_agents.len(),
+                                                    "Agent sessions",
+                                                    &self.agents,
+                                                    0,
                                                     &self.selected_agent_id,
                                                     &pick_badges,
                                                     window,

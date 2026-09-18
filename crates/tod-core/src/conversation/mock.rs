@@ -14,6 +14,7 @@
 //! flag <id>: <reason>
 //! ask <text>
 //! think <text>
+//! permission <title>
 //! ```
 //!
 //! `<id>` is a node slug or UUID, or an obligation or plan-step id (full or
@@ -25,6 +26,10 @@
 //! ([`MockReply::parts`]): when there is work, a note that it is working, a
 //! thought for each `think`, and a tool call for each carried-out directive;
 //! then the reply.
+//!
+//! `permission` is the transport mock's (`tod_agent::MockAgentProvider`): it
+//! holds the turn on a permission request titled `<title>` until the user
+//! answers it. Here it is skipped.
 
 use crate::interview::client::InterviewClient;
 use anyhow::{Context, Result, bail};
@@ -113,6 +118,9 @@ pub fn reply(client: &impl Access, blocks: &[String]) -> Result<MockReply> {
     let mut parts = Vec::new();
     let lines = message.lines().map(str::trim).filter(|l| !l.is_empty());
     for (ix, line) in lines.enumerate() {
+        if line.starts_with("permission ") {
+            continue;
+        }
         if let Some(thought) = line.strip_prefix("think ") {
             parts.push(ReplyPart::Thought {
                 text: thought.trim().to_string(),

@@ -2,6 +2,7 @@ use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::command_log::CommandLog;
 use crate::fleet::reconnect_identity::ReconnectIdentity;
 use crate::fleet::repos::agent_run::{AgentRunRepo, RUNTIME_STATUS_ACTIVE};
+use crate::fleet::repos::agent_session::{AgentSessionRepo, NewAgentSession};
 use crate::fleet::repos::node_agent::NodeAgentRepo;
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::notification::NotificationRepo;
@@ -127,6 +128,17 @@ pub enum FleetMutation {
     EndAgentRun {
         run_id: String,
     },
+    /// An agent session has started (or resumed) — see
+    /// `AgentSessionRepo::record`.
+    RecordAgentSession(NewAgentSession),
+    /// Keep a session's transcript as read from the platform's record.
+    CacheAgentSessionTranscript {
+        agent_session_id: String,
+        platform: String,
+        transcript: String,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
     DeleteAgentRun {
         run_id: String,
     },
@@ -195,6 +207,8 @@ impl FleetMutation {
                 | FleetMutation::CreateAgentRun { .. }
                 | FleetMutation::SetAgentRunSessionId { .. }
                 | FleetMutation::CacheAgentRunTranscript { .. }
+                | FleetMutation::RecordAgentSession(_)
+                | FleetMutation::CacheAgentSessionTranscript { .. }
                 | FleetMutation::EndAgentRun { .. }
                 | FleetMutation::DeleteAgentRun { .. }
                 | FleetMutation::CreateNotification { .. }
@@ -325,6 +339,22 @@ impl FleetMutation {
             } => {
                 AgentRunRepo::new(conn).cache_transcript(
                     run_id,
+                    transcript,
+                    fingerprint.as_deref(),
+                )?;
+            }
+            FleetMutation::RecordAgentSession(session) => {
+                AgentSessionRepo::new(conn).record(session)?;
+            }
+            FleetMutation::CacheAgentSessionTranscript {
+                agent_session_id,
+                platform,
+                transcript,
+                fingerprint,
+            } => {
+                AgentSessionRepo::new(conn).cache_transcript(
+                    agent_session_id,
+                    platform,
                     transcript,
                     fingerprint.as_deref(),
                 )?;

@@ -157,6 +157,10 @@ pub enum InterviewCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<crate::conversation::ReplyPart>,
     },
+    /// Close the turns left waiting on an agent when the app last stopped
+    /// (at startup, before any turn is in flight); returns their
+    /// conversations.
+    CloseInterruptedConversationTurns { body: String },
     /// Record the provider session the conversation continues (`None` clears
     /// it, so the next message starts a fresh one).
     SetConversationSession {
@@ -731,6 +735,10 @@ pub fn execute(
             }
             let turn = repo.append_turn_with_parts(*conversation_id, *role, body, parts)?;
             Ok(json!({ "seq": turn.seq }))
+        }
+        InterviewCommand::CloseInterruptedConversationTurns { body } => {
+            let ids = crate::conversation::ConversationRepo::new(conn).close_interrupted_turns(body)?;
+            Ok(json!({ "conversations": ids.iter().map(Uuid::to_string).collect::<Vec<_>>() }))
         }
         InterviewCommand::SetConversationSession {
             conversation_id,

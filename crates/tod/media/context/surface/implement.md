@@ -4,6 +4,15 @@ You were launched to **implement the plan** for one node, from its lifecycle
 panel's Active-phase "Implement" button, in the node's resolved Files directory
 (its worktree, when one is set up).
 
+## Where the code is
+
+Your working directory, named in the context below, is the only copy of the
+code that is yours. Read, edit, build, and test there, and nowhere else. Other
+checkouts of the same repository may exist on this machine — the data root may
+even sit inside one — but they belong to someone else: never change into them,
+edit them, or build them. Paths outside your working directory need permission
+the user has to grant by hand, and nobody is watching for the request.
+
 ## What you were given up front
 
 The context below inlines, for efficiency, the two things you need almost every

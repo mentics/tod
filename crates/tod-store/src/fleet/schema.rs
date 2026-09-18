@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 39;
+pub const CURRENT_USER_VERSION: i32 = 40;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -293,6 +293,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 39 {
         migrate_v38_to_v39(conn)?;
         conn.pragma_update(None, "user_version", 39)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 40 {
+        migrate_v39_to_v40(conn)?;
+        conn.pragma_update(None, "user_version", 40)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -626,6 +631,50 @@ fn migrate_v38_to_v39(conn: &Connection) -> Result<()> {
             PRIMARY KEY (conversation_id, turn_seq)
         );
         PRAGMA foreign_keys=ON;
+        ",
+    )?;
+    Ok(())
+}
+
+/// `agent_sessions`: every agent session tod started, recorded when the agent
+/// reports its id (see `repos::agent_session`). Seeded from the tables that
+/// kept session ids before: fleet runs, conversations, and interview agents.
+fn migrate_v39_to_v40(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            agent_session_id       TEXT PRIMARY KEY NOT NULL,
+            platform               TEXT,
+            session_key            TEXT,
+            title                  TEXT,
+            cwd                    TEXT,
+            started_at             INTEGER NOT NULL,
+            cached_transcript      TEXT,
+            transcript_fingerprint TEXT
+        );
+
+        INSERT OR IGNORE INTO agent_sessions
+            (agent_session_id, platform, session_key, title, started_at,
+             cached_transcript, transcript_fingerprint)
+        SELECT agent_session_id, platform, id, session_name, started_at,
+               cached_transcript, transcript_fingerprint
+        FROM agent_runs
+        WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
+
+        INSERT OR IGNORE INTO agent_sessions
+            (agent_session_id, platform, session_key, title, started_at)
+        SELECT agent_session_id, platform,
+               'conversation-' || substr(h, 1, 8) || '-' || substr(h, 9, 4) || '-'
+                   || substr(h, 13, 4) || '-' || substr(h, 17, 4) || '-' || substr(h, 21),
+               session_name, created_at
+        FROM (SELECT *, lower(hex(id)) AS h FROM conversations)
+        WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
+
+        INSERT OR IGNORE INTO agent_sessions
+            (agent_session_id, title, started_at)
+        SELECT agent_session_id, 'Interview ' || role || ' · ' || phase, created_at
+        FROM interview_agent_sessions
+        WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
         ",
     )?;
     Ok(())
