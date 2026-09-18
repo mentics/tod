@@ -23,6 +23,7 @@ toml = "0.8"
 tod-agent = { path = "../tod-agent" }
 tod-integration = { path = "../tod-integration" }
 tod-store = { path = "../tod-store" }
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-rolling-file = { version = "0.1.3", features = ["non-blocking"] }

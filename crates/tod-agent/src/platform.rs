@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Interview agent platform — persisted in `tod.yml` and shown in Settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPlatform {
     Cursor,

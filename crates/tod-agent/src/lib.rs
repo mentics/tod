@@ -16,6 +16,7 @@ mod provider;
 mod reply;
 mod routing;
 pub mod run_state;
+mod transcript;
 pub mod util;
 
 pub use agent_launch::{AgentLaunchOptions, effort_for_acp};
@@ -40,6 +41,10 @@ pub use provider::{
 };
 pub use reply::ReplyPart;
 pub use routing::RoutingAgentProvider;
+pub use transcript::{
+    FormatProblem, Transcript, TranscriptRead, TranscriptTurn, read_transcript,
+    transcript_fingerprint,
+};
 
 use std::sync::{Arc, Mutex};
 

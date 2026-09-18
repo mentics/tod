@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_agent::{EngagementState, SessionOpening, SessionTurn, SharedEngagementRegistry};
+use tod_core::run_transcript;
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::{AgentRole, TodSettings, parse_platform, platform_storage};
 
@@ -55,8 +56,8 @@ struct PendingRun {
 }
 
 /// Prior-session history shown above the live conversation. Populated from
-/// the run's cached transcript, or fetched once in the background (via ACP
-/// resume/load) when a resumable session has none cached yet.
+/// the run's stored transcript, or fetched in the background (the session is
+/// loaded read-only) when a resumable session has none stored yet.
 enum TranscriptHistory {
     /// No prior agent-side session — nothing to load.
     NotNeeded,
@@ -153,7 +154,7 @@ impl InteractiveAgentView {
             .map(|node| node.title)
             .unwrap_or_default();
         let run = fleet.get_run(&session_run_id).ok().flatten();
-        let cached_transcript = run.as_ref().and_then(|run| run.cached_transcript.clone());
+        let stored_transcript = run.as_ref().and_then(run_transcript::stored);
         let launch = run
             .as_ref()
             .and_then(|run| run.launch_options())
@@ -164,8 +165,8 @@ impl InteractiveAgentView {
             .unwrap_or_else(|| format!("Session {}", run.as_ref().map_or(0, |run| run.run_number)));
         let agent_session_id = run.and_then(|run| run.agent_session_id);
 
-        let history = match (&cached_transcript, &agent_session_id) {
-            (Some(text), _) => TranscriptHistory::Loaded(text.clone()),
+        let history = match (&stored_transcript, &agent_session_id) {
+            (Some(transcript), _) => TranscriptHistory::Loaded(transcript.to_text()),
             (None, Some(_)) => TranscriptHistory::Loading,
             (None, None) => TranscriptHistory::NotNeeded,
         };
@@ -197,17 +198,7 @@ impl InteractiveAgentView {
         };
 
         if matches!(history, TranscriptHistory::Loading) {
-            spawn_history_fetch(
-                fleet.clone(),
-                agent.clone(),
-                session_run_id.clone(),
-                launch.platform,
-                workspace_cwd.clone(),
-                agent_session_id
-                    .clone()
-                    .expect("Loading implies a session id"),
-                cx,
-            );
+            spawn_history_fetch(fleet.clone(), session_run_id.clone(), cx);
         }
 
         let view = Self {
@@ -686,36 +677,31 @@ fn render_agent_thinking_panel(
         )
 }
 
-/// Fetch a resumed session's full transcript in the background (no prompt
-/// sent, so it never blocks the window) and cache it once it lands.
+/// Read a resumed session's full transcript in the background, so it never
+/// blocks the window, and store it once it lands.
 fn spawn_history_fetch(
     fleet: Arc<FleetStore>,
-    agent: SharedAgent,
     run_id: String,
-    platform: tod_store::AgentPlatform,
-    cwd: PathBuf,
-    agent_session_id: String,
     cx: &mut Context<InteractiveAgentView>,
 ) {
     let entity = cx.weak_entity();
     cx.spawn(async move |_, cx| {
-        let fetch = std::thread::spawn(move || {
-            let agent = agent.lock().unwrap_or_else(|e| e.into_inner());
-            agent.fetch_full_transcript(platform, &cwd, &agent_session_id)
-        })
-        .join();
-        let result = match fetch {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(err)) => Err(err.to_string()),
-            Err(_) => Err("transcript fetch thread panicked".into()),
-        };
-        if let Ok(text) = &result {
-            let _ = fleet.enqueue(FleetMutation::CacheAgentRunTranscript {
-                run_id,
-                transcript: text.clone(),
-                fingerprint: None,
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = fleet.get_run(&run_id).and_then(|run| match run {
+                Some(run) => run_transcript::capture(&fleet, &run),
+                None => Ok(None),
             });
-        }
+            let _ = tx.send_blocking(
+                result
+                    .map(|read| read.map(|read| read.transcript.to_text()).unwrap_or_default())
+                    .map_err(|err| err.to_string()),
+            );
+        });
+        let result = rx
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err("transcript fetch thread panicked".into()));
         let _ = entity.update(cx, |this, cx| {
             this.history = match result {
                 Ok(text) => TranscriptHistory::Loaded(text),

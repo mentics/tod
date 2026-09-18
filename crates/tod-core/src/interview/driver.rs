@@ -791,14 +791,6 @@ mod tests {
             None
         }
 
-        fn fetch_full_transcript(
-            &self,
-            _platform: tod_agent::AgentPlatform,
-            _cwd: &std::path::Path,
-            _agent_session_id: &str,
-        ) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
 
         fn session_context_chars(&self, key: &str) -> Option<u64> {
             self.chars.get(key).copied()

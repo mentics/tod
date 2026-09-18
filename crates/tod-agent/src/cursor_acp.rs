@@ -607,20 +607,6 @@ impl AgentProvider for CursorAcpProvider {
         })
     }
 
-    fn fetch_full_transcript(
-        &self,
-        _platform: crate::platform::AgentPlatform,
-        cwd: &Path,
-        agent_session_id: &str,
-    ) -> Result<String> {
-        fetch_transcript(
-            self.host,
-            &self.agent_bin,
-            cwd,
-            agent_session_id,
-            self.traffic_log.clone(),
-        )
-    }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.conversations
@@ -971,7 +957,6 @@ fn run_acp_session(
         next_id: 1,
         request_rx,
         assistant_text: String::new(),
-        replay_transcript: Vec::new(),
         cancelled: cancelled.clone(),
         traffic_log,
         tag,
@@ -1080,12 +1065,6 @@ struct AcpClient {
     next_id: i64,
     request_rx: Receiver<AcpRequest>,
     assistant_text: String,
-    /// Every message chunk seen on this connection, by role, coalesced across
-    /// consecutive chunks of the same role. Populated during live turns and
-    /// (more importantly) during a `session/resume`/`session/load` replay, so
-    /// [`fetch_transcript`] can read back full history without a separate
-    /// tracking mechanism.
-    replay_transcript: Vec<(&'static str, String)>,
     cancelled: Arc<AtomicBool>,
     traffic_log: Option<SharedAgentTrafficLog>,
     tag: TrafficTag,
@@ -1135,26 +1114,6 @@ impl AcpClient {
 
     fn set_activity(&self, activity: Option<String>) {
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = activity;
-    }
-
-    fn push_replay_chunk(&mut self, role: &'static str, text: &str) {
-        match self.replay_transcript.last_mut() {
-            Some((last_role, buf)) if *last_role == role => buf.push_str(text),
-            _ => self.replay_transcript.push((role, text.to_string())),
-        }
-    }
-
-    /// Render every captured chunk (from live turns and any resume/load
-    /// replay on this connection) as a plain-text transcript.
-    fn replay_transcript_text(&self) -> String {
-        self.replay_transcript
-            .iter()
-            .map(|(role, text)| {
-                let label = if *role == "user" { "User" } else { "Assistant" };
-                format!("{label}:\n{text}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
     }
 
     /// Publish a permission request for `poll_run` to surface, then block
@@ -1298,17 +1257,8 @@ impl AcpClient {
                         {
                             self.assistant_text.push_str(text);
                             self.update_reply(|parts| reply::push_text(parts, false, text));
-                            self.push_replay_chunk("assistant", text);
                         }
                         self.set_activity(Some("Writing reply…".to_string()));
-                    } else if kind == "user_message_chunk" {
-                        if let Some(text) = update
-                            .get("content")
-                            .and_then(|c| c.get("text"))
-                            .and_then(Value::as_str)
-                        {
-                            self.push_replay_chunk("user", text);
-                        }
                     } else if kind == "agent_thought_chunk" {
                         if let Some(text) = update
                             .get("content")
@@ -1749,7 +1699,6 @@ impl PersistentAcpSession {
             next_id: 1,
             request_rx,
             assistant_text: String::new(),
-        replay_transcript: Vec::new(),
             cancelled: cancelled.clone(),
             traffic_log,
             tag,
@@ -1873,50 +1822,6 @@ impl PersistentAcpSession {
         }
         let _ = self._reader_handle.join();
     }
-}
-
-/// Fetch a resumable session's full transcript by connecting fresh and
-/// issuing `session/resume`/`session/load` — no prompt is sent, and the
-/// process is torn down immediately after. Used to populate the one-time
-/// cached transcript for a run that doesn't have one yet (e.g. reopening a
-/// `Done` chat window, or reconciling on force-exit).
-pub(crate) fn fetch_transcript(
-    host: AcpHost,
-    agent_bin: &Path,
-    cwd: &Path,
-    session_id: &str,
-    traffic_log: Option<SharedAgentTrafficLog>,
-) -> Result<String> {
-    let child_slot: Arc<Mutex<Option<AgentProcess>>> = Arc::new(Mutex::new(None));
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let activity = Arc::new(Mutex::new(None));
-    let pending_permission: PendingPermissionSlot = Arc::new(Mutex::new(None));
-    let session = PersistentAcpSession::connect(
-        host,
-        agent_bin,
-        cwd,
-        "",
-        "",
-        child_slot.clone(),
-        cancelled,
-        activity,
-        pending_permission,
-        &[],
-        &SessionStart::Resume(session_id.to_string()),
-        traffic_log,
-        TrafficTag::new(
-            format!("transcript-{session_id}"),
-            &format!("Transcript fetch · {session_id}"),
-            "",
-        ),
-        AgentRunKind::FleetAgent,
-        &[],
-        None,
-        None,
-    )?;
-    let text = session.client.replay_transcript_text();
-    session.shutdown(child_slot);
-    Ok(text)
 }
 
 #[cfg(test)]

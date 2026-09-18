@@ -32,8 +32,13 @@ pub enum ReplyPart {
 pub(crate) type SharedReplyParts = Arc<Mutex<Vec<ReplyPart>>>;
 
 /// Append streamed text of one kind, coalescing with the previous part when
-/// it is the same kind.
+/// it is the same kind. An empty chunk adds nothing — agents often record that
+/// a thought happened without what it said, and an empty part would only show
+/// as a heading with nothing under it.
 pub(crate) fn push_text(parts: &mut Vec<ReplyPart>, thought: bool, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
     match (parts.last_mut(), thought) {
         (Some(ReplyPart::Text { text }), false) | (Some(ReplyPart::Thought { text }), true) => {
             text.push_str(chunk)

@@ -116,14 +116,6 @@ impl AgentProvider for FakeAgent {
         None
     }
 
-    fn fetch_full_transcript(
-        &self,
-        _: AgentPlatform,
-        _: &std::path::Path,
-        _: &str,
-    ) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.chars.get(key).copied()

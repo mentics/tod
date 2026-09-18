@@ -18,6 +18,7 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         },
         body: turn.body.clone(),
         parts: turn.parts.clone(),
+        label: None,
     }
 }
 
