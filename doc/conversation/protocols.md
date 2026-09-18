@@ -231,9 +231,12 @@ Stops on any of:
 
 The header shows the continuation count while a loop runs.
 
-A `continuation` turn is a one-line transcript marker, exactly as
-`TurnRole::Rotation` already is — *not* a synthesized user turn. The user can
-always see that the loop ran and how often.
+A `continuation` turn records the message the loop sent, verbatim — *not* a
+synthesized user turn: it is left out of the history a fresh session is
+seeded with, and the transcript shows it as "Sent automatically", so the user
+sees exactly what the agent was told, that the loop ran, and how often. The
+message opens with what is left ("4 plan steps are still open…"), lists the
+open steps, says what the tests still need, and restates the reply rule.
 
 ### 4.5 Side pane
 

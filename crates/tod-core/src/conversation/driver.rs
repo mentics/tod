@@ -433,9 +433,9 @@ impl ConversationDriver {
                 self.continuations = 0;
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
-            Next::Continue { note, message } => {
+            Next::Continue { message } => {
                 self.continuations += 1;
-                self.append(fleet, id, TurnRole::Continuation, &note)?;
+                self.append(fleet, id, TurnRole::Continuation, &message)?;
                 self.resend(fleet, agent, id, message)?;
                 events.push(ConversationEvent::Continued);
             }

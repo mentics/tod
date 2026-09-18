@@ -9,6 +9,10 @@ use gpui::{AnyElement, AppContext, Context, Entity, IntoElement, Subscription, W
 use tod_store::conversation::{Turn, TurnRole};
 
 pub(super) fn entry_of(turn: &Turn) -> Entry {
+    // What the app sent on its own, shown as sent.
+    if turn.role == TurnRole::Continuation {
+        return Entry::raw(true, "Sent automatically", turn.body.clone());
+    }
     Entry {
         kind: match turn.role {
             TurnRole::User => EntryKind::User,

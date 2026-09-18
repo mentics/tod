@@ -851,7 +851,8 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
         driver.tick(&fx.fleet, &mut agent),
         [ConversationEvent::Continued]
     );
-    assert!(agent.last().message.contains("Step 1"), "{}", agent.last().message);
+    let continuation = agent.last().message.clone();
+    assert!(continuation.contains("Step 1"), "{continuation}");
     // Both closed and green tests, recorded this turn: done.
     assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
 
@@ -860,10 +861,8 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
         [
             (TurnRole::User, "Implement the plan.".to_string()),
             (TurnRole::Agent, String::new()),
-            (
-                TurnRole::Continuation,
-                "Asked the agent to finish the last open plan step".to_string()
-            ),
+            // What was sent, verbatim.
+            (TurnRole::Continuation, continuation),
             (TurnRole::Agent, String::new()),
         ]
     );
