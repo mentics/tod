@@ -117,7 +117,7 @@ Nothing else may contain behavioral policy.
 | Block | Used by | Says |
 |---|---|---|
 | `stance/interactive-chat.md` | 2, 11 | Side panel chat with a human. Keep replies short. The selection's text is inlined — don't shell out for what you were given. |
-| `stance/autonomous-session.md` | 3, 5, 6 | No human is waiting. Act directly, don't ask permission, be as verbose as the work needs. Report what you did. |
+| `stance/autonomous-session.md` | 3, 5, 6 | Work autonomously; questions go unanswered until the turn ends. Act directly, don't ask permission, be as verbose as the work needs. Report what you did unless the surface says otherwise. |
 | `stance/one-shot.md` | 4 | Single turn, no follow-up. If you can't decide, say so in the structured reply rather than asking a question. |
 | `stance/agent-to-agent.md` | 7, 8 | Your counterpart is an agent, your input is a snapshot, your output is parsed. No conversational filler. |
 

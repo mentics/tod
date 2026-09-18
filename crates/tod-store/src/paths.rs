@@ -46,50 +46,31 @@ pub fn clear_data_root_override() {
     *DATA_ROOT_OVERRIDE.write().expect("data root override lock") = None;
 }
 
-/// Resolved paths for durable tod data and git checkout discovery.
+/// Resolved paths for durable tod data.
 #[derive(Debug, Clone)]
 pub struct TodPaths {
-    /// Git checkout root (`assets/process/`, source tree). Independent of data root.
-    git_repo_root: PathBuf,
     /// Durable state root (`tod.db`, `tod.yml`, …).
     data_root: PathBuf,
     config_dir: PathBuf,
 }
 
 impl TodPaths {
-    /// Resolve git checkout and configured data root.
+    /// Resolve the configured data root.
     pub fn discover() -> Result<Self> {
-        let start = std::env::current_dir().context("failed to read current directory")?;
-        let git_repo_root = find_repo_root(&start).unwrap_or(start);
         let data_root = DATA_ROOT_OVERRIDE
             .read()
             .expect("data root override lock")
             .clone()
             .context("data root is not configured")?;
-        Ok(Self::new(git_repo_root, data_root))
+        Ok(Self::new(data_root))
     }
 
-    pub fn from_repo_root(git_repo_root: PathBuf) -> Result<Self> {
-        let data_root = DATA_ROOT_OVERRIDE
-            .read()
-            .expect("data root override lock")
-            .clone()
-            .context("data root is not configured")?;
-        Ok(Self::new(git_repo_root, data_root))
-    }
-
-    fn new(git_repo_root: PathBuf, data_root: PathBuf) -> Self {
+    fn new(data_root: PathBuf) -> Self {
         let config_dir = data_root.clone();
         Self {
-            git_repo_root,
             data_root,
             config_dir,
         }
-    }
-
-    /// Git checkout root (for `assets/process/` and other repo files).
-    pub fn repo_root(&self) -> &Path {
-        &self.git_repo_root
     }
 
     /// Durable state root (`tod.db`, logs, scratchpads).
@@ -156,24 +137,22 @@ impl TodPaths {
     }
 }
 
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start.to_path_buf();
-    loop {
-        if dir.join(".git").is_dir() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The data-root override is process-wide, and tests run in parallel:
+    /// every test that sets or clears it holds this for its duration.
+    static OVERRIDE: Mutex<()> = Mutex::new(());
+
+    fn hold_override() -> MutexGuard<'static, ()> {
+        OVERRIDE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn paths_are_flat_under_data_root() {
+        let _override = hold_override();
         let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
@@ -187,6 +166,7 @@ mod tests {
 
     #[test]
     fn discover_honors_data_root_override() {
+        let _override = hold_override();
         let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
         set_data_root(root.clone());
         let paths = TodPaths::discover().unwrap();
@@ -195,20 +175,8 @@ mod tests {
     }
 
     #[test]
-    fn repo_root_stays_checkout_when_data_root_overridden() {
-        let root = std::env::temp_dir().join(format!("tod-paths-{}", uuid::Uuid::new_v4()));
-        set_data_root(root);
-        let paths = TodPaths::discover().unwrap();
-        assert!(
-            paths.repo_root().join("doc").join("process").is_dir()
-                || paths.repo_root().join("assets").join("process").is_dir(),
-            "repo_root should remain the git checkout, not data root"
-        );
-        clear_data_root_override();
-    }
-
-    #[test]
     fn discover_fails_without_data_root() {
+        let _override = hold_override();
         clear_data_root_override();
         assert!(TodPaths::discover().is_err());
     }
