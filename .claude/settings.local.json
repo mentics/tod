@@ -187,7 +187,19 @@
       "Bash(for id in e61f28d1 38552b29 73c0107d b3d27294 5299923e f6d802ba 914aa8b3 1b6df491 530701c8 08303bfe)",
       "Bash(\"/c/data/git/tod/target/dev-fast/tod-cli.exe\" drafting buildable --node c01b1570-3516-468b-8db7-9fe38adfff4a --outcome pass --detail \"All Linear adapter requirements consolidated into a buildable spec. Filter discovery \\(introspection\\), configuration \\(form structure, presets, validation\\), field mapping, reconciliation \\(algorithm, greyed-out state\\), error handling, and UI \\(detail view, refresh states\\) are completely specified. A competent implementer with the inherited context and codebase can build the Linear data-source adapter correctly from these obligations.\" --data-root /c/data/git/tod/.local/data)",
       "Bash(C:\\\\data\\\\git\\\\tod\\\\target\\\\dev-fast\\\\tod-cli.exe:*)",
-      "Bash(/c/data/git/tod/target/dev-fast/tod-cli.exe:*)"
+      "Bash(/c/data/git/tod/target/dev-fast/tod-cli.exe:*)",
+      "Bash(find:*)",
+      "Bash(cargo test:*)",
+      "Bash(target/debug/tod-cli:*)",
+      "Bash(cargo run:*)",
+      "Bash(git fetch:*)",
+      "Bash(git merge:*)",
+      "Bash(git stash push:*)",
+      "Bash(git add:*)",
+      "Bash(for id in 199468e9 4e1e3487 5c0efd6e f875c359)",
+      "Bash(do cargo run -p tod-cli --quiet -- --data-root \"C:\\\\data\\\\git\\\\tod\\\\.local\\\\data\" plan update $id --status implemented)",
+      "Bash(for id in 5d91fe38 ee57b001 401f28a7)",
+      "Bash(for id in 13941988 118b90a8 8decf8c1 36a833a4 5a390256 64411b25 45d406c6 828fd9b5)"
     ]
   }
 }

@@ -15,6 +15,11 @@ pub struct DataSourceItem {
     pub tags: Vec<String>,
     /// Body text (description, details). May contain markdown.
     pub body: String,
+    /// Optional metadata (priority, state, assignee, etc.) as JSON value.
+    /// Data sources store display-ready strings here; the generator framework
+    /// treats this as opaque and passes it through to managed nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     /// Child items, forming a tree structure (e.g. sub-issues).
     pub children: Vec<DataSourceItem>,
 }

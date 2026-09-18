@@ -30,8 +30,22 @@ pub const CREDENTIAL_LINEAR_API_KEY: &str = "linear_api_key";
 
 /// Resolve a data source implementation by its persisted `data_source_type`.
 pub fn data_source_for_type(data_source_type: &str) -> Option<Box<dyn DataSource>> {
+    data_source_for_type_with_root(data_source_type, None)
+}
+
+/// Resolve a data source implementation with an optional data root for caching.
+pub fn data_source_for_type_with_root(
+    data_source_type: &str,
+    data_root: Option<&std::path::Path>,
+) -> Option<Box<dyn DataSource>> {
     match data_source_type {
-        DATA_SOURCE_LINEAR => Some(Box::new(LinearDataSource::new())),
+        DATA_SOURCE_LINEAR => {
+            if let Some(root) = data_root {
+                Some(Box::new(LinearDataSource::with_data_root(root.to_path_buf())))
+            } else {
+                Some(Box::new(LinearDataSource::new()))
+            }
+        }
         DATA_SOURCE_MOCK => Some(Box::new(MockDataSource::new())),
         _ => None,
     }
@@ -253,13 +267,15 @@ pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>,
             "node has no generator configuration".into(),
         ));
     };
-    let data_source = data_source_for_type(&config.data_source_type).ok_or_else(|| {
-        RefreshError::Other(format!(
-            "unknown data source type: {}",
-            config.data_source_type
-        ))
-    })?;
-    let credentials = resolve_credentials(fleet.paths().root(), data_source.as_ref());
+    let data_root = fleet.paths().root();
+    let data_source = data_source_for_type_with_root(&config.data_source_type, Some(data_root))
+        .ok_or_else(|| {
+            RefreshError::Other(format!(
+                "unknown data source type: {}",
+                config.data_source_type
+            ))
+        })?;
+    let credentials = resolve_credentials(data_root, data_source.as_ref());
 
     let missing = missing_credentials(data_source.as_ref(), &credentials);
     if !missing.is_empty() {
@@ -685,6 +701,7 @@ mod tests {
             title: title.into(),
             tags: vec![],
             body: String::new(),
+            metadata: None,
             children,
         }
     }

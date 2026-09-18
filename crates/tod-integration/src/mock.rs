@@ -139,6 +139,7 @@ mod tests {
             title: "Test item".into(),
             tags: vec!["tag1".into()],
             body: "body".into(),
+            metadata: None,
             children: vec![],
         }]);
         let result = ds
@@ -173,6 +174,7 @@ mod tests {
             title: "First".into(),
             tags: vec![],
             body: "".into(),
+            metadata: None,
             children: vec![],
         }]);
         let r1 = ds.fetch(&serde_json::json!({}), &HashMap::new()).unwrap();
@@ -184,6 +186,7 @@ mod tests {
                 title: "First (updated)".into(),
                 tags: vec![],
                 body: "".into(),
+                metadata: None,
                 children: vec![],
             },
             DataSourceItem {
@@ -191,6 +194,7 @@ mod tests {
                 title: "Second".into(),
                 tags: vec![],
                 body: "".into(),
+                metadata: None,
                 children: vec![],
             },
         ]);
