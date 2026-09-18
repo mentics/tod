@@ -30,7 +30,7 @@ use crate::views::visual_design_panel::register_visual_design_panel_keyboard_bin
 use gpui::*;
 
 pub use history_window::HistoryWindowControl;
-pub use interactive_agent_window::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
+pub use interactive_agent_window::InteractiveAgentWindowControl;
 pub use window::{open, open_data_root_setup};
 
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {

@@ -2,8 +2,8 @@
 
 use super::change_set::{DisplayRow, Tab, display_rows, tab_counts};
 use super::keyboard::*;
-use crate::ui::agent_conversation::PanelStop;
 use super::*;
+use crate::ui::agent_conversation::PanelStop;
 use crate::views::rows::fixture::Fixture;
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::Root;

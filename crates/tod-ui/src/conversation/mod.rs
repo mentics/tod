@@ -14,11 +14,11 @@
 //! (`ui::key_context`).
 
 mod change_set;
-mod side_pane;
 mod context_panel;
 mod header;
 mod keyboard;
 mod nav;
+mod side_pane;
 mod transcript;
 
 #[cfg(test)]
@@ -50,6 +50,7 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use keyboard::*;
 use nav::NavMenu;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
@@ -60,7 +61,6 @@ use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
     ProtocolKind, Turn, net_changes,
 };
-use std::path::PathBuf;
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
@@ -649,9 +649,7 @@ impl ConversationView {
         if let Some(turns) = loop_turns {
             self.loop_turns = turns;
         }
-        let want_files = finished
-            .then(|| self.implementation_worktree())
-            .flatten();
+        let want_files = finished.then(|| self.implementation_worktree()).flatten();
         let current = self
             .current_driver()
             .map(|d| d.status())
@@ -751,7 +749,10 @@ impl ConversationView {
                 .map(|(node, title)| Crumb { node, title })
                 .collect();
             let protocol = match id {
-                Some(id) => repo.get(id)?.map(|c| c.protocol).unwrap_or(fallback_protocol),
+                Some(id) => repo
+                    .get(id)?
+                    .map(|c| c.protocol)
+                    .unwrap_or(fallback_protocol),
                 None => fallback_protocol,
             };
             // Only the protocols whose side pane shows them pay for these.

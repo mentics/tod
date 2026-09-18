@@ -472,9 +472,11 @@ impl ConversationDriver {
         correction: String,
         events: &mut Vec<ConversationEvent>,
     ) -> Result<()> {
-        let note = format!("The agent's reply did not match the protocol: {reason}
+        let note = format!(
+            "The agent's reply did not match the protocol: {reason}
 
-{raw}");
+{raw}"
+        );
         self.append(fleet, id, TurnRole::Error, &note)?;
         if self.corrections == 0 {
             self.corrections += 1;
@@ -509,15 +511,7 @@ impl ConversationDriver {
         })?;
         let live = agent.session_id(&Self::session_key(id)).is_some();
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
-        self.start(
-            fleet,
-            agent,
-            &conversation,
-            last_seq,
-            None,
-            message,
-            resume,
-        )
+        self.start(fleet, agent, &conversation, last_seq, None, message, resume)
     }
 
     fn ensure_row(&mut self, fleet: &FleetStore) -> Result<Uuid> {
@@ -708,7 +702,6 @@ impl ConversationDriver {
         self.reported_stale = reported;
         result
     }
-
 }
 
 /// The delta (if any), then the user's message.

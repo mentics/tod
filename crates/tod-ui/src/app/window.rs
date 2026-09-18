@@ -40,10 +40,10 @@ use crate::views::visual_design_panel::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use tod_agent::EngagementState;
 use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tod_agent::EngagementState;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
@@ -1462,12 +1462,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
-                            LifecyclePanelView::new(
-                                cx,
-                                fleet.clone(),
-                                agent.clone(),
-                                paths.clone(),
-                            )
+                            LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));

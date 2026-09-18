@@ -69,10 +69,13 @@ impl ConversationView {
     }
 
     /// Bring the panel up to date and return it for the layout.
-    pub(super) fn render_transcript(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let active = self.pane == Pane::Transcript
-            && self.stop == Stop::Transcript
-            && self.picker.is_none();
+    pub(super) fn render_transcript(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active =
+            self.pane == Pane::Transcript && self.stop == Stop::Transcript && self.picker.is_none();
         let entries = self.data.turns.iter().map(entry_of).collect();
         let empty = format!(
             "No conversation about {} yet. Give direction below.",

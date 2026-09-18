@@ -6,11 +6,12 @@
 //! Agents section shows when the node resolves Agent, and the Shells and Code
 //! editors sections show when it resolves Files.
 
-use crate::app::{InteractiveAgentOpenParams, InteractiveAgentWindowControl};
+use crate::app::InteractiveAgentWindowControl;
 use crate::interview::TodPaths;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::settings::TodSettings;
 use crate::ui::actionable::chrome_control_with_shortcut;
+use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
@@ -28,6 +29,7 @@ use std::sync::Arc;
 use tod_agent::{EngagementState, SharedEngagementRegistry};
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, build_fleet_agent_prompt};
 use tod_core::session_name::session_name;
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::repos::agent_run::RUNTIME_STATUS_ACTIVE;
 use tod_store::fleet::repos::shell::ShellSession;
 use tod_store::fleet::terminal::{
@@ -80,7 +82,6 @@ pub struct ActionPanelView {
     runs: Vec<AgentRun>,
     in_flight: Vec<InFlightFleetRun>,
     shells: Vec<ShellSession>,
-    chat_sessions: Vec<AgentRun>,
     terminal_agents: Vec<AgentRun>,
     status_message: String,
     shell_poll_generation: u64,
@@ -118,7 +119,6 @@ impl ActionPanelView {
             runs: Vec::new(),
             in_flight: Vec::new(),
             shells: Vec::new(),
-            chat_sessions: Vec::new(),
             terminal_agents: Vec::new(),
             status_message: String::new(),
             shell_poll_generation: 0,
@@ -175,20 +175,6 @@ impl ActionPanelView {
             .fleet
             .list_shells_for_node(&task_id)
             .unwrap_or_default();
-        // Implementation sessions (launched from the lifecycle panel's Active
-        // "Implement" button) show up alongside ordinary chat sessions — same
-        // node, just a distinct `run_kind`.
-        let mut sessions = self
-            .fleet
-            .list_interactive_sessions_for_node(&task_id)
-            .unwrap_or_default();
-        sessions.extend(
-            self.fleet
-                .list_implementation_sessions_for_node(&task_id)
-                .unwrap_or_default(),
-        );
-        sessions.sort_by(|a, b| b.run_number.cmp(&a.run_number));
-        self.chat_sessions = sessions;
         self.terminal_agents = self
             .fleet
             .list_terminal_agent_runs_for_node(&task_id)
@@ -205,7 +191,6 @@ impl ActionPanelView {
         self.agent_capability = None;
         self.runs.clear();
         self.shells.clear();
-        self.chat_sessions.clear();
         self.terminal_agents.clear();
         self.status_message.clear();
         cx.emit(ActionPanelEvent::Close);
@@ -277,24 +262,6 @@ impl ActionPanelView {
             .as_ref()
             .map(|agent| agent.launch_options(&self.settings, role))
             .unwrap_or_else(|| self.settings.launch_options_for(role))
-    }
-
-    fn session_label(&self, session: &AgentRun) -> String {
-        if let Some(name) = session.session_name.as_deref() {
-            return name.to_string();
-        }
-        if let Some(cached) = session.cached_transcript.as_deref() {
-            if let Some(first_line) = cached.lines().find(|line| !line.trim().is_empty()) {
-                let preview: String = first_line.chars().take(48).collect();
-                let suffix = if first_line.chars().count() > 48 {
-                    "…"
-                } else {
-                    ""
-                };
-                return format!("Session {} · {preview}{suffix}", session.run_number);
-            }
-        }
-        format!("Session {}", session.run_number)
     }
 
     fn flush_fleet(&self) -> Result<(), String> {
@@ -576,41 +543,23 @@ impl ActionPanelView {
         self.changed("Deleted run", cx);
     }
 
-    fn new_chat_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open this node's chat in the conversation view. The view's own picker
+    /// lists the node's earlier chats, so there is no session list here.
+    fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        match self
-            .interactive_window
-            .create_and_open_session(&task_id, None, None, cx)
-        {
-            Ok(_) => self.changed("Opened a new chat session", cx),
-            Err(err) => error_toast(window, cx, format!("New session failed: {err}")),
-        }
-    }
-
-    fn open_chat_session(
-        &mut self,
-        session_run_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(task_id) = self.task_id.clone() else {
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            error_toast(window, cx, format!("Not a node id: {task_id}"));
             return;
         };
-        if let Err(err) = self.interactive_window.open_session(
-            InteractiveAgentOpenParams {
-                node_id: task_id,
-                session_run_id: session_run_id.to_string(),
-                // Reopening an existing session: its agent session already holds
-                // the context it was opened with.
-                initial_context: None,
-                auto_submit_message: None,
-            },
+        window.dispatch_action(
+            Box::new(OpenConversation {
+                focus: Focus::Node(node_id),
+                protocol: ProtocolKind::Chat,
+            }),
             cx,
-        ) {
-            error_toast(window, cx, format!("Open session failed: {err}"));
-        }
+        );
     }
 
     fn launch_agent_in_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -829,45 +778,22 @@ impl ActionPanelView {
                 .text_color(muted),
         );
 
-        // Chat sessions — work without Files (they run in the data root).
-        section = section
-            .child(Self::render_subheading("Chat sessions", cx))
-            .when(self.chat_sessions.is_empty(), |col| {
-                col.child(Self::render_hint("No sessions yet.", cx))
-            })
-            .children(self.chat_sessions.iter().enumerate().map(|(idx, session)| {
-                let label = self.session_label(session);
-                let status = format_status_label(&session.id, &session.runtime_status, &engagement);
-                let session_id = session.id.clone();
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new(("action-chat-open", idx))
-                            .label(label)
-                            .small()
-                            .compact()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_chat_session(&session_id, window, cx);
-                            })),
-                    )
-                    .child(
-                        selectable_text(("action-chat-status", idx), status, window, cx)
-                            .text_xs()
-                            .text_color(muted),
-                    )
-            }))
-            .child(
-                h_flex().child(
-                    Button::new("action-chat-new")
-                        .label("New chat")
-                        .small()
-                        .compact()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.new_chat_session(window, cx);
-                        })),
-                ),
-            );
+        // Chat — a conversation about this node, with its own picker for the
+        // node's earlier chats. It needs no Files: the agent reads the project
+        // through `tod-cli` and changes nothing.
+        let chat_node = self.task_id.clone();
+        section = section.child(
+            h_flex().child(
+                Button::new("action-chat-open")
+                    .label("Chat")
+                    .small()
+                    .compact()
+                    .disabled(chat_node.is_none())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_chat(window, cx);
+                    })),
+            ),
+        );
 
         // Background runs.
         section = section

@@ -9,7 +9,10 @@
 //! calls through it. [`protocol_for`] is the registry: one match, every kind.
 //! Spec: `doc/conversation/protocols.md`.
 
-use crate::conversation::context::{ReportedStale, delta, opening, resume_snapshot};
+use crate::context_recipes::NODE_CHAT;
+use crate::conversation::context::{
+    ReportedStale, append_recent_turns, delta, opening, opening_with, resume_snapshot,
+};
 use crate::media::MediaPaths;
 use anyhow::Result;
 use serde_json::Value;
@@ -139,8 +142,10 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
     match kind {
         ProtocolKind::Outline => &OutlineProtocol,
         ProtocolKind::Implementation => &super::implement::ImplementationProtocol,
-        ProtocolKind::Chat => &PlainProtocol,
-        ProtocolKind::VisualDesign => &PlainProtocol,
+        ProtocolKind::Chat => &ChatProtocol,
+        // Until the visual designer has its own protocol and side pane, a
+        // visual-design conversation behaves as a plain chat.
+        ProtocolKind::VisualDesign => &ChatProtocol,
     }
 }
 
@@ -201,11 +206,13 @@ impl Protocol for OutlineProtocol {
     }
 }
 
-/// A conversation with no change set and no loop: the agent answers, and
-/// whatever it does it does through `tod-cli` like any other caller.
-pub struct PlainProtocol;
+/// Thinking out loud about one item: the agent reads the project and answers,
+/// and changes nothing. There is no change set, so there is nothing for the
+/// side pane to show and nothing to reverse — which is why `surface/chat`
+/// makes this surface read-only.
+pub struct ChatProtocol;
 
-impl Protocol for PlainProtocol {
+impl Protocol for ChatProtocol {
     fn kind(&self) -> ProtocolKind {
         ProtocolKind::Chat
     }
@@ -214,15 +221,27 @@ impl Protocol for PlainProtocol {
         crate::session_name::CHAT_SURFACE
     }
 
+    /// An empty directory, as [`OutlineProtocol`] uses: the agent reaches the
+    /// project through `tod-cli` and has no repository to work in.
     fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
-        Ok(env.data_root.to_path_buf())
+        scratch_dir(env.data_root, "chat")
     }
 
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
-        env.fleet
-            .read(|conn| opening(conn, env.media, env.data_root, env.conversation_id))
+        env.fleet.read(|conn| {
+            opening_with(
+                conn,
+                env.media,
+                env.data_root,
+                env.conversation_id,
+                &NODE_CHAT,
+            )
+        })
     }
 
+    /// Opening context plus the tail of the transcript. Unlike
+    /// [`OutlineProtocol`] there is no change set to summarize — the turns are
+    /// the whole of what this conversation did.
     fn resume_snapshot(
         &self,
         env: &ProtocolEnv<'_>,
@@ -230,14 +249,18 @@ impl Protocol for PlainProtocol {
         before_seq: Option<i64>,
     ) -> Result<String> {
         env.fleet.read(|conn| {
-            resume_snapshot(
+            let mut out = opening_with(
                 conn,
                 env.media,
                 env.data_root,
                 env.conversation_id,
-                budget_tokens,
-                before_seq,
-            )
+                &NODE_CHAT,
+            )?;
+            out.push_str(
+                "\n\n---\n\n# Continuing a chat\n\nThis chat started in an earlier agent session. Its most recent turns are below.\n",
+            );
+            append_recent_turns(conn, env.conversation_id, budget_tokens, before_seq, &mut out)?;
+            Ok(out)
         })
     }
 }
@@ -248,4 +271,45 @@ pub(super) fn scratch_dir(data_root: &Path, name: &str) -> Result<PathBuf> {
     let dir = data_root.join("agent").join(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every kind resolves to the protocol that claims it — the one place a
+    /// new protocol can be added to the enum and forgotten in the registry.
+    /// `VisualDesign` is the exception until it has a protocol of its own: it
+    /// borrows [`ChatProtocol`], which reports itself as `Chat`.
+    #[test]
+    fn every_kind_resolves_to_its_own_protocol() {
+        for kind in [
+            ProtocolKind::Outline,
+            ProtocolKind::Implementation,
+            ProtocolKind::Chat,
+        ] {
+            assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");
+        }
+        assert_eq!(
+            protocol_for(ProtocolKind::VisualDesign).kind(),
+            ProtocolKind::Chat
+        );
+    }
+
+    /// The chat recipe must not hand the agent the change-set noun: there is
+    /// no change set behind a chat to read or flag.
+    #[test]
+    fn the_chat_recipe_carries_no_change_set() {
+        assert!(!NODE_CHAT.layers.contains(&"cli/changeset"));
+        assert!(NODE_CHAT.layers.contains(&"surface/chat"));
+    }
+
+    /// Chat and implementation loop differently: only implementation sends a
+    /// turn the user did not ask for.
+    #[test]
+    fn only_the_implementation_protocol_loops() {
+        assert!(!OutlineProtocol.loops());
+        assert!(!ChatProtocol.loops());
+        assert!(super::super::implement::ImplementationProtocol.loops());
+    }
 }

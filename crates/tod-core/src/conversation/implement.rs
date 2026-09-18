@@ -352,8 +352,12 @@ fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
         .unwrap_or_default()
         .into_iter()
         .map(|step| {
-            let depends_on = fleet.list_plan_step_dependencies(step.id).unwrap_or_default();
-            let satisfies = fleet.list_plan_step_obligations(step.id).unwrap_or_default();
+            let depends_on = fleet
+                .list_plan_step_dependencies(step.id)
+                .unwrap_or_default();
+            let satisfies = fleet
+                .list_plan_step_obligations(step.id)
+                .unwrap_or_default();
             PlanStepWithLinks {
                 step,
                 depends_on,
@@ -488,7 +492,10 @@ notes: |
     #[test]
     fn tolerates_a_code_fence() {
         let fenced = format!("```yaml\n{GOOD}\n```");
-        assert_eq!(parse_report(&fenced).expect("parses").status, ReportStatus::Complete);
+        assert_eq!(
+            parse_report(&fenced).expect("parses").status,
+            ReportStatus::Complete
+        );
     }
 
     #[test]
@@ -647,7 +654,12 @@ notes: |
         fn the_cap_stops_the_loop() {
             let fx = planned(2, 0);
             assert!(matches!(
-                decide(&fx, &report(ReportStatus::Working, false), CONTINUATION_CAP, true),
+                decide(
+                    &fx,
+                    &report(ReportStatus::Working, false),
+                    CONTINUATION_CAP,
+                    true
+                ),
                 Next::Done
             ));
         }

@@ -70,14 +70,12 @@ impl ConversationView {
                             .flex_shrink_0()
                             .child(step.status.clone()),
                     )
-                    .child(
-                        div().flex_1().min_w_0().child(selectable_text(
-                            format!("plan-step-{}", step.id),
-                            step.body.clone(),
-                            window,
-                            cx,
-                        )),
-                    )
+                    .child(div().flex_1().min_w_0().child(selectable_text(
+                        format!("plan-step-{}", step.id),
+                        step.body.clone(),
+                        window,
+                        cx,
+                    )))
                     .into_any_element(),
             );
         }
@@ -131,9 +129,7 @@ impl ConversationView {
                         .flex_shrink_0()
                         .child("Implementation"),
                     )
-                    .child(
-                        style::text_dense_muted(div()).child(format!("{done}/{total} steps")),
-                    )
+                    .child(style::text_dense_muted(div()).child(format!("{done}/{total} steps")))
                     .when_some(report.as_ref(), |el, report| {
                         el.child(style::badge(div()).child(test_label(report)))
                     })
@@ -155,14 +151,12 @@ impl ConversationView {
             )
             .when_some(report, |el, report| {
                 el.when(!report.summary.trim().is_empty(), |el| {
-                    el.child(
-                        style::panel_footer(div()).child(selectable_text(
-                            "implementation-summary",
-                            report.summary.clone(),
-                            window,
-                            cx,
-                        )),
-                    )
+                    el.child(style::panel_footer(div()).child(selectable_text(
+                        "implementation-summary",
+                        report.summary.clone(),
+                        window,
+                        cx,
+                    )))
                 })
             })
             .into_any_element()

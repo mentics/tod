@@ -218,7 +218,11 @@ const DONE: ConversationEvent = ConversationEvent::TurnFinished { error: None };
 fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
     assert_eq!(
         driver.conversation_id(),
         None,
@@ -280,14 +284,21 @@ fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     assert_eq!(conversation.platform.as_deref(), Some("claude"));
     assert_eq!(conversation.agent_session_id, agent.session_id(&turn.key));
     // The name the session was given is the one recorded.
-    assert_eq!(conversation.session_name.as_deref(), Some(turn.title.as_str()));
+    assert_eq!(
+        conversation.session_name.as_deref(),
+        Some(turn.title.as_str())
+    );
 }
 
 #[test]
 fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
     say(
         &mut driver,
         &fx,
@@ -371,7 +382,8 @@ fn a_session_over_budget_rotates_to_a_snapshot() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
     // Any opening already exceeds this budget.
-    let mut driver = ConversationDriver::new(config(&fx, 1), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 1), Focus::Node(fx.node), ProtocolKind::Outline);
     say(
         &mut driver,
         &fx,
@@ -427,7 +439,8 @@ fn a_session_over_budget_rotates_to_a_snapshot() {
 fn a_session_that_cannot_be_resumed_rotates_and_resends() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
     say(&mut driver, &fx, &mut agent, "ask Hello?");
     let id = driver.conversation_id().unwrap();
 
@@ -459,7 +472,8 @@ fn a_session_that_cannot_be_resumed_rotates_and_resends() {
 fn a_failed_turn_is_an_error_turn() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
     say(&mut driver, &fx, &mut agent, "ask Hi?");
     let id = driver.conversation_id().unwrap();
     // Refuse the next run outright.
@@ -491,7 +505,11 @@ fn a_failed_turn_is_an_error_turn() {
 fn an_item_changed_elsewhere_is_reported_once() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
     say(
         &mut driver,
         &fx,
@@ -527,7 +545,11 @@ fn an_item_changed_elsewhere_is_reported_once() {
 fn delta_lists_user_edits_and_is_empty_without_them() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
     say(
         &mut driver,
         &fx,
@@ -576,7 +598,8 @@ fn net_changes_first(fx: &Fixture, id: Uuid) -> Uuid {
 fn the_mock_carries_out_every_directive() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Project, ProtocolKind::Outline);
     let root = slug(&fx);
     say(
         &mut driver,
@@ -734,7 +757,11 @@ fn the_focus_block_describes_each_kind() {
 fn a_reply_keeps_its_parts_and_its_body_is_the_answer() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);
-    let mut driver = ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Outline);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
     let message = format!(
         "think Which node?\nadd obligation {}: Passwords are hashed.\nask Anything else?",
         slug(&fx)

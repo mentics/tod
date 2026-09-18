@@ -36,11 +36,10 @@
 //! advance and Revert both require a confirming second click
 //! (`GateCheckState::force_advance_armed` / `revert_armed`).
 
-use crate::ui::agent_chat::OpenConversation;
-use tod_store::conversation::{Focus, ProtocolKind};
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::chrome_control_with_shortcut;
+use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
@@ -65,6 +64,7 @@ use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::{FleetStore, resolve_launch_cwd};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
