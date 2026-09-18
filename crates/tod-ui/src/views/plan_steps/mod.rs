@@ -398,7 +398,7 @@ impl PlanStepsView {
             return;
         };
         cx.stop_propagation();
-        window.dispatch_action(Box::new(OpenConversation { focus }), cx);
+        window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
     }
 
     /// The conversation Ctrl+J opens here: the selected step, or the node

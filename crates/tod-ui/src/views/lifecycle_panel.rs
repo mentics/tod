@@ -36,10 +36,10 @@
 //! advance and Revert both require a confirming second click
 //! (`GateCheckState::force_advance_armed` / `revert_armed`).
 
-use crate::app::InteractiveAgentWindowControl;
 use crate::interview::agent::{AgentRunState, RunId, SharedAgent};
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::chrome_control_with_shortcut;
+use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
@@ -64,6 +64,7 @@ use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::{FleetStore, resolve_launch_cwd};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
@@ -170,7 +171,6 @@ pub struct LifecyclePanelView {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
     paths: TodPaths,
-    interactive_window: InteractiveAgentWindowControl,
     task_id: Option<String>,
     title: String,
     lifecycle: String,
@@ -192,7 +192,6 @@ impl LifecyclePanelView {
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
         paths: TodPaths,
-        interactive_window: InteractiveAgentWindowControl,
     ) -> Self {
         let poll_entity = cx.weak_entity();
         let _poll_task = cx.spawn(async move |_, cx| {
@@ -213,7 +212,6 @@ impl LifecyclePanelView {
             fleet,
             agent,
             paths,
-            interactive_window,
             task_id: None,
             title: String::new(),
             lifecycle: String::new(),
@@ -573,22 +571,16 @@ impl LifecyclePanelView {
             .map(|run| run.id)
     }
 
-    /// Launch (or, if one is already live, report) the node's
-    /// `implementation`-kind session — see `crate::app::InteractiveAgentWindowControl::
-    /// create_and_open_implementation_session`. Assembles the initial context
-    /// (plan + full obligation hierarchy) via `tod_core::agent_context` and
-    /// sends it with the session's first turn, same mechanism as any other
-    /// in-window agent chat.
-    fn launch_implementation(&mut self, cx: &mut Context<Self>) {
+    /// Open the node's implementation conversation — one per node, reopened
+    /// however many times this is pressed. The conversation view runs it
+    /// under the implementation protocol: the agent works in the node's
+    /// worktree, its replies are read as reports, and the app keeps sending
+    /// it back to the remaining plan steps until the plan is done. See
+    /// `doc/conversation/protocols.md`.
+    fn launch_implementation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        if let Some(run_id) = self.implementation_run_live() {
-            self.implement_status
-                .insert(task_id, format!("Already implementing ({run_id})."));
-            cx.notify();
-            return;
-        }
         if let Err(reason) = self.implement_directory() {
             self.implement_status.insert(task_id, reason);
             cx.notify();
@@ -597,99 +589,26 @@ impl LifecyclePanelView {
         let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
             return;
         };
-
-        let build = (|| -> anyhow::Result<String> {
-            let node = self
-                .fleet
-                .get_node(&task_id)?
-                .ok_or_else(|| anyhow::anyhow!("node not found"))?;
-            let body = self
-                .fleet
-                .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
-                .ok()
-                .flatten();
-            let plan_steps = self
-                .fleet
-                .list_plan_steps_for_node(node_id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|step| {
-                    let depends_on = self
-                        .fleet
-                        .list_plan_step_dependencies(step.id)
-                        .unwrap_or_default();
-                    let satisfies = self
-                        .fleet
-                        .list_plan_step_obligations(step.id)
-                        .unwrap_or_default();
-                    PlanStepWithLinks {
-                        step,
-                        depends_on,
-                        satisfies,
-                    }
-                })
-                .collect();
-            let obligations = self
-                .fleet
-                .list_obligations_for_node(node_id)
-                .unwrap_or_default();
-            let ancestor_context = self
-                .fleet
-                .read(|conn| {
-                    tod_core::node_context::render_inherited_context(
-                        conn,
-                        &NodeRepo::new(conn),
-                        node_id,
-                        None,
-                    )
-                })
-                .unwrap_or_default();
-            let media = tod_core::media::MediaPaths::discover()?;
-            tod_core::agent_context::build_implement_message(
-                &media,
-                &tod_core::agent_context::ImplementRequest {
-                    data_root: self.paths.data_root(),
-                    node: tod_core::agent_context::NodeSelection {
-                        id: node_id,
-                        slug: Some(node.slug.clone()),
-                        title: node.title,
-                        body,
-                        lifecycle: Some(self.lifecycle.clone()),
-                    },
-                    plan_steps,
-                    obligations,
-                    ancestor_context,
-                },
-            )
-        })();
-
-        match build {
-            Ok(context) => {
-                match self
-                    .interactive_window
-                    .create_and_open_implementation_session(
-                        &task_id,
-                        tod_core::agent_context::IMPLEMENT_SURFACE_KEY,
-                        context,
-                        cx,
-                    ) {
-                    Ok(run_id) => {
-                        self.implement_status
-                            .insert(task_id, format!("Implementing ({run_id})."));
-                    }
-                    Err(err) => {
-                        self.implement_status
-                            .insert(task_id, format!("Launch implementation failed: {err}"));
-                    }
-                }
-            }
-            Err(err) => {
-                self.implement_status.insert(
-                    task_id,
-                    format!("Failed to assemble implementation context: {err:#}"),
-                );
-            }
+        // The done-signal is "no plan step still open", so a node with no
+        // plan has nothing to drive the loop. The lifecycle gate is meant to
+        // guarantee one by `ready`; nothing stops a plan being emptied after.
+        if !tod_core::conversation::implement::has_plan_steps(&self.fleet, node_id) {
+            self.implement_status.insert(
+                task_id,
+                "This node has no plan steps. Add a plan before implementing.".to_string(),
+            );
+            cx.notify();
+            return;
         }
+        self.implement_status.remove(&task_id);
+        window.dispatch_action(
+            Box::new(OpenConversation {
+                focus: Focus::Node(node_id),
+                protocol: ProtocolKind::Implementation,
+                start: true,
+            }),
+            cx,
+        );
         cx.notify();
     }
 
@@ -1581,30 +1500,27 @@ impl Render for LifecyclePanelView {
                 } else {
                     "Implement"
                 };
-                body =
-                    body.child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .items_center()
-                            .child(div().flex_1().text_xs().text_color(muted).child(
-                                selectable_text(
-                                    "lifecycle-panel-implement-detail",
-                                    detail,
-                                    window,
-                                    cx,
-                                ),
-                            ))
-                            .child(
-                                Button::new("lifecycle-panel-implement")
-                                    .label(label)
-                                    .ghost()
-                                    .disabled(blocked || live_run.is_some())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.launch_implementation(cx);
-                                    })),
-                            ),
-                    );
+                body = body.child(
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .items_center()
+                        // `min_w_0` so a long directory wraps instead of
+                        // pushing the button out of the panel.
+                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
+                            selectable_text("lifecycle-panel-implement-detail", detail, window, cx),
+                        ))
+                        .child(
+                            Button::new("lifecycle-panel-implement")
+                                .label(label)
+                                .ghost()
+                                .flex_shrink_0()
+                                .disabled(blocked)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.launch_implementation(window, cx);
+                                })),
+                        ),
+                );
                 if let Some(status) = implement_status {
                     body = body.child(div().text_xs().text_color(muted).child(selectable_text(
                         "lifecycle-panel-implement-status",

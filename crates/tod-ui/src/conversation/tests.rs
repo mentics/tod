@@ -2,8 +2,8 @@
 
 use super::change_set::{DisplayRow, Tab, display_rows, tab_counts};
 use super::keyboard::*;
-use crate::ui::agent_conversation::PanelStop;
 use super::*;
+use crate::ui::agent_conversation::PanelStop;
 use crate::views::rows::fixture::Fixture;
 use gpui::{TestAppContext, VisualTestContext};
 use gpui_component::Root;
@@ -59,6 +59,7 @@ fn create_conversation(fixture: &Fixture, focus: Focus) -> Uuid {
             ACTOR_USER,
             InterviewCommand::CreateConversation {
                 id,
+                protocol: tod_store::conversation::ProtocolKind::Outline,
                 focus,
                 platform: None,
                 model: None,
@@ -1269,4 +1270,95 @@ fn display_title_is_one_line_and_bounded() {
         ..item(None)
     };
     assert_eq!(display_title(&node_focus), "Auth");
+}
+
+#[gpui::test]
+fn the_picker_offers_implementation_only_on_an_active_planned_node(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.data.new_kinds,
+            vec![ProtocolKind::Outline, ProtocolKind::Chat]
+        );
+    });
+
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::SetLifecycle {
+            node_id: fixture.node_id,
+            state: "active".into(),
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    view.update_in(cx, |view, window, cx| view.open(node, false, window, cx));
+    draw(cx);
+    let implementation_ix = view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.data.new_kinds,
+            vec![
+                ProtocolKind::Outline,
+                ProtocolKind::Chat,
+                ProtocolKind::Implementation
+            ]
+        );
+        view.data.conversations.len() + 2
+    });
+
+    // Choosing it starts an unsaved implementation conversation, whose side
+    // pane is the plan and whose input offers the starter message unsent.
+    view.update_in(cx, |view, window, cx| {
+        view.choose_picker_entry(implementation_ix, window, cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.conversation_id(), None);
+        assert_eq!(view.data.protocol, ProtocolKind::Implementation);
+        assert_eq!(view.data.plan.len(), fixture.steps.len());
+        assert!(view.data.turns.is_empty());
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "Implement the plan.");
+    });
+
+    // An outline conversation has no starter: its input stays empty.
+    let outline_ix = view.read_with(cx, |view, _| view.data.conversations.len());
+    view.update_in(cx, |view, window, cx| {
+        view.choose_picker_entry(outline_ix, window, cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.data.protocol, ProtocolKind::Outline);
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "");
+    });
+}
+
+#[gpui::test]
+fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Implementation, false, window, cx)
+    });
+    draw(cx);
+    let steps = fixture.steps.len();
+    assert!(steps >= 2, "the fixture has a plan to walk");
+    view.update_in(cx, |view, window, cx| {
+        view.focus_pane(Pane::ChangeSet, window, cx)
+    });
+
+    cx.dispatch_action(ConversationDown);
+    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(0));
+    cx.dispatch_action(ConversationDown);
+    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(1));
+    for _ in 0..steps + 3 {
+        cx.dispatch_action(ConversationDown);
+    }
+    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(steps - 1));
+    cx.dispatch_action(ConversationUp);
+    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(steps - 2));
+    // The change set's own cursor is untouched.
+    assert_eq!(view.read_with(cx, |v, _| v.cursor), None);
 }

@@ -11,7 +11,7 @@ use uuid::Uuid;
 const OPENING_WORDS: usize = 8;
 
 const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
-     session_name, platform, model, effort, created_at, updated_at";
+     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id";
 
 const ACTION_COLUMNS: &str = "id, conversation_id, turn_seq, actor, kind, entity, entity_id, \
      node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
@@ -28,11 +28,12 @@ impl<'a> ConversationRepo<'a> {
     pub fn create(
         &self,
         focus: Focus,
+        protocol: ProtocolKind,
         platform: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
     ) -> Result<Conversation> {
-        self.create_with_id(Uuid::new_v4(), focus, platform, model, effort)
+        self.create_with_id(Uuid::new_v4(), focus, protocol, platform, model, effort)
     }
 
     /// [`Self::create`] with a caller-chosen id.
@@ -40,6 +41,7 @@ impl<'a> ConversationRepo<'a> {
         &self,
         id: Uuid,
         focus: Focus,
+        protocol: ProtocolKind,
         platform: Option<&str>,
         model: Option<&str>,
         effort: Option<&str>,
@@ -47,8 +49,9 @@ impl<'a> ConversationRepo<'a> {
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO conversations
-             (id, focus_kind, focus_id, focus_node_id, platform, model, effort, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+             (id, focus_kind, focus_id, focus_node_id, platform, model, effort, protocol,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 uuid_to_blob(id),
                 focus.kind_str(),
@@ -57,10 +60,91 @@ impl<'a> ConversationRepo<'a> {
                 platform,
                 model,
                 effort,
+                protocol.as_str(),
                 now
             ],
         )?;
         self.get(id)?.context("conversation vanished after insert")
+    }
+
+    /// The focus's most recently updated conversation running `protocol` —
+    /// how a protocol with one conversation per focus (implementation) finds
+    /// the one to reopen.
+    pub fn latest_for_focus_with_protocol(
+        &self,
+        focus: Focus,
+        protocol: ProtocolKind,
+    ) -> Result<Option<Conversation>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {CONVERSATION_COLUMNS} FROM conversations
+                     WHERE focus_kind = ?1 AND focus_id IS ?2 AND protocol = ?3
+                     ORDER BY updated_at DESC, created_at DESC
+                     LIMIT 1"
+                ),
+                params![
+                    focus.kind_str(),
+                    focus.focus_id().map(uuid_to_blob),
+                    protocol.as_str()
+                ],
+                map_conversation,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Store a protocol's parsed report for a turn, replacing any earlier one.
+    pub fn set_report(
+        &self,
+        conversation_id: Uuid,
+        turn_seq: i64,
+        body: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO conversation_reports (conversation_id, turn_seq, body)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (conversation_id, turn_seq) DO UPDATE SET body = excluded.body",
+            params![uuid_to_blob(conversation_id), turn_seq, body.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The report stored for a turn, if the protocol stored one.
+    pub fn report(&self, conversation_id: Uuid, turn_seq: i64) -> Result<Option<serde_json::Value>> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM conversation_reports
+                 WHERE conversation_id = ?1 AND turn_seq = ?2",
+                params![uuid_to_blob(conversation_id), turn_seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        body.map(|body| Ok(serde_json::from_str(&body)?)).transpose()
+    }
+
+    /// The conversation's most recent report.
+    pub fn latest_report(&self, conversation_id: Uuid) -> Result<Option<serde_json::Value>> {
+        let body: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT body FROM conversation_reports
+                 WHERE conversation_id = ?1 ORDER BY turn_seq DESC LIMIT 1",
+                params![uuid_to_blob(conversation_id)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        body.map(|body| Ok(serde_json::from_str(&body)?)).transpose()
+    }
+
+    /// Point a conversation at the fleet run its agent process belongs to.
+    pub fn set_agent_run(&self, id: Uuid, agent_run_id: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET agent_run_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![uuid_to_blob(id), agent_run_id, now_ms()],
+        )?;
+        Ok(())
     }
 
     pub fn get(&self, id: Uuid) -> Result<Option<Conversation>> {
@@ -330,10 +414,14 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
     let effort = row.get(8)?;
     let created_at = row.get(9)?;
     let updated_at = row.get(10)?;
-    Ok(
-        Focus::from_columns(&kind, focus_id, focus_node).map(|focus| Conversation {
+    let protocol: String = row.get(11)?;
+    let agent_run_id = row.get(12)?;
+    Ok(Focus::from_columns(&kind, focus_id, focus_node).and_then(|focus| {
+        Ok(Conversation {
             id,
             focus,
+            protocol: ProtocolKind::parse(&protocol)?,
+            agent_run_id,
             agent_session_id,
             session_name,
             platform,
@@ -341,8 +429,8 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
             effort,
             created_at,
             updated_at,
-        }),
-    )
+        })
+    }))
 }
 
 /// An action row as read, before its text columns are parsed.

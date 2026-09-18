@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 38;
+pub const CURRENT_USER_VERSION: i32 = 39;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -289,6 +289,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v37_to_v38(conn)?;
         conn.pragma_update(None, "user_version", 38)?;
     }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 39 {
+        migrate_v38_to_v39(conn)?;
+        conn.pragma_update(None, "user_version", 39)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -571,6 +576,58 @@ fn migrate_v37_to_v38(conn: &Connection) -> Result<()> {
     if !present {
         conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN parts TEXT;")?;
     }
+    Ok(())
+}
+
+/// Conversation protocols: which protocol runs a conversation, the fleet run
+/// its agent process belongs to, the `continuation` turn role the protocol
+/// loop appends, and the parsed reports a reply-parsing protocol stores.
+/// See `doc/conversation/protocols.md`.
+fn migrate_v38_to_v39(conn: &Connection) -> Result<()> {
+    let column = |table: &str, name: &str| -> Result<bool> {
+        Ok(conn
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?
+            .exists([name])?)
+    };
+    if !column("conversations", "protocol")? {
+        conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN protocol TEXT NOT NULL DEFAULT 'outline';",
+        )?;
+    }
+    if !column("conversations", "agent_run_id")? {
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN agent_run_id TEXT;")?;
+    }
+    // `role`'s CHECK has to grow `continuation`, which means a table rebuild.
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE conversation_turns_v39 (
+            id              BLOB PRIMARY KEY,
+            conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            seq             INTEGER NOT NULL,
+            role            TEXT NOT NULL
+                CHECK (role IN ('user','agent','error','rotation','continuation')),
+            body            TEXT NOT NULL DEFAULT '',
+            parts           TEXT,
+            created_at      INTEGER NOT NULL,
+            UNIQUE (conversation_id, seq)
+        );
+        INSERT INTO conversation_turns_v39
+            (id, conversation_id, seq, role, body, parts, created_at)
+        SELECT id, conversation_id, seq, role, body, parts, created_at
+        FROM conversation_turns;
+        DROP TABLE conversation_turns;
+        ALTER TABLE conversation_turns_v39 RENAME TO conversation_turns;
+
+        CREATE TABLE IF NOT EXISTS conversation_reports (
+            conversation_id BLOB NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            turn_seq        INTEGER NOT NULL,
+            body            TEXT NOT NULL,
+            PRIMARY KEY (conversation_id, turn_seq)
+        );
+        PRAGMA foreign_keys=ON;
+        ",
+    )?;
     Ok(())
 }
 

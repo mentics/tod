@@ -39,7 +39,7 @@ fn setup() -> Fx {
     let n1 = add_node(&conn, list, None, 0, "One");
     let n2 = add_node(&conn, list, None, 1, "Two");
     let conv = ConversationRepo::new(&conn)
-        .create(Focus::Node(n1), Some("claude"), None, None)
+        .create(Focus::Node(n1), ProtocolKind::Outline, Some("claude"), None, None)
         .unwrap()
         .id;
     ConversationRepo::new(&conn)
@@ -1432,10 +1432,10 @@ fn agent_writes_record_one_action_and_other_actors_record_none() {
 fn conversations_are_listed_per_focus_and_keep_their_turns() {
     let fx = setup();
     let repo = ConversationRepo::new(&fx.conn);
-    let project = repo.create(Focus::Project, None, None, None).unwrap();
+    let project = repo.create(Focus::Project, ProtocolKind::Outline, None, None, None).unwrap();
     let o = add_obligation(&fx.conn, fx.n1, "Focus.");
     let focus = Focus::Obligation { node: fx.n1, id: o };
-    let about = repo.create(focus, None, None, None).unwrap();
+    let about = repo.create(focus, ProtocolKind::Outline, None, None, None).unwrap();
     assert_eq!(repo.get(about.id).unwrap().unwrap().focus, focus);
     assert_eq!(
         repo.latest_for_focus(Focus::Project).unwrap().unwrap().id,
@@ -1471,7 +1471,7 @@ fn conversations_are_listed_per_focus_and_keep_their_turns() {
     assert_eq!(row.session_name.as_deref(), Some("Project chat"));
 
     // The newest conversation for a focus comes first.
-    let newer = repo.create(Focus::Project, None, None, None).unwrap();
+    let newer = repo.create(Focus::Project, ProtocolKind::Outline, None, None, None).unwrap();
     fx.conn
         .execute(
             "UPDATE conversations SET updated_at = updated_at + 1000 WHERE id = ?1",

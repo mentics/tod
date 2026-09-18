@@ -1,3 +1,8 @@
+//! **Slated for deletion.** Every chat that used to open here now runs in the
+//! conversation view under a protocol; the one caller left is the visual
+//! design panel's embedded chat. Delete this file with
+//! `views/visual_design_panel.rs`. See `doc/conversation/protocols.md` §6.
+//!
 //! Interactive fleet-agent chat window — prompt in, replies out.
 
 use crate::app::InteractiveAgentWindowControl;

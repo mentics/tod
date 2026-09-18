@@ -314,8 +314,13 @@ impl AgentConversationPanel {
     }
 
     pub fn clear_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_input("", window, cx);
+    }
+
+    pub fn set_input(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.to_string();
         self.input
-            .update(cx, |input, cx| input.set_value("", window, cx));
+            .update(cx, |input, cx| input.set_value(text, window, cx));
     }
 
     // ----- chunks ------------------------------------------------------------

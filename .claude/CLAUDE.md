@@ -119,10 +119,13 @@ an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
 
-Other agent chats (the `A` key's agent chat and the visual-design chat) still use
-`InteractiveAgentWindow`. Their context is assembled by `tod_core::agent_context`
-and held until the user submits their first message — nothing reaches the agent
-before then. A chat window holds one long-lived agent session
+Implement and the action panel's Chat now run in the conversation view (see
+**Protocols** below). The one chat left on the old path is the visual-design
+panel's embedded chat, which uses `InteractiveAgentView`; it, the view, and
+`InteractiveAgentWindow` are slated for deletion once visual design is rebuilt
+as a protocol. What follows describes that old path. Its context is assembled by
+`tod_core::agent_context` and held until the user submits their first message —
+nothing reaches the agent before then. A chat window holds one long-lived agent session
 (`AgentProvider::send_session_turn`):
 the first message opens it — the context and the message go out together as one
 turn, and the session is given its name (for Claude, a `custom-title` record
@@ -211,6 +214,19 @@ transaction** (only inside `run_interview`, never the batched flush).
 deleted is hidden), `reverse_actions` applies inverse mutations and reports
 conflicts and dependents for confirmation, and user edits from the view go
 through `ConversationEdit`. Content and lifecycle mutations are not recorded.
+
+**Protocols.** A conversation's `protocol` (schema v39) decides what kind of
+conversation it is: the context recipe, the working directory, the turn
+envelope, how the reply is read, what "done" means, whether the app loops it
+without the user, and which side pane the view shows.
+`tod_core::conversation::protocol` holds the `Protocol` trait and
+`protocol_for`, the one registry; `implement.rs` is the implementation
+protocol, whose replies are structured reports and whose loop keeps sending
+the agent back to open plan steps until the plan is done and its tests are
+green. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
+"New …" entry per kind the focus can start. Adding a kind means a
+`ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
+`doc/conversation/protocols.md`.
 
 `tod_core::conversation` runs it: `driver.rs` (`ConversationDriver`: send, tick,
 resume, rotation), `context.rs` (opening message, per-turn delta, rotation

@@ -11,6 +11,7 @@ pub mod agent_traffic;
 mod cursor_acp;
 mod mock;
 pub mod platform;
+mod process_tree;
 mod provider;
 mod reply;
 mod routing;

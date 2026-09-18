@@ -11,23 +11,24 @@
 //! Nothing runs on its own: there are no automatic turns, no backoff, and no
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
-use crate::conversation::context::{
-    ReportedStale, delta, focus_selection, last_action_at, opening, resume_snapshot,
+use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
+use crate::conversation::protocol::{
+    Next, Protocol, ProtocolEnv, Reading, TurnContext, protocol_for,
 };
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
-use crate::session_name::{CONVERSATION_SURFACE, session_name};
+use crate::session_name::session_name;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
-    SessionPurpose, SessionTurn,
+    SessionTurn,
 };
 use tod_store::conversation::{
-    Conversation, ConversationRepo, Focus, ReplyPart, TurnRole, actor_for, reply_answer,
+    Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnRole, reply_answer,
 };
 use tod_store::fleet::FleetStore;
-use tod_store::interview::{ACTOR_ENV, ACTOR_USER, InterviewCommand};
+use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
 use uuid::Uuid;
 
@@ -64,6 +65,9 @@ pub enum ConversationEvent {
     /// The driver started a fresh agent session; a rotation turn is in the
     /// transcript.
     Rotated,
+    /// The protocol's loop sent another turn without the user; a continuation
+    /// turn is in the transcript and a run is still in flight.
+    Continued,
 }
 
 /// The turn in flight.
@@ -84,6 +88,16 @@ struct Run {
 pub struct ConversationDriver {
     config: ConversationConfig,
     focus: Focus,
+    /// What kind of conversation this is: context, cwd, reply reading, and
+    /// whether the app loops it without the user.
+    protocol: &'static dyn Protocol,
+    /// Turns sent without the user since the last user message.
+    continuations: u32,
+    /// Correction turns sent for the reply in flight. Reset per turn; a
+    /// second malformed reply gives up (see `read_reply`).
+    corrections: u32,
+    /// The protocol's progress fingerprint before the turn in flight started.
+    progress_before: Option<String>,
     /// `None` until the first send creates the row.
     conversation_id: Option<Uuid>,
     run: Option<Run>,
@@ -98,10 +112,14 @@ pub struct ConversationDriver {
 impl ConversationDriver {
     /// An unsaved, empty conversation about `focus`. Its row is created by
     /// the first [`Self::send`].
-    pub fn new(config: ConversationConfig, focus: Focus) -> Self {
+    pub fn new(config: ConversationConfig, focus: Focus, protocol: ProtocolKind) -> Self {
         Self {
             config,
             focus,
+            protocol: protocol_for(protocol),
+            continuations: 0,
+            corrections: 0,
+            progress_before: None,
             conversation_id: None,
             run: None,
             session_tokens: None,
@@ -121,13 +139,35 @@ impl ConversationDriver {
         let conversation = fleet
             .read(|conn| ConversationRepo::new(conn).get(conversation_id))?
             .with_context(|| format!("conversation {conversation_id} not found"))?;
-        let mut driver = Self::new(config, conversation.focus);
+        let mut driver = Self::new(config, conversation.focus, conversation.protocol);
         driver.conversation_id = Some(conversation_id);
         Ok(driver)
     }
 
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// Which protocol runs this conversation.
+    pub fn protocol(&self) -> &'static dyn Protocol {
+        self.protocol
+    }
+
+    /// Continuations sent for the user message being answered.
+    pub fn continuations(&self) -> u32 {
+        self.continuations
+    }
+
+    /// What the protocol is given about this conversation. Opens its own
+    /// reads, so never call a protocol method from inside `fleet.read`.
+    fn env<'a>(&'a self, fleet: &'a FleetStore, conversation_id: Uuid) -> ProtocolEnv<'a> {
+        ProtocolEnv {
+            fleet,
+            media: &self.config.media,
+            data_root: &self.config.data_root,
+            conversation_id,
+            focus: self.focus,
+        }
     }
 
     /// The stored conversation, once the first send created it.
@@ -205,13 +245,15 @@ impl ConversationDriver {
             Ok((conversation, prior_user_at, has_history))
         })?;
         let changes = match prior_user_at {
-            Some(at) => fleet.read(|conn| {
-                let since = last_action_at(conn, id, at)?;
-                delta(conn, id, since, &mut self.reported_stale)
-            })?,
+            Some(at) => {
+                let since = fleet.read(|conn| last_action_at(conn, id, at))?;
+                self.protocol_delta(fleet, id, since)?
+            }
             None => String::new(),
         };
         let user_seq = self.append(fleet, id, TurnRole::User, text)?;
+        // A user message ends whatever loop the previous one started.
+        self.continuations = 0;
 
         let live = agent.session_id(&key).is_some();
         let resumable = live || conversation.agent_session_id.is_some();
@@ -237,8 +279,7 @@ impl ConversationDriver {
             return self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text);
         }
         // The first turn: the opening context, then the message.
-        let context =
-            fleet.read(|conn| opening(conn, &self.config.media, &self.config.data_root, id))?;
+        let context = self.protocol.opening(&self.env(fleet, id))?;
         self.session_tokens = Some(0);
         self.start(
             fleet,
@@ -324,8 +365,7 @@ impl ConversationDriver {
                 } else {
                     reply_answer(&parts)
                 };
-                self.append_with_parts(fleet, id, TurnRole::Agent, &body, parts)?;
-                events.push(ConversationEvent::TurnFinished { error: None });
+                self.land_reply(fleet, agent, id, body, parts, events)?;
             }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
@@ -358,6 +398,122 @@ impl ConversationDriver {
         Ok(())
     }
 
+    /// Read a finished reply through the protocol, record it, and decide
+    /// whether the exchange is over or another turn goes out without the user.
+    fn land_reply(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        id: Uuid,
+        body: String,
+        parts: Vec<ReplyPart>,
+        events: &mut Vec<ConversationEvent>,
+    ) -> Result<()> {
+        match self.protocol.read_reply(&body) {
+            Reading::Malformed { reason, correction } => {
+                self.record_malformed(fleet, agent, id, &body, &reason, correction, events)
+            }
+            Reading::Accepted { body, report } => {
+                let seq = self.append_with_parts(fleet, id, TurnRole::Agent, &body, parts)?;
+                self.corrections = 0;
+                if let Some(report) = &report {
+                    fleet.interview(
+                        ACTOR_USER,
+                        InterviewCommand::SetConversationReport {
+                            conversation_id: id,
+                            turn_seq: seq,
+                            body: report.clone(),
+                        },
+                    )?;
+                }
+                let next = {
+                    let env = self.env(fleet, id);
+                    let after = self.protocol.progress(&env).ok().flatten();
+                    let progressed = match (&self.progress_before, &after) {
+                        (Some(before), Some(after)) => before != after,
+                        // Nothing to compare: never stop the loop for it.
+                        _ => true,
+                    };
+                    self.protocol.next(&TurnContext {
+                        env: &env,
+                        report: report.as_ref(),
+                        continuations: self.continuations,
+                        progressed,
+                    })?
+                };
+                match next {
+                    Next::Done => {
+                        self.continuations = 0;
+                        events.push(ConversationEvent::TurnFinished { error: None });
+                    }
+                    Next::Continue { note, message } => {
+                        self.continuations += 1;
+                        self.append(fleet, id, TurnRole::Continuation, &note)?;
+                        self.resend(fleet, agent, id, message)?;
+                        events.push(ConversationEvent::Continued);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// A reply the protocol could not read. The raw text is kept as an error
+    /// turn either way, so it can be looked at; the first one also asks the
+    /// agent to try again.
+    #[allow(clippy::too_many_arguments)]
+    fn record_malformed(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        id: Uuid,
+        raw: &str,
+        reason: &str,
+        correction: String,
+        events: &mut Vec<ConversationEvent>,
+    ) -> Result<()> {
+        let note = format!(
+            "The agent's reply did not match the protocol: {reason}
+
+{raw}"
+        );
+        self.append(fleet, id, TurnRole::Error, &note)?;
+        if self.corrections == 0 {
+            self.corrections += 1;
+            self.resend(fleet, agent, id, correction)?;
+            events.push(ConversationEvent::Continued);
+            return Ok(());
+        }
+        self.corrections = 0;
+        self.continuations = 0;
+        let message = format!("The agent's reply did not match the protocol: {reason}");
+        self.last_error = Some(message.clone());
+        events.push(ConversationEvent::TurnFinished {
+            error: Some(message),
+        });
+        Ok(())
+    }
+
+    /// Send another turn on the conversation's own session, without a user
+    /// message behind it.
+    fn resend(
+        &mut self,
+        fleet: &FleetStore,
+        agent: &mut dyn AgentProvider,
+        id: Uuid,
+        message: String,
+    ) -> Result<()> {
+        let (conversation, last_seq) = fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let conversation = repo.get(id)?.context("conversation vanished")?;
+            let last_seq = repo.turns(id)?.last().map_or(0, |t| t.seq);
+            Ok((conversation, last_seq))
+        })?;
+        let live = agent.session_id(&Self::session_key(id)).is_some();
+        let resume = conversation.agent_session_id.clone().filter(|_| !live);
+        self.start(fleet, agent, &conversation, last_seq, None, message, resume)
+    }
+
     fn ensure_row(&mut self, fleet: &FleetStore) -> Result<Uuid> {
         if let Some(id) = self.conversation_id {
             return Ok(id);
@@ -369,6 +525,7 @@ impl ConversationDriver {
             InterviewCommand::CreateConversation {
                 id,
                 focus: self.focus,
+                protocol: self.protocol.kind(),
                 platform: Some(launch.platform.label().to_lowercase()),
                 model: Some(launch.model.clone()).filter(|m| !m.is_empty()),
                 effort: Some(launch.effort.clone()).filter(|e| !e.is_empty()),
@@ -425,16 +582,9 @@ impl ConversationDriver {
             },
         )?;
         let budget = self.config.context.context_budget_tokens as i64;
-        let context = fleet.read(|conn| {
-            resume_snapshot(
-                conn,
-                &self.config.media,
-                &self.config.data_root,
-                id,
-                budget,
-                Some(user_seq),
-            )
-        })?;
+        let context =
+            self.protocol
+                .resume_snapshot(&self.env(fleet, id), budget, Some(user_seq))?;
         self.session_tokens = Some(0);
         self.start(
             fleet,
@@ -472,17 +622,26 @@ impl ConversationDriver {
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let cold_resume = resume.is_some();
+        let (cwd, turn_env, progress) = {
+            let env = self.env(fleet, id);
+            (
+                self.protocol.cwd(&env)?,
+                self.protocol.turn_env(&env),
+                self.protocol.progress(&env).ok().flatten(),
+            )
+        };
+        self.progress_before = progress;
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
             title: title.clone(),
-            cwd: self.scratch_dir()?,
+            cwd,
             options: self.config.launch.clone(),
             resume_session_id: resume,
             opening,
             message,
-            purpose: SessionPurpose::Conversation,
-            env: vec![(ACTOR_ENV.to_string(), actor_for(id))],
+            purpose: self.protocol.purpose(),
+            env: turn_env,
         });
         let handle = match handle {
             Ok(handle) => handle,
@@ -510,7 +669,7 @@ impl ConversationDriver {
     fn session_title(&self, fleet: &FleetStore) -> Result<String> {
         let focus = fleet.read(|conn| focus_selection(conn, self.focus))?;
         Ok(session_name(
-            Some(CONVERSATION_SURFACE),
+            Some(self.protocol.surface()),
             &focus.title,
             chrono::Local::now(),
         ))
@@ -519,13 +678,13 @@ impl ConversationDriver {
     /// The session's size when this driver did not see it grow: the opening
     /// (or the latest snapshot) plus every turn since the latest rotation.
     fn estimate_from_transcript(&self, fleet: &FleetStore, id: Uuid) -> Result<i64> {
+        let base = self.protocol.opening(&self.env(fleet, id))?;
         fleet.read(|conn| {
             let turns = ConversationRepo::new(conn).turns(id)?;
             let since = turns
                 .iter()
                 .rposition(|t| t.role == TurnRole::Rotation)
                 .map_or(0, |i| i + 1);
-            let base = opening(conn, &self.config.media, &self.config.data_root, id)?;
             Ok(estimate_tokens(&base)
                 + turns[since..]
                     .iter()
@@ -534,12 +693,14 @@ impl ConversationDriver {
         })
     }
 
-    /// An empty directory: the agent works on the project through `tod-cli`
-    /// and needs nothing from a repository.
-    fn scratch_dir(&self) -> Result<PathBuf> {
-        let dir = self.config.data_root.join("agent").join("conversation");
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        Ok(dir)
+    /// The protocol's delta, with `reported_stale` lent to it.
+    fn protocol_delta(&mut self, fleet: &FleetStore, id: Uuid, since: i64) -> Result<String> {
+        let mut reported = std::mem::take(&mut self.reported_stale);
+        let result = self
+            .protocol
+            .delta(&self.env(fleet, id), since, &mut reported);
+        self.reported_stale = reported;
+        result
     }
 }
 

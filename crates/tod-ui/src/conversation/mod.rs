@@ -18,7 +18,28 @@ mod context_panel;
 mod header;
 mod keyboard;
 mod nav;
+mod side_pane;
 mod transcript;
+
+/// What the picker offers to start on `focus`. An outline conversation and a
+/// chat work anywhere; an implementation conversation needs a node that is
+/// `active` and has a plan to work through — the same conditions the lifecycle
+/// panel's Implement checks. Visual design is not offered until its protocol
+/// exists.
+fn new_kinds(
+    conn: &rusqlite::Connection,
+    node: Option<Uuid>,
+    focus: Focus,
+) -> anyhow::Result<Vec<ProtocolKind>> {
+    let mut kinds = vec![ProtocolKind::Outline, ProtocolKind::Chat];
+    if let (Focus::Node(_), Some(node)) = (focus, node) {
+        let active = NodeRepo::new(conn).get_lifecycle(node)?.as_deref() == Some("active");
+        if active && !PlanStepRepo::new(conn).list_for_node(node)?.is_empty() {
+            kinds.push(ProtocolKind::Implementation);
+        }
+    }
+    Ok(kinds)
+}
 
 #[cfg(test)]
 mod tests;
@@ -49,19 +70,21 @@ use gpui_component::resizable::{h_resizable, resizable_panel};
 use keyboard::*;
 use nav::NavMenu;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{
-    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
+    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, protocol_for,
 };
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
-    Turn, net_changes,
+    ProtocolKind, Turn, net_changes,
 };
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
-use tod_store::outline::repos::NodeRepo;
+use tod_store::outline::PlanStep;
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -227,6 +250,14 @@ pub(crate) struct Snapshot {
     pub changes: Vec<NetChange>,
     /// Titles of the nodes the changes live on.
     pub node_titles: HashMap<Uuid, String>,
+    /// Which protocol runs the open conversation.
+    pub protocol: ProtocolKind,
+    /// The focus node's plan steps, for protocols whose side pane shows them.
+    pub plan: Vec<PlanStep>,
+    /// The latest report a reply-parsing protocol stored.
+    pub report: Option<serde_json::Value>,
+    /// The kinds of conversation the picker offers to start on this focus.
+    pub new_kinds: Vec<ProtocolKind>,
 }
 
 /// An underline tab bar whose underline moves in the same frame as the
@@ -273,6 +304,20 @@ pub struct ConversationView {
     picker: Option<usize>,
     /// The header's drill-down into the focused item's children, when open.
     nav: Option<NavMenu>,
+
+    /// The protocol a conversation opened from here runs. A stored
+    /// conversation carries its own; this is what a new one gets.
+    protocol: ProtocolKind,
+    /// Files the implementation protocol's worktree has changed, refreshed
+    /// off the main thread when a turn ends.
+    side_files: Vec<String>,
+    /// Turns the protocol's loop has sent since the last user message.
+    loop_turns: u32,
+    /// The highlighted row of a side pane other than the change set: plan
+    /// steps first, then changed files.
+    side_cursor: Option<usize>,
+    side_scroll: ScrollHandle,
+    side_scroll_pending: bool,
 
     tab: Tab,
     cursor: Option<ChangeKey>,
@@ -333,13 +378,32 @@ impl ConversationView {
                 if committed {
                     idle = 0;
                 }
-                let Ok(()) = this.update(cx, |this, cx| {
-                    if this.poll(committed) {
+                let Ok(want_files) = this.update(cx, |this, cx| {
+                    let (changed, want_files) = this.poll(committed);
+                    if changed {
                         cx.notify();
                     }
+                    want_files
                 }) else {
                     break;
                 };
+                // Reading the worktree spawns `git`, so it happens here — on
+                // the background executor, between polls — never in `poll`
+                // itself, which runs on the main thread.
+                if let Some(cwd) = want_files {
+                    let files = cx
+                        .background_executor()
+                        .spawn(async move { worktree_files(&cwd) })
+                        .await;
+                    let Ok(()) = this.update(cx, |this, cx| {
+                        if this.side_files != files {
+                            this.side_files = files;
+                            cx.notify();
+                        }
+                    }) else {
+                        break;
+                    };
+                }
             }
         });
         let context = ContextPanel::new(fleet.clone(), window, cx);
@@ -362,6 +426,9 @@ impl ConversationView {
             _transcript_events: transcript_events,
             picker: None,
             nav: None,
+            protocol: ProtocolKind::Outline,
+            side_files: Vec::new(),
+            loop_turns: 0,
             tab: Tab::All,
             cursor: None,
             link: None,
@@ -371,6 +438,9 @@ impl ConversationView {
             edit_input,
             confirm: None,
             change_scroll: ScrollHandle::new(),
+            side_cursor: None,
+            side_scroll: ScrollHandle::new(),
+            side_scroll_pending: false,
             scroll_to_cursor: false,
             context,
             error: None,
@@ -405,9 +475,30 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_with(focus, ProtocolKind::Outline, record, window, cx);
+    }
+
+    /// [`Self::open`], on the focus's most recent conversation running
+    /// `protocol` — for `Implementation`, the node's one implementation
+    /// conversation, reopened however many times it is launched.
+    pub fn open_with(
+        &mut self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        record: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.protocol = protocol;
         let latest = self
             .fleet
-            .read(|conn| ConversationRepo::new(conn).latest_for_focus(focus))
+            .read(|conn| {
+                let repo = ConversationRepo::new(conn);
+                match protocol {
+                    ProtocolKind::Outline => repo.latest_for_focus(focus),
+                    other => repo.latest_for_focus_with_protocol(focus, other),
+                }
+            })
             .ok()
             .flatten()
             .map(|c| c.id);
@@ -439,6 +530,7 @@ impl ConversationView {
         if switching {
             self.data = Snapshot::default();
             self.cursor = None;
+            self.side_cursor = None;
             self.link = None;
             self.selected.clear();
             self.expanded.clear();
@@ -495,10 +587,27 @@ impl ConversationView {
         self.open(focus, true, window, cx);
     }
 
+    /// A fresh conversation of the current protocol. Its starter message,
+    /// when it has one, waits in the input for the user to edit or send.
     fn new_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show(self.focus, None, false, cx);
         self.pane = Pane::Transcript;
+        let starter = protocol_for(self.protocol).starter().unwrap_or_default();
+        self.transcript
+            .update(cx, |panel, cx| panel.set_input(starter, window, cx));
         self.enter_input_edit(window, cx);
+    }
+
+    /// Send the open conversation's starter message, unless its protocol has
+    /// none or the agent is already working on it.
+    pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(starter) = protocol_for(self.protocol).starter() else {
+            return;
+        };
+        if self.current_driver().is_some_and(|d| d.status().running) {
+            return;
+        }
+        self.send(starter, window, cx);
     }
 
     // ----- drivers and data ----------------------------------------------
@@ -538,7 +647,7 @@ impl ConversationView {
             Some(id) => {
                 ConversationDriver::open(config, &self.fleet, id).map_err(|e| format!("{e:#}"))?
             }
-            None => ConversationDriver::new(config, self.focus),
+            None => ConversationDriver::new(config, self.focus, self.protocol),
         };
         self.drivers.push(driver);
         Ok(self.drivers.len() - 1)
@@ -557,20 +666,38 @@ impl ConversationView {
     }
 
     /// Advance the drivers, and reload when the store changed. Returns
-    /// whether anything visible changed.
-    fn poll(&mut self, committed: bool) -> bool {
+    /// whether anything visible changed, and the worktree to re-read the
+    /// changed files from (the caller does that off the main thread).
+    fn poll(&mut self, committed: bool) -> (bool, Option<PathBuf>) {
         let mut finished = false;
         let mut current_error = None;
+        let mut loop_turns = None;
         if let Ok(mut agent) = self.agent.try_lock() {
+            let current = self.conversation_id;
             for driver in &mut self.drivers {
                 for event in driver.tick(&self.fleet, agent.as_mut()) {
                     finished = true;
-                    if let ConversationEvent::TurnFinished { error: Some(error) } = event {
-                        current_error = Some(error);
+                    match event {
+                        ConversationEvent::TurnFinished { error: Some(error) } => {
+                            current_error = Some(error);
+                        }
+                        // The loop sent another turn: nothing ended, but the
+                        // transcript has a new marker and the side pane's
+                        // counter moved.
+                        ConversationEvent::Continued
+                        | ConversationEvent::TurnFinished { error: None } => {}
+                        ConversationEvent::Rotated => {}
+                    }
+                    if driver.conversation_id() == current && current.is_some() {
+                        loop_turns = Some(driver.continuations());
                     }
                 }
             }
         }
+        if let Some(turns) = loop_turns {
+            self.loop_turns = turns;
+        }
+        let want_files = finished.then(|| self.implementation_worktree()).flatten();
         let current = self
             .current_driver()
             .map(|d| d.status())
@@ -599,13 +726,24 @@ impl ConversationView {
         if (committed || finished) && self.reload() {
             changed = true;
         }
-        changed
+        (changed, want_files)
+    }
+
+    /// The worktree an implementation conversation is running in, when that
+    /// is what is open.
+    fn implementation_worktree(&self) -> Option<PathBuf> {
+        if self.data.protocol != ProtocolKind::Implementation {
+            return None;
+        }
+        let node = self.focus.node_id()?;
+        tod_store::fleet::provision::resolve_launch_cwd(&self.fleet, &node.to_string()).ok()
     }
 
     /// Re-read everything shown; returns whether it changed.
     fn reload(&mut self) -> bool {
         let focus = self.focus;
         let id = self.conversation_id;
+        let fallback_protocol = self.protocol;
         let data = self.fleet.read(|conn| {
             let selection = focus_selection(conn, focus)?;
             let repo = ConversationRepo::new(conn);
@@ -658,7 +796,24 @@ impl ConversationView {
                 .zip(selection.path)
                 .map(|(node, title)| Crumb { node, title })
                 .collect();
+            let protocol = match id {
+                Some(id) => repo
+                    .get(id)?
+                    .map(|c| c.protocol)
+                    .unwrap_or(fallback_protocol),
+                None => fallback_protocol,
+            };
+            // Only the protocols whose side pane shows them pay for these.
+            let (plan, report) = match (protocol, selection.node, id) {
+                (ProtocolKind::Implementation, Some(node), id) => (
+                    PlanStepRepo::new(conn).list_for_node(node)?,
+                    id.and_then(|id| repo.latest_report(id).ok().flatten()),
+                ),
+                _ => (Vec::new(), None),
+            };
+            let new_kinds = new_kinds(conn, selection.node, focus)?;
             Ok(Snapshot {
+                new_kinds,
                 path,
                 has_children: nav::has_children(conn, selection.node)?,
                 focus_node: selection.node,
@@ -667,6 +822,9 @@ impl ConversationView {
                 turns,
                 changes,
                 node_titles,
+                protocol,
+                plan,
+                report,
             })
         });
         let data = match data {
@@ -841,7 +999,7 @@ impl ConversationView {
             return;
         }
         if let Some(ix) = self.picker {
-            let last = self.data.conversations.len() as isize;
+            let last = (self.data.conversations.len() + self.data.new_kinds.len()) as isize - 1;
             self.picker = Some((ix as isize + delta).clamp(0, last) as usize);
             cx.notify();
             return;
@@ -871,6 +1029,9 @@ impl ConversationView {
                 cx.notify();
             }
             Pane::Context => {}
+            Pane::ChangeSet if self.data.protocol == ProtocolKind::Implementation => {
+                self.move_side_cursor(delta, cx);
+            }
             Pane::ChangeSet => {
                 let keys = self.visible_keys();
                 if keys.is_empty() {
@@ -1134,6 +1295,8 @@ impl Render for ConversationView {
             )
             .on_action(cx.listener(|this, _: &ConversationNew, window, cx| {
                 this.cancel_edit(window, cx);
+                // Another of whatever kind is open.
+                this.protocol = this.data.protocol;
                 this.new_conversation(window, cx)
             }))
             // Works from anywhere in the view, text fields included.
@@ -1241,7 +1404,7 @@ impl Render for ConversationView {
 
         let header = self.render_header(window, cx);
         let transcript = self.render_transcript(window, cx);
-        let changes = self.render_change_set(window, cx);
+        let changes = self.render_side_pane(window, cx);
         let context = self
             .context
             .open
@@ -1291,4 +1454,25 @@ impl Render for ConversationView {
             )
             .children(confirm)
     }
+}
+
+/// The worktree's changed files, one `git status --porcelain` line each.
+/// Empty when it is not a repository, or git is not on the path — the pane
+/// simply shows nothing rather than an error.
+fn worktree_files(cwd: &std::path::Path) -> Vec<String> {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim_end)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
