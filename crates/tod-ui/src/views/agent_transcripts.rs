@@ -4,7 +4,7 @@ use crate::ui::actionable::{
 };
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::transcript_list::{
-    self, ChunkId, Entry, EntryKind, TranscriptList, TranscriptListEvent,
+    self, ChunkId, Entry, EntryKind, StartState, TranscriptList, TranscriptListEvent,
 };
 use chrono::{Local, TimeZone};
 use gpui::prelude::FluentBuilder;
@@ -112,6 +112,9 @@ pub struct AgentTranscriptsView {
     /// The selected agent's turns, rendered by the same component the
     /// conversation view uses.
     transcript: Entity<TranscriptList>,
+    /// What the transcript shows, rebuilt when the selected agent's turns
+    /// change rather than every frame: a long transcript is megabytes.
+    entries: Vec<Entry>,
     /// Chunks the user toggled away from how they start.
     toggled: HashMap<ChunkId, bool>,
     _transcript_subscription: Subscription,
@@ -133,7 +136,9 @@ impl AgentTranscriptsView {
         traffic_log: SharedAgentTrafficLog,
         window_control: TranscriptWindowControl,
     ) -> Self {
-        let transcript = cx.new(|_| TranscriptList::new());
+        // Everything starts collapsed: a transcript is read by opening the
+        // turns that matter, not by scrolling past all of them.
+        let transcript = cx.new(|_| TranscriptList::starting(StartState::Collapsed));
         let subscription = cx.subscribe(&transcript, |this, _, event, cx| match event {
             TranscriptListEvent::ChunkClicked(id) => this.toggle(*id, cx),
         });
@@ -152,6 +157,7 @@ impl AgentTranscriptsView {
             turns: Vec::new(),
             header: "Agent transcripts".into(),
             transcript,
+            entries: Vec::new(),
             toggled: HashMap::new(),
             _transcript_subscription: subscription,
         };
@@ -236,21 +242,46 @@ impl AgentTranscriptsView {
 
     /// Expand or collapse one chunk.
     fn toggle(&mut self, id: ChunkId, cx: &mut Context<Self>) {
-        let entries = self.entries();
-        let expanded = !transcript_list::is_expanded(&entries, &self.toggled, id);
-        if expanded == transcript_list::expanded_by_default(&entries, id) {
+        let start = StartState::Collapsed;
+        let expanded = !transcript_list::is_expanded(&self.entries, &self.toggled, id, start);
+        if expanded == transcript_list::expanded_by_default(&self.entries, id, start) {
             self.toggled.remove(&id);
         } else {
             self.toggled.insert(id, expanded);
         }
+        self.sync_transcript(cx);
         cx.notify();
+    }
+
+    /// Rebuild the entries from the selected agent's turns and bring the
+    /// transcript up to date. This window has no chunk highlight of its own
+    /// — the agent list owns the keyboard — so the list is fed entries and
+    /// what the user toggled, nothing more.
+    fn sync_transcript(&mut self, cx: &mut Context<Self>) {
+        self.entries = self.build_entries();
+        let entries = self.entries.clone();
+        let toggled = self.toggled.clone();
+        let reading = self
+            .selected_agent_id
+            .as_ref()
+            .is_some_and(|id| self.reading.contains(id));
+        self.transcript.update(cx, |list, cx| {
+            list.set_entries(entries, cx);
+            list.set_toggled(toggled, cx);
+            list.set_status(
+                reading,
+                reading.then(|| "reading the transcript".to_string()),
+                cx,
+            );
+            list.set_empty_message("No transcript turns for this agent yet.", cx);
+        });
     }
 
     /// The selected agent's transcript entries: the run's stored transcript,
     /// read as the conversation view reads a conversation, then any raw
     /// traffic this process logged for it. A request carries what we sent,
     /// so it reads as the outgoing side.
-    fn entries(&self) -> Vec<Entry> {
+    fn build_entries(&self) -> Vec<Entry> {
         let history = self.history.iter().flat_map(|transcript| &transcript.turns);
         let format_problems = (!self.format_problems.is_empty()).then(|| Entry {
             kind: EntryKind::Error,
@@ -338,6 +369,7 @@ impl AgentTranscriptsView {
                     }
                     this.set_header(&run_id);
                 }
+                this.sync_transcript(cx);
                 cx.notify();
             });
         })
@@ -359,6 +391,7 @@ impl AgentTranscriptsView {
         if let Some(run) = run.filter(|run| run.agent_session_id.is_some() && !run.is_live()) {
             self.refresh_history(run, cx);
         }
+        self.sync_transcript(cx);
         cx.notify();
     }
 
@@ -403,6 +436,7 @@ impl AgentTranscriptsView {
             self.read_error = None;
             self.format_problems.clear();
             self.header = "Agent transcripts · no agents yet".into();
+            self.sync_transcript(cx);
             cx.notify();
         }
     }
@@ -605,26 +639,6 @@ impl Render for AgentTranscriptsView {
         let muted_bg = cx.theme().muted;
         let accent = cx.theme().primary;
         let pick_badges = self.agent_pick_badges();
-
-        // Bring the transcript up to date. This window has no chunk
-        // highlight of its own — the agent list owns the keyboard — so the
-        // list is fed entries and what the user toggled, nothing more.
-        let entries = self.entries();
-        let toggled = self.toggled.clone();
-        let reading = self
-            .selected_agent_id
-            .as_ref()
-            .is_some_and(|id| self.reading.contains(id));
-        self.transcript.update(cx, |list, cx| {
-            list.set_entries(entries, cx);
-            list.set_toggled(toggled, cx);
-            list.set_status(
-                reading,
-                reading.then(|| "reading the transcript".to_string()),
-                cx,
-            );
-            list.set_empty_message("No transcript turns for this agent yet.", cx);
-        });
 
         h_flex()
             .key_context(AGENT_TRANSCRIPTS_CONTEXT)
@@ -846,12 +860,7 @@ impl Render for AgentTranscriptsView {
                                                     })),
                                             ),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_h_0()
-                                            .child(self.transcript.clone()),
-                                    ),
+                                    .child(div().flex_1().min_h_0().child(self.transcript.clone())),
                             ),
                     ),
             )
