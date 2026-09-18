@@ -198,10 +198,20 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     } else {
         row
     };
+    // Why a partial or blocked step stopped, and how to unblock it.
+    let note = step.note.as_ref().map(|note| {
+        div().text_xs().text_color(status_color).child(selectable_text(
+            ("plan-step-note", row_ix),
+            SharedString::from(note.clone()),
+            window,
+            cx,
+        ))
+    });
     row.when(highlighted, style::highlighted)
         .child(header)
         .children(editor)
         .children(body)
+        .children(note)
         .children(links("depends on", depends_on))
         .children(links("satisfies", satisfies))
         .into_any_element()
@@ -210,7 +220,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
 fn status_color(status: &str, theme: &gpui_component::Theme) -> gpui::Hsla {
     match status {
         "verified" | "implemented" => theme.success,
-        "in_progress" => theme.warning,
+        "in_progress" | "partial" => theme.warning,
         "blocked" => theme.danger,
         "ready" => theme.primary,
         _ => theme.muted_foreground,

@@ -62,6 +62,7 @@ pub fn snapshot(conn: &Connection, entity: Entity, id: Uuid) -> Result<Option<En
                 ordinal: step.ordinal,
                 body: step.body,
                 status: step.status,
+                note: step.note,
                 depends_on,
                 satisfies,
             })

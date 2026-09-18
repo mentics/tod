@@ -23,7 +23,7 @@ use tod_store::conversation::ProtocolKind;
 use tod_store::interview::InterviewCommand;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::plan_steps::{
-    PLAN_STEP_STATUSES, STATUS_IMPLEMENTED, STATUS_VERIFIED,
+    PLAN_STEP_STATUSES, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
 };
 use uuid::Uuid;
 
@@ -73,9 +73,16 @@ impl ConversationView {
             .iter()
             .any(|s| s.id == step && s.status == status);
         if !unchanged {
+            // A step left for the user keeps the note saying why; any other
+            // status has none.
+            let note = needs_user(status)
+                .then(|| self.data.plan.iter().find(|s| s.id == step))
+                .flatten()
+                .and_then(|s| s.note.clone());
             let mutation = OutlineMutation::UpdatePlanStepStatus {
                 step_id: step,
                 status: status.to_string(),
+                note,
             };
             self.command(match self.conversation_id {
                 Some(conversation_id) => InterviewCommand::ConversationEdit {
@@ -275,13 +282,13 @@ impl ConversationView {
         }
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        let steps: Vec<(Uuid, String, String)> = self
+        let steps: Vec<(Uuid, String, String, Option<String>)> = self
             .data
             .plan
             .iter()
-            .map(|s| (s.id, s.status.clone(), s.body.clone()))
+            .map(|s| (s.id, s.status.clone(), s.body.clone(), s.note.clone()))
             .collect();
-        for (n, (id, status, body)) in steps.into_iter().enumerate() {
+        for (n, (id, status, body, note)) in steps.into_iter().enumerate() {
             let badge = self.render_status_badge(id, &status, cx);
             rows.push(
                 h_flex()
@@ -291,12 +298,27 @@ impl ConversationView {
                     .py(style::space::INLINE)
                     .items_start()
                     .child(badge)
-                    .child(div().flex_1().min_w_0().child(selectable_text(
-                        format!("plan-step-{id}"),
-                        body,
-                        window,
-                        cx,
-                    )))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(selectable_text(
+                                format!("plan-step-{id}"),
+                                body,
+                                window,
+                                cx,
+                            ))
+                            // Why a partial or blocked step stopped, and how
+                            // to unblock it: what the user acts on.
+                            .children(note.map(|note| {
+                                style::text_dense_muted(div()).child(selectable_text(
+                                    format!("plan-step-note-{id}"),
+                                    note,
+                                    window,
+                                    cx,
+                                ))
+                            })),
+                    )
                     .into_any_element(),
             );
         }

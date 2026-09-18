@@ -162,6 +162,9 @@ pub enum EntitySnapshot {
         ordinal: i32,
         body: String,
         status: String,
+        /// Why a `partial` or `blocked` step stopped short.
+        #[serde(default)]
+        note: Option<String>,
         /// Sorted.
         depends_on: Vec<Uuid>,
         /// Obligations this step is linked to. Sorted.

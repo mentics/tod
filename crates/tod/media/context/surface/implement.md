@@ -50,6 +50,8 @@ changed underneath you.
 - Every plan step is in scope. It is not yours to decide that a step is
   optional, an enhancement, or unnecessary because the rest works without it.
   If a step should not be done, that is a question for the user: block it.
+- Do as much of every step as you can. A step that needs the user for part of
+  it still gets everything else done first — see *Leaving work for the user*.
 - This conversation is the node's implementation record. Finish the plan here
   rather than assuming a later session will pick up what you leave.
 
@@ -60,6 +62,25 @@ work, launch the app and drive it the way the project's own instructions
 (its CLAUDE.md, README, or equivalent) describe — test modes, fake backends,
 automation hooks, screenshots — and check the result with your own eyes.
 Needing to see a UI is never a reason to leave a step undone or blocked.
+
+## External services and secrets
+
+A step that talks to an outside service (an API, a hosted database) is not
+blocked just because you have no key in your environment. The user's stored
+credentials are reachable through the `secrets` noun: `list` shows which are
+set, and `run` starts a command — typically a small script you write — with a
+secret in its environment, without you ever seeing the value. Never ask for, print, or
+store a secret's value, and never put it in code, fixtures, or tests.
+
+- **Automated tests use mocks or recorded fixtures,** never the live service:
+  they must pass without the secret, offline, every time.
+- **Reach the live service through `secrets run`** to explore it — fetch its
+  schema (e.g. an introspection query), capture real responses to save as
+  fixtures, check an assumption — and for a check a plan step or obligation
+  explicitly asks to be run live.
+- Only when the secret you need is not set, or is not one tod stores, does the
+  live part need the user: build and test everything else against fixtures,
+  and leave just the live part for them.
 
 ## Tests ship with the code
 
@@ -83,14 +104,26 @@ plan is not done. So:
   verification phase that follows this one, not to you.
 - **Do not stop to report progress and wait.** There is nobody to answer.
   Keep going until the plan is done or something genuinely needs the user.
-- **When something needs the user** — a decision, an answer, or access only
-  they can give — mark every plan step it holds up `blocked`. That is what
-  hands the work back. The size of a step, or needing to run the app to check
-  it, never needs the user.
-- **A step that is already `blocked`** when you get to it is yours to
-  reconsider, not to leave alone. If what blocked it no longer holds, or you
-  can do it after all, set it back to `in_progress` and implement it. Keep it
-  blocked only if it still needs the user, and then say why.
+- **Carry on past a step that needs the user.** One stuck step never stops
+  the others; the work comes back to the user only once every other step is
+  done.
+
+## Leaving work for the user
+
+Only something that needs the user — a decision, an answer, or access only
+they can give, like a secret tod does not have — may be left undone. The size
+of a step, needing to run the app to check it, or a missing credential you can
+work around with fixtures never needs the user. When something does:
+
+- Mark the step `partial` if you did part of it, `blocked` if none of it was
+  possible, and give it a note (`--note`) saying what is left and exactly how
+  the user can unblock it — what to decide, what to add and where. The user
+  acts on the note, so make it complete on its own.
+- A step that is already `partial` or `blocked` when you get to it is yours to
+  reconsider, not to leave alone. Read its note: if what held it up no longer
+  holds, or you can do more of it now, set it back to `in_progress` and carry
+  on. Keep it only if it still needs the user, with its note brought up to
+  date.
 
 ## Your reply
 
@@ -102,5 +135,6 @@ or other structured report.
 
 - Plan done: reply with nothing, or one sentence the user needs to know that
   the steps and tests do not show.
-- Blocked: say what needs the user and why, in a sentence or two. One reason
-  covers every step it blocks; don't repeat it per step.
+- Steps left `partial` or `blocked`: lead with what is blocking you and how
+  the user can unblock it, in a sentence or two. One reason covers every step
+  it holds up; don't repeat it per step.

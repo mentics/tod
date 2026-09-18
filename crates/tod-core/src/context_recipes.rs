@@ -104,6 +104,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/plan",
         "cli/tests",
+        "cli/secrets",
         "surface/implement",
     ],
     blocks: &[

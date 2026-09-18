@@ -26,7 +26,9 @@ use tod_store::fleet::FleetStore;
 use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::repos::NodeRepo;
-use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
+use tod_store::outline::repos::plan_steps::{
+    STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
+};
 use uuid::Uuid;
 
 /// One test run, as the agent records it with `tod-cli tests record`. The
@@ -198,24 +200,20 @@ impl Protocol for ImplementationProtocol {
     }
 
     /// Done when every plan step is closed and this turn recorded a green
-    /// test run; handed back when a step is blocked, since that needs the
-    /// user. Otherwise another turn goes out, until the cap or a turn that
-    /// changed nothing.
+    /// test run. Handed back once nothing is left but `partial` and `blocked`
+    /// steps: those need the user, but only after everything else is done, so
+    /// one stuck step never stops work on the rest. Otherwise another turn
+    /// goes out, until the cap or a turn that changed nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
         let node = node_id(turn.env)?;
         let steps = plan_steps(turn.env.fleet, node);
-        if steps
-            .iter()
-            .any(|linked| linked.step.status == STATUS_BLOCKED)
-        {
-            return Ok(Next::Done);
-        }
         let open: Vec<&PlanStepWithLinks> = steps
             .iter()
-            .filter(|linked| !step_is_done(&linked.step.status))
+            .filter(|linked| step_is_open(&linked.step.status))
             .collect();
+        let needs_user = steps.iter().any(|linked| needs_user(&linked.step.status));
         let tests = turn.report.and_then(TestRun::from_report);
-        if open.is_empty() && tests.as_ref().is_some_and(TestRun::green) {
+        if open.is_empty() && (needs_user || tests.as_ref().is_some_and(TestRun::green)) {
             return Ok(Next::Done);
         }
         if turn.continuations >= super::protocol::CONTINUATION_CAP {
@@ -251,7 +249,7 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
              that a step is optional, an enhancement, or unnecessary because \
              the rest works without it: write the code, then mark the step \
              `implemented`. Do not stop to report progress, and do not ask \
-             whether to continue — nobody is reading until the plan is done.\n\n",
+             whether to continue.\n\n",
         );
     }
     match tests {
@@ -270,13 +268,17 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
         ),
     }
     out.push_str(
-        "Only something that needs the user — a decision or access only they \
-         can give — is a reason to stop early. Then mark the plan steps it \
-         holds up `blocked`.\n\n\
+        "Do as much of every step as you can. Only what needs the user — a \
+         decision, or access only they can give — may be left: mark the step \
+         `partial` if you did part of it or `blocked` if none of it was \
+         possible, with a note saying what is left and how the user can \
+         unblock it. A missing credential or live service is not a reason by \
+         itself: build and test against fixtures, and reach the real service \
+         through `secrets run` when it has the secret you need.\n\n\
          Your reply, when you stop, is at most a sentence or two: nothing \
-         when the plan is done, or what needs the user and why when you \
-         blocked. No summary of what works, no list of steps, no test counts \
-         — the user already sees all of that.",
+         when the plan is done, or what the user must do to unblock what you \
+         left. No summary of what works, no list of steps, no test counts — \
+         the user already sees all of that.",
     );
     out
 }
@@ -284,6 +286,12 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
 /// A plan step the agent is done with.
 fn step_is_done(status: &str) -> bool {
     status == STATUS_IMPLEMENTED || status == STATUS_VERIFIED
+}
+
+/// A plan step still waiting on the agent: neither done nor handed to the
+/// user.
+fn step_is_open(status: &str) -> bool {
+    !step_is_done(status) && !needs_user(status)
 }
 
 /// Whether the node has anything to implement. The lifecycle gate is meant to
@@ -355,6 +363,7 @@ pub fn mock_turn(
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
                 step_id: step.id,
                 status: STATUS_IMPLEMENTED.to_string(),
+                note: None,
             },
             target: None,
         })?;
@@ -377,6 +386,7 @@ pub fn mock_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_PARTIAL};
 
     fn run(passed: u32, failed: u32, errors: u32) -> TestRun {
         TestRun {
@@ -476,6 +486,7 @@ mod tests {
                     .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
                         step_id,
                         status: STATUS_IMPLEMENTED.to_string(),
+                        note: None,
                     })
                     .unwrap();
             }
@@ -555,17 +566,36 @@ mod tests {
             assert!(message.contains("No test run was recorded"), "{message}");
         }
 
-        /// Blocking is done on the plan: a blocked step hands back, whatever
-        /// else is open.
-        #[test]
-        fn a_blocked_step_hands_back_with_work_left() {
-            let fx = planned(3, 0);
+        fn hand_over(fx: &Fixture, n: usize, status: &str) {
             fx.fleet
                 .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
-                    step_id: step(&fx, 1),
-                    status: STATUS_BLOCKED.to_string(),
+                    step_id: step(fx, n),
+                    status: status.to_string(),
+                    note: Some("Needs the Linear API key".into()),
                 })
                 .unwrap();
+        }
+
+        /// One stuck step does not stop work on the rest: the others are
+        /// still sent back, and the stuck one is not among them.
+        #[test]
+        fn a_blocked_step_does_not_stop_the_open_ones() {
+            let fx = planned(3, 0);
+            hand_over(&fx, 1, STATUS_BLOCKED);
+            let Next::Continue { message } = decide(&fx, None, 0, true) else {
+                panic!("the other open steps should continue");
+            };
+            assert!(message.starts_with("2 plan steps are still open"), "{message}");
+            assert!(!message.contains("Step 1"), "{message}");
+        }
+
+        /// Once nothing but `partial` and `blocked` steps is left, the work
+        /// goes back to the user, tests or not.
+        #[test]
+        fn only_steps_that_need_the_user_left_hands_back() {
+            let fx = planned(3, 1);
+            hand_over(&fx, 1, STATUS_PARTIAL);
+            hand_over(&fx, 2, STATUS_BLOCKED);
             assert!(matches!(decide(&fx, None, 0, true), Next::Done));
         }
 

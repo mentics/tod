@@ -14,16 +14,26 @@ pub const STATUS_READY: &str = "ready";
 pub const STATUS_IN_PROGRESS: &str = "in_progress";
 pub const STATUS_IMPLEMENTED: &str = "implemented";
 pub const STATUS_VERIFIED: &str = "verified";
+/// Done as far as it can go without the user; the step's note says what is
+/// left and how to unblock it. Unlike `blocked`, work was done.
+pub const STATUS_PARTIAL: &str = "partial";
+/// Could not be started without the user; the note says why.
 pub const STATUS_BLOCKED: &str = "blocked";
 
-pub const PLAN_STEP_STATUSES: [&str; 6] = [
+pub const PLAN_STEP_STATUSES: [&str; 7] = [
     STATUS_PENDING,
     STATUS_READY,
     STATUS_IN_PROGRESS,
     STATUS_IMPLEMENTED,
     STATUS_VERIFIED,
+    STATUS_PARTIAL,
     STATUS_BLOCKED,
 ];
+
+/// A status that hands the step back to the user, with a note saying why.
+pub fn needs_user(status: &str) -> bool {
+    status == STATUS_PARTIAL || status == STATUS_BLOCKED
+}
 
 /// A status that unblocks any dependent step waiting on this one.
 fn satisfies_dependency(status: &str) -> bool {
@@ -37,6 +47,10 @@ pub struct PlanStep {
     pub ordinal: i32,
     pub body: String,
     pub status: String,
+    /// Why the step stopped short — what is left, and how the user can
+    /// unblock it. Set with a `partial` or `blocked` status; any other
+    /// status change clears it.
+    pub note: Option<String>,
 }
 
 pub struct PlanStepRepo<'a> {
@@ -50,7 +64,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status FROM node_plan_steps WHERE id = ?1",
+            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_plan_step)
@@ -60,7 +74,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps
              WHERE node_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt
@@ -73,7 +87,7 @@ impl<'a> PlanStepRepo<'a> {
     /// Backs the project-wide `tod-cli plan list`.
     pub fn list_all(&self) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps
              ORDER BY node_id, ordinal",
         )?;
         let rows = stmt
@@ -129,17 +143,18 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
-    /// Set `id`'s status and, when it becomes `implemented`/`verified`,
-    /// promote any `pending` dependent whose other dependencies are now all
-    /// satisfied to `ready`.
-    pub fn update_status(&self, id: Uuid, status: &str) -> Result<()> {
+    /// Set `id`'s status and note (`None` clears it) and, when it becomes
+    /// `implemented`/`verified`, promote any `pending` dependent whose other
+    /// dependencies are now all satisfied to `ready`.
+    pub fn update_status(&self, id: Uuid, status: &str, note: Option<&str>) -> Result<()> {
         anyhow::ensure!(
             PLAN_STEP_STATUSES.contains(&status),
             "unknown plan step status `{status}`"
         );
+        let note = note.map(str::trim).filter(|note| !note.is_empty());
         let n = self.conn.execute(
-            "UPDATE node_plan_steps SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            params![status, now_ms(), uuid_to_blob(id)],
+            "UPDATE node_plan_steps SET status = ?1, note = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, note, now_ms(), uuid_to_blob(id)],
         )?;
         if n == 0 {
             anyhow::bail!("plan step not found");
@@ -171,7 +186,7 @@ impl<'a> PlanStepRepo<'a> {
             }
         }
         if all_satisfied {
-            self.update_status(id, STATUS_READY)?;
+            self.update_status(id, STATUS_READY, None)?;
         }
         Ok(())
     }
@@ -379,5 +394,6 @@ fn map_plan_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStep> {
         ordinal: row.get(2)?,
         body: row.get(3)?,
         status: row.get(4)?,
+        note: row.get(5)?,
     })
 }

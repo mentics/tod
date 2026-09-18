@@ -16,6 +16,7 @@ mod interview;
 mod node;
 mod obligations;
 mod plan;
+mod secrets;
 mod test_runs;
 mod visual_design;
 
@@ -45,6 +46,7 @@ NOUNS:
     visual-design          the UI mockup associated with one obligation
     changeset              This conversation's net changes and unsure flags
     tests                  Record a test run for this implementation
+    secrets                Run a command with stored secrets, without seeing them
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
@@ -100,6 +102,12 @@ fn run(args: &[String]) -> anyhow::Result<String> {
                 data_root = Some(PathBuf::from(value));
             }
             "--json" => json = true,
+            // Everything after `--` belongs to the command `secrets run`
+            // starts, including its own `--json`.
+            "--" => {
+                rest.extend(args[i..].iter().cloned());
+                break;
+            }
             other => rest.push(other.to_string()),
         }
         i += 1;
@@ -136,8 +144,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "visual-design" => visual_design::run(invocation),
         "changeset" => changeset::run(invocation),
         "tests" => test_runs::run(invocation),
+        "secrets" => secrets::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, secrets)"
         ),
     }
 }

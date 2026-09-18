@@ -11,7 +11,10 @@ node at a time.
   judged — an obligation no step satisfies is an obligation nothing is being
   done about.
 - A step has a status: `pending`, `ready`, `in_progress`, `implemented`,
-  `verified`, or `blocked`.
+  `verified`, `partial`, or `blocked`. `partial` means the step was done as
+  far as it could go and the rest needs the user; `blocked` means it could not
+  be started at all. Both carry a **note**: what is left, and how the user can
+  unblock it.
 
 Plans and obligations move together. If an obligation changes, the steps
 linked to it may need their body updated, their status reset, or a new step

@@ -180,17 +180,27 @@ Nothing in an implementation reply is parsed. The app reads what the agent
 wrote as it worked, through `tod-cli`:
 
 - **Plan steps.** It closes each finished step (`plan update --status
-  implemented`), and marks every step something holds up `blocked`.
+  implemented`). A step that needs the user it marks `partial` (done as far
+  as it could go) or `blocked` (nothing could be done), with a `--note`
+  saying what is left and how the user unblocks it; the note is shown under
+  the step in the side pane.
 - **The test run.** After its last change in a turn it runs the tests and
   records the counts: `tests record --command <cmd> --passed N [--failed N]
   [--errors N]`, stored in `conversation_reports` as a `TestRun`. The latest
   record in a turn is that turn's.
 
 The reply is only what the user needs that those do not already show —
-usually nothing when the plan is done, and a sentence or two saying what
-needs the user when it is blocked. The context says so as a scoped exception
+usually nothing when the plan is done, and, when steps are left for the
+user, a sentence or two leading with what blocks them and how to unblock it. The context says so as a scoped exception
 to the autonomous stance (`surface/implement.md`): no summary of the work, no
 list of steps, no test results. One reason covers every step it blocks.
+
+A missing credential is not by itself a reason to block. `tod-cli secrets run`
+starts a command (usually a script the agent writes) with a secret from tod's
+credential store in its environment and masks the value in its output, so the
+agent uses the user's stored keys without seeing them. Automated tests use
+mocks or recorded fixtures; live calls are for exploring the service,
+capturing fixtures, and checks a step or obligation asks to run live.
 
 This replaced a YAML report the whole reply had to be. It restated what the
 plan steps already said, models wrapped it in prose anyway, and the user got
@@ -200,8 +210,8 @@ the whole document back as the reply.
 
 A turn ends the exchange when **both**:
 
-1. No plan step on the node is `pending`, `ready`, `in_progress`, or
-   `blocked` — every one is `implemented` or `verified`
+1. No plan step on the node is `pending`, `ready`, `in_progress`,
+   `partial`, or `blocked` — every one is `implemented` or `verified`
    (`tod_store::outline::repos::plan_steps`).
 2. The turn recorded a test run with at least one pass and no failures or
    errors. A run from an earlier turn does not count: the code may have
@@ -209,8 +219,10 @@ A turn ends the exchange when **both**:
 
 Both are read from the store. Test counts are agent-recorded and trusted.
 
-Any plan step in `blocked` stops the loop and hands back to the user
-regardless.
+Once no step is left open — every one is done, `partial`, or `blocked`, and
+at least one is `partial` or `blocked` — the loop hands back to the user,
+whatever the tests say. A `partial` or `blocked` step never stops work on the
+open ones: the loop keeps going while any step is still open.
 
 ### 4.4 The loop
 
@@ -221,7 +233,7 @@ carrying the remaining work — without the user.
 Stops on any of:
 
 - **Done** (§4.3).
-- **Blocked** — a blocked plan step.
+- **Needs the user** — every step not done is `partial` or `blocked`.
 - **Cap** — 10 continuations per user message.
 - **No progress** — a continuation that closes no plan step and changes no
   file in the worktree. Checked against the step statuses and `git status
