@@ -7,6 +7,7 @@
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const STATUS_PENDING: &str = "pending";
@@ -35,6 +36,68 @@ pub fn needs_user(status: &str) -> bool {
     status == STATUS_PARTIAL || status == STATUS_BLOCKED
 }
 
+/// Why a `partial` or `blocked` step needs the user. A closed set on
+/// purpose: a step's size, not knowing how to do it, or existing code that
+/// does not fit are not reasons, since none of them needs the user. Stored as
+/// JSON in `node_plan_steps.reason`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HandoffReason {
+    /// Obligations that cannot all hold, cited by id.
+    Conflict { obligations: Vec<Uuid> },
+    /// A choice the obligations leave open that the agent should not make,
+    /// with the options it sees.
+    Decision { options: Vec<String> },
+    /// A secret, account, or permission the agent does not have.
+    Access,
+    /// Waiting on something outside this node.
+    External,
+}
+
+impl HandoffReason {
+    /// Every kind, as `tod-cli plan update --reason` takes it.
+    pub const KINDS: [&'static str; 4] = ["conflict", "decision", "access", "external"];
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Conflict { .. } => "conflict",
+            Self::Decision { .. } => "decision",
+            Self::Access => "access",
+            Self::External => "external",
+        }
+    }
+
+    /// How the reason reads to the user.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Conflict { .. } => "Conflicting obligations",
+            Self::Decision { .. } => "Needs your decision",
+            Self::Access => "Needs access",
+            Self::External => "Waiting on something outside this node",
+        }
+    }
+
+    /// One line: the kind, then what it cites or offers.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Conflict { obligations } => format!(
+                "conflict between [{}]",
+                obligations
+                    .iter()
+                    .map(|id| crate::interview::short_id(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Decision { options } => format!("decision: {}", options.join(" | ")),
+            Self::Access | Self::External => self.kind().to_string(),
+        }
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::to_string(self).expect("a handoff reason serializes")
+    }
+}
+
 /// A status that unblocks any dependent step waiting on this one.
 fn satisfies_dependency(status: &str) -> bool {
     status == STATUS_IMPLEMENTED || status == STATUS_VERIFIED
@@ -51,6 +114,9 @@ pub struct PlanStep {
     /// unblock it. Set with a `partial` or `blocked` status; any other
     /// status change clears it.
     pub note: Option<String>,
+    /// Why a `partial` or `blocked` step needs the user; set and cleared with
+    /// the note. Steps handed back before reasons existed have a note alone.
+    pub reason: Option<HandoffReason>,
 }
 
 pub struct PlanStepRepo<'a> {
@@ -64,7 +130,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn get(&self, id: Uuid) -> Result<Option<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps WHERE id = ?1",
+            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![uuid_to_blob(id)], map_plan_step)
@@ -74,7 +140,7 @@ impl<'a> PlanStepRepo<'a> {
 
     pub fn list_for_node(&self, node_id: Uuid) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps
              WHERE node_id = ?1 ORDER BY ordinal",
         )?;
         let rows = stmt
@@ -87,7 +153,7 @@ impl<'a> PlanStepRepo<'a> {
     /// Backs the project-wide `tod-cli plan list`.
     pub fn list_all(&self) -> Result<Vec<PlanStep>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, node_id, ordinal, body, status, note FROM node_plan_steps
+            "SELECT id, node_id, ordinal, body, status, note, reason FROM node_plan_steps
              ORDER BY node_id, ordinal",
         )?;
         let rows = stmt
@@ -143,18 +209,31 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
-    /// Set `id`'s status and note (`None` clears it) and, when it becomes
+    /// Set `id`'s status, note, and reason (`None` clears them) and, when it becomes
     /// `implemented`/`verified`, promote any `pending` dependent whose other
     /// dependencies are now all satisfied to `ready`.
-    pub fn update_status(&self, id: Uuid, status: &str, note: Option<&str>) -> Result<()> {
+    pub fn update_status(
+        &self,
+        id: Uuid,
+        status: &str,
+        note: Option<&str>,
+        reason: Option<&HandoffReason>,
+    ) -> Result<()> {
         anyhow::ensure!(
             PLAN_STEP_STATUSES.contains(&status),
             "unknown plan step status `{status}`"
         );
         let note = note.map(str::trim).filter(|note| !note.is_empty());
         let n = self.conn.execute(
-            "UPDATE node_plan_steps SET status = ?1, note = ?2, updated_at = ?3 WHERE id = ?4",
-            params![status, note, now_ms(), uuid_to_blob(id)],
+            "UPDATE node_plan_steps SET status = ?1, note = ?2, reason = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![
+                status,
+                note,
+                reason.map(HandoffReason::to_json),
+                now_ms(),
+                uuid_to_blob(id)
+            ],
         )?;
         if n == 0 {
             anyhow::bail!("plan step not found");
@@ -186,7 +265,7 @@ impl<'a> PlanStepRepo<'a> {
             }
         }
         if all_satisfied {
-            self.update_status(id, STATUS_READY, None)?;
+            self.update_status(id, STATUS_READY, None, None)?;
         }
         Ok(())
     }
@@ -395,5 +474,9 @@ fn map_plan_step(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStep> {
         body: row.get(3)?,
         status: row.get(4)?,
         note: row.get(5)?,
+        // Unreadable JSON is a reason lost, not a step lost.
+        reason: row
+            .get::<_, Option<String>>(6)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }

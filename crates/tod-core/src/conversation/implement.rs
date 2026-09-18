@@ -25,9 +25,11 @@ use tod_store::conversation::ProtocolKind;
 use tod_store::fleet::FleetStore;
 use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
+use tod_store::interview::short_id;
+use tod_store::outline::PlanStep;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::repos::plan_steps::{
-    STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
+    HandoffReason, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
 };
 use uuid::Uuid;
 
@@ -268,18 +270,70 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
         ),
     }
     out.push_str(
-        "Do as much of every step as you can. Only what needs the user — a \
-         decision, or access only they can give — may be left: mark the step \
-         `partial` if you did part of it or `blocked` if none of it was \
-         possible, with a note saying what is left and how the user can \
-         unblock it. A missing credential or live service is not a reason by \
-         itself: build and test against fixtures, and reach the real service \
-         through `secrets run` when it has the secret you need.\n\n\
+        "Do as much of every step as you can. Only what needs the user may be \
+         left: mark the step `partial` if you did part of it or `blocked` if \
+         none of it was possible, with one of the four reasons — `conflict` \
+         (obligations that cannot all hold, cited by id), `decision` (a \
+         choice they leave open, with the options), `access` (a secret or \
+         permission you lack), or `external` (waiting on something outside \
+         this node) — and a note saying what is left and how the user can \
+         unblock it. The size of a step, or existing code that does not fit \
+         an obligation, is not a reason: extend or replace that code. A \
+         missing credential or live service is not one by itself either: \
+         build and test against fixtures, and reach the real service through \
+         `secrets run` when it has the secret you need.\n\n\
          Your reply, when you stop, is at most a sentence or two: nothing \
          when the plan is done, or what the user must do to unblock what you \
          left. No summary of what works, no list of steps, no test counts — \
          the user already sees all of that.",
     );
+    out
+}
+
+/// The user's answer to a plan step the agent left for them, by its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffAnswer {
+    /// Of a conflict's cited obligations, this one stands.
+    Keep(Uuid),
+    /// Of a decision's options, this one (by index).
+    Choose(usize),
+    /// The access, or the outside thing, is in place now.
+    Retry,
+}
+
+/// What the app tells the agent when the user answers `step`. The app sets the
+/// step back to `in_progress` as it sends this, which clears the step's note
+/// and reason, so the message carries them.
+pub fn handoff_answer_message(step: &PlanStep, answer: &HandoffAnswer) -> String {
+    let id = short_id(step.id);
+    let mut out = match (&step.reason, answer) {
+        (Some(HandoffReason::Conflict { obligations }), HandoffAnswer::Keep(kept)) => {
+            let others: Vec<String> = obligations
+                .iter()
+                .filter(|o| *o != kept)
+                .map(|o| format!("[{}]", short_id(*o)))
+                .collect();
+            format!(
+                "Plan step [{id}]: keep obligation [{}] as written. Where {} disagree{} \
+                 with it, it wins: update {} to fit, then carry on with the step.",
+                short_id(*kept),
+                others.join(", "),
+                if others.len() == 1 { "s" } else { "" },
+                if others.len() == 1 { "it" } else { "them" },
+            )
+        }
+        (Some(HandoffReason::Decision { options }), HandoffAnswer::Choose(ix)) => {
+            let choice = options.get(*ix).map(String::as_str).unwrap_or_default();
+            format!("Plan step [{id}]: go with \"{choice}\". Carry on with the step.")
+        }
+        (Some(HandoffReason::External), _) => format!(
+            "Plan step [{id}]: what it was waiting on is in place now. Carry on with it."
+        ),
+        _ => format!("Plan step [{id}]: the access it needed is in place now. Carry on with it."),
+    };
+    if let Some(note) = &step.note {
+        out.push_str(&format!("\n\nYour note on it was: {note}"));
+    }
     out
 }
 
@@ -364,6 +418,7 @@ pub fn mock_turn(
                 step_id: step.id,
                 status: STATUS_IMPLEMENTED.to_string(),
                 note: None,
+                reason: None,
             },
             target: None,
         })?;
@@ -487,6 +542,7 @@ mod tests {
                         step_id,
                         status: STATUS_IMPLEMENTED.to_string(),
                         note: None,
+                        reason: None,
                     })
                     .unwrap();
             }
@@ -566,12 +622,50 @@ mod tests {
             assert!(message.contains("No test run was recorded"), "{message}");
         }
 
+        fn handed_back(reason: HandoffReason) -> PlanStep {
+            PlanStep {
+                id: Uuid::from_u128(0xaaaa_aaaa << 96),
+                node_id: Uuid::nil(),
+                ordinal: 1,
+                body: "Build the filter form".into(),
+                status: STATUS_BLOCKED.into(),
+                note: Some("The form outgrew ConfigSchema.".into()),
+                reason: Some(reason),
+            }
+        }
+
+        /// Each answer names the step and what the user decided, and carries
+        /// the note the reopened step no longer has.
+        #[test]
+        fn an_answer_tells_the_agent_what_the_user_decided() {
+            let a = Uuid::from_u128(0xbbbb_bbbb << 96);
+            let b = Uuid::from_u128(0xcccc_cccc << 96);
+            let conflict = handed_back(HandoffReason::Conflict {
+                obligations: vec![a, b],
+            });
+            let text = handoff_answer_message(&conflict, &HandoffAnswer::Keep(a));
+            assert!(text.starts_with("Plan step [aaaaaaaa]: keep obligation [bbbbbbbb]"), "{text}");
+            assert!(text.contains("Where [cccccccc] disagrees with it"), "{text}");
+            assert!(text.ends_with("Your note on it was: The form outgrew ConfigSchema."), "{text}");
+
+            let decision = handed_back(HandoffReason::Decision {
+                options: vec!["Generic".into(), "Linear-specific".into()],
+            });
+            let text = handoff_answer_message(&decision, &HandoffAnswer::Choose(1));
+            assert!(text.contains("go with \"Linear-specific\""), "{text}");
+
+            let access = handed_back(HandoffReason::Access);
+            let text = handoff_answer_message(&access, &HandoffAnswer::Retry);
+            assert!(text.contains("the access it needed is in place now"), "{text}");
+        }
+
         fn hand_over(fx: &Fixture, n: usize, status: &str) {
             fx.fleet
                 .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
                     step_id: step(fx, n),
                     status: status.to_string(),
                     note: Some("Needs the Linear API key".into()),
+                    reason: Some(HandoffReason::Access),
                 })
                 .unwrap();
         }

@@ -6,7 +6,7 @@ use crate::args::Args;
 use std::collections::HashMap;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
-use tod_store::outline::repos::plan_steps::needs_user;
+use tod_store::outline::repos::plan_steps::{HandoffReason, needs_user};
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
 use uuid::Uuid;
@@ -24,7 +24,7 @@ COMMANDS:
     add       --node <UUID> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
 
 Use `depend`/`satisfy` to add further links after creation — `add` only takes one of each.
-    update    <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|partial|blocked] [--note <TEXT>]
+    update    <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|partial|blocked] [--reason conflict|decision|access|external] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--note <TEXT>]
     delete    <ID>
     depend    <ID> --on <ID>
     undepend  <ID> --on <ID>
@@ -36,8 +36,13 @@ Use `depend`/`satisfy` to add further links after creation — `add` only takes 
 dependency implemented/verified) — the set that can be dispatched in parallel.
 
 `partial` means done as far as it can go without the user; `blocked` means it
-could not be started. Both require --note: what is left, and how the user can
-unblock it. Any other status clears the note.
+could not be started. Both require --reason and --note (what is left, and how
+the user can unblock it):
+  conflict   obligations that cannot all hold; --cites each of them (two or more)
+  decision   a choice the obligations leave open; --option each choice (two or more)
+  access     a secret, account, or permission you do not have
+  external   waiting on something outside this node
+Any other status clears the reason and note.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -91,6 +96,7 @@ fn step_json(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> serde_json:
         "node_id": row.node_id.to_string(),
         "status": row.status,
         "note": row.note,
+        "reason": row.reason,
         "body": row.body,
         "depends_on": deps.iter().map(Uuid::to_string).collect::<Vec<_>>(),
         "satisfies": obligations.iter().map(Uuid::to_string).collect::<Vec<_>>(),
@@ -118,13 +124,16 @@ fn step_line(row: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> String {
                 .join(",")
         )
     };
+    let reason = match &row.reason {
+        Some(reason) => format!("\n    reason: {}", reason.describe()),
+        None => String::new(),
+    };
     let note = match &row.note {
-        Some(note) => format!("
-    note: {note}"),
+        Some(note) => format!("\n    note: {note}"),
         None => String::new(),
     };
     format!(
-        "[{}] {}{deps}{satisfies}: {}{note}",
+        "[{}] {}{deps}{satisfies}: {}{reason}{note}",
         short_id(row.id),
         row.status,
         row.body
@@ -281,7 +290,19 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     if body.is_none() && status.is_none() {
         anyhow::bail!("--body and/or --status is required");
     }
-    check_note(status, note)?;
+    let mut cites = Vec::new();
+    for raw in args.get_all("--cites") {
+        for id in raw.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            cites.push(resolve_obligation(inv, id)?);
+        }
+    }
+    let options: Vec<String> = args
+        .get_all("--option")
+        .into_iter()
+        .map(|option| option.trim().to_string())
+        .filter(|option| !option.is_empty())
+        .collect();
+    let reason = handoff(status, note, args.get("--reason"), cites, options)?;
     let client = inv.client();
     let mut target = Some(id);
     if let Some(body) = body {
@@ -299,6 +320,7 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
                 step_id: id,
                 status: status.to_string(),
                 note: note.map(str::to_string),
+                reason,
             },
             target,
         })?;
@@ -306,19 +328,56 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     Ok(ack(id, inv.json))
 }
 
-/// A `partial` or `blocked` step must say what is left and how the user can
-/// unblock it; no other status carries a note.
-fn check_note(status: Option<&str>, note: Option<&str>) -> anyhow::Result<()> {
-    match (status, note) {
-        (Some(status), None) if needs_user(status) => anyhow::bail!(
-            "--status {status} requires --note: what is left, and how the user can unblock it"
+/// The reason a `partial` or `blocked` step needs the user, checked: such a
+/// step must give a reason and a note, `conflict` must cite the obligations
+/// and `decision` offer the options (two or more of each), and no other status
+/// carries any of it.
+fn handoff(
+    status: Option<&str>,
+    note: Option<&str>,
+    reason: Option<&str>,
+    cites: Vec<Uuid>,
+    options: Vec<String>,
+) -> anyhow::Result<Option<HandoffReason>> {
+    let given = note.is_some() || reason.is_some() || !cites.is_empty() || !options.is_empty();
+    let status = match status {
+        Some(status) if needs_user(status) => status,
+        Some(status) if given => anyhow::bail!(
+            "--reason, --note, --cites, and --option go with --status partial or blocked, not {status}"
         ),
-        (Some(status), Some(_)) if !needs_user(status) => {
-            anyhow::bail!("--note goes with --status partial or blocked, not {status}")
-        }
-        (None, Some(_)) => anyhow::bail!("--note is given with --status partial or blocked"),
-        _ => Ok(()),
-    }
+        None if given => anyhow::bail!(
+            "--reason, --note, --cites, and --option go with --status partial or blocked"
+        ),
+        _ => return Ok(None),
+    };
+    let kinds = HandoffReason::KINDS.join("|");
+    let Some(reason) = reason else {
+        anyhow::bail!("--status {status} requires --reason {kinds}");
+    };
+    anyhow::ensure!(
+        note.is_some(),
+        "--status {status} requires --note: what is left, and how the user can unblock it"
+    );
+    let reason = match reason.trim().to_ascii_lowercase().as_str() {
+        "conflict" => HandoffReason::Conflict { obligations: cites.clone() },
+        "decision" => HandoffReason::Decision { options: options.clone() },
+        "access" => HandoffReason::Access,
+        "external" => HandoffReason::External,
+        other => anyhow::bail!("unknown reason `{other}` (expected {kinds})"),
+    };
+    let is_conflict = matches!(reason, HandoffReason::Conflict { .. });
+    let is_decision = matches!(reason, HandoffReason::Decision { .. });
+    anyhow::ensure!(
+        !is_conflict || cites.len() >= 2,
+        "--reason conflict requires --cites for each obligation that cannot hold with the others (two or more)"
+    );
+    anyhow::ensure!(
+        !is_decision || options.len() >= 2,
+        "--reason decision requires an --option for each choice (two or more)"
+    );
+    anyhow::ensure!(is_conflict || cites.is_empty(), "--cites goes with --reason conflict");
+    anyhow::ensure!(is_decision || options.is_empty(), "--option goes with --reason decision");
+    Ok(Some(reason))
 }
 
 fn delete(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
@@ -409,15 +468,60 @@ fn ack(id: Uuid, json: bool) -> String {
 mod tests {
     use super::*;
 
+    fn check(
+        status: Option<&str>,
+        note: Option<&str>,
+        reason: Option<&str>,
+        cites: usize,
+        options: &[&str],
+    ) -> anyhow::Result<Option<HandoffReason>> {
+        handoff(
+            status,
+            note,
+            reason,
+            (0..cites).map(|n| Uuid::from_u128(n as u128 + 1)).collect(),
+            options.iter().map(|o| o.to_string()).collect(),
+        )
+    }
+
     #[test]
-    fn only_steps_left_for_the_user_carry_a_note() {
-        assert!(check_note(Some("partial"), Some("add the key")).is_ok());
-        assert!(check_note(Some("blocked"), Some("decide X")).is_ok());
-        assert!(check_note(Some("implemented"), None).is_ok());
-        assert!(check_note(None, None).is_ok());
-        assert!(check_note(Some("partial"), None).is_err());
-        assert!(check_note(Some("blocked"), None).is_err());
-        assert!(check_note(Some("implemented"), Some("x")).is_err());
-        assert!(check_note(None, Some("x")).is_err());
+    fn a_step_left_for_the_user_says_why_in_structure() {
+        let ok = |r: anyhow::Result<Option<HandoffReason>>| r.unwrap();
+        assert_eq!(
+            ok(check(Some("blocked"), Some("add the key"), Some("access"), 0, &[])),
+            Some(HandoffReason::Access)
+        );
+        assert_eq!(
+            ok(check(Some("partial"), Some("n"), Some("external"), 0, &[])),
+            Some(HandoffReason::External)
+        );
+        assert!(matches!(
+            ok(check(Some("blocked"), Some("n"), Some("conflict"), 2, &[])),
+            Some(HandoffReason::Conflict { obligations }) if obligations.len() == 2
+        ));
+        assert!(matches!(
+            ok(check(Some("blocked"), Some("n"), Some("Decision"), 0, &["a", "b"])),
+            Some(HandoffReason::Decision { options }) if options == ["a", "b"]
+        ));
+        assert_eq!(ok(check(Some("implemented"), None, None, 0, &[])), None);
+        assert_eq!(ok(check(None, None, None, 0, &[])), None);
+    }
+
+    #[test]
+    fn an_incomplete_or_misplaced_reason_is_refused() {
+        let err = |r: anyhow::Result<Option<HandoffReason>>| r.unwrap_err().to_string();
+        // Both a reason and a note.
+        assert!(err(check(Some("blocked"), Some("n"), None, 0, &[])).contains("--reason"));
+        assert!(err(check(Some("partial"), None, Some("access"), 0, &[])).contains("--note"));
+        // A conflict names what conflicts; a decision offers the choices.
+        assert!(err(check(Some("blocked"), Some("n"), Some("conflict"), 1, &[])).contains("--cites"));
+        assert!(err(check(Some("blocked"), Some("n"), Some("decision"), 0, &["a"])).contains("--option"));
+        assert!(err(check(Some("blocked"), Some("n"), Some("access"), 2, &[])).contains("--cites"));
+        assert!(err(check(Some("blocked"), Some("n"), Some("conflict"), 2, &["a"])).contains("--option"));
+        // Not a reason there is.
+        assert!(err(check(Some("blocked"), Some("n"), Some("too-big"), 0, &[])).contains("unknown reason"));
+        // Only for a step left for the user.
+        assert!(check(Some("implemented"), Some("n"), None, 0, &[]).is_err());
+        assert!(check(None, None, Some("access"), 0, &[]).is_err());
     }
 }

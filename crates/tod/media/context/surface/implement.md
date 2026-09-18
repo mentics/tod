@@ -116,14 +116,31 @@ of a step, needing to run the app to check it, or a missing credential you can
 work around with fixtures never needs the user. When something does:
 
 - Mark the step `partial` if you did part of it, `blocked` if none of it was
-  possible, and give it a note (`--note`) saying what is left and exactly how
-  the user can unblock it — what to decide, what to add and where. The user
-  acts on the note, so make it complete on its own.
+  possible, and give it a reason and a note (`--reason`, `--note`). The
+  reasons are a closed set, and the app offers the user a way to answer each:
+  - `conflict` — obligations that cannot all hold. Cite every one of them;
+    the user decides which stands.
+  - `decision` — a choice the obligations leave open that is not yours to
+    make. List the options you see; the user picks one.
+  - `access` — a secret, account, or permission you do not have.
+  - `external` — waiting on something outside this node.
+- The note says what is left and exactly how the user can unblock it — what
+  to decide, what to add and where. The user acts on it, so make it complete
+  on its own.
+- None of these is a reason: a step is large, you are not sure how to do it,
+  or code that already exists — including code you wrote earlier in this plan
+  — does not fit an obligation. Existing code is never a requirement: extend
+  it or replace it. A conflict is between obligations, never between an
+  obligation and the code.
 - A step that is already `partial` or `blocked` when you get to it is yours to
-  reconsider, not to leave alone. Read its note: if what held it up no longer
-  holds, or you can do more of it now, set it back to `in_progress` and carry
-  on. Keep it only if it still needs the user, with its note brought up to
-  date.
+  reconsider, not to leave alone. Read its reason and note: if what held it up
+  no longer holds, or you can do more of it now, set it back to `in_progress`
+  and carry on. Keep it only if it still needs the user, with its reason and
+  note brought up to date.
+- When the user answers one — settles a conflict, picks an option, supplies
+  access — the app sets the step back to `in_progress` and tells you the
+  answer. Act on it; where the answer changes what an obligation says, update
+  the obligation to match.
 
 ## Your reply
 

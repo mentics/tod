@@ -199,6 +199,10 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         row
     };
     // Why a partial or blocked step stopped, and how to unblock it.
+    let reason = step
+        .reason
+        .as_ref()
+        .map(|reason| div().text_xs().text_color(status_color).child(reason.label()));
     let note = step.note.as_ref().map(|note| {
         div().text_xs().text_color(status_color).child(selectable_text(
             ("plan-step-note", row_ix),
@@ -211,6 +215,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         .child(header)
         .children(editor)
         .children(body)
+        .children(reason)
         .children(note)
         .children(links("depends on", depends_on))
         .children(links("satisfies", satisfies))

@@ -170,13 +170,16 @@ pub enum OutlineMutation {
         step_id: Uuid,
         body: String,
     },
-    /// Set a step's status and its note: why a `partial` or `blocked` step
-    /// stopped short. Any status change replaces the note; `None` clears it.
+    /// Set a step's status and its note and reason: why a `partial` or
+    /// `blocked` step needs the user. Any status change replaces both; `None`
+    /// clears them.
     UpdatePlanStepStatus {
         step_id: Uuid,
         status: String,
         #[serde(default)]
         note: Option<String>,
+        #[serde(default)]
+        reason: Option<crate::outline::repos::plan_steps::HandoffReason>,
     },
     DeletePlanStep {
         step_id: Uuid,
@@ -601,8 +604,14 @@ impl OutlineMutation {
                 step_id,
                 status,
                 note,
+                reason,
             } => {
-                PlanStepRepo::new(conn).update_status(*step_id, status, note.as_deref())?;
+                PlanStepRepo::new(conn).update_status(
+                    *step_id,
+                    status,
+                    note.as_deref(),
+                    reason.as_ref(),
+                )?;
             }
             OutlineMutation::DeletePlanStep { step_id } => {
                 PlanStepRepo::new(conn).delete(*step_id)?;
@@ -966,6 +975,7 @@ fn restore_plan_step(
         body,
         status,
         note,
+        reason,
         depends_on,
         satisfies,
     } = snapshot
@@ -987,8 +997,15 @@ fn restore_plan_step(
     repo.insert_at(id, *node_id, index_from_ordinal(*ordinal), body)?;
     // Set directly: restoring is not a status change, so nothing is promoted.
     conn.execute(
-        "UPDATE node_plan_steps SET status = ?1, note = ?2 WHERE id = ?3",
-        params![status, note, uuid_to_blob(id)],
+        "UPDATE node_plan_steps SET status = ?1, note = ?2, reason = ?3 WHERE id = ?4",
+        params![
+            status,
+            note,
+            reason
+                .as_ref()
+                .map(|reason| serde_json::to_string(reason).expect("a handoff reason serializes")),
+            uuid_to_blob(id)
+        ],
     )?;
     for dep in depends_on {
         if repo.get(*dep)?.is_some() {

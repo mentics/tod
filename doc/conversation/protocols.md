@@ -181,9 +181,22 @@ wrote as it worked, through `tod-cli`:
 
 - **Plan steps.** It closes each finished step (`plan update --status
   implemented`). A step that needs the user it marks `partial` (done as far
-  as it could go) or `blocked` (nothing could be done), with a `--note`
-  saying what is left and how the user unblocks it; the note is shown under
-  the step in the side pane.
+  as it could go) or `blocked` (nothing could be done), with a `--reason`
+  and a `--note` saying what is left and how the user unblocks it. The
+  reason is a closed set (`HandoffReason`, stored as JSON in
+  `node_plan_steps.reason`, schema v42), each with what the user needs to
+  answer it:
+  - `conflict` — obligations that cannot all hold, cited by id (two or more);
+  - `decision` — a choice the obligations leave open, with the options (two
+    or more);
+  - `access` — a secret, account, or permission the agent lacks;
+  - `external` — waiting on something outside the node.
+
+  A step's size, not knowing how, or existing code that does not fit an
+  obligation are deliberately not reasons: the context tells the agent that
+  existing code is never a requirement, and a conflict is between
+  obligations. `tod-cli` refuses a conflict without citations or a decision
+  without options.
 - **The test run.** After its last change in a turn it runs the tests and
   records the counts: `tests record --command <cmd> --passed N [--failed N]
   [--errors N]`, stored in `conversation_reports` as a `TestRun`. The latest
@@ -257,7 +270,17 @@ done-check reads, so the user sees what the gate sees. Below them, the files
 changed in the worktree (`git status --porcelain`, refreshed when a turn
 finishes). A header strip carries the latest recorded test run's counts
 ("24 passed", "22 passed, 2 failed" in the error color) — nothing until the
-agent records one — and the loop's continuation count.
+agent records one — and the loop's continuation count, and says how many
+steps need the user.
+
+Under each `partial` or `blocked` step: its reason, its note, and a way to
+answer by reason — for a conflict, each cited obligation's text with
+**Keep**; for a decision, each option with **Choose**; for access or
+something external, **Retry**. Answering sends the agent a message saying
+what the user decided (`implement::handoff_answer_message`, which carries the
+note along) and, once it has gone out, sets the step back to `in_progress`
+as the user's edit, which starts the loop again. A step handed back before
+reasons existed shows its note alone; the message input answers it.
 
 ## 5. View changes
 

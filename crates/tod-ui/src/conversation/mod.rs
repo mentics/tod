@@ -84,8 +84,8 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
-use tod_store::outline::repos::plan_steps::PLAN_STEP_STATUSES;
-use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
+use tod_store::outline::repos::plan_steps::{HandoffReason, PLAN_STEP_STATUSES};
+use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -255,6 +255,9 @@ pub(crate) struct Snapshot {
     pub protocol: ProtocolKind,
     /// The focus node's plan steps, for protocols whose side pane shows them.
     pub plan: Vec<PlanStep>,
+    /// The text of every obligation a conflicting plan step cites, so the
+    /// side pane can show them side by side.
+    pub cited: HashMap<Uuid, String>,
     /// The latest report the conversation's agent recorded (for
     /// implementation, its test run).
     pub report: Option<serde_json::Value>,
@@ -817,6 +820,17 @@ impl ConversationView {
                 ),
                 _ => (Vec::new(), None),
             };
+            let obligations = ObligationRepo::new(conn);
+            let mut cited = HashMap::new();
+            for step in &plan {
+                if let Some(HandoffReason::Conflict { obligations: ids }) = &step.reason {
+                    for id in ids {
+                        if let Some(o) = obligations.get(*id)? {
+                            cited.insert(*id, o.body);
+                        }
+                    }
+                }
+            }
             let new_kinds = new_kinds(conn, selection.node, focus)?;
             Ok(Snapshot {
                 new_kinds,
@@ -830,6 +844,7 @@ impl ConversationView {
                 node_titles,
                 protocol,
                 plan,
+                cited,
                 report,
             })
         });
@@ -947,16 +962,25 @@ impl ConversationView {
     }
 
     fn send(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deliver(text, cx) {
+            self.transcript
+                .update(cx, |panel, cx| panel.clear_input(window, cx));
+        }
+    }
+
+    /// Send `text` as the user's message, leaving the input as it is; `true`
+    /// when it went out.
+    fn deliver(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
         let text = text.trim().to_string();
         if text.is_empty() {
-            return;
+            return false;
         }
         let ix = match self.ensure_current_driver() {
             Ok(ix) => ix,
             Err(err) => {
                 self.error = Some(err.into());
                 cx.notify();
-                return;
+                return false;
             }
         };
         let result = match self.agent.lock() {
@@ -965,18 +989,21 @@ impl ConversationView {
                 .map_err(|e| format!("{e:#}")),
             Err(_) => Err("the agent is unavailable".to_string()),
         };
-        match result {
+        let sent = match result {
             Ok(()) => {
                 self.error = None;
                 self.conversation_id = self.drivers[ix].conversation_id();
                 self.status = self.drivers[ix].status();
-                self.transcript
-                    .update(cx, |panel, cx| panel.clear_input(window, cx));
+                true
             }
-            Err(err) => self.error = Some(err.into()),
-        }
+            Err(err) => {
+                self.error = Some(err.into());
+                false
+            }
+        };
         self.reload();
         cx.notify();
+        sent
     }
 
     fn stop_turn(&mut self, cx: &mut Context<Self>) {

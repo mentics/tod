@@ -10,6 +10,8 @@ const SWITCHES: &[&str] = &["--before", "--append", "--inherited"];
 pub struct Args {
     pub positional: Vec<String>,
     flags: HashMap<String, String>,
+    /// Every flag value in order, repeats included, for [`Args::get_all`].
+    all: Vec<(String, String)>,
     switches: Vec<String>,
 }
 
@@ -47,6 +49,7 @@ impl Args {
                     stdin_flag = Some(arg);
                 }
                 out.flags.insert(arg.clone(), value.clone());
+                out.all.push((arg.clone(), value.clone()));
             } else {
                 out.positional.push(arg.clone());
             }
@@ -59,12 +62,27 @@ impl Args {
                 anyhow::bail!("{flag} - read nothing from stdin");
             }
             out.flags.insert(flag.clone(), text.to_string());
+            for (name, value) in &mut out.all {
+                if name == flag && value == "-" {
+                    *value = text.to_string();
+                }
+            }
         }
         Ok(out)
     }
 
     pub fn get(&self, flag: &str) -> Option<&str> {
         self.flags.get(flag).map(String::as_str)
+    }
+
+    /// Every value a repeatable flag was given, in order. [`Args::get`] sees
+    /// only the last.
+    pub fn get_all(&self, flag: &str) -> Vec<&str> {
+        self.all
+            .iter()
+            .filter(|(name, _)| name == flag)
+            .map(|(_, value)| value.as_str())
+            .collect()
     }
 
     pub fn require(&self, flag: &str) -> anyhow::Result<&str> {
