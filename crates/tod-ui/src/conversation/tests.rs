@@ -1362,3 +1362,81 @@ fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
     // The change set's own cursor is untouched.
     assert_eq!(view.read_with(cx, |v, _| v.cursor), None);
 }
+
+#[gpui::test]
+fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
+    use tod_store::outline::repos::plan_steps::{PLAN_STEP_STATUSES, STATUS_BLOCKED, STATUS_READY};
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let step = fixture.steps[0];
+    let status_of = |fixture: &Fixture| {
+        fixture
+            .store
+            .read(|conn| Ok(PlanStepRepo::new(conn).get(step)?.unwrap().status))
+            .unwrap()
+    };
+    let (view, _, cx) = open_view(&fixture, node, cx);
+
+    // Unsaved: Enter on the highlighted step opens the dropdown on its
+    // current status; the last entry is `blocked`.
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Implementation, false, window, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
+    });
+    draw(cx);
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationActivate);
+    let before = status_of(&fixture);
+    view.read_with(cx, |v, _| {
+        let menu = v.status_menu.expect("Enter opens the dropdown");
+        assert_eq!(menu.step, step);
+        assert_eq!(PLAN_STEP_STATUSES[menu.highlighted], before);
+    });
+    draw(cx);
+    for _ in 0..PLAN_STEP_STATUSES.len() {
+        cx.dispatch_action(ConversationDown);
+    }
+    cx.dispatch_action(ConversationActivate);
+    assert_eq!(status_of(&fixture), STATUS_BLOCKED);
+    view.read_with(cx, |v, _| {
+        assert!(v.status_menu.is_none());
+        assert_eq!(v.data.plan[0].status, STATUS_BLOCKED);
+    });
+
+    // Escape closes it without a change.
+    cx.dispatch_action(ConversationActivate);
+    cx.dispatch_action(ConversationUp);
+    cx.dispatch_action(ConversationEscape);
+    assert!(view.read_with(cx, |v, _| v.status_menu.is_none()));
+    assert_eq!(status_of(&fixture), STATUS_BLOCKED);
+
+    // In a saved conversation the choice is the user's recorded edit, so it
+    // shows in the change set and can be reversed.
+    let id = Uuid::new_v4();
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::CreateConversation {
+                id,
+                protocol: ProtocolKind::Implementation,
+                focus: node,
+                platform: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+    view.update(cx, |view, cx| {
+        view.show(node, Some(id), false, cx);
+        view.choose_status(step, STATUS_READY, cx);
+    });
+    assert_eq!(status_of(&fixture), STATUS_READY);
+    let changed = changes(&view, cx);
+    assert!(
+        changed
+            .iter()
+            .any(|c| change_set::key_of(c) == (ItemEntity::PlanStep, step)),
+        "the status change is in the change set: {changed:?}"
+    );
+}

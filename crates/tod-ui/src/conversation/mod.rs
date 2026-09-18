@@ -84,6 +84,7 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
+use tod_store::outline::repos::plan_steps::PLAN_STEP_STATUSES;
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use uuid::Uuid;
 
@@ -317,6 +318,8 @@ pub struct ConversationView {
     /// The highlighted row of a side pane other than the change set: plan
     /// steps first, then changed files.
     side_cursor: Option<usize>,
+    /// The plan-step status dropdown, while open.
+    status_menu: Option<side_pane::StatusMenu>,
     side_scroll: ScrollHandle,
     side_scroll_pending: bool,
 
@@ -440,6 +443,7 @@ impl ConversationView {
             confirm: None,
             change_scroll: ScrollHandle::new(),
             side_cursor: None,
+            status_menu: None,
             side_scroll: ScrollHandle::new(),
             side_scroll_pending: false,
             scroll_to_cursor: false,
@@ -532,6 +536,7 @@ impl ConversationView {
             self.data = Snapshot::default();
             self.cursor = None;
             self.side_cursor = None;
+            self.status_menu = None;
             self.link = None;
             self.selected.clear();
             self.expanded.clear();
@@ -1005,6 +1010,9 @@ impl ConversationView {
             cx.notify();
             return;
         }
+        if self.move_status_menu(delta, cx) {
+            return;
+        }
         match self.pane {
             Pane::Transcript => {
                 if self.stop == Stop::Transcript {
@@ -1061,6 +1069,10 @@ impl ConversationView {
             self.choose_picker_entry(ix, window, cx);
             return;
         }
+        if let Some(menu) = self.status_menu {
+            self.choose_status(menu.step, PLAN_STEP_STATUSES[menu.highlighted], cx);
+            return;
+        }
         match self.pane {
             Pane::Transcript => match self.stop {
                 Stop::Back => self.go_back(window, cx),
@@ -1076,6 +1088,12 @@ impl ConversationView {
                 }
             },
             Pane::Context => {}
+            Pane::ChangeSet if self.data.protocol == ProtocolKind::Implementation => {
+                // A highlighted plan step's Enter opens its status dropdown.
+                if let Some(step) = self.side_cursor.and_then(|ix| self.data.plan.get(ix)) {
+                    self.open_status_menu(step.id, cx);
+                }
+            }
             Pane::ChangeSet => {
                 if self.open_highlighted_link(cx) {
                     return;
@@ -1098,7 +1116,7 @@ impl ConversationView {
         if self.confirm.take().is_some() {
             cx.notify();
         } else if self.close_nav_menu(cx) {
-        } else if self.picker.take().is_some() {
+        } else if self.picker.take().is_some() || self.status_menu.take().is_some() {
             cx.notify();
         } else if self.pane == Pane::Context {
             self.focus_pane(Pane::ChangeSet, window, cx);
