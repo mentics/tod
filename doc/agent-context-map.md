@@ -193,7 +193,8 @@ which surface it is serving.
 
 3 Implementation session
   stance/autonomous-session, domain/outline, domain/obligations, domain/plan,
-  domain/lifecycle, cli/intro, cli/obligations, cli/plan, surface/implement
+  domain/lifecycle, cli/intro, cli/obligations, cli/plan, cli/tests,
+  cli/secrets, surface/implement
   dyn: DataRoot, Node, Plan, NodeObligations, AncestorObligations, Workspace
 
 4 Gate check

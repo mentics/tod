@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 40;
+pub const CURRENT_USER_VERSION: i32 = 41;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -298,6 +298,11 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 40 {
         migrate_v39_to_v40(conn)?;
         conn.pragma_update(None, "user_version", 40)?;
+    }
+    let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version < 41 {
+        migrate_v40_to_v41(conn)?;
+        conn.pragma_update(None, "user_version", 41)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -677,6 +682,64 @@ fn migrate_v39_to_v40(conn: &Connection) -> Result<()> {
         WHERE agent_session_id IS NOT NULL AND agent_session_id != '';
         ",
     )?;
+    Ok(())
+}
+
+/// Plan steps: the `partial` status (done as far as it can go without the
+/// user) and the `note` a `partial` or `blocked` step carries — what is left,
+/// and how to unblock it. `status`'s CHECK has to grow, which means a table
+/// rebuild; the table's own indexes and triggers are recreated as they were.
+fn migrate_v40_to_v41(conn: &Connection) -> Result<()> {
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'node_plan_steps'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_sql.contains("'partial'") {
+        return Ok(());
+    }
+    let dependents: Vec<String> = conn
+        .prepare(
+            "SELECT sql FROM sqlite_master
+             WHERE tbl_name = 'node_plan_steps' AND type IN ('index', 'trigger')
+               AND sql IS NOT NULL",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    // `node_plan_steps` is referenced by the dependency and obligation-link
+    // tables, and the pragma is a no-op inside a transaction.
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        CREATE TABLE node_plan_steps_v41 (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            ordinal      INTEGER NOT NULL,
+            body         TEXT NOT NULL,
+            status       TEXT NOT NULL CHECK (status IN
+                             ('pending','ready','in_progress','implemented','verified',
+                              'partial','blocked')),
+            note         TEXT,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            UNIQUE (node_id, ordinal)
+        );
+        INSERT INTO node_plan_steps_v41
+            (id, node_id, ordinal, body, status, created_at, updated_at)
+        SELECT id, node_id, ordinal, body, status, created_at, updated_at
+        FROM node_plan_steps;
+        DROP TABLE node_plan_steps;
+        ",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch("ALTER TABLE node_plan_steps_v41 RENAME TO node_plan_steps;")?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    for sql in &dependents {
+        tx.execute_batch(sql)?;
+    }
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
@@ -3818,6 +3881,106 @@ mod plan_step_migration_tests {
     /// A v35 store (main before the conversation view) — drafting tables, obligation mark columns, and the
     /// change-log triggers that read them — upgrades with its obligations and
     /// change log intact and nothing left naming the dropped columns.
+    /// v41 widens `node_plan_steps.status` to `partial` and adds `note`,
+    /// keeping every row and the table's own indexes and triggers.
+    #[test]
+    fn v41_adds_partial_and_note_to_plan_steps() {
+        use rusqlite::params;
+        let (dir, conn) = temp_db();
+        let dependents = |conn: &Connection| -> Vec<String> {
+            conn.prepare(
+                "SELECT type || ' ' || name FROM sqlite_master
+                 WHERE tbl_name = 'node_plan_steps' AND type IN ('index', 'trigger')
+                   AND sql IS NOT NULL ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        let before = dependents(&conn);
+        let dependent_sql: Vec<String> = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE tbl_name = 'node_plan_steps' AND type IN ('index', 'trigger')
+                   AND sql IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        // Put the table back in its v40 shape, dependents and all.
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys=OFF;
+            DROP TABLE node_plan_steps;
+            CREATE TABLE node_plan_steps (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                ordinal      INTEGER NOT NULL,
+                body         TEXT NOT NULL,
+                status       TEXT NOT NULL CHECK (status IN
+                                 ('pending','ready','in_progress','implemented','verified','blocked')),
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                UNIQUE (node_id, ordinal)
+            );
+            PRAGMA foreign_keys=ON;
+            ",
+        )
+        .unwrap();
+        for sql in &dependent_sql {
+            conn.execute_batch(sql).unwrap();
+        }
+        let node_id = uuid::Uuid::new_v4();
+        let step_id = uuid::Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO nodes (id, slug, title, created_at, updated_at)
+             VALUES (?1, 'x', 'x', 0, 0)",
+            params![uuid_to_blob(node_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node_plan_steps (id, node_id, ordinal, body, status, created_at, updated_at)
+             VALUES (?1, ?2, 1, 'keep me', 'blocked', 3, 4)",
+            params![uuid_to_blob(step_id), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+
+        migrate_v40_to_v41(&conn).unwrap();
+        // Running it again is harmless.
+        migrate_v40_to_v41(&conn).unwrap();
+
+        assert_eq!(dependents(&conn), before);
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT body, status, note FROM node_plan_steps WHERE id = ?1",
+                params![uuid_to_blob(step_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("keep me".into(), "blocked".into(), None));
+        conn.execute(
+            "UPDATE node_plan_steps SET status = 'partial', note = 'needs a key' WHERE id = ?1",
+            params![uuid_to_blob(step_id)],
+        )
+        .unwrap();
+        let fk_problems: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_problems, 0);
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn v37_upgrade_drops_drafting_and_obligation_marks() {
         use rusqlite::params;

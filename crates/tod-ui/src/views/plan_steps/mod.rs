@@ -692,6 +692,7 @@ impl PlanStepsView {
             .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
                 step_id: step.id,
                 status: next.to_string(),
+                note: None,
             })
         {
             crate::ui::toast::error_toast(window, cx, format!("Status update failed: {err}"));

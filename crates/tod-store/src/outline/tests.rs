@@ -978,6 +978,7 @@ fn plan_step_dependency_graph_and_obligation_links() {
         .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
             step_id: step_a,
             status: "implemented".into(),
+            note: None,
         })
         .unwrap();
     store.writer().flush().unwrap();

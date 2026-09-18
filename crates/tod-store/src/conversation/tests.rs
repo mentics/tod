@@ -211,6 +211,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
         ordinal: 1,
         body: String::new(),
         status: "pending".into(),
+        note: None,
         depends_on: vec![],
         satisfies: vec![],
     };
@@ -392,6 +393,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
             M::UpdatePlanStepStatus {
                 step_id: id(),
                 status: "ready".into(),
+                note: None,
             },
             Some(Edit),
         ),
@@ -967,6 +969,7 @@ fn plan_steps_round_trip_through_reversal() {
         M::UpdatePlanStepStatus {
             step_id: s2,
             status: "in_progress".into(),
+            note: None,
         },
         M::AddPlanStepDependency {
             step_id: s3,

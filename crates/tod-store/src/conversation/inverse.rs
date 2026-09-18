@@ -95,6 +95,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
             let EntitySnapshot::PlanStep {
                 body,
                 status,
+                note,
                 depends_on,
                 satisfies,
                 ..
@@ -107,6 +108,7 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
                 M::UpdatePlanStepStatus { .. } => M::UpdatePlanStepStatus {
                     step_id: id,
                     status,
+                    note,
                 },
                 // Put the edge back the way `before` had it.
                 M::AddPlanStepDependency {

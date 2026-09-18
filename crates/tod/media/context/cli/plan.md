@@ -4,7 +4,7 @@
 tod-cli --data-root <DATA_ROOT> plan list      [--node <NODE_UUID>] [--search <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan show      <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
-tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|blocked]
+tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|partial|blocked] [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan delete    <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan depend    <STEP_ID> --on <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan undepend  <STEP_ID> --on <STEP_ID>
@@ -23,6 +23,11 @@ constraint it fulfills — use `obligations list --node <NODE_UUID>` to find the
 obligation id if you weren't given it. `ready` lists the steps eligible to
 start now (status `ready`, or `pending` with every dependency
 `implemented`/`verified`).
+
+`--status partial` and `--status blocked` require `--note`: what is left and
+how the user can unblock it (use `--note -` and a heredoc for anything long).
+Setting any other status clears the note. `list` and `show` print a step's
+note on the line below it.
 
 If you change an obligation and existing plan steps depend on it or claim to
 satisfy it, check `plan list --node <NODE_UUID>` for steps whose `satisfies`

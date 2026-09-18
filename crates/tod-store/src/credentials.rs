@@ -21,6 +21,18 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    /// Every kind, in the order `tod-cli secrets list` shows them.
+    pub const ALL: [Self; 1] = [Self::LinearApiKey];
+
+    /// The name an agent uses for this secret (`tod-cli secrets`).
+    pub fn name(self) -> &'static str {
+        self.keyring_account()
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::LinearApiKey => "Linear API key",

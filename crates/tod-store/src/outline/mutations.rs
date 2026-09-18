@@ -170,9 +170,13 @@ pub enum OutlineMutation {
         step_id: Uuid,
         body: String,
     },
+    /// Set a step's status and its note: why a `partial` or `blocked` step
+    /// stopped short. Any status change replaces the note; `None` clears it.
     UpdatePlanStepStatus {
         step_id: Uuid,
         status: String,
+        #[serde(default)]
+        note: Option<String>,
     },
     DeletePlanStep {
         step_id: Uuid,
@@ -593,8 +597,12 @@ impl OutlineMutation {
             OutlineMutation::UpdatePlanStepBody { step_id, body } => {
                 PlanStepRepo::new(conn).update_body(*step_id, body)?;
             }
-            OutlineMutation::UpdatePlanStepStatus { step_id, status } => {
-                PlanStepRepo::new(conn).update_status(*step_id, status)?;
+            OutlineMutation::UpdatePlanStepStatus {
+                step_id,
+                status,
+                note,
+            } => {
+                PlanStepRepo::new(conn).update_status(*step_id, status, note.as_deref())?;
             }
             OutlineMutation::DeletePlanStep { step_id } => {
                 PlanStepRepo::new(conn).delete(*step_id)?;
@@ -957,6 +965,7 @@ fn restore_plan_step(
         ordinal,
         body,
         status,
+        note,
         depends_on,
         satisfies,
     } = snapshot
@@ -978,8 +987,8 @@ fn restore_plan_step(
     repo.insert_at(id, *node_id, index_from_ordinal(*ordinal), body)?;
     // Set directly: restoring is not a status change, so nothing is promoted.
     conn.execute(
-        "UPDATE node_plan_steps SET status = ?1 WHERE id = ?2",
-        params![status, uuid_to_blob(id)],
+        "UPDATE node_plan_steps SET status = ?1, note = ?2 WHERE id = ?3",
+        params![status, note, uuid_to_blob(id)],
     )?;
     for dep in depends_on {
         if repo.get(*dep)?.is_some() {

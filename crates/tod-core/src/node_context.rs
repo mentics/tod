@@ -135,8 +135,12 @@ pub fn plan_step_line(step: &PlanStep, deps: &[Uuid], obligations: &[Uuid]) -> S
                 .join(",")
         )
     };
+    let note = match &step.note {
+        Some(note) => format!(" (note: {})", one_line(note)),
+        None => String::new(),
+    };
     format!(
-        "[{}] {}{deps}{satisfies}: {}",
+        "[{}] {}{deps}{satisfies}: {}{note}",
         short_id(step.id),
         step.status,
         one_line(&step.body)

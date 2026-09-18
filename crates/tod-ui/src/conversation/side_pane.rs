@@ -118,12 +118,27 @@ impl ConversationView {
                             .flex_shrink_0()
                             .child(step.status.clone()),
                     )
-                    .child(div().flex_1().min_w_0().child(selectable_text(
-                        format!("plan-step-{}", step.id),
-                        step.body.clone(),
-                        window,
-                        cx,
-                    )))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(selectable_text(
+                                format!("plan-step-{}", step.id),
+                                step.body.clone(),
+                                window,
+                                cx,
+                            ))
+                            // Why a partial or blocked step stopped, and how
+                            // to unblock it: what the user acts on.
+                            .children(step.note.as_ref().map(|note| {
+                                style::text_dense_muted(div()).child(selectable_text(
+                                    format!("plan-step-note-{}", step.id),
+                                    note.clone(),
+                                    window,
+                                    cx,
+                                ))
+                            })),
+                    )
                     .into_any_element(),
             );
         }

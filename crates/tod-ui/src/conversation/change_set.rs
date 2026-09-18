@@ -250,6 +250,7 @@ pub(crate) fn field_diffs(
                 ordinal: o0,
                 body: b0,
                 status: st0,
+                note: no0,
                 depends_on: d0,
                 satisfies: sa0,
             }),
@@ -258,12 +259,14 @@ pub(crate) fn field_diffs(
                 ordinal: o1,
                 body: b1,
                 status: st1,
+                note: no1,
                 depends_on: d1,
                 satisfies: sa1,
             }),
         ) => {
             field("Text", b0.clone(), b1.clone());
             field("Status", st0.clone(), st1.clone());
+            field("Note", opt(no0), opt(no1));
             field("Depends on", ids(d0), ids(d1));
             field("Satisfies", ids(sa0), ids(sa1));
             field("Node", node(n0), node(n1));
@@ -305,6 +308,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             ordinal,
             body,
             status,
+            note,
             ..
         } => Some(PlanStep {
             id: change.id,
@@ -312,6 +316,7 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
             ordinal: *ordinal,
             body: body.clone(),
             status: status.clone(),
+            note: note.clone(),
         }),
         _ => None,
     }
