@@ -3,10 +3,11 @@ use std::rc::Rc;
 
 use crate::ui::drag_payload::ObligationDragPayload;
 use gpui::{
-    Context, Entity, InteractiveElement, MouseButton, ParentElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::Input;
 use gpui_component::input::InputState;
 use gpui_component::list::{ListDelegate, ListItem, ListState};
@@ -14,8 +15,9 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Sizable, StyledExt, h_flex};
 
+use super::TaskListView;
 use super::model::TaskItem;
-use super::row_menu::{RowMenuKind, row_menu_anchor};
+use super::row_menu::{RowMenuKind, popup_anchor, row_menu_anchor};
 
 /// Checkvist-style uniform tree row height.
 pub const TREE_ROW_HEIGHT: gpui::Pixels = gpui::px(28.0);
@@ -78,6 +80,13 @@ pub struct TaskListDelegate {
     inline_edit_input: Option<Entity<InputState>>,
     open_row_menu: Option<(RowMenuKind, String)>,
     row_menu: Option<Entity<PopupMenu>>,
+    /// Generator node whose filter popup is open, and the input it edits. The
+    /// popup is drawn by the generator's own row so it lands under the chip
+    /// that opened it.
+    generator_filter_open: Option<String>,
+    generator_filter_input: Option<Entity<InputState>>,
+    /// The view that owns this delegate, for row popups that drive it directly.
+    view: Option<WeakEntity<TaskListView>>,
     recently_updated: std::collections::HashSet<String>,
 }
 
@@ -92,6 +101,9 @@ impl TaskListDelegate {
             inline_edit_input: None,
             open_row_menu: None,
             row_menu: None,
+            generator_filter_open: None,
+            generator_filter_input: None,
+            view: None,
             recently_updated: std::collections::HashSet::new(),
         }
     }
@@ -107,6 +119,17 @@ impl TaskListDelegate {
     ) {
         self.open_row_menu = open;
         self.row_menu = menu;
+    }
+
+    pub fn set_generator_filter(
+        &mut self,
+        open: Option<String>,
+        input: Entity<InputState>,
+        view: WeakEntity<TaskListView>,
+    ) {
+        self.generator_filter_open = open;
+        self.generator_filter_input = Some(input);
+        self.view = Some(view);
     }
 
     pub fn set_inline_edit(
@@ -319,7 +342,7 @@ impl ListDelegate for TaskListDelegate {
                 },
             ));
             let task_id_filter = item.id.clone();
-            chips = chips.child(action_chip(
+            let filter_chip = action_chip(
                 cx,
                 border,
                 primary,
@@ -337,7 +360,16 @@ impl ListDelegate for TaskListDelegate {
                         });
                     }
                 },
-            ));
+            )
+            .into_any_element();
+            let filter_popup = (self.generator_filter_open.as_deref() == Some(item.id.as_str()))
+                .then(|| self.generator_filter_input.clone())
+                .flatten()
+                .zip(self.view.clone())
+                .map(|(input, view)| {
+                    generator_filter_popup(cx, input, item.id.clone(), view).into_any_element()
+                });
+            chips = chips.child(popup_anchor(filter_chip, filter_popup));
             match item.generator_status.as_deref() {
                 Some("in_progress") => {
                     chips = chips.child(
@@ -653,6 +685,61 @@ fn title_label(
         })
 }
 
+/// The generator's filter popup, drawn under its magnifying-glass chip. Clicks
+/// inside it stay inside; a mouse-down anywhere else dismisses it. Its buttons
+/// drive the view directly rather than through the row-action sink, so a
+/// dismissal always reaches the view that owns the popup.
+fn generator_filter_popup(
+    cx: &mut Context<ListState<TaskListDelegate>>,
+    input: Entity<InputState>,
+    task_id: String,
+    view: WeakEntity<TaskListView>,
+) -> impl gpui::IntoElement {
+    let border = cx.theme().border;
+    let background = cx.theme().background;
+    let muted_foreground = cx.theme().muted_foreground;
+    let clear_view = view.clone();
+    div()
+        .min_w(px(220.))
+        .p_2()
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .shadow_lg()
+        .rounded_md()
+        .v_flex()
+        .gap_1()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        .on_mouse_down_out(move |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.close_generator_filter(window, cx);
+            })
+            .ok();
+        })
+        .child(
+            div()
+                .text_xs()
+                .text_color(muted_foreground)
+                .child("Filter this generator's items"),
+        )
+        .child(Input::new(&input))
+        .child(
+            Button::new("generator-filter-clear")
+                .label("Clear")
+                .ghost()
+                .w_full()
+                .on_click(move |_, window, cx| {
+                    clear_view
+                        .update(cx, |this, cx| {
+                            this.clear_generator_filter(&task_id, window, cx);
+                        })
+                        .ok();
+                }),
+        )
+}
+
 fn action_chip(
     cx: &mut Context<ListState<TaskListDelegate>>,
     border: gpui::Hsla,
@@ -690,6 +777,9 @@ fn action_chip(
             cx.listener(move |_, _, _, cx| {
                 cx.stop_propagation();
                 on_click();
+                // The action only reaches the view when it renders and drains
+                // the sink, and nothing else here marks anything dirty.
+                cx.notify();
             }),
         )
 }
