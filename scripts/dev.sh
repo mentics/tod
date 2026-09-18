@@ -7,6 +7,6 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 cargo build --profile dev-fast -p tod -p tod-cli
-cargo build -p tod-cli
+# cargo build -p tod-cli
 # cargo run -p tod -- "$@"
 cargo run --profile dev-fast -p tod -- "$@"
