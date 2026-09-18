@@ -15,22 +15,31 @@ pub(super) enum RowMenuKind {
     Shells,
 }
 
-/// Anchor a standard popup menu under a row trigger.
-pub(super) fn row_menu_anchor(
+/// Anchor a popup under a row trigger: it hangs from the trigger's own corner,
+/// paints above the list, and swallows the clicks that land on it.
+pub(super) fn popup_anchor(
     trigger: impl IntoElement,
-    menu: Option<Entity<PopupMenu>>,
+    popup: Option<impl IntoElement>,
 ) -> impl IntoElement {
-    div().relative().child(trigger).when_some(menu, |el, menu| {
+    div().relative().child(trigger).when_some(popup, |el, popup| {
         el.child(
             deferred(
                 anchored()
                     .anchor(Anchor::TopLeft)
                     .snap_to_window_with_margin(px(8.))
-                    .child(div().occlude().mt_1().child(menu)),
+                    .child(div().occlude().mt_1().child(popup)),
             )
             .with_priority(1),
         )
     })
+}
+
+/// Anchor a standard popup menu under a row trigger.
+pub(super) fn row_menu_anchor(
+    trigger: impl IntoElement,
+    menu: Option<Entity<PopupMenu>>,
+) -> impl IntoElement {
+    popup_anchor(trigger, menu)
 }
 
 impl TaskListView {

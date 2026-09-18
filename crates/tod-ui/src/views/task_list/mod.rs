@@ -308,6 +308,10 @@ pub struct TaskListView {
     /// node is selected.
     recently_updated_copy_ids: std::collections::HashSet<String>,
     _list_subscription: Subscription,
+    /// Row chips push their action onto `action_sink` from the list's own
+    /// context, which notifies the list and not this view. Observing the list
+    /// is what makes the next render — and so the drain — happen.
+    _list_observation: Subscription,
     _compose_subscription: Subscription,
     _credential_subscription: Subscription,
     _inline_edit_subscription: Subscription,
@@ -383,6 +387,8 @@ impl TaskListView {
         let list_view = ListView::new(list_state.clone());
         let focus_handle = cx.focus_handle();
 
+        let _list_observation = cx.observe(&list_state, |_, _, cx| cx.notify());
+
         let _list_subscription = cx.subscribe(&list_state, |this, _state, event, cx| match event {
             // Keyboard navigation emits Select; clicks and Enter emit Confirm.
             ListEvent::Select(ix) => {
@@ -457,6 +463,7 @@ impl TaskListView {
             copied_managed_node_id: None,
             recently_updated_copy_ids: std::collections::HashSet::new(),
             _list_subscription,
+            _list_observation,
             _compose_subscription,
             _credential_subscription,
             _inline_edit_subscription,
@@ -747,8 +754,15 @@ impl TaskListView {
         let Some(generator_id) = self.generator_ancestor_id(task_id) else {
             return;
         };
-        if self.generator_filter_open.as_deref() == Some(generator_id.as_str()) {
-            self.generator_filter_open = None;
+        let was_open = self.generator_filter_open.as_deref() == Some(generator_id.as_str());
+        // One popup at a time.
+        self.close_sort_menu(cx);
+        self.close_row_menu(cx);
+        self.generator_filter_open = None;
+        if was_open {
+            if !self.is_editing() {
+                self.focus_handle.focus(window, cx);
+            }
         } else {
             let current = self
                 .working_set
@@ -762,7 +776,48 @@ impl TaskListView {
             });
             self.generator_filter_open = Some(generator_id);
         }
+        self.sync_delegate_generator_filter(cx);
         cx.notify();
+    }
+
+    /// Mirror the open filter popup into the delegate, which draws it under the
+    /// generator row's own chip.
+    fn sync_delegate_generator_filter(&mut self, cx: &mut Context<Self>) {
+        let open = self.generator_filter_open.clone();
+        let input = self.generator_filter_input.clone();
+        let view = cx.weak_entity();
+        self.list_state.update(cx, |state, _| {
+            state.delegate_mut().set_generator_filter(open, input, view);
+        });
+    }
+
+    fn close_generator_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.generator_filter_open.take().is_none() {
+            return;
+        }
+        self.sync_delegate_generator_filter(cx);
+        if !self.is_editing() {
+            self.focus_handle.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_generator_filter(
+        &mut self,
+        generator_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generator_filter_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.working_set
+            .generator_sorts
+            .entry(generator_id.to_string())
+            .or_default()
+            .filter_query = String::new();
+        self.persist_working_set();
+        self.rebuild_visible_list(window, cx);
     }
 
     fn sync_generator_filter_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1818,6 +1873,8 @@ impl TaskListView {
             self.close_compose(window, cx);
         } else if self.credential_prompt_open {
             self.cancel_credential_prompt(window, cx);
+        } else if self.generator_filter_open.is_some() {
+            self.close_generator_filter(window, cx);
         } else if self.sort_menu_open {
             self.close_sort_menu(cx);
         } else if self.open_row_menu.is_some() {
@@ -2568,54 +2625,6 @@ impl TaskListView {
         )
     }
 
-    fn render_generator_filter_overlay(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<impl gpui::IntoElement> {
-        let generator_id = self.generator_filter_open.clone()?;
-        let theme = cx.theme();
-        Some(
-            div()
-                .absolute()
-                .top_10()
-                .right_3()
-                .min_w_48()
-                .p_2()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                .shadow_lg()
-                .rounded_md()
-                .v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Filter this generator's items"),
-                )
-                .child(Input::new(&self.generator_filter_input))
-                .child(
-                    Button::new("generator-filter-clear")
-                        .label("Clear")
-                        .ghost()
-                        .w_full()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.generator_filter_input.update(cx, |input, cx| {
-                                input.set_value("", window, cx);
-                            });
-                            this.working_set
-                                .generator_sorts
-                                .entry(generator_id.clone())
-                                .or_default()
-                                .filter_query = String::new();
-                            this.persist_working_set();
-                            this.rebuild_visible_list(window, cx);
-                        })),
-                ),
-        )
-    }
-
     fn body_state(&self, cx: &Context<Self>) -> BodyState {
         let total = self.all_tasks.len();
         let visible_count = self.list_state.read(cx).delegate().items_count();
@@ -2820,9 +2829,6 @@ impl Render for TaskListView {
             .child(self.render_header(window, cx))
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
-            .when_some(self.render_generator_filter_overlay(cx), |el, menu| {
-                el.child(menu)
-            })
             .when(self.credential_prompt_open, |el| {
                 el.child(self.render_credential_prompt_overlay(cx))
             });
