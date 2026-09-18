@@ -13,15 +13,177 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div,
+    Anchor, AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
-use gpui_component::{h_flex, v_flex};
+use gpui_component::{Icon, Sizable, h_flex, v_flex};
+use gpui_kit_assets::IconName;
 use tod_core::conversation::implement::TestRun;
 use tod_store::conversation::ProtocolKind;
-use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
+use tod_store::interview::InterviewCommand;
+use tod_store::outline::OutlineMutation;
+use tod_store::outline::repos::plan_steps::{
+    PLAN_STEP_STATUSES, STATUS_IMPLEMENTED, STATUS_VERIFIED,
+};
+use uuid::Uuid;
+
+/// The status dropdown open on one plan step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct StatusMenu {
+    pub step: Uuid,
+    /// Index into [`PLAN_STEP_STATUSES`].
+    pub highlighted: usize,
+}
 
 impl ConversationView {
+    /// Open the status dropdown on `step`, highlighting its current status.
+    pub(super) fn open_status_menu(&mut self, step: Uuid, cx: &mut Context<Self>) {
+        let Some(current) = self.data.plan.iter().find(|s| s.id == step) else {
+            return;
+        };
+        let highlighted = PLAN_STEP_STATUSES
+            .iter()
+            .position(|s| *s == current.status)
+            .unwrap_or(0);
+        self.pane = Pane::ChangeSet;
+        self.picker = None;
+        self.status_menu = Some(StatusMenu { step, highlighted });
+        cx.notify();
+    }
+
+    /// Move the open status dropdown's highlight; `false` when none is open.
+    pub(super) fn move_status_menu(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.status_menu.as_mut() else {
+            return false;
+        };
+        let last = PLAN_STEP_STATUSES.len() as isize - 1;
+        menu.highlighted = (menu.highlighted as isize + delta).clamp(0, last) as usize;
+        cx.notify();
+        true
+    }
+
+    /// Set `step`'s status as the user. In a saved conversation it is recorded
+    /// as the user's edit, so it can be reversed and the agent hears of it;
+    /// before the first message there is no conversation to record it in.
+    pub(super) fn choose_status(&mut self, step: Uuid, status: &str, cx: &mut Context<Self>) {
+        self.status_menu = None;
+        let unchanged = self
+            .data
+            .plan
+            .iter()
+            .any(|s| s.id == step && s.status == status);
+        if !unchanged {
+            let mutation = OutlineMutation::UpdatePlanStepStatus {
+                step_id: step,
+                status: status.to_string(),
+            };
+            self.command(match self.conversation_id {
+                Some(conversation_id) => InterviewCommand::ConversationEdit {
+                    conversation_id,
+                    mutation,
+                },
+                None => InterviewCommand::Outline {
+                    mutation,
+                    target: None,
+                },
+            });
+            self.reload();
+        }
+        cx.notify();
+    }
+
+    /// A plan step's status badge: click it for the dropdown of the others.
+    fn render_status_badge(
+        &mut self,
+        step: Uuid,
+        status: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let menu = self
+            .status_menu
+            .filter(|m| m.step == step)
+            .map(|m| self.render_status_menu(m, status, cx));
+        div()
+            .id(ElementId::Name(format!("plan-status-{step}").into()))
+            .relative()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.status_menu.take().is_none_or(|m| m.step != step) {
+                        this.open_status_menu(step, cx);
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                style::badge(h_flex())
+                    .items_center()
+                    .gap(style::space::HAIRLINE)
+                    .child(status.to_string())
+                    .child(Icon::new(IconName::ChevronDown).xsmall()),
+            )
+            .when_some(menu, |el, menu| {
+                el.child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopLeft)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(div().occlude().mt_1().child(menu)),
+                    )
+                    .with_priority(1),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_status_menu(
+        &self,
+        menu: StatusMenu,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let step = menu.step;
+        let mut list = style::floating_panel(v_flex())
+            .id("plan-status-menu")
+            .min_w(px(160.))
+            .gap(style::space::HAIRLINE)
+            .px(style::space::INLINE)
+            .py(style::space::INLINE)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.status_menu = None;
+                cx.notify();
+            }));
+        for (ix, status) in PLAN_STEP_STATUSES.iter().copied().enumerate() {
+            list = list.child(
+                style::menu_item(h_flex(), ix == menu.highlighted)
+                    .id(ElementId::Name(format!("plan-status-{status}").into()))
+                    .w_full()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.choose_status(step, status, cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .flex_shrink_0()
+                            .when(status == current, |el| {
+                                el.child(Icon::new(IconName::Check).xsmall())
+                            }),
+                    )
+                    .child(div().flex_1().child(status)),
+            );
+        }
+        list.into_any_element()
+    }
+
     /// The side pane for whichever protocol runs the open conversation.
     pub(super) fn render_side_pane(
         &mut self,
@@ -104,8 +266,23 @@ impl ConversationView {
             }
         }
 
+        // A menu left open on a step that has since gone closes.
+        if self
+            .status_menu
+            .is_some_and(|m| !self.data.plan.iter().any(|s| s.id == m.step))
+        {
+            self.status_menu = None;
+        }
+
         let mut rows: Vec<AnyElement> = Vec::new();
-        for (n, step) in self.data.plan.iter().enumerate() {
+        let steps: Vec<(Uuid, String, String)> = self
+            .data
+            .plan
+            .iter()
+            .map(|s| (s.id, s.status.clone(), s.body.clone()))
+            .collect();
+        for (n, (id, status, body)) in steps.into_iter().enumerate() {
+            let badge = self.render_status_badge(id, &status, cx);
             rows.push(
                 h_flex()
                     .when(lit(n), style::highlighted)
@@ -113,14 +290,10 @@ impl ConversationView {
                     .px(style::space::RELATED)
                     .py(style::space::INLINE)
                     .items_start()
-                    .child(
-                        style::badge(div())
-                            .flex_shrink_0()
-                            .child(step.status.clone()),
-                    )
+                    .child(badge)
                     .child(div().flex_1().min_w_0().child(selectable_text(
-                        format!("plan-step-{}", step.id),
-                        step.body.clone(),
+                        format!("plan-step-{id}"),
+                        body,
                         window,
                         cx,
                     )))
