@@ -81,6 +81,8 @@ struct Run {
     chars_at_start: u64,
     /// The session's name, as sent with the turn.
     title: String,
+    /// The session's id is stored on the conversation.
+    session_saved: bool,
 }
 
 pub struct ConversationDriver {
@@ -314,11 +316,14 @@ impl ConversationDriver {
             Some(AgentRunState::InFlight(activity)) => {
                 self.activity = activity;
                 self.permission = None;
-                return Ok(());
+                return self.save_session_id(fleet, agent);
             }
             Some(AgentRunState::NeedsPermission(request)) => {
+                // Otherwise the view keeps showing the tool that asked, as
+                // if it were still running.
+                self.activity = Some(format!("Waiting for your permission: {}", request.title));
                 self.permission = Some(request);
-                return Ok(());
+                return self.save_session_id(fleet, agent);
             }
             Some(AgentRunState::Success(reply)) => Ok(reply.unwrap_or_default()),
             Some(AgentRunState::Failure(message)) => Err(message),
@@ -568,9 +573,11 @@ impl ConversationDriver {
         let cold_resume = resume.is_some();
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
+            let mut turn_env = self.protocol.turn_env(&env);
+            turn_env.extend(tod_cli_path_env());
             (
                 self.protocol.cwd(&env)?,
-                self.protocol.turn_env(&env),
+                turn_env,
                 self.protocol.progress(&env).ok().flatten(),
             )
         };
@@ -605,7 +612,33 @@ impl ConversationDriver {
             cold_resume,
             chars_at_start,
             title,
+            session_saved: false,
         });
+        Ok(())
+    }
+
+    /// Store the session's id on the conversation as soon as the agent has
+    /// given one, not when the turn ends: a turn that never ends still leaves
+    /// the session resumable.
+    fn save_session_id(&mut self, fleet: &FleetStore, agent: &dyn AgentProvider) -> Result<()> {
+        let (Some(run), Some(id)) = (self.run.as_mut(), self.conversation_id) else {
+            return Ok(());
+        };
+        if run.session_saved {
+            return Ok(());
+        }
+        let Some(session) = agent.session_id(&run.key) else {
+            return Ok(());
+        };
+        run.session_saved = true;
+        fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::SetConversationSession {
+                conversation_id: id,
+                agent_session_id: Some(session),
+                session_name: Some(run.title.clone()),
+            },
+        )?;
         Ok(())
     }
 
@@ -654,5 +687,38 @@ fn join(changes: &str, text: &str) -> String {
         text.to_string()
     } else {
         format!("{}\n\n# Message\n\n{text}", changes.trim_end())
+    }
+}
+
+/// `PATH` with the directory holding the installed `tod-cli` first, so the
+/// agent's `tod-cli` resolves to the one next to this app — never a build in
+/// some other checkout it went looking for. Empty when there is no such
+/// binary (tests, or a broken install).
+fn tod_cli_path_env() -> Option<(String, String)> {
+    let cli = crate::interview::tod_cli_path();
+    let dir = cli.parent().filter(|_| cli.is_file())?;
+    Some(("PATH".to_string(), prepend_path(dir, std::env::var_os("PATH"))?))
+}
+
+fn prepend_path(dir: &std::path::Path, path: Option<std::ffi::OsString>) -> Option<String> {
+    let mut dirs = vec![dir.to_path_buf()];
+    if let Some(path) = path {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(dirs).ok()?.into_string().ok()
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::prepend_path;
+    use std::path::Path;
+
+    #[test]
+    fn the_tod_cli_directory_goes_first_on_path() {
+        let dir = Path::new("tod-bin");
+        let rest = std::env::join_paths(["a", "b"]).unwrap();
+        let path = prepend_path(dir, Some(rest)).unwrap();
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(dirs, [Path::new("tod-bin"), Path::new("a"), Path::new("b")]);
     }
 }

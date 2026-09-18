@@ -1,6 +1,6 @@
 use super::provider::{
-    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, RunId, SessionPurpose,
-    SessionTurn,
+    AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, PermissionOption,
+    PermissionRequest, RunId, SessionPurpose, SessionTurn,
 };
 use crate::ReplyPart;
 use crate::agent_launch::AgentLaunchOptions;
@@ -56,6 +56,8 @@ pub struct MockAgentProvider {
     runs: HashMap<RunId, AgentRunState>,
     /// Runs the handler is still playing: kind, session key, and the result.
     pending: HashMap<RunId, (AgentRunKind, String, mpsc::Receiver<Result<MockReply, String>>)>,
+    /// Runs held on a permission request, and how to release them.
+    gated: HashMap<RunId, (PermissionRequest, mpsc::Sender<()>)>,
     /// Where each run's traffic is filed.
     run_agent: HashMap<RunId, TrafficTag>,
     fleet_run_sessions: HashMap<RunId, String>,
@@ -82,6 +84,7 @@ impl MockAgentProvider {
         Self {
             runs: HashMap::new(),
             pending: HashMap::new(),
+            gated: HashMap::new(),
             run_agent: HashMap::new(),
             fleet_run_sessions: HashMap::new(),
             sessions: HashMap::new(),
@@ -257,7 +260,29 @@ impl AgentProvider for MockAgentProvider {
             env: turn.env,
             blocks,
         };
+        // A `permission <title>` line holds the turn on a permission request,
+        // the way a real agent waits on one, until it is answered.
+        let gate = permission_line(&turn.message).map(|title| {
+            let (open, wait) = mpsc::channel();
+            let request = PermissionRequest {
+                run: id,
+                title: title.to_string(),
+                options: ["allow", "reject"]
+                    .map(|id| PermissionOption {
+                        id: id.to_string(),
+                        label: format!("{}{}", id[..1].to_uppercase(), &id[1..]),
+                    })
+                    .to_vec(),
+            };
+            self.gated.insert(id, (request, open));
+            wait
+        });
         thread::spawn(move || {
+            if let Some(wait) = gate
+                && wait.recv().is_err()
+            {
+                return;
+            }
             let _ = tx.send(handler(&mock_turn).map_err(|err| format!("{err:#}")));
         });
         self.runs.insert(id, AgentRunState::InFlight(None));
@@ -290,14 +315,24 @@ impl AgentProvider for MockAgentProvider {
 
     fn poll_run(&mut self, id: RunId) -> Option<AgentRunState> {
         self.drain_pending();
+        if let Some((request, _)) = self.gated.get(&id) {
+            return Some(AgentRunState::NeedsPermission(request.clone()));
+        }
         self.runs.get(&id).cloned()
     }
 
-    fn respond_to_permission(&mut self, _id: RunId, _option_id: &str) -> Result<()> {
-        anyhow::bail!("mock agent never requests permission")
+    /// Either answer lets the turn go on: the mock has nothing to withhold.
+    fn respond_to_permission(&mut self, id: RunId, _option_id: &str) -> Result<()> {
+        let (_, open) = self
+            .gated
+            .remove(&id)
+            .ok_or_else(|| anyhow::anyhow!("run has no pending permission request"))?;
+        let _ = open.send(());
+        Ok(())
     }
 
     fn cancel_run(&mut self, id: RunId) -> Result<()> {
+        self.gated.remove(&id);
         self.pending.remove(&id);
         self.runs.remove(&id);
         self.run_agent.remove(&id);
@@ -378,6 +413,14 @@ fn mock_gate_check_reply(message: &str) -> String {
         }
     }
     reply
+}
+
+/// The title of the message's `permission <title>` line, if it has one.
+fn permission_line(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("permission "))
+        .map(str::trim)
 }
 
 #[cfg(test)]
@@ -597,5 +640,30 @@ mod tests {
             SessionPurpose::Conversation.run_kind(),
             AgentRunKind::FleetAgent
         );
+    }
+
+    /// A `permission` line holds the turn until the request is answered.
+    #[test]
+    fn a_permission_line_holds_the_turn_until_answered() {
+        set_mock_interview_handler(Arc::new(echo_handler));
+        let mut mock = MockAgentProvider::new();
+        let run = mock
+            .send_session_turn(session_turn(
+                "conversation-2",
+                None,
+                None,
+                "permission Edit `/elsewhere/Cargo.toml`",
+                SessionPurpose::Conversation,
+            ))
+            .unwrap();
+        let AgentRunState::NeedsPermission(request) = poll_run(&mut mock, run.id) else {
+            panic!("expected a permission request");
+        };
+        assert_eq!(request.title, "Edit `/elsewhere/Cargo.toml`");
+        mock.respond_to_permission(run.id, "allow").unwrap();
+        assert!(matches!(
+            poll_run(&mut mock, run.id),
+            AgentRunState::Success(Some(_))
+        ));
     }
 }

@@ -1550,3 +1550,22 @@ fn a_report_is_recorded_against_the_turn_in_progress() {
         Some(serde_json::json!({ "passed": 2 }))
     );
 }
+
+/// A turn left waiting when the app stopped is closed with an error turn at
+/// the next startup; an answered one is left alone.
+#[test]
+fn startup_closes_turns_left_waiting_on_the_agent() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let answered = repo
+        .create(Focus::Node(fx.n2), ProtocolKind::Outline, None, None, None)
+        .unwrap()
+        .id;
+    repo.append_turn(answered, TurnRole::User, "Hi").unwrap();
+    repo.append_turn(answered, TurnRole::Agent, "").unwrap();
+
+    assert_eq!(repo.close_interrupted_turns("Interrupted").unwrap(), vec![fx.conv]);
+    let last = repo.turns(fx.conv).unwrap().pop().unwrap();
+    assert_eq!((last.role, last.body.as_str()), (TurnRole::Error, "Interrupted"));
+    assert!(repo.close_interrupted_turns("Interrupted").unwrap().is_empty());
+}

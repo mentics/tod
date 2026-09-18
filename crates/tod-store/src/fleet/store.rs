@@ -17,6 +17,7 @@ use crate::fleet::paths::FleetPaths;
 use crate::fleet::projection::FleetProjection;
 use crate::fleet::reattach;
 use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo, RUNTIME_STATUS_ACTIVE};
+use crate::fleet::repos::agent_session::{AgentSession, AgentSessionRepo};
 use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
@@ -521,6 +522,23 @@ impl FleetStore {
         AgentRunRepo::new(&guard.connection())
             .list_unended()
             .map_err(Into::into)
+    }
+
+    /// Every recorded agent session, newest first.
+    pub fn list_agent_sessions(&self) -> Result<Vec<AgentSession>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentSessionRepo::new(&guard.connection()).list()
+    }
+
+    /// [`Self::list_agent_sessions`] without their stored transcripts.
+    pub fn list_agent_sessions_without_transcripts(&self) -> Result<Vec<AgentSession>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentSessionRepo::new(&guard.connection()).list_without_transcripts()
+    }
+
+    pub fn get_agent_session(&self, agent_session_id: &str) -> Result<Option<AgentSession>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        AgentSessionRepo::new(&guard.connection()).get(agent_session_id)
     }
 
     /// Every agent run across all nodes, newest first.

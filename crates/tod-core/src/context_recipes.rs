@@ -107,6 +107,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "surface/implement",
     ],
     blocks: &[
+        DynamicBlock::WorkingDirectory,
         DynamicBlock::DataRoot,
         DynamicBlock::Node,
         DynamicBlock::Plan,

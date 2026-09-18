@@ -41,6 +41,7 @@ pub use projection::FleetProjection;
 pub use provision::{release_worktree_for_node, resolve_launch_cwd, setup_worktree_for_node};
 pub use reattach::ReattachReport;
 pub use repos::agent_run::AgentRun;
+pub use repos::agent_session::{AgentSession, NewAgentSession};
 pub use repos::node_agent::NodeAgent;
 pub use repos::node_files::NodeFiles;
 pub use repos::notification::FleetNotification;

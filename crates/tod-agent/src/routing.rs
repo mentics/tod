@@ -105,6 +105,11 @@ impl AgentProvider for RoutingAgentProvider {
         self.claude.close_session(key);
     }
 
+    fn set_session_observer(&mut self, observer: super::provider::SessionObserver) {
+        self.cursor.set_session_observer(observer.clone());
+        self.claude.set_session_observer(observer);
+    }
+
     fn poll_run(&mut self, id: RunId) -> Option<super::provider::AgentRunState> {
         self.cursor.poll_run(id).or_else(|| self.claude.poll_run(id))
     }

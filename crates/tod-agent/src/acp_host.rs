@@ -20,6 +20,13 @@ pub enum AcpHost {
 }
 
 impl AcpHost {
+    pub fn platform(self) -> AgentPlatform {
+        match self {
+            Self::Cursor => AgentPlatform::Cursor,
+            Self::Claude => AgentPlatform::Claude,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Cursor => "Cursor",

@@ -60,6 +60,8 @@ pub const IMPLEMENT_SURFACE_KEY: &str = "active/implement";
 #[derive(Debug, Clone)]
 pub struct ImplementRequest<'a> {
     pub data_root: &'a Path,
+    /// Where the session runs: the node's worktree, when one is set up.
+    pub working_dir: &'a Path,
     pub node: NodeSelection,
     /// This node's plan steps with their dependency and `--satisfies` links.
     pub plan_steps: Vec<PlanStepWithLinks>,
@@ -86,6 +88,7 @@ pub fn build_implement_message(
         None,
         &DynamicContext {
             data_root: Some(request.data_root),
+            working_dir: Some(request.working_dir),
             node: Some(&request.node),
             obligations: &request.obligations,
             ancestor_context: &request.ancestor_context,
@@ -223,5 +226,25 @@ mod tests {
                 .unwrap()
                 < pos(&DynamicBlock::AncestorContext)
         );
+    }
+
+    /// An implementation session is told where its code is, ahead of the data
+    /// root, which may sit inside another checkout of the same repository.
+    #[test]
+    fn implement_names_its_working_directory_before_the_data_root() {
+        let blocks = IMPLEMENT_SESSION.blocks;
+        let pos = |b: &DynamicBlock| blocks.iter().position(|x| x == b).unwrap();
+        assert!(pos(&DynamicBlock::WorkingDirectory) < pos(&DynamicBlock::DataRoot));
+
+        let worktree = Path::new("/worktrees/node/tod");
+        let text = render(
+            blocks,
+            &DynamicContext {
+                data_root: Some(Path::new("/repo/.local/data")),
+                working_dir: Some(worktree),
+                ..Default::default()
+            },
+        );
+        assert!(text.contains(&format!("**Working directory:** `{}`", worktree.display())));
     }
 }

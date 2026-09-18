@@ -69,6 +69,7 @@ fn main() -> Result<()> {
         &media,
         &ImplementRequest {
             data_root: &PathBuf::from(&data_root),
+            working_dir: &std::env::current_dir()?,
             node: NodeSelection {
                 id: node_id,
                 title: node.title.clone(),
