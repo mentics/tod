@@ -126,21 +126,31 @@ Each conversation's agent is an ACP child process spawned with piped stdio
 `claude-code-acp` adapter, reached on Windows through its npm `.cmd` shim, so
 the tree is `tod` → `cmd` → `node` → whatever the agent is running.
 
-- **Clean close.** `CursorAcpProvider`'s `Drop` kills the whole tree
-  (`taskkill /T` on Windows). Nothing survives, provided the provider is
-  actually dropped on the way out.
-- **Crash.** The child is not in a job object and not tied to the parent's
-  lifetime (no `KILL_ON_JOB_CLOSE`, no `PDEATHSIG`), so the OS leaves it
-  running. It has lost both ends of its only channel: stdin reads EOF and its
-  replies go nowhere. The Claude adapter does not stop on that EOF: after a
-  force-killed tod, its `cmd` → `node` chain was still running with no parent.
-  Subprocesses it had started (a build, a test run) keep running too. Nothing
-  reconnects to it. Putting agents in a job object with
-  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would have Windows kill the tree when
-  tod dies for any reason.
+Every agent is spawned into a container the OS tears down with tod
+(`tod_agent::process_tree`):
+
+- **Windows**: a job object per agent with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. tod holds its only handle. The child is
+  created suspended and resumed once it is in the job, so everything it starts
+  is in the job too.
+- **macOS and Linux**: the agent leads its own process group, and a watchdog
+  `sh` blocks reading a pipe only tod writes to. When tod exits the read hits
+  EOF and the watchdog kills the group.
+
+- **Clean close.** `CursorAcpProvider`'s `Drop` kills each agent's tree
+  (`AgentProcess::kill_tree`: `TerminateJobObject`, or `killpg`).
+- **Crash.** The OS closes tod's handles (or the watchdog's pipe), and the tree
+  dies with it — including whatever the agent was running. Verified on
+  Windows by force-killing tod while Claude ran a shell command: `cmd`, both
+  `node`s, `bash`, and the command were all gone within two seconds. Before
+  this the adapter kept running with no parent, since it does not stop on
+  stdin EOF. The Unix side is type-checked and its watchdog script was run
+  under a Linux kernel, but the Rust has not been run on Linux or macOS.
+  If the container cannot be set up, the agent runs without it and a warning
+  is logged.
 - **Next launch.** The conversation's turn is left without a reply. Sending
   again resumes the recorded agent session id in a *new* process, which has the
-  session's history but none of the orphan's unreported work.
+  session's history but none of the killed agent's unreported work.
 
 Agents do not inherit `CLAUDECODE`: `spawn_acp_process` removes it, because
 Claude refuses to start where it finds it set, and tod launched from a Claude
@@ -318,11 +328,12 @@ loop's continuation count.
   nothing writes them, and that is deliberate for now: reattaching to a
   still-running agent only earns its keep once agents run in dev containers
   and cloud VMs. Locally a conversation already survives a restart by resuming
-  its agent session id. Two consequences until then: the one-live-run-per-node
-  lock (`live_implementation_session_for_node`) no longer covers
-  implementation conversations, and an agent orphaned by a crash (§3.2) is not
-  found again. §3.1 describes a fleet-run link that may not be the shape this
-  ends up taking.
+  its agent session id. Until then the one-live-run-per-node lock
+  (`live_implementation_session_for_node`) no longer covers implementation
+  conversations, and an agent does not survive tod (§3.2), so there is
+  nothing to reattach to. A remote agent will need to outlive tod on purpose,
+  which is where reattach comes back. §3.1 describes a fleet-run link that may
+  not be the shape this ends up taking.
 
 ## 7. Out of scope
 

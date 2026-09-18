@@ -299,7 +299,7 @@ pub fn spawn_acp_process(
     host: AcpHost,
     agent_bin: &Path,
     env: &[(String, String)],
-) -> Result<std::process::Child> {
+) -> Result<crate::process_tree::AgentProcess> {
     use std::process::{Command, Stdio};
 
     let use_subcommand = host.uses_acp_subcommand(agent_bin);
@@ -355,7 +355,7 @@ pub fn spawn_acp_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    command.spawn().with_context(|| {
+    crate::process_tree::spawn(&mut command).with_context(|| {
         format!(
             "failed to spawn {} ACP ({})",
             host.label(),
