@@ -225,53 +225,58 @@ impl Protocol for ImplementationProtocol {
             return Ok(Next::Done);
         }
         Ok(Next::Continue {
-            note: continuation_note(open.len()),
             message: continuation_message(&open, tests.as_ref()),
         })
     }
 }
 
-/// Why the loop sent another turn, as the transcript shows it.
-fn continuation_note(open: usize) -> String {
-    match open {
-        0 => "Asked the agent to run the tests".to_string(),
-        1 => "Asked the agent to finish the last open plan step".to_string(),
-        n => format!("Asked the agent to finish {n} open plan steps"),
-    }
-}
-
 /// What the loop sends: the plan steps the store still shows open, and what
-/// the tests still need.
+/// the tests still need. The transcript shows it verbatim, so its first
+/// sentence is what the collapsed entry reads as.
 fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) -> String {
-    let mut out = String::from(
-        "Keep going. This turn is not finished — do not stop to report \
-         progress, and do not ask whether to continue.\n\n",
-    );
+    let mut out = match open.len() {
+        0 => String::from("Every plan step is closed, but the plan is not done yet.\n\n"),
+        1 => String::from("1 plan step is still open. Implement it now, in this turn.\n\n"),
+        n => format!("{n} plan steps are still open. Implement them now, in this turn.\n\n"),
+    };
     if !open.is_empty() {
-        out.push_str("These plan steps are still open:\n\n");
         for linked in open {
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 linked.step.id, linked.step.status, linked.step.body
             ));
         }
-        out.push('\n');
+        out.push_str(
+            "\nEvery plan step is part of the work. It is not yours to decide \
+             that a step is optional, an enhancement, or unnecessary because \
+             the rest works without it: write the code, then mark the step \
+             `implemented`. Do not stop to report progress, and do not ask \
+             whether to continue — nobody is reading until the plan is done.\n\n",
+        );
     }
     match tests {
         None => out.push_str(
-            "No test run was recorded this turn. Run the tests for this work \
-             and record the result.\n\n",
+            "No test run was recorded this turn. After your last change, run \
+             the tests for this work and record the result.\n\n",
         ),
         Some(run) if !run.green() => out.push_str(&format!(
             "The recorded test run is not green ({}). Fix it, run the tests \
              again, and record the result.\n\n",
             run.label()
         )),
-        Some(_) => {}
+        Some(_) => out.push_str(
+            "Once the code changes, the last test run no longer counts: run \
+             the tests again after your last change and record the result.\n\n",
+        ),
     }
     out.push_str(
-        "If something needs the user, mark the plan steps it holds up \
-         `blocked` and say why in a sentence or two.",
+        "Only something that needs the user — a decision or access only they \
+         can give — is a reason to stop early. Then mark the plan steps it \
+         holds up `blocked`.\n\n\
+         Your reply, when you stop, is at most a sentence or two: nothing \
+         when the plan is done, or what needs the user and why when you \
+         blocked. No summary of what works, no list of steps, no test counts \
+         — the user already sees all of that.",
     );
     out
 }
@@ -413,18 +418,27 @@ mod tests {
     fn the_continuation_message_asks_for_a_missing_or_red_test_run() {
         let missing = continuation_message(&[], None);
         assert!(missing.contains("No test run was recorded"), "{missing}");
-        assert!(missing.contains("Keep going"), "{missing}");
+
         let red = continuation_message(&[], Some(&run(22, 2, 0)));
         assert!(red.contains("not green (22 passed, 2 failed)"), "{red}");
         let green = continuation_message(&[], Some(&run(24, 0, 0)));
-        assert!(!green.contains("test run"), "{green}");
+        assert!(!green.contains("not green"), "{green}");
+        assert!(!green.contains("No test run"), "{green}");
+        assert!(green.contains("run the tests again after your last change"), "{green}");
     }
 
+    /// The message opens with what is left, since that is all the
+    /// collapsed transcript entry shows of it.
     #[test]
-    fn the_continuation_note_counts_open_steps() {
-        assert!(continuation_note(0).contains("run the tests"));
-        assert!(continuation_note(1).contains("last open plan step"));
-        assert!(continuation_note(3).contains("3 open plan steps"));
+    fn the_continuation_message_leads_with_what_is_left() {
+        assert!(continuation_message(&[], None).starts_with("Every plan step is closed"));
+        let fx = loops::planned(3, 0);
+        let steps = plan_steps(&fx.fleet, fx.node);
+        let open: Vec<&PlanStepWithLinks> = steps.iter().collect();
+        let message = continuation_message(&open, None);
+        assert!(message.starts_with("3 plan steps are still open"), "{message}");
+        assert!(message.contains("not yours to decide"), "{message}");
+        assert!(message.contains("at most a sentence or two"), "{message}");
     }
 
     mod loops {
@@ -437,7 +451,7 @@ mod tests {
         use tod_store::outline::repos::PlanStepRepo;
 
         /// A node with `steps` plan steps, the first `done` of them closed.
-        fn planned(steps: usize, done: usize) -> Fixture {
+        pub(super) fn planned(steps: usize, done: usize) -> Fixture {
             let fx = fixture();
             for n in 0..steps {
                 fx.fleet
@@ -508,10 +522,10 @@ mod tests {
         #[test]
         fn an_open_plan_step_keeps_the_loop_going_however_green_the_tests() {
             let fx = planned(2, 1);
-            let Next::Continue { note, message } = decide(&fx, green(), 0, true) else {
+            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
                 panic!("an open plan step should continue");
             };
-            assert!(note.contains("last open plan step"), "{note}");
+            assert!(message.starts_with("1 plan step is still open"), "{message}");
             assert!(message.contains("Step 1"), "{message}");
         }
 
@@ -524,7 +538,7 @@ mod tests {
         #[test]
         fn red_tests_keep_the_loop_going_even_with_every_step_closed() {
             let fx = planned(2, 2);
-            let Next::Continue { message, .. } = decide(&fx, Some(run(22, 2, 0)), 0, true)
+            let Next::Continue { message } = decide(&fx, Some(run(22, 2, 0)), 0, true)
             else {
                 panic!("red tests should continue");
             };
@@ -535,10 +549,10 @@ mod tests {
         #[test]
         fn no_recorded_test_run_keeps_the_loop_going() {
             let fx = planned(2, 2);
-            let Next::Continue { note, .. } = decide(&fx, None, 0, true) else {
+            let Next::Continue { message } = decide(&fx, None, 0, true) else {
                 panic!("an unrecorded test run should continue");
             };
-            assert!(note.contains("run the tests"), "{note}");
+            assert!(message.contains("No test run was recorded"), "{message}");
         }
 
         /// Blocking is done on the plan: a blocked step hands back, whatever

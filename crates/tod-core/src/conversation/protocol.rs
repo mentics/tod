@@ -39,10 +39,10 @@ pub struct ProtocolEnv<'a> {
 pub enum Next {
     /// Hand back to the user.
     Done,
-    /// Send `message` as another turn, without the user. `note` is the
-    /// one-line [`TurnRole::Continuation`](tod_store::conversation::TurnRole)
-    /// marker the transcript shows in its place.
-    Continue { note: String, message: String },
+    /// Send `message` as another turn, without the user. It is recorded
+    /// verbatim as a [`TurnRole::Continuation`](tod_store::conversation::TurnRole)
+    /// turn, so the transcript shows exactly what the app sent.
+    Continue { message: String },
 }
 
 /// What [`Protocol::next`] decides from.

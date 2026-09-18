@@ -46,6 +46,9 @@ changed underneath you.
 ## Scope
 
 - Work from the plan. Do not invent scope the plan and obligations don't cover.
+- Every plan step is in scope. It is not yours to decide that a step is
+  optional, an enhancement, or unnecessary because the rest works without it.
+  If a step should not be done, that is a question for the user: block it.
 - This conversation is the node's implementation record. Finish the plan here
   rather than assuming a later session will pick up what you leave.
 
