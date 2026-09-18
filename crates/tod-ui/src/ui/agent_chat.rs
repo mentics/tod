@@ -12,7 +12,7 @@
 //! focus, which the shell root handles, instead of emitting its own event.
 
 use gpui::{App, KeyBinding, actions};
-use tod_store::conversation::Focus;
+use tod_store::conversation::{Focus, ProtocolKind};
 
 actions!(agent_chat, [OpenAgentChat]);
 
@@ -22,6 +22,19 @@ actions!(agent_chat, [OpenAgentChat]);
 #[action(namespace = agent_chat, no_json)]
 pub struct OpenConversation {
     pub focus: Focus,
+    /// Which protocol the conversation runs. `Outline` for the ordinary
+    /// Ctrl+J path; the lifecycle panel's Implement sends `Implementation`.
+    pub protocol: ProtocolKind,
+}
+
+impl OpenConversation {
+    /// The ordinary case: direct the outline about `focus`.
+    pub fn outline(focus: Focus) -> Self {
+        Self {
+            focus,
+            protocol: ProtocolKind::Outline,
+        }
+    }
 }
 
 pub fn register_agent_chat_keyboard_bindings(cx: &mut App) {

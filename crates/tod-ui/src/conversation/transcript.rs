@@ -14,7 +14,7 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
             TurnRole::User => EntryKind::User,
             TurnRole::Agent => EntryKind::Agent,
             TurnRole::Error => EntryKind::Error,
-            TurnRole::Rotation => EntryKind::Marker,
+            TurnRole::Rotation | TurnRole::Continuation => EntryKind::Marker,
         },
         body: turn.body.clone(),
         parts: turn.parts.clone(),

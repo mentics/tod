@@ -1402,7 +1402,7 @@ impl TaskListView {
                 tod_store::conversation::Focus::Node(id)
             });
         cx.stop_propagation();
-        window.dispatch_action(Box::new(OpenConversation { focus }), cx);
+        window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
     }
 
     fn selected_task(&self, cx: &Context<Self>) -> Option<TaskItem> {

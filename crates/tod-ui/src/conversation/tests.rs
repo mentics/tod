@@ -59,6 +59,7 @@ fn create_conversation(fixture: &Fixture, focus: Focus) -> Uuid {
             ACTOR_USER,
             InterviewCommand::CreateConversation {
                 id,
+                protocol: tod_store::conversation::ProtocolKind::Outline,
                 focus,
                 platform: None,
                 model: None,

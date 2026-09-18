@@ -10,7 +10,9 @@
 
 pub mod context;
 pub mod driver;
+pub mod implement;
 pub mod mock;
+pub mod protocol;
 
 #[cfg(test)]
 mod tests;
@@ -18,3 +20,4 @@ mod tests;
 pub use driver::{
     ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, ROTATION_NOTE,
 };
+pub use protocol::{CONTINUATION_CAP, Next, Protocol, ProtocolEnv, Reading, protocol_for};

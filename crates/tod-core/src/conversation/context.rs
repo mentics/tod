@@ -456,7 +456,7 @@ pub fn resume_snapshot(
                 TurnRole::User => "User",
                 TurnRole::Agent => "You",
                 TurnRole::Error => "Error",
-                TurnRole::Rotation => return None,
+                TurnRole::Rotation | TurnRole::Continuation => return None,
             };
             let body = match (t.role, t.body.trim()) {
                 (TurnRole::Agent, "") => "(no reply)",

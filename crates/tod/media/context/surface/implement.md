@@ -40,3 +40,52 @@ changed underneath you.
 - This session is tracked as a distinct "implementation" run on this node —
   only one runs at a time per node, so finish or hand off cleanly rather than
   assuming another one will pick up silently.
+
+## Tests ship with the code
+
+Automated tests for what you build are part of the work, not a later phase.
+Before you report the plan complete, the tests you wrote must have been run and
+must pass. Report that honestly — "not run" and "red" are both fine answers
+while there is still work left; claiming green when you have not run them is
+not.
+
+## The app reads your replies
+
+Your reply is not read by a person as it arrives — the app reads it, decides
+whether the plan is finished, and sends you straight back to the remaining work
+if it is not. So:
+
+- **Close plan steps as you go**, through the `plan` noun. The app takes
+  plan-step status from the database, not from your reply: a step you finished
+  but left open will be sent back to you.
+- **Do not stop to report progress and wait.** There is nobody to answer. If
+  work remains, keep going until it is done or something genuinely needs the
+  user's decision, and say so with `status: blocked`.
+
+## Reply format
+
+Every reply is a single YAML document and nothing else: no prose before or
+after it, no code fence around it. Prose goes in `notes`.
+
+```
+status: working        # working | complete | blocked
+summary: One line on what this turn did.
+steps:                 # every plan step this turn touched
+  - id: <plan step slug or uuid>
+    status: in_progress | implemented | verified | blocked
+    note: optional
+tests:
+  written: true        # tests were added or updated for this turn's work
+  ran: true
+  green: true
+  detail: the command you ran and its result
+remaining:             # what this turn did not finish
+  - ...
+blockers:              # what needs the user; omit unless status is blocked
+  - ...
+notes: |
+  Optional prose.
+```
+
+`status: complete` means every plan step is closed and the tests are green.
+The app checks both; if either is not true it will send you back to finish.

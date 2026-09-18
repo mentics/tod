@@ -212,6 +212,18 @@ deleted is hidden), `reverse_actions` applies inverse mutations and reports
 conflicts and dependents for confirmation, and user edits from the view go
 through `ConversationEdit`. Content and lifecycle mutations are not recorded.
 
+**Protocols.** A conversation's `protocol` (schema v39) decides what kind of
+conversation it is: the context recipe, the working directory, the turn
+envelope, how the reply is read, what "done" means, whether the app loops it
+without the user, and which side pane the view shows.
+`tod_core::conversation::protocol` holds the `Protocol` trait and
+`protocol_for`, the one registry; `implement.rs` is the implementation
+protocol, whose replies are structured reports and whose loop keeps sending
+the agent back to open plan steps until the plan is done and its tests are
+green. `tod_ui::conversation::side_pane` picks the pane. Adding a kind means a
+`ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
+`doc/conversation/protocols.md`.
+
 `tod_core::conversation` runs it: `driver.rs` (`ConversationDriver`: send, tick,
 resume, rotation), `context.rs` (opening message, per-turn delta, rotation
 snapshot, the `Focus` block's loader), and `mock.rs`, which plays the agent for

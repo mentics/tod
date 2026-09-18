@@ -48,7 +48,7 @@ use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
-use tod_store::conversation::Focus;
+use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
 use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
 use uuid::Uuid;
@@ -564,9 +564,19 @@ impl Shell {
     /// Show the conversation view on `focus`: its latest conversation, or a
     /// new, unsaved one.
     fn open_conversation(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_conversation_with(focus, ProtocolKind::Outline, window, cx);
+    }
+
+    fn open_conversation_with(
+        &mut self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_view(ShellView::Conversation, window, cx);
         self.conversation.update(cx, |conversation, cx| {
-            conversation.open(focus, true, window, cx);
+            conversation.open_with(focus, protocol, true, window, cx);
         });
         cx.notify();
     }
@@ -930,7 +940,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
-                this.open_conversation(action.focus, window, cx);
+                this.open_conversation_with(action.focus, action.protocol, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellGoSettings, window, cx| {
                 this.select_view(ShellView::Settings, window, cx);
@@ -1457,7 +1467,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 fleet.clone(),
                                 agent.clone(),
                                 paths.clone(),
-                                interactive_agent_window.clone(),
                             )
                         });
                         let visual_design_panel =

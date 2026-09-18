@@ -21,6 +21,17 @@ pub fn install_mock_interview_handler(data_root: PathBuf) {
 }
 
 fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> {
+    // An implementation conversation carries its node instead of a
+    // conversation actor: its writes are its own, not a change set.
+    if let Some(node) = turn
+        .env
+        .iter()
+        .find(|(key, _)| key == crate::conversation::implement::IMPLEMENT_NODE_ENV)
+        .and_then(|(_, value)| Uuid::parse_str(value).ok())
+    {
+        let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
+        return crate::conversation::implement::mock_turn(&client, node).map(MockReply::from);
+    }
     // A conversation's actor is `conversation:<uuid>`, not a session id.
     if turn.purpose == SessionPurpose::Conversation {
         return crate::conversation::mock::handle_turn(data_root, turn);

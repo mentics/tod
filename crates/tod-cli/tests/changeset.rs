@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tod_store::conversation::{
+use tod_store::conversation::{ProtocolKind, 
     ActionActor, ActionKind, ConversationRepo, Entity, Focus, TurnRole, actor_for,
 };
 use tod_store::fleet::{FleetPaths, FleetStore, schema};
@@ -53,7 +53,7 @@ fn setup() -> (Root, Uuid, Uuid) {
         }
     }
     let conversation = with_repo(&root, |repo| {
-        let id = repo.create(Focus::Node(node), None, None, None).unwrap().id;
+        let id = repo.create(Focus::Node(node), ProtocolKind::Outline, None, None, None).unwrap().id;
         repo.append_turn(id, TurnRole::User, "Harden auth.").unwrap();
         id
     });
