@@ -12,7 +12,6 @@ pub mod resolve;
 pub mod slug;
 pub mod types;
 pub mod uuid_blob;
-pub mod workspace;
 
 pub use file_refs::{check_no_file_references, referenced_files};
 pub use gate_criteria_seed::{GATE_CRITERIA, seed_gate_criteria};
@@ -35,7 +34,6 @@ pub use types::{
     EXTRA_CONTENT_TYPES, FlatNodeRow, Node, OutlineEntry, OutlineList,
 };
 pub use uuid_blob::{blob_to_uuid, ms_to_datetime, now_ms, uuid_to_blob};
-pub use workspace::workspace_cwd_for_node;
 
 #[cfg(test)]
 mod tests;

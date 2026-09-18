@@ -141,6 +141,18 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                  Pass this to every `tod-cli` invocation as `--data-root`.\n\n",
                 root.display()
             ));
+            // The app puts tod-cli on the agent's PATH, but an agent's own
+            // shell setup can lose it; the full path always works. Forward
+            // slashes, so it runs unchanged from bash or PowerShell.
+            let cli = crate::interview::tod_cli_path();
+            if cli.is_file() {
+                out.push_str(&format!(
+                    "**`tod-cli`:** `{}` — call it by this full path if plain \
+                     `tod-cli` is not found. Never build or `cargo run` your own \
+                     copy against this data root.\n\n",
+                    cli.display().to_string().replace('\\', "/")
+                ));
+            }
         }
 
         DynamicBlock::WorkingDirectory => {

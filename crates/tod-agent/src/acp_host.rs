@@ -353,6 +353,13 @@ pub fn spawn_acp_process(
     // received". The agent is tod's child, not a nested session.
     command.env_remove("CLAUDECODE");
 
+    // Git Bash's login profile rebuilds PATH from ORIGINAL_PATH when that is
+    // already set, and every Git Bash terminal exports it. tod launched from
+    // one would hand it down, and the agent's shell would drop whatever the
+    // caller added to PATH (tod-cli's directory among them). Without it, the
+    // profile starts from the PATH the agent was actually given.
+    command.env_remove("ORIGINAL_PATH");
+
     for (key, value) in env {
         command.env(key, value);
     }
