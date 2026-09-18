@@ -564,19 +564,23 @@ impl Shell {
     /// Show the conversation view on `focus`: its latest conversation, or a
     /// new, unsaved one.
     fn open_conversation(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_conversation_with(focus, ProtocolKind::Outline, window, cx);
+        self.open_conversation_with(focus, ProtocolKind::Outline, false, window, cx);
     }
 
     fn open_conversation_with(
         &mut self,
         focus: Focus,
         protocol: ProtocolKind,
+        start: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.select_view(ShellView::Conversation, window, cx);
         self.conversation.update(cx, |conversation, cx| {
             conversation.open_with(focus, protocol, true, window, cx);
+            if start {
+                conversation.start(window, cx);
+            }
         });
         cx.notify();
     }
@@ -940,7 +944,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
-                this.open_conversation_with(action.focus, action.protocol, window, cx);
+                this.open_conversation_with(action.focus, action.protocol, action.start, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellGoSettings, window, cx| {
                 this.select_view(ShellView::Settings, window, cx);

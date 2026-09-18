@@ -187,6 +187,10 @@ impl Protocol for ImplementationProtocol {
         crate::session_name::IMPLEMENT_SURFACE
     }
 
+    fn starter(&self) -> Option<&'static str> {
+        Some("Implement the plan.")
+    }
+
     /// Nobody is waiting at a prompt between turns: the app is.
     fn purpose(&self) -> SessionPurpose {
         SessionPurpose::Conversation

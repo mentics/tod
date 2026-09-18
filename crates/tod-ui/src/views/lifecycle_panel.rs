@@ -605,6 +605,7 @@ impl LifecyclePanelView {
             Box::new(OpenConversation {
                 focus: Focus::Node(node_id),
                 protocol: ProtocolKind::Implementation,
+                start: true,
             }),
             cx,
         );

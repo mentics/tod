@@ -75,7 +75,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{
-    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus,
+    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, protocol_for,
 };
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
@@ -587,10 +587,27 @@ impl ConversationView {
         self.open(focus, true, window, cx);
     }
 
+    /// A fresh conversation of the current protocol. Its starter message,
+    /// when it has one, waits in the input for the user to edit or send.
     fn new_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show(self.focus, None, false, cx);
         self.pane = Pane::Transcript;
+        let starter = protocol_for(self.protocol).starter().unwrap_or_default();
+        self.transcript
+            .update(cx, |panel, cx| panel.set_input(starter, window, cx));
         self.enter_input_edit(window, cx);
+    }
+
+    /// Send the open conversation's starter message, unless its protocol has
+    /// none or the agent is already working on it.
+    pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(starter) = protocol_for(self.protocol).starter() else {
+            return;
+        };
+        if self.current_driver().is_some_and(|d| d.status().running) {
+            return;
+        }
+        self.send(starter, window, cx);
     }
 
     // ----- drivers and data ----------------------------------------------

@@ -89,6 +89,13 @@ pub trait Protocol: Send + Sync {
         Vec::new()
     }
 
+    /// The message a conversation of this kind usually starts with, when
+    /// there is one. A new conversation offers it in the input; a launch that
+    /// already says what the user wants sends it.
+    fn starter(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The first message's context.
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String>;
 

@@ -56,11 +56,6 @@ pub fn build_first_message(paths: &MediaPaths, request: &ContextRequest<'_>) -> 
 /// `session_name::session_name_for`) — not a media context key.
 pub const IMPLEMENT_SURFACE_KEY: &str = "active/implement";
 
-/// The user-visible message auto-submitted on an implementation session's
-/// first turn — the Implement button means "go implement this now", so the
-/// session shouldn't sit waiting on the user to type that themselves.
-pub const IMPLEMENT_START_MESSAGE: &str = "Go implement this.";
-
 /// Everything an implementation session's first-turn context describes.
 #[derive(Debug, Clone)]
 pub struct ImplementRequest<'a> {

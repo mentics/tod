@@ -1307,15 +1307,30 @@ fn the_picker_offers_implementation_only_on_an_active_planned_node(cx: &mut Test
     });
 
     // Choosing it starts an unsaved implementation conversation, whose side
-    // pane is the plan.
+    // pane is the plan and whose input offers the starter message unsent.
     view.update_in(cx, |view, window, cx| {
         view.choose_picker_entry(implementation_ix, window, cx)
     });
     draw(cx);
-    view.read_with(cx, |view, _| {
+    view.read_with(cx, |view, cx| {
         assert_eq!(view.conversation_id(), None);
         assert_eq!(view.data.protocol, ProtocolKind::Implementation);
         assert_eq!(view.data.plan.len(), fixture.steps.len());
+        assert!(view.data.turns.is_empty());
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "Implement the plan.");
+    });
+
+    // An outline conversation has no starter: its input stays empty.
+    let outline_ix = view.read_with(cx, |view, _| view.data.conversations.len());
+    view.update_in(cx, |view, window, cx| {
+        view.choose_picker_entry(outline_ix, window, cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.data.protocol, ProtocolKind::Outline);
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "");
     });
 }
 

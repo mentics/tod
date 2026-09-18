@@ -339,6 +339,13 @@ pub fn spawn_acp_process(
         }
     }
 
+    // Claude Code marks its own shell with this, and Claude refuses to start
+    // inside one ("cannot be launched inside another Claude Code session").
+    // tod launched from a Claude Code session would otherwise hand it to every
+    // agent it starts, which then fail with only "Query closed before response
+    // received". The agent is tod's child, not a nested session.
+    command.env_remove("CLAUDECODE");
+
     for (key, value) in env {
         command.env(key, value);
     }

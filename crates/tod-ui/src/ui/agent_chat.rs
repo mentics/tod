@@ -25,6 +25,11 @@ pub struct OpenConversation {
     /// Which protocol the conversation runs. `Outline` for the ordinary
     /// Ctrl+J path; the lifecycle panel's Implement sends `Implementation`.
     pub protocol: ProtocolKind,
+    /// Send the protocol's starter message as soon as the conversation is
+    /// open, when it has one and the agent is not already working. The
+    /// lifecycle panel's Implement sets this: clicking it already says what
+    /// the user wants.
+    pub start: bool,
 }
 
 impl OpenConversation {
@@ -33,6 +38,7 @@ impl OpenConversation {
         Self {
             focus,
             protocol: ProtocolKind::Outline,
+            start: false,
         }
     }
 }

@@ -557,6 +557,7 @@ impl ActionPanelView {
             Box::new(OpenConversation {
                 focus: Focus::Node(node_id),
                 protocol: ProtocolKind::Chat,
+                start: false,
             }),
             cx,
         );
