@@ -139,7 +139,7 @@ impl Protocol for ImplementationProtocol {
             .get_extra_content(node_id, EXTRA_CONTENT_DETAILS)
             .ok()
             .flatten();
-        let plan_steps = plan_steps(fleet, node_id);
+        let plan_steps = open_plan_steps(plan_steps(fleet, node_id));
         let obligations = fleet.list_obligations_for_node(node_id).unwrap_or_default();
         let ancestor_context = fleet
             .read(|conn| {
@@ -389,6 +389,26 @@ fn step_is_done(status: &str) -> bool {
 /// user.
 fn step_is_open(status: &str) -> bool {
     !step_is_done(status) && !needs_user(status)
+}
+
+/// The steps the implementation agent is shown: those not yet `implemented`
+/// or `verified`. Finished steps are not its work, and a dependency on one is
+/// already met, so it is dropped rather than left pointing at a step the
+/// agent never sees.
+fn open_plan_steps(steps: Vec<PlanStepWithLinks>) -> Vec<PlanStepWithLinks> {
+    let open: Vec<Uuid> = steps
+        .iter()
+        .filter(|linked| !step_is_done(&linked.step.status))
+        .map(|linked| linked.step.id)
+        .collect();
+    steps
+        .into_iter()
+        .filter(|linked| open.contains(&linked.step.id))
+        .map(|mut linked| {
+            linked.depends_on.retain(|dep| open.contains(dep));
+            linked
+        })
+        .collect()
 }
 
 /// Where a node's plan stands, for deciding whether implementing it makes
@@ -889,6 +909,15 @@ mod tests {
                 plan_progress(&fx.fleet, fx.node),
                 PlanProgress::Complete { total: 2 }
             );
+        }
+
+        /// The agent is shown only the steps still to do.
+        #[test]
+        fn the_opening_lists_only_open_plan_steps() {
+            let fx = planned(3, 2);
+            let open = open_plan_steps(plan_steps(&fx.fleet, fx.node));
+            assert_eq!(open.len(), 1);
+            assert!(!step_is_done(&open[0].step.status));
         }
 
         #[test]

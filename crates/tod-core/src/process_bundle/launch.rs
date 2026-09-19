@@ -92,6 +92,18 @@ pub fn state_lifecycle_doc(manifest: &ProcessManifest, lifecycle: &str) -> Resul
 {}", state_body.trim()))
 }
 
+/// `lifecycle`'s doc up to its forward gate rules, for a conversation that does
+/// the state's work but does not evaluate the gate. The gate rules, "Exit", and
+/// "Blockers" tell the agent to return `gate_results` and `forward_lifecycle`;
+/// they sit last in the prompt, so they outweigh a surface's plain-reply rule.
+pub fn state_working_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
+    let doc = state_lifecycle_doc(manifest, lifecycle)?;
+    Ok(match doc.find("\n## Forward gate rules") {
+        Some(at) => doc[..at].trim_end().to_string(),
+        None => doc,
+    })
+}
+
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
 pub fn build_fleet_agent_prompt(
     manifest: &ProcessManifest,
@@ -211,5 +223,26 @@ mod tests {
         assert!(!only.contains("## Response format"));
         assert!(only.starts_with("## Lifecycle state: verifying"));
         assert!(full.ends_with(&only));
+    }
+
+    /// The gate rules' "return `gate_results` / `forward_lifecycle`" lines
+    /// pulled the verification reply back into a YAML envelope.
+    #[test]
+    fn working_doc_leaves_out_the_gate_rules() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join("process");
+        if !root.join("README.md").is_file() {
+            return;
+        }
+        let install = TodInstallPaths::from_process_root(root).unwrap();
+        let manifest = ProcessManifest::load(&install).unwrap();
+        let doc = state_working_doc(&manifest, "verifying").unwrap();
+        assert!(doc.contains("## On entry"));
+        assert!(doc.contains("### Test strategy"));
+        assert!(!doc.contains("gate_results"));
+        assert!(!doc.contains("forward_lifecycle"));
     }
 }

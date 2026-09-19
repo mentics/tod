@@ -7,9 +7,9 @@
 //! input.
 //!
 //! Only the forward path is here. The manual escape hatches (force advance,
-//! revert, open interview) stay in the lifecycle panel — except "Back to
-//! active" once verification has failed steps, which is the step forward
-//! from there.
+//! revert, open interview) stay in the lifecycle panel — except "Fix failed"
+//! once verification has failed steps: it moves the node back to `active` and
+//! starts an implementation conversation, the step forward from there.
 
 use super::ConversationView;
 use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
@@ -31,7 +31,7 @@ const REVIEW: &str = "lifecycle:review";
 const FIX: &str = "lifecycle:fix";
 const GATE_CHECK: &str = "lifecycle:gate-check";
 const ADVANCE: &str = "lifecycle:advance";
-const BACK_TO_ACTIVE: &str = "lifecycle:back-to-active";
+const FIX_FAILED: &str = "lifecycle:fix-failed";
 const WAIVE: &str = "lifecycle:waive:";
 
 /// Where the focused node stands, read with the rest of the view's data.
@@ -178,22 +178,15 @@ impl ConversationView {
                 let unchecked = snapshot.total() - snapshot.verified - snapshot.failed;
                 if snapshot.failed > 0 && unchecked == 0 {
                     // Failed steps are fixed in `active`, where implementation
-                    // works each one again from its note.
-                    let steps = if snapshot.failed == 1 {
-                        "step"
-                    } else {
-                        "steps"
-                    };
+                    // works each one again from its note: one press moves the
+                    // node there and starts that implementation.
                     actions.push(
                         PanelAction::new(
-                            BACK_TO_ACTIVE,
-                            if gate.revert_armed {
-                                "Confirm: back to active".to_string()
-                            } else {
-                                format!("Back to active ({} failed {steps})", snapshot.failed)
-                            },
+                            FIX_FAILED,
+                            format!("Fix failed ({})", snapshot.failed),
                         )
-                        .primary(true),
+                        .primary(true)
+                        .disabled(blocked),
                     );
                     gate_offered = false;
                 } else {
@@ -350,7 +343,13 @@ impl ConversationView {
             FIX => self.run_protocol(node, ProtocolKind::Fix, window, cx),
             GATE_CHECK => lifecycle.update(cx, |c, cx| c.run_gate_check(&task_id, cx)),
             ADVANCE => lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx)),
-            BACK_TO_ACTIVE => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
+            FIX_FAILED => {
+                if snapshot.blocked.is_none()
+                    && lifecycle.update(cx, |c, cx| c.revert_now(&task_id, cx))
+                {
+                    self.run_protocol(node, ProtocolKind::Implementation, window, cx);
+                }
+            }
             other => {
                 if let Some(criterion) = other
                     .strip_prefix(WAIVE)
