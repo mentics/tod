@@ -170,6 +170,11 @@ pub enum InterviewCommand {
         #[serde(default)]
         session_name: Option<String>,
     },
+    /// Record the context the conversation's first turn sent.
+    SetConversationOpeningContext {
+        conversation_id: Uuid,
+        context: String,
+    },
     /// A user edit made from the conversation view: recorded as the user's
     /// action, and it clears the item's unsure flag.
     ConversationEdit {
@@ -765,6 +770,14 @@ pub fn execute(
                 agent_session_id.as_deref(),
                 session_name.as_deref(),
             )?;
+            Ok(json!({}))
+        }
+        InterviewCommand::SetConversationOpeningContext {
+            conversation_id,
+            context,
+        } => {
+            crate::conversation::ConversationRepo::new(conn)
+                .set_opening_context(*conversation_id, context)?;
             Ok(json!({}))
         }
         InterviewCommand::RecordConversationReport {

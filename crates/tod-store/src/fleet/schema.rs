@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 45;
+pub const CURRENT_USER_VERSION: i32 = 46;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -319,6 +319,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 45 {
         migrate_v44_to_v45(conn)?;
         conn.pragma_update(None, "user_version", 45)?;
+    }
+    if version < 46 {
+        migrate_v45_to_v46(conn)?;
+        conn.pragma_update(None, "user_version", 46)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -781,10 +785,24 @@ fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// `conversations.opening_context`: the context the conversation's first
+/// turn sent, so the view can hand it to the user.
+fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('conversations') WHERE name = 'opening_context'",
+        )?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversations ADD COLUMN opening_context TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Review findings: the `rejected` status (the fix agent's pushback). The
 /// status CHECK has to grow, which means a table rebuild; nothing references
 /// `review_findings`, so it is renamed aside and copied back.
-fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
+fn migrate_v45_to_v46(conn: &Connection) -> Result<()> {
     let table_sql: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_findings'",
@@ -804,7 +822,7 @@ fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
     tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
     tx.execute_batch(
         "DROP INDEX IF EXISTS idx_review_findings_node;
-         ALTER TABLE review_findings RENAME TO review_findings_v44;",
+         ALTER TABLE review_findings RENAME TO review_findings_v45;",
     )?;
     tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
     tx.execute_batch(crate::review::CREATE_TABLE)?;
@@ -814,8 +832,8 @@ fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
               status, response, created_at, updated_at)
          SELECT id, node_id, conversation_id, seq, severity, file, line, summary, detail,
               status, response, created_at, updated_at
-         FROM review_findings_v44;
-         DROP TABLE review_findings_v44;",
+         FROM review_findings_v45;
+         DROP TABLE review_findings_v45;",
     )?;
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -4154,10 +4172,10 @@ mod plan_step_migration_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// v45 lets a finding be `rejected`, keeping every finding and response
+    /// v46 lets a finding be `rejected`, keeping every finding and response
     /// that is already there.
     #[test]
-    fn v45_lets_a_finding_be_rejected() {
+    fn v46_lets_a_finding_be_rejected() {
         use crate::outline::uuid_blob::uuid_to_blob;
         use rusqlite::params;
         let (dir, conn) = temp_db();
@@ -4193,8 +4211,8 @@ mod plan_step_migration_tests {
         )
         .unwrap();
 
-        migrate_v44_to_v45(&conn).unwrap();
-        migrate_v44_to_v45(&conn).unwrap();
+        migrate_v45_to_v46(&conn).unwrap();
+        migrate_v45_to_v46(&conn).unwrap();
 
         let row: (String, String, Option<String>) = conn
             .query_row(

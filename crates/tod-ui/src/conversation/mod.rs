@@ -257,6 +257,9 @@ pub(crate) struct Snapshot {
     /// Conversations about the focus, newest first.
     pub conversations: Vec<ConversationSummary>,
     pub turns: Vec<Turn>,
+    /// The open conversation's first turn recorded the context it sent, so
+    /// the transcript can offer to copy it.
+    pub has_opening_context: bool,
     /// Grouped by node in tree order (see `net_changes`).
     pub changes: Vec<NetChange>,
     /// Titles of the nodes the changes live on.
@@ -828,6 +831,10 @@ impl ConversationView {
                 Some(id) => (repo.turns(id)?, net_changes(conn, id)?, repo.actions(id)?),
                 None => (Vec::new(), Vec::new(), Vec::new()),
             };
+            let has_opening_context = match id {
+                Some(id) => repo.has_opening_context(id)?,
+                None => false,
+            };
             // An item the conversation added and then reversed has neither a
             // `before` nor a `current`; show it as the log last saw it.
             let mut last_known: HashMap<ChangeKey, EntitySnapshot> = HashMap::new();
@@ -914,6 +921,7 @@ impl ConversationView {
                 title,
                 conversations,
                 turns,
+                has_opening_context,
                 changes,
                 node_titles,
                 protocol,

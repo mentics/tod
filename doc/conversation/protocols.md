@@ -372,7 +372,7 @@ no longer runs an agent by itself.
 - **Responses.** A finding is `open` until answered: `fixed` (the response
   points at the change), `out_of_scope`, `declined` (not critical, beyond
   the requirements, or not worth the cost), or `rejected` (not a problem
-  after all; schema v45). The user answers from the finding's status badge,
+  after all; schema v46). The user answers from the finding's status badge,
   whose menu leaves out `rejected` (it needs a note) unless the finding is
   already rejected; an agent answers through `tod-cli review respond`, which
   requires a response for anything but `open`, and the store refuses a

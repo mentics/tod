@@ -276,6 +276,14 @@ impl ConversationDriver {
         }
         // The first turn: the opening context, then the message.
         let context = self.protocol.opening(&self.env(fleet, id))?;
+        // Kept so the user can read what the agent was given.
+        fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::SetConversationOpeningContext {
+                conversation_id: id,
+                context: context.clone(),
+            },
+        )?;
         self.session_tokens = Some(0);
         self.start(
             fleet,

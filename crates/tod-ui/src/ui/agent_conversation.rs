@@ -71,6 +71,8 @@ pub fn register_agent_conversation_bindings(cx: &mut App) {
 /// A keyboard stop in the panel, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelStop {
+    /// The host's header button `ix`, beside the title.
+    HeaderAction(usize),
     Chunk(ChunkId),
     /// The button on notice `ix` (only notices that have one are stops).
     NoticeAction(usize),
@@ -81,7 +83,7 @@ pub enum PanelStop {
     Stop,
 }
 
-/// A host button: beside Send, or on a notice.
+/// A host button: beside Send, on a notice, or in the header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelAction {
     /// Reported back in [`AgentConversationEvent::Action`].
@@ -173,6 +175,8 @@ pub struct AgentConversationPanel {
     extra_hint: Option<SharedString>,
     /// The host's buttons beside Send.
     actions: Vec<PanelAction>,
+    /// The host's buttons beside the title.
+    header_actions: Vec<PanelAction>,
     /// The host's status lines above the input.
     notices: Vec<PanelNotice>,
     input: Entity<TextareaState>,
@@ -220,6 +224,7 @@ impl AgentConversationPanel {
             empty_message: SharedString::default(),
             extra_hint: None,
             actions: Vec::new(),
+            header_actions: Vec::new(),
             notices: Vec::new(),
             input,
             editing: false,
@@ -284,6 +289,15 @@ impl AgentConversationPanel {
     pub fn set_actions(&mut self, actions: Vec<PanelAction>, cx: &mut Context<Self>) {
         if actions != self.actions {
             self.actions = actions;
+            self.keep_highlight();
+            cx.notify();
+        }
+    }
+
+    /// The host's buttons beside the title, left to right.
+    pub fn set_header_actions(&mut self, actions: Vec<PanelAction>, cx: &mut Context<Self>) {
+        if actions != self.header_actions {
+            self.header_actions = actions;
             self.keep_highlight();
             cx.notify();
         }
@@ -361,11 +375,18 @@ impl AgentConversationPanel {
 
     /// The panel's stops, top to bottom.
     pub fn stops(&self) -> Vec<PanelStop> {
-        let mut stops: Vec<PanelStop> =
+        let mut stops: Vec<PanelStop> = self
+            .header_actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| !a.disabled)
+            .map(|(ix, _)| PanelStop::HeaderAction(ix))
+            .collect();
+        stops.extend(
             transcript_list::chunks(&self.entries, &self.toggled, StartState::Reading)
                 .into_iter()
-                .map(PanelStop::Chunk)
-                .collect();
+                .map(PanelStop::Chunk),
+        );
         stops.extend(
             self.notices
                 .iter()
@@ -421,6 +442,11 @@ impl AgentConversationPanel {
             }
             PanelStop::NoticeAction(ix) => {
                 if let Some(action) = self.notices.get(ix).and_then(|n| n.action.as_ref()) {
+                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                }
+            }
+            PanelStop::HeaderAction(ix) => {
+                if let Some(action) = self.header_actions.get(ix) {
                     cx.emit(AgentConversationEvent::Action(action.id.clone()));
                 }
             }
@@ -580,6 +606,20 @@ impl Render for AgentConversationPanel {
                     .children(button),
             );
         }
+        let header_actions: Vec<Button> = self
+            .header_actions
+            .clone()
+            .iter()
+            .enumerate()
+            .map(|(ix, action)| {
+                self.action_button(
+                    ("agent-conversation-header-action", ix),
+                    action,
+                    PanelStop::HeaderAction(ix),
+                    cx,
+                )
+            })
+            .collect();
         let actions: Vec<Button> = self
             .actions
             .clone()
@@ -617,14 +657,19 @@ impl Render for AgentConversationPanel {
                 }),
             )
             .child(
-                style::panel_header(h_flex()).items_center().child(
-                    if self.active {
-                        style::text_title(div())
-                    } else {
-                        style::text_muted(div())
-                    }
-                    .child(self.title.clone()),
-                ),
+                style::panel_header(h_flex())
+                    .items_center()
+                    .child(
+                        if self.active {
+                            style::text_title(div())
+                        } else {
+                            style::text_muted(div())
+                        }
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.title.clone()),
+                    )
+                    .children(header_actions),
             )
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(

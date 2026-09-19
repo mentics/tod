@@ -3,10 +3,15 @@
 
 use super::{ConversationView, Pane, Stop};
 use crate::ui::agent_conversation::{
-    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind,
+    AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
-use gpui::{AnyElement, AppContext, Context, Entity, IntoElement, Subscription, Window};
-use tod_store::conversation::{Turn, TurnRole};
+use gpui::{
+    AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
+};
+use tod_store::conversation::{ConversationRepo, Turn, TurnRole};
+
+/// The transcript header's button that copies the opening context.
+const COPY_CONTEXT: &str = "transcript:copy-context";
 
 pub(super) fn entry_of(turn: &Turn) -> Entry {
     // What the app sent on its own, shown as sent.
@@ -55,6 +60,9 @@ impl ConversationView {
         match event {
             AgentConversationEvent::Send(text) => self.send(text, window, cx),
             AgentConversationEvent::Stop => self.stop_turn(cx),
+            AgentConversationEvent::Action(id) if id.as_ref() == COPY_CONTEXT => {
+                self.copy_opening_context(cx)
+            }
             AgentConversationEvent::Action(id) => self.lifecycle_action(id, window, cx),
             AgentConversationEvent::Activated => {
                 self.pane = Pane::Transcript;
@@ -74,6 +82,28 @@ impl ConversationView {
         }
     }
 
+    /// Put the context the conversation's first turn sent on the clipboard,
+    /// for the user to paste somewhere and read.
+    pub(super) fn copy_opening_context(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.conversation_id else {
+            return;
+        };
+        match self
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).opening_context(id))
+        {
+            Ok(Some(context)) => {
+                let kb = context.len().div_ceil(1024);
+                cx.write_to_clipboard(ClipboardItem::new_string(context));
+                self.status_line =
+                    format!("Copied the opening context ({kb} KB) to the clipboard").into();
+            }
+            Ok(None) => self.status_line = "This conversation has no recorded context".into(),
+            Err(err) => self.status_line = format!("Could not read the context: {err:#}").into(),
+        }
+        cx.notify();
+    }
+
     /// Bring the panel up to date and return it for the layout.
     pub(super) fn render_transcript(
         &mut self,
@@ -90,7 +120,13 @@ impl ConversationView {
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
+        let header_actions = if self.data.has_opening_context {
+            vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
+        } else {
+            Vec::new()
+        };
         self.transcript.update(cx, |panel, cx| {
+            panel.set_header_actions(header_actions, cx);
             panel.set_actions(actions, cx);
             panel.set_notices(notices, cx);
             panel.set_return_focus(return_focus);
