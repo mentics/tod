@@ -394,8 +394,7 @@ impl LifecyclePanelView {
                 })
     }
 
-    /// Open the node's latest verification conversation (or a new one) and
-    /// send it "Verify the plan.", as Implement does for implementation. See
+    /// Start a new verification conversation on the node and send it "Verify the plan.", as Implement does for implementation. See
     /// `doc/conversation/protocols.md`.
     fn launch_verification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.launch_node_conversation(ProtocolKind::Verification, window, cx);
@@ -407,8 +406,8 @@ impl LifecyclePanelView {
         self.lifecycle_capable && self.lifecycle == "review"
     }
 
-    /// Open the node's latest review conversation (or a new one) and send it
-    /// "Review the change.". The conversation view runs it under the review
+    /// Start a new review conversation on the node and send it "Review the
+    /// change.". The conversation view runs it under the review
     /// protocol: an agent that did not build the change reviews it in the
     /// node's worktree and records each finding through `tod-cli review`, and
     /// the side pane lists them. See `doc/conversation/protocols.md` §4c.
@@ -416,8 +415,9 @@ impl LifecyclePanelView {
         self.launch_node_conversation(ProtocolKind::Review, window, cx);
     }
 
-    /// Open the node's latest `protocol` conversation (or a new one), which
-    /// runs in the node's worktree, and send the protocol's starter.
+    /// Start a new `protocol` conversation on the node, which runs in the
+    /// node's worktree, and send the protocol's starter. Every run gets a
+    /// fresh agent; one still going is shown instead of started again.
     fn launch_node_conversation(
         &mut self,
         protocol: ProtocolKind,
@@ -639,8 +639,9 @@ impl LifecyclePanelView {
                 format!("{open} findings need")
             };
             body = body.child(div().text_xs().text_color(danger).child(format!(
-                "{needs} a response before approval: fixed, out of scope, or declined. \
-                 Answer each in the review conversation's findings pane."
+                "{needs} a response before approval: fixed, out of scope, declined, or \
+                 rejected. Fix in the conversation view resolves them, or answer each \
+                 in the findings pane."
             )));
         }
         body

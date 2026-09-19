@@ -22,6 +22,9 @@ Track all findings until each has an explicit response:
 - Fix with pointer to change/commit
 - Out of scope
 - Not critical / beyond requirements / not worth the cost
+- Rejected: not a problem after all, with a note saying why
+
+Fixing is a separate fix conversation, started from the conversation view's **Fix** button: its agent answers each open finding `fixed` or `rejected`, and the user gives the other answers.
 
 No outstanding unaddressed findings.
 
@@ -40,7 +43,7 @@ Implement fixes or document responses. Re-verify when fixes touch behavior cover
 The app checks this gate itself from the node's data; no agent evaluates it:
 
 - The review conversation recorded the review finished.
-- No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; or declined as not critical, beyond requirements, or not worth the cost — small cheap extras may still be taken).
+- No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; declined as not critical, beyond requirements, or not worth the cost — small cheap extras may still be taken; or rejected as not a problem, with a note saying why).
 - **Approval is always an external gate** (not waived in autonomous mode): once both checks pass, the user advances the node. That is the external approval; do not advance it yourself.
 
 ## Exit

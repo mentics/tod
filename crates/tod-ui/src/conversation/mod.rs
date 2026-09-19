@@ -28,8 +28,8 @@ mod transcript;
 /// chat work anywhere; an implementation conversation needs a node that is
 /// `active` and has a plan to work through — the same conditions the lifecycle
 /// panel's Implement checks — and a verification one a node that is
-/// `verifying` and has a plan to check. A review needs a node in `review`.
-/// Visual design is not offered until its protocol exists.
+/// `verifying` and has a plan to check. A review, and a fix of what it found,
+/// need a node in `review`. Visual design is not offered until its protocol exists.
 fn new_kinds(
     conn: &rusqlite::Connection,
     node: Option<Uuid>,
@@ -42,7 +42,7 @@ fn new_kinds(
         match lifecycle.as_deref() {
             Some("active") if planned => kinds.push(ProtocolKind::Implementation),
             Some("verifying") if planned => kinds.push(ProtocolKind::Verification),
-            Some("review") => kinds.push(ProtocolKind::Review),
+            Some("review") => kinds.extend([ProtocolKind::Review, ProtocolKind::Fix]),
             _ => {}
         }
     }
@@ -513,8 +513,7 @@ impl ConversationView {
     }
 
     /// [`Self::open`], on the focus's most recent conversation running
-    /// `protocol` — for `Implementation` and `Verification`, the node's latest
-    /// one, reopened however many times it is launched.
+    /// `protocol`.
     pub fn open_with(
         &mut self,
         focus: Focus,
@@ -537,6 +536,36 @@ impl ConversationView {
             .flatten()
             .map(|c| c.id);
         self.show(focus, latest, record, cx);
+        self.settle_on_transcript(window, cx);
+    }
+
+    /// Run `protocol` on `focus` in a new conversation, as the lifecycle's
+    /// Implement, Verify, Review, and Fix do: every run gets a fresh agent,
+    /// so nothing an earlier run said or concluded skews this one. A run
+    /// already under way is shown instead of starting a second beside it.
+    pub fn run(
+        &mut self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let running = self
+            .drivers
+            .iter()
+            .find(|d| d.focus() == focus && d.protocol().kind() == protocol && d.status().running)
+            .map(|d| d.conversation_id());
+        self.protocol = protocol;
+        self.show(focus, running.flatten(), true, cx);
+        self.settle_on_transcript(window, cx);
+        if running.is_none() {
+            self.start(window, cx);
+        }
+    }
+
+    /// Put the keyboard on the transcript's input, as opening a
+    /// conversation does.
+    fn settle_on_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pane = Pane::Transcript;
         self.stop = Stop::Transcript;
         self.transcript
@@ -668,7 +697,11 @@ impl ConversationView {
     fn is_current(&self, driver: &ConversationDriver) -> bool {
         match self.conversation_id {
             Some(id) => driver.conversation_id() == Some(id),
-            None => driver.conversation_id().is_none() && driver.focus() == self.focus,
+            None => {
+                driver.conversation_id().is_none()
+                    && driver.focus() == self.focus
+                    && driver.protocol().kind() == self.protocol
+            }
         }
     }
 
@@ -746,10 +779,15 @@ impl ConversationView {
         // A finished run for another conversation leaves nothing to show.
         let conversation_id = self.conversation_id;
         let focus = self.focus;
+        let protocol = self.protocol;
         self.drivers.retain(|d| {
             let current = match conversation_id {
                 Some(id) => d.conversation_id() == Some(id),
-                None => d.conversation_id().is_none() && d.focus() == focus,
+                None => {
+                    d.conversation_id().is_none()
+                        && d.focus() == focus
+                        && d.protocol().kind() == protocol
+                }
             };
             current || d.status().running
         });
@@ -850,7 +888,9 @@ impl ConversationView {
                 _ => (Vec::new(), None),
             };
             let findings = match (protocol, selection.node) {
-                (ProtocolKind::Review, Some(node)) => ReviewRepo::new(conn).list_for_node(node)?,
+                (protocol, Some(node)) if protocol.works_the_findings() => {
+                    ReviewRepo::new(conn).list_for_node(node)?
+                }
                 _ => Vec::new(),
             };
             let obligations = ObligationRepo::new(conn);
@@ -1105,7 +1145,7 @@ impl ConversationView {
             Pane::Context => {}
             Pane::ChangeSet
                 if self.data.protocol.works_the_plan()
-                    || self.data.protocol == ProtocolKind::Review =>
+                    || self.data.protocol.works_the_findings() =>
             {
                 self.move_side_cursor(delta, cx);
             }
@@ -1163,12 +1203,11 @@ impl ConversationView {
                     self.open_status_menu(step.id, cx);
                 }
             }
-            Pane::ChangeSet if self.data.protocol == ProtocolKind::Review => {
+            Pane::ChangeSet if self.data.protocol.works_the_findings() => {
                 // So does a highlighted finding's.
                 let finding = self
                     .side_cursor
-                    .and_then(|ix| self.data.findings.get(ix))
-                    .map(|f| f.id);
+                    .and_then(|ix| self.shown_findings().get(ix).map(|f| f.id));
                 if let Some(finding) = finding {
                     self.open_status_menu(finding, cx);
                 }

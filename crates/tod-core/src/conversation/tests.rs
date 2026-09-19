@@ -1008,6 +1008,98 @@ fn a_review_loops_until_it_is_recorded_done() {
     assert_eq!(turns(&fx, id).len(), 4);
 }
 
+/// The fix loop end to end: the agent is given only the open findings, the
+/// mock fixes one per turn with a green test run, and the app sends it back
+/// until none is open.
+#[test]
+fn a_fix_loops_until_no_finding_is_open() {
+    use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, NewFinding, ReviewRepo};
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
+            id: fx.node.to_string(),
+            repo: Some(workspace.display().to_string()),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+    let mut ids = Vec::new();
+    for summary in ["Empty input panics", "Unused import", "Already declined"] {
+        let result = fx
+            .fleet
+            .interview(
+                tod_store::interview::ACTOR_AGENT,
+                InterviewCommand::AddReviewFinding {
+                    node_id: fx.node,
+                    conversation_id: None,
+                    finding: NewFinding {
+                        severity: "high".into(),
+                        file: Some("src/lib.rs".into()),
+                        line: Some(3),
+                        summary: summary.into(),
+                        detail: Some("Reproduce with an empty string.".into()),
+                    },
+                },
+            )
+            .unwrap();
+        ids.push(Uuid::parse_str(result["id"].as_str().unwrap()).unwrap());
+    }
+    fx.fleet
+        .interview(
+            tod_store::interview::ACTOR_USER,
+            InterviewCommand::RespondReviewFinding {
+                finding_id: ids[2],
+                status: FINDING_DECLINED.into(),
+                response: None,
+            },
+        )
+        .unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver =
+        ConversationDriver::new(config(&fx, 100_000), Focus::Node(fx.node), ProtocolKind::Fix);
+    driver
+        .send(&fx.fleet, &mut agent, "Resolve the open review findings.")
+        .unwrap();
+    let id = driver.conversation_id().unwrap();
+    let opening = agent.last().prompt_blocks().join("\n");
+    assert!(opening.contains("review fix session"), "{opening}");
+    assert!(opening.contains("## Open review findings"), "{opening}");
+    assert!(opening.contains("Empty input panics"), "{opening}");
+    assert!(opening.contains("Reproduce with an empty string."), "{opening}");
+    assert!(opening.contains("Unused import"), "{opening}");
+    assert!(!opening.contains("Already declined"), "{opening}");
+    assert!(opening.contains("## Plan steps"), "{opening}");
+
+    assert_eq!(
+        driver.tick(&fx.fleet, &mut agent),
+        [ConversationEvent::Continued]
+    );
+    let continuation = agent.last().message.clone();
+    assert!(
+        continuation.starts_with("1 review finding is still open"),
+        "{continuation}"
+    );
+    assert!(continuation.contains("Unused import"), "{continuation}");
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    let statuses: Vec<String> = fx
+        .fleet
+        .read(|conn| ReviewRepo::new(conn).list_for_node(fx.node))
+        .unwrap()
+        .into_iter()
+        .map(|f| f.status)
+        .collect();
+    assert_eq!(statuses, [FINDING_FIXED, FINDING_FIXED, FINDING_DECLINED]);
+    assert_eq!(turns(&fx, id).len(), 4);
+}
+
 /// The session's id is stored as soon as the agent reports it, so a turn
 /// that never finishes still leaves the session to resume.
 #[test]

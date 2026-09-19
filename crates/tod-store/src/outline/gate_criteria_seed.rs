@@ -312,7 +312,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "review",
         to_state: "approved",
         slug: crate::outline::repos::gate::REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
-        label: "Every review finding answered (fixed, out of scope, or declined)?",
+        label: "Every review finding answered (fixed, out of scope, declined, or rejected)?",
         sort_order: 2,
     },
 ];

@@ -1,5 +1,5 @@
 //! The lifecycle buttons beside Send: whichever step moves the focused node
-//! along its lifecycle now — Implement, Verify, Review, the gate check, Advance — so
+//! along its lifecycle now — Implement, Verify, Review, Fix, the gate check, Advance — so
 //! the user never has to go to the lifecycle panel to take it. The gate
 //! check's state lives in the shared [`LifecycleController`], so a check
 //! started here shows in the lifecycle panel too, and the other way round;
@@ -28,6 +28,7 @@ use uuid::Uuid;
 const IMPLEMENT: &str = "lifecycle:implement";
 const VERIFY: &str = "lifecycle:verify";
 const REVIEW: &str = "lifecycle:review";
+const FIX: &str = "lifecycle:fix";
 const GATE_CHECK: &str = "lifecycle:gate-check";
 const ADVANCE: &str = "lifecycle:advance";
 const BACK_TO_ACTIVE: &str = "lifecycle:back-to-active";
@@ -212,8 +213,12 @@ impl ConversationView {
                 }
             }
             "verifying" if open_is(ProtocolKind::Verification) => gate_offered = false,
-            "review" if open_is(ProtocolKind::Review) => gate_offered = false,
+            "review" if open_is(ProtocolKind::Review) || open_is(ProtocolKind::Fix) => {
+                gate_offered = false;
+            }
             "review" => {
+                let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix);
+                let fix_first = snapshot.review_done && snapshot.open_findings > 0;
                 actions.push(
                     PanelAction::new(
                         REVIEW,
@@ -226,9 +231,25 @@ impl ConversationView {
                     .primary(!snapshot.review_done)
                     .disabled(blocked),
                 );
+                // Fixing resolves the open findings — fixed, or rejected with
+                // a note — in a fix conversation, while the node stays here.
+                if snapshot.open_findings > 0 || fixing {
+                    actions.push(
+                        PanelAction::new(
+                            FIX,
+                            if fixing {
+                                "Fixing…".to_string()
+                            } else {
+                                format!("Fix ({} open)", snapshot.open_findings)
+                            },
+                        )
+                        .primary(fix_first)
+                        .disabled(blocked),
+                    );
+                }
                 // Approval waits for a finished review with every finding
                 // answered — the gate's two app-checked criteria.
-                gate_offered &= snapshot.review_done && snapshot.open_findings == 0;
+                gate_offered &= snapshot.review_done && snapshot.open_findings == 0 && !fixing;
                 if snapshot.open_findings > 0 {
                     let needs = if snapshot.open_findings == 1 {
                         "1 review finding needs".to_string()
@@ -238,7 +259,10 @@ impl ConversationView {
                     notices.push(PanelNotice::new(
                         NoticeTone::Error,
                         format!(
-                            "{needs} an answer before approval: fixed, out of scope, or                              declined. Answer each from its status in the review                              conversation's findings pane."
+                            "{needs} an answer before approval. Fix resolves them \
+                             (fixed, or rejected with a note); out of scope and \
+                             declined are answered from a finding's status in the \
+                             findings pane."
                         ),
                     ));
                 }
@@ -323,6 +347,7 @@ impl ConversationView {
             IMPLEMENT => self.run_protocol(node, ProtocolKind::Implementation, window, cx),
             VERIFY => self.run_protocol(node, ProtocolKind::Verification, window, cx),
             REVIEW => self.run_protocol(node, ProtocolKind::Review, window, cx),
+            FIX => self.run_protocol(node, ProtocolKind::Fix, window, cx),
             GATE_CHECK => lifecycle.update(cx, |c, cx| c.run_gate_check(&task_id, cx)),
             ADVANCE => lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx)),
             BACK_TO_ACTIVE => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
@@ -338,8 +363,8 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Open `node`'s latest conversation running `protocol` and set it
-    /// going, as the lifecycle panel's Implement, Verify, and Review do.
+    /// Run `protocol` on `node` in a new conversation (see
+    /// [`ConversationView::run`]).
     fn run_protocol(
         &mut self,
         node: Uuid,
@@ -355,8 +380,7 @@ impl ConversationView {
         {
             return;
         }
-        self.open_with(Focus::Node(node), protocol, true, window, cx);
-        self.start(window, cx);
+        self.run(Focus::Node(node), protocol, window, cx);
     }
 
     /// Bring back the node's last gate check, if the controller has not seen

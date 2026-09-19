@@ -241,7 +241,10 @@ for a node in `review` (the lifecycle panel's Review): the agent records each
 finding through `tod-cli review` (`tod_store::review`, on the node, not the
 conversation) and loops until it records `review done`; it replaces the old
 `review` on-entry turn, and the side pane lists the findings, each answered
-from its status badge. The `review` → `approved` gate is app-checked
+from its status badge. `fix.rs` resolves them (the conversation view's Fix,
+beside Review): given the open findings, the agent answers each `fixed` or
+`rejected` with a note — `tod-cli` refuses it the user's answers — and loops
+until none is open and a test run is green. The `review` → `approved` gate is app-checked
 (`tod_core::gate::derived`): review recorded done, no finding still open. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:

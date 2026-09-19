@@ -125,6 +125,7 @@ str_enum!(
         Implementation => "implementation",
         Verification => "verification",
         Review => "review",
+        Fix => "fix",
         Chat => "chat",
         VisualDesign => "visual_design",
     }
@@ -135,6 +136,12 @@ impl ProtocolKind {
     /// the plan, and its agent records what it did on the steps themselves.
     pub fn works_the_plan(self) -> bool {
         matches!(self, ProtocolKind::Implementation | ProtocolKind::Verification)
+    }
+
+    /// Whether this kind works through a node's review findings — its side
+    /// pane lists them, each answered from its status.
+    pub fn works_the_findings(self) -> bool {
+        matches!(self, ProtocolKind::Review | ProtocolKind::Fix)
     }
 }
 

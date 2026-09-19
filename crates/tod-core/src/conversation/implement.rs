@@ -450,7 +450,7 @@ pub(super) fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithL
 /// `git status --porcelain` in the worktree, or an empty mark when it cannot
 /// be read (a worktree that is not a repository still implements fine; it
 /// just contributes nothing to the progress check).
-fn worktree_fingerprint(cwd: &std::path::Path) -> String {
+pub(super) fn worktree_fingerprint(cwd: &std::path::Path) -> String {
     Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(cwd)

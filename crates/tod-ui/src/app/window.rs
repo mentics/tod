@@ -579,9 +579,10 @@ impl Shell {
     ) {
         self.select_view(ShellView::Conversation, window, cx);
         self.conversation.update(cx, |conversation, cx| {
-            conversation.open_with(focus, protocol, true, window, cx);
             if start {
-                conversation.start(window, cx);
+                conversation.run(focus, protocol, window, cx);
+            } else {
+                conversation.open_with(focus, protocol, true, window, cx);
             }
         });
         cx.notify();

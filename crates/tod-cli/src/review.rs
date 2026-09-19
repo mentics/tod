@@ -1,19 +1,22 @@
 //! `tod-cli review` — code review findings on a node: what a review
 //! conversation's agent found, and the response each one gets.
 //!
-//! Inside a review conversation the app sets `TOD_IMPLEMENT_NODE` and
+//! Inside a review or fix conversation the app sets `TOD_IMPLEMENT_NODE` and
 //! `TOD_IMPLEMENT_CONVERSATION`, so `--node` defaults to the node under
 //! review and each finding is filed under the conversation. `done` only
-//! works there: it is how the app learns the review is finished.
+//! works in a review conversation: it is how the app learns the review is
+//! finished. A fix conversation's agent may only respond `fixed` or
+//! `rejected`; the other answers are the user's.
 
 use crate::Invocation;
 use crate::args::Args;
 use tod_core::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};
 use tod_core::conversation::review::done_report;
-use tod_store::conversation::ConversationRepo;
+use tod_store::conversation::{ConversationRepo, ProtocolKind};
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::review::{
-    FINDING_OPEN, FINDING_STATUSES, NewFinding, ReviewFinding, ReviewRepo, normalize,
+    FINDING_OPEN, FINDING_STATUSES, FIX_AGENT_STATUSES, NewFinding, ReviewFinding, ReviewRepo,
+    normalize,
 };
 use uuid::Uuid;
 
@@ -21,21 +24,23 @@ pub(crate) const USAGE: &str = "\
 tod-cli review — code review findings on a node
 
 Finding ids may be given in full or as the 8-character prefix shown in listings.
-Inside a review conversation --node defaults to the node under review.
+Inside a review or fix conversation --node defaults to the node under review.
 
 COMMANDS:
     list      [--node <UUID>] [--open]
     show      <ID>
     add       [--node <UUID>] --severity high|medium|low --summary <TEXT> [--file <PATH>] [--line <N>] [--detail <TEXT>]
-    respond   <ID> --status open|fixed|out_of_scope|declined [--response <TEXT>]
+    respond   <ID> --status open|fixed|out_of_scope|declined|rejected [--response <TEXT>]
     done
 
 `add` records an open finding: --summary is the defect in a sentence, --detail
 the inputs or state that go wrong and how (use `--detail -` and a heredoc for
 anything long), --file a repo-relative path and --line its 1-based line.
 `respond` answers one: fixed (the response points at the change), out_of_scope,
-or declined (not critical, beyond the requirements, or not worth the cost).
-Every status but open needs --response; open clears it.
+declined (not critical, beyond the requirements, or not worth the cost), or
+rejected (not a problem after all; the response says why).
+Every status but open needs --response; open clears it. Inside a fix
+conversation only fixed and rejected are allowed.
 `done` records that this review is finished; it only works inside a review
 conversation (TOD_IMPLEMENT_CONVERSATION=<UUID>).
 ";
@@ -201,6 +206,14 @@ fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         status == FINDING_OPEN || response.is_some(),
         "--status {status} needs --response: the fix, or why not"
     );
+    if in_fix_conversation(inv)? {
+        anyhow::ensure!(
+            FIX_AGENT_STATUSES.contains(&status),
+            "a fix conversation may only respond {}: out_of_scope and declined \
+             are the user's to give, and open is where the finding already is",
+            FIX_AGENT_STATUSES.join(" or ")
+        );
+    }
     inv.client()
         .interview(InterviewCommand::RespondReviewFinding {
             finding_id: id,
@@ -208,6 +221,19 @@ fn respond(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             response: response.map(str::to_string),
         })?;
     Ok(format!("ok {}", short_id(id)))
+}
+
+/// Whether this runs inside a fix conversation, whose agent may only give the
+/// statuses in [`FIX_AGENT_STATUSES`].
+fn in_fix_conversation(inv: &Invocation) -> anyhow::Result<bool> {
+    let Some(conversation) = env_uuid(IMPLEMENT_CONVERSATION_ENV)? else {
+        return Ok(false);
+    };
+    inv.client().read(|conn| {
+        Ok(ConversationRepo::new(conn)
+            .get(conversation)?
+            .is_some_and(|c| c.protocol == ProtocolKind::Fix))
+    })
 }
 
 /// Record the review finished, in the conversation the app named.

@@ -273,7 +273,8 @@ impl AgentTranscriptsView {
         let format_problems = (!self.format_problems.is_empty()).then(|| Entry {
             kind: EntryKind::Error,
             body: format!(
-                "The transcript format has changed, so parts of this transcript are left                  out until the reader is updated: {}.",
+                "The transcript format has changed, so parts of this transcript are left \
+                 out until the reader is updated: {}.",
                 self.format_problems
                     .iter()
                     .map(ToString::to_string)

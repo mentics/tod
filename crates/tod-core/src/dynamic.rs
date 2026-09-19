@@ -14,6 +14,7 @@ use crate::node_context::{obligation_line, plan_step_line};
 use std::path::Path;
 use tod_store::conversation::Focus;
 use tod_store::outline::NodeObligation;
+use tod_store::review::ReviewFinding;
 use uuid::Uuid;
 
 /// The node an agent surface was opened against.
@@ -96,6 +97,9 @@ pub enum DynamicBlock {
     AncestorContext,
     /// This node's plan steps with their dependency and `satisfies` links.
     Plan,
+    /// The review findings a fix session is to resolve — the open ones,
+    /// with their ids, severity, location, and detail.
+    ReviewFindings,
     /// Repo, branch, working directory, and task notes.
     Workspace,
     /// The directory the agent was launched in, for a surface whose code
@@ -118,9 +122,33 @@ pub struct DynamicContext<'a> {
     pub obligations: &'a [NodeObligation],
     pub ancestor_context: &'a str,
     pub plan_steps: &'a [PlanStepWithLinks],
+    pub findings: &'a [ReviewFinding],
     pub workspace: Option<&'a Workspace>,
     pub working_dir: Option<&'a Path>,
     pub focus: Option<&'a FocusSelection>,
+}
+
+/// One finding as a fix session is shown it: a line with its id, severity,
+/// location, and summary, then its detail indented under it.
+pub fn review_finding_lines(finding: &ReviewFinding) -> String {
+    let location = finding
+        .location()
+        .map(|l| format!(" `{l}`"))
+        .unwrap_or_default();
+    let mut out = format!(
+        "- [{}] {}{location}: {}\n",
+        tod_store::interview::short_id(finding.id),
+        finding.severity,
+        finding.summary.trim()
+    );
+    if let Some(detail) = finding.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        for line in detail.lines() {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Render `blocks`, in order, under a single `# Current context` heading.
@@ -257,6 +285,17 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                         &entry.satisfies,
                     ));
                     out.push('\n');
+                }
+            }
+        }
+
+        DynamicBlock::ReviewFindings => {
+            out.push_str("\n## Open review findings\n\n");
+            if ctx.findings.is_empty() {
+                out.push_str("(none)\n");
+            } else {
+                for finding in ctx.findings {
+                    out.push_str(&review_finding_lines(finding));
                 }
             }
         }

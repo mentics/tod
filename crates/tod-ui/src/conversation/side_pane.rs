@@ -15,7 +15,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Anchor, AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
+    Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
     ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -29,7 +29,10 @@ use tod_store::outline::repos::plan_steps::{
     STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
-use tod_store::review::FINDING_STATUSES;
+use tod_store::review::{
+    FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_REJECTED, FINDING_STATUSES,
+    ReviewFinding, USER_FINDING_STATUSES,
+};
 use uuid::Uuid;
 
 /// The status dropdown open on one plan step or review finding.
@@ -37,8 +40,8 @@ use uuid::Uuid;
 pub(super) struct StatusMenu {
     /// The plan step or finding.
     pub step: Uuid,
-    /// The statuses it lists: [`PLAN_STEP_STATUSES`] or
-    /// [`FINDING_STATUSES`].
+    /// The statuses it lists: [`PLAN_STEP_STATUSES`], or for a finding
+    /// [`USER_FINDING_STATUSES`] ([`FINDING_STATUSES`] once it is rejected).
     pub options: &'static [&'static str],
     /// Index into `options`.
     pub highlighted: usize,
@@ -52,7 +55,12 @@ impl ConversationView {
             if let Some(s) = self.data.plan.iter().find(|s| s.id == step) {
                 (&s.status, &PLAN_STEP_STATUSES)
             } else if let Some(f) = self.data.findings.iter().find(|f| f.id == step) {
-                (&f.status, &FINDING_STATUSES)
+                let options: &'static [&'static str] = if f.status == FINDING_REJECTED {
+                    &FINDING_STATUSES
+                } else {
+                    &USER_FINDING_STATUSES
+                };
+                (&f.status, options)
             } else {
                 return;
             };
@@ -392,7 +400,7 @@ impl ConversationView {
             ProtocolKind::Implementation | ProtocolKind::Verification => {
                 self.render_plan_pane(window, cx)
             }
-            ProtocolKind::Review => self.render_review_pane(window, cx),
+            ProtocolKind::Review | ProtocolKind::Fix => self.render_review_pane(window, cx),
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => self.render_empty_pane(
@@ -414,8 +422,21 @@ impl ConversationView {
             .collect()
     }
 
-    /// Show or hide steps in `status`. With no status toggled on, every step
-    /// shows.
+    /// The review findings the status filter lets through, in the order they
+    /// were recorded.
+    pub(super) fn shown_findings(&self) -> Vec<ReviewFinding> {
+        self.data
+            .findings
+            .iter()
+            .filter(|f| {
+                self.status_filter.is_empty() || self.status_filter.contains(f.status.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Show or hide plan steps, or findings, in `status`. With no status
+    /// toggled on, every row shows.
     pub(super) fn toggle_status_filter(&mut self, status: &'static str, cx: &mut Context<Self>) {
         if !self.status_filter.remove(status) {
             self.status_filter.insert(status);
@@ -428,16 +449,31 @@ impl ConversationView {
 
     /// Rows Up/Down move among in the plan pane, or the review pane.
     fn side_row_count(&self) -> usize {
-        if self.data.protocol == ProtocolKind::Review {
-            return self.data.findings.len();
+        if self.data.protocol.works_the_findings() {
+            return self.shown_findings().len();
         }
         self.shown_plan().len() + self.side_files.len()
     }
 
-    /// One toggle per status the plan has a step in (and any toggled on that
-    /// has since emptied), with its count, plus "All" to clear them.
+    /// One toggle per status the pane has a row in — a plan step, or a
+    /// review finding — (and any toggled on that has since emptied), with its
+    /// count, plus "All" to clear them.
     fn render_status_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.data.plan.is_empty() {
+        let findings = self.data.protocol.works_the_findings();
+        let (kind, statuses, rows): (&str, &'static [&'static str], Vec<&str>) = if findings {
+            (
+                "finding",
+                &FINDING_STATUSES,
+                self.data.findings.iter().map(|f| f.status.as_str()).collect(),
+            )
+        } else {
+            (
+                "plan",
+                &PLAN_STEP_STATUSES,
+                self.data.plan.iter().map(|s| s.status.as_str()).collect(),
+            )
+        };
+        if rows.is_empty() {
             return None;
         }
         let mut bar = h_flex()
@@ -447,7 +483,7 @@ impl ConversationView {
             .px(style::space::RELATED)
             .py(style::space::HAIRLINE)
             .child(
-                Button::new("plan-filter-all")
+                Button::new(ElementId::Name(format!("{kind}-filter-all").into()))
                     .label("All")
                     .ghost()
                     .small()
@@ -460,14 +496,14 @@ impl ConversationView {
                         }
                     })),
             );
-        for status in PLAN_STEP_STATUSES {
-            let n = self.data.plan.iter().filter(|s| s.status == status).count();
+        for status in statuses.iter().copied() {
+            let n = rows.iter().filter(|s| **s == status).count();
             let on = self.status_filter.contains(status);
             if n == 0 && !on {
                 continue;
             }
             bar = bar.child(
-                Button::new(ElementId::Name(format!("plan-filter-{status}").into()))
+                Button::new(ElementId::Name(format!("{kind}-filter-{status}").into()))
                     .label(format!("{status} {n}"))
                     .ghost()
                     .small()
@@ -703,8 +739,10 @@ impl ConversationView {
     }
 
     /// The node's review findings in the order they were recorded — the
-    /// same rows the `review` → `approved` gate asks a response for. Each
-    /// row's status badge is the user's answer to it.
+    /// same rows the `review` → `approved` gate asks a response for — in a
+    /// review or a fix conversation. Each row's status badge is its answer,
+    /// and the response under it (a fix's pointer, a rejection's reason) is
+    /// labelled with that answer.
     fn render_review_pane(
         &mut self,
         window: &mut Window,
@@ -713,7 +751,8 @@ impl ConversationView {
         let active = self.pane == Pane::ChangeSet;
         let total = self.data.findings.len();
         let open = self.data.findings.iter().filter(|f| f.is_open()).count();
-        let cursor = self.side_cursor.filter(|ix| *ix < total);
+        let findings = self.shown_findings();
+        let cursor = self.side_cursor.filter(|ix| *ix < findings.len());
         if std::mem::take(&mut self.side_scroll_pending) {
             if let Some(row) = cursor {
                 self.side_scroll.scroll_to_item(row);
@@ -727,7 +766,6 @@ impl ConversationView {
             self.status_menu = None;
         }
 
-        let findings = self.data.findings.clone();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (n, finding) in findings.into_iter().enumerate() {
             let id = finding.id;
@@ -765,12 +803,21 @@ impl ConversationView {
                 )));
             }
             if let Some(response) = &finding.response {
-                col = col.child(style::text_dense(div()).child(selectable_text(
-                    format!("review-finding-response-{id}"),
-                    response.clone(),
-                    window,
-                    cx,
-                )));
+                col = col.child(
+                    v_flex()
+                        .pt(style::space::HAIRLINE)
+                        .child(
+                            style::text_dense_muted(div())
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(response_label(&finding.status)),
+                        )
+                        .child(style::text_dense(div()).child(selectable_text(
+                            format!("review-finding-response-{id}"),
+                            response.clone(),
+                            window,
+                            cx,
+                        ))),
+                );
             }
             rows.push(
                 h_flex()
@@ -789,7 +836,11 @@ impl ConversationView {
             rows.push(
                 style::empty_message(div())
                     .p(style::space::INSET)
-                    .child("No findings recorded.")
+                    .child(if total == 0 {
+                        "No findings recorded."
+                    } else {
+                        "No findings in the chosen statuses."
+                    })
                     .into_any_element(),
             );
         }
@@ -809,7 +860,11 @@ impl ConversationView {
                             style::text_muted(div())
                         }
                         .flex_shrink_0()
-                        .child("Review"),
+                        .child(if self.data.protocol == ProtocolKind::Fix {
+                            "Fix"
+                        } else {
+                            "Review"
+                        }),
                     )
                     .child(style::text_dense_muted(div()).child(match total {
                         1 => format!("1 finding, {open} open"),
@@ -822,6 +877,7 @@ impl ConversationView {
                         )
                     }),
             )
+            .children(self.render_status_filter(cx))
             .child(
                 v_flex()
                     .id("review-pane")
@@ -846,5 +902,16 @@ impl ConversationView {
                     .child(message),
             )
             .into_any_element()
+    }
+}
+
+/// What a finding's response is, by the answer it came with.
+fn response_label(status: &str) -> &'static str {
+    match status {
+        FINDING_FIXED => "Fixed",
+        FINDING_REJECTED => "Rejected — why it is not a problem",
+        FINDING_OUT_OF_SCOPE => "Out of scope",
+        FINDING_DECLINED => "Declined",
+        _ => "Note",
     }
 }

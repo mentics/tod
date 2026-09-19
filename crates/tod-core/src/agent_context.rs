@@ -8,7 +8,7 @@
 //! caller's request into a [`DynamicContext`].
 
 use crate::context_recipes::{
-    IMPLEMENT_SESSION, REVIEW_SESSION, VERIFY_SESSION, VISUAL_DESIGN_CHAT,
+    FIX_SESSION, IMPLEMENT_SESSION, REVIEW_SESSION, VERIFY_SESSION, VISUAL_DESIGN_CHAT,
 };
 use crate::dynamic::DynamicContext;
 use crate::gate::PlanStepWithLinks;
@@ -16,6 +16,7 @@ use crate::media::MediaPaths;
 use anyhow::Result;
 use std::path::Path;
 use tod_store::outline::NodeObligation;
+use tod_store::review::ReviewFinding;
 
 pub use crate::context_recipes::ContextRecipe;
 pub use crate::dynamic::{NodeSelection, ObligationSelection};
@@ -108,11 +109,31 @@ pub fn build_review_message(
     build_plan_session_message(paths, &REVIEW_SESSION, Some(role_doc), request)
 }
 
+/// Build the full fix-session first message: what an implementation session
+/// is given, plus the node's open review findings to resolve.
+pub fn build_fix_message(
+    paths: &MediaPaths,
+    request: &ImplementRequest<'_>,
+    findings: &[ReviewFinding],
+) -> Result<String> {
+    build_plan_session_message_with(paths, &FIX_SESSION, None, request, findings)
+}
+
 fn build_plan_session_message(
     paths: &MediaPaths,
     recipe: &ContextRecipe,
     role_doc: Option<&str>,
     request: &ImplementRequest<'_>,
+) -> Result<String> {
+    build_plan_session_message_with(paths, recipe, role_doc, request, &[])
+}
+
+fn build_plan_session_message_with(
+    paths: &MediaPaths,
+    recipe: &ContextRecipe,
+    role_doc: Option<&str>,
+    request: &ImplementRequest<'_>,
+    findings: &[ReviewFinding],
 ) -> Result<String> {
     crate::context_recipes::build_message(
         paths,
@@ -125,6 +146,7 @@ fn build_plan_session_message(
             obligations: &request.obligations,
             ancestor_context: &request.ancestor_context,
             plan_steps: &request.plan_steps,
+            findings,
             ..Default::default()
         },
         "",

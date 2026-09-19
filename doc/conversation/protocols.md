@@ -73,6 +73,7 @@ context recipes — one list, one place, tests over it.
 | `implementation` | Active-phase **Implement** | node worktree | no | plan steps + changed files | yes |
 | `verification` | Verifying-phase **Verify** | node worktree | no | plan steps with verdicts | yes |
 | `review` | Review-phase **Review** | node worktree | no | review findings | yes |
+| `fix` | Review-phase **Fix** | node worktree | no | review findings | yes |
 | `chat` | action panel's **Chat**, the picker | node's directory, else scratch | yes, recorded | change set | no |
 | `visual_design` | design panel | scratch | yes (1 command) | designer | no |
 
@@ -369,17 +370,23 @@ no longer runs an agent by itself.
   conversation, which each one only names. The reply is empty or a sentence
   or two.
 - **Responses.** A finding is `open` until answered: `fixed` (the response
-  points at the change), `out_of_scope`, or `declined` (not critical, beyond
-  the requirements, or not worth the cost). The user answers from the
-  finding's status badge; an agent answers through `tod-cli review respond`,
-  which requires a response for anything but `open`.
+  points at the change), `out_of_scope`, `declined` (not critical, beyond
+  the requirements, or not worth the cost), or `rejected` (not a problem
+  after all; schema v45). The user answers from the finding's status badge,
+  whose menu leaves out `rejected` (it needs a note) unless the finding is
+  already rejected; an agent answers through `tod-cli review respond`, which
+  requires a response for anything but `open`, and the store refuses a
+  `rejected` without one.
 - **Done.** A turn recorded the review done. Otherwise the loop sends the
   agent back to finish, capped and stopped by a turn that recorded no
   finding and changed no status, like §4.4.
 - **Side pane.** The node's findings in the order they were recorded, titled
   "Review" and counted ("4 findings, 3 open"): each row's status badge (a
   dropdown, as a plan step's is), severity, summary, location, detail, and
-  response. Up/Down move among them; Enter opens the highlighted one's
+  response, labelled with the answer it came with ("Fixed", "Rejected — why
+  it is not a problem"). Under the header, one toggle per status with a
+  finding in it narrows the list, as the plan pane's do; All clears them.
+  Up/Down move among the shown rows; Enter opens the highlighted one's
   status dropdown.
 - **Gate.** The `review` → `approved` gate is two criteria the app answers
   itself (`tod_core::gate::derived`), so its gate check runs no agent: the
@@ -388,6 +395,35 @@ no longer runs an agent by itself.
   then the user's Advance, the external gate the role doc requires.
   Beside Send, the gate check is offered only once both hold; until then an
   open finding shows as a notice above the input.
+
+## 4d. The fix protocol
+
+Resolving what the review found (`tod_core::conversation::fix`). The node
+stays in `review`: fixing is an answer to the review, not a phase of its own.
+
+- **Launch.** Beside Send, **Fix (N open)** sits next to Review whenever a
+  finding is open — the primary button once the review is recorded done —
+  and reads "Fixing…" while a fix conversation on the node is running. It
+  starts a new fix conversation (§5: every run gets a fresh agent) and sends
+  the starter, "Resolve the open review findings." The picker offers "New fix"
+  on a node in `review`.
+- **Context.** Implementation's blocks under the `FIX_SESSION` recipe, plus
+  the open findings (`DynamicBlock::ReviewFindings`: id, severity, location,
+  summary, detail) ahead of the plan and obligations. Findings already
+  answered are left out. `surface/fix` says what resolving means and sets the
+  reply rule. A later user message in the same conversation carries the
+  findings open now as its delta.
+- **What the agent records.** Each finding's answer, through `tod-cli review
+  respond`: `fixed` with a pointer to the change, or `rejected` with a note
+  saying why it is not a problem. Inside a fix conversation `tod-cli` refuses
+  every other status — `out_of_scope` and `declined` are the user's. It
+  records a test run through `tod-cli tests record`, as implementation does.
+- **Done.** No finding is `open` and the turn recorded a green test run.
+  Otherwise the loop sends the agent back with the findings still open,
+  capped and stopped by a turn that changed no status and no file, like §4.4.
+- **Side pane.** The review pane (§4c), titled "Fix".
+- **Gate.** Unchanged: rejected counts as answered. The user reads each
+  rejection's note, and reopens the finding if they disagree.
 
 ## 5. View changes
 
@@ -403,16 +439,23 @@ no longer runs an agent by itself.
   a conversation and a chat anywhere, an implementation only on an `active`
   node with plan steps, a verification only on a `verifying` one, a review
   only on a node in `review`. Ctrl+N starts another of the kind that is open.
-  *Done.* So a node can have several implementation conversations; Implement
-  reopens the most recent.
+  *Done.* So a node can have several implementation conversations.
+- **Every lifecycle run is a new conversation.** Implement, Verify, Review,
+  and Fix — and their "again" forms — each start a new conversation with a
+  fresh agent session, rather than reopening the node's latest one: an agent
+  carrying an earlier run's context tends to lean on what it concluded then
+  (a reviewer re-finding, or not finding, what it found before; a fixer
+  defending its last fix). A run still going on the node is shown instead of
+  starting a second beside it (`ConversationView::run`). Earlier runs stay
+  in the picker. What a run needs from before — open findings, failed-step
+  notes, the plan's statuses — comes from the store, not the session.
 - A protocol may name a **starter** message (`Protocol::starter`;
   implementation's is "Implement the plan.", verification's "Verify the
   plan.", review's "Review the change."). A new conversation from the
   picker or Ctrl+N puts it in the input, unsent, to edit or send as is. The
-  lifecycle panel's Implement, and the one beside Send on an `active` node,
-  sends it on arrival (`OpenConversation::start` / `ConversationView::start`),
-  since the click already says what the user wants — unless the agent is
-  still working on that conversation.
+  lifecycle's buttons (in the panel and beside Send) send it on arrival
+  (`OpenConversation::start` / `ConversationView::run`), since the click
+  already says what the user wants.
 
 ## 6. Staging
 

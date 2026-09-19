@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use rusqlite::backup::Backup;
 use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 44;
+pub const CURRENT_USER_VERSION: i32 = 45;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -315,6 +315,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 44 {
         migrate_v43_to_v44(conn)?;
         conn.pragma_update(None, "user_version", 44)?;
+    }
+    if version < 45 {
+        migrate_v44_to_v45(conn)?;
+        conn.pragma_update(None, "user_version", 45)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -774,6 +778,47 @@ fn migrate_v41_to_v42(conn: &Connection) -> Result<()> {
 /// change, and the response each gets (`crate::review`).
 fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::review::CREATE_TABLE)?;
+    Ok(())
+}
+
+/// Review findings: the `rejected` status (the fix agent's pushback). The
+/// status CHECK has to grow, which means a table rebuild; nothing references
+/// `review_findings`, so it is renamed aside and copied back.
+fn migrate_v44_to_v45(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_findings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        conn.execute_batch(crate::review::CREATE_TABLE)?;
+        return Ok(());
+    };
+    if table_sql.contains("'rejected'") {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_review_findings_node;
+         ALTER TABLE review_findings RENAME TO review_findings_v44;",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(crate::review::CREATE_TABLE)?;
+    tx.execute_batch(
+        "INSERT INTO review_findings
+             (id, node_id, conversation_id, seq, severity, file, line, summary, detail,
+              status, response, created_at, updated_at)
+         SELECT id, node_id, conversation_id, seq, severity, file, line, summary, detail,
+              status, response, created_at, updated_at
+         FROM review_findings_v44;
+         DROP TABLE review_findings_v44;",
+    )?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
@@ -4101,6 +4146,80 @@ mod plan_step_migration_tests {
             })
             .unwrap();
         assert_eq!(fk_problems, 0);
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys, 1);
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// v45 lets a finding be `rejected`, keeping every finding and response
+    /// that is already there.
+    #[test]
+    fn v45_lets_a_finding_be_rejected() {
+        use crate::outline::uuid_blob::uuid_to_blob;
+        use rusqlite::params;
+        let (dir, conn) = temp_db();
+        let node_id = uuid::Uuid::new_v4();
+        let finding_id = uuid::Uuid::new_v4();
+        // Put the table back in its v44 shape.
+        conn.execute_batch(
+            "DROP TABLE review_findings;
+             CREATE TABLE review_findings (
+                 id BLOB PRIMARY KEY NOT NULL,
+                 node_id BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                 conversation_id BLOB REFERENCES conversations(id) ON DELETE SET NULL,
+                 seq INTEGER NOT NULL,
+                 severity TEXT NOT NULL CHECK (severity IN ('high','medium','low')),
+                 file TEXT, line INTEGER, summary TEXT NOT NULL, detail TEXT,
+                 status TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','fixed','out_of_scope','declined')),
+                 response TEXT,
+                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                 UNIQUE (node_id, seq)
+             );
+             CREATE INDEX idx_review_findings_node ON review_findings(node_id, seq);",
+        )
+        .unwrap();
+        crate::outline::repos::NodeRepo::new(&conn)
+            .create_with_id(node_id, "reviewed", "Reviewed")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO review_findings (id, node_id, seq, severity, summary, status, response,
+                                          created_at, updated_at)
+             VALUES (?1, ?2, 1, 'high', 'keep me', 'declined', 'not worth it', 1, 2)",
+            params![uuid_to_blob(finding_id), uuid_to_blob(node_id)],
+        )
+        .unwrap();
+
+        migrate_v44_to_v45(&conn).unwrap();
+        migrate_v44_to_v45(&conn).unwrap();
+
+        let row: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT summary, status, response FROM review_findings WHERE id = ?1",
+                params![uuid_to_blob(finding_id)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            ("keep me".into(), "declined".into(), Some("not worth it".into()))
+        );
+        conn.execute(
+            "UPDATE review_findings SET status = 'rejected' WHERE id = ?1",
+            params![uuid_to_blob(finding_id)],
+        )
+        .unwrap();
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_review_findings_node'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
         let foreign_keys: i64 = conn
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .unwrap();
