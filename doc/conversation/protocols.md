@@ -316,7 +316,8 @@ The mirror of implementation, checking the plan instead of building it
 turn, whose reply was a wall of narration in the lifecycle panel: entering
 `verifying` no longer runs an agent by itself.
 
-- **Launch.** The lifecycle panel's Verification section shows **Verify**
+- **Launch.** The lifecycle panel's Verification section, and the lifecycle
+  buttons beside the conversation view's Send, show **Verify**
   while any plan step has no verdict and **Verify again** once every step
   has one. Either opens the node's most recent verification conversation (or
   a new one) and sends the starter, "Verify the plan." The picker offers
@@ -345,7 +346,8 @@ An independent code review of the node's change
 whose findings came back as prose in the lifecycle panel: entering `review`
 no longer runs an agent by itself.
 
-- **Launch.** The lifecycle panel's Code review section shows **Review**
+- **Launch.** The lifecycle panel's Code review section, and the lifecycle
+  buttons beside the conversation view's Send, show **Review**
   until the node has a review conversation, and **Review again** after.
   Either opens the node's most recent review conversation (or a new one) and
   sends the starter, "Review the change." The picker offers "New review" on
@@ -384,6 +386,8 @@ no longer runs an agent by itself.
   node's review conversation last reported the review done, and no finding
   is still `open`. A node with no findings passes the second. Approval is
   then the user's Advance, the external gate the role doc requires.
+  Beside Send, the gate check is offered only once both hold; until then an
+  open finding shows as a notice above the input.
 
 ## 5. View changes
 
@@ -405,7 +409,8 @@ no longer runs an agent by itself.
   implementation's is "Implement the plan.", verification's "Verify the
   plan.", review's "Review the change."). A new conversation from the
   picker or Ctrl+N puts it in the input, unsent, to edit or send as is. The
-  lifecycle panel's Implement sends it on arrival (`OpenConversation::start`),
+  lifecycle panel's Implement, and the one beside Send on an `active` node,
+  sends it on arrival (`OpenConversation::start` / `ConversationView::start`),
   since the click already says what the user wants — unless the agent is
   still working on that conversation.
 

@@ -31,7 +31,8 @@ fn open_view<'a>(
     let (slot_in, events_in) = (slot.clone(), events.clone());
     let (_, cx) = cx.add_window_view(move |window, cx| {
         let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
-        let view = cx.new(|cx| ConversationView::new(window, cx, agent, store));
+        let lifecycle = cx.new(|cx| LifecycleController::new(cx, store.clone(), agent.clone()));
+        let view = cx.new(|cx| ConversationView::new(window, cx, agent, store, lifecycle));
         cx.subscribe(&view, move |_, _, event: &ConversationViewEvent, _| {
             events_in.borrow_mut().push(event.clone());
         })
@@ -1666,4 +1667,178 @@ fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
         assert!(v.status_menu.is_none());
         assert_eq!(v.data.findings[1].status, FINDING_DECLINED);
     });
+}
+
+// ----- lifecycle controls ------------------------------------------------------
+
+fn set_lifecycle(fixture: &Fixture, state: &str) {
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fixture.node_id,
+            capabilities: vec![tod_store::outline::types::Capability::Lifecycle],
+        })
+        .unwrap();
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::SetLifecycle {
+            node_id: fixture.node_id,
+            state: state.into(),
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+}
+
+fn lifecycle_labels(view: &Entity<ConversationView>, cx: &mut VisualTestContext) -> Vec<String> {
+    view.read_with(cx, |view, cx| {
+        let (actions, _) = view.lifecycle_controls(cx);
+        actions.iter().map(|a| a.label.to_string()).collect()
+    })
+}
+
+fn lifecycle_notices(
+    view: &Entity<ConversationView>,
+    cx: &mut VisualTestContext,
+) -> Vec<crate::ui::agent_conversation::PanelNotice> {
+    view.read_with(cx, |view, cx| view.lifecycle_controls(cx).1)
+}
+
+/// Press the lifecycle button labelled `label` through the transcript panel,
+/// the way Enter on it would.
+fn press_lifecycle(view: &Entity<ConversationView>, label: &str, cx: &mut VisualTestContext) {
+    let ix = view.read_with(cx, |view, cx| {
+        let (actions, _) = view.lifecycle_controls(cx);
+        actions
+            .iter()
+            .position(|a| a.label.as_ref() == label)
+            .unwrap_or_else(|| panic!("no {label:?} in {actions:?}"))
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.transcript.update(cx, |panel, cx| {
+            panel.set_highlight(PanelStop::Action(ix), cx);
+            panel.activate(window, cx);
+        });
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+fn a_node_without_a_lifecycle_has_no_lifecycle_buttons(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    assert!(lifecycle_labels(&view, cx).is_empty());
+    assert!(lifecycle_notices(&view, cx).is_empty());
+    // Nor does the project.
+    view.update_in(cx, |view, window, cx| {
+        view.open(Focus::Project, false, window, cx)
+    });
+    draw(cx);
+    assert!(lifecycle_labels(&view, cx).is_empty());
+}
+
+#[gpui::test]
+fn an_active_node_with_open_steps_offers_implement(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "active");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    let steps = fixture.steps.len();
+    assert_eq!(
+        lifecycle_labels(&view, cx),
+        vec![format!("Implement ({steps} of {steps} left)")]
+    );
+    // The fixture has no Agent or Files, so it cannot run, and says why.
+    view.read_with(cx, |view, cx| {
+        let (actions, notices) = view.lifecycle_controls(cx);
+        assert!(actions[0].disabled);
+        assert!(notices.iter().any(|n| n.text.contains("Agent capability")));
+    });
+}
+
+#[gpui::test]
+fn a_design_node_offers_the_gate_check(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "design");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Gate check → planning"]);
+}
+
+/// `ready` → `active` has only criteria the app answers itself, so the whole
+/// round runs without an agent: the check fails the fixture (no Agent or
+/// Files), Waive clears it, and Advance moves the node on.
+#[gpui::test]
+fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "ready");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    press_lifecycle(&view, "Gate check → active", cx);
+
+    let waive = lifecycle_notices(&view, cx)
+        .into_iter()
+        .filter_map(|n| n.action)
+        .collect::<Vec<_>>();
+    assert!(!waive.is_empty(), "the failing criteria can be waived");
+    assert!(
+        !lifecycle_labels(&view, cx).contains(&"Advance to active".to_string()),
+        "no Advance while a criterion fails"
+    );
+    for action in waive {
+        view.update_in(cx, |view, window, cx| {
+            view.lifecycle_action(&action.id, window, cx)
+        });
+    }
+    draw(cx);
+    assert_eq!(
+        lifecycle_labels(&view, cx),
+        vec!["Advance to active", "Check again"]
+    );
+
+    press_lifecycle(&view, "Advance to active", cx);
+    let lifecycle = fixture
+        .store
+        .get_node(&fixture.node_id.to_string())
+        .unwrap()
+        .unwrap()
+        .lifecycle;
+    assert_eq!(lifecycle, "active");
+    view.update(cx, |view, _| view.reload());
+    let steps = fixture.steps.len();
+    assert_eq!(
+        lifecycle_labels(&view, cx),
+        vec![format!("Implement ({steps} of {steps} left)")]
+    );
+}
+
+/// In `review`, Review sits beside Send, and approval waits: no gate check is
+/// offered while the review is unfinished or a finding is still open.
+#[gpui::test]
+fn a_review_node_offers_review_and_holds_the_gate_for_open_findings(cx: &mut TestAppContext) {
+    use tod_store::review::NewFinding;
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    fixture
+        .store
+        .interview(
+            tod_store::interview::ACTOR_AGENT,
+            InterviewCommand::AddReviewFinding {
+                node_id: fixture.node_id,
+                conversation_id: None,
+                finding: NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "Unused import".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review"]);
+    assert!(
+        lifecycle_notices(&view, cx)
+            .iter()
+            .any(|n| n.text.contains("1 review finding needs an answer")),
+        "{:?}",
+        lifecycle_notices(&view, cx)
+    );
 }

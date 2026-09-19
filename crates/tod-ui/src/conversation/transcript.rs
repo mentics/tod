@@ -55,6 +55,7 @@ impl ConversationView {
         match event {
             AgentConversationEvent::Send(text) => self.send(text, window, cx),
             AgentConversationEvent::Stop => self.stop_turn(cx),
+            AgentConversationEvent::Action(id) => self.lifecycle_action(id, window, cx),
             AgentConversationEvent::Activated => {
                 self.pane = Pane::Transcript;
                 self.stop = Stop::Transcript;
@@ -88,7 +89,10 @@ impl ConversationView {
         );
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
+        let (actions, notices) = self.lifecycle_controls(cx);
         self.transcript.update(cx, |panel, cx| {
+            panel.set_actions(actions, cx);
+            panel.set_notices(notices, cx);
             panel.set_return_focus(return_focus);
             panel.set_entries(entries, cx);
             panel.set_empty_message(empty, cx);

@@ -98,6 +98,15 @@ in the title bar (`render_shortcut_pill_in_context(.., &OpenAgentChat, None, ..)
 `proposed` and `design` nodes open the same view from the lifecycle panel, and
 the app nav's "Conversation" opens it on the project.
 
+On a node with the Lifecycle capability, the step that moves it along —
+Implement, Verify, Review, the gate check, Advance — sits beside Send, with the gate
+check's status and a Waive per failing criterion above the input
+(`conversation/lifecycle.rs`). Gate checks, waiving, advancing, and on-entry
+turns run in `views::lifecycle_control::LifecycleController`, one entity the
+shell shares between the conversation view and the lifecycle panel, so a
+check started in either shows in both. The manual escape hatches (force
+advance, revert, open interview) stay in the panel.
+
 Every conversation has a **focus** (project, node, obligation, or plan step) and
 the view lists only that focus's conversations. Ctrl+J opens the focus's most
 recent one, or an empty one that is saved on its first send; new conversations
