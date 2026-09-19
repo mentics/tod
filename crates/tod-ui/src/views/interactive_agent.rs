@@ -694,7 +694,10 @@ fn spawn_history_fetch(
             });
             let _ = tx.send_blocking(
                 result
-                    .map(|read| read.map(|read| read.transcript.to_text()).unwrap_or_default())
+                    .map(|read| {
+                        read.map(|read| read.transcript.to_text())
+                            .unwrap_or_default()
+                    })
                     .map_err(|err| err.to_string()),
             );
         });

@@ -684,38 +684,36 @@ impl Render for AgentConversationPanel {
             )
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(
-                style::panel_footer(v_flex())
-                    .child(field)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(style::space::RELATED)
-                            .child(
-                                style::text_dense_muted(div())
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(hint),
-                            )
-                            .when(self.running, |el| {
-                                el.child(
-                                    Button::new("agent-conversation-stop")
-                                        .label("Stop")
-                                        .ghost()
-                                        .small()
-                                        .selected(stop_highlighted)
-                                        .on_click(cx.listener(|_, _, _, cx| {
-                                            cx.emit(AgentConversationEvent::Stop)
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("agent-conversation-send")
-                                    .label("Send")
-                                    .primary()
+                style::panel_footer(v_flex()).child(field).child(
+                    h_flex()
+                        .items_center()
+                        .gap(style::space::RELATED)
+                        .child(
+                            style::text_dense_muted(div())
+                                .flex_1()
+                                .min_w_0()
+                                .child(hint),
+                        )
+                        .when(self.running, |el| {
+                            el.child(
+                                Button::new("agent-conversation-stop")
+                                    .label("Stop")
+                                    .ghost()
                                     .small()
-                                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
-                            ),
-                    ),
+                                    .selected(stop_highlighted)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(AgentConversationEvent::Stop)
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("agent-conversation-send")
+                                .label("Send")
+                                .primary()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+                        ),
+                ),
             )
             .when(has_lifecycle, |el| {
                 el.child(

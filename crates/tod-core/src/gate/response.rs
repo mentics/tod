@@ -80,12 +80,33 @@ pub struct GateResultRow {
     pub action: GateAction,
 }
 
+/// One thing standing between the node and the next state, with what the
+/// user should do about it. A blocked reply without any (and without a
+/// failing `gate_results` row) leaves the user nothing to act on —
+/// [`GateCheckReply::gives_no_reasons`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateBlocker {
+    /// `plan_step | test | criterion | finding | other`.
+    pub kind: String,
+    /// Plan step id, test path, criterion id — whatever names it.
+    pub reference: String,
+    pub what: String,
+    /// `implement | fix | verify | waive | interview | ask_user`.
+    pub action: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct GateCheckReply {
     pub result: GateOutcome,
     pub forward_lifecycle: Option<String>,
     pub paused: bool,
-    /// Findings/summary text, straight from the `findings` field.
+    /// One sentence: why the gate did or did not pass.
+    pub summary: String,
+    /// The single recommended next step (same vocabulary as a blocker's
+    /// `do`), empty when the agent named none.
+    pub next: String,
+    pub blockers: Vec<GateBlocker>,
+    /// Findings/detail text, straight from the `findings` field.
     pub findings: String,
     /// Present when the request carried criteria and the agent returned a
     /// `gate_results` list.
@@ -102,7 +123,25 @@ struct RawReply {
     #[serde(default)]
     findings: String,
     #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    next: String,
+    #[serde(default)]
+    blockers: Vec<RawBlocker>,
+    #[serde(default)]
     gate_results: Vec<RawRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBlocker {
+    #[serde(default)]
+    kind: String,
+    #[serde(default, rename = "ref")]
+    reference: String,
+    #[serde(default)]
+    what: String,
+    #[serde(default, rename = "do")]
+    action: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +152,17 @@ struct RawRow {
     detail: Option<String>,
     #[serde(default)]
     action: String,
+}
+
+impl GateCheckReply {
+    /// The gate did not pass but nothing says why: no blocker, no failing
+    /// criterion row. The app says so and shows the raw reply rather than
+    /// pointing at a list that is empty.
+    pub fn gives_no_reasons(&self) -> bool {
+        !self.result.advances()
+            && self.blockers.is_empty()
+            && !self.gate_results.iter().any(|r| r.outcome == "fail")
+    }
 }
 
 /// Parse an agent's raw reply text into a [`GateCheckReply`].
@@ -145,6 +195,18 @@ pub fn parse_gate_reply(text: &str) -> Result<GateCheckReply> {
         result,
         forward_lifecycle: raw.forward_lifecycle,
         paused: raw.paused,
+        summary: raw.summary.trim().to_string(),
+        next: raw.next.trim().to_string(),
+        blockers: raw
+            .blockers
+            .into_iter()
+            .map(|b| GateBlocker {
+                kind: b.kind.trim().to_string(),
+                reference: b.reference.trim().to_string(),
+                what: b.what.trim().to_string(),
+                action: b.action.trim().to_string(),
+            })
+            .collect(),
         findings: raw.findings.trim().to_string(),
         gate_results,
     })
@@ -267,6 +329,36 @@ fn find_fenced_blocks(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_blockers_and_next() {
+        let reply = parse_gate_reply(
+            r#"result: blocked
+summary: "Two UI steps are stubs."
+next: implement
+blockers:
+  - kind: plan_step
+    ref: "031f62f7"
+    what: "result cap is a placeholder"
+    do: implement
+  - kind: test
+    ref: "paths::tests::x"
+    what: "fails, untouched by this node"
+    do: waive
+"#,
+        )
+        .unwrap();
+        assert_eq!(reply.next, "implement");
+        assert_eq!(reply.blockers.len(), 2);
+        assert_eq!(reply.blockers[1].action, "waive");
+        assert!(!reply.gives_no_reasons());
+    }
+
+    #[test]
+    fn blocked_without_blockers_or_failing_rows_gives_no_reasons() {
+        let reply = parse_gate_reply("result: blocked\nfindings: \"hm\"\n").unwrap();
+        assert!(reply.gives_no_reasons());
+    }
 
     #[test]
     fn parses_pass_with_gate_results() {

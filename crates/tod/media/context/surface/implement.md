@@ -50,6 +50,12 @@ changed underneath you.
 - Every plan step is in scope. It is not yours to decide that a step is
   optional, an enhancement, or unnecessary because the rest works without it.
   If a step should not be done, that is a question for the user: block it.
+- A step too large to finish in one pass is yours to split, not to block. Add
+  the smaller steps with the `plan` noun in the order you will do them, carry
+  the original's dependencies and the obligations it satisfies over to them
+  (every obligation the original satisfied stays satisfied by some step), then
+  delete the original or narrow it to what is left. Splitting reorganizes the
+  work; it never drops any, and it is not a way to defer part of it.
 - Do as much of every step as you can. A step that needs the user for part of
   it still gets everything else done first — see *Leaving work for the user*.
 - This conversation is the node's implementation record. Finish the plan here

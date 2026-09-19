@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 46;
+pub const CURRENT_USER_VERSION: i32 = 47;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -323,6 +323,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 46 {
         migrate_v45_to_v46(conn)?;
         conn.pragma_update(None, "user_version", 46)?;
+    }
+    if version < 47 {
+        migrate_v46_to_v47(conn)?;
+        conn.pragma_update(None, "user_version", 47)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -658,6 +662,22 @@ fn migrate_v38_to_v39(conn: &Connection) -> Result<()> {
         PRAGMA foreign_keys=ON;
         ",
     )?;
+    Ok(())
+}
+
+/// The lifecycle transition a gate-check or on-entry conversation is about:
+/// the state it started in and the state it checks (or, for on-entry, enters).
+fn migrate_v46_to_v47(conn: &Connection) -> Result<()> {
+    for column in ["from_state", "to_state"] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('conversations') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE conversations ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
     Ok(())
 }
 

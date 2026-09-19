@@ -425,6 +425,9 @@ impl ConversationDriver {
         events: &mut Vec<ConversationEvent>,
     ) -> Result<()> {
         self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
+        for notice in self.protocol.on_reply(&self.env(fleet, id), body) {
+            events.push(ConversationEvent::Notice(notice));
+        }
         let report = fleet.read(|conn| ConversationRepo::new(conn).report_since(id, turn_seq))?;
         let next = {
             let env = self.env(fleet, id);
@@ -496,6 +499,18 @@ impl ConversationDriver {
                 effort: Some(launch.effort.clone()).filter(|e| !e.is_empty()),
             },
         )?;
+        // A gate check or on-entry run records which transition it is about,
+        // as of now: the node may move on while the conversation stays.
+        if let Some((from_state, to_state)) = self.protocol.transition(fleet, self.focus) {
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationTransition {
+                    conversation_id: id,
+                    from_state,
+                    to_state,
+                },
+            )?;
+        }
         self.conversation_id = Some(id);
         Ok(id)
     }

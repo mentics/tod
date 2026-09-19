@@ -33,6 +33,12 @@ pub const REVIEW_SURFACE: &str = "review";
 /// The surface label a review-fix session is named with.
 pub const FIX_SURFACE: &str = "fix";
 
+/// The surface label a lifecycle gate-check session is named with.
+pub const GATE_CHECK_SURFACE: &str = "gate check";
+
+/// The surface label a state's on-entry session is named with.
+pub const ON_ENTRY_SURFACE: &str = "on entry";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see

@@ -5,7 +5,6 @@ use super::context_panel::link_label;
 use super::{ChangeAction, ConversationView, Pane};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
-use tod_store::outline::repos::plan_steps::HandoffReason;
 use crate::views::rows::{
     NodeRowProps, ObligationRowProps, PlanStepRowProps, RowAction, RowOptions, node_row,
     obligation_row, op_icon, plan_step_row,
@@ -28,6 +27,7 @@ use tod_store::conversation::{
     Entity as ItemEntity, EntitySnapshot, Focus, NetChange, NetOp, ReverseOutcome,
 };
 use tod_store::interview::{InterviewCommand, short_id};
+use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::{NodeObligation, OutlineMutation, PlanStep};
 use uuid::Uuid;
 
@@ -727,9 +727,7 @@ impl ConversationView {
                 })
                 .xsmall(),
             )
-            .tooltip(|window, cx| {
-                Tooltip::new("Show all of it (Enter)").build(window, cx)
-            })
+            .tooltip(|window, cx| Tooltip::new("Show all of it (Enter)").build(window, cx))
             .on_mouse_down(MouseButton::Left, {
                 let host = host.clone();
                 move |_, _, cx| {

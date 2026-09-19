@@ -31,7 +31,7 @@ fn open_view<'a>(
     let (slot_in, events_in) = (slot.clone(), events.clone());
     let (_, cx) = cx.add_window_view(move |window, cx| {
         let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
-        let lifecycle = cx.new(|cx| LifecycleController::new(cx, store.clone(), agent.clone()));
+        let lifecycle = cx.new(|_| LifecycleController::new(store.clone()));
         let view = cx.new(|cx| ConversationView::new(window, cx, agent, store, lifecycle));
         cx.subscribe(&view, move |_, _, event: &ConversationViewEvent, _| {
             events_in.borrow_mut().push(event.clone());
@@ -1416,7 +1416,9 @@ fn the_status_filter_narrows_the_plan_pane(cx: &mut TestAppContext) {
     let steps = fixture.steps.len();
     assert!(steps >= 2, "the fixture has a plan to filter");
     // Put the second step in a status no other step has.
-    view.update(cx, |v, cx| v.choose_status(fixture.steps[1], STATUS_BLOCKED, cx));
+    view.update(cx, |v, cx| {
+        v.choose_status(fixture.steps[1], STATUS_BLOCKED, cx)
+    });
 
     // Nothing toggled: every step shows.
     assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), steps);
@@ -1635,7 +1637,12 @@ fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
     draw(cx);
     let second = view.read_with(cx, |view, cx| {
         assert_eq!(view.data.protocol, ProtocolKind::Review);
-        let summaries: Vec<_> = view.data.findings.iter().map(|f| f.summary.as_str()).collect();
+        let summaries: Vec<_> = view
+            .data
+            .findings
+            .iter()
+            .map(|f| f.summary.as_str())
+            .collect();
         assert_eq!(summaries, ["Empty input panics", "Unused import"]);
         let input = view.transcript.read(cx).input().read(cx).value();
         assert_eq!(input.as_ref(), "Review the change.");
@@ -1742,7 +1749,10 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
         })
     };
     // Nothing recorded, nothing to copy.
-    assert_eq!(view.read_with(cx, |v, _| v.conversation_id()), Some(without));
+    assert_eq!(
+        view.read_with(cx, |v, _| v.conversation_id()),
+        Some(without)
+    );
     assert!(!header_stop(&view, cx));
 
     fixture

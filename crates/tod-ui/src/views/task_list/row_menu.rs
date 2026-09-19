@@ -21,17 +21,20 @@ pub(super) fn popup_anchor(
     trigger: impl IntoElement,
     popup: Option<impl IntoElement>,
 ) -> impl IntoElement {
-    div().relative().child(trigger).when_some(popup, |el, popup| {
-        el.child(
-            deferred(
-                anchored()
-                    .anchor(Anchor::TopLeft)
-                    .snap_to_window_with_margin(px(8.))
-                    .child(div().occlude().mt_1().child(popup)),
+    div()
+        .relative()
+        .child(trigger)
+        .when_some(popup, |el, popup| {
+            el.child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(div().occlude().mt_1().child(popup)),
+                )
+                .with_priority(1),
             )
-            .with_priority(1),
-        )
-    })
+        })
 }
 
 /// Anchor a standard popup menu under a row trigger.

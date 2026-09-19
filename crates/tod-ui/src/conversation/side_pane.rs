@@ -15,8 +15,9 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
+    Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored,
+    deferred, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Sizable, h_flex, v_flex};
@@ -25,7 +26,7 @@ use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_m
 use tod_store::conversation::ProtocolKind;
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, PLAN_STEP_STATUSES, STATUS_FAILED, STATUS_IN_PROGRESS, STATUS_IMPLEMENTED,
+    HandoffReason, PLAN_STEP_STATUSES, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_IN_PROGRESS,
     STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
@@ -207,16 +208,19 @@ impl ConversationView {
             return None;
         }
         let id = step.id;
-        let answer_button = |key: String, label: &'static str, answer: HandoffAnswer, cx: &mut Context<Self>| {
-            Button::new(ElementId::Name(key.into()))
-                .label(label)
-                .small()
-                .flex_shrink_0()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.answer_handoff(id, answer.clone(), cx);
-                }))
-        };
-        let mut col = v_flex().gap(style::space::HAIRLINE).pt(style::space::HAIRLINE);
+        let answer_button =
+            |key: String, label: &'static str, answer: HandoffAnswer, cx: &mut Context<Self>| {
+                Button::new(ElementId::Name(key.into()))
+                    .label(label)
+                    .small()
+                    .flex_shrink_0()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.answer_handoff(id, answer.clone(), cx);
+                    }))
+            };
+        let mut col = v_flex()
+            .gap(style::space::HAIRLINE)
+            .pt(style::space::HAIRLINE);
         if let Some(reason) = &step.reason {
             col = col.child(style::text_dense(div()).child(reason.label()));
         }
@@ -417,6 +421,16 @@ impl ConversationView {
                 self.render_plan_pane(window, cx)
             }
             ProtocolKind::Review | ProtocolKind::Fix => self.render_review_pane(window, cx),
+            // The verdict and its blockers sit above the input, and the
+            // criteria rows beside them; this pane says what was run.
+            ProtocolKind::GateCheck => self.render_empty_pane(
+                "Gate check",
+                "The verdict and what blocks it are above the input.",
+            ),
+            ProtocolKind::OnEntry => self.render_empty_pane(
+                "On entry",
+                "What the state's agent did is in the transcript.",
+            ),
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => self.render_empty_pane(
@@ -480,7 +494,11 @@ impl ConversationView {
             (
                 "finding",
                 &FINDING_STATUSES,
-                self.data.findings.iter().map(|f| f.status.as_str()).collect(),
+                self.data
+                    .findings
+                    .iter()
+                    .map(|f| f.status.as_str())
+                    .collect(),
             )
         } else {
             (
@@ -554,11 +572,7 @@ impl ConversationView {
     /// the worktree's changed files. Verification shows the same rows, counted
     /// by verdict; the steps it fails go back to implementation, not to the
     /// user, so it offers no answers to a step left for the user.
-    fn render_plan_pane(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_plan_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active = self.pane == Pane::ChangeSet;
         // Nothing until the agent records a run: before that there is no
         // test status to show.
@@ -706,7 +720,11 @@ impl ConversationView {
                             style::text_muted(div())
                         }
                         .flex_shrink_0()
-                        .child(if verifying { "Verification" } else { "Implementation" }),
+                        .child(if verifying {
+                            "Verification"
+                        } else {
+                            "Implementation"
+                        }),
                     )
                     .child(style::text_dense_muted(div()).child({
                         let mut summary = if verifying {
@@ -759,11 +777,7 @@ impl ConversationView {
     /// review or a fix conversation. Each row's status badge is its answer,
     /// and the response under it (a fix's pointer, a rejection's reason) is
     /// labelled with that answer.
-    fn render_review_pane(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_review_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let active = self.pane == Pane::ChangeSet;
         let total = self.data.findings.len();
         let open = self.data.findings.iter().filter(|f| f.is_open()).count();
@@ -786,7 +800,9 @@ impl ConversationView {
         for (n, finding) in findings.into_iter().enumerate() {
             let id = finding.id;
             let badge = self.render_status_badge(id, &finding.status, cx);
-            let severity = style::badge(div()).flex_shrink_0().child(finding.severity.clone());
+            let severity = style::badge(div())
+                .flex_shrink_0()
+                .child(finding.severity.clone());
             let severity = if finding.severity == "high" {
                 style::text_error(severity)
             } else {
@@ -842,7 +858,12 @@ impl ConversationView {
                     .px(style::space::RELATED)
                     .py(style::space::INLINE)
                     .items_start()
-                    .child(div().w(SEVERITY_COLUMN_WIDTH).flex_shrink_0().child(severity))
+                    .child(
+                        div()
+                            .w(SEVERITY_COLUMN_WIDTH)
+                            .flex_shrink_0()
+                            .child(severity),
+                    )
                     .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
                     .child(col)
                     .into_any_element(),
@@ -876,11 +897,13 @@ impl ConversationView {
                             style::text_muted(div())
                         }
                         .flex_shrink_0()
-                        .child(if self.data.protocol == ProtocolKind::Fix {
-                            "Fix"
-                        } else {
-                            "Review"
-                        }),
+                        .child(
+                            if self.data.protocol == ProtocolKind::Fix {
+                                "Fix"
+                            } else {
+                                "Review"
+                            },
+                        ),
                     )
                     .child(style::text_dense_muted(div()).child(match total {
                         1 => format!("1 finding, {open} open"),

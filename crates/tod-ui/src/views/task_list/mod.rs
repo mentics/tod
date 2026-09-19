@@ -33,8 +33,7 @@ use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, KeyBinding,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
-    prelude::FluentBuilder, px,
+    ParentElement, Render, Styled, Subscription, Window, actions, div, prelude::FluentBuilder, px,
 };
 use gpui_component::IndexPath;
 use gpui_component::button::{Button, ButtonVariants};
@@ -239,7 +238,6 @@ pub enum TaskListEvent {
         task_id: String,
         editor_id: String,
     },
-    StatusChanged(SharedString),
 }
 
 pub struct TaskListView {
@@ -1676,8 +1674,8 @@ impl TaskListView {
         if self.status_line == message {
             return;
         }
-        self.status_line = message.clone();
-        cx.emit(TaskListEvent::StatusChanged(message.into()));
+        crate::ui::status::post(cx, crate::ui::status::StatusSource::Tasks, message.clone());
+        self.status_line = message;
         cx.notify();
     }
 

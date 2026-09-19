@@ -179,21 +179,6 @@ impl ConversationView {
                     .find(|c| c.conversation.id == id)
             })
             .map(|c| format_time(c.conversation.updated_at));
-        let status: Option<SharedString> = if self.status.running {
-            Some(
-                self.status
-                    .activity
-                    .clone()
-                    .unwrap_or_else(|| "Agent working…".into())
-                    .into(),
-            )
-        } else if let Some(error) = &self.status.last_error {
-            Some(error.clone().into())
-        } else {
-            (!self.status_line.is_empty()).then(|| self.status_line.clone())
-        };
-        let status_is_error = !self.status.running && self.status.last_error.is_some();
-
         let picker = self.render_picker_button(stop == Some(Stop::Picker), updated, window, cx);
         let app_nav = self.render_app_nav(window, cx).into_any_element();
 
@@ -295,19 +280,6 @@ impl ConversationView {
                     )
                     .child(self.render_drill_down(window, cx)),
             )
-            .when_some(status, |el, status| {
-                let text = selectable_text("conversation-status", status, window, cx)
-                    .flex_shrink_0()
-                    .max_w(px(320.))
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .overflow_hidden();
-                el.child(if status_is_error {
-                    style::text_error(text)
-                } else {
-                    style::text_dense_muted(text)
-                })
-            })
             .child(
                 Button::new("conversation-context-toggle")
                     .icon(Icon::new(IconName::PanelRight))
@@ -469,6 +441,11 @@ impl ConversationView {
                             )
                         },
                     )
+                    // Which transition a gate check checks, or which state an
+                    // on-entry run set up.
+                    .children(summary.conversation.transition_label().map(|label| {
+                        style::badge(div()).flex_shrink_0().child(label)
+                    }))
                     .child(
                         selectable_text(
                             ElementId::Name(format!("picker-opening-{ix}").into()),
@@ -529,6 +506,8 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Fix => "fix",
         ProtocolKind::Chat => "chat",
         ProtocolKind::VisualDesign => "visual design",
+        ProtocolKind::GateCheck => "gate check",
+        ProtocolKind::OnEntry => "on entry",
     }
 }
 
@@ -542,5 +521,8 @@ pub(super) fn new_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Fix => "New fix",
         ProtocolKind::Chat => "New conversation",
         ProtocolKind::VisualDesign => "New visual design",
+        // Started by the lifecycle buttons, which know the transition.
+        ProtocolKind::GateCheck => "New gate check",
+        ProtocolKind::OnEntry => "New on-entry run",
     }
 }

@@ -26,7 +26,9 @@ use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
-use crate::views::lifecycle_control::{GateCheckState, LifecycleController, implement_directory};
+use crate::views::lifecycle_control::{
+    GateCheckState, LifecycleController, enters_with_agent, implement_directory,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -34,8 +36,7 @@ use gpui::{
     Subscription, Window, actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::spinner::Spinner;
-use gpui_component::{ActiveTheme, Disableable, Sizable as _, Size, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
@@ -151,19 +152,6 @@ impl LifecyclePanelView {
         }
     }
 
-    /// Task ids with a gate check (or on-entry run) currently in flight,
-    /// independent of which task is selected — used by the app shell to
-    /// warn before closing the window while one is still running.
-    pub fn running_gate_check_task_ids(&self, cx: &App) -> Vec<String> {
-        self.controller.read(cx).running_task_ids()
-    }
-
-    /// Task ids with a gate check or on-entry run in flight, paired with a
-    /// short status — for the task list's "running" badge.
-    pub fn in_flight_activity(&self, cx: &App) -> HashMap<String, String> {
-        self.controller.read(cx).in_flight_activity()
-    }
-
     fn stops(&self) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
         match self.active_control {
@@ -237,7 +225,7 @@ impl LifecyclePanelView {
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
             Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
-            Some(LifecyclePanelStop::RunGateCheck) => self.run_gate_check(cx),
+            Some(LifecyclePanelStop::RunGateCheck) => self.run_gate_check(window, cx),
             Some(LifecyclePanelStop::OpenInterview) => {
                 if let Some(task_id) = self.task_id.clone() {
                     cx.emit(LifecyclePanelEvent::OpenInterview {
@@ -246,7 +234,7 @@ impl LifecyclePanelView {
                     });
                 }
             }
-            Some(LifecyclePanelStop::ForceAdvance) => self.force_advance(cx),
+            Some(LifecyclePanelStop::ForceAdvance) => self.force_advance(window, cx),
             Some(LifecyclePanelStop::RevertLifecycle) => self.revert_lifecycle(cx),
             Some(LifecyclePanelStop::Close) => self.close(cx),
             None => {}
@@ -254,24 +242,40 @@ impl LifecyclePanelView {
     }
 
     /// Run `f` on the controller for the panel's node.
-    fn with_controller(
+    fn with_controller<R>(
         &mut self,
         cx: &mut Context<Self>,
-        f: impl FnOnce(&mut LifecycleController, &str, &mut Context<LifecycleController>),
+        f: impl FnOnce(&mut LifecycleController, &str, &mut Context<LifecycleController>) -> R,
+    ) -> Option<R> {
+        let task_id = self.task_id.clone()?;
+        Some(
+            self.controller
+                .update(cx, |controller, cx| f(controller, &task_id, cx)),
+        )
+    }
+
+    /// Check the gate to the next state in a conversation, which shows what
+    /// the state's agent concluded and what to do about it.
+    fn run_gate_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_node_conversation(ProtocolKind::GateCheck, window, cx);
+    }
+
+    fn force_advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entered = self.with_controller(cx, |c, id, cx| c.force_advance(id, cx));
+        self.enter_state(entered.flatten(), window, cx);
+    }
+
+    /// A node landed in `state`: when that state has on-entry work for its
+    /// agent, start it in a conversation.
+    fn enter_state(
+        &mut self,
+        state: Option<&'static str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        let Some(task_id) = self.task_id.clone() else {
-            return;
-        };
-        self.controller
-            .update(cx, |controller, cx| f(controller, &task_id, cx));
-    }
-
-    fn run_gate_check(&mut self, cx: &mut Context<Self>) {
-        self.with_controller(cx, |c, id, cx| c.run_gate_check(id, cx));
-    }
-
-    fn force_advance(&mut self, cx: &mut Context<Self>) {
-        self.with_controller(cx, |c, id, cx| c.force_advance(id, cx));
+        if state.is_some_and(enters_with_agent) {
+            self.launch_node_conversation(ProtocolKind::OnEntry, window, cx);
+        }
     }
 
     fn revert_lifecycle(&mut self, cx: &mut Context<Self>) {
@@ -282,8 +286,9 @@ impl LifecyclePanelView {
         self.with_controller(cx, |c, id, cx| c.waive(id, criterion_id, cx));
     }
 
-    fn advance_after_criteria(&mut self, cx: &mut Context<Self>) {
-        self.with_controller(cx, |c, id, cx| c.advance_after_criteria(id, cx));
+    fn advance_after_criteria(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entered = self.with_controller(cx, |c, id, cx| c.advance_after_criteria(id, cx));
+        self.enter_state(entered.flatten(), window, cx);
     }
 
     /// Where implementation would run: the node needs a resolved Agent and a
@@ -427,10 +432,14 @@ impl LifecyclePanelView {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        if let Err(reason) = self.implement_directory() {
-            self.implement_status.insert(task_id, reason);
-            cx.notify();
-            return;
+        // The state agents (gate check, on entry) work through `tod-cli`
+        // wherever the node's files are; the rest need its worktree.
+        if !protocol.has_transition() {
+            if let Err(reason) = self.implement_directory() {
+                self.implement_status.insert(task_id, reason);
+                cx.notify();
+                return;
+            }
         }
         let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
             return;
@@ -785,22 +794,16 @@ impl Render for LifecyclePanelView {
 
         let next_state = next_lifecycle(&self.lifecycle);
         let (
-            in_flight,
             gate_status,
             gate_error,
             criteria_detail,
-            on_entry_running,
-            on_entry_status,
             force_advance_armed,
             revert_armed,
         ) = self.current_state(cx, |s| {
             (
-                s.in_flight(),
                 s.gate_status.clone(),
                 s.gate_error.clone(),
                 s.criteria_detail.clone(),
-                s.on_entry_running(),
-                s.on_entry_status.clone(),
                 s.force_advance_armed,
                 s.revert_armed,
             )
@@ -933,16 +936,11 @@ impl Render for LifecyclePanelView {
                         })
                         .child(
                             Button::new("lifecycle-panel-run-gate-check")
-                                .label(if in_flight {
-                                    format!("Running gate check to advance to {next}…")
-                                } else {
-                                    format!("Run gate check to advance to {next}")
-                                })
+                                .label(format!("Run gate check to advance to {next}"))
                                 .primary()
                                 .w_full()
-                                .disabled(in_flight)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_gate_check(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.run_gate_check(window, cx);
                                 })),
                         ),
                 ),
@@ -1005,8 +1003,8 @@ impl Render for LifecyclePanelView {
                             })
                             .ghost()
                             .w_full()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.force_advance(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.force_advance(window, cx);
                             })),
                     ),
             );
@@ -1039,20 +1037,7 @@ impl Render for LifecyclePanelView {
         }
 
         if self.lifecycle_capable {
-            if in_flight {
-                body = body.child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Spinner::new().with_size(Size::Small))
-                        .child(div().text_xs().text_color(muted).child(selectable_text(
-                            "lifecycle-panel-gate-status",
-                            gate_status.clone(),
-                            window,
-                            cx,
-                        ))),
-                );
-            } else if !gate_status.is_empty() {
+            if !gate_status.is_empty() {
                 body = body.child(div().text_xs().text_color(muted).child(selectable_text(
                     "lifecycle-panel-gate-status",
                     gate_status.clone(),
@@ -1065,28 +1050,6 @@ impl Render for LifecyclePanelView {
                 body = body.child(div().text_xs().text_color(danger).child(selectable_text(
                     "lifecycle-panel-gate-error",
                     error,
-                    window,
-                    cx,
-                )));
-            }
-
-            if on_entry_running {
-                body = body.child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(Spinner::new().with_size(Size::Small))
-                        .child(div().text_xs().text_color(muted).child(selectable_text(
-                            "lifecycle-panel-on-entry-status",
-                            on_entry_status.clone(),
-                            window,
-                            cx,
-                        ))),
-                );
-            } else if !on_entry_status.is_empty() {
-                body = body.child(div().text_xs().text_color(muted).child(selectable_text(
-                    "lifecycle-panel-on-entry-status",
-                    on_entry_status.clone(),
                     window,
                     cx,
                 )));
@@ -1265,8 +1228,8 @@ impl Render for LifecyclePanelView {
                             .primary()
                             .w_full()
                             .disabled(!all_clear)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.advance_after_criteria(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.advance_after_criteria(window, cx);
                             })),
                     );
                 }

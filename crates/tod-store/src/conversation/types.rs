@@ -128,6 +128,8 @@ str_enum!(
         Fix => "fix",
         Chat => "chat",
         VisualDesign => "visual_design",
+        GateCheck => "gate_check",
+        OnEntry => "on_entry",
     }
 );
 
@@ -142,6 +144,12 @@ impl ProtocolKind {
     /// pane lists them, each answered from its status.
     pub fn works_the_findings(self) -> bool {
         matches!(self, ProtocolKind::Review | ProtocolKind::Fix)
+    }
+
+    /// Whether this kind belongs to a lifecycle transition (or a state's
+    /// entry), which its conversation records as `from_state`/`to_state`.
+    pub fn has_transition(self) -> bool {
+        matches!(self, ProtocolKind::GateCheck | ProtocolKind::OnEntry)
     }
 }
 
@@ -243,8 +251,25 @@ pub struct Conversation {
     pub platform: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// For a gate check or on-entry run: the lifecycle state it started in,
+    /// and the one it is about. Equal for on-entry (`to_state` is the state
+    /// entered); `None` for every other kind.
+    pub from_state: Option<String>,
+    pub to_state: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl Conversation {
+    /// What the picker says beside a gate check or on-entry run: the
+    /// transition it checks, or the state it sets up. `None` for other kinds.
+    pub fn transition_label(&self) -> Option<String> {
+        let (from, to) = (self.from_state.as_deref()?, self.to_state.as_deref()?);
+        Some(match self.protocol {
+            ProtocolKind::OnEntry => format!("on entry to {to}"),
+            _ => format!("{from} \u{2192} {to}"),
+        })
+    }
 }
 
 /// One picker entry: a conversation, its net change count, and the opening

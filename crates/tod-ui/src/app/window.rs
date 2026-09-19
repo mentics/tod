@@ -27,6 +27,7 @@ use crate::ui::app_nav::{
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::status::{self, StatusSource};
 use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
@@ -105,7 +106,6 @@ pub struct Shell {
     _interactive_agent_window: InteractiveAgentWindowControl,
     history_window: HistoryWindowControl,
     agent_status_text: SharedString,
-    status_line: SharedString,
     paths: TodPaths,
     migration_notice_dismissed: bool,
     pending_open_interview: Option<PendingOpenInterview>,
@@ -115,6 +115,8 @@ pub struct Shell {
     pending_open_interview_for_task: Option<(String, String)>,
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
+    /// A node that just entered a state with on-entry work for its agent.
+    pending_on_entry: Option<Uuid>,
     /// The conversation view asked to return to where the user came from.
     pending_leave_conversation: bool,
     /// The conversation's context panel asked to show a node (and maybe an
@@ -156,7 +158,7 @@ pub(crate) fn spec_conversation_focus(lifecycle: &str, node_id: Uuid) -> Option<
 /// window closed right now: agents mid-run and gate checks in flight.
 fn collect_running_work(
     fleet: &FleetStore,
-    lifecycle_panel: &Entity<LifecyclePanelView>,
+    _lifecycle_panel: &Entity<LifecyclePanelView>,
     sessions: &Entity<SessionsView>,
     conversation: &Entity<ConversationView>,
     cx: &App,
@@ -183,15 +185,6 @@ fn collect_running_work(
                 )));
             }
         }
-    }
-    for task_id in lifecycle_panel.read(cx).running_gate_check_task_ids(cx) {
-        let title = fleet
-            .get_task(&task_id)
-            .ok()
-            .flatten()
-            .map(|t| t.title)
-            .unwrap_or_else(|| task_id.clone());
-        items.push(SharedString::from(format!("Gate check running: {title}")));
     }
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
@@ -402,10 +395,6 @@ impl Shell {
             self.agent_status_text = text.into();
             cx.notify();
         }
-        let gate_activity = self.drawer.lifecycle.read(cx).in_flight_activity(cx);
-        self.task_list.update(cx, |list, cx| {
-            list.set_agent_activity(gate_activity, cx);
-        });
     }
 
     fn replace_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
@@ -600,6 +589,15 @@ impl Shell {
     fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.pending_open_conversation.take() {
             self.open_conversation(focus, window, cx);
+        }
+        if let Some(node) = self.pending_on_entry.take() {
+            self.open_conversation_with(
+                Focus::Node(node),
+                ProtocolKind::OnEntry,
+                true,
+                window,
+                cx,
+            );
         }
         if std::mem::take(&mut self.pending_leave_conversation) {
             let view = self.view_before_conversation;
@@ -829,18 +827,23 @@ impl Shell {
         }
     }
 
-    /// The status bar's message. `status_line` is the Tasks view's own
-    /// (it comes from the task list), so other views show none rather than a
-    /// stale one; the conversation view reports its activity and last action
-    /// in its header. Returning to Tasks shows its message again.
-    fn status_bar_message(&self) -> SharedString {
-        status_bar_message(self.active_view, &self.status_line)
+    /// The status bar's message: what the active view last posted to the
+    /// status hub (`ui::status`); views that post nothing show none.
+    fn status_bar_message(&self, cx: &App) -> SharedString {
+        let source = match self.active_view {
+            ShellView::Tasks => StatusSource::Tasks,
+            ShellView::Conversation => StatusSource::Conversation,
+            ShellView::Interview | ShellView::Settings | ShellView::Database => {
+                return SharedString::default();
+            }
+        };
+        status::current(cx, source).unwrap_or_default()
     }
 
     fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
-        let status = self.status_bar_message();
+        let status = self.status_bar_message(cx);
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -1269,18 +1272,6 @@ pub(crate) fn fallback_focus(selected_node: Option<Uuid>) -> Focus {
     selected_node.map_or(Focus::Project, Focus::Node)
 }
 
-/// The status bar's message in `view`: the Tasks view's `tasks_status`
-/// there, nothing elsewhere.
-fn status_bar_message(view: ShellView, tasks_status: &SharedString) -> SharedString {
-    match view {
-        ShellView::Tasks => tasks_status.clone(),
-        ShellView::Interview
-        | ShellView::Conversation
-        | ShellView::Settings
-        | ShellView::Database => SharedString::default(),
-    }
-}
-
 fn platform_label(platform: AgentPlatform) -> &'static str {
     match platform {
         AgentPlatform::Cursor => "cursor",
@@ -1510,9 +1501,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
-                        let lifecycle = cx.new(|cx| {
-                            LifecycleController::new(cx, fleet.clone(), agent.clone())
-                        });
+                        let lifecycle = cx.new(|_| LifecycleController::new(fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
                             LifecyclePanelView::new(cx, fleet.clone(), lifecycle.clone())
                         });
@@ -1629,10 +1618,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 editor_id.clone(),
                                                 cx,
                                             );
-                                        }
-                                        TaskListEvent::StatusChanged(message) => {
-                                            this.status_line = message.clone();
-                                            cx.notify();
                                         }
                                     }
                                 });
@@ -1804,6 +1789,10 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 this.queue_warning_toast(message.clone(), cx)
                                             }
                                         },
+                                        ConversationViewEvent::EnterState { node_id } => {
+                                            this.pending_on_entry = Some(*node_id);
+                                            cx.notify();
+                                        }
                                         ConversationViewEvent::GoToTasks {
                                             node_id,
                                             obligation_id,
@@ -1848,12 +1837,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _interactive_agent_window: interactive_agent_window.clone(),
                                 history_window: history_window.clone(),
                                 agent_status_text,
-                                status_line: SharedString::default(),
                                 paths: paths.clone(),
                                 migration_notice_dismissed: false,
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
+                                pending_on_entry: None,
                                 pending_go_to_tasks: None,
                                 pending_leave_conversation: false,
                                 pending_open_lifecycle: None,
@@ -1876,6 +1865,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _conversation_subscription,
                                 _settings_subscription,
                             };
+                            let status_hub = status::hub(cx);
+                            cx.observe(&status_hub, |_, _, cx| cx.notify()).detach();
                             let poll_entity = cx.weak_entity();
                             cx.spawn(async move |_, cx| {
                                 loop {
@@ -2020,26 +2011,9 @@ pub fn register_shell_keyboard_bindings(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ShellView, fallback_focus, obligation_focus, spec_conversation_focus, status_bar_message,
-    };
-    use gpui::SharedString;
+    use super::{fallback_focus, obligation_focus, spec_conversation_focus};
     use tod_store::conversation::Focus;
     use uuid::Uuid;
-
-    #[test]
-    fn the_tasks_status_shows_only_in_the_tasks_view() {
-        let status = SharedString::from("Edit: Sync server");
-        assert_eq!(status_bar_message(ShellView::Tasks, &status), status);
-        for view in [
-            ShellView::Conversation,
-            ShellView::Interview,
-            ShellView::Settings,
-            ShellView::Database,
-        ] {
-            assert!(status_bar_message(view, &status).is_empty(), "{view:?}");
-        }
-    }
 
     #[test]
     fn proposed_and_design_nodes_open_the_conversation_view() {

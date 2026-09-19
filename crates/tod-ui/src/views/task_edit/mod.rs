@@ -22,11 +22,11 @@ use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tod_core::generator::ConfigFieldType;
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
 };
-use tod_core::generator::ConfigFieldType;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
@@ -562,9 +562,7 @@ impl TaskEditView {
                 stops.push(TaskEditField::GeneratorSource);
             }
             if self.generator_source_key().is_some() {
-                stops.extend(
-                    (0..self.generator_fields.len()).map(TaskEditField::GeneratorField),
-                );
+                stops.extend((0..self.generator_fields.len()).map(TaskEditField::GeneratorField));
                 stops.push(TaskEditField::GeneratorSave);
             }
             if self.generator_data_source_type.is_some() {
@@ -1872,7 +1870,8 @@ impl TaskEditView {
                 linked_issues: vec![ticket.clone()],
             });
             self.pending_toast = Some(
-                "Linear API key not configured — linked ticket only; description not imported".into(),
+                "Linear API key not configured — linked ticket only; description not imported"
+                    .into(),
             );
             cx.notify();
             return;
@@ -3311,8 +3310,7 @@ impl TaskEditView {
             )));
         }
         if invalid {
-            row = row
-                .child(div().text_xs().text_color(danger).child("Required"));
+            row = row.child(div().text_xs().text_color(danger).child("Required"));
         }
 
         self.apply_focus_scroll_anchor(stop, row).into_any_element()

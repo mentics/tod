@@ -11,6 +11,7 @@
 pub mod context;
 pub mod driver;
 pub mod fix;
+pub mod gate_check;
 pub mod implement;
 pub mod mock;
 pub mod protocol;

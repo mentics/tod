@@ -363,8 +363,14 @@ impl AgentProvider for MockAgentProvider {
 /// Spell out what reached the agent, so UI checks can see a session's opening
 /// arrive exactly once.
 fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
-    if turn.message.contains("phase_purpose:** gate_check") {
-        return mock_gate_check_reply(&turn.message);
+    // A gate check's request is the session's opening context; the message
+    // beside it is only the starter.
+    let request = match turn.opening.as_ref().and_then(|o| o.context.as_deref()) {
+        Some(context) => format!("{context}\n{}", turn.message),
+        None => turn.message.clone(),
+    };
+    if request.contains("phase_purpose:** gate_check") {
+        return mock_gate_check_reply(&request);
     }
 
     let mut reply = format!("Mock session reply · message {message_number}\n\n");
@@ -402,7 +408,7 @@ fn mock_gate_check_reply(message: &str) -> String {
         .collect();
 
     let mut reply = format!(
-        "result: pass\nforward_lifecycle: {forward_state}\npaused: false\nfindings: \"Mock gate check: pass.\"\n"
+        "result: pass\nforward_lifecycle: {forward_state}\npaused: false\nsummary: \"Mock gate check: pass.\"\nfindings: \"Mock gate check: pass.\"\n"
     );
     if !criterion_ids.is_empty() {
         reply.push_str("gate_results:\n");

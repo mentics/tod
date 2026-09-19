@@ -62,6 +62,7 @@ use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
+use crate::ui::status::{self, StatusSource};
 use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
@@ -98,6 +99,8 @@ use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::review::{ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
+/// The status-hub key of the agent turn in flight.
+const AGENT_TURN: &str = "agent-turn";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Polls between reloads when the store has not signalled a commit.
 const FALLBACK_POLLS: u32 = 8;
@@ -114,6 +117,9 @@ pub enum ConversationViewEvent {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
     },
+    /// A gate check advanced the node into a state whose agent has on-entry
+    /// work: the shell starts it in a conversation.
+    EnterState { node_id: Uuid },
     /// A run ended with something the user should hear about (a failed
     /// commit, a branch that does not match): the shell shows it as a toast.
     Notice(RunNotice),
@@ -341,6 +347,9 @@ pub struct ConversationView {
     loop_turns: u32,
     /// Notices from finished runs, emitted as events on the next poll.
     pending_notices: Vec<RunNotice>,
+    /// Nodes a finished gate check advanced, whose new state's on-entry work
+    /// starts on the next poll.
+    pending_entries: Vec<Uuid>,
     /// The highlighted row of a side pane other than the change set: plan
     /// steps first, then changed files.
     side_cursor: Option<usize>,
@@ -374,6 +383,8 @@ pub struct ConversationView {
     error: Option<SharedString>,
     /// The error last shown as a toast, so a lingering error toasts once.
     toasted_error: Option<SharedString>,
+    /// The agent's last turn error already shown as a toast.
+    toasted_agent_error: Option<String>,
     status_line: SharedString,
     app_nav: AppNavMenu,
     _poll_task: Task<()>,
@@ -420,8 +431,12 @@ impl ConversationView {
                 }
                 let Ok(want_files) = this.update(cx, |this, cx| {
                     let (changed, want_files) = this.poll(committed);
+                    this.publish_status(cx);
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
+                    }
+                    for node_id in std::mem::take(&mut this.pending_entries) {
+                        cx.emit(ConversationViewEvent::EnterState { node_id });
                     }
                     if changed {
                         cx.notify();
@@ -473,6 +488,7 @@ impl ConversationView {
             side_files: Vec::new(),
             loop_turns: 0,
             pending_notices: Vec::new(),
+            pending_entries: Vec::new(),
             tab: Tab::All,
             cursor: None,
             link: None,
@@ -493,6 +509,7 @@ impl ConversationView {
             _lifecycle_changes: lifecycle_changes,
             error: None,
             toasted_error: None,
+            toasted_agent_error: None,
             status_line: SharedString::default(),
             app_nav: AppNavMenu::default(),
             _poll_task: poll_task,
@@ -630,7 +647,24 @@ impl ConversationView {
             .current_driver()
             .map(|d| d.status())
             .unwrap_or_default();
+        self.publish_status(cx);
         cx.notify();
+    }
+
+    /// What the agent is doing and the last action, for the status bar
+    /// (`ui::status`). Posting the same state again changes nothing.
+    fn publish_status(&self, cx: &mut Context<Self>) {
+        if self.status.running {
+            let text = self
+                .status
+                .activity
+                .clone()
+                .unwrap_or_else(|| "Agent working…".into());
+            status::begin_activity(cx, StatusSource::Conversation, AGENT_TURN, text);
+        } else {
+            status::end_activity(cx, StatusSource::Conversation, AGENT_TURN);
+        }
+        status::post(cx, StatusSource::Conversation, self.status_line.clone());
     }
 
     /// Where the view is now, as the history records it.
@@ -770,8 +804,12 @@ impl ConversationView {
                         // The loop sent another turn: nothing ended, but the
                         // transcript has a new marker and the side pane's
                         // counter moved.
-                        ConversationEvent::Continued
-                        | ConversationEvent::TurnFinished { error: None } => {}
+                        ConversationEvent::Continued => {}
+                        ConversationEvent::TurnFinished { error: None } => {
+                            if let Some(node) = entered_state(&self.fleet, driver) {
+                                self.pending_entries.push(node);
+                            }
+                        }
                         ConversationEvent::Rotated => {}
                         ConversationEvent::Notice(notice) => self.pending_notices.push(notice),
                     }
@@ -1101,6 +1139,7 @@ impl ConversationView {
             }
         };
         self.reload();
+        self.publish_status(cx);
         cx.notify();
         sent
     }
@@ -1116,6 +1155,7 @@ impl ConversationView {
         }
         self.status = self.drivers[ix].status();
         self.reload();
+        self.publish_status(cx);
         cx.notify();
     }
 
@@ -1575,6 +1615,12 @@ impl Render for ConversationView {
             }
             self.toasted_error = self.error.clone();
         }
+        if self.status.last_error != self.toasted_agent_error {
+            if let Some(message) = self.status.last_error.clone() {
+                crate::ui::toast::error_toast(window, cx, message);
+            }
+            self.toasted_agent_error = self.status.last_error.clone();
+        }
 
         root.child(header)
             .child(
@@ -1630,4 +1676,23 @@ fn worktree_files(cwd: &std::path::Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The node a finished gate check just advanced into a state whose agent has
+/// on-entry work, when `driver` ran one that did.
+fn entered_state(fleet: &FleetStore, driver: &ConversationDriver) -> Option<Uuid> {
+    if driver.protocol().kind() != ProtocolKind::GateCheck {
+        return None;
+    }
+    let Focus::Node(node) = driver.focus() else {
+        return None;
+    };
+    let id = driver.conversation_id()?;
+    let advanced_to = fleet
+        .read(|conn| ConversationRepo::new(conn).latest_report(id))
+        .ok()
+        .flatten()
+        .and_then(|report| tod_core::conversation::gate_check::GateReportRecord::from_stored(&report))
+        .and_then(|report| report.advanced_to)?;
+    crate::views::lifecycle_control::enters_with_agent(&advanced_to).then_some(node)
 }

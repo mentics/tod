@@ -11,7 +11,7 @@ use uuid::Uuid;
 const OPENING_WORDS: usize = 8;
 
 const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
-     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id";
+     session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state";
 
 const ACTION_COLUMNS: &str = "id, conversation_id, turn_seq, actor, kind, entity, entity_id, \
      node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
@@ -65,6 +65,15 @@ impl<'a> ConversationRepo<'a> {
             ],
         )?;
         self.get(id)?.context("conversation vanished after insert")
+    }
+
+    /// Record the lifecycle transition a gate check or on-entry run is about.
+    pub fn set_transition(&self, id: Uuid, from_state: &str, to_state: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET from_state = ?2, to_state = ?3 WHERE id = ?1",
+            params![uuid_to_blob(id), from_state, to_state],
+        )?;
+        Ok(())
     }
 
     /// The focus's most recently updated conversation running `protocol` —
@@ -483,6 +492,8 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
     let updated_at = row.get(10)?;
     let protocol: String = row.get(11)?;
     let agent_run_id = row.get(12)?;
+    let from_state = row.get(13)?;
+    let to_state = row.get(14)?;
     Ok(Focus::from_columns(&kind, focus_id, focus_node).and_then(|focus| {
         Ok(Conversation {
             id,
@@ -494,6 +505,8 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
             platform,
             model,
             effort,
+            from_state,
+            to_state,
             created_at,
             updated_at,
         })

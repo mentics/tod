@@ -147,6 +147,13 @@ pub enum InterviewCommand {
         #[serde(default)]
         effort: Option<String>,
     },
+    /// Record which lifecycle transition a gate-check or on-entry
+    /// conversation is about.
+    SetConversationTransition {
+        conversation_id: Uuid,
+        from_state: String,
+        to_state: String,
+    },
     /// Append a transcript entry; returns its `seq`.
     AppendConversationTurn {
         conversation_id: Uuid,
@@ -742,6 +749,18 @@ pub fn execute(
                 effort.as_deref(),
             )?;
             Ok(json!({ "id": conversation.id.to_string() }))
+        }
+        InterviewCommand::SetConversationTransition {
+            conversation_id,
+            from_state,
+            to_state,
+        } => {
+            crate::conversation::ConversationRepo::new(conn).set_transition(
+                *conversation_id,
+                from_state,
+                to_state,
+            )?;
+            Ok(json!({}))
         }
         InterviewCommand::AppendConversationTurn {
             conversation_id,

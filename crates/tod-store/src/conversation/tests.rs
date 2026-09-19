@@ -1619,3 +1619,32 @@ fn snapshot_with_removed_handoff_reason_still_reads() {
     let snap: EntitySnapshot = serde_json::from_str(json).unwrap();
     assert!(matches!(snap, EntitySnapshot::PlanStep { reason: None, .. }));
 }
+
+#[test]
+fn a_gate_check_and_an_on_entry_run_name_the_transition_they_belong_to() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    let gate = repo
+        .create(Focus::Node(fx.n1), ProtocolKind::GateCheck, None, None, None)
+        .unwrap();
+    repo.set_transition(gate.id, "verifying", "review").unwrap();
+    let entry = repo
+        .create(Focus::Node(fx.n1), ProtocolKind::OnEntry, None, None, None)
+        .unwrap();
+    repo.set_transition(entry.id, "review", "review").unwrap();
+
+    let gate = repo.get(gate.id).unwrap().unwrap();
+    assert_eq!(gate.from_state.as_deref(), Some("verifying"));
+    assert_eq!(gate.to_state.as_deref(), Some("review"));
+    assert_eq!(
+        gate.transition_label().as_deref(),
+        Some("verifying \u{2192} review")
+    );
+    assert_eq!(
+        repo.get(entry.id).unwrap().unwrap().transition_label().as_deref(),
+        Some("on entry to review")
+    );
+    // Other kinds carry none.
+    let plain = repo.get(fx.conv).unwrap().unwrap();
+    assert_eq!(plain.transition_label(), None);
+}

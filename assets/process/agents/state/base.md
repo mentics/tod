@@ -70,7 +70,14 @@ the reply:
 result: pass | blocked | needs_human | no_change
 forward_lifecycle: {string|null}
 paused: {true|false}
-findings: "short summary or multi-line block scalar"
+summary: "one sentence: why the gate passed or did not"
+next: implement | verify | fix | waive | interview | ask_user   # the ONE step the user should take next; omit on pass
+blockers:                     # required whenever result is not pass and no gate_results row fails
+  - kind: plan_step | test | criterion | finding | other
+    ref: "plan step id, test path, or criterion id"
+    what: "what is wrong, in one line"
+    do: implement | verify | fix | waive | interview | ask_user
+findings: "optional longer detail or multi-line block scalar"
 gate_results:
   - criterion_id: {uuid}
     outcome: pass | fail | waived
@@ -94,7 +101,9 @@ Rules for the envelope, since these break the parser outright:
 
 **`result` is not the same vocabulary as `gate_results[].outcome` below** — two different fields, two different enums, both about pass/fail, easy to conflate. `result` is exactly `pass | blocked | needs_human | no_change` — **never `fail`**. If any criterion failed, `result` is `blocked` (or `needs_human`), and that individual criterion's row gets `outcome: fail`.
 
-When the invocation is user-facing, put a short summary in `findings`. Silent gate checks should leave it brief or empty.
+**A reply that does not pass must say what to do about it.** The user sees only your `summary`, `blockers` and `next`. A `blocked` reply with no blocker and no failing row leaves them with nothing to act on — the app will tell them you gave no reasons. A failure unrelated to this node's work (e.g. a test the node did not touch) is still a blocker, with `do: waive`. Judge each blocker against *this state's* gate rules only — do not count work that belongs to a later state (e.g. plan steps not yet `verified` while the node is `active`).
+
+When the invocation is user-facing, put a short summary in `summary`. Silent gate checks should leave it brief or empty.
 
 ### Required when `phase_purpose: gate_check` and criteria were sent
 

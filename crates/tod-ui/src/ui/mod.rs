@@ -9,6 +9,7 @@ pub mod list;
 pub mod pane_nav;
 pub mod panel_split;
 pub mod selectable_text;
+pub mod status;
 pub mod style;
 pub mod toast;
 pub mod transcript_list;

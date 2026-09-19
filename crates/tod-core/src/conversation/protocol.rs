@@ -117,6 +117,21 @@ pub trait Protocol: Send + Sync {
         before_seq: Option<i64>,
     ) -> Result<String>;
 
+    /// The lifecycle transition a conversation of this kind is about, for the
+    /// kinds that belong to one (a gate check, an on-entry run): recorded on
+    /// the conversation when it starts, and shown by the picker. `None` for
+    /// every other kind.
+    fn transition(&self, _fleet: &FleetStore, _focus: Focus) -> Option<(String, String)> {
+        None
+    }
+
+    /// Runs on every agent reply once it is in the transcript, for a protocol
+    /// that reads the reply itself (the gate check's verdict). What it returns
+    /// is shown to the user as toasts.
+    fn on_reply(&self, _env: &ProtocolEnv<'_>, _reply: &str) -> Vec<RunNotice> {
+        Vec::new()
+    }
+
     /// Whether this protocol loops without the user.
     fn loops(&self) -> bool {
         false
@@ -149,6 +164,8 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::Verification => &super::verify::VerificationProtocol,
         ProtocolKind::Review => &super::review::ReviewProtocol,
         ProtocolKind::Fix => &super::fix::FixProtocol,
+        ProtocolKind::GateCheck => &super::gate_check::GateCheckProtocol,
+        ProtocolKind::OnEntry => &super::gate_check::OnEntryProtocol,
         ProtocolKind::Chat => &ChatProtocol,
         // Until the visual designer has its own protocol and side pane, a
         // visual-design conversation behaves as a plain chat.
@@ -304,6 +321,8 @@ mod tests {
             ProtocolKind::Verification,
             ProtocolKind::Review,
             ProtocolKind::Fix,
+            ProtocolKind::GateCheck,
+            ProtocolKind::OnEntry,
             ProtocolKind::Chat,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");
