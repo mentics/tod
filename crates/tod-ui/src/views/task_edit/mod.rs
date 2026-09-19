@@ -28,6 +28,7 @@ use tod_store::fleet::{
 };
 use tod_core::generator::ConfigFieldType;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
+use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
     parse_platform, platform_storage, resolve_linear_api_key,
@@ -198,6 +199,38 @@ impl GeneratorConfigField {
             .map(|input| any_input_text(input, cx).trim().to_string())
             .unwrap_or_default()
     }
+
+    /// Returns the string representation of the field's value for any field type.
+    fn value_as_string(&self, cx: &App) -> Option<String> {
+        match &self.schema.field_type {
+            tod_core::generator::ConfigFieldType::Text
+            | tod_core::generator::ConfigFieldType::TextArea => {
+                let text = self.text_value(cx);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            tod_core::generator::ConfigFieldType::Boolean => Some(self.toggle.to_string()),
+            tod_core::generator::ConfigFieldType::Select { .. } => self.choice.clone(),
+            tod_core::generator::ConfigFieldType::Custom { .. } => {
+                // Custom fields are handled by their own widgets; treat as empty here
+                None
+            }
+        }
+    }
+
+    /// Checks if the field has a non-empty value.
+    fn is_empty(&self, cx: &App) -> bool {
+        match &self.schema.field_type {
+            tod_core::generator::ConfigFieldType::Text
+            | tod_core::generator::ConfigFieldType::TextArea => self.text_value(cx).is_empty(),
+            tod_core::generator::ConfigFieldType::Boolean => false, // Boolean always has a value
+            tod_core::generator::ConfigFieldType::Select { .. } => self.choice.is_none(),
+            tod_core::generator::ConfigFieldType::Custom { .. } => true,
+        }
+    }
 }
 
 struct PendingLinearApply {
@@ -270,8 +303,12 @@ pub struct TaskEditView {
     generator_last_status: Option<String>,
     generator_last_error: Option<String>,
     generator_config_error: Option<String>,
+    /// When true, show the generator detail view instead of the edit form.
+    generator_show_detail: bool,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
+    /// Linear metadata (priority, state, assignee, workspace_slug) for managed nodes.
+    managed_metadata: Option<serde_json::Value>,
     /// This node's own Agent values (unset = follow settings).
     node_agent: NodeAgent,
     resolved_agent: Option<ResolvedAgent>,
@@ -408,8 +445,10 @@ impl TaskEditView {
             generator_last_status: None,
             generator_last_error: None,
             generator_config_error: None,
+            generator_show_detail: false,
             managed_link: None,
             managed_source_type: None,
+            managed_metadata: None,
             node_agent: NodeAgent::default(),
             resolved_agent: None,
             resolved_files: None,
@@ -915,6 +954,9 @@ impl TaskEditView {
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
         self.load_managed_link();
+        // Show generator detail view by default for configured generators
+        self.generator_show_detail = self.generator_data_source_type.is_some()
+            && self.capability_enabled(Capability::Generator);
         let linear = task.linked_issues.first().cloned().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
@@ -1193,10 +1235,23 @@ impl TaskEditView {
                 .flatten()
                 .map(|config| config.data_source_type)
         });
+        self.managed_metadata = self.node_uuid().and_then(|node_id| {
+            self.fleet
+                .get_extra_content(node_id, EXTRA_CONTENT_METADATA)
+                .ok()
+                .flatten()
+                .and_then(|json_str| serde_json::from_str(&json_str).ok())
+        });
     }
 
     fn is_managed(&self) -> bool {
         self.managed_link.is_some()
+    }
+
+    fn is_configured_generator(&self) -> bool {
+        self.generator_show_detail
+            && self.generator_data_source_type.is_some()
+            && self.capability_enabled(Capability::Generator)
     }
 
     fn managed_external_url(&self) -> Option<String> {
@@ -3483,6 +3538,72 @@ impl TaskEditView {
                 ),
             );
         }
+
+        // Linear metadata row (priority, state, assignee)
+        if source_type.as_deref() == Some(tod_core::generator::DATA_SOURCE_LINEAR) {
+            if let Some(metadata) = &self.managed_metadata {
+                let priority = metadata
+                    .get("priority")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let state = metadata
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let assignee = metadata
+                    .get("assignee")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+
+                body = body.child(
+                    h_flex()
+                        .gap_4()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("Priority:"),
+                                )
+                                .child(div().text_xs().child(priority)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("State:"),
+                                )
+                                .child(div().text_xs().child(state)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("Assignee:"),
+                                )
+                                .child(div().text_xs().child(assignee)),
+                        ),
+                );
+            }
+        }
+
         body = body.child(
             v_flex()
                 .gap_1()
@@ -3589,6 +3710,252 @@ impl TaskEditView {
             .into_any_element()
     }
 
+    fn render_generator_detail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let border = theme.border;
+        let accent = theme.primary;
+        let background = theme.background;
+        let secondary = theme.secondary;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+
+        // Get data source display name
+        let sources = tod_core::generator::available_data_sources();
+        let source_display_name = self
+            .generator_data_source_type
+            .as_ref()
+            .and_then(|ds_type| {
+                sources
+                    .iter()
+                    .find(|(key, _, _)| key == ds_type)
+                    .map(|(_, name, _)| name.to_string())
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        // Build config summary
+        let config_summary = if self.generator_fields.is_empty() {
+            "No configuration".to_string()
+        } else {
+            let filter_count = self
+                .generator_fields
+                .iter()
+                .filter(|f| !f.is_empty(cx))
+                .count();
+            let result_cap = self
+                .generator_fields
+                .iter()
+                .find(|f| f.schema.name == "result_cap")
+                .and_then(|f| f.value_as_string(cx))
+                .unwrap_or_else(|| "200".to_string());
+            format!("{} filters · cap: {}", filter_count, result_cap)
+        };
+
+        // Check credential status
+        let credential_status = if let Some(data_source_type) = &self.generator_data_source_type {
+            if data_source_type == tod_core::generator::DATA_SOURCE_LINEAR {
+                let store = CredentialStore::from_data_root(self.fleet.paths().root());
+                if resolve_linear_api_key(&store).is_some() {
+                    "Linear API key configured".to_string()
+                } else {
+                    "Linear API key not configured".to_string()
+                }
+            } else {
+                "Credentials OK".to_string()
+            }
+        } else {
+            "No data source selected".to_string()
+        };
+
+        let mut body = v_flex().gap_3().p_3().w_full();
+
+        // Title
+        body = body.child(div().text_lg().font_semibold().child(selectable_text(
+            "task-edit-generator-title",
+            self.loaded_title.clone(),
+            window,
+            cx,
+        )));
+
+        // Data source type
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Data source", cx))
+                .child(selectable_text(
+                    "task-edit-generator-source",
+                    source_display_name,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Configuration summary
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Configuration", cx))
+                .child(selectable_text(
+                    "task-edit-generator-config-summary",
+                    config_summary,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Last refresh status
+        let status_text = if let Some(status) = &self.generator_last_status {
+            format!("Last refresh: {}", status)
+        } else {
+            "Never refreshed".to_string()
+        };
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Status", cx))
+                .child(selectable_text(
+                    "task-edit-generator-status",
+                    status_text,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Detailed error message if present
+        if let Some(error) = &self.generator_last_error {
+            body = body.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(danger)
+                            .child("Error"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(danger)
+                            .child(selectable_text(
+                                "task-edit-generator-error-detail",
+                                error.clone(),
+                                window,
+                                cx,
+                            )),
+                    ),
+            );
+        }
+
+        // Credential status
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Credentials", cx))
+                .child(selectable_text(
+                    "task-edit-generator-credentials",
+                    credential_status,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Action buttons
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("task-edit-generator-edit-config")
+                        .label("Edit configuration")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // Switch to edit view
+                            this.generator_show_detail = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("task-edit-generator-refresh")
+                        .label("Refresh")
+                        .ghost()
+                        .compact()
+                        .disabled(self.generator_busy.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_generator_now(cx);
+                        })),
+                ),
+        );
+
+        v_flex()
+            .key_context(TASK_EDIT_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .h_full()
+            .bg(background)
+            .border_l_2()
+            .border_color(accent)
+            .on_action(cx.listener(Self::on_close))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Generator Detail"),
+                    )
+                    .child(div().flex_1())
+                    .child(chrome_control_with_shortcut(
+                        Button::new("task-edit-generator-close")
+                            .label("Close")
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close(cx);
+                            })),
+                        window,
+                        &TaskEditClose,
+                        TASK_EDIT_CONTEXT,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .id("task-edit-generator-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Generator node · manages child items from an external source"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_capability_section(
         &self,
         cap: Capability,
@@ -3643,6 +4010,10 @@ impl Render for TaskEditView {
 
         if self.is_managed() {
             return self.render_managed_detail(window, cx);
+        }
+
+        if self.is_configured_generator() {
+            return self.render_generator_detail(window, cx);
         }
 
         self.sync_input_tab_stops(cx);
