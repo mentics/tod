@@ -117,6 +117,17 @@ impl ConversationView {
             "No conversation about {} yet. Give direction below.",
             self.data.title
         );
+        // The title the picker lists this conversation under.
+        let title = match self.conversation_id.and_then(|id| {
+            self.data
+                .conversations
+                .iter()
+                .find(|c| c.conversation.id == id)
+        }) {
+            Some(c) if c.opening.is_empty() => "(no messages)".to_string(),
+            Some(c) => c.opening.clone(),
+            None => super::header::new_label(self.data.protocol).to_string(),
+        };
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
@@ -126,6 +137,7 @@ impl ConversationView {
             Vec::new()
         };
         self.transcript.update(cx, |panel, cx| {
+            panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);
             panel.set_actions(actions, cx);
             panel.set_notices(notices, cx);

@@ -294,6 +294,15 @@ impl AgentConversationPanel {
         }
     }
 
+    /// Replace the panel's title.
+    pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let title = title.into();
+        if title != self.title {
+            self.title = title;
+            cx.notify();
+        }
+    }
+
     /// The host's buttons beside the title, left to right.
     pub fn set_header_actions(&mut self, actions: Vec<PanelAction>, cx: &mut Context<Self>) {
         if actions != self.header_actions {
@@ -635,6 +644,8 @@ impl Render for AgentConversationPanel {
             })
             .collect();
 
+        let has_lifecycle = !self.notices.is_empty() || !self.actions.is_empty();
+
         v_flex()
             .key_context(AGENT_CONVERSATION_CONTEXT)
             .size_full()
@@ -674,7 +685,6 @@ impl Render for AgentConversationPanel {
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(
                 style::panel_footer(v_flex())
-                    .when(!self.notices.is_empty(), |el| el.child(notices))
                     .child(field)
                     .child(
                         h_flex()
@@ -686,7 +696,6 @@ impl Render for AgentConversationPanel {
                                     .min_w_0()
                                     .child(hint),
                             )
-                            .children(actions)
                             .when(self.running, |el| {
                                 el.child(
                                     Button::new("agent-conversation-stop")
@@ -708,5 +717,21 @@ impl Render for AgentConversationPanel {
                             ),
                     ),
             )
+            .when(has_lifecycle, |el| {
+                el.child(
+                    style::panel_footer(v_flex())
+                        .child(style::text_dense_muted(div()).child("Lifecycle"))
+                        .when(!self.notices.is_empty(), |el| el.child(notices))
+                        .when(!actions.is_empty(), |el| {
+                            el.child(
+                                h_flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap(style::space::RELATED)
+                                    .children(actions),
+                            )
+                        }),
+                )
+            })
     }
 }

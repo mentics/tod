@@ -533,14 +533,14 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
 }
 
 /// The picker entry that starts a conversation of `kind`.
-fn new_label(kind: ProtocolKind) -> &'static str {
+pub(super) fn new_label(kind: ProtocolKind) -> &'static str {
     match kind {
-        ProtocolKind::Outline => "New conversation",
+        ProtocolKind::Outline => "New outline",
         ProtocolKind::Implementation => "New implementation",
         ProtocolKind::Verification => "New verification",
         ProtocolKind::Review => "New review",
         ProtocolKind::Fix => "New fix",
-        ProtocolKind::Chat => "New chat",
+        ProtocolKind::Chat => "New conversation",
         ProtocolKind::VisualDesign => "New visual design",
     }
 }
