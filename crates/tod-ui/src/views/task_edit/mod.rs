@@ -248,6 +248,58 @@ enum LinearPresetAction {
     Delete,
 }
 
+/// Represents the value state of a single Linear filter field.
+#[derive(Clone, Debug)]
+enum LinearFilterValue {
+    /// Text input (for string fields with 'contains' comparator)
+    Text(String),
+    /// Enum selection (cycles through enum values + None)
+    Enum { selected: Option<String>, options: Vec<String> },
+    /// Date range (after/before inputs with gte/lte comparators)
+    DateRange {
+        after: String,
+        before: String,
+    },
+    /// Nullable three-state (any/has value/is empty)
+    Nullable { state: NullableState },
+    /// Multi-select (for team/state/assignee/labels)
+    MultiSelect { selected: Vec<String>, options: Vec<String> },
+}
+
+/// Input entities for filter fields that need text input (text fields, date ranges).
+/// Lazily created during render.
+#[derive(Default)]
+struct LinearFilterInputs {
+    text_inputs: HashMap<String, Entity<InputState>>,
+    date_after_inputs: HashMap<String, Entity<InputState>>,
+    date_before_inputs: HashMap<String, Entity<InputState>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NullableState {
+    Any,
+    HasValue,
+    IsEmpty,
+}
+
+impl NullableState {
+    fn cycle(&self) -> Self {
+        match self {
+            NullableState::Any => NullableState::HasValue,
+            NullableState::HasValue => NullableState::IsEmpty,
+            NullableState::IsEmpty => NullableState::Any,
+        }
+    }
+
+    fn to_label(&self) -> &'static str {
+        match self {
+            NullableState::Any => "any",
+            NullableState::HasValue => "has value",
+            NullableState::IsEmpty => "is empty",
+        }
+    }
+}
+
 pub struct TaskEditView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
@@ -322,7 +374,8 @@ pub struct TaskEditView {
     linear_selected_preset: Option<String>,
     linear_preset_name_input: Entity<InputState>,
     linear_preset_action: Option<LinearPresetAction>,
-    linear_filter_inputs: HashMap<String, Entity<InputState>>,
+    linear_filter_values: HashMap<String, LinearFilterValue>,
+    linear_filter_inputs: LinearFilterInputs,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
     /// Linear metadata (priority, state, assignee, workspace_slug) for managed nodes.
@@ -479,7 +532,8 @@ impl TaskEditView {
             linear_selected_preset: None,
             linear_preset_name_input,
             linear_preset_action: None,
-            linear_filter_inputs: HashMap::new(),
+            linear_filter_values: HashMap::new(),
+            linear_filter_inputs: LinearFilterInputs::default(),
             managed_link: None,
             managed_source_type: None,
             managed_metadata: None,
@@ -1482,6 +1536,7 @@ impl TaskEditView {
                 // Load Linear-specific data if this is a Linear generator
                 if config.data_source_type == "linear" {
                     self.load_linear_state();
+                    self.initialize_linear_filter_values();
                 }
             }
             None => {
@@ -1556,7 +1611,8 @@ impl TaskEditView {
         self.linear_presets.clear();
         self.linear_selected_preset = None;
         self.linear_preset_action = None;
-        self.linear_filter_inputs.clear();
+        self.linear_filter_values.clear();
+        self.linear_filter_inputs = LinearFilterInputs::default();
     }
 
     fn trigger_linear_introspection_fetch(&mut self, cx: &mut Context<Self>) {
@@ -1645,9 +1701,133 @@ impl TaskEditView {
         cx.notify();
     }
 
-    fn load_linear_preset_values(&mut self, _filters: &serde_json::Map<String, serde_json::Value>) {
-        // TODO: Load filter values into linear_filter_inputs
-        // This requires the filter input fields to exist first
+    fn initialize_linear_filter_values(&mut self) {
+        let Some(ref cache) = self.linear_introspection_cache else {
+            return;
+        };
+
+        self.linear_filter_values.clear();
+
+        for field in &cache.filter_fields {
+            // Skip ID fields
+            if field.field_type.ends_with("ID") {
+                continue;
+            }
+
+            let value = if cache.enums.contains_key(&field.field_type) {
+                // Enum field
+                LinearFilterValue::Enum {
+                    selected: None,
+                    options: cache.enums.get(&field.field_type).cloned().unwrap_or_default(),
+                }
+            } else if field.field_type == "DateTime" {
+                // Date range field
+                LinearFilterValue::DateRange {
+                    after: String::new(),
+                    before: String::new(),
+                }
+            } else if field.is_nullable {
+                // Nullable three-state field
+                LinearFilterValue::Nullable {
+                    state: NullableState::Any,
+                }
+            } else if ["team", "state", "assignee", "labels"].contains(&field.name.as_str()) {
+                // Multi-select field - options would need to be fetched separately
+                // For now, empty options (TODO: fetch entity lists from Linear API)
+                LinearFilterValue::MultiSelect {
+                    selected: Vec::new(),
+                    options: Vec::new(),
+                }
+            } else {
+                // Text field (default)
+                LinearFilterValue::Text(String::new())
+            };
+
+            self.linear_filter_values.insert(field.name.clone(), value);
+        }
+    }
+
+    fn load_linear_preset_values(&mut self, filters: &serde_json::Map<String, serde_json::Value>) {
+        // Load filter values from preset into linear_filter_values
+        for (key, value) in filters {
+            if let Some(filter_value) = self.linear_filter_values.get_mut(key) {
+                match filter_value {
+                    LinearFilterValue::Text(text) => {
+                        if let Some(t) = value.as_str() {
+                            *text = t.to_string();
+                        }
+                    }
+                    LinearFilterValue::Enum { selected, .. } => {
+                        if let Some(s) = value.as_str() {
+                            *selected = Some(s.to_string());
+                        }
+                    }
+                    LinearFilterValue::DateRange { after, before } => {
+                        if let Some(obj) = value.as_object() {
+                            if let Some(a) = obj.get("gte").and_then(|v| v.as_str()) {
+                                *after = a.to_string();
+                            }
+                            if let Some(b) = obj.get("lte").and_then(|v| v.as_str()) {
+                                *before = b.to_string();
+                            }
+                        }
+                    }
+                    LinearFilterValue::Nullable { state } => {
+                        if let Some(obj) = value.as_object() {
+                            if obj.get("null") == Some(&serde_json::Value::Bool(true)) {
+                                *state = NullableState::IsEmpty;
+                            } else if obj.get("null") == Some(&serde_json::Value::Bool(false)) {
+                                *state = NullableState::HasValue;
+                            }
+                        }
+                    }
+                    LinearFilterValue::MultiSelect { selected, .. } => {
+                        if let Some(arr) = value.as_array() {
+                            *selected = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cycle_linear_enum_filter(&mut self, field_name: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::Enum { selected, options }) = self.linear_filter_values.get_mut(field_name) {
+            let current_idx = selected.as_ref().and_then(|s| options.iter().position(|o| o == s));
+            let next_idx = match current_idx {
+                None => 0,
+                Some(idx) if idx + 1 >= options.len() => {
+                    // Cycle back to None
+                    *selected = None;
+                    cx.notify();
+                    return;
+                }
+                Some(idx) => idx + 1,
+            };
+            *selected = Some(options[next_idx].clone());
+            cx.notify();
+        }
+    }
+
+    fn cycle_linear_nullable_filter(&mut self, field_name: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::Nullable { state }) = self.linear_filter_values.get_mut(field_name) {
+            *state = state.cycle();
+            cx.notify();
+        }
+    }
+
+    fn toggle_linear_multiselect_filter(&mut self, field_name: &str, option: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::MultiSelect { selected, .. }) = self.linear_filter_values.get_mut(field_name) {
+            if let Some(pos) = selected.iter().position(|s| s == option) {
+                selected.remove(pos);
+            } else {
+                selected.push(option.to_string());
+            }
+            cx.notify();
+        }
     }
 
     fn confirm_linear_preset_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1721,9 +1901,55 @@ impl TaskEditView {
     }
 
     fn extract_linear_filter_values(&self, _cx: &Context<Self>) -> serde_json::Map<String, serde_json::Value> {
-        // TODO: Extract values from linear_filter_inputs HashMap
-        // For now return empty map
-        serde_json::Map::new()
+        let mut result = serde_json::Map::new();
+
+        for (key, value) in &self.linear_filter_values {
+            let json_value = match value {
+                LinearFilterValue::Text(text) => {
+                    if text.is_empty() {
+                        continue; // Skip empty text fields
+                    }
+                    serde_json::json!({ "contains": text })
+                }
+                LinearFilterValue::Enum { selected, .. } => {
+                    if let Some(s) = selected {
+                        serde_json::json!({ "eq": s })
+                    } else {
+                        continue; // Skip unselected enums
+                    }
+                }
+                LinearFilterValue::DateRange { after, before } => {
+                    if after.is_empty() && before.is_empty() {
+                        continue; // Skip empty date ranges
+                    }
+                    let mut range = serde_json::Map::new();
+                    if !after.is_empty() {
+                        range.insert("gte".to_string(), serde_json::Value::String(after.clone()));
+                    }
+                    if !before.is_empty() {
+                        range.insert("lte".to_string(), serde_json::Value::String(before.clone()));
+                    }
+                    serde_json::Value::Object(range)
+                }
+                LinearFilterValue::Nullable { state } => {
+                    match state {
+                        NullableState::Any => continue, // Skip 'any' state
+                        NullableState::HasValue => serde_json::json!({ "null": false }),
+                        NullableState::IsEmpty => serde_json::json!({ "null": true }),
+                    }
+                }
+                LinearFilterValue::MultiSelect { selected, .. } => {
+                    if selected.is_empty() {
+                        continue; // Skip empty multiselects
+                    }
+                    serde_json::json!({ "in": selected })
+                }
+            };
+
+            result.insert(key.clone(), json_value);
+        }
+
+        result
     }
 
     fn select_generator_data_source(
@@ -3682,8 +3908,6 @@ impl TaskEditView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
-
         v_flex()
             .gap_3()
             .child(self.render_linear_credential_status(muted, cx))
@@ -3881,11 +4105,11 @@ impl TaskEditView {
         additional.sort_by(|a, b| a.name.cmp(&b.name));
 
         let common_elements: Vec<_> = common.iter().map(|field| {
-            self.render_linear_filter_field_readonly(field, &cache.enums)
+            self.render_linear_filter_field(field, &cache.enums)
         }).collect();
 
         let additional_elements: Vec<_> = additional.iter().map(|field| {
-            self.render_linear_filter_field_readonly(field, &cache.enums)
+            self.render_linear_filter_field(field, &cache.enums)
         }).collect();
 
         v_flex()
@@ -3901,14 +4125,16 @@ impl TaskEditView {
             .into_any_element()
     }
 
-    fn render_linear_filter_field_readonly(
+    fn render_linear_filter_field(
         &self,
         field: &tod_integration::FilterFieldMetadata,
-        enums: &std::collections::HashMap<String, Vec<String>>,
+        _enums: &std::collections::HashMap<String, Vec<String>>,
     ) -> impl IntoElement {
         let field_name = field.name.clone();
         let help_text = field.description.clone().unwrap_or_else(|| {
-            if enums.contains_key(&field.field_type) {
+            // Generate help text based on field type
+            if field.field_type.contains("Filter") || !field.field_type.is_empty() && field.field_type.chars().next().unwrap().is_uppercase() {
+                // Likely an enum type
                 format!("{} (eq)", field_name)
             } else if field.field_type == "DateTime" {
                 format!("{} (after/before)", field_name)
@@ -3919,15 +4145,56 @@ impl TaskEditView {
             }
         });
 
+        let control = if let Some(value) = self.linear_filter_values.get(&field.name) {
+            match value {
+                LinearFilterValue::Text(text) => {
+                    let display = if text.is_empty() { "(empty)".to_string() } else { text.clone() };
+                    div()
+                        .text_xs()
+                        .child(display)
+                        .into_any_element()
+                }
+                LinearFilterValue::Enum { selected, .. } => {
+                    let display = selected.clone().unwrap_or_else(|| "(none)".to_string());
+                    div()
+                        .text_xs()
+                        .child(display)
+                        .into_any_element()
+                }
+                LinearFilterValue::DateRange { after, before } => {
+                    div()
+                        .text_xs()
+                        .child(format!("after: {} | before: {}",
+                            if after.is_empty() { "(any)" } else { after },
+                            if before.is_empty() { "(any)" } else { before }))
+                        .into_any_element()
+                }
+                LinearFilterValue::Nullable { state } => {
+                    div()
+                        .text_xs()
+                        .child(state.to_label())
+                        .into_any_element()
+                }
+                LinearFilterValue::MultiSelect { selected, .. } => {
+                    div()
+                        .text_xs()
+                        .child(if selected.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            selected.join(", ")
+                        })
+                        .into_any_element()
+                }
+            }
+        } else {
+            div().text_xs().child("(not initialized)").into_any_element()
+        };
+
         v_flex()
             .gap_1()
             .child(div().text_xs().child(field_name))
             .child(div().text_xs().text_color(gpui::rgb(0x888888)).child(help_text))
-            .child(
-                div()
-                    .text_xs()
-                    .child("[Filter control - input fields to be added in step 1d815f4c]")
-            )
+            .child(control)
     }
 
     fn render_linear_result_cap(
