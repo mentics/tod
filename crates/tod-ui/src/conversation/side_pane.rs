@@ -5,7 +5,8 @@
 //! ([`super::change_set`]); an implementation conversation shows the plan it
 //! is working, the latest test run its agent recorded, and the files its
 //! worktree has changed; a verification conversation shows the same plan with
-//! its verdicts, and the test run. A plain chat has nothing to show.
+//! its verdicts, and the test run; a review conversation lists the node's
+//! review findings. A plain chat has nothing to show.
 //!
 //! Spec: `doc/conversation/protocols.md` §4.5.
 
@@ -28,29 +29,41 @@ use tod_store::outline::repos::plan_steps::{
     STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
+use tod_store::review::FINDING_STATUSES;
 use uuid::Uuid;
 
-/// The status dropdown open on one plan step.
+/// The status dropdown open on one plan step or review finding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StatusMenu {
+    /// The plan step or finding.
     pub step: Uuid,
-    /// Index into [`PLAN_STEP_STATUSES`].
+    /// The statuses it lists: [`PLAN_STEP_STATUSES`] or
+    /// [`FINDING_STATUSES`].
+    pub options: &'static [&'static str],
+    /// Index into `options`.
     pub highlighted: usize,
 }
 
 impl ConversationView {
-    /// Open the status dropdown on `step`, highlighting its current status.
+    /// Open the status dropdown on `step` (a plan step or a finding),
+    /// highlighting its current status.
     pub(super) fn open_status_menu(&mut self, step: Uuid, cx: &mut Context<Self>) {
-        let Some(current) = self.data.plan.iter().find(|s| s.id == step) else {
-            return;
-        };
-        let highlighted = PLAN_STEP_STATUSES
-            .iter()
-            .position(|s| *s == current.status)
-            .unwrap_or(0);
+        let (current, options): (&str, &'static [&'static str]) =
+            if let Some(s) = self.data.plan.iter().find(|s| s.id == step) {
+                (&s.status, &PLAN_STEP_STATUSES)
+            } else if let Some(f) = self.data.findings.iter().find(|f| f.id == step) {
+                (&f.status, &FINDING_STATUSES)
+            } else {
+                return;
+            };
+        let highlighted = options.iter().position(|s| *s == current).unwrap_or(0);
         self.pane = Pane::ChangeSet;
         self.picker = None;
-        self.status_menu = Some(StatusMenu { step, highlighted });
+        self.status_menu = Some(StatusMenu {
+            step,
+            options,
+            highlighted,
+        });
         cx.notify();
     }
 
@@ -59,16 +72,22 @@ impl ConversationView {
         let Some(menu) = self.status_menu.as_mut() else {
             return false;
         };
-        let last = PLAN_STEP_STATUSES.len() as isize - 1;
+        let last = menu.options.len() as isize - 1;
         menu.highlighted = (menu.highlighted as isize + delta).clamp(0, last) as usize;
         cx.notify();
         true
     }
 
-    /// Set `step`'s status as the user. In a saved conversation it is recorded
-    /// as the user's edit, so it can be reversed and the agent hears of it;
-    /// before the first message there is no conversation to record it in.
+    /// Set `step`'s status as the user. A plan step's change, in a saved
+    /// conversation, is recorded as the user's edit, so it can be reversed and
+    /// the agent hears of it; before the first message there is no
+    /// conversation to record it in. A finding's is the user's response to it
+    /// ([`Self::respond_to_finding`]).
     pub(super) fn choose_status(&mut self, step: Uuid, status: &str, cx: &mut Context<Self>) {
+        if self.data.findings.iter().any(|f| f.id == step) {
+            self.respond_to_finding(step, status, cx);
+            return;
+        }
         self.status_menu = None;
         let unchanged = self
             .data
@@ -96,6 +115,29 @@ impl ConversationView {
                     mutation,
                     target: None,
                 },
+            });
+            self.reload();
+        }
+        cx.notify();
+    }
+
+    /// Answer a review finding as the user: the status is the response, and
+    /// a note the finding already has stays with it. Reopening clears it.
+    pub(super) fn respond_to_finding(
+        &mut self,
+        finding: Uuid,
+        status: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_menu = None;
+        let Some(current) = self.data.findings.iter().find(|f| f.id == finding) else {
+            return;
+        };
+        if current.status != status {
+            self.command(InterviewCommand::RespondReviewFinding {
+                finding_id: finding,
+                status: status.to_string(),
+                response: current.response.clone(),
             });
             self.reload();
         }
@@ -309,7 +351,7 @@ impl ConversationView {
                 this.status_menu = None;
                 cx.notify();
             }));
-        for (ix, status) in PLAN_STEP_STATUSES.iter().copied().enumerate() {
+        for (ix, status) in menu.options.iter().copied().enumerate() {
             list = list.child(
                 style::menu_item(h_flex(), ix == menu.highlighted)
                     .id(ElementId::Name(format!("plan-status-{status}").into()))
@@ -350,6 +392,7 @@ impl ConversationView {
             ProtocolKind::Implementation | ProtocolKind::Verification => {
                 self.render_plan_pane(window, cx)
             }
+            ProtocolKind::Review => self.render_review_pane(window, cx),
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => self.render_empty_pane(
@@ -383,8 +426,11 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Rows Up/Down move among in the plan pane.
+    /// Rows Up/Down move among in the plan pane, or the review pane.
     fn side_row_count(&self) -> usize {
+        if self.data.protocol == ProtocolKind::Review {
+            return self.data.findings.len();
+        }
         self.shown_plan().len() + self.side_files.len()
     }
 
@@ -646,6 +692,139 @@ impl ConversationView {
             .child(
                 v_flex()
                     .id("plan-pane")
+                    .track_scroll(&self.side_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .pb(style::space::RELATED)
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// The node's review findings in the order they were recorded — the
+    /// same rows the `review` → `approved` gate asks a response for. Each
+    /// row's status badge is the user's answer to it.
+    fn render_review_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let active = self.pane == Pane::ChangeSet;
+        let total = self.data.findings.len();
+        let open = self.data.findings.iter().filter(|f| f.is_open()).count();
+        let cursor = self.side_cursor.filter(|ix| *ix < total);
+        if std::mem::take(&mut self.side_scroll_pending) {
+            if let Some(row) = cursor {
+                self.side_scroll.scroll_to_item(row);
+            }
+        }
+        // A menu left open on a finding that has since gone closes.
+        if self
+            .status_menu
+            .is_some_and(|m| !self.data.findings.iter().any(|f| f.id == m.step))
+        {
+            self.status_menu = None;
+        }
+
+        let findings = self.data.findings.clone();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (n, finding) in findings.into_iter().enumerate() {
+            let id = finding.id;
+            let badge = self.render_status_badge(id, &finding.status, cx);
+            let severity = style::badge(div()).flex_shrink_0().child(finding.severity.clone());
+            let severity = if finding.severity == "high" {
+                style::text_error(severity)
+            } else {
+                severity
+            };
+            let mut col = v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(style::space::HAIRLINE)
+                .child(selectable_text(
+                    format!("review-finding-{id}"),
+                    finding.summary.clone(),
+                    window,
+                    cx,
+                ));
+            if let Some(location) = finding.location() {
+                col = col.child(style::text_dense_muted(div()).child(selectable_text(
+                    format!("review-finding-location-{id}"),
+                    location,
+                    window,
+                    cx,
+                )));
+            }
+            if let Some(detail) = &finding.detail {
+                col = col.child(style::text_dense_muted(div()).child(selectable_text(
+                    format!("review-finding-detail-{id}"),
+                    detail.clone(),
+                    window,
+                    cx,
+                )));
+            }
+            if let Some(response) = &finding.response {
+                col = col.child(style::text_dense(div()).child(selectable_text(
+                    format!("review-finding-response-{id}"),
+                    response.clone(),
+                    window,
+                    cx,
+                )));
+            }
+            rows.push(
+                h_flex()
+                    .when(active && cursor == Some(n), style::highlighted)
+                    .gap(style::space::INLINE)
+                    .px(style::space::RELATED)
+                    .py(style::space::INLINE)
+                    .items_start()
+                    .child(badge)
+                    .child(severity)
+                    .child(col)
+                    .into_any_element(),
+            );
+        }
+        if rows.is_empty() {
+            rows.push(
+                style::empty_message(div())
+                    .p(style::space::INSET)
+                    .child("No findings recorded.")
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(
+                style::panel_header(h_flex())
+                    .items_center()
+                    .gap(style::space::INLINE)
+                    .child(
+                        if active {
+                            style::text_title(div())
+                        } else {
+                            style::text_muted(div())
+                        }
+                        .flex_shrink_0()
+                        .child("Review"),
+                    )
+                    .child(style::text_dense_muted(div()).child(match total {
+                        1 => format!("1 finding, {open} open"),
+                        n => format!("{n} findings, {open} open"),
+                    }))
+                    .when(self.loop_turns > 0, |el| {
+                        el.child(
+                            style::text_dense_muted(div())
+                                .child(format!("loop {}", self.loop_turns)),
+                        )
+                    }),
+            )
+            .child(
+                v_flex()
+                    .id("review-pane")
                     .track_scroll(&self.side_scroll)
                     .flex_1()
                     .min_h_0()

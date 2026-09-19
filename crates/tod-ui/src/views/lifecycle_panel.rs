@@ -65,12 +65,13 @@ use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle, state_has_agent};
 use tod_store::AgentRole;
-use tod_store::conversation::{Focus, ProtocolKind};
+use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::{FleetStore, resolve_launch_cwd};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
+use tod_store::review::ReviewRepo;
 use tod_store::outline::{
     GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_DERIVED,
     SOURCE_HUMAN,
@@ -110,6 +111,7 @@ pub enum LifecyclePanelEvent {
 enum LifecyclePanelStop {
     Implement,
     Verify,
+    Review,
     RunGateCheck,
     OpenInterview,
     ForceAdvance,
@@ -284,6 +286,9 @@ impl LifecyclePanelView {
                 if self.verification_offered() {
                     stops.push(LifecyclePanelStop::Verify);
                 }
+                if self.review_offered() {
+                    stops.push(LifecyclePanelStop::Review);
+                }
                 if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
                     stops.push(LifecyclePanelStop::RunGateCheck);
                 }
@@ -347,6 +352,7 @@ impl LifecyclePanelView {
         match self.focused_stop() {
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
+            Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
             Some(LifecyclePanelStop::RunGateCheck) => {
                 if let Some(next) = next_lifecycle(&self.lifecycle) {
                     self.run_gate_check(next, cx);
@@ -698,6 +704,32 @@ impl LifecyclePanelView {
     /// `failed` on it, and the app keeps sending it back until every step has
     /// a verdict. See `doc/conversation/protocols.md`.
     fn launch_verification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_node_conversation(ProtocolKind::Verification, window, cx);
+    }
+
+    /// Whether the Code review section's Review button is shown: the node is
+    /// in `review`.
+    fn review_offered(&self) -> bool {
+        self.lifecycle_capable && self.lifecycle == "review"
+    }
+
+    /// Open the node's latest review conversation (or a new one) and send it
+    /// "Review the change.". The conversation view runs it under the review
+    /// protocol: an agent that did not build the change reviews it in the
+    /// node's worktree and records each finding through `tod-cli review`, and
+    /// the side pane lists them. See `doc/conversation/protocols.md` §4c.
+    fn launch_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.launch_node_conversation(ProtocolKind::Review, window, cx);
+    }
+
+    /// Open the node's latest `protocol` conversation (or a new one), which
+    /// runs in the node's worktree, and send the protocol's starter.
+    fn launch_node_conversation(
+        &mut self,
+        protocol: ProtocolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
@@ -713,7 +745,7 @@ impl LifecyclePanelView {
         window.dispatch_action(
             Box::new(OpenConversation {
                 focus: Focus::Node(node_id),
-                protocol: ProtocolKind::Verification,
+                protocol,
                 start: true,
             }),
             cx,
@@ -823,6 +855,99 @@ impl LifecyclePanelView {
                             this.revert_lifecycle(cx);
                         })),
                 );
+        }
+        body
+    }
+
+    /// The `review` section: how the node's review findings stand, and the
+    /// Review button that runs a code review in the conversation view, where
+    /// the findings are listed and answered.
+    fn render_review(
+        &self,
+        mut body: Stateful<Div>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (muted, danger, list_active_border) = (
+            theme.muted_foreground,
+            theme.danger,
+            theme.list_active_border,
+        );
+        let Some(node_id) = self
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        else {
+            return body;
+        };
+        let (findings, reviewed) = self
+            .fleet
+            .read(|conn| {
+                let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+                let reviewed = ConversationRepo::new(conn)
+                    .latest_for_focus_with_protocol(Focus::Node(node_id), ProtocolKind::Review)?
+                    .is_some();
+                Ok((findings, reviewed))
+            })
+            .unwrap_or_default();
+        let open = findings.iter().filter(|f| f.is_open()).count();
+        let status = self
+            .task_id
+            .as_ref()
+            .and_then(|id| self.implement_status.get(id))
+            .cloned();
+
+        body = body.child(div().text_xs().font_semibold().child("Code review"));
+        let summary = match (reviewed, findings.len()) {
+            (false, 0) => "Not reviewed yet".to_string(),
+            (true, 0) => "No findings".to_string(),
+            (_, 1) => format!("1 finding, {open} open"),
+            (_, n) => format!("{n} findings, {open} open"),
+        };
+        body = body
+            .child(div().text_xs().text_color(muted).child(selectable_text(
+                "lifecycle-panel-review-summary",
+                summary,
+                window,
+                cx,
+            )))
+            .child(
+                div()
+                    .w_full()
+                    .rounded_md()
+                    .when(self.is_focused(LifecyclePanelStop::Review), |el| {
+                        el.border_1().border_color(list_active_border)
+                    })
+                    .child(
+                        Button::new("lifecycle-panel-review")
+                            .label(if reviewed { "Review again" } else { "Review" })
+                            .when(!reviewed, |b| b.primary())
+                            .when(reviewed, |b| b.ghost())
+                            .w_full()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launch_review(window, cx);
+                            })),
+                    ),
+            );
+        if let Some(status) = status {
+            body = body.child(div().text_xs().text_color(muted).child(selectable_text(
+                "lifecycle-panel-review-status",
+                status,
+                window,
+                cx,
+            )));
+        }
+        if open > 0 {
+            let needs = if open == 1 {
+                "1 finding needs".to_string()
+            } else {
+                format!("{open} findings need")
+            };
+            body = body.child(div().text_xs().text_color(danger).child(format!(
+                "{needs} a response before approval: fixed, out of scope, or declined. \
+                 Answer each in the review conversation's findings pane."
+            )));
         }
         body
     }
@@ -1262,9 +1387,10 @@ impl LifecyclePanelView {
     /// title/repo rather than trusting `self.title` — a transition can land
     /// while a different node is selected in the panel (see `apply_gate_reply`).
     fn run_on_entry(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
-        // Verification runs in its own conversation, from the Verify button
-        // (`launch_verification`), not as an on-entry turn.
-        if !state_has_agent(lifecycle) || lifecycle == "verifying" {
+        // Verification and review run in their own conversations, from the
+        // Verify and Review buttons (`launch_verification`, `launch_review`),
+        // not as on-entry turns.
+        if !state_has_agent(lifecycle) || matches!(lifecycle, "verifying" | "review") {
             return;
         }
         if self
@@ -1783,6 +1909,9 @@ impl Render for LifecyclePanelView {
 
             if self.lifecycle == "verifying" {
                 body = self.render_verification(body, window, cx);
+            }
+            if self.review_offered() {
+                body = self.render_review(body, window, cx);
             }
 
             // In `active`, the gate check only takes over once the plan is done.

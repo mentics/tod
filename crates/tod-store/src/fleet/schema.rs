@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 43;
+pub const CURRENT_USER_VERSION: i32 = 44;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -311,6 +311,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 43 {
         migrate_v42_to_v43(conn)?;
         conn.pragma_update(None, "user_version", 43)?;
+    }
+    if version < 44 {
+        migrate_v43_to_v44(conn)?;
+        conn.pragma_update(None, "user_version", 44)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -763,6 +767,13 @@ fn migrate_v41_to_v42(conn: &Connection) -> Result<()> {
     if !has_reason {
         conn.execute_batch("ALTER TABLE node_plan_steps ADD COLUMN reason TEXT;")?;
     }
+    Ok(())
+}
+
+/// `review_findings`: what a review conversation's agent found in a node's
+/// change, and the response each gets (`crate::review`).
+fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
+    conn.execute_batch(crate::review::CREATE_TABLE)?;
     Ok(())
 }
 

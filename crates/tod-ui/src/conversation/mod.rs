@@ -25,8 +25,8 @@ mod transcript;
 /// chat work anywhere; an implementation conversation needs a node that is
 /// `active` and has a plan to work through — the same conditions the lifecycle
 /// panel's Implement checks — and a verification one a node that is
-/// `verifying` and has a plan to check. Visual design is not offered until its
-/// protocol exists.
+/// `verifying` and has a plan to check. A review needs a node in `review`.
+/// Visual design is not offered until its protocol exists.
 fn new_kinds(
     conn: &rusqlite::Connection,
     node: Option<Uuid>,
@@ -39,6 +39,7 @@ fn new_kinds(
         match lifecycle.as_deref() {
             Some("active") if planned => kinds.push(ProtocolKind::Implementation),
             Some("verifying") if planned => kinds.push(ProtocolKind::Verification),
+            Some("review") => kinds.push(ProtocolKind::Review),
             _ => {}
         }
     }
@@ -88,7 +89,8 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
-use tod_store::outline::repos::plan_steps::{HandoffReason, PLAN_STEP_STATUSES};
+use tod_store::outline::repos::plan_steps::HandoffReason;
+use tod_store::review::{ReviewFinding, ReviewRepo};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use uuid::Uuid;
 
@@ -265,6 +267,8 @@ pub(crate) struct Snapshot {
     /// The latest report the conversation's agent recorded (for
     /// implementation, its test run).
     pub report: Option<serde_json::Value>,
+    /// The focus node's code review findings, for the review protocol's pane.
+    pub findings: Vec<ReviewFinding>,
     /// The kinds of conversation the picker offers to start on this focus.
     pub new_kinds: Vec<ProtocolKind>,
 }
@@ -829,6 +833,10 @@ impl ConversationView {
                 ),
                 _ => (Vec::new(), None),
             };
+            let findings = match (protocol, selection.node) {
+                (ProtocolKind::Review, Some(node)) => ReviewRepo::new(conn).list_for_node(node)?,
+                _ => Vec::new(),
+            };
             let obligations = ObligationRepo::new(conn);
             let mut cited = HashMap::new();
             for step in &plan {
@@ -855,6 +863,7 @@ impl ConversationView {
                 plan,
                 cited,
                 report,
+                findings,
             })
         });
         let data = match data {
@@ -1074,7 +1083,10 @@ impl ConversationView {
                 cx.notify();
             }
             Pane::Context => {}
-            Pane::ChangeSet if self.data.protocol.works_the_plan() => {
+            Pane::ChangeSet
+                if self.data.protocol.works_the_plan()
+                    || self.data.protocol == ProtocolKind::Review =>
+            {
                 self.move_side_cursor(delta, cx);
             }
             Pane::ChangeSet => {
@@ -1106,7 +1118,7 @@ impl ConversationView {
             return;
         }
         if let Some(menu) = self.status_menu {
-            self.choose_status(menu.step, PLAN_STEP_STATUSES[menu.highlighted], cx);
+            self.choose_status(menu.step, menu.options[menu.highlighted], cx);
             return;
         }
         match self.pane {
@@ -1129,6 +1141,16 @@ impl ConversationView {
                 let shown = self.shown_plan();
                 if let Some(step) = self.side_cursor.and_then(|ix| shown.get(ix)) {
                     self.open_status_menu(step.id, cx);
+                }
+            }
+            Pane::ChangeSet if self.data.protocol == ProtocolKind::Review => {
+                // So does a highlighted finding's.
+                let finding = self
+                    .side_cursor
+                    .and_then(|ix| self.data.findings.get(ix))
+                    .map(|f| f.id);
+                if let Some(finding) = finding {
+                    self.open_status_menu(finding, cx);
                 }
             }
             Pane::ChangeSet => {

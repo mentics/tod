@@ -142,6 +142,28 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
     blocks: IMPLEMENT_SESSION.blocks,
 };
 
+/// A code review session: the node's change, reviewed by an agent that did
+/// not build it. The `review` state agent's role doc goes ahead of the
+/// dynamic blocks (see `agent_context::build_review_message`);
+/// `surface/review` scopes it to recording findings through the `review`
+/// noun — no fixes, no approval, no gate — and says how the reply works.
+pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
+    name: "code review session",
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/review",
+        "surface/review",
+    ],
+    blocks: IMPLEMENT_SESSION.blocks,
+};
+
 /// A gate-check turn. Stance is `one-shot`: a single structured-response turn
 /// that must not end by asking a question. It loads no `cli/` fragments at all
 /// — it returns YAML and the app persists the result, so it never mutates
@@ -290,6 +312,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     VISUAL_DESIGN_CHAT,
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
+    REVIEW_SESSION,
     GATE_CHECK,
     ON_ENTRY,
     FLEET_AUTONOMOUS,
@@ -451,6 +474,7 @@ mod tests {
             "interview ",
             "visual-design ",
             "changeset ",
+            "review ",
         ];
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {

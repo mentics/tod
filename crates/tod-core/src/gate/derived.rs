@@ -15,8 +15,10 @@ use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
 use tod_store::outline::{
     GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
+    REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
     VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
+use tod_store::review::ReviewRepo;
 use uuid::Uuid;
 
 /// The app's verdict on one derived criterion.
@@ -37,6 +39,10 @@ pub fn evaluate_derived_criterion(
     match criterion.slug.as_str() {
         READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
         VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => plan_verified_outcome(conn, node_id).map(Some),
+        REVIEW_APPROVED_REVIEW_DONE_SLUG => review_done_outcome(conn, node_id).map(Some),
+        REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
+            findings_answered_outcome(conn, node_id).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -135,6 +141,47 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
         ));
     }
     Ok(fail(parts.join(" ")))
+}
+
+/// The node's review conversation recorded the review finished.
+fn review_done_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    if crate::conversation::review::review_recorded_done(conn, node_id)? {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: "The review conversation recorded the review finished.".into(),
+        });
+    }
+    Ok(fail(
+        "No finished code review — run Review from this panel and let it record the          review finished.",
+    ))
+}
+
+/// No finding still `open`: each is fixed, out of scope, or declined. A node
+/// with no findings passes — whether it was reviewed at all is the other
+/// criterion's question.
+fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+    let open: Vec<String> = findings
+        .iter()
+        .filter(|f| f.is_open())
+        .map(|f| format!("[{}] {}", short_id(f.id), f.summary))
+        .collect();
+    if open.is_empty() {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: match findings.len() {
+                0 => "No review findings.".into(),
+                1 => "The one review finding is answered.".into(),
+                n => format!("All {n} review findings answered."),
+            },
+        });
+    }
+    Ok(fail(format!(
+        "{} of {} review findings still open: {}. Answer each from its status in the          review conversation — fixed, out of scope, or declined.",
+        open.len(),
+        findings.len(),
+        open.join("; ")
+    )))
 }
 
 #[cfg(test)]
@@ -307,6 +354,70 @@ mod tests {
             "{}",
             outcome.detail
         );
+    }
+
+    #[test]
+    fn approval_needs_a_finished_review_and_every_finding_answered() {
+        use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+        use tod_store::review::{FINDING_DECLINED, NewFinding};
+
+        let done = REVIEW_APPROVED_REVIEW_DONE_SLUG;
+        let answered = REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG;
+        let (store, node) = store_with_node();
+        let conn = tod_store::fleet::schema::open_writer_connection(store.writer().db_path())
+            .unwrap();
+
+        // Never reviewed: not done, and nothing to answer.
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_FAIL);
+        assert_eq!(
+            evaluate(&store, node, answered).unwrap().outcome,
+            OUTCOME_PASS
+        );
+
+        // The review runs and records a finding, but has not finished.
+        let conversations = ConversationRepo::new(&conn);
+        let conversation = conversations
+            .create(Focus::Node(node), ProtocolKind::Review, None, None, None)
+            .unwrap();
+        let finding = ReviewRepo::new(&conn)
+            .add(
+                node,
+                Some(conversation.id),
+                &NewFinding {
+                    severity: "medium".into(),
+                    file: Some("src/lib.rs".into()),
+                    line: Some(3),
+                    summary: "Unchecked unwrap".into(),
+                    detail: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_FAIL);
+        let outcome = evaluate(&store, node, answered).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("1 of 1"), "{}", outcome.detail);
+        assert!(
+            outcome.detail.contains(&short_id(finding.id)),
+            "{}",
+            outcome.detail
+        );
+
+        // It finishes, and the finding is answered.
+        conversations
+            .append_turn(conversation.id, tod_store::conversation::TurnRole::User, "Review")
+            .unwrap();
+        conversations
+            .record_report(
+                conversation.id,
+                &crate::conversation::review::done_report(),
+            )
+            .unwrap();
+        ReviewRepo::new(&conn)
+            .respond(finding.id, FINDING_DECLINED, Some("Input is validated upstream"))
+            .unwrap();
+        assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_PASS);
+        let outcome = evaluate(&store, node, answered).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
     }
 
     #[test]

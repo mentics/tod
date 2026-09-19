@@ -119,7 +119,7 @@ an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
 
-Implement, Verify, and the action panel's Chat now run in the conversation view (see
+Implement, Verify, Review, and the action panel's Chat now run in the conversation view (see
 **Protocols** below). The one chat left on the old path is the visual-design
 panel's embedded chat, which uses `InteractiveAgentView`; it, the view, and
 `InteractiveAgentWindow` are slated for deletion once visual design is rebuilt
@@ -227,7 +227,13 @@ the plan is done and a test run it recorded (`tod-cli tests record`) is
 green; a `blocked` plan step hands back to the user. `verify.rs` is its
 mirror for a `verifying` node (the lifecycle panel's Verify): it loops until
 every plan step is `verified` or `failed` and a test run is recorded, and
-replaces the old `verifying` on-entry turn. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
+replaces the old `verifying` on-entry turn. `review.rs` is the code review
+for a node in `review` (the lifecycle panel's Review): the agent records each
+finding through `tod-cli review` (`tod_store::review`, on the node, not the
+conversation) and loops until it records `review done`; it replaces the old
+`review` on-entry turn, and the side pane lists the findings, each answered
+from its status badge. The `review` → `approved` gate is app-checked
+(`tod_core::gate::derived`): review recorded done, no finding still open. `tod_ui::conversation::side_pane` picks the pane, and the picker offers a
 "New …" entry per kind the focus can start. Adding a kind means a
 `ProtocolKind` variant, an impl, a registry arm, and a side pane. Spec:
 `doc/conversation/protocols.md`.

@@ -26,6 +26,16 @@ pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-co
 /// (`tod_core::gate::derived`); it never goes to an agent.
 pub const VERIFYING_REVIEW_PLAN_VERIFIED_SLUG: &str = "verifying-review.plan-steps-verified";
 
+/// `review` → `approved`: the node's review conversation recorded the review
+/// finished (`tod-cli review done`). The app answers this one itself
+/// (`tod_core::gate::derived`); it never goes to an agent.
+pub const REVIEW_APPROVED_REVIEW_DONE_SLUG: &str = "review-approved.review-done";
+
+/// `review` → `approved`: no review finding is still `open` — each is fixed,
+/// out of scope, or declined. The app answers this one itself from the
+/// findings table (`tod_core::gate::derived`); it never goes to an agent.
+pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findings-answered";
+
 /// `design` → `planning`: the one active criterion for that transition. Any obligation
 /// change on the node resets its evaluation to pending (a schema trigger).
 pub const BUILDABLE_CRITERION_SLUG: &str = "design-planning.buildable";

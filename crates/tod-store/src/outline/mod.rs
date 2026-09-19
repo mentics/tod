@@ -19,7 +19,8 @@ pub use mutations::{CreatePosition, OutlineMutation, ReorderDirection};
 pub use references::{BrokenReference, broken_references, check_references, referenced_slugs};
 pub use repos::gate::{
     BUILDABLE_CRITERION_SLUG, GateCriterion, GateRepo, NodeGateEvaluation, OUTCOME_FAIL,
-    OUTCOME_PASS, OUTCOME_PENDING, OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG, SOURCE_AGENT,
+    OUTCOME_PASS, OUTCOME_PENDING, OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG,
+    REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG, SOURCE_AGENT,
     SOURCE_DERIVED, SOURCE_HUMAN, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 pub use repos::obligations::{

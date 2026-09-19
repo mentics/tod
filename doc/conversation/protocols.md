@@ -72,12 +72,13 @@ context recipes — one list, one place, tests over it.
 | `outline` | Ctrl+J, app nav, `proposed`/`design` nodes | scratch | yes, recorded | change set | no |
 | `implementation` | Active-phase **Implement** | node worktree | no | plan steps + changed files | yes |
 | `verification` | Verifying-phase **Verify** | node worktree | no | plan steps with verdicts | yes |
+| `review` | Review-phase **Review** | node worktree | no | review findings | yes |
 | `chat` | action panel's **Chat**, the picker | node's directory, else scratch | yes, recorded | change set | no |
 | `visual_design` | design panel | scratch | yes (1 command) | designer | no |
 
 `outline` is today's behavior, unchanged. Implementation, chat, and visual
 design replace the interactive agent window, which is deleted; verification
-replaces the `verifying` on-entry turn (§4b).
+and review replace the `verifying` and `review` on-entry turns (§4b, §4c).
 
 ## 3. Data model
 
@@ -337,6 +338,53 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
   verdict ("3/5 verified, 1 failed"), with each failed step's note. A step
   left for the user offers no answers here: that is implementation's.
 
+## 4c. The review protocol
+
+An independent code review of the node's change
+(`tod_core::conversation::review`). It replaces the `review` on-entry turn,
+whose findings came back as prose in the lifecycle panel: entering `review`
+no longer runs an agent by itself.
+
+- **Launch.** The lifecycle panel's Code review section shows **Review**
+  until the node has a review conversation, and **Review again** after.
+  Either opens the node's most recent review conversation (or a new one) and
+  sends the starter, "Review the change." The picker offers "New review" on
+  a node in `review`. The section also counts the findings and says how many
+  still need a response before approval.
+- **Context.** Implementation's blocks (worktree, node, plan, obligations,
+  ancestors) under the `REVIEW_SESSION` recipe, with the `review` state
+  agent's role doc and `surface/review`, which scopes it to recording
+  findings — no fixes, no responses, no approval, no gate evaluation — and
+  sets the reply rule. The session did not build the change, so it is the
+  independent reviewer the role doc asks for; it spawns no subagent.
+- **What the agent records.** Each finding, as it finds it, through
+  `tod-cli review add`: a severity (`high`, `medium`, `low`), the file and
+  line, a one-sentence summary, and the detail someone fixing it needs. It
+  lists the node's findings first and records none twice. When the whole
+  change is reviewed it records `tod-cli review done`, a conversation report
+  (`{"review": "done"}`). Findings belong to the node
+  (`tod_store::review`, table `review_findings`, schema v44), not the
+  conversation, which each one only names. The reply is empty or a sentence
+  or two.
+- **Responses.** A finding is `open` until answered: `fixed` (the response
+  points at the change), `out_of_scope`, or `declined` (not critical, beyond
+  the requirements, or not worth the cost). The user answers from the
+  finding's status badge; an agent answers through `tod-cli review respond`,
+  which requires a response for anything but `open`.
+- **Done.** A turn recorded the review done. Otherwise the loop sends the
+  agent back to finish, capped and stopped by a turn that recorded no
+  finding and changed no status, like §4.4.
+- **Side pane.** The node's findings in the order they were recorded, titled
+  "Review" and counted ("4 findings, 3 open"): each row's status badge (a
+  dropdown, as a plan step's is), severity, summary, location, detail, and
+  response. Up/Down move among them; Enter opens the highlighted one's
+  status dropdown.
+- **Gate.** The `review` → `approved` gate is two criteria the app answers
+  itself (`tod_core::gate::derived`), so its gate check runs no agent: the
+  node's review conversation last reported the review done, and no finding
+  is still `open`. A node with no findings passes the second. Approval is
+  then the user's Advance, the external gate the role doc requires.
+
 ## 5. View changes
 
 - `Pane::ChangeSet` becomes `Pane::Side`; the pane's content comes from the
@@ -349,12 +397,13 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
 - The picker lists all of a focus's conversations regardless of protocol,
   badged by kind, followed by one "New …" entry per kind the focus can start:
   a conversation and a chat anywhere, an implementation only on an `active`
-  node with plan steps, a verification only on a `verifying` one. Ctrl+N starts another of the kind that is open.
+  node with plan steps, a verification only on a `verifying` one, a review
+  only on a node in `review`. Ctrl+N starts another of the kind that is open.
   *Done.* So a node can have several implementation conversations; Implement
   reopens the most recent.
 - A protocol may name a **starter** message (`Protocol::starter`;
   implementation's is "Implement the plan.", verification's "Verify the
-  plan."). A new conversation from the
+  plan.", review's "Review the change."). A new conversation from the
   picker or Ctrl+N puts it in the input, unsent, to edit or send as is. The
   lifecycle panel's Implement sends it on arrival (`OpenConversation::start`),
   since the click already says what the user wants — unless the agent is

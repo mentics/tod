@@ -7,7 +7,9 @@
 //! [`crate::context_recipes::build_message`]. This module's job is turning the
 //! caller's request into a [`DynamicContext`].
 
-use crate::context_recipes::{IMPLEMENT_SESSION, VERIFY_SESSION, VISUAL_DESIGN_CHAT};
+use crate::context_recipes::{
+    IMPLEMENT_SESSION, REVIEW_SESSION, VERIFY_SESSION, VISUAL_DESIGN_CHAT,
+};
 use crate::dynamic::DynamicContext;
 use crate::gate::PlanStepWithLinks;
 use crate::media::MediaPaths;
@@ -94,6 +96,16 @@ pub fn build_verify_message(
     role_doc: &str,
 ) -> Result<String> {
     build_plan_session_message(paths, &VERIFY_SESSION, Some(role_doc), request)
+}
+
+/// Build the full code-review-session first message: the same node, plan,
+/// and obligations, plus the `review` state agent's role doc.
+pub fn build_review_message(
+    paths: &MediaPaths,
+    request: &ImplementRequest<'_>,
+    role_doc: &str,
+) -> Result<String> {
+    build_plan_session_message(paths, &REVIEW_SESSION, Some(role_doc), request)
 }
 
 fn build_plan_session_message(

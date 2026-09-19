@@ -10,6 +10,7 @@ pub mod log_level;
 pub mod outline;
 pub mod path_util;
 pub mod paths;
+pub mod review;
 pub mod settings;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they

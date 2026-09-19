@@ -124,6 +124,7 @@ str_enum!(
         Outline => "outline",
         Implementation => "implementation",
         Verification => "verification",
+        Review => "review",
         Chat => "chat",
         VisualDesign => "visual_design",
     }

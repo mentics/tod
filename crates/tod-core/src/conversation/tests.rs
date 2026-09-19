@@ -953,6 +953,61 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
     assert_eq!(turns(&fx, id).len(), 4);
 }
 
+/// The review loop end to end: the mock records a finding and stops without
+/// finishing, the app sends it back, and the next turn records the review
+/// done. The finding is on the node, filed under the conversation.
+#[test]
+fn a_review_loops_until_it_is_recorded_done() {
+    use tod_store::review::ReviewRepo;
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
+            id: fx.node.to_string(),
+            repo: Some(workspace.display().to_string()),
+        })
+        .unwrap();
+    fx.fleet.writer().flush().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Review,
+    );
+    driver.send(&fx.fleet, &mut agent, "Review the change.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let opening = agent.last().prompt_blocks().join("
+");
+    assert!(opening.contains("code review session"), "{opening}");
+    assert!(opening.contains("# State: `review`"), "{opening}");
+
+    assert_eq!(
+        driver.tick(&fx.fleet, &mut agent),
+        [ConversationEvent::Continued]
+    );
+    let continuation = agent.last().message.clone();
+    assert!(
+        continuation.starts_with("The review is not recorded as finished"),
+        "{continuation}"
+    );
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    let findings = fx
+        .fleet
+        .read(|conn| ReviewRepo::new(conn).list_for_node(fx.node))
+        .unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].conversation_id, Some(id));
+    assert_eq!(turns(&fx, id).len(), 4);
+}
+
 /// The session's id is stored as soon as the agent reports it, so a turn
 /// that never finishes still leaves the session to resume.
 #[test]

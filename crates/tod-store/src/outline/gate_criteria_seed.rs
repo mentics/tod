@@ -297,6 +297,24 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Node- or ancestor-defined gate extras (if any) done?",
         sort_order: 9,
     },
+    // review → approved — evaluated by the app, not an agent (`tod_core::gate::derived`).
+    // Approval itself is the user's Advance once both pass.
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000001",
+        from_state: "review",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::REVIEW_APPROVED_REVIEW_DONE_SLUG,
+        label: "Independent code review recorded as finished?",
+        sort_order: 1,
+    },
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000002",
+        from_state: "review",
+        to_state: "approved",
+        slug: crate::outline::repos::gate::REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
+        label: "Every review finding answered (fixed, out of scope, or declined)?",
+        sort_order: 2,
+    },
 ];
 
 /// SQL for gate criteria tables (also appended to outline DDL).
