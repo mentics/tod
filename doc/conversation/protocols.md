@@ -174,6 +174,18 @@ agent-judged rule on `planning` → `ready`
 criterion on `ready` → `active` stays the action-config check in
 `tod_core::gate::derived`.
 
+### 4.1a Back from verification
+
+Verification does not fix what it finds. The `verifying` → `review` gate has
+a criterion the app answers itself (`verifying-review.plan-steps-verified`,
+`tod_core::gate::derived`): every plan step `verified`, none `failed` or
+unchecked. While any step is `failed`, the lifecycle panel's Verification
+section says so and offers **Back to active**, which reverts the node to
+`active`; **Implement** then sends the agent back to the failed steps, and
+advancing to `verifying` again runs the on-entry verification over the
+result. **Verify again** reruns that on-entry turn without leaving
+`verifying`.
+
 ### 4.2 What the agent records, and what it says
 
 Nothing in an implementation reply is parsed. The app reads what the agent
@@ -197,6 +209,17 @@ wrote as it worked, through `tod-cli`:
   existing code is never a requirement, and a conflict is between
   obligations. `tod-cli` refuses a conflict without citations or a decision
   without options.
+- **Steps that failed verification.** The `verifying` state's on-entry turn
+  checks every plan step and records its verdict on the step: `verified`, or
+  `failed` with a `--note` saying what was checked, how, and what happened
+  (`tod-cli` refuses `failed` without one). A `failed` step is open work for
+  this protocol, like any step not yet `implemented`. The agent is shown its
+  latest note — as the step's own note while it is `failed`, and as
+  `failed verification: …` once it has moved the step on, since a status
+  change clears the step's note — and the continuation message repeats it.
+  Every note a step is given is kept in `node_plan_step_notes` (schema v43),
+  oldest first, and `plan show` lists them: several `failed` notes on one
+  step are several attempts that did not hold up.
 - **The test run.** After its last change in a turn it runs the tests and
   records the counts: `tests record --command <cmd> --passed N [--failed N]
   [--errors N]`, stored in `conversation_reports` as a `TestRun`. The latest
@@ -223,7 +246,7 @@ the whole document back as the reply.
 
 A turn ends the exchange when **both**:
 
-1. No plan step on the node is `pending`, `ready`, `in_progress`,
+1. No plan step on the node is `pending`, `ready`, `in_progress`, `failed`,
    `partial`, or `blocked` — every one is `implemented` or `verified`
    (`tod_store::outline::repos::plan_steps`).
 2. The turn recorded a test run with at least one pass and no failures or
@@ -272,6 +295,9 @@ finishes). A header strip carries the latest recorded test run's counts
 ("24 passed", "22 passed, 2 failed" in the error color) — nothing until the
 agent records one — and the loop's continuation count, and says how many
 steps need the user.
+
+Under each `failed` step: "Failed verification" and its note. The header
+says how many steps failed.
 
 Under each `partial` or `blocked` step: its reason, its note, and a way to
 answer by reason — for a conflict, each cited obligation's text with

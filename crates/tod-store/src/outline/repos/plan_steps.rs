@@ -15,18 +15,22 @@ pub const STATUS_READY: &str = "ready";
 pub const STATUS_IN_PROGRESS: &str = "in_progress";
 pub const STATUS_IMPLEMENTED: &str = "implemented";
 pub const STATUS_VERIFIED: &str = "verified";
+/// Verification found the step not done; the note says what failed and what
+/// to fix. Open work for implementation again, not a hand-off to the user.
+pub const STATUS_FAILED: &str = "failed";
 /// Done as far as it can go without the user; the step's note says what is
 /// left and how to unblock it. Unlike `blocked`, work was done.
 pub const STATUS_PARTIAL: &str = "partial";
 /// Could not be started without the user; the note says why.
 pub const STATUS_BLOCKED: &str = "blocked";
 
-pub const PLAN_STEP_STATUSES: [&str; 7] = [
+pub const PLAN_STEP_STATUSES: [&str; 8] = [
     STATUS_PENDING,
     STATUS_READY,
     STATUS_IN_PROGRESS,
     STATUS_IMPLEMENTED,
     STATUS_VERIFIED,
+    STATUS_FAILED,
     STATUS_PARTIAL,
     STATUS_BLOCKED,
 ];
@@ -110,13 +114,25 @@ pub struct PlanStep {
     pub ordinal: i32,
     pub body: String,
     pub status: String,
-    /// Why the step stopped short — what is left, and how the user can
-    /// unblock it. Set with a `partial` or `blocked` status; any other
-    /// status change clears it.
+    /// The step's current note: for `partial` or `blocked`, what is left and
+    /// how the user can unblock it; for `failed`, what verification found.
+    /// Any status change replaces it. Every note it has had is kept in
+    /// [`PlanStepRepo::list_notes`].
     pub note: Option<String>,
     /// Why a `partial` or `blocked` step needs the user; set and cleared with
     /// the note. Steps handed back before reasons existed have a note alone.
     pub reason: Option<HandoffReason>,
+}
+
+/// One note a step was given, with the status it was given with. A later note
+/// supersedes an earlier one; the history is kept so a step that failed or
+/// was handed back more than once shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStepNote {
+    pub status: String,
+    pub body: String,
+    /// Milliseconds since the epoch.
+    pub created_at: i64,
 }
 
 pub struct PlanStepRepo<'a> {
@@ -238,12 +254,50 @@ impl<'a> PlanStepRepo<'a> {
         if n == 0 {
             anyhow::bail!("plan step not found");
         }
+        if let Some(note) = note {
+            self.record_note(id, status, note)?;
+        }
         if satisfies_dependency(status) {
             for dependent in self.list_dependents(id)? {
                 self.maybe_promote_to_ready(dependent)?;
             }
         }
         Ok(())
+    }
+
+    /// Append `note` to `id`'s history, unless the step already has this
+    /// note with this status — which is what reversing a status change, or
+    /// repeating one, would otherwise add again.
+    fn record_note(&self, id: Uuid, status: &str, note: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO node_plan_step_notes (step_id, status, body, created_at)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM node_plan_step_notes
+                 WHERE step_id = ?1 AND status = ?2 AND body = ?3
+             )",
+            params![uuid_to_blob(id), status, note, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Every note `id` has been given, oldest first. The last is the latest;
+    /// the step's own `note` is it while the status it came with holds.
+    pub fn list_notes(&self, id: Uuid) -> Result<Vec<PlanStepNote>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT status, body, created_at FROM node_plan_step_notes
+             WHERE step_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(id)], |row| {
+                Ok(PlanStepNote {
+                    status: row.get(0)?,
+                    body: row.get(1)?,
+                    created_at: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn maybe_promote_to_ready(&self, id: Uuid) -> Result<()> {

@@ -226,7 +226,7 @@ fn status_color(status: &str, theme: &gpui_component::Theme) -> gpui::Hsla {
     match status {
         "verified" | "implemented" => theme.success,
         "in_progress" | "partial" => theme.warning,
-        "blocked" => theme.danger,
+        "blocked" | "failed" => theme.danger,
         "ready" => theme.primary,
         _ => theme.muted_foreground,
     }

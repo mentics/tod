@@ -4,7 +4,7 @@
 tod-cli --data-root <DATA_ROOT> plan list      [--node <NODE_UUID>] [--search <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan show      <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan add       --node <NODE_UUID> --body <TEXT> [--after <STEP_ID>] [--before] [--depends-on <STEP_ID>] [--satisfies <OBLIGATION_ID>]
-tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|partial|blocked] [--reason conflict|decision|access|external] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--note <TEXT>]
+tod-cli --data-root <DATA_ROOT> plan update    <STEP_ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access|external] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--note <TEXT>]
 tod-cli --data-root <DATA_ROOT> plan delete    <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan depend    <STEP_ID> --on <STEP_ID>
 tod-cli --data-root <DATA_ROOT> plan undepend  <STEP_ID> --on <STEP_ID>
@@ -41,8 +41,19 @@ For example:
 tod-cli --data-root <DATA_ROOT> plan update <STEP_ID> --status blocked --reason decision --option "Keep the generic form" --option "Build the Linear-specific form" --note -
 ```
 
+`--status failed` is verification's verdict that a step is not done. It
+requires `--note` — what failed and the evidence (the command run, what it
+printed, what was expected) — and takes no `--reason`:
+
+```
+tod-cli --data-root <DATA_ROOT> plan update <STEP_ID> --status failed --note -
+```
+
 Setting any other status clears the reason and note. `list` and `show` print
-a step's reason and note on the lines below it.
+a step's current reason and note on the lines below it. Every note a step has
+been given is kept, and `show` lists them all, oldest first, each with its
+time and the status it came with — a step with several `failed` notes has
+failed verification several times.
 
 If you change an obligation and existing plan steps depend on it or claim to
 satisfy it, check `plan list --node <NODE_UUID>` for steps whose `satisfies`

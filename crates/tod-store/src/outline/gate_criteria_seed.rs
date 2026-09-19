@@ -18,7 +18,7 @@ pub struct GateCriterionSeed {
     pub sort_order: i32,
 }
 
-/// Stable criterion catalog (32 items across design→planning, planning→ready, verifying→review).
+/// Stable criterion catalog (33 items across design→planning, planning→ready, verifying→review).
 pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     // design → planning
     GateCriterionSeed {
@@ -217,6 +217,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         sort_order: 1,
     },
     // verifying → review
+    GateCriterionSeed {
+        id_str: "a1000003-0003-4003-8003-00000000000a",
+        from_state: "verifying",
+        to_state: "review",
+        slug: crate::outline::repos::gate::VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+        label: "Every plan step verified (none failed verification or still unchecked)?",
+        sort_order: 0,
+    },
     GateCriterionSeed {
         id_str: "a1000003-0003-4003-8003-000000000001",
         from_state: "verifying",

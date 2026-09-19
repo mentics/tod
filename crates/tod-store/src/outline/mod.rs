@@ -20,7 +20,7 @@ pub use references::{BrokenReference, broken_references, check_references, refer
 pub use repos::gate::{
     BUILDABLE_CRITERION_SLUG, GateCriterion, GateRepo, NodeGateEvaluation, OUTCOME_FAIL,
     OUTCOME_PASS, OUTCOME_PENDING, OUTCOME_WAIVED, READY_ACTIVE_ACTION_CONFIG_SLUG, SOURCE_AGENT,
-    SOURCE_DERIVED, SOURCE_HUMAN,
+    SOURCE_DERIVED, SOURCE_HUMAN, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 pub use repos::obligations::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, ObligationCounts, ObligationRepo,
