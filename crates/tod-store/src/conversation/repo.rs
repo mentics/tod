@@ -355,6 +355,41 @@ impl<'a> ConversationRepo<'a> {
         Ok(())
     }
 
+    /// Record the context the conversation's first turn sent.
+    pub fn set_opening_context(&self, conversation_id: Uuid, context: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE conversations SET opening_context = ?1 WHERE id = ?2",
+            params![context, uuid_to_blob(conversation_id)],
+        )?;
+        anyhow::ensure!(n == 1, "conversation {conversation_id} not found");
+        Ok(())
+    }
+
+    /// The context the conversation's first turn sent; `None` before it was
+    /// sent, and for conversations started before it was recorded.
+    pub fn opening_context(&self, conversation_id: Uuid) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT opening_context FROM conversations WHERE id = ?1",
+                params![uuid_to_blob(conversation_id)],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Whether the conversation's first turn recorded its context, without
+    /// reading it.
+    pub fn has_opening_context(&self, conversation_id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM conversations
+                            WHERE id = ?1 AND opening_context IS NOT NULL)",
+            params![uuid_to_blob(conversation_id)],
+            |row| row.get(0),
+        )?)
+    }
+
     /// The seq of the latest user turn (0 before the first): the turn an
     /// agent's actions are attributed to.
     pub fn max_user_seq(&self, conversation_id: Uuid) -> Result<i64> {
