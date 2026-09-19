@@ -16,12 +16,14 @@ node at a time.
   phase's verdict on it. A `failed` step carries a **note** saying what
   failed, and goes back to implementation as open work. `partial` means the
   step was done as far as it could go and the rest needs the user; `blocked`
-  means it could not be started at all. Both carry a **reason** — `conflict` (obligations that
-  cannot all hold, cited by id), `decision` (a choice the obligations leave
-  open, with the options), `access` (a secret, account, or permission), or
-  `external` (waiting on something outside the node) — and a **note**: what
-  is left, and how the user can unblock it. The user answers through the
-  reason: they settle the conflict, pick an option, or supply the access.
+  means it could not be started at all. Both carry a **reason** — `conflict`
+  (obligations that cannot all hold, cited by id), `decision` (a choice the
+  obligations leave open, with the options), or `access` (a secret, account,
+  or permission: what is needed, and the attempt that failed for want of it)
+  — and a **note** saying why the agent cannot go on until the user acts.
+  The user answers through the reason: they settle the conflict, pick an
+  option, or supply the access. A step with nothing for the user to do is
+  not handed back: the agent does it.
 - Every note a step is given is kept, oldest first; the latest supersedes the
   rest. Several notes on one step mean several attempts at it.
 

@@ -291,17 +291,20 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
     }
     out.push_str(
         "Do as much of every step as you can. Only what needs the user may be \
-         left: mark the step `partial` if you did part of it or `blocked` if \
-         none of it was possible, with one of the four reasons — `conflict` \
-         (obligations that cannot all hold, cited by id), `decision` (a \
-         choice they leave open, with the options), `access` (a secret or \
-         permission you lack), or `external` (waiting on something outside \
-         this node) — and a note saying what is left and how the user can \
-         unblock it. The size of a step, or existing code that does not fit \
-         an obligation, is not a reason: extend or replace that code. A \
-         missing credential or live service is not one by itself either: \
-         build and test against fixtures, and reach the real service through \
-         `secrets run` when it has the secret you need.\n\n\
+         left, and only by naming what the user must do: mark the step \
+         `partial` (with `--did`, what you built) or `blocked` (nothing was \
+         possible) with one of three reasons — `conflict` (obligations that \
+         cannot all hold, cited by id), `decision` (a choice they leave \
+         open, with the options), or `access` (a secret or permission you \
+         lack: `--needs` what the user must supply, `--tried` the command \
+         you ran and the error it gave) — and `--why`, why you cannot go on \
+         until they do. If you cannot name what the user must do, there is \
+         nothing to hand back: do the work. The size of a step, work left \
+         in one layer while the rest is done, or existing code that does not \
+         fit an obligation, is not a reason: write it, extend it, or replace \
+         it. A missing credential or live service is not one by itself \
+         either: build and test against fixtures, and reach the real service \
+         through `secrets run` when it has the secret you need.\n\n\
          Your reply, when you stop, is at most a sentence or two: nothing \
          when the plan is done, or what the user must do to unblock what you \
          left. No summary of what works, no list of steps, no test counts — \
@@ -345,9 +348,6 @@ pub fn handoff_answer_message(step: &PlanStep, answer: &HandoffAnswer) -> String
         (Some(HandoffReason::Decision { options }), HandoffAnswer::Choose(ix)) => {
             let choice = options.get(*ix).map(String::as_str).unwrap_or_default();
             format!("Plan step [{id}]: go with \"{choice}\". Carry on with the step.")
-        }
-        (Some(HandoffReason::External), _) => {
-            format!("Plan step [{id}]: what it was waiting on is in place now. Carry on with it.")
         }
         _ => format!("Plan step [{id}]: the access it needed is in place now. Carry on with it."),
     };
@@ -999,7 +999,10 @@ mod tests {
             let text = handoff_answer_message(&decision, &HandoffAnswer::Choose(1));
             assert!(text.contains("go with \"Linear-specific\""), "{text}");
 
-            let access = handed_back(HandoffReason::Access);
+            let access = handed_back(HandoffReason::Access {
+                needs: "the Linear API key".into(),
+                tried: "a request, which returned 401".into(),
+            });
             let text = handoff_answer_message(&access, &HandoffAnswer::Retry);
             assert!(
                 text.contains("the access it needed is in place now"),
@@ -1013,7 +1016,10 @@ mod tests {
                     step_id: step(fx, n),
                     status: status.to_string(),
                     note: Some("Needs the Linear API key".into()),
-                    reason: Some(HandoffReason::Access),
+                    reason: Some(HandoffReason::Access {
+                        needs: "the Linear API key".into(),
+                        tried: "a request, which returned 401".into(),
+                    }),
                 })
                 .unwrap();
         }

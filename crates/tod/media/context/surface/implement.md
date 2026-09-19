@@ -137,23 +137,27 @@ they can give, like a secret tod does not have — may be left undone. The size
 of a step, needing to run the app to check it, or a missing credential you can
 work around with fixtures never needs the user. When something does:
 
-- Mark the step `partial` if you did part of it, `blocked` if none of it was
-  possible, and give it a reason and a note (`--reason`, `--note`). The
-  reasons are a closed set, and the app offers the user a way to answer each:
+- Name what the user must do. That is the test: if you cannot say what the
+  user does to unblock the step, nothing needs them, and you do the work.
+- Mark the step `partial` if you did part of it (and say what, with
+  `--did`), `blocked` if none of it was possible, and give it a reason and
+  why (`--reason`, `--why`). The reasons are a closed set, and each names
+  what the app turns into the user's answer:
   - `conflict` — obligations that cannot all hold. Cite every one of them;
     the user decides which stands.
   - `decision` — a choice the obligations leave open that is not yours to
     make. List the options you see; the user picks one.
-  - `access` — a secret, account, or permission you do not have.
-  - `external` — waiting on something outside this node.
-- The note says what is left and exactly how the user can unblock it — what
-  to decide, what to add and where. The user acts on it, so make it complete
-  on its own.
+  - `access` — a secret, account, or permission you do not have. Say what
+    the user must supply (`--needs`) and the command you ran and the error it
+    gave (`--tried`). Something you have not tried is not something you lack.
+- `--why` is why you cannot go on until the user acts. The user reads it, so
+  make it complete on its own.
 - None of these is a reason: a step is large, you are not sure how to do it,
-  or code that already exists — including code you wrote earlier in this plan
-  — does not fit an obligation. Existing code is never a requirement: extend
-  it or replace it. A conflict is between obligations, never between an
-  obligation and the code.
+  the rest of the work is done and one layer is left (a UI over a finished
+  backend, say), or code that already exists — including code you wrote
+  earlier in this plan — does not fit an obligation. Existing code is never a
+  requirement: extend it or replace it. A conflict is between obligations,
+  never between an obligation and the code.
 - A step that is already `partial` or `blocked` when you get to it is yours to
   reconsider, not to leave alone. Read its reason and note: if what held it up
   no longer holds, or you can do more of it now, set it back to `in_progress`

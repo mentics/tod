@@ -42,8 +42,11 @@ pub fn needs_user(status: &str) -> bool {
 
 /// Why a `partial` or `blocked` step needs the user. A closed set on
 /// purpose: a step's size, not knowing how to do it, or existing code that
-/// does not fit are not reasons, since none of them needs the user. Stored as
-/// JSON in `node_plan_steps.reason`.
+/// does not fit are not reasons, since none of them needs the user. Each
+/// kind carries what the app turns into the user's answer (a cited
+/// obligation to keep, an option to choose, access to retry), so a hand-off
+/// with nothing for the user to do cannot be recorded. Stored as JSON in
+/// `node_plan_steps.reason`; a reason no longer in the set reads as none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandoffReason {
@@ -52,22 +55,26 @@ pub enum HandoffReason {
     /// A choice the obligations leave open that the agent should not make,
     /// with the options it sees.
     Decision { options: Vec<String> },
-    /// A secret, account, or permission the agent does not have.
-    Access,
-    /// Waiting on something outside this node.
-    External,
+    /// A secret, account, or permission the agent does not have: what the
+    /// user must supply, and the attempt that failed for want of it. Steps
+    /// handed back before these were recorded have both empty.
+    Access {
+        #[serde(default)]
+        needs: String,
+        #[serde(default)]
+        tried: String,
+    },
 }
 
 impl HandoffReason {
     /// Every kind, as `tod-cli plan update --reason` takes it.
-    pub const KINDS: [&'static str; 4] = ["conflict", "decision", "access", "external"];
+    pub const KINDS: [&'static str; 3] = ["conflict", "decision", "access"];
 
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Conflict { .. } => "conflict",
             Self::Decision { .. } => "decision",
-            Self::Access => "access",
-            Self::External => "external",
+            Self::Access { .. } => "access",
         }
     }
 
@@ -76,8 +83,7 @@ impl HandoffReason {
         match self {
             Self::Conflict { .. } => "Conflicting obligations",
             Self::Decision { .. } => "Needs your decision",
-            Self::Access => "Needs access",
-            Self::External => "Waiting on something outside this node",
+            Self::Access { .. } => "Needs access",
         }
     }
 
@@ -93,7 +99,8 @@ impl HandoffReason {
                     .join(", ")
             ),
             Self::Decision { options } => format!("decision: {}", options.join(" | ")),
-            Self::Access | Self::External => self.kind().to_string(),
+            Self::Access { needs, .. } if needs.is_empty() => self.kind().to_string(),
+            Self::Access { needs, .. } => format!("access: {needs}"),
         }
     }
 
@@ -114,8 +121,9 @@ pub struct PlanStep {
     pub ordinal: i32,
     pub body: String,
     pub status: String,
-    /// The step's current note: for `partial` or `blocked`, what is left and
-    /// how the user can unblock it; for `failed`, what verification found.
+    /// The step's current note: for `partial` or `blocked`, why the user has
+    /// to act and, for `partial`, what was done; for `failed`, what
+    /// verification found.
     /// Any status change replaces it. Every note it has had is kept in
     /// [`PlanStepRepo::list_notes`].
     pub note: Option<String>,

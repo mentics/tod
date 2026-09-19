@@ -275,7 +275,23 @@ impl ConversationView {
                     );
                 }
             }
-            Some(HandoffReason::Access | HandoffReason::External) => {
+            Some(HandoffReason::Access { needs, tried }) => {
+                if !needs.is_empty() {
+                    col = col.child(selectable_text(
+                        format!("plan-step-needs-{id}"),
+                        format!("Needs: {needs}"),
+                        window,
+                        cx,
+                    ));
+                }
+                if !tried.is_empty() {
+                    col = col.child(selectable_text(
+                        format!("plan-step-tried-{id}"),
+                        format!("Tried: {tried}"),
+                        window,
+                        cx,
+                    ));
+                }
                 col = col.child(h_flex().child(answer_button(
                     format!("plan-step-retry-{id}"),
                     "Retry",
