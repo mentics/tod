@@ -185,8 +185,10 @@ a criterion the app answers itself (`verifying-review.plan-steps-verified`,
 `tod_core::gate::derived`): every plan step `verified`, none `failed` or
 unchecked. While any step is `failed`, the lifecycle panel's Verification
 section says so and offers **Back to active**, which reverts the node to
-`active`; **Implement** then sends the agent back to the failed steps, and
-back in `verifying`, **Verify** checks the result (§4b).
+`active`. The conversation view's **Fix failed** does that and starts an
+implementation conversation in one press. The implementation agent is shown
+only the open steps (not `implemented` or `verified`), so it works the failed
+ones from their notes; back in `verifying`, **Verify** checks the result (§4b).
 
 ### 4.2 What the agent records, and what it says
 

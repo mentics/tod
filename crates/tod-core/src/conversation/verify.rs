@@ -17,7 +17,7 @@ use super::implement::{
 use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_verify_message};
 use crate::gate::PlanStepWithLinks;
-use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_lifecycle_doc};
+use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_working_doc};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tod_store::conversation::ProtocolKind;
@@ -87,7 +87,7 @@ impl Protocol for VerificationProtocol {
             })
             .unwrap_or_default();
         let manifest = ProcessManifest::load(&TodInstallPaths::discover()?)?;
-        let role_doc = state_lifecycle_doc(&manifest, VERIFYING)?;
+        let role_doc = state_working_doc(&manifest, VERIFYING)?;
         let working_dir = self.cwd(env)?;
         build_verify_message(
             env.media,

@@ -7,9 +7,9 @@
 //! input.
 //!
 //! Only the forward path is here. The manual escape hatches (force advance,
-//! revert, open interview) stay in the lifecycle panel — except "Back to
-//! active" once verification has failed steps, which is the step forward
-//! from there.
+//! revert, open interview) stay in the lifecycle panel — except "Fix failed"
+//! once verification has failed steps: it moves the node back to `active` and
+//! starts an implementation conversation, the step forward from there.
 
 use super::ConversationView;
 use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
@@ -17,7 +17,7 @@ use crate::views::lifecycle_control::{GateCheckState, implement_directory};
 use gpui::{App, Context, SharedString, Window};
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::conversation::review::review_recorded_done;
-use tod_core::task::model::next_lifecycle;
+use tod_core::task::model::{next_lifecycle, previous_lifecycle};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
@@ -31,7 +31,8 @@ const REVIEW: &str = "lifecycle:review";
 const FIX: &str = "lifecycle:fix";
 const GATE_CHECK: &str = "lifecycle:gate-check";
 const ADVANCE: &str = "lifecycle:advance";
-const BACK_TO_ACTIVE: &str = "lifecycle:back-to-active";
+const FIX_FAILED: &str = "lifecycle:fix-failed";
+const BACK: &str = "lifecycle:back";
 const WAIVE: &str = "lifecycle:waive:";
 
 /// Where the focused node stands, read with the rest of the view's data.
@@ -178,22 +179,15 @@ impl ConversationView {
                 let unchecked = snapshot.total() - snapshot.verified - snapshot.failed;
                 if snapshot.failed > 0 && unchecked == 0 {
                     // Failed steps are fixed in `active`, where implementation
-                    // works each one again from its note.
-                    let steps = if snapshot.failed == 1 {
-                        "step"
-                    } else {
-                        "steps"
-                    };
+                    // works each one again from its note: one press moves the
+                    // node there and starts that implementation.
                     actions.push(
                         PanelAction::new(
-                            BACK_TO_ACTIVE,
-                            if gate.revert_armed {
-                                "Confirm: back to active".to_string()
-                            } else {
-                                format!("Back to active ({} failed {steps})", snapshot.failed)
-                            },
+                            FIX_FAILED,
+                            format!("Fix failed ({})", snapshot.failed),
                         )
-                        .primary(true),
+                        .primary(true)
+                        .disabled(blocked),
                     );
                     gate_offered = false;
                 } else {
@@ -289,7 +283,33 @@ impl ConversationView {
             }
         }
 
-        if !gate.gate_status.is_empty() {
+        // One state back, whatever the state, for when a later stage shows the
+        // work is not where the node says it is; click again to go further.
+        let back_offered = !actions.iter().any(|a| a.id.as_ref() == FIX_FAILED);
+        if let Some(prev) = previous_lifecycle(&snapshot.lifecycle).filter(|_| back_offered) {
+            actions.push(PanelAction::new(
+                BACK,
+                if gate.revert_armed {
+                    format!("Confirm: back to {prev}")
+                } else {
+                    format!("Back to {prev}")
+                },
+            ));
+        }
+
+        // A gate check recorded earlier says nothing once the work has moved
+        // on: after a verification that failed steps, or a review with open
+        // findings, its "all criteria satisfied" would be wrong.
+        let unchecked = snapshot
+            .total()
+            .saturating_sub(snapshot.verified + snapshot.failed);
+        let gate_stale = !gate.in_flight()
+            && match snapshot.lifecycle.as_str() {
+                "verifying" => snapshot.failed > 0 || unchecked > 0,
+                "review" => snapshot.open_findings > 0 || !snapshot.review_done,
+                _ => false,
+            };
+        if !gate.gate_status.is_empty() && !gate_stale {
             let tone = if gate.in_flight() {
                 NoticeTone::Busy
             } else {
@@ -300,7 +320,11 @@ impl ConversationView {
         if let Some(error) = &gate.gate_error {
             notices.push(PanelNotice::new(NoticeTone::Error, error.clone()));
         }
-        for row in gate.criteria_detail.iter().filter(|r| r.is_failing()) {
+        for row in gate
+            .criteria_detail
+            .iter()
+            .filter(|r| r.is_failing() && !gate_stale)
+        {
             let text = match row.detail.as_deref().map(str::trim) {
                 Some(detail) if !detail.is_empty() => format!("✗ {}: {detail}", row.label),
                 _ => format!("✗ {}", row.label),
@@ -350,7 +374,14 @@ impl ConversationView {
             FIX => self.run_protocol(node, ProtocolKind::Fix, window, cx),
             GATE_CHECK => lifecycle.update(cx, |c, cx| c.run_gate_check(&task_id, cx)),
             ADVANCE => lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx)),
-            BACK_TO_ACTIVE => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
+            BACK => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
+            FIX_FAILED => {
+                if snapshot.blocked.is_none()
+                    && lifecycle.update(cx, |c, cx| c.revert_now(&task_id, cx))
+                {
+                    self.run_protocol(node, ProtocolKind::Implementation, window, cx);
+                }
+            }
             other => {
                 if let Some(criterion) = other
                     .strip_prefix(WAIVE)
