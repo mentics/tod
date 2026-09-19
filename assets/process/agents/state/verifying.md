@@ -6,6 +6,13 @@
 
 1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
+3. **Verify every plan step and record the verdict on the step itself**, through the `plan` noun — this is how verification's findings get back to implementation, so a finding that is only in your reply is lost:
+   - Check each step that is not already `verified` against what it says and every obligation it `--satisfies` (success criteria when present, otherwise the measurable statement), by running it.
+   - Passed: set it `verified`.
+   - Not done, done wrong, or not working: set it `failed` with a note. The note is what the implementation agent starts from on its next attempt, and the latest note is the only one it is shown, so make it complete on its own: what you checked, how (the command or steps), what happened, and what was expected. Name the obligation it falls short of.
+   - A requirement no plan step satisfies, and that is not met: add a plan step for it that `--satisfies` it, and set that step `failed` with a note the same way. Do not leave a failure recorded nowhere.
+   - A step already `verified` whose code changed since: check it again, and set it `failed` if it no longer holds.
+4. A step's earlier notes are its history (`plan show`). If a step has failed before, read them: a failure that repeats deserves a note that says so, and says what the earlier attempts missed.
 
 ## Responsibilities
 
@@ -21,13 +28,14 @@ Re-exercise in **running context** as needed for the full sweep (prefer automate
 
 ### Test strategy
 
-- **Narrow failures for iteration** — When a running-context / integration / E2E check fails: first rule out environment (wrong build, stale process, harness/focus, fixture paths). If it’s a product defect, **write or extend a focused unit (or narrow) test that fails for that cause, fix against that loop, then re-run the broader check once.** Do not use the slow UI/integration loop as the primary edit–run cycle.
+- **Rule out the environment first** — When a running-context / integration / E2E check fails: first rule out environment (wrong build, stale process, harness/focus, fixture paths) before calling it a product defect.
+- **Record defects, don't fix them here** — A product defect fails its plan step, with a note precise enough to reproduce it; implementation, back in `active`, makes the fix. Narrow it down as far as you can (the smallest input or command that shows it) so the note points straight at the cause.
 - **No bug hiding** — Do not weaken tests, guess constants, or special-case fixtures to pass.
 - **Evidence** — Pass/fail and how verification was run belong in notes; ship-with-code tests belong in the repo.
 
 ### Traceability
 
-Results must trace upstream through plan steps (`--satisfies` links, each step `verified`) and obligations, including design-phase ones.
+Results must trace upstream through plan steps (`--satisfies` links, each step `verified`) and obligations, including design-phase ones. A step's status is the record: `verified` or `failed` with its note, never only a line in your reply.
 
 ### Revalidate conformance
 
@@ -59,3 +67,5 @@ When the `verifying` → `review` gate passes (checklist included), return `forw
 ## Blockers
 
 Failed verification, untraceable results, or known functional defects → stay in `verifying` or move back to `active` for fixes; do not enter `review` hoping review will catch bugs.
+
+Any `failed` plan step blocks the gate. The fix is not made here: the user moves the node back to `active`, where implementation works every `failed` step again from its note, and entering `verifying` again runs this state's on-entry verification over the result.

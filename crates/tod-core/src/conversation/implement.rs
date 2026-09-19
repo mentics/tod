@@ -27,10 +27,10 @@ use tod_store::fleet::provision::resolve_launch_cwd;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
-use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
+    HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
 };
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use uuid::Uuid;
 
 /// One test run, as the agent records it with `tod-cli tests record`. The
@@ -245,6 +245,17 @@ fn continuation_message(open: &[&PlanStepWithLinks], tests: Option<&TestRun>) ->
                 "- {} ({}): {}\n",
                 linked.step.id, linked.step.status, linked.step.body
             ));
+            if let Some(note) = &linked.step.note {
+                out.push_str(&format!("  note: {note}\n"));
+            }
+        }
+        if open.iter().any(|linked| is_failure_note(&linked.step)) {
+            out.push_str(
+                "\nA step that failed verification was implemented once already \
+                 and did not hold up: its note says what verification found. \
+                 Fix what the note describes, check it the way the note says it \
+                 was checked, then mark the step `implemented`.\n",
+            );
         }
         out.push_str(
             "\nEvery plan step is part of the work. It is not yours to decide \
@@ -337,6 +348,29 @@ pub fn handoff_answer_message(step: &PlanStep, answer: &HandoffAnswer) -> String
     out
 }
 
+/// How a verification failure carried over from an earlier status reads.
+const FAILURE_PREFIX: &str = "failed verification: ";
+
+/// `step`'s note is a verification failure: it is `failed`, or its note was
+/// carried over from when it was.
+fn is_failure_note(step: &PlanStep) -> bool {
+    step.status == STATUS_FAILED
+        || step
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with(FAILURE_PREFIX))
+}
+
+/// The body of `step_id`'s latest note, when that note came with `failed`.
+fn latest_failure(fleet: &FleetStore, step_id: Uuid) -> Option<String> {
+    fleet
+        .read(|conn| Ok(PlanStepRepo::new(conn).list_notes(step_id)?))
+        .ok()?
+        .pop()
+        .filter(|note| note.status == STATUS_FAILED)
+        .map(|note| note.body)
+}
+
 /// A plan step the agent is done with.
 fn step_is_done(status: &str) -> bool {
     status == STATUS_IMPLEMENTED || status == STATUS_VERIFIED
@@ -382,12 +416,20 @@ fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
         .context("an implementation conversation without a node")
 }
 
+/// The node's plan steps, as the agent is shown them. An open step whose
+/// latest note is a verification failure keeps showing that note even once
+/// the agent has moved it on from `failed` — a status change clears the
+/// step's own note, but the failure is what the step is being fixed for.
 fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
     fleet
         .list_plan_steps_for_node(node_id)
         .unwrap_or_default()
         .into_iter()
-        .map(|step| {
+        .map(|mut step| {
+            if step.note.is_none() && step_is_open(&step.status) {
+                step.note = latest_failure(fleet, step.id)
+                    .map(|note| format!("{FAILURE_PREFIX}{note}"));
+            }
             let depends_on = fleet
                 .list_plan_step_dependencies(step.id)
                 .unwrap_or_default();
@@ -731,6 +773,48 @@ mod tests {
             hand_over(&fx, 1, STATUS_PARTIAL);
             hand_over(&fx, 2, STATUS_BLOCKED);
             assert!(matches!(decide(&fx, None, 0, true), Next::Done));
+        }
+
+        fn set(fx: &Fixture, n: usize, status: &str, note: Option<&str>) {
+            fx.fleet
+                .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                    step_id: step(fx, n),
+                    status: status.to_string(),
+                    note: note.map(str::to_string),
+                    reason: None,
+                })
+                .unwrap();
+            fx.fleet.writer().flush().unwrap();
+        }
+
+        /// A step that failed verification is open work again, sent back with
+        /// what verification found — and still with it once the agent has
+        /// moved the step on from `failed`, which clears the step's own note.
+        #[test]
+        fn a_failed_step_goes_back_with_its_failure() {
+            let fx = planned(2, 2);
+            set(&fx, 0, STATUS_FAILED, Some("Empty input panics"));
+            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+                panic!("a failed step should continue");
+            };
+            assert!(message.starts_with("1 plan step is still open"), "{message}");
+            assert!(message.contains("(failed): Step 0"), "{message}");
+            assert!(message.contains("note: Empty input panics"), "{message}");
+            assert!(message.contains("failed verification was implemented once"), "{message}");
+
+            set(&fx, 0, "in_progress", None);
+            let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+                panic!("an in-progress step should continue");
+            };
+            assert!(
+                message.contains("note: failed verification: Empty input panics"),
+                "{message}"
+            );
+
+            // Once implemented again, the old failure is no longer shown.
+            set(&fx, 0, STATUS_IMPLEMENTED, None);
+            let steps = plan_steps(&fx.fleet, fx.node);
+            assert_eq!(steps[0].step.note, None);
         }
 
         #[test]

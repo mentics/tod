@@ -21,6 +21,11 @@ pub const ACTION_INTERVIEW: &str = "interview";
 /// answers this one itself (`tod_core::gate::derived`); it never goes to an agent.
 pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-configured";
 
+/// `verifying` → `review`: every plan step is `verified`, none `failed` or
+/// unchecked. The app answers this one itself from the steps' statuses
+/// (`tod_core::gate::derived`); it never goes to an agent.
+pub const VERIFYING_REVIEW_PLAN_VERIFIED_SLUG: &str = "verifying-review.plan-steps-verified";
+
 /// `design` → `planning`: the one active criterion for that transition. Any obligation
 /// change on the node resets its evaluation to pending (a schema trigger).
 pub const BUILDABLE_CRITERION_SLUG: &str = "design-planning.buildable";

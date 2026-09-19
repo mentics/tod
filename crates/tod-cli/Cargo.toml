@@ -12,6 +12,7 @@ path = "src/main.rs"
 # agents, so startup cost matters.
 [dependencies]
 anyhow = "1.0"
+chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

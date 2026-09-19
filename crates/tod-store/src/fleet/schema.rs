@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 42;
+pub const CURRENT_USER_VERSION: i32 = 43;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -307,6 +307,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 42 {
         migrate_v41_to_v42(conn)?;
         conn.pragma_update(None, "user_version", 42)?;
+    }
+    if version < 43 {
+        migrate_v42_to_v43(conn)?;
+        conn.pragma_update(None, "user_version", 43)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -759,6 +763,80 @@ fn migrate_v41_to_v42(conn: &Connection) -> Result<()> {
     if !has_reason {
         conn.execute_batch("ALTER TABLE node_plan_steps ADD COLUMN reason TEXT;")?;
     }
+    Ok(())
+}
+
+/// Plan steps: the `failed` status (verification found the step not done)
+/// and `node_plan_step_notes`, every note a step has been given, oldest
+/// first. The step's own `note` stays its current one; the history is what
+/// shows a step that has failed, or been handed back, more than once.
+/// `status`'s CHECK has to grow, which means a table rebuild, as in v41.
+fn migrate_v42_to_v43(conn: &Connection) -> Result<()> {
+    let table_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'node_plan_steps'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_sql.contains("'failed'") {
+        let dependents: Vec<String> = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE tbl_name = 'node_plan_steps' AND type IN ('index', 'trigger')
+                   AND sql IS NOT NULL",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "
+            CREATE TABLE node_plan_steps_v43 (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                ordinal      INTEGER NOT NULL,
+                body         TEXT NOT NULL,
+                status       TEXT NOT NULL CHECK (status IN
+                                 ('pending','ready','in_progress','implemented','verified',
+                                  'failed','partial','blocked')),
+                note         TEXT,
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL,
+                reason       TEXT,
+                UNIQUE (node_id, ordinal)
+            );
+            INSERT INTO node_plan_steps_v43
+                (id, node_id, ordinal, body, status, note, created_at, updated_at, reason)
+            SELECT id, node_id, ordinal, body, status, note, created_at, updated_at, reason
+            FROM node_plan_steps;
+            DROP TABLE node_plan_steps;
+            ",
+        )?;
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch("ALTER TABLE node_plan_steps_v43 RENAME TO node_plan_steps;")?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        for sql in &dependents {
+            tx.execute_batch(sql)?;
+        }
+        tx.commit()?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS node_plan_step_notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id    BLOB NOT NULL REFERENCES node_plan_steps(id) ON DELETE CASCADE,
+            status     TEXT NOT NULL,
+            body       TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_node_plan_step_notes_step
+            ON node_plan_step_notes(step_id, id);
+        INSERT INTO node_plan_step_notes (step_id, status, body, created_at)
+        SELECT id, status, note, updated_at FROM node_plan_steps
+        WHERE note IS NOT NULL AND note != ''
+          AND NOT EXISTS (SELECT 1 FROM node_plan_step_notes n WHERE n.step_id = node_plan_steps.id);
+        ",
+    )?;
     Ok(())
 }
 
@@ -3985,6 +4063,24 @@ mod plan_step_migration_tests {
         assert_eq!(row, ("keep me".into(), "blocked".into(), None));
         conn.execute(
             "UPDATE node_plan_steps SET status = 'partial', note = 'needs a key' WHERE id = ?1",
+            params![uuid_to_blob(step_id)],
+        )
+        .unwrap();
+
+        // v43: `failed`, and the note history seeded from each step's note.
+        migrate_v42_to_v43(&conn).unwrap();
+        migrate_v42_to_v43(&conn).unwrap();
+        assert_eq!(dependents(&conn), before);
+        let history: Vec<(String, String)> = conn
+            .prepare("SELECT status, body FROM node_plan_step_notes WHERE step_id = ?1")
+            .unwrap()
+            .query_map(params![uuid_to_blob(step_id)], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(history, vec![("partial".into(), "needs a key".into())]);
+        conn.execute(
+            "UPDATE node_plan_steps SET status = 'failed' WHERE id = ?1",
             params![uuid_to_blob(step_id)],
         )
         .unwrap();

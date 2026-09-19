@@ -45,9 +45,9 @@ use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Window, actions, div,
-    px,
+    App, Context, Div, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, ParentElement, Render, Stateful, StatefulInteractiveElement, Styled, Window,
+    actions, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::spinner::Spinner;
@@ -70,6 +70,7 @@ use tod_store::fleet::{FleetStore, resolve_launch_cwd};
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::OutlineMutation;
 use tod_store::outline::repos::NodeRepo;
+use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
 use tod_store::outline::{
     GateCriterion, NodeGateEvaluation, OUTCOME_PASS, OUTCOME_WAIVED, SOURCE_AGENT, SOURCE_DERIVED,
     SOURCE_HUMAN,
@@ -665,6 +666,103 @@ impl LifecyclePanelView {
             cx,
         );
         cx.notify();
+    }
+
+    /// Run the `verifying` on-entry turn again: the agent re-checks every plan
+    /// step not yet `verified` and records `verified` or `failed` on each.
+    fn rerun_verification(&mut self, cx: &mut Context<Self>) {
+        if let Some(task_id) = self.task_id.clone() {
+            self.run_on_entry(&task_id, "verifying", cx);
+        }
+    }
+
+    /// The `verifying` section: how the plan steps stand against verification,
+    /// and — when any failed — the way back to implementation. Failed steps
+    /// are fixed in `active`, where implementation works each one again from
+    /// its note; they cannot be fixed from here.
+    fn render_verification(
+        &self,
+        mut body: Stateful<Div>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
+        let Some(node_id) = self
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        else {
+            return body;
+        };
+        let steps = self
+            .fleet
+            .list_plan_steps_for_node(node_id)
+            .unwrap_or_default();
+        let verified = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
+        let failed = steps.iter().filter(|s| s.status == STATUS_FAILED).count();
+        let on_entry_running = self
+            .current_state()
+            .is_some_and(|s| s.on_entry_run.is_some());
+        let revert_armed = self.current_state().is_some_and(|s| s.revert_armed);
+
+        body = body.child(div().text_xs().font_semibold().child("Verification"));
+        let mut summary = format!("{verified} of {} plan steps verified", steps.len());
+        if failed > 0 {
+            summary.push_str(&format!(", {failed} failed"));
+        }
+        body =
+            body.child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
+                        selectable_text(
+                            "lifecycle-panel-verification-summary",
+                            summary,
+                            window,
+                            cx,
+                        ),
+                    ))
+                    .child(
+                        Button::new("lifecycle-panel-rerun-verification")
+                            .label(if on_entry_running {
+                                "Verifying…"
+                            } else {
+                                "Verify again"
+                            })
+                            .ghost()
+                            .flex_shrink_0()
+                            .disabled(on_entry_running)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rerun_verification(cx);
+                            })),
+                    ),
+            );
+        if failed > 0 {
+            let steps_word = if failed == 1 { "step" } else { "steps" };
+            body = body
+                .child(div().text_xs().text_color(danger).child(format!(
+                    "{failed} plan {steps_word} failed verification. Move the node back to \
+                     active and implement again: each failed step goes back to the agent \
+                     with its note saying what to fix."
+                )))
+                .child(
+                    Button::new("lifecycle-panel-back-to-active")
+                        .label(if revert_armed {
+                            "Confirm: back to active".to_string()
+                        } else {
+                            format!("Back to active to fix {failed} failed {steps_word}")
+                        })
+                        .primary()
+                        .w_full()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.revert_lifecycle(cx);
+                        })),
+                );
+        }
+        body
     }
 
     pub fn is_open(&self) -> bool {
@@ -1617,6 +1715,10 @@ impl Render for LifecyclePanelView {
                         }
                     }
                 }
+            }
+
+            if self.lifecycle == "verifying" {
+                body = self.render_verification(body, window, cx);
             }
 
             // In `active`, the gate check only takes over once the plan is done.
