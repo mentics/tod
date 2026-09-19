@@ -722,9 +722,9 @@ impl LifecycleController {
     /// transition lands here. Idempotent by design (the prompt tells the
     /// agent to add only what's missing).
     fn run_on_entry(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
-        // Verification runs in its own conversation, from Verify, not as an
-        // on-entry turn.
-        if !state_has_agent(lifecycle) || lifecycle == "verifying" {
+        // Verification and review run in their own conversations, from Verify
+        // and Review, not as on-entry turns.
+        if !state_has_agent(lifecycle) || matches!(lifecycle, "verifying" | "review") {
             return;
         }
         if self

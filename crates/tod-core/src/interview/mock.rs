@@ -21,7 +21,7 @@ pub fn install_mock_interview_handler(data_root: PathBuf) {
 }
 
 fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> {
-    // An implementation or verification conversation carries its node and
+    // An implementation, verification, or review conversation carries its node and
     // conversation instead of a conversation actor: its writes are its own,
     // not a change set.
     use crate::conversation::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV};

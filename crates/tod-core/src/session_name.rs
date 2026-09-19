@@ -27,6 +27,9 @@ pub const IMPLEMENT_SURFACE: &str = "implement";
 /// The surface label a verification session is named with.
 pub const VERIFY_SURFACE: &str = "verify";
 
+/// The surface label a code review session is named with.
+pub const REVIEW_SURFACE: &str = "review";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see

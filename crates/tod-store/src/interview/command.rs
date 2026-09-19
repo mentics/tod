@@ -191,6 +191,21 @@ pub enum InterviewCommand {
     /// Store a report against the conversation's turn in progress,
     /// replacing any earlier one for that turn.
     RecordConversationReport { conversation_id: Uuid, body: Value },
+    /// Record an open code review finding on a node (`crate::review`).
+    AddReviewFinding {
+        node_id: Uuid,
+        /// The review conversation recording it.
+        #[serde(default)]
+        conversation_id: Option<Uuid>,
+        finding: crate::review::NewFinding,
+    },
+    /// Respond to a review finding: its status, and the fix or why not.
+    RespondReviewFinding {
+        finding_id: Uuid,
+        status: String,
+        #[serde(default)]
+        response: Option<String>,
+    },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -759,6 +774,23 @@ pub fn execute(
             let turn_seq = crate::conversation::ConversationRepo::new(conn)
                 .record_report(*conversation_id, body)?;
             Ok(json!({ "turn_seq": turn_seq }))
+        }
+        InterviewCommand::AddReviewFinding {
+            node_id,
+            conversation_id,
+            finding,
+        } => {
+            let finding =
+                crate::review::ReviewRepo::new(conn).add(*node_id, *conversation_id, finding)?;
+            Ok(json!({ "id": finding.id.to_string(), "seq": finding.seq }))
+        }
+        InterviewCommand::RespondReviewFinding {
+            finding_id,
+            status,
+            response,
+        } => {
+            crate::review::ReviewRepo::new(conn).respond(*finding_id, status, response.as_deref())?;
+            Ok(json!({}))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,

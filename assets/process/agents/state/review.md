@@ -4,6 +4,8 @@
 
 ## On entry
 
+The review runs as the node's review conversation, started from the lifecycle panel's **Review** button, not automatically on entry.
+
 1. Read lifecycle state, obligations (including design-phase) and plan steps, implementation, and verification evidence from `verifying`.
 2. Functional correctness should already be established—do not treat this state as primary QA.
 
@@ -11,7 +13,9 @@
 
 ### Independent code review
 
-Spawn a **clean subagent** not involved in building this node’s docs or implementation. Use a code-review skill when available.
+The review is done by an agent **not involved** in building this node's docs or implementation — the review conversation's agent is one. Use a code-review skill when available.
+
+Record every finding on the node through the `review` noun, one at a time, as it is found: that is how the user sees them, and how their responses are tracked. A finding that is only in a reply is lost.
 
 Track all findings until each has an explicit response:
 
@@ -33,15 +37,15 @@ Implement fixes or document responses. Re-verify when fixes touch behavior cover
 
 ## Forward gate rules (`review` → `approved`)
 
-Apply these prose rules (no DB checklist items for this transition):
+The app checks this gate itself from the node's data; no agent evaluates it:
 
-- Every review finding has an explicit response (fix with pointer to change/commit; out of scope; or not critical / beyond requirements / not worth the cost—small cheap extras may still be taken).
-- No outstanding **unaddressed** findings.
-- **Approval is always an external gate** (not waived in autonomous mode): some process outside this automation marks the change approved. On this team that is currently human review; the process only requires that the external gate fires.
+- The review conversation recorded the review finished.
+- No finding is still open: each has an explicit response (fixed, with a pointer to the change or commit; out of scope; or declined as not critical, beyond requirements, or not worth the cost — small cheap extras may still be taken).
+- **Approval is always an external gate** (not waived in autonomous mode): once both checks pass, the user advances the node. That is the external approval; do not advance it yourself.
 
 ## Exit
 
-When every finding is addressed and **external approval** is recorded, return `forward_lifecycle: approved`.
+The user advances the node to `approved` once every finding is answered; that is the external approval.
 
 ## Blockers
 

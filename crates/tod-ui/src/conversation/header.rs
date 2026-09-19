@@ -525,6 +525,7 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Outline => "outline",
         ProtocolKind::Implementation => "implementation",
         ProtocolKind::Verification => "verification",
+        ProtocolKind::Review => "review",
         ProtocolKind::Chat => "chat",
         ProtocolKind::VisualDesign => "visual design",
     }
@@ -536,6 +537,7 @@ fn new_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Outline => "New conversation",
         ProtocolKind::Implementation => "New implementation",
         ProtocolKind::Verification => "New verification",
+        ProtocolKind::Review => "New review",
         ProtocolKind::Chat => "New chat",
         ProtocolKind::VisualDesign => "New visual design",
     }

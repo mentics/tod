@@ -1,5 +1,5 @@
 //! The lifecycle buttons beside Send: whichever step moves the focused node
-//! along its lifecycle now — Implement, Verify, the gate check, Advance — so
+//! along its lifecycle now — Implement, Verify, Review, the gate check, Advance — so
 //! the user never has to go to the lifecycle panel to take it. The gate
 //! check's state lives in the shared [`LifecycleController`], so a check
 //! started here shows in the lifecycle panel too, and the other way round;
@@ -16,15 +16,18 @@ use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
 use crate::views::lifecycle_control::{GateCheckState, implement_directory};
 use gpui::{App, Context, SharedString, Window};
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
+use tod_core::conversation::review::review_recorded_done;
 use tod_core::task::model::next_lifecycle;
-use tod_store::conversation::{Focus, ProtocolKind};
+use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
 use tod_store::outline::types::Capability;
+use tod_store::review::ReviewRepo;
 use uuid::Uuid;
 
 const IMPLEMENT: &str = "lifecycle:implement";
 const VERIFY: &str = "lifecycle:verify";
+const REVIEW: &str = "lifecycle:review";
 const GATE_CHECK: &str = "lifecycle:gate-check";
 const ADVANCE: &str = "lifecycle:advance";
 const BACK_TO_ACTIVE: &str = "lifecycle:back-to-active";
@@ -38,7 +41,13 @@ pub(crate) struct LifecycleSnapshot {
     pub plan: PlanProgress,
     pub verified: usize,
     pub failed: usize,
-    /// Why implementation or verification cannot run here, when it cannot.
+    /// In `review`: whether the node has a review conversation, whether it
+    /// last reported the review done, and how many findings are still open.
+    pub review_started: bool,
+    pub review_done: bool,
+    pub open_findings: usize,
+    /// Why implementation, verification, or review cannot run here, when it
+    /// cannot.
     pub blocked: Option<String>,
 }
 
@@ -59,15 +68,37 @@ impl LifecycleSnapshot {
         let lifecycle = fleet.get_node(&task_id).ok()??.lifecycle;
         let steps = fleet.list_plan_steps_for_node(node).unwrap_or_default();
         let count = |status: &str| steps.iter().filter(|s| s.status == status).count();
-        // Implementation and verification both run in the node's worktree.
-        let blocked = matches!(lifecycle.as_str(), "active" | "verifying")
+        // Implementation, verification, and review all run in the node's
+        // worktree.
+        let blocked = matches!(lifecycle.as_str(), "active" | "verifying" | "review")
             .then(|| implement_directory(fleet, &task_id).err())
             .flatten();
+        let (review_started, review_done, open_findings) = if lifecycle == "review" {
+            fleet
+                .read(|conn| {
+                    let started = ConversationRepo::new(conn)
+                        .latest_for_focus_with_protocol(focus, ProtocolKind::Review)?
+                        .is_some();
+                    let done = review_recorded_done(conn, node)?;
+                    let open = ReviewRepo::new(conn)
+                        .list_for_node(node)?
+                        .iter()
+                        .filter(|f| f.is_open())
+                        .count();
+                    Ok((started, done, open))
+                })
+                .unwrap_or_default()
+        } else {
+            (false, false, 0)
+        };
         Some(Self {
             node,
             plan: plan_progress(fleet, node),
             verified: count(STATUS_VERIFIED),
             failed: count(STATUS_FAILED),
+            review_started,
+            review_done,
+            open_findings,
             lifecycle,
             blocked,
         })
@@ -181,6 +212,37 @@ impl ConversationView {
                 }
             }
             "verifying" if open_is(ProtocolKind::Verification) => gate_offered = false,
+            "review" if open_is(ProtocolKind::Review) => gate_offered = false,
+            "review" => {
+                actions.push(
+                    PanelAction::new(
+                        REVIEW,
+                        if snapshot.review_started {
+                            "Review again"
+                        } else {
+                            "Review"
+                        },
+                    )
+                    .primary(!snapshot.review_done)
+                    .disabled(blocked),
+                );
+                // Approval waits for a finished review with every finding
+                // answered — the gate's two app-checked criteria.
+                gate_offered &= snapshot.review_done && snapshot.open_findings == 0;
+                if snapshot.open_findings > 0 {
+                    let needs = if snapshot.open_findings == 1 {
+                        "1 review finding needs".to_string()
+                    } else {
+                        format!("{} review findings need", snapshot.open_findings)
+                    };
+                    notices.push(PanelNotice::new(
+                        NoticeTone::Error,
+                        format!(
+                            "{needs} an answer before approval: fixed, out of scope, or                              declined. Answer each from its status in the review                              conversation's findings pane."
+                        ),
+                    ));
+                }
+            }
             _ => {}
         }
         if blocked && !actions.is_empty() {
@@ -260,6 +322,7 @@ impl ConversationView {
         match id.as_ref() {
             IMPLEMENT => self.run_protocol(node, ProtocolKind::Implementation, window, cx),
             VERIFY => self.run_protocol(node, ProtocolKind::Verification, window, cx),
+            REVIEW => self.run_protocol(node, ProtocolKind::Review, window, cx),
             GATE_CHECK => lifecycle.update(cx, |c, cx| c.run_gate_check(&task_id, cx)),
             ADVANCE => lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx)),
             BACK_TO_ACTIVE => lifecycle.update(cx, |c, cx| c.revert(&task_id, cx)),
@@ -276,7 +339,7 @@ impl ConversationView {
     }
 
     /// Open `node`'s latest conversation running `protocol` and set it
-    /// going, as the lifecycle panel's Implement and Verify do.
+    /// going, as the lifecycle panel's Implement, Verify, and Review do.
     fn run_protocol(
         &mut self,
         node: Uuid,

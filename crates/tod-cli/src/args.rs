@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Flags that never take a value.
-const SWITCHES: &[&str] = &["--before", "--append", "--inherited"];
+const SWITCHES: &[&str] = &["--before", "--append", "--inherited", "--open"];
 
 #[derive(Default)]
 pub struct Args {

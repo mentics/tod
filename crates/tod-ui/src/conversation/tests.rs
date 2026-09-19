@@ -1581,6 +1581,94 @@ fn an_answer_that_is_not_sent_leaves_the_step_handed_back(cx: &mut TestAppContex
     assert_eq!(step.reason, Some(reason));
 }
 
+/// In `review`, the picker offers a review conversation; its pane lists the
+/// node's findings, and a finding's status is the user's answer to it,
+/// chosen from its dropdown.
+#[gpui::test]
+fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
+    use tod_store::review::{FINDING_DECLINED, FINDING_STATUSES, NewFinding, ReviewRepo};
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::SetLifecycle {
+            node_id: fixture.node_id,
+            state: "review".into(),
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    for summary in ["Empty input panics", "Unused import"] {
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_AGENT,
+                InterviewCommand::AddReviewFinding {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    finding: NewFinding {
+                        severity: "high".into(),
+                        file: Some("src/lib.rs".into()),
+                        line: Some(3),
+                        summary: summary.into(),
+                        detail: None,
+                    },
+                },
+            )
+            .unwrap();
+    }
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let review_ix = view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.data.new_kinds,
+            vec![ProtocolKind::Outline, ProtocolKind::Chat, ProtocolKind::Review]
+        );
+        view.data.conversations.len() + 2
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.choose_picker_entry(review_ix, window, cx);
+    });
+    draw(cx);
+    let second = view.read_with(cx, |view, cx| {
+        assert_eq!(view.data.protocol, ProtocolKind::Review);
+        let summaries: Vec<_> = view.data.findings.iter().map(|f| f.summary.as_str()).collect();
+        assert_eq!(summaries, ["Empty input panics", "Unused import"]);
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "Review the change.");
+        view.data.findings[1].id
+    });
+
+    // Down to the second finding; Enter opens its dropdown on `open`. (A new
+    // conversation starts editing its starter; leave that first.)
+    view.update_in(cx, |view, window, cx| {
+        view.exit_input_edit(window, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
+    });
+    draw(cx);
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationActivate);
+    view.read_with(cx, |v, _| {
+        let menu = v.status_menu.expect("Enter opens the dropdown");
+        assert_eq!(menu.step, second);
+        assert_eq!(menu.options, &FINDING_STATUSES);
+        assert_eq!(menu.highlighted, 0);
+    });
+    draw(cx);
+    for _ in 0..FINDING_STATUSES.len() {
+        cx.dispatch_action(ConversationDown);
+    }
+    cx.dispatch_action(ConversationActivate);
+    let status = fixture
+        .store
+        .read(|conn| Ok(ReviewRepo::new(conn).get(second)?.unwrap().status))
+        .unwrap();
+    assert_eq!(status, FINDING_DECLINED);
+    view.read_with(cx, |v, _| {
+        assert!(v.status_menu.is_none());
+        assert_eq!(v.data.findings[1].status, FINDING_DECLINED);
+    });
+}
+
 // ----- lifecycle controls ------------------------------------------------------
 
 fn set_lifecycle(fixture: &Fixture, state: &str) {
@@ -1717,5 +1805,40 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     assert_eq!(
         lifecycle_labels(&view, cx),
         vec![format!("Implement ({steps} of {steps} left)")]
+    );
+}
+
+/// In `review`, Review sits beside Send, and approval waits: no gate check is
+/// offered while the review is unfinished or a finding is still open.
+#[gpui::test]
+fn a_review_node_offers_review_and_holds_the_gate_for_open_findings(cx: &mut TestAppContext) {
+    use tod_store::review::NewFinding;
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    fixture
+        .store
+        .interview(
+            tod_store::interview::ACTOR_AGENT,
+            InterviewCommand::AddReviewFinding {
+                node_id: fixture.node_id,
+                conversation_id: None,
+                finding: NewFinding {
+                    severity: "low".into(),
+                    file: None,
+                    line: None,
+                    summary: "Unused import".into(),
+                    detail: None,
+                },
+            },
+        )
+        .unwrap();
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review"]);
+    assert!(
+        lifecycle_notices(&view, cx)
+            .iter()
+            .any(|n| n.text.contains("1 review finding needs an answer")),
+        "{:?}",
+        lifecycle_notices(&view, cx)
     );
 }

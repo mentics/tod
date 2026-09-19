@@ -73,13 +73,14 @@ impl TestRun {
     }
 }
 
-/// The node being implemented (or verified), passed to the agent's process so
-/// a tool that needs it does not have to parse the context back out.
+/// The node being implemented (or verified, or reviewed), passed to the
+/// agent's process so a tool that needs it does not have to parse the context
+/// back out.
 pub const IMPLEMENT_NODE_ENV: &str = "TOD_IMPLEMENT_NODE";
 
-/// The implementation (or verification) conversation, passed to the agent's
-/// process so `tod-cli tests record` knows which conversation the run belongs
-/// to.
+/// The implementation (or verification, or review) conversation, passed to
+/// the agent's process so `tod-cli tests record` and `tod-cli review` know
+/// which conversation they record for.
 pub const IMPLEMENT_CONVERSATION_ENV: &str = "TOD_IMPLEMENT_CONVERSATION";
 
 pub struct ImplementationProtocol;
