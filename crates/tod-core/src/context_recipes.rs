@@ -119,6 +119,29 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// A verification session: the same node, plan, and obligations as an
+/// implementation session, checked instead of built. The `verifying` state
+/// agent's role doc goes ahead of the dynamic blocks (see
+/// `agent_context::build_verify_message`); `surface/verify` scopes it to the
+/// verdicts and says how the reply works.
+pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
+    name: "verification session",
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/tests",
+        "cli/secrets",
+        "surface/verify",
+    ],
+    blocks: IMPLEMENT_SESSION.blocks,
+};
+
 /// A gate-check turn. Stance is `one-shot`: a single structured-response turn
 /// that must not end by asking a question. It loads no `cli/` fragments at all
 /// — it returns YAML and the app persists the result, so it never mutates
@@ -266,6 +289,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     CHAT,
     VISUAL_DESIGN_CHAT,
     IMPLEMENT_SESSION,
+    VERIFY_SESSION,
     GATE_CHECK,
     ON_ENTRY,
     FLEET_AUTONOMOUS,

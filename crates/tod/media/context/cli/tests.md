@@ -1,7 +1,7 @@
 ## `tod-cli tests`
 
 How the app learns whether the work's tests pass. It only exists inside an
-implementation conversation; outside one it fails.
+implementation or verification conversation; outside one it fails.
 
 ```
 tod-cli --data-root <DATA_ROOT> tests record --command <TEXT> --passed <N> [--failed <N>] [--errors <N>]

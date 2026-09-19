@@ -48,6 +48,23 @@ use uuid::Uuid;
 /// (see `driver::join`).
 const MESSAGE_HEADING: &str = "# Message\n\n";
 
+/// Plays whichever plan-working agent runs `conversation` — implementation or
+/// verification. Both are told their node and conversation the same way, so
+/// the conversation's own protocol says which one this is.
+pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> Result<String> {
+    let protocol = access.read(|conn| {
+        Ok(tod_store::conversation::ConversationRepo::new(conn)
+            .get(conversation_id)?
+            .map(|c| c.protocol))
+    })?;
+    match protocol {
+        Some(tod_store::conversation::ProtocolKind::Verification) => {
+            super::verify::mock_turn(access, node_id, conversation_id)
+        }
+        _ => super::implement::mock_turn(access, node_id, conversation_id),
+    }
+}
+
 /// How the mock reaches the data: through [`InterviewClient`] in the app, or
 /// an already-open store in tests.
 pub trait Access {

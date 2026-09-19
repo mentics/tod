@@ -73,12 +73,13 @@ impl TestRun {
     }
 }
 
-/// The node being implemented, passed to the agent's process so a tool that
-/// needs it does not have to parse the context back out.
+/// The node being implemented (or verified), passed to the agent's process so
+/// a tool that needs it does not have to parse the context back out.
 pub const IMPLEMENT_NODE_ENV: &str = "TOD_IMPLEMENT_NODE";
 
-/// The implementation conversation, passed to the agent's process so
-/// `tod-cli tests record` knows which conversation the run belongs to.
+/// The implementation (or verification) conversation, passed to the agent's
+/// process so `tod-cli tests record` knows which conversation the run belongs
+/// to.
 pub const IMPLEMENT_CONVERSATION_ENV: &str = "TOD_IMPLEMENT_CONVERSATION";
 
 pub struct ImplementationProtocol;
@@ -410,7 +411,7 @@ pub fn plan_progress(fleet: &FleetStore, node_id: Uuid) -> PlanProgress {
     }
 }
 
-fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
+pub(super) fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
     env.focus
         .node_id()
         .context("an implementation conversation without a node")
@@ -420,7 +421,7 @@ fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
 /// latest note is a verification failure keeps showing that note even once
 /// the agent has moved it on from `failed` — a status change clears the
 /// step's own note, but the failure is what the step is being fixed for.
-fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
+pub(super) fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
     fleet
         .list_plan_steps_for_node(node_id)
         .unwrap_or_default()

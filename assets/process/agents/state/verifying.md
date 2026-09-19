@@ -4,6 +4,8 @@
 
 ## On entry
 
+This runs as the node's verification conversation, started from the lifecycle panel's **Verify** button, not automatically on entry.
+
 1. Read lifecycle state, resolved obligations (including inherited and design-phase) and plan steps, implementation, and evidence from `active`.
 2. Ship-with-code tests should already exist from `active`.
 3. **Verify every plan step and record the verdict on the step itself**, through the `plan` noun — this is how verification's findings get back to implementation, so a finding that is only in your reply is lost:
@@ -68,4 +70,4 @@ When the `verifying` → `review` gate passes (checklist included), return `forw
 
 Failed verification, untraceable results, or known functional defects → stay in `verifying` or move back to `active` for fixes; do not enter `review` hoping review will catch bugs.
 
-Any `failed` plan step blocks the gate. The fix is not made here: the user moves the node back to `active`, where implementation works every `failed` step again from its note, and entering `verifying` again runs this state's on-entry verification over the result.
+Any `failed` plan step blocks the gate. The fix is not made here: the user moves the node back to `active`, where implementation works every `failed` step again from its note, and back in `verifying` the user's **Verify** runs this state's verification over the result.

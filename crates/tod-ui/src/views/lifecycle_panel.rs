@@ -109,6 +109,7 @@ pub enum LifecyclePanelEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
     Implement,
+    Verify,
     RunGateCheck,
     OpenInterview,
     ForceAdvance,
@@ -280,6 +281,9 @@ impl LifecyclePanelView {
             Some(ActiveControl::Implement { .. }) => stops.push(LifecyclePanelStop::Implement),
             Some(ActiveControl::NoPlan) => {}
             Some(ActiveControl::Complete { .. }) | None => {
+                if self.verification_offered() {
+                    stops.push(LifecyclePanelStop::Verify);
+                }
                 if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
                     stops.push(LifecyclePanelStop::RunGateCheck);
                 }
@@ -342,6 +346,7 @@ impl LifecyclePanelView {
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.focused_stop() {
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
+            Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
             Some(LifecyclePanelStop::RunGateCheck) => {
                 if let Some(next) = next_lifecycle(&self.lifecycle) {
                     self.run_gate_check(next, cx);
@@ -668,12 +673,52 @@ impl LifecyclePanelView {
         cx.notify();
     }
 
-    /// Run the `verifying` on-entry turn again: the agent re-checks every plan
-    /// step not yet `verified` and records `verified` or `failed` on each.
-    fn rerun_verification(&mut self, cx: &mut Context<Self>) {
-        if let Some(task_id) = self.task_id.clone() {
-            self.run_on_entry(&task_id, "verifying", cx);
+    /// Whether the Verification section's Verify button is shown: the node
+    /// is in `verifying` and has a plan to check.
+    fn verification_offered(&self) -> bool {
+        self.lifecycle_capable
+            && self.lifecycle == "verifying"
+            && self
+                .task_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                .is_some_and(|node| {
+                    !self
+                        .fleet
+                        .list_plan_steps_for_node(node)
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+    }
+
+    /// Open the node's latest verification conversation (or a new one) and
+    /// send it "Verify the plan.", as Implement does for implementation. The
+    /// conversation view runs it under the verification protocol: the agent
+    /// checks each plan step in the node's worktree and records `verified` or
+    /// `failed` on it, and the app keeps sending it back until every step has
+    /// a verdict. See `doc/conversation/protocols.md`.
+    fn launch_verification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if let Err(reason) = self.implement_directory() {
+            self.implement_status.insert(task_id, reason);
+            cx.notify();
+            return;
         }
+        let Ok(node_id) = uuid::Uuid::parse_str(&task_id) else {
+            return;
+        };
+        self.implement_status.remove(&task_id);
+        window.dispatch_action(
+            Box::new(OpenConversation {
+                focus: Focus::Node(node_id),
+                protocol: ProtocolKind::Verification,
+                start: true,
+            }),
+            cx,
+        );
+        cx.notify();
     }
 
     /// The `verifying` section: how the plan steps stand against verification,
@@ -687,7 +732,11 @@ impl LifecyclePanelView {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = cx.theme();
-        let (muted, danger) = (theme.muted_foreground, theme.danger);
+        let (muted, danger, list_active_border) = (
+            theme.muted_foreground,
+            theme.danger,
+            theme.list_active_border,
+        );
         let Some(node_id) = self
             .task_id
             .as_deref()
@@ -701,9 +750,13 @@ impl LifecyclePanelView {
             .unwrap_or_default();
         let verified = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
         let failed = steps.iter().filter(|s| s.status == STATUS_FAILED).count();
-        let on_entry_running = self
-            .current_state()
-            .is_some_and(|s| s.on_entry_run.is_some());
+        // "Verify" until every step has a verdict, then "Verify again".
+        let unchecked = steps.len() - verified - failed;
+        let status = self
+            .task_id
+            .as_ref()
+            .and_then(|id| self.implement_status.get(id))
+            .cloned();
         let revert_armed = self.current_state().is_some_and(|s| s.revert_armed);
 
         body = body.child(div().text_xs().font_semibold().child("Verification"));
@@ -711,35 +764,44 @@ impl LifecyclePanelView {
         if failed > 0 {
             summary.push_str(&format!(", {failed} failed"));
         }
-        body =
-            body.child(
-                h_flex()
+        body = body.child(div().text_xs().text_color(muted).child(selectable_text(
+            "lifecycle-panel-verification-summary",
+            summary,
+            window,
+            cx,
+        )));
+        if !steps.is_empty() {
+            body = body.child(
+                div()
                     .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
-                        selectable_text(
-                            "lifecycle-panel-verification-summary",
-                            summary,
-                            window,
-                            cx,
-                        ),
-                    ))
+                    .rounded_md()
+                    .when(self.is_focused(LifecyclePanelStop::Verify), |el| {
+                        el.border_1().border_color(list_active_border)
+                    })
                     .child(
-                        Button::new("lifecycle-panel-rerun-verification")
-                            .label(if on_entry_running {
-                                "Verifying…"
+                        Button::new("lifecycle-panel-verify")
+                            .label(if unchecked > 0 {
+                                "Verify"
                             } else {
                                 "Verify again"
                             })
-                            .ghost()
-                            .flex_shrink_0()
-                            .disabled(on_entry_running)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.rerun_verification(cx);
+                            .when(unchecked > 0, |b| b.primary())
+                            .when(unchecked == 0, |b| b.ghost())
+                            .w_full()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.launch_verification(window, cx);
                             })),
                     ),
             );
+        }
+        if let Some(status) = status {
+            body = body.child(div().text_xs().text_color(muted).child(selectable_text(
+                "lifecycle-panel-verify-status",
+                status,
+                window,
+                cx,
+            )));
+        }
         if failed > 0 {
             let steps_word = if failed == 1 { "step" } else { "steps" };
             body = body
@@ -1200,7 +1262,9 @@ impl LifecyclePanelView {
     /// title/repo rather than trusting `self.title` — a transition can land
     /// while a different node is selected in the panel (see `apply_gate_reply`).
     fn run_on_entry(&mut self, task_id: &str, lifecycle: &str, cx: &mut Context<Self>) {
-        if !state_has_agent(lifecycle) {
+        // Verification runs in its own conversation, from the Verify button
+        // (`launch_verification`), not as an on-entry turn.
+        if !state_has_agent(lifecycle) || lifecycle == "verifying" {
             return;
         }
         if self
