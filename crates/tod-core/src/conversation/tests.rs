@@ -91,15 +91,15 @@ impl AgentProvider for FakeAgent {
                     .find(|(k, _)| k == name)
                     .map(|(_, v)| v.clone())
             };
-            // An implementation turn carries its node and conversation, not
-            // a conversation actor.
+            // An implementation or verification turn carries its node and
+            // conversation, not a conversation actor.
             let implementing = env(IMPLEMENT_NODE_ENV).zip(env(IMPLEMENT_CONVERSATION_ENV));
             let client = Direct {
                 fleet: &self.fleet,
                 actor: env(ACTOR_ENV).unwrap_or_else(|| ACTOR_USER.to_string()),
             };
             let reply = match implementing {
-                Some((node, conversation)) => super::implement::mock_turn(
+                Some((node, conversation)) => super::mock::plan_turn(
                     &client,
                     node.parse().unwrap(),
                     conversation.parse().unwrap(),
@@ -873,6 +873,84 @@ fn an_implementation_loops_on_recorded_state_until_the_plan_is_done() {
         .and_then(|value| TestRun::from_report(&value))
         .expect("a recorded test run");
     assert!(run.green(), "{run:?}");
+}
+
+/// The verification loop end to end: the mock verifies one plan step a turn
+/// and records a test run, so a two-step plan takes one continuation, and
+/// every step ends `verified`.
+#[test]
+fn a_verification_loops_until_every_step_has_a_verdict() {
+    use tod_store::outline::repos::PlanStepRepo;
+    use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
+    let fx = fixture();
+    let workspace = fx.root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    fx.fleet
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fx.node,
+            capabilities: vec![tod_store::outline::Capability::Files],
+        })
+        .unwrap();
+    fx.fleet
+        .enqueue(tod_store::fleet::FleetMutation::UpdateTaskRepo {
+            id: fx.node.to_string(),
+            repo: Some(workspace.display().to_string()),
+        })
+        .unwrap();
+    for n in 0..2 {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: None,
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: format!("Step {n}"),
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+    let steps = || {
+        fx.fleet
+            .read(|conn| Ok(PlanStepRepo::new(conn).list_for_node(fx.node)?))
+            .unwrap()
+    };
+    for step in steps() {
+        fx.fleet
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: step.id,
+                status: STATUS_IMPLEMENTED.to_string(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+    }
+    fx.fleet.writer().flush().unwrap();
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Verification,
+    );
+    driver.send(&fx.fleet, &mut agent, "Verify the plan.").unwrap();
+    let id = driver.conversation_id().unwrap();
+    let opening = agent.last().prompt_blocks().join("
+");
+    assert!(opening.contains("verification session"), "{opening}");
+    assert!(opening.contains("Lifecycle state: verifying"), "{opening}");
+
+    assert_eq!(
+        driver.tick(&fx.fleet, &mut agent),
+        [ConversationEvent::Continued]
+    );
+    let continuation = agent.last().message.clone();
+    assert!(
+        continuation.starts_with("1 plan step has no verdict yet"),
+        "{continuation}"
+    );
+    assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);
+    assert!(steps().iter().all(|s| s.status == STATUS_VERIFIED));
+    assert_eq!(turns(&fx, id).len(), 4);
 }
 
 /// The session's id is stored as soon as the agent reports it, so a turn

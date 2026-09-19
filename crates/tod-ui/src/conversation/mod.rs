@@ -24,8 +24,9 @@ mod transcript;
 /// What the picker offers to start on `focus`. An outline conversation and a
 /// chat work anywhere; an implementation conversation needs a node that is
 /// `active` and has a plan to work through — the same conditions the lifecycle
-/// panel's Implement checks. Visual design is not offered until its protocol
-/// exists.
+/// panel's Implement checks — and a verification one a node that is
+/// `verifying` and has a plan to check. Visual design is not offered until its
+/// protocol exists.
 fn new_kinds(
     conn: &rusqlite::Connection,
     node: Option<Uuid>,
@@ -33,9 +34,12 @@ fn new_kinds(
 ) -> anyhow::Result<Vec<ProtocolKind>> {
     let mut kinds = vec![ProtocolKind::Outline, ProtocolKind::Chat];
     if let (Focus::Node(_), Some(node)) = (focus, node) {
-        let active = NodeRepo::new(conn).get_lifecycle(node)?.as_deref() == Some("active");
-        if active && !PlanStepRepo::new(conn).list_for_node(node)?.is_empty() {
-            kinds.push(ProtocolKind::Implementation);
+        let lifecycle = NodeRepo::new(conn).get_lifecycle(node)?;
+        let planned = !PlanStepRepo::new(conn).list_for_node(node)?.is_empty();
+        match lifecycle.as_deref() {
+            Some("active") if planned => kinds.push(ProtocolKind::Implementation),
+            Some("verifying") if planned => kinds.push(ProtocolKind::Verification),
+            _ => {}
         }
     }
     Ok(kinds)
@@ -487,8 +491,8 @@ impl ConversationView {
     }
 
     /// [`Self::open`], on the focus's most recent conversation running
-    /// `protocol` — for `Implementation`, the node's one implementation
-    /// conversation, reopened however many times it is launched.
+    /// `protocol` — for `Implementation` and `Verification`, the node's latest
+    /// one, reopened however many times it is launched.
     pub fn open_with(
         &mut self,
         focus: Focus,
@@ -540,6 +544,7 @@ impl ConversationView {
             self.cursor = None;
             self.side_cursor = None;
             self.status_menu = None;
+            self.side_files.clear();
             self.link = None;
             self.selected.clear();
             self.expanded.clear();
@@ -814,7 +819,7 @@ impl ConversationView {
             };
             // Only the protocols whose side pane shows them pay for these.
             let (plan, report) = match (protocol, selection.node, id) {
-                (ProtocolKind::Implementation, Some(node), id) => (
+                (protocol, Some(node), id) if protocol.works_the_plan() => (
                     PlanStepRepo::new(conn).list_for_node(node)?,
                     id.and_then(|id| repo.latest_report(id).ok().flatten()),
                 ),
@@ -1065,7 +1070,7 @@ impl ConversationView {
                 cx.notify();
             }
             Pane::Context => {}
-            Pane::ChangeSet if self.data.protocol == ProtocolKind::Implementation => {
+            Pane::ChangeSet if self.data.protocol.works_the_plan() => {
                 self.move_side_cursor(delta, cx);
             }
             Pane::ChangeSet => {
@@ -1115,7 +1120,7 @@ impl ConversationView {
                 }
             },
             Pane::Context => {}
-            Pane::ChangeSet if self.data.protocol == ProtocolKind::Implementation => {
+            Pane::ChangeSet if self.data.protocol.works_the_plan() => {
                 // A highlighted plan step's Enter opens its status dropdown.
                 if let Some(step) = self.side_cursor.and_then(|ix| self.data.plan.get(ix)) {
                     self.open_status_menu(step.id, cx);

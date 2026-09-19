@@ -524,6 +524,7 @@ fn kind_label(kind: ProtocolKind) -> &'static str {
     match kind {
         ProtocolKind::Outline => "outline",
         ProtocolKind::Implementation => "implementation",
+        ProtocolKind::Verification => "verification",
         ProtocolKind::Chat => "chat",
         ProtocolKind::VisualDesign => "visual design",
     }
@@ -534,6 +535,7 @@ fn new_label(kind: ProtocolKind) -> &'static str {
     match kind {
         ProtocolKind::Outline => "New conversation",
         ProtocolKind::Implementation => "New implementation",
+        ProtocolKind::Verification => "New verification",
         ProtocolKind::Chat => "New chat",
         ProtocolKind::VisualDesign => "New visual design",
     }

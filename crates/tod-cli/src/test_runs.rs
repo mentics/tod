@@ -1,7 +1,8 @@
-//! `tod-cli tests` — the test run an implementation agent records, which is
-//! how the app learns whether the work's tests pass.
+//! `tod-cli tests` — the test run an implementation or verification agent
+//! records, which is how the app learns whether the work's tests pass.
 //!
-//! Only meaningful inside an implementation conversation: the conversation is
+//! Only meaningful inside an implementation or verification conversation: the
+//! conversation is
 //! the one named by `TOD_IMPLEMENT_CONVERSATION`, which the app sets for the
 //! agent.
 
@@ -13,9 +14,10 @@ use tod_store::interview::InterviewCommand;
 use uuid::Uuid;
 
 pub(crate) const USAGE: &str = "\
-tod-cli tests — record a test run for this implementation
+tod-cli tests — record a test run for this implementation or verification
 
-Only works inside an implementation conversation (TOD_IMPLEMENT_CONVERSATION=<UUID>).
+Only works inside an implementation or verification conversation
+(TOD_IMPLEMENT_CONVERSATION=<UUID>).
 
 COMMANDS:
     record    --command <TEXT> --passed <N> [--failed <N>] [--errors <N>]
@@ -70,7 +72,7 @@ fn record(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 fn conversation(inv: &Invocation) -> anyhow::Result<Uuid> {
     let raw = std::env::var(IMPLEMENT_CONVERSATION_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "`tests` only works inside an implementation conversation: \
+            "`tests` only works inside an implementation or verification conversation: \
              {IMPLEMENT_CONVERSATION_ENV} is not set"
         )
     })?;

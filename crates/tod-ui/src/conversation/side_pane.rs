@@ -4,7 +4,8 @@
 //! differ. An outline conversation shows its reversible change set
 //! ([`super::change_set`]); an implementation conversation shows the plan it
 //! is working, the latest test run its agent recorded, and the files its
-//! worktree has changed. A plain chat has nothing to show.
+//! worktree has changed; a verification conversation shows the same plan with
+//! its verdicts, and the test run. A plain chat has nothing to show.
 //!
 //! Spec: `doc/conversation/protocols.md` §4.5.
 
@@ -346,7 +347,9 @@ impl ConversationView {
             // A chat's outline writes are recorded like an outline
             // conversation's, so it has a change set too.
             ProtocolKind::Outline | ProtocolKind::Chat => self.render_change_set(window, cx),
-            ProtocolKind::Implementation => self.render_implementation_pane(window, cx),
+            ProtocolKind::Implementation | ProtocolKind::Verification => {
+                self.render_plan_pane(window, cx)
+            }
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => self.render_empty_pane(
@@ -356,12 +359,12 @@ impl ConversationView {
         }
     }
 
-    /// Rows Up/Down move among in the implementation pane.
+    /// Rows Up/Down move among in the plan pane.
     fn side_row_count(&self) -> usize {
         self.data.plan.len() + self.side_files.len()
     }
 
-    /// Move the implementation pane's highlight; entering an unhighlighted
+    /// Move the plan pane's highlight; entering an unhighlighted
     /// pane lands on its first row.
     pub(super) fn move_side_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.side_row_count();
@@ -380,8 +383,10 @@ impl ConversationView {
     }
 
     /// Plan steps first — the same state the protocol's done-check reads — then
-    /// the worktree's changed files.
-    fn render_implementation_pane(
+    /// the worktree's changed files. Verification shows the same rows, counted
+    /// by verdict; the steps it fails go back to implementation, not to the
+    /// user, so it offers no answers to a step left for the user.
+    fn render_plan_pane(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -409,6 +414,13 @@ impl ConversationView {
             .plan
             .iter()
             .filter(|step| step.status == STATUS_FAILED)
+            .count();
+        let verifying = self.data.protocol == ProtocolKind::Verification;
+        let verified = self
+            .data
+            .plan
+            .iter()
+            .filter(|step| step.status == STATUS_VERIFIED)
             .count();
         let count = self.side_row_count();
         let cursor = self.side_cursor.filter(|ix| *ix < count);
@@ -443,9 +455,12 @@ impl ConversationView {
         for (n, step) in steps.into_iter().enumerate() {
             let id = step.id;
             let badge = self.render_status_badge(id, &step.status, cx);
-            let handoff = self
-                .render_handoff(&step, window, cx)
-                .or_else(|| self.render_failure(&step, window, cx));
+            let handoff = if verifying {
+                self.render_failure(&step, window, cx)
+            } else {
+                self.render_handoff(&step, window, cx)
+                    .or_else(|| self.render_failure(&step, window, cx))
+            };
             rows.push(
                 h_flex()
                     .when(lit(n), style::highlighted)
@@ -518,14 +533,21 @@ impl ConversationView {
                             style::text_muted(div())
                         }
                         .flex_shrink_0()
-                        .child("Implementation"),
+                        .child(if verifying { "Verification" } else { "Implementation" }),
                     )
                     .child(style::text_dense_muted(div()).child({
-                        let mut summary = format!("{done}/{total} steps");
+                        let mut summary = if verifying {
+                            format!("{verified}/{total} verified")
+                        } else {
+                            format!("{done}/{total} steps")
+                        };
                         if failed > 0 {
-                            summary.push_str(&format!(", {failed} failed verification"));
+                            summary.push_str(&format!(", {failed} failed"));
+                            if !verifying {
+                                summary.push_str(" verification");
+                            }
                         }
-                        if waiting > 0 {
+                        if waiting > 0 && !verifying {
                             summary.push_str(&format!(", {waiting} need you"));
                         }
                         summary
@@ -547,7 +569,7 @@ impl ConversationView {
             )
             .child(
                 v_flex()
-                    .id("implementation-pane")
+                    .id("plan-pane")
                     .track_scroll(&self.side_scroll)
                     .flex_1()
                     .min_h_0()

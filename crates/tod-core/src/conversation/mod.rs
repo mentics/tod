@@ -13,6 +13,7 @@ pub mod driver;
 pub mod implement;
 pub mod mock;
 pub mod protocol;
+pub mod verify;
 
 #[cfg(test)]
 mod tests;

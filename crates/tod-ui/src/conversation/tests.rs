@@ -1334,6 +1334,44 @@ fn the_picker_offers_implementation_only_on_an_active_planned_node(cx: &mut Test
     });
 }
 
+/// In `verifying`, the picker offers a verification conversation instead of
+/// an implementation one; it shows the plan and starts with its own starter.
+#[gpui::test]
+fn the_picker_offers_verification_on_a_verifying_planned_node(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::SetLifecycle {
+            node_id: fixture.node_id,
+            state: "verifying".into(),
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let verification_ix = view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.data.new_kinds,
+            vec![
+                ProtocolKind::Outline,
+                ProtocolKind::Chat,
+                ProtocolKind::Verification
+            ]
+        );
+        view.data.conversations.len() + 2
+    });
+    view.update_in(cx, |view, window, cx| {
+        view.choose_picker_entry(verification_ix, window, cx)
+    });
+    draw(cx);
+    view.read_with(cx, |view, cx| {
+        assert_eq!(view.data.protocol, ProtocolKind::Verification);
+        assert_eq!(view.data.plan.len(), fixture.steps.len());
+        let input = view.transcript.read(cx).input().read(cx).value();
+        assert_eq!(input.as_ref(), "Verify the plan.");
+    });
+}
+
 #[gpui::test]
 fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
     let fixture = Fixture::new();

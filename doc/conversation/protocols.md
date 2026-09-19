@@ -65,17 +65,19 @@ whole design.
 Registered the way `tod_core::context_recipes::ALL_RECIPES` already registers
 context recipes — one list, one place, tests over it.
 
-### 2.2 The four protocols in scope
+### 2.2 The protocols in scope
 
 | Protocol | Launched from | cwd | Mutates outline | Side pane | Loops |
 |---|---|---|---|---|---|
 | `outline` | Ctrl+J, app nav, `proposed`/`design` nodes | scratch | yes, recorded | change set | no |
 | `implementation` | Active-phase **Implement** | node worktree | no | plan steps + changed files | yes |
+| `verification` | Verifying-phase **Verify** | node worktree | no | plan steps with verdicts | yes |
 | `chat` | action panel's **Chat**, the picker | node's directory, else scratch | yes, recorded | change set | no |
 | `visual_design` | design panel | scratch | yes (1 command) | designer | no |
 
-`outline` is today's behavior, unchanged. The other three replace the
-interactive agent window, which is deleted.
+`outline` is today's behavior, unchanged. Implementation, chat, and visual
+design replace the interactive agent window, which is deleted; verification
+replaces the `verifying` on-entry turn (§4b).
 
 ## 3. Data model
 
@@ -182,9 +184,7 @@ a criterion the app answers itself (`verifying-review.plan-steps-verified`,
 unchecked. While any step is `failed`, the lifecycle panel's Verification
 section says so and offers **Back to active**, which reverts the node to
 `active`; **Implement** then sends the agent back to the failed steps, and
-advancing to `verifying` again runs the on-entry verification over the
-result. **Verify again** reruns that on-entry turn without leaving
-`verifying`.
+back in `verifying`, **Verify** checks the result (§4b).
 
 ### 4.2 What the agent records, and what it says
 
@@ -308,6 +308,35 @@ note along) and, once it has gone out, sets the step back to `in_progress`
 as the user's edit, which starts the loop again. A step handed back before
 reasons existed shows its note alone; the message input answers it.
 
+## 4b. The verification protocol
+
+The mirror of implementation, checking the plan instead of building it
+(`tod_core::conversation::verify`). It replaces the `verifying` on-entry
+turn, whose reply was a wall of narration in the lifecycle panel: entering
+`verifying` no longer runs an agent by itself.
+
+- **Launch.** The lifecycle panel's Verification section shows **Verify**
+  while any plan step has no verdict and **Verify again** once every step
+  has one. Either opens the node's most recent verification conversation (or
+  a new one) and sends the starter, "Verify the plan." The picker offers
+  "New verification" on a `verifying` node with plan steps.
+- **Context.** Implementation's blocks (worktree, node, plan, obligations,
+  ancestors) under the `VERIFY_SESSION` recipe, with the `verifying` state
+  agent's role doc — whose "On entry" section is how verification is done —
+  and `surface/verify`, which scopes it to verdicts (no gate evaluation) and
+  sets the reply rule.
+- **What the agent records.** A verdict on every step through `tod-cli
+  plan`: `verified`, or `failed` with a note implementation can start from;
+  and a test run through `tod-cli tests record`, as implementation does
+  (same environment variables). The reply is empty or a sentence or two.
+- **Done.** Every plan step `verified` or `failed`, and a test run recorded
+  this turn, red or green. Otherwise the loop sends the steps still without
+  a verdict back, capped and stopped by a turn that changed no status or
+  note, like §4.4.
+- **Side pane.** The plan pane (§4.5), titled "Verification" and counted by
+  verdict ("3/5 verified, 1 failed"), with each failed step's note. A step
+  left for the user offers no answers here: that is implementation's.
+
 ## 5. View changes
 
 - `Pane::ChangeSet` becomes `Pane::Side`; the pane's content comes from the
@@ -320,11 +349,12 @@ reasons existed shows its note alone; the message input answers it.
 - The picker lists all of a focus's conversations regardless of protocol,
   badged by kind, followed by one "New …" entry per kind the focus can start:
   a conversation and a chat anywhere, an implementation only on an `active`
-  node with plan steps. Ctrl+N starts another of the kind that is open.
+  node with plan steps, a verification only on a `verifying` one. Ctrl+N starts another of the kind that is open.
   *Done.* So a node can have several implementation conversations; Implement
   reopens the most recent.
 - A protocol may name a **starter** message (`Protocol::starter`;
-  implementation's is "Implement the plan."). A new conversation from the
+  implementation's is "Implement the plan.", verification's "Verify the
+  plan."). A new conversation from the
   picker or Ctrl+N puts it in the input, unsent, to edit or send as is. The
   lifecycle panel's Implement sends it on arrival (`OpenConversation::start`),
   since the click already says what the user wants — unless the agent is

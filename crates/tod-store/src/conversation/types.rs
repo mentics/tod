@@ -123,10 +123,19 @@ str_enum!(
     ProtocolKind {
         Outline => "outline",
         Implementation => "implementation",
+        Verification => "verification",
         Chat => "chat",
         VisualDesign => "visual_design",
     }
 );
+
+impl ProtocolKind {
+    /// Whether this kind works through a node's plan steps — its side pane is
+    /// the plan, and its agent records what it did on the steps themselves.
+    pub fn works_the_plan(self) -> bool {
+        matches!(self, ProtocolKind::Implementation | ProtocolKind::Verification)
+    }
+}
 
 impl Default for ProtocolKind {
     fn default() -> Self {

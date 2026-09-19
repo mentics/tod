@@ -133,6 +133,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
     match kind {
         ProtocolKind::Outline => &OutlineProtocol,
         ProtocolKind::Implementation => &super::implement::ImplementationProtocol,
+        ProtocolKind::Verification => &super::verify::VerificationProtocol,
         ProtocolKind::Chat => &ChatProtocol,
         // Until the visual designer has its own protocol and side pane, a
         // visual-design conversation behaves as a plain chat.
@@ -285,6 +286,7 @@ mod tests {
         for kind in [
             ProtocolKind::Outline,
             ProtocolKind::Implementation,
+            ProtocolKind::Verification,
             ProtocolKind::Chat,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");
@@ -303,12 +305,13 @@ mod tests {
         assert!(CHAT.layers.contains(&"surface/chat"));
     }
 
-    /// Chat and implementation loop differently: only implementation sends a
-    /// turn the user did not ask for.
+    /// Only the protocols that work a plan send a turn the user did not ask
+    /// for.
     #[test]
-    fn only_the_implementation_protocol_loops() {
+    fn only_the_plan_protocols_loop() {
         assert!(!OutlineProtocol.loops());
         assert!(!ChatProtocol.loops());
         assert!(super::super::implement::ImplementationProtocol.loops());
+        assert!(super::super::verify::VerificationProtocol.loops());
     }
 }
