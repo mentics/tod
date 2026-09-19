@@ -164,6 +164,40 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     blocks: IMPLEMENT_SESSION.blocks,
 };
 
+/// A fix session: an agent resolving a node's open review findings in its
+/// worktree — fixing each, or rejecting it with a note saying why it is not a
+/// problem. It gets what an implementation session gets, plus the open
+/// findings; `surface/fix` says which statuses are its to give and how the
+/// reply works.
+pub const FIX_SESSION: ContextRecipe = ContextRecipe {
+    name: "review fix session",
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/review",
+        "cli/tests",
+        "cli/secrets",
+        "surface/fix",
+    ],
+    blocks: &[
+        DynamicBlock::WorkingDirectory,
+        DynamicBlock::DataRoot,
+        DynamicBlock::Node,
+        DynamicBlock::ReviewFindings,
+        DynamicBlock::Plan,
+        DynamicBlock::NodeObligations {
+            note: OWN_OBLIGATIONS_NOTE,
+        },
+        DynamicBlock::AncestorContext,
+    ],
+};
+
 /// A gate-check turn. Stance is `one-shot`: a single structured-response turn
 /// that must not end by asking a question. It loads no `cli/` fragments at all
 /// — it returns YAML and the app persists the result, so it never mutates
@@ -313,6 +347,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
     REVIEW_SESSION,
+    FIX_SESSION,
     GATE_CHECK,
     ON_ENTRY,
     FLEET_AUTONOMOUS,

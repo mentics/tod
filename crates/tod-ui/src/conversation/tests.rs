@@ -1586,7 +1586,7 @@ fn an_answer_that_is_not_sent_leaves_the_step_handed_back(cx: &mut TestAppContex
 /// chosen from its dropdown.
 #[gpui::test]
 fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
-    use tod_store::review::{FINDING_DECLINED, FINDING_STATUSES, NewFinding, ReviewRepo};
+    use tod_store::review::{FINDING_DECLINED, NewFinding, ReviewRepo, USER_FINDING_STATUSES};
     let fixture = Fixture::new();
     let node = Focus::Node(fixture.node_id);
     fixture
@@ -1620,7 +1620,12 @@ fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
     let review_ix = view.read_with(cx, |view, _| {
         assert_eq!(
             view.data.new_kinds,
-            vec![ProtocolKind::Outline, ProtocolKind::Chat, ProtocolKind::Review]
+            vec![
+                ProtocolKind::Outline,
+                ProtocolKind::Chat,
+                ProtocolKind::Review,
+                ProtocolKind::Fix
+            ]
         );
         view.data.conversations.len() + 2
     });
@@ -1650,11 +1655,11 @@ fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
     view.read_with(cx, |v, _| {
         let menu = v.status_menu.expect("Enter opens the dropdown");
         assert_eq!(menu.step, second);
-        assert_eq!(menu.options, &FINDING_STATUSES);
+        assert_eq!(menu.options, &USER_FINDING_STATUSES);
         assert_eq!(menu.highlighted, 0);
     });
     draw(cx);
-    for _ in 0..FINDING_STATUSES.len() {
+    for _ in 0..USER_FINDING_STATUSES.len() {
         cx.dispatch_action(ConversationDown);
     }
     cx.dispatch_action(ConversationActivate);
@@ -1880,12 +1885,156 @@ fn a_review_node_offers_review_and_holds_the_gate_for_open_findings(cx: &mut Tes
         )
         .unwrap();
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
-    assert_eq!(lifecycle_labels(&view, cx), vec!["Review"]);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)"]);
     assert!(
         lifecycle_notices(&view, cx)
             .iter()
             .any(|n| n.text.contains("1 review finding needs an answer")),
         "{:?}",
         lifecycle_notices(&view, cx)
+    );
+}
+
+/// A lifecycle run never reopens an earlier conversation: each gets a fresh
+/// agent, so the last run's context cannot skew it. Opening one still does.
+#[gpui::test]
+fn every_lifecycle_run_starts_a_new_conversation(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    let node = Focus::Node(fixture.node_id);
+    let mut earlier = Vec::new();
+    for protocol in [ProtocolKind::Review, ProtocolKind::Fix] {
+        let id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id,
+                    protocol,
+                    focus: node,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        earlier.push((protocol, id));
+    }
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    for (protocol, id) in earlier {
+        view.update_in(cx, |view, window, cx| {
+            view.open_with(node, protocol, false, window, cx)
+        });
+        assert_eq!(view.read_with(cx, |v, _| v.conversation_id()), Some(id));
+
+        view.update_in(cx, |view, window, cx| view.run(node, protocol, window, cx));
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            assert_ne!(v.conversation_id(), Some(id), "{protocol:?} reopened");
+            assert_eq!(v.protocol, protocol);
+        });
+    }
+}
+
+/// With findings open, Fix sits beside Review. A fix conversation's pane
+/// lists the same findings under a status filter, and a rejection shows its
+/// note.
+#[gpui::test]
+fn a_fix_conversation_lists_the_findings_under_a_status_filter(cx: &mut TestAppContext) {
+    use tod_store::review::{
+        FINDING_OPEN, FINDING_REJECTED, FINDING_STATUSES, NewFinding, ReviewRepo,
+        USER_FINDING_STATUSES,
+    };
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    let mut ids = Vec::new();
+    for summary in ["Empty input panics", "Unused import"] {
+        let result = fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_AGENT,
+                InterviewCommand::AddReviewFinding {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    finding: NewFinding {
+                        severity: "medium".into(),
+                        file: Some("src/lib.rs".into()),
+                        line: Some(3),
+                        summary: summary.into(),
+                        detail: None,
+                    },
+                },
+            )
+            .unwrap();
+        ids.push(Uuid::parse_str(result["id"].as_str().unwrap()).unwrap());
+    }
+    fixture
+        .store
+        .interview(
+            tod_store::interview::ACTOR_AGENT,
+            InterviewCommand::RespondReviewFinding {
+                finding_id: ids[1],
+                status: FINDING_REJECTED.into(),
+                response: Some("The import is used behind a feature flag.".into()),
+            },
+        )
+        .unwrap();
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)"]);
+
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Fix, false, window, cx);
+        view.exit_input_edit(window, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
+    });
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.data.protocol, ProtocolKind::Fix);
+        assert_eq!(v.data.findings.len(), 2);
+    });
+
+    // Only the rejected one; Enter on it opens its dropdown.
+    view.update(cx, |v, cx| v.toggle_status_filter(FINDING_REJECTED, cx));
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        let shown: Vec<_> = v.shown_findings().iter().map(|f| f.id).collect();
+        assert_eq!(shown, vec![ids[1]]);
+    });
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationActivate);
+    // A rejected finding's menu keeps `rejected`, highlighted; an open one's
+    // leaves it out, since the menu cannot give the note it needs.
+    view.read_with(cx, |v, _| {
+        let menu = v.status_menu.expect("Enter opens the dropdown");
+        assert_eq!(menu.step, ids[1]);
+        assert_eq!(menu.options, &FINDING_STATUSES);
+        assert_eq!(menu.options[menu.highlighted], FINDING_REJECTED);
+    });
+    cx.dispatch_action(ConversationEscape);
+    view.update(cx, |v, cx| v.open_status_menu(ids[0], cx));
+    view.read_with(cx, |v, _| {
+        assert_eq!(v.status_menu.unwrap().options, &USER_FINDING_STATUSES);
+    });
+    cx.dispatch_action(ConversationEscape);
+
+    // Open and rejected together show both; All clears the filter.
+    view.update(cx, |v, cx| v.toggle_status_filter(FINDING_OPEN, cx));
+    assert_eq!(view.read_with(cx, |v, _| v.shown_findings().len()), 2);
+    view.update(cx, |v, cx| {
+        v.toggle_status_filter(FINDING_OPEN, cx);
+        v.toggle_status_filter(FINDING_REJECTED, cx);
+    });
+    draw(cx);
+    assert_eq!(view.read_with(cx, |v, _| v.shown_findings().len()), 2);
+    let response = fixture
+        .store
+        .read(|conn| Ok(ReviewRepo::new(conn).get(ids[1])?.unwrap().response))
+        .unwrap();
+    assert_eq!(
+        response.as_deref(),
+        Some("The import is used behind a feature flag.")
     );
 }

@@ -49,7 +49,7 @@ use uuid::Uuid;
 const MESSAGE_HEADING: &str = "# Message\n\n";
 
 /// Plays whichever node-working agent runs `conversation` — implementation,
-/// verification, or review. Each is told its node and conversation the same
+/// verification, review, or fix. Each is told its node and conversation the same
 /// way, so the conversation's own protocol says which one this is.
 pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> Result<String> {
     let protocol = access.read(|conn| {
@@ -63,6 +63,9 @@ pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> 
         }
         Some(tod_store::conversation::ProtocolKind::Review) => {
             super::review::mock_turn(access, node_id, conversation_id)
+        }
+        Some(tod_store::conversation::ProtocolKind::Fix) => {
+            super::fix::mock_turn(access, node_id, conversation_id)
         }
         _ => super::implement::mock_turn(access, node_id, conversation_id),
     }

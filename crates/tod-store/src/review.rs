@@ -20,14 +20,31 @@ pub const FINDING_FIXED: &str = "fixed";
 pub const FINDING_OUT_OF_SCOPE: &str = "out_of_scope";
 /// Not critical, beyond the requirements, or not worth the cost.
 pub const FINDING_DECLINED: &str = "declined";
+/// Not a defect after all: the fix agent's pushback, with a note saying why.
+pub const FINDING_REJECTED: &str = "rejected";
 
 /// Every finding status, in the order a status menu lists them.
-pub const FINDING_STATUSES: [&str; 4] = [
+pub const FINDING_STATUSES: [&str; 5] = [
+    FINDING_OPEN,
+    FINDING_FIXED,
+    FINDING_OUT_OF_SCOPE,
+    FINDING_DECLINED,
+    FINDING_REJECTED,
+];
+
+/// The statuses the user answers a finding with from its menu. `rejected` is
+/// the fix agent's, and needs a note the menu cannot give; a finding already
+/// rejected keeps it in its menu.
+pub const USER_FINDING_STATUSES: [&str; 4] = [
     FINDING_OPEN,
     FINDING_FIXED,
     FINDING_OUT_OF_SCOPE,
     FINDING_DECLINED,
 ];
+
+/// The statuses a fix conversation's agent may give a finding: it fixes it,
+/// or pushes back with a note. Out of scope and declined are the user's call.
+pub const FIX_AGENT_STATUSES: [&str; 2] = [FINDING_FIXED, FINDING_REJECTED];
 
 /// How much a finding matters, most first.
 pub const FINDING_SEVERITIES: [&str; 3] = ["high", "medium", "low"];
@@ -50,8 +67,8 @@ pub struct ReviewFinding {
     /// Why it matters: the inputs or state that go wrong, and how.
     pub detail: Option<String>,
     pub status: String,
-    /// The response: a pointer to the fix, or why it is out of scope or
-    /// declined.
+    /// The response: a pointer to the fix, or why it is out of scope,
+    /// declined, or rejected.
     pub response: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -97,7 +114,7 @@ pub const CREATE_TABLE: &str = "
         summary         TEXT NOT NULL,
         detail          TEXT,
         status          TEXT NOT NULL DEFAULT 'open'
-                            CHECK (status IN ('open','fixed','out_of_scope','declined')),
+                            CHECK (status IN ('open','fixed','out_of_scope','declined','rejected')),
         response        TEXT,
         created_at      INTEGER NOT NULL,
         updated_at      INTEGER NOT NULL,
@@ -183,12 +200,16 @@ impl<'a> ReviewRepo<'a> {
 
     /// Set a finding's status and response; `open` clears the response.
     /// The user answers from a status menu, so a response is optional here —
-    /// `tod-cli review respond` asks an agent for one.
+    /// `tod-cli review respond` asks an agent for one. `rejected` always needs
+    /// one: a pushback nobody explained is not an answer.
     pub fn respond(&self, id: Uuid, status: &str, response: Option<&str>) -> Result<()> {
         let status = normalize(status, &FINDING_STATUSES, "status")?;
         let response = response
             .map(str::trim)
             .filter(|r| !r.is_empty() && status != FINDING_OPEN);
+        if status == FINDING_REJECTED && response.is_none() {
+            bail!("rejecting a finding needs a note saying why it is not a problem");
+        }
         let changed = self.conn.execute(
             "UPDATE review_findings SET status = ?2, response = ?3, updated_at = ?4
              WHERE id = ?1",
@@ -364,6 +385,20 @@ mod tests {
         let got = repo.get(id).unwrap().unwrap();
         assert!(got.is_open());
         assert_eq!(got.response, None);
+    }
+
+    #[test]
+    fn a_rejection_needs_a_note() {
+        let fx = setup();
+        let repo = ReviewRepo::new(&fx.conn);
+        let id = repo.add(fx.node, None, &finding("x")).unwrap().id;
+        assert!(repo.respond(id, "rejected", None).is_err());
+        assert!(repo.respond(id, "rejected", Some("  ")).is_err());
+        repo.respond(id, "rejected", Some("Input is validated upstream"))
+            .unwrap();
+        let got = repo.get(id).unwrap().unwrap();
+        assert_eq!(got.status, FINDING_REJECTED);
+        assert!(!got.is_open());
     }
 
     /// Findings belong to the node: deleting the conversation that recorded

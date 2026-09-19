@@ -50,7 +50,9 @@ it needs.
 The conversation can be reopened later, after the change has moved on, so
 before you start, list the findings already on the node and record none of
 them again. An open finding the change has since fixed is still not yours to
-respond to: say so in your reply instead.
+respond to: say so in your reply instead. A `rejected` finding carries the
+fixer's note on why it is not a problem; if you find the note wrong, record a
+new finding that says why, rather than the same one again.
 
 When you have reviewed the whole change, record the review done. Nobody reads
 your turns as they arrive: until a turn records it done, the app sends you

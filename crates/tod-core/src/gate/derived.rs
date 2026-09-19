@@ -152,13 +152,14 @@ fn review_done_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcom
         });
     }
     Ok(fail(
-        "No finished code review — run Review from this panel and let it record the          review finished.",
+        "No finished code review — run Review from this panel and let it record the \
+         review finished.",
     ))
 }
 
-/// No finding still `open`: each is fixed, out of scope, or declined. A node
-/// with no findings passes — whether it was reviewed at all is the other
-/// criterion's question.
+/// No finding still `open`: each is fixed, out of scope, declined, or
+/// rejected. A node with no findings passes — whether it was reviewed at all
+/// is the other criterion's question.
 fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
     let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
     let open: Vec<String> = findings
@@ -177,7 +178,8 @@ fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<Derived
         });
     }
     Ok(fail(format!(
-        "{} of {} review findings still open: {}. Answer each from its status in the          review conversation — fixed, out of scope, or declined.",
+        "{} of {} review findings still open: {}. Resolve them with Fix, or answer each \
+         from its status in the findings pane — fixed, out of scope, declined, or rejected.",
         open.len(),
         findings.len(),
         open.join("; ")
