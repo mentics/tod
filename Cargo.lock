@@ -2778,7 +2778,7 @@ dependencies = [
  "lyon",
  "num_cpus",
  "parking",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "pollster 0.4.0",
  "postage",
@@ -2968,7 +2968,7 @@ dependencies = [
  "lyon",
  "num_cpus",
  "parking",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "pollster 0.4.0",
  "postage",
@@ -3022,7 +3022,7 @@ dependencies = [
  "metal",
  "objc",
  "objc2 0.6.4",
- "parking_lot 0.12.5",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3061,7 +3061,7 @@ dependencies = [
  "http",
  "http-body",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -3095,7 +3095,7 @@ dependencies = [
  "notify-rust",
  "oo7",
  "open",
- "parking_lot 0.12.5",
+ "parking_lot",
  "raw-window-handle",
  "smallvec",
  "smol",
@@ -3153,7 +3153,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-screen-capture-kit",
  "objc2-user-notifications",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pathfinder_geometry",
  "raw-window-handle",
  "semver",
@@ -3286,7 +3286,7 @@ dependencies = [
  "chrono",
  "flume 0.12.0",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.9.5",
  "wasm_thread 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "web-time",
@@ -3353,7 +3353,7 @@ dependencies = [
  "gpui-pre-wgpu",
  "js-sys",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "raw-window-handle",
  "smallvec",
  "unicode-properties",
@@ -3382,7 +3382,7 @@ dependencies = [
  "gpui-pre-util",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "profiling",
  "raw-window-handle",
  "smallvec",
@@ -3412,7 +3412,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.9.5",
  "raw-window-handle",
  "smallvec",
@@ -3484,7 +3484,7 @@ dependencies = [
  "log",
  "metal",
  "objc",
- "parking_lot 0.12.5",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3506,7 +3506,7 @@ dependencies = [
  "log",
  "notify-rust",
  "oo7",
- "parking_lot 0.12.5",
+ "parking_lot",
  "raw-window-handle",
  "smallvec",
  "smol",
@@ -3551,7 +3551,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pathfinder_geometry",
  "raw-window-handle",
  "semver",
@@ -3617,7 +3617,7 @@ dependencies = [
  "http_client",
  "js-sys",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "raw-window-handle",
  "scheduler",
  "uuid",
@@ -3642,7 +3642,7 @@ dependencies = [
  "gpui_util",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "profiling",
  "raw-window-handle",
  "smallvec",
@@ -3670,7 +3670,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.9.5",
  "raw-window-handle",
  "smallvec",
@@ -3967,7 +3967,7 @@ dependencies = [
  "http",
  "http-body",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -6033,37 +6033,12 @@ checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d17b78036a60663b797adeaee46f5c9dfebb86948d1255007a1d6be0271ff99"
-dependencies = [
- "instant",
- "lock_api",
- "parking_lot_core 0.8.6",
-]
-
-[[package]]
-name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
  "lock_api",
- "parking_lot_core 0.9.12",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.8.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60a2cfe6f0ad2bfc16aefa463b497d5c7a5ecd44a23efa72aa342d90177356dc"
-dependencies = [
- "cfg-if",
- "instant",
- "libc",
- "redox_syscall 0.2.16",
- "smallvec",
- "winapi",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -6074,7 +6049,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.5.18",
+ "redox_syscall",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -6344,12 +6319,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pin-utils"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
-
-[[package]]
 name = "piper"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6463,7 +6432,7 @@ dependencies = [
  "crossbeam-queue",
  "futures",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project",
  "pollster 0.2.5",
  "static_assertions",
@@ -7054,15 +7023,6 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redox_syscall"
-version = "0.2.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5a58c1855b4b6819d59012155603f0b22ad30cad752600aadfcb695265519a"
-dependencies = [
- "bitflags 1.3.2",
-]
-
-[[package]]
-name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
@@ -7198,42 +7158,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reqwest-middleware"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "562ceb5a604d3f7c885a792d42c199fd8af239d0a51b2fa6a78aafa092452b04"
-dependencies = [
- "anyhow",
- "async-trait",
- "http",
- "reqwest",
- "serde",
- "thiserror 1.0.69",
- "tower-service",
-]
-
-[[package]]
-name = "reqwest-retry"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83df1aaec00176d0fabb65dea13f832d2a446ca99107afc17c5d2d4981221d0"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "getrandom 0.2.17",
- "http",
- "hyper",
- "parking_lot 0.11.2",
- "reqwest",
- "reqwest-middleware",
- "retry-policies",
- "tokio",
- "tracing",
- "wasm-timer",
-]
-
-[[package]]
 name = "resvg"
 version = "0.45.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7265,15 +7189,6 @@ dependencies = [
  "tiny-skia",
  "usvg 0.46.0",
  "zune-jpeg 0.5.15",
-]
-
-[[package]]
-name = "retry-policies"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5875471e6cab2871bc150ecb8c727db5113c9338cc3354dc5ee3425b6aa40a1c"
-dependencies = [
- "rand 0.8.7",
 ]
 
 [[package]]
@@ -7588,7 +7503,7 @@ dependencies = [
  "chrono",
  "flume 0.12.0",
  "futures",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.9.5",
  "wasm_thread 0.3.3 (git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937)",
  "web-time",
@@ -8155,7 +8070,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot 0.12.5",
+ "parking_lot",
  "phf_shared 0.11.3",
  "precomputed-hash",
  "serde",
@@ -8775,12 +8690,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "reqwest",
- "reqwest-middleware",
- "reqwest-retry",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
- "tokio",
 ]
 
 [[package]]
@@ -9685,21 +9597,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-timer"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be0ecb0db480561e9a7642b5d3e4187c128914e58aa84330b9493e3eb68c5e7f"
-dependencies = [
- "futures",
- "js-sys",
- "parking_lot 0.11.2",
- "pin-utils",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "wasm_thread"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9952,7 +9849,7 @@ dependencies = [
  "js-sys",
  "log",
  "naga",
- "parking_lot 0.12.5",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
@@ -9984,7 +9881,7 @@ dependencies = [
  "log",
  "naga",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
@@ -10070,7 +9967,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "once_cell",
  "ordered-float",
- "parking_lot 0.12.5",
+ "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
  "profiling",
@@ -10205,7 +10102,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a4df73e95feddb9ec1a7e9c2ca6323b8c97d5eeeff78d28f1eccdf19c882b24"
 dependencies = [
- "parking_lot 0.12.5",
+ "parking_lot",
  "rayon",
  "thiserror 2.0.20",
  "windows 0.61.3",

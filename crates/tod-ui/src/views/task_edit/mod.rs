@@ -1295,6 +1295,11 @@ impl TaskEditView {
                         });
                     (None, false, choice)
                 }
+                ConfigFieldType::Custom { .. } => {
+                    // Custom fields don't use the generic input/toggle/choice pattern.
+                    // They're handled separately in rendering.
+                    (None, false, None)
+                }
             };
             fields.push(GeneratorConfigField {
                 schema: schema_field,
@@ -1304,9 +1309,16 @@ impl TaskEditView {
             });
         }
 
+        // Schema evolution: orphaned field values (fields in stored config but not
+        // in current schema) are kept in generator_extra_config but only temporarily.
+        // They're omitted from the form and removed on next save.
         self.generator_extra_config = stored
             .into_iter()
-            .filter(|(key, _)| !described.contains(key))
+            .filter(|(key, _)| {
+                // Keep only special keys that aren't field names (e.g., result_cap is
+                // in the basic schema, workspace_slug is fetched separately)
+                !described.contains(key) && (key == "workspace_slug")
+            })
             .collect();
         self.generator_fields = fields;
         self.generator_invalid_fields.clear();
@@ -1314,6 +1326,7 @@ impl TaskEditView {
 
     /// The config JSON the form currently describes.
     fn generator_config_value(&self, cx: &App) -> serde_json::Value {
+        // Only include generator_extra_config (which now only has non-field special keys)
         let mut map = self.generator_extra_config.clone();
         for field in &self.generator_fields {
             let name = field.schema.name.clone();
@@ -1340,6 +1353,10 @@ impl TaskEditView {
                         map.remove(&name);
                     }
                 },
+                ConfigFieldType::Custom { .. } => {
+                    // Custom fields don't contribute to the config directly.
+                    // They're placeholders for data-source-specific UI that reads/writes config elsewhere.
+                }
             }
         }
         serde_json::Value::Object(map)
@@ -1450,6 +1467,7 @@ impl TaskEditView {
                 };
             }
             ConfigFieldType::Text | ConfigFieldType::TextArea => return,
+            ConfigFieldType::Custom { .. } => return,
         }
         self.generator_invalid_fields.remove(&index);
         cx.notify();
@@ -3289,6 +3307,23 @@ impl TaskEditView {
                     cx,
                 )
                 .into_any_element(),
+            ConfigFieldType::Custom { type_hint, .. } => {
+                // For Linear filter fields, render a stub message for now.
+                // Full implementation will come in the UI rendering step.
+                if type_hint == "linear_filter_fields" {
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Linear filter configuration requires introspection (under development)")
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Custom field type: {}", type_hint))
+                        .into_any_element()
+                }
+            }
         };
 
         let mut row = v_flex()

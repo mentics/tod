@@ -7,10 +7,12 @@
 mod data_source;
 pub mod linear;
 pub mod mock;
+pub mod preset;
 
 pub use data_source::{
     ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, DataSource,
     DataSourceError, DataSourceItem,
 };
-pub use linear::LinearDataSource;
+pub use linear::{IntrospectionCache, LinearDataSource};
 pub use mock::MockDataSource;
+pub use preset::{delete_preset, load_presets, rename_preset, save_preset, FilterPreset};

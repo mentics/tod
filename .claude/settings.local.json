@@ -199,7 +199,9 @@
       "Bash(for id in 199468e9 4e1e3487 5c0efd6e f875c359)",
       "Bash(do cargo run -p tod-cli --quiet -- --data-root \"C:\\\\data\\\\git\\\\tod\\\\.local\\\\data\" plan update $id --status implemented)",
       "Bash(for id in 5d91fe38 ee57b001 401f28a7)",
-      "Bash(for id in 13941988 118b90a8 8decf8c1 36a833a4 5a390256 64411b25 45d406c6 828fd9b5)"
+      "Bash(for id in 13941988 118b90a8 8decf8c1 36a833a4 5a390256 64411b25 45d406c6 828fd9b5)",
+      "Bash(C:/data/git/tod/target/dev-fast/tod-cli.exe:*)",
+      "Bash(git log:*)"
     ]
   }
 }

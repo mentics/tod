@@ -1196,6 +1196,7 @@ fn create_managed_node_for_test(
             generator_node_id,
             tags: vec![],
             body: String::new(),
+            metadata: None,
         })
         .unwrap();
     store.writer().flush().unwrap();
@@ -1787,6 +1788,7 @@ fn setup_generator_with_managed_tree(store: &FleetStore, list_id: Uuid) -> (Uuid
             generator_node_id: generator_id,
             tags: vec!["urgent".into()],
             body: "child body".into(),
+            metadata: None,
         })
         .unwrap();
     store.writer().flush().unwrap();

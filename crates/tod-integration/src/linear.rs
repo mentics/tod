@@ -72,22 +72,20 @@ impl LinearDataSource {
         Ok(cache)
     }
 
-    /// Force refresh of introspection cache.
-    pub fn refresh_introspection(&self, api_key: &str) -> Result<(), DataSourceError> {
-        let Some(ref data_root) = self.data_root else {
-            return Err(DataSourceError::InvalidConfig(
-                "introspection requires data root".into(),
-            ));
-        };
-
-        let cache = fetch_introspection(api_key)?;
-        let cache_path = data_root.join("linear_introspection_cache.json");
-        let json = serde_json::to_string_pretty(&cache)
-            .map_err(|e| DataSourceError::Other(e.into()))?;
-        std::fs::write(&cache_path, json).map_err(|e| DataSourceError::Other(e.into()))?;
-
-        Ok(())
+    /// Get cached introspection metadata path.
+    fn cache_path(&self) -> Option<PathBuf> {
+        self.data_root
+            .as_ref()
+            .map(|root| root.join("linear_introspection_cache.json"))
     }
+
+    /// Get introspection cache if it exists.
+    pub fn get_cached_introspection(&self) -> Option<IntrospectionCache> {
+        let cache_path = self.cache_path()?;
+        let contents = std::fs::read_to_string(&cache_path).ok()?;
+        serde_json::from_str(&contents).ok()
+    }
+
 }
 
 impl Default for LinearDataSource {
@@ -113,19 +111,31 @@ impl DataSource for LinearDataSource {
     }
 
     fn configuration_schema(&self) -> ConfigSchema {
-        // Basic schema without introspection - the UI will enrich this
-        // using introspection data fetched separately
+        // Basic schema with result_cap and a placeholder for Linear filter fields.
+        // The UI will use introspection_metadata() to render the actual filter form.
         ConfigSchema {
-            fields: vec![ConfigField {
-                name: "result_cap".into(),
-                label: "Result cap".into(),
-                help: format!(
-                    "Maximum total items to fetch (default {})",
-                    DEFAULT_RESULT_CAP
-                ),
-                field_type: ConfigFieldType::Text,
-                required: false,
-            }],
+            fields: vec![
+                ConfigField {
+                    name: "_linear_filters".into(),
+                    label: "Filter criteria".into(),
+                    help: "Configure Linear issue filters (requires introspection)".into(),
+                    field_type: ConfigFieldType::Custom {
+                        type_hint: "linear_filter_fields".into(),
+                        metadata: serde_json::json!({}),
+                    },
+                    required: false,
+                },
+                ConfigField {
+                    name: "result_cap".into(),
+                    label: "Result cap".into(),
+                    help: format!(
+                        "Maximum total items to fetch (default {})",
+                        DEFAULT_RESULT_CAP
+                    ),
+                    field_type: ConfigFieldType::Text,
+                    required: false,
+                },
+            ],
         }
     }
 
@@ -146,6 +156,68 @@ impl DataSource for LinearDataSource {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_config_with_test_query(
+        &self,
+        config: &serde_json::Value,
+        credentials: &HashMap<String, String>,
+    ) -> Result<(), DataSourceError> {
+        // First, do basic validation
+        self.validate_config(config)?;
+
+        // Get API key from credentials
+        let api_key = credentials
+            .get(LINEAR_API_KEY)
+            .ok_or_else(|| DataSourceError::Auth("Linear API key not configured".into()))?;
+
+        // Build filter from config
+        let filter = build_filter_from_config(config)?;
+
+        // Send a test query with first=1 to validate filter syntax
+        let client = build_client()?;
+        let query = r#"
+            query TestFilter($filter: IssueFilter, $first: Int!) {
+                issues(first: $first, filter: $filter) {
+                    nodes {
+                        id
+                    }
+                }
+            }
+        "#;
+
+        let body = serde_json::json!({
+            "query": query,
+            "variables": {
+                "filter": filter,
+                "first": 1,
+            },
+        });
+
+        let response = client
+            .post(LINEAR_GRAPHQL_URL)
+            .headers(build_headers(api_key)?)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .map_err(|e| DataSourceError::Fetch(format!("Test query failed: {}", e)))?;
+
+        let status = response.status();
+
+        if !status.is_success() && status != StatusCode::OK {
+            return Err(DataSourceError::Fetch(format!(
+                "HTTP error {}: test query failed",
+                status
+            )));
+        }
+
+        let payload: GraphQlResponse<serde_json::Value> = response.json().map_err(|e| {
+            DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
+        })?;
+
+        handle_graphql_errors(&payload, status)?;
+
         Ok(())
     }
 
@@ -177,6 +249,33 @@ impl DataSource for LinearDataSource {
         let items = build_tree(flat, &workspace_slug);
 
         Ok(items)
+    }
+
+    fn introspection_metadata(&self) -> Option<serde_json::Value> {
+        self.get_cached_introspection()
+            .and_then(|cache| serde_json::to_value(&cache).ok())
+    }
+
+    fn has_introspection_cache(&self) -> bool {
+        self.cache_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+    }
+
+    fn refresh_introspection(&self, api_key: &str) -> Result<(), DataSourceError> {
+        let Some(ref data_root) = self.data_root else {
+            return Err(DataSourceError::InvalidConfig(
+                "introspection requires data root".into(),
+            ));
+        };
+
+        let cache = fetch_introspection(api_key)?;
+        let cache_path = data_root.join("linear_introspection_cache.json");
+        let json = serde_json::to_string_pretty(&cache)
+            .map_err(|e| DataSourceError::Other(e.into()))?;
+        std::fs::write(&cache_path, json).map_err(|e| DataSourceError::Other(e.into()))?;
+
+        Ok(())
     }
 }
 
@@ -229,6 +328,14 @@ fn fetch_workspace_slug(api_key: &str) -> Result<String, DataSourceError> {
         .map_err(|e| DataSourceError::Fetch(format!("Failed to fetch workspace slug: {}", e)))?;
 
     let status = response.status();
+
+    if !status.is_success() && status != StatusCode::OK {
+        return Err(DataSourceError::Fetch(format!(
+            "HTTP error {}: failed to fetch workspace slug",
+            status
+        )));
+    }
+
     let payload: GraphQlResponse<WorkspaceData> = response.json().map_err(|e| {
         DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
     })?;
@@ -294,6 +401,14 @@ fn fetch_introspection(api_key: &str) -> Result<IntrospectionCache, DataSourceEr
         .map_err(|e| DataSourceError::Fetch(format!("Failed to fetch introspection: {}", e)))?;
 
     let status = response.status();
+
+    if !status.is_success() && status != StatusCode::OK {
+        return Err(DataSourceError::Fetch(format!(
+            "HTTP error {}: failed to fetch introspection",
+            status
+        )));
+    }
+
     let payload: GraphQlResponse<IntrospectionData> = response.json().map_err(|e| {
         DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
     })?;
@@ -471,6 +586,14 @@ fn fetch_all_issues(
         };
 
         let status = response.status();
+
+        if !status.is_success() && status != StatusCode::OK {
+            return Err(DataSourceError::Fetch(format!(
+                "HTTP error {}: failed to fetch issues",
+                status
+            )));
+        }
+
         let payload: GraphQlResponse<IssuesData> = response.json().map_err(|e| {
             DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
         })?;
@@ -547,42 +670,46 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
         // Build metadata JSON with priority, state, assignee, workspace_slug
         let mut meta = serde_json::Map::new();
 
-        if let Some(pri) = issue.priority {
-            let priority_name = match pri {
-                0 => "No priority",
-                1 => "Urgent",
-                2 => "High",
-                3 => "Medium",
-                4 => "Low",
-                _ => "Unknown",
-            };
-            meta.insert(
-                "priority".into(),
-                serde_json::Value::String(priority_name.into()),
-            );
-        }
+        let priority_name = issue.priority.map(|pri| match pri {
+            0 => "No priority",
+            1 => "Urgent",
+            2 => "High",
+            3 => "Medium",
+            4 => "Low",
+            _ => "Unknown",
+        });
 
-        if let Some(ref state) = issue.state {
-            meta.insert("state".into(), serde_json::Value::String(state.clone()));
-        }
+        meta.insert(
+            "priority".into(),
+            priority_name
+                .map(|s| serde_json::Value::String(s.into()))
+                .unwrap_or(serde_json::Value::Null),
+        );
 
-        if let Some(ref assignee) = issue.assignee {
-            meta.insert(
-                "assignee".into(),
-                serde_json::Value::String(assignee.clone()),
-            );
-        }
+        meta.insert(
+            "state".into(),
+            issue
+                .state
+                .as_ref()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+
+        meta.insert(
+            "assignee".into(),
+            issue
+                .assignee
+                .as_ref()
+                .map(|a| serde_json::Value::String(a.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
 
         meta.insert(
             "workspace_slug".into(),
             serde_json::Value::String(workspace_slug.into()),
         );
 
-        let metadata = if meta.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(meta))
-        };
+        let metadata = Some(serde_json::Value::Object(meta));
 
         // Title includes identifier prefix (e.g., "TOD-142: Fix bug")
         let prefixed_title = format!("{}: {}", issue.identifier, issue.title);
