@@ -1402,6 +1402,53 @@ fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_status_filter_narrows_the_plan_pane(cx: &mut TestAppContext) {
+    use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_FAILED};
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Implementation, false, window, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
+    });
+    draw(cx);
+    let steps = fixture.steps.len();
+    assert!(steps >= 2, "the fixture has a plan to filter");
+    // Put the second step in a status no other step has.
+    view.update(cx, |v, cx| v.choose_status(fixture.steps[1], STATUS_BLOCKED, cx));
+
+    // Nothing toggled: every step shows.
+    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), steps);
+
+    // Toggling `blocked` on shows only that step, and Enter on the first
+    // shown row opens its dropdown.
+    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_BLOCKED, cx));
+    draw(cx);
+    view.read_with(cx, |v, _| {
+        let shown: Vec<_> = v.shown_plan().iter().map(|s| s.id).collect();
+        assert_eq!(shown, vec![fixture.steps[1]]);
+    });
+    cx.dispatch_action(ConversationDown);
+    cx.dispatch_action(ConversationDown);
+    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(0));
+    cx.dispatch_action(ConversationActivate);
+    assert_eq!(
+        view.read_with(cx, |v, _| v.status_menu.map(|m| m.step)),
+        Some(fixture.steps[1])
+    );
+    cx.dispatch_action(ConversationEscape);
+
+    // A status with no steps shows none; toggling both off shows them all.
+    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_FAILED, cx));
+    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), 1);
+    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_BLOCKED, cx));
+    draw(cx);
+    assert!(view.read_with(cx, |v, _| v.shown_plan().is_empty()));
+    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_FAILED, cx));
+    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), steps);
+}
+
+#[gpui::test]
 fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
     use tod_store::outline::repos::plan_steps::{PLAN_STEP_STATUSES, STATUS_BLOCKED, STATUS_READY};
     let fixture = Fixture::new();
