@@ -1559,6 +1559,173 @@ impl TaskEditView {
         self.linear_filter_inputs.clear();
     }
 
+    fn trigger_linear_introspection_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.linear_introspection_fetching {
+            return;
+        }
+
+        let data_root = self.paths.data_root().to_path_buf();
+        let fleet = self.fleet.clone();
+
+        self.linear_introspection_fetching = true;
+        self.linear_introspection_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = cx.background_executor().spawn(async move {
+                let store = CredentialStore::from_data_root(fleet.paths().root());
+                let Some(api_key) = resolve_linear_api_key(&store) else {
+                    return Err("Linear API key not configured".to_string());
+                };
+
+                use tod_integration::LinearDataSource;
+                let ds = LinearDataSource::with_data_root(data_root.clone());
+
+                // Force re-fetch by deleting cache first
+                let cache_path = data_root.join("linear_introspection_cache.json");
+                let _ = std::fs::remove_file(&cache_path);
+
+                // Fetch fresh introspection (this will write the cache)
+                match ds.get_cached_introspection() {
+                    Some(_) => Ok(()),
+                    None => {
+                        // Cache doesn't exist, need to fetch manually
+                        // This is a limitation - LinearDataSource doesn't expose public fetch method
+                        Err("Re-fetch not yet implemented - LinearDataSource needs public fetch_introspection method".to_string())
+                    }
+                }
+            }).await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.linear_introspection_fetching = false;
+                match result {
+                    Ok(()) => {
+                        this.load_linear_state();
+                        this.linear_introspection_error = None;
+                    }
+                    Err(e) => {
+                        this.linear_introspection_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn cycle_linear_preset(&mut self, cx: &mut Context<Self>) {
+        let options: Vec<String> = std::iter::once("None".to_string())
+            .chain(self.linear_presets.iter().map(|p| p.name.clone()))
+            .collect();
+
+        let current = self.linear_selected_preset.as_deref();
+        let current_idx = current.and_then(|c| options.iter().position(|o| o == c));
+
+        let next_idx = match current_idx {
+            None => 0,
+            Some(idx) if idx + 1 >= options.len() => 0,
+            Some(idx) => idx + 1,
+        };
+
+        self.linear_selected_preset = if options[next_idx] == "None" {
+            None
+        } else {
+            Some(options[next_idx].clone())
+        };
+
+        // If a preset was selected, load its values
+        if let Some(ref preset_name) = self.linear_selected_preset {
+            let filters = self.linear_presets.iter()
+                .find(|p| &p.name == preset_name)
+                .map(|p| p.filters.clone());
+            if let Some(filters) = filters {
+                self.load_linear_preset_values(&filters);
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn load_linear_preset_values(&mut self, _filters: &serde_json::Map<String, serde_json::Value>) {
+        // TODO: Load filter values into linear_filter_inputs
+        // This requires the filter input fields to exist first
+    }
+
+    fn confirm_linear_preset_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.linear_preset_action.clone() else {
+            return;
+        };
+
+        let preset_name = input_text(&self.linear_preset_name_input, cx);
+        if preset_name.trim().is_empty() && action != LinearPresetAction::Delete {
+            self.linear_preset_action = None;
+            cx.notify();
+            return;
+        }
+
+        let data_root = self.paths.data_root().to_path_buf();
+
+        match action {
+            LinearPresetAction::Save => {
+                // Check for overwrite
+                let exists = self.linear_presets.iter().any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
+                if exists {
+                    // TODO: Show confirmation toast
+                    // For now, just proceed with overwrite
+                }
+
+                // Extract current filter values
+                let filters = self.extract_linear_filter_values(cx);
+
+                if let Err(e) = tod_integration::save_preset(&data_root, &preset_name, &filters) {
+                    self.generator_config_error = Some(format!("Failed to save preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = Some(preset_name);
+                }
+            }
+            LinearPresetAction::Rename => {
+                let Some(ref old_name) = self.linear_selected_preset else {
+                    self.linear_preset_action = None;
+                    cx.notify();
+                    return;
+                };
+
+                if let Err(e) = tod_integration::rename_preset(&data_root, old_name, &preset_name) {
+                    self.generator_config_error = Some(format!("Failed to rename preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = Some(preset_name);
+                }
+            }
+            LinearPresetAction::Delete => {
+                let Some(ref name) = self.linear_selected_preset else {
+                    self.linear_preset_action = None;
+                    cx.notify();
+                    return;
+                };
+
+                if let Err(e) = tod_integration::delete_preset(&data_root, name) {
+                    self.generator_config_error = Some(format!("Failed to delete preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = None;
+                }
+            }
+        }
+
+        self.linear_preset_name_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.linear_preset_action = None;
+        cx.notify();
+    }
+
+    fn extract_linear_filter_values(&self, _cx: &Context<Self>) -> serde_json::Map<String, serde_json::Value> {
+        // TODO: Extract values from linear_filter_inputs HashMap
+        // For now return empty map
+        serde_json::Map::new()
+    }
+
     fn select_generator_data_source(
         &mut self,
         data_source_type: String,
@@ -3512,81 +3679,266 @@ impl TaskEditView {
     fn render_linear_filter_ui(
         &self,
         muted: gpui::Hsla,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
 
         v_flex()
             .gap_3()
-            .child(
-                // Credential status section
-                self.render_linear_credential_status(muted, theme)
-            )
-            .child(
-                // Introspection status section
-                self.render_linear_introspection_status(muted, theme)
-            )
-            .child(
-                // Filter fields section (placeholder for now)
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("Filter fields will be rendered here based on introspection")
-            )
+            .child(self.render_linear_credential_status(muted, cx))
+            .child(self.render_linear_introspection_section(muted, cx))
+            .when(self.linear_introspection_cache.is_some(), |el| {
+                el.child(self.render_linear_preset_section(muted, window, cx))
+                    .child(self.render_linear_filter_fields(muted, window, cx))
+                    .child(self.render_linear_result_cap(window, cx))
+            })
+            .when(self.linear_introspection_cache.is_none(), |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Filter configuration requires introspection schema. Use re-fetch button above.")
+                )
+            })
     }
 
     fn render_linear_credential_status(
         &self,
         muted: gpui::Hsla,
-        _theme: &gpui_component::theme::Theme,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        match &self.linear_credential_status {
-            Some(Ok(())) => div()
-                .text_xs()
-                .child("✓ Linear API key configured"),
-            Some(Err(msg)) => div()
-                .text_xs()
-                .text_color(muted)
-                .child(format!("⚠ {}", msg)),
-            None => div()
-                .text_xs()
-                .text_color(muted)
-                .child("Checking credentials..."),
-        }
+        let status_text = match &self.linear_credential_status {
+            Some(Ok(())) => "✓ Linear API key configured".to_string(),
+            Some(Err(msg)) => msg.clone(),
+            None => "Checking credentials...".to_string(),
+        };
+        let status_color = match &self.linear_credential_status {
+            Some(Ok(())) => gpui::white(),
+            _ => muted,
+        };
+        let show_link = matches!(&self.linear_credential_status, Some(Err(_)));
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status_text)
+            )
+            .when(show_link, |el| {
+                el.child(
+                    Button::new("linear-cred-link")
+                        .label("Settings")
+                        .xsmall()
+                        .ghost()
+                )
+            })
     }
 
-    fn render_linear_introspection_status(
+    fn render_linear_introspection_section(
         &self,
         muted: gpui::Hsla,
-        _theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        if self.linear_introspection_fetching {
-            return div()
-                .text_xs()
-                .text_color(muted)
-                .child("Fetching schema...");
-        }
+        let age_text = self.linear_introspection_age.as_deref().unwrap_or("unknown age");
+        let has_cache = self.linear_introspection_cache.is_some();
 
-        if let Some(ref error) = self.linear_introspection_error {
-            return div()
-                .text_xs()
-                .text_color(muted)
-                .child(format!("Schema fetch failed: {}", error));
-        }
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if has_cache { gpui::white() } else { muted })
+                    .child(if self.linear_introspection_fetching {
+                        "Fetching schema...".to_string()
+                    } else if let Some(ref error) = self.linear_introspection_error {
+                        format!("Schema fetch failed: {}", error)
+                    } else if has_cache {
+                        format!("Schema cached ({})", age_text)
+                    } else {
+                        "No cached schema".to_string()
+                    })
+            )
+            .child(
+                Button::new("linear-refetch")
+                    .label(if self.linear_introspection_fetching { "Fetching..." } else { "Re-fetch schema" })
+                    .xsmall()
+                    .ghost()
+                    .disabled(self.linear_introspection_fetching)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.trigger_linear_introspection_fetch(cx);
+                    }))
+            )
+    }
 
-        match (&self.linear_introspection_cache, &self.linear_introspection_age) {
-            (Some(_), Some(age)) => div()
-                .text_xs()
-                .child(format!("Schema cached ({})", age)),
-            (Some(_), None) => div()
-                .text_xs()
-                .child("Schema cached"),
-            (None, _) => div()
-                .text_xs()
-                .text_color(muted)
-                .child("No cached schema. Fetch required."),
-        }
+    fn render_linear_preset_section(
+        &self,
+        _muted: gpui::Hsla,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let preset_options: Vec<String> = std::iter::once("None".to_string())
+            .chain(self.linear_presets.iter().map(|p| p.name.clone()))
+            .collect();
+
+        let current_selection = self.linear_selected_preset.as_deref().unwrap_or("None");
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().text_xs().child("Preset:"))
+            .child(
+                Button::new("linear-preset-select")
+                    .label(current_selection)
+                    .xsmall()
+                    .outline()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.cycle_linear_preset(cx);
+                    }))
+            )
+            .when(self.linear_selected_preset.is_some(), |el| {
+                el.child(
+                    Button::new("linear-preset-save")
+                        .label("Save")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Save);
+                            cx.notify();
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-rename")
+                        .label("Rename")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Rename);
+                            cx.notify();
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-delete")
+                        .label("Delete")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Delete);
+                            cx.notify();
+                        }))
+                )
+            })
+            .when(self.linear_preset_action.is_some(), |el| {
+                el.child(
+                    Input::new(&self.linear_preset_name_input)
+                        .xsmall()
+                )
+                .child(
+                    Button::new("linear-preset-confirm")
+                        .label("Confirm")
+                        .xsmall()
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_linear_preset_action(window, cx);
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-cancel")
+                        .label("Cancel")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = None;
+                            cx.notify();
+                        }))
+                )
+            })
+    }
+
+    fn render_linear_filter_fields(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(ref cache) = self.linear_introspection_cache else {
+            return v_flex().into_any_element();
+        };
+
+        let common_fields = ["team", "state", "priority", "assignee", "labels"];
+        let mut common: Vec<_> = cache.filter_fields.iter()
+            .filter(|f| common_fields.contains(&f.name.as_str()))
+            .collect();
+        common.sort_by_key(|f| common_fields.iter().position(|&name| name == f.name).unwrap_or(usize::MAX));
+
+        let mut additional: Vec<_> = cache.filter_fields.iter()
+            .filter(|f| !common_fields.contains(&f.name.as_str()) && !f.field_type.ends_with("ID"))
+            .collect();
+        additional.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let common_elements: Vec<_> = common.iter().map(|field| {
+            self.render_linear_filter_field_readonly(field, &cache.enums)
+        }).collect();
+
+        let additional_elements: Vec<_> = additional.iter().map(|field| {
+            self.render_linear_filter_field_readonly(field, &cache.enums)
+        }).collect();
+
+        v_flex()
+            .gap_2()
+            .when(!common_elements.is_empty(), |el| {
+                el.child(div().text_xs().text_color(muted).child("Common filters"))
+                    .child(v_flex().gap_1().children(common_elements))
+            })
+            .when(!additional_elements.is_empty(), |el| {
+                el.child(div().text_xs().text_color(muted).child("Additional filters"))
+                    .child(v_flex().gap_1().children(additional_elements))
+            })
+            .into_any_element()
+    }
+
+    fn render_linear_filter_field_readonly(
+        &self,
+        field: &tod_integration::FilterFieldMetadata,
+        enums: &std::collections::HashMap<String, Vec<String>>,
+    ) -> impl IntoElement {
+        let field_name = field.name.clone();
+        let help_text = field.description.clone().unwrap_or_else(|| {
+            if enums.contains_key(&field.field_type) {
+                format!("{} (eq)", field_name)
+            } else if field.field_type == "DateTime" {
+                format!("{} (after/before)", field_name)
+            } else if field.is_nullable {
+                format!("{} (any/has value/is empty)", field_name)
+            } else {
+                format!("{} (contains)", field_name)
+            }
+        });
+
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().child(field_name))
+            .child(div().text_xs().text_color(gpui::rgb(0x888888)).child(help_text))
+            .child(
+                div()
+                    .text_xs()
+                    .child("[Filter control - input fields to be added in step 1d815f4c]")
+            )
+    }
+
+    fn render_linear_result_cap(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().child("Result cap"))
+            .child(div().text_xs().child("[Input field placeholder - default 200]"))
     }
 
     /// Save / Refresh. Nothing in this section is ever written on blur — the

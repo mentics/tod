@@ -13,6 +13,6 @@ pub use data_source::{
     ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, DataSource,
     DataSourceError, DataSourceItem,
 };
-pub use linear::{IntrospectionCache, LinearDataSource};
+pub use linear::{FilterFieldMetadata, IntrospectionCache, LinearDataSource};
 pub use mock::MockDataSource;
 pub use preset::{delete_preset, load_presets, rename_preset, save_preset, FilterPreset};
