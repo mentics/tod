@@ -17,8 +17,8 @@ use gpui::{
     Anchor, AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
     ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
-use gpui_component::button::Button;
-use gpui_component::{Icon, Sizable, h_flex, v_flex};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
 use tod_store::conversation::ProtocolKind;
@@ -359,9 +359,79 @@ impl ConversationView {
         }
     }
 
+    /// The plan steps the status filter lets through, in plan order.
+    pub(super) fn shown_plan(&self) -> Vec<PlanStep> {
+        self.data
+            .plan
+            .iter()
+            .filter(|step| {
+                self.status_filter.is_empty() || self.status_filter.contains(step.status.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Show or hide steps in `status`. With no status toggled on, every step
+    /// shows.
+    pub(super) fn toggle_status_filter(&mut self, status: &'static str, cx: &mut Context<Self>) {
+        if !self.status_filter.remove(status) {
+            self.status_filter.insert(status);
+        }
+        // The rows under the highlight have changed; start it over.
+        self.side_cursor = None;
+        self.status_menu = None;
+        cx.notify();
+    }
+
     /// Rows Up/Down move among in the plan pane.
     fn side_row_count(&self) -> usize {
-        self.data.plan.len() + self.side_files.len()
+        self.shown_plan().len() + self.side_files.len()
+    }
+
+    /// One toggle per status the plan has a step in (and any toggled on that
+    /// has since emptied), with its count, plus "All" to clear them.
+    fn render_status_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.data.plan.is_empty() {
+            return None;
+        }
+        let mut bar = h_flex()
+            .flex_wrap()
+            .items_center()
+            .gap(style::space::HAIRLINE)
+            .px(style::space::RELATED)
+            .py(style::space::HAIRLINE)
+            .child(
+                Button::new("plan-filter-all")
+                    .label("All")
+                    .ghost()
+                    .small()
+                    .selected(self.status_filter.is_empty())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.status_filter.is_empty() {
+                            this.status_filter.clear();
+                            this.side_cursor = None;
+                            cx.notify();
+                        }
+                    })),
+            );
+        for status in PLAN_STEP_STATUSES {
+            let n = self.data.plan.iter().filter(|s| s.status == status).count();
+            let on = self.status_filter.contains(status);
+            if n == 0 && !on {
+                continue;
+            }
+            bar = bar.child(
+                Button::new(ElementId::Name(format!("plan-filter-{status}").into()))
+                    .label(format!("{status} {n}"))
+                    .ghost()
+                    .small()
+                    .selected(on)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_status_filter(status, cx);
+                    })),
+            );
+        }
+        Some(bar.into_any_element())
     }
 
     /// Move the plan pane's highlight; entering an unhighlighted
@@ -403,6 +473,8 @@ impl ConversationView {
             .filter(|step| step.status == STATUS_IMPLEMENTED || step.status == STATUS_VERIFIED)
             .count();
         let total = self.data.plan.len();
+        let shown_steps = self.shown_plan();
+        let shown = shown_steps.len();
         let waiting = self
             .data
             .plan
@@ -438,7 +510,7 @@ impl ConversationView {
         };
         if std::mem::take(&mut self.side_scroll_pending) {
             if let Some(row) = cursor {
-                self.side_scroll.scroll_to_item(child_of(row, total));
+                self.side_scroll.scroll_to_item(child_of(row, shown));
             }
         }
 
@@ -451,8 +523,7 @@ impl ConversationView {
         }
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        let steps: Vec<PlanStep> = self.data.plan.clone();
-        for (n, step) in steps.into_iter().enumerate() {
+        for (n, step) in shown_steps.into_iter().enumerate() {
             let id = step.id;
             let badge = self.render_status_badge(id, &step.status, cx);
             let handoff = if verifying {
@@ -488,7 +559,11 @@ impl ConversationView {
             rows.push(
                 style::empty_message(div())
                     .p(style::space::INSET)
-                    .child("This node has no plan steps.")
+                    .child(if total == 0 {
+                        "This node has no plan steps."
+                    } else {
+                        "No plan steps in the chosen statuses."
+                    })
                     .into_any_element(),
             );
         }
@@ -504,7 +579,7 @@ impl ConversationView {
             for (i, line) in self.side_files.iter().enumerate() {
                 rows.push(
                     div()
-                        .when(lit(total + i), style::highlighted)
+                        .when(lit(shown + i), style::highlighted)
                         .px(style::space::RELATED)
                         .py(style::space::INLINE)
                         .child(selectable_text(
@@ -567,6 +642,7 @@ impl ConversationView {
                         )
                     }),
             )
+            .children(self.render_status_filter(cx))
             .child(
                 v_flex()
                     .id("plan-pane")

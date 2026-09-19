@@ -327,6 +327,8 @@ pub struct ConversationView {
     side_cursor: Option<usize>,
     /// The plan-step status dropdown, while open.
     status_menu: Option<side_pane::StatusMenu>,
+    /// The plan-step statuses the plan pane shows; empty shows every step.
+    status_filter: HashSet<&'static str>,
     side_scroll: ScrollHandle,
     side_scroll_pending: bool,
 
@@ -451,6 +453,7 @@ impl ConversationView {
             change_scroll: ScrollHandle::new(),
             side_cursor: None,
             status_menu: None,
+            status_filter: HashSet::new(),
             side_scroll: ScrollHandle::new(),
             side_scroll_pending: false,
             scroll_to_cursor: false,
@@ -544,6 +547,7 @@ impl ConversationView {
             self.cursor = None;
             self.side_cursor = None;
             self.status_menu = None;
+            self.status_filter.clear();
             self.side_files.clear();
             self.link = None;
             self.selected.clear();
@@ -1122,7 +1126,8 @@ impl ConversationView {
             Pane::Context => {}
             Pane::ChangeSet if self.data.protocol.works_the_plan() => {
                 // A highlighted plan step's Enter opens its status dropdown.
-                if let Some(step) = self.side_cursor.and_then(|ix| self.data.plan.get(ix)) {
+                let shown = self.shown_plan();
+                if let Some(step) = self.side_cursor.and_then(|ix| shown.get(ix)) {
                     self.open_status_menu(step.id, cx);
                 }
             }
