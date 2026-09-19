@@ -315,7 +315,8 @@ The mirror of implementation, checking the plan instead of building it
 turn, whose reply was a wall of narration in the lifecycle panel: entering
 `verifying` no longer runs an agent by itself.
 
-- **Launch.** The lifecycle panel's Verification section shows **Verify**
+- **Launch.** The lifecycle panel's Verification section, and the lifecycle
+  buttons beside the conversation view's Send, show **Verify**
   while any plan step has no verdict and **Verify again** once every step
   has one. Either opens the node's most recent verification conversation (or
   a new one) and sends the starter, "Verify the plan." The picker offers
@@ -356,7 +357,8 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
   implementation's is "Implement the plan.", verification's "Verify the
   plan."). A new conversation from the
   picker or Ctrl+N puts it in the input, unsent, to edit or send as is. The
-  lifecycle panel's Implement sends it on arrival (`OpenConversation::start`),
+  lifecycle panel's Implement, and the one beside Send on an `active` node,
+  sends it on arrival (`OpenConversation::start` / `ConversationView::start`),
   since the click already says what the user wants — unless the agent is
   still working on that conversation.
 
