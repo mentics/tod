@@ -62,7 +62,6 @@ use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
-use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
@@ -373,6 +372,8 @@ pub struct ConversationView {
     _lifecycle_changes: Subscription,
 
     error: Option<SharedString>,
+    /// The error last shown as a toast, so a lingering error toasts once.
+    toasted_error: Option<SharedString>,
     status_line: SharedString,
     app_nav: AppNavMenu,
     _poll_task: Task<()>,
@@ -491,6 +492,7 @@ impl ConversationView {
             lifecycle,
             _lifecycle_changes: lifecycle_changes,
             error: None,
+            toasted_error: None,
             status_line: SharedString::default(),
             app_nav: AppNavMenu::default(),
             _poll_task: poll_task,
@@ -1567,17 +1569,14 @@ impl Render for ConversationView {
             .then(|| self.render_context_panel(window, cx));
         let confirm = self.render_confirm(window, cx);
 
+        if self.error != self.toasted_error {
+            if let Some(message) = self.error.clone() {
+                crate::ui::toast::error_toast(window, cx, message);
+            }
+            self.toasted_error = self.error.clone();
+        }
+
         root.child(header)
-            .when_some(self.error.clone(), |el, message| {
-                el.child(
-                    style::panel_header(div()).child(style::text_error(selectable_text(
-                        "conversation-error",
-                        message,
-                        window,
-                        cx,
-                    ))),
-                )
-            })
             .child(
                 div()
                     .flex_1()

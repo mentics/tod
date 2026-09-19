@@ -1612,3 +1612,10 @@ fn startup_closes_turns_left_waiting_on_the_agent() {
     assert_eq!((last.role, last.body.as_str()), (TurnRole::Error, "Interrupted"));
     assert!(repo.close_interrupted_turns("Interrupted").unwrap().is_empty());
 }
+
+#[test]
+fn snapshot_with_removed_handoff_reason_still_reads() {
+    let json = r#"{"entity":"plan_step","node_id":"00000000-0000-0000-0000-000000000001","ordinal":1,"body":"b","status":"blocked","reason":{"kind":"external"},"depends_on":[],"satisfies":[]}"#;
+    let snap: EntitySnapshot = serde_json::from_str(json).unwrap();
+    assert!(matches!(snap, EntitySnapshot::PlanStep { reason: None, .. }));
+}

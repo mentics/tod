@@ -178,7 +178,7 @@ pub enum OutlineMutation {
         status: String,
         #[serde(default)]
         note: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "crate::conversation::lenient_reason")]
         reason: Option<crate::outline::repos::plan_steps::HandoffReason>,
     },
     DeletePlanStep {

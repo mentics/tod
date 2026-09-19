@@ -183,7 +183,7 @@ pub enum EntitySnapshot {
         #[serde(default)]
         note: Option<String>,
         /// Why such a step needs the user.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "lenient_reason")]
         reason: Option<crate::outline::repos::plan_steps::HandoffReason>,
         /// Sorted.
         depends_on: Vec<Uuid>,
@@ -379,4 +379,16 @@ pub enum ReverseOutcome {
         conflicts: Vec<NetChange>,
         dependents: Vec<NetChange>,
     },
+}
+
+/// A reason whose kind is no longer in the set reads as none, as it does in
+/// `node_plan_steps.reason`, so old action snapshots stay readable.
+pub(crate) fn lenient_reason<'de, D>(
+    de: D,
+) -> Result<Option<crate::outline::repos::plan_steps::HandoffReason>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(de)?;
+    Ok(value.and_then(|v| serde_json::from_value(v).ok()))
 }
