@@ -56,6 +56,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_agent::{SessionOpening, SessionPurpose, SessionTurn};
+use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::gate::{
     GateAction, GateCheckRequest, PlanStepWithLinks, build_gate_check_message,
     build_on_entry_message, evaluate_derived_criterion, parse_gate_reply,
@@ -106,11 +107,24 @@ pub enum LifecyclePanelEvent {
 /// Keyboard-navigable stops within the panel, in visual order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
+    Implement,
     RunGateCheck,
     OpenInterview,
     ForceAdvance,
     RevertLifecycle,
     Close,
+}
+
+/// In `active`, implementing and the gate check are one control, chosen by
+/// where the node's plan stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveControl {
+    /// Plan steps remain, or an implementation run is still going: Implement.
+    Implement { remaining: usize, total: usize },
+    /// No plan at all — nothing to implement and nothing to check yet.
+    NoPlan,
+    /// Every plan step is done: the gate check takes over.
+    Complete { total: usize },
 }
 
 /// One row of per-criterion detail shown after a gate check completes.
@@ -181,6 +195,9 @@ pub struct LifecyclePanelView {
     /// Status line for the Active-phase implementation launcher, keyed by
     /// task id (mirrors `gate_states`' per-task keying).
     implement_status: HashMap<String, String>,
+    /// `None` outside `active`. Refreshed on open and each render, so the
+    /// keyboard stops and the rendered control agree.
+    active_control: Option<ActiveControl>,
     focus_handle: FocusHandle,
     focus_index: usize,
     _poll_task: gpui::Task<()>,
@@ -218,6 +235,7 @@ impl LifecyclePanelView {
             lifecycle_capable: false,
             gate_states: HashMap::new(),
             implement_status: HashMap::new(),
+            active_control: None,
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _poll_task,
@@ -257,8 +275,14 @@ impl LifecyclePanelView {
 
     fn stops(&self) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
-        if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
-            stops.push(LifecyclePanelStop::RunGateCheck);
+        match self.active_control {
+            Some(ActiveControl::Implement { .. }) => stops.push(LifecyclePanelStop::Implement),
+            Some(ActiveControl::NoPlan) => {}
+            Some(ActiveControl::Complete { .. }) | None => {
+                if self.lifecycle_capable && next_lifecycle(&self.lifecycle).is_some() {
+                    stops.push(LifecyclePanelStop::RunGateCheck);
+                }
+            }
         }
         if self.interview_available() {
             stops.push(LifecyclePanelStop::OpenInterview);
@@ -314,8 +338,9 @@ impl LifecyclePanelView {
         cx.notify();
     }
 
-    fn activate_focused(&mut self, cx: &mut Context<Self>) {
+    fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.focused_stop() {
+            Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::RunGateCheck) => {
                 if let Some(next) = next_lifecycle(&self.lifecycle) {
                     self.run_gate_check(next, cx);
@@ -571,6 +596,30 @@ impl LifecyclePanelView {
             .map(|run| run.id)
     }
 
+    /// Recompute `active_control` from the plan and any live run. A live run
+    /// keeps Implement up even once every step is closed: its loop may still
+    /// be getting the tests green.
+    fn refresh_active_control(&mut self) {
+        self.active_control = (|| {
+            if !self.lifecycle_capable || self.lifecycle != "active" {
+                return None;
+            }
+            let node_id = uuid::Uuid::parse_str(self.task_id.as_ref()?).ok()?;
+            let running = self.implementation_run_live().is_some();
+            Some(match plan_progress(&self.fleet, node_id) {
+                PlanProgress::NoPlan => ActiveControl::NoPlan,
+                PlanProgress::Remaining { remaining, total } => {
+                    ActiveControl::Implement { remaining, total }
+                }
+                PlanProgress::Complete { total } if running => ActiveControl::Implement {
+                    remaining: 0,
+                    total,
+                },
+                PlanProgress::Complete { total } => ActiveControl::Complete { total },
+            })
+        })();
+    }
+
     /// Open the node's implementation conversation — one per node, reopened
     /// however many times this is pressed. The conversation view runs it
     /// under the implementation protocol: the agent works in the node's
@@ -590,15 +639,21 @@ impl LifecyclePanelView {
             return;
         };
         // The done-signal is "no plan step still open", so a node with no
-        // plan has nothing to drive the loop. The lifecycle gate is meant to
-        // guarantee one by `ready`; nothing stops a plan being emptied after.
-        if !tod_core::conversation::implement::has_plan_steps(&self.fleet, node_id) {
-            self.implement_status.insert(
-                task_id,
-                "This node has no plan steps. Add a plan before implementing.".to_string(),
-            );
-            cx.notify();
-            return;
+        // plan has nothing to drive the loop, and a finished one would only
+        // be sent round again. The button is not offered for either; this
+        // guards against the plan changing since the last render.
+        match plan_progress(&self.fleet, node_id) {
+            PlanProgress::Remaining { .. } => {}
+            PlanProgress::NoPlan | PlanProgress::Complete { .. }
+                if self.implementation_run_live().is_none() =>
+            {
+                self.refresh_active_control();
+                self.clamp_focus_index();
+                cx.notify();
+                return;
+            }
+            // A run still going is reopened, not restarted.
+            _ => {}
         }
         self.implement_status.remove(&task_id);
         window.dispatch_action(
@@ -629,6 +684,7 @@ impl LifecyclePanelView {
                     .is_some_and(|caps| {
                         caps.contains(&tod_store::outline::types::Capability::Lifecycle)
                     });
+                self.refresh_active_control();
                 true
             }
             _ => false,
@@ -1437,6 +1493,8 @@ impl Render for LifecyclePanelView {
         if !self.is_open() {
             return div().size_full().into_any_element();
         }
+        self.refresh_active_control();
+        self.clamp_focus_index();
 
         let theme = cx.theme();
         let border = theme.border;
@@ -1482,56 +1540,92 @@ impl Render for LifecyclePanelView {
                     .child(format!("Current: {}", self.lifecycle)),
             );
 
-            if self.lifecycle == "active" {
-                let directory = self.implement_directory();
-                let live_run = self.implementation_run_live();
-                let implement_status = self
-                    .task_id
-                    .as_ref()
-                    .and_then(|id| self.implement_status.get(id))
-                    .cloned();
+            if let Some(control) = self.active_control {
                 body = body.child(div().text_xs().font_semibold().child("Implementation"));
-                let (detail, blocked) = match &directory {
-                    Ok(dir) => (format!("Runs in {}", dir.display()), false),
-                    Err(reason) => (reason.clone(), true),
-                };
-                let label = if live_run.is_some() {
-                    "Implementing…"
-                } else {
-                    "Implement"
-                };
-                body = body.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .items_center()
-                        // `min_w_0` so a long directory wraps instead of
-                        // pushing the button out of the panel.
-                        .child(div().flex_1().min_w_0().text_xs().text_color(muted).child(
-                            selectable_text("lifecycle-panel-implement-detail", detail, window, cx),
-                        ))
-                        .child(
-                            Button::new("lifecycle-panel-implement")
-                                .label(label)
-                                .ghost()
-                                .flex_shrink_0()
-                                .disabled(blocked)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.launch_implementation(window, cx);
-                                })),
-                        ),
-                );
-                if let Some(status) = implement_status {
-                    body = body.child(div().text_xs().text_color(muted).child(selectable_text(
-                        "lifecycle-panel-implement-status",
-                        status,
-                        window,
-                        cx,
+                match control {
+                    ActiveControl::NoPlan => {
+                        body = body.child(div().text_xs().text_color(danger).child(
+                            "This node has no plan steps, so there is nothing to implement \
+                         and nothing to check. It should not have got this far: \
+                         revert it to planning and give it a plan first.",
+                        ));
+                    }
+                    ActiveControl::Complete { total } => {
+                        body = body.child(div().text_xs().text_color(muted).child(format!(
+                        "Plan implementation complete — {} done. Run the gate check to advance.",
+                        if total == 1 {
+                            "the 1 plan step is".to_string()
+                        } else {
+                            format!("all {total} plan steps are")
+                        }
                     )));
+                    }
+                    ActiveControl::Implement { remaining, total } => {
+                        let running = self.implementation_run_live().is_some();
+                        let implement_status = self
+                            .task_id
+                            .as_ref()
+                            .and_then(|id| self.implement_status.get(id))
+                            .cloned();
+                        let (directory, blocked) = match self.implement_directory() {
+                            Ok(dir) => (format!("Runs in {}", dir.display()), false),
+                            Err(reason) => (reason, true),
+                        };
+                        let progress = if remaining == 0 {
+                            format!("All {total} plan steps closed; the run is finishing up.")
+                        } else {
+                            format!("{remaining} of {total} plan steps not done yet.")
+                        };
+                        body =
+                            body.child(div().text_xs().text_color(muted).child(selectable_text(
+                                "lifecycle-panel-implement-detail",
+                                format!("{progress} {directory}"),
+                                window,
+                                cx,
+                            )));
+                        body = body.child(
+                            div()
+                                .w_full()
+                                .rounded_md()
+                                .when(self.is_focused(LifecyclePanelStop::Implement), |el| {
+                                    el.border_1().border_color(list_active_border)
+                                })
+                                .child(
+                                    Button::new("lifecycle-panel-implement")
+                                        .label(if running {
+                                            "Implementing…"
+                                        } else {
+                                            "Implement"
+                                        })
+                                        .primary()
+                                        .w_full()
+                                        .disabled(blocked)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.launch_implementation(window, cx);
+                                        })),
+                                ),
+                        );
+                        if let Some(status) = implement_status {
+                            body = body.child(div().text_xs().text_color(muted).child(
+                                selectable_text(
+                                    "lifecycle-panel-implement-status",
+                                    status,
+                                    window,
+                                    cx,
+                                ),
+                            ));
+                        }
+                    }
                 }
             }
 
-            body = match next_state {
+            // In `active`, the gate check only takes over once the plan is done.
+            let gate_check_offered = matches!(
+                self.active_control,
+                None | Some(ActiveControl::Complete { .. })
+            );
+            body = match next_state.filter(|_| gate_check_offered) {
+                None if !gate_check_offered => body,
                 Some(next) => body.child(
                     div()
                         .w_full()
@@ -1904,8 +1998,8 @@ impl Render for LifecyclePanelView {
                     cx.stop_propagation();
                 }),
             )
-            .on_action(cx.listener(|this, _: &LifecyclePanelActivate, _, cx| {
-                this.activate_focused(cx);
+            .on_action(cx.listener(|this, _: &LifecyclePanelActivate, window, cx| {
+                this.activate_focused(window, cx);
                 cx.stop_propagation();
             }))
             .child(

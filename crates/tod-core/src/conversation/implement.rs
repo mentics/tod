@@ -348,14 +348,32 @@ fn step_is_open(status: &str) -> bool {
     !step_is_done(status) && !needs_user(status)
 }
 
-/// Whether the node has anything to implement. The lifecycle gate is meant to
-/// guarantee this on `planning` → `ready`, but nothing stops a plan being
-/// emptied afterwards.
-pub fn has_plan_steps(fleet: &FleetStore, node_id: Uuid) -> bool {
-    !fleet
-        .list_plan_steps_for_node(node_id)
-        .unwrap_or_default()
-        .is_empty()
+/// Where a node's plan stands, for deciding whether implementing it makes
+/// sense at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanProgress {
+    /// No plan steps. The lifecycle gate is meant to guarantee a plan by
+    /// `planning` → `ready`, but nothing stops one being emptied afterwards.
+    NoPlan,
+    /// Some steps are not done yet: `remaining` of `total`, counting the
+    /// `partial` and `blocked` ones left for the user.
+    Remaining { remaining: usize, total: usize },
+    /// Every step is `implemented` or `verified`.
+    Complete { total: usize },
+}
+
+pub fn plan_progress(fleet: &FleetStore, node_id: Uuid) -> PlanProgress {
+    let steps = fleet.list_plan_steps_for_node(node_id).unwrap_or_default();
+    let total = steps.len();
+    let remaining = steps
+        .iter()
+        .filter(|step| !step_is_done(&step.status))
+        .count();
+    match (total, remaining) {
+        (0, _) => PlanProgress::NoPlan,
+        (total, 0) => PlanProgress::Complete { total },
+        (total, remaining) => PlanProgress::Remaining { remaining, total },
+    }
 }
 
 fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
@@ -584,6 +602,28 @@ mod tests {
 
         fn green() -> Option<TestRun> {
             Some(run(24, 0, 0))
+        }
+
+        /// Steps handed to the user still count as remaining: the plan is
+        /// complete only once every step is done.
+        #[test]
+        fn plan_progress_counts_what_is_not_done() {
+            let fx = planned(0, 0);
+            assert_eq!(plan_progress(&fx.fleet, fx.node), PlanProgress::NoPlan);
+            let fx = planned(3, 1);
+            hand_over(&fx, 1, STATUS_BLOCKED);
+            assert_eq!(
+                plan_progress(&fx.fleet, fx.node),
+                PlanProgress::Remaining {
+                    remaining: 2,
+                    total: 3
+                }
+            );
+            let fx = planned(2, 2);
+            assert_eq!(
+                plan_progress(&fx.fleet, fx.node),
+                PlanProgress::Complete { total: 2 }
+            );
         }
 
         #[test]
