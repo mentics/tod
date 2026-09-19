@@ -296,6 +296,32 @@ fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
 }
 
 #[test]
+fn the_opening_context_is_recorded_as_sent() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
+    say(&mut driver, &fx, &mut agent, "hello");
+    let id = driver.conversation_id().unwrap();
+    let sent = agent.last().opening.as_ref().unwrap().context.clone();
+    let recorded = || {
+        fx.fleet
+            .read(|conn| ConversationRepo::new(conn).opening_context(id))
+            .unwrap()
+    };
+    assert!(sent.is_some());
+    assert_eq!(recorded(), sent);
+
+    // A later turn sends no context and leaves the recorded one alone.
+    say(&mut driver, &fx, &mut agent, "again");
+    assert!(agent.last().opening.is_none());
+    assert_eq!(recorded(), sent);
+}
+
+#[test]
 fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);

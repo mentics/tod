@@ -1723,6 +1723,53 @@ fn press_lifecycle(view: &Entity<ConversationView>, label: &str, cx: &mut Visual
 }
 
 #[gpui::test]
+fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let without = create_conversation(&fixture, node);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let header_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.transcript
+                .read(cx)
+                .stops()
+                .contains(&PanelStop::HeaderAction(0))
+        })
+    };
+    // Nothing recorded, nothing to copy.
+    assert_eq!(view.read_with(cx, |v, _| v.conversation_id()), Some(without));
+    assert!(!header_stop(&view, cx));
+
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::SetConversationOpeningContext {
+                conversation_id: without,
+                context: "# The opening context".into(),
+            },
+        )
+        .unwrap();
+    view.update(cx, |view, _| view.reload());
+    draw(cx);
+    assert!(header_stop(&view, cx));
+
+    view.update_in(cx, |view, window, cx| {
+        view.transcript.update(cx, |panel, cx| {
+            panel.set_highlight(PanelStop::HeaderAction(0), cx);
+            panel.activate(window, cx);
+        });
+    });
+    draw(cx);
+    let copied = cx.update(|_, cx| cx.read_from_clipboard().and_then(|c| c.text()));
+    assert_eq!(copied.as_deref(), Some("# The opening context"));
+    assert!(
+        view.read_with(cx, |v, _| v.status_line.contains("Copied")),
+        "the header says it was copied"
+    );
+}
+
+#[gpui::test]
 fn a_node_without_a_lifecycle_has_no_lifecycle_buttons(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
