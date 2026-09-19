@@ -16,7 +16,7 @@ use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
+    ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
@@ -621,7 +621,7 @@ impl ConversationView {
                     .px(style::space::RELATED)
                     .py(style::space::INLINE)
                     .items_start()
-                    .child(badge)
+                    .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
                     .child(
                         v_flex()
                             .flex_1()
@@ -826,8 +826,8 @@ impl ConversationView {
                     .px(style::space::RELATED)
                     .py(style::space::INLINE)
                     .items_start()
-                    .child(badge)
-                    .child(severity)
+                    .child(div().w(SEVERITY_COLUMN_WIDTH).flex_shrink_0().child(severity))
+                    .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
                     .child(col)
                     .into_any_element(),
             );
@@ -906,6 +906,11 @@ impl ConversationView {
 }
 
 /// What a finding's response is, by the answer it came with.
+/// Fixed widths for the leading columns of the plan and findings tables, so
+/// the text column starts at the same x on every row.
+const SEVERITY_COLUMN_WIDTH: Pixels = px(64.);
+const STATUS_COLUMN_WIDTH: Pixels = px(120.);
+
 fn response_label(status: &str) -> &'static str {
     match status {
         FINDING_FIXED => "Fixed",
