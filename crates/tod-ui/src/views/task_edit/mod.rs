@@ -20,7 +20,7 @@ use gpui_component::input::{
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
@@ -241,6 +241,13 @@ struct PendingLinearApply {
     tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum LinearPresetAction {
+    Save,
+    Rename,
+    Delete,
+}
+
 pub struct TaskEditView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
@@ -305,6 +312,17 @@ pub struct TaskEditView {
     generator_config_error: Option<String>,
     /// When true, show the generator detail view instead of the edit form.
     generator_show_detail: bool,
+    /// Linear-specific state for filter configuration UI
+    linear_introspection_cache: Option<tod_integration::IntrospectionCache>,
+    linear_introspection_age: Option<String>,
+    linear_introspection_fetching: bool,
+    linear_introspection_error: Option<String>,
+    linear_credential_status: Option<Result<(), String>>,
+    linear_presets: Vec<tod_integration::FilterPreset>,
+    linear_selected_preset: Option<String>,
+    linear_preset_name_input: Entity<InputState>,
+    linear_preset_action: Option<LinearPresetAction>,
+    linear_filter_inputs: HashMap<String, Entity<InputState>>,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
     /// Linear metadata (priority, state, assignee, workspace_slug) for managed nodes.
@@ -323,6 +341,7 @@ pub struct TaskEditView {
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
     _note_edit_subscription: Subscription,
+    _linear_preset_name_subscription: Subscription,
 }
 
 impl TaskEditView {
@@ -355,6 +374,8 @@ impl TaskEditView {
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
+        let linear_preset_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -422,6 +443,9 @@ impl TaskEditView {
                 this.commit_tag_draft(cx);
             }
         });
+        let _linear_preset_name_subscription = cx.subscribe(&linear_preset_name_input, |_this: &mut TaskEditView, _, _event: &InputEvent, _cx| {
+            // Preset name input is handled by explicit actions, not on blur/enter
+        });
         Self {
             fleet,
             paths,
@@ -446,6 +470,16 @@ impl TaskEditView {
             generator_last_error: None,
             generator_config_error: None,
             generator_show_detail: false,
+            linear_introspection_cache: None,
+            linear_introspection_age: None,
+            linear_introspection_fetching: false,
+            linear_introspection_error: None,
+            linear_credential_status: None,
+            linear_presets: Vec::new(),
+            linear_selected_preset: None,
+            linear_preset_name_input,
+            linear_preset_action: None,
+            linear_filter_inputs: HashMap::new(),
             managed_link: None,
             managed_source_type: None,
             managed_metadata: None,
@@ -493,6 +527,7 @@ impl TaskEditView {
             _details_subscription,
             _tag_draft_subscription,
             _note_edit_subscription,
+            _linear_preset_name_subscription,
         }
     }
 
@@ -1444,6 +1479,10 @@ impl TaskEditView {
                 // Compare against the form's own rendering of the stored
                 // config, so a round trip alone never reads as dirty.
                 self.generator_saved_config = Some(self.generator_config_value(cx));
+                // Load Linear-specific data if this is a Linear generator
+                if config.data_source_type == "linear" {
+                    self.load_linear_state();
+                }
             }
             None => {
                 self.generator_data_source_type = None;
@@ -1453,6 +1492,7 @@ impl TaskEditView {
                 self.generator_extra_config.clear();
                 self.generator_invalid_fields.clear();
                 self.generator_saved_config = None;
+                self.clear_linear_state();
             }
         }
         self.clamp_focus_index();
@@ -1466,6 +1506,57 @@ impl TaskEditView {
             self.generator_last_status = config.last_refresh_status;
             self.generator_last_error = config.last_refresh_error;
         }
+    }
+
+    fn load_linear_state(&mut self) {
+        use tod_integration::LinearDataSource;
+
+        // Load introspection cache
+        let data_root = self.paths.data_root();
+        let linear_ds = LinearDataSource::with_data_root(data_root.to_path_buf());
+        self.linear_introspection_cache = linear_ds.get_cached_introspection();
+
+        // Calculate cache age if it exists
+        if self.linear_introspection_cache.is_some() {
+            let cache_path = data_root.join("linear_introspection_cache.json");
+            if let Ok(metadata) = std::fs::metadata(&cache_path) {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(elapsed) = modified.elapsed() {
+                        let days = elapsed.as_secs() / 86400;
+                        self.linear_introspection_age = if days == 0 {
+                            Some("Today".to_string())
+                        } else if days == 1 {
+                            Some("1 day ago".to_string())
+                        } else {
+                            Some(format!("{} days ago", days))
+                        };
+                    }
+                }
+            }
+        }
+
+        // Load presets
+        self.linear_presets = tod_integration::load_presets(data_root)
+            .unwrap_or_else(|_| Vec::new());
+
+        // Check credential status
+        let store = CredentialStore::from_data_root(self.fleet.paths().root());
+        self.linear_credential_status = match resolve_linear_api_key(&store) {
+            Some(_) => Some(Ok(())),
+            None => Some(Err("Linear API key not set".to_string())),
+        };
+    }
+
+    fn clear_linear_state(&mut self) {
+        self.linear_introspection_cache = None;
+        self.linear_introspection_age = None;
+        self.linear_introspection_fetching = false;
+        self.linear_introspection_error = None;
+        self.linear_credential_status = None;
+        self.linear_presets.clear();
+        self.linear_selected_preset = None;
+        self.linear_preset_action = None;
+        self.linear_filter_inputs.clear();
     }
 
     fn select_generator_data_source(
@@ -3363,13 +3454,8 @@ impl TaskEditView {
                 )
                 .into_any_element(),
             ConfigFieldType::Custom { type_hint, .. } => {
-                // For Linear filter fields, render a stub message for now.
-                // Full implementation will come in the UI rendering step.
                 if type_hint == "linear_filter_fields" {
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child("Linear filter configuration requires introspection (under development)")
+                    self.render_linear_filter_ui(muted, window, cx)
                         .into_any_element()
                 } else {
                     div()
@@ -3421,6 +3507,86 @@ impl TaskEditView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.enter_field_edit(TaskEditField::GeneratorField(index), window, cx);
             }))
+    }
+
+    fn render_linear_filter_ui(
+        &self,
+        muted: gpui::Hsla,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+
+        v_flex()
+            .gap_3()
+            .child(
+                // Credential status section
+                self.render_linear_credential_status(muted, theme)
+            )
+            .child(
+                // Introspection status section
+                self.render_linear_introspection_status(muted, theme)
+            )
+            .child(
+                // Filter fields section (placeholder for now)
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Filter fields will be rendered here based on introspection")
+            )
+    }
+
+    fn render_linear_credential_status(
+        &self,
+        muted: gpui::Hsla,
+        _theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        match &self.linear_credential_status {
+            Some(Ok(())) => div()
+                .text_xs()
+                .child("✓ Linear API key configured"),
+            Some(Err(msg)) => div()
+                .text_xs()
+                .text_color(muted)
+                .child(format!("⚠ {}", msg)),
+            None => div()
+                .text_xs()
+                .text_color(muted)
+                .child("Checking credentials..."),
+        }
+    }
+
+    fn render_linear_introspection_status(
+        &self,
+        muted: gpui::Hsla,
+        _theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        if self.linear_introspection_fetching {
+            return div()
+                .text_xs()
+                .text_color(muted)
+                .child("Fetching schema...");
+        }
+
+        if let Some(ref error) = self.linear_introspection_error {
+            return div()
+                .text_xs()
+                .text_color(muted)
+                .child(format!("Schema fetch failed: {}", error));
+        }
+
+        match (&self.linear_introspection_cache, &self.linear_introspection_age) {
+            (Some(_), Some(age)) => div()
+                .text_xs()
+                .child(format!("Schema cached ({})", age)),
+            (Some(_), None) => div()
+                .text_xs()
+                .child("Schema cached"),
+            (None, _) => div()
+                .text_xs()
+                .text_color(muted)
+                .child("No cached schema. Fetch required."),
+        }
     }
 
     /// Save / Refresh. Nothing in this section is ever written on blur — the
