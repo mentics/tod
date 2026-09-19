@@ -30,6 +30,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::toast::{error_toast, notification_overlay};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
+use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
@@ -181,7 +182,7 @@ fn collect_running_work(
             }
         }
     }
-    for task_id in lifecycle_panel.read(cx).running_gate_check_task_ids() {
+    for task_id in lifecycle_panel.read(cx).running_gate_check_task_ids(cx) {
         let title = fleet
             .get_task(&task_id)
             .ok()
@@ -399,7 +400,7 @@ impl Shell {
             self.agent_status_text = text.into();
             cx.notify();
         }
-        let gate_activity = self.drawer.lifecycle.read(cx).in_flight_activity();
+        let gate_activity = self.drawer.lifecycle.read(cx).in_flight_activity(cx);
         self.task_list.update(cx, |list, cx| {
             list.set_agent_activity(gate_activity, cx);
         });
@@ -1488,8 +1489,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
+                        let lifecycle = cx.new(|cx| {
+                            LifecycleController::new(cx, fleet.clone(), agent.clone())
+                        });
                         let lifecycle_panel = cx.new(|cx| {
-                            LifecyclePanelView::new(cx, fleet.clone(), agent.clone(), paths.clone())
+                            LifecyclePanelView::new(cx, fleet.clone(), lifecycle.clone())
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
@@ -1507,7 +1511,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let agent_for_conversation = agent.clone();
                         let conversation = cx.new(|cx| {
-                            ConversationView::new(window, cx, agent_for_conversation, fleet.clone())
+                            ConversationView::new(
+                                window,
+                                cx,
+                                agent_for_conversation,
+                                fleet.clone(),
+                                lifecycle.clone(),
+                            )
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));

@@ -4,6 +4,7 @@ pub mod command_history;
 pub mod database;
 pub mod interactive_agent;
 pub use tod_core::linear_import;
+pub mod lifecycle_control;
 pub mod lifecycle_panel;
 pub mod obligations;
 pub mod plan_steps;

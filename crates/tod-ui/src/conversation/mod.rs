@@ -5,7 +5,9 @@
 //! Layout: a one-line header ([`header`]), then the transcript pane
 //! ([`transcript`]), the change-set pane ([`change_set`]), and, when open,
 //! the context pane ([`context_panel`]) side by side. The context pane
-//! follows the change-set cursor ([`ConversationView::set_cursor`]).
+//! follows the change-set cursor ([`ConversationView::set_cursor`]). On a
+//! node with a lifecycle, the step that moves it along sits beside Send
+//! ([`lifecycle`]).
 //!
 //! Keyboard: one focus handle for the whole view, and [`Pane`] says which
 //! pane Up/Down act on. The transcript pane's stops are [`Stop`]s, the last of
@@ -17,6 +19,7 @@ mod change_set;
 mod context_panel;
 mod header;
 mod keyboard;
+mod lifecycle;
 mod nav;
 mod side_pane;
 mod transcript;
@@ -60,6 +63,7 @@ use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
+use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
 use change_set::{ChangeKey, PendingReverse, Tab};
 use context_panel::{ContextPanel, ContextTab};
@@ -267,6 +271,9 @@ pub(crate) struct Snapshot {
     pub report: Option<serde_json::Value>,
     /// The kinds of conversation the picker offers to start on this focus.
     pub new_kinds: Vec<ProtocolKind>,
+    /// Where the focused node's lifecycle stands; `None` unless the focus is
+    /// a node with one.
+    pub lifecycle: Option<lifecycle::LifecycleSnapshot>,
 }
 
 /// An underline tab bar whose underline moves in the same frame as the
@@ -348,6 +355,10 @@ pub struct ConversationView {
     scroll_to_cursor: bool,
     context: ContextPanel,
 
+    /// Runs gate checks and lifecycle moves; shared with the lifecycle panel.
+    lifecycle: Entity<LifecycleController>,
+    _lifecycle_changes: Subscription,
+
     error: Option<SharedString>,
     status_line: SharedString,
     app_nav: AppNavMenu,
@@ -362,8 +373,10 @@ impl ConversationView {
         cx: &mut Context<Self>,
         agent: SharedAgent,
         fleet: Arc<FleetStore>,
+        lifecycle: Entity<LifecycleController>,
     ) -> Self {
         let (transcript, transcript_events) = Self::new_transcript(window, cx);
+        let lifecycle_changes = cx.observe(&lifecycle, |_, _, cx| cx.notify());
         let edit_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(2)
@@ -458,6 +471,8 @@ impl ConversationView {
             side_scroll_pending: false,
             scroll_to_cursor: false,
             context,
+            lifecycle,
+            _lifecycle_changes: lifecycle_changes,
             error: None,
             status_line: SharedString::default(),
             app_nav: AppNavMenu::default(),
@@ -562,6 +577,7 @@ impl ConversationView {
             self.transcript.update(cx, |panel, cx| panel.reset(cx));
         }
         self.reload();
+        self.load_lifecycle_state(cx);
         self.status = self
             .current_driver()
             .map(|d| d.status())
@@ -843,6 +859,7 @@ impl ConversationView {
             let new_kinds = new_kinds(conn, selection.node, focus)?;
             Ok(Snapshot {
                 new_kinds,
+                lifecycle: None,
                 path,
                 has_children: nav::has_children(conn, selection.node)?,
                 focus_node: selection.node,
@@ -858,7 +875,10 @@ impl ConversationView {
             })
         });
         let data = match data {
-            Ok(data) => data,
+            Ok(data) => Snapshot {
+                lifecycle: lifecycle::LifecycleSnapshot::load(&self.fleet, focus),
+                ..data
+            },
             Err(err) => {
                 let message: SharedString = format!("{err:#}").into();
                 let changed = self.error.as_ref() != Some(&message);
