@@ -439,6 +439,9 @@ impl ConversationDriver {
         match next {
             Next::Done => {
                 self.continuations = 0;
+                if let Err(err) = self.protocol.finish(&self.env(fleet, id)) {
+                    tracing::warn!(conversation = %id, "end-of-run commit failed: {err:#}");
+                }
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
             Next::Continue { message } => {

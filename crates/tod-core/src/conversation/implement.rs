@@ -103,6 +103,10 @@ impl Protocol for ImplementationProtocol {
         SessionPurpose::Conversation
     }
 
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Result<()> {
+        commit_run(env, &self.cwd(env)?, "Implement")
+    }
+
     /// Its writes are not a reversible change set, so no conversation actor:
     /// plan-step and file changes are the agent's own, like any other caller.
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
@@ -459,6 +463,68 @@ pub(super) fn worktree_fingerprint(cwd: &std::path::Path) -> String {
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default()
+}
+
+/// Commit whatever the agent left in the worktree, at the end of a run.
+///
+/// Does nothing outside a repository or when the tree is clean. A detached
+/// HEAD has no branch to commit to, so one named `branch` is created first.
+/// Returns whether a commit was made.
+pub(super) fn commit_worktree(cwd: &std::path::Path, branch: &str, message: &str) -> Result<bool> {
+    fn git(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+        Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .with_context(|| format!("running git {}", args.join(" ")))
+    }
+    let inside = git(cwd, &["rev-parse", "--is-inside-work-tree"])?;
+    if !inside.status.success() {
+        return Ok(false);
+    }
+    let status = git(cwd, &["status", "--porcelain"])?;
+    if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        return Ok(false);
+    }
+    // `symbolic-ref` fails on a detached HEAD.
+    if !git(cwd, &["symbolic-ref", "-q", "HEAD"])?.status.success() {
+        let out = git(cwd, &["checkout", "-b", branch])?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git checkout -b {branch}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let add = git(cwd, &["add", "-A"])?;
+    anyhow::ensure!(
+        add.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add.stderr).trim()
+    );
+    let commit = git(cwd, &["commit", "-m", message])?;
+    anyhow::ensure!(
+        commit.status.success(),
+        "git commit: {}{}",
+        String::from_utf8_lossy(&commit.stdout).trim(),
+        String::from_utf8_lossy(&commit.stderr).trim()
+    );
+    Ok(true)
+}
+
+/// Commit at the end of an implementation or fix run (see [`Protocol::finish`]).
+pub(super) fn commit_run(env: &ProtocolEnv<'_>, cwd: &std::path::Path, what: &str) -> Result<()> {
+    let node = node_id(env)?;
+    let title = env
+        .fleet
+        .get_node(&node.to_string())
+        .ok()
+        .flatten()
+        .map(|n| n.title)
+        .unwrap_or_default();
+    let branch = format!("tod/{}", short_id(node));
+    let message = format!("{what}: {title}\n\nCommitted by tod at the end of the run.");
+    commit_worktree(cwd, &branch, message.trim())?;
+    Ok(())
 }
 
 /// Plays the implementation agent for `--agent mock`: closes the first open

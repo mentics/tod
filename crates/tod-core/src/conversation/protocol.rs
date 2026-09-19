@@ -122,6 +122,12 @@ pub trait Protocol: Send + Sync {
         Ok(None)
     }
 
+    /// Runs once when the exchange ends and control returns to the user. A
+    /// failure is logged, never shown as a turn error.
+    fn finish(&self, _env: &ProtocolEnv<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether to hand back to the user, or send another turn without them.
     fn next(&self, _turn: &TurnContext<'_>) -> Result<Next> {
         Ok(Next::Done)

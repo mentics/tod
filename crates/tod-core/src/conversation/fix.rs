@@ -16,7 +16,7 @@
 
 use super::context::ReportedStale;
 use super::implement::{
-    IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, node_id, plan_steps,
+    IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
     worktree_fingerprint,
 };
 use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
@@ -57,6 +57,10 @@ impl Protocol for FixProtocol {
 
     fn starter(&self) -> Option<&'static str> {
         Some("Resolve the open review findings.")
+    }
+
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Result<()> {
+        commit_run(env, &self.cwd(env)?, "Fix review findings")
     }
 
     /// The same variables as review: `tod-cli review` defaults to the node,
