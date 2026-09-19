@@ -78,6 +78,16 @@ styles:
     background: danger-fill
     border: danger-fill
     hover: hover-danger
+  # A button that is on or off (e.g. a filter). Off looks like a quiet outlined
+  # button; on must be unmistakable at a glance: solid accent fill, bright edge,
+  # bold text.
+  button-toggle:
+    extends: button-small
+    color: text-muted
+    background: none
+    border: control-edge
+    hover: hover-control
+    selected: toggle-on
   button-small:
     font: body
     height: control-small
@@ -247,6 +257,11 @@ states:
     background: drag-edge
   disabled:
     color: text-muted
+  toggle-on:
+    color: text
+    background: toggle-on-fill
+    border: toggle-on-edge
+    font-weight: semibold
 
 properties:
   extends: "styles, comma-separated; later ones override earlier ones"
@@ -283,6 +298,8 @@ properties:
   hover: state
   highlighted: state
   disabled: state
+  selected: state
+  font-weight: "regular | semibold"
   dragging: state
 
 tokens:
@@ -312,6 +329,8 @@ tokens:
     badge-edge: "#a3a3a38c"
     highlight: "#1e40af33"
     highlight-edge: "#1d4ed8"
+    toggle-on-fill: "#1d4ed8"
+    toggle-on-edge: "#93c5fd"
     accent: "#1d4ed88c"
     link: "#fafafa"
     drag-edge: "#fafafaa6"

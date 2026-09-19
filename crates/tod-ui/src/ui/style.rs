@@ -54,6 +54,15 @@ pub mod color {
     pub fn link() -> Hsla {
         hex(0xfafafaff)
     }
+    pub fn toggle_on_fill() -> Hsla {
+        hex(0x1d4ed8ff)
+    }
+    pub fn toggle_on_edge() -> Hsla {
+        hex(0x93c5fdff)
+    }
+    pub fn control_edge() -> Hsla {
+        hex(0x2f2f2fff)
+    }
     pub fn accent() -> Hsla {
         hex(0x1d4ed88c)
     }
@@ -100,6 +109,20 @@ pub mod radius {
     pub const BADGE: Pixels = px(2.);
     pub const CONTROL: Pixels = px(6.);
     pub const FLOATING: Pixels = px(8.);
+}
+
+/// `styles.button-toggle`: a small outlined button; when `on` it takes the
+/// `toggle-on` state (solid accent fill, bright edge, semibold text).
+pub fn button_toggle<E: Styled>(el: E, on: bool) -> E {
+    let el = el.border_1().border_color(color::control_edge());
+    if on {
+        el.bg(color::toggle_on_fill())
+            .border_color(color::toggle_on_edge())
+            .text_color(color::text())
+            .font_weight(FontWeight::SEMIBOLD)
+    } else {
+        el.text_color(color::text_muted())
+    }
 }
 
 /// `styles.text`: body font in the text color, wrapping.

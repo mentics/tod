@@ -19,7 +19,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{Icon, Selectable, Sizable, h_flex, v_flex};
+use gpui_component::{Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
 use tod_store::conversation::ProtocolKind;
@@ -482,12 +482,11 @@ impl ConversationView {
             .gap(style::space::HAIRLINE)
             .px(style::space::RELATED)
             .py(style::space::HAIRLINE)
-            .child(
+            .child(style::button_toggle(
                 Button::new(ElementId::Name(format!("{kind}-filter-all").into()))
                     .label("All")
                     .ghost()
                     .small()
-                    .selected(self.status_filter.is_empty())
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.status_filter.is_empty() {
                             this.status_filter.clear();
@@ -495,23 +494,24 @@ impl ConversationView {
                             cx.notify();
                         }
                     })),
-            );
+                self.status_filter.is_empty(),
+            ));
         for status in statuses.iter().copied() {
             let n = rows.iter().filter(|s| **s == status).count();
             let on = self.status_filter.contains(status);
             if n == 0 && !on {
                 continue;
             }
-            bar = bar.child(
+            bar = bar.child(style::button_toggle(
                 Button::new(ElementId::Name(format!("{kind}-filter-{status}").into()))
                     .label(format!("{status} {n}"))
                     .ghost()
                     .small()
-                    .selected(on)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_status_filter(status, cx);
                     })),
-            );
+                on,
+            ));
         }
         Some(bar.into_any_element())
     }
