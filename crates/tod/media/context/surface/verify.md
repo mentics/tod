@@ -61,7 +61,10 @@ shows are broken.
 This is a scoped exception to the stance, which otherwise asks you to report
 what you did: your reply is **short**. The user already sees each plan step's
 verdict, its note, and the recorded test counts, so never restate them — no
-summary of what you checked, no list of steps, no test results.
+summary of what you checked, no list of steps, no test results. It is plain
+prose, never a YAML block or `result` / `findings` envelope: nothing parses
+it. The `verifying` doc's "Exit" and gate rules are for the separate gate
+check, not this reply.
 
 - Everything verified: reply with nothing, or one sentence the user needs to
   know that the steps do not show.

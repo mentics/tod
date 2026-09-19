@@ -64,6 +64,22 @@ pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<Str
     let base_path = manifest.state_base_doc();
     let base = read_doc(&base_path)
         .with_context(|| format!("read bundled state agent base doc {}", base_path.display()))?;
+    Ok(format!(
+        "## State agent conventions
+
+{}
+
+{}",
+        base.trim(),
+        state_lifecycle_doc(manifest, lifecycle)?,
+    ))
+}
+
+/// Only `lifecycle`'s own doc, without the shared state-agent conventions.
+/// Those conventions describe the app's structured turns (on-entry, gate
+/// check) and their YAML response envelope; a conversation that works a
+/// state's responsibilities replies in plain text, so it takes this instead.
+pub fn state_lifecycle_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<String> {
     let state_body = manifest
         .state_doc(lifecycle)
         .map(|path| read_doc(&path))
@@ -71,11 +87,9 @@ pub fn state_role_doc(manifest: &ProcessManifest, lifecycle: &str) -> Result<Str
         .unwrap_or_else(|| {
             format!("(No bundled state agent doc for lifecycle `{lifecycle}` — apply general task work.)")
         });
-    Ok(format!(
-        "## State agent conventions\n\n{}\n\n## Lifecycle state: {lifecycle}\n\n{}",
-        base.trim(),
-        state_body.trim(),
-    ))
+    Ok(format!("## Lifecycle state: {lifecycle}
+
+{}", state_body.trim()))
 }
 
 /// Assemble an ACP prompt for a fleet agent run from bundled state-agent docs.
@@ -174,5 +188,28 @@ mod tests {
             stance < cli && cli < role,
             "media fragments must precede the process-bundle role docs"
         );
+    }
+
+    /// The verification conversation once carried the shared state-agent
+    /// conventions, whose YAML response envelope the agent followed instead
+    /// of the surface's short plain reply.
+    #[test]
+    fn lifecycle_doc_leaves_out_the_structured_response_envelope() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("assets")
+            .join("process");
+        if !root.join("README.md").is_file() {
+            return;
+        }
+        let install = TodInstallPaths::from_process_root(root).unwrap();
+        let manifest = ProcessManifest::load(&install).unwrap();
+        let full = state_role_doc(&manifest, "verifying").unwrap();
+        let only = state_lifecycle_doc(&manifest, "verifying").unwrap();
+        assert!(full.contains("## Response format"));
+        assert!(!only.contains("## Response format"));
+        assert!(only.starts_with("## Lifecycle state: verifying"));
+        assert!(full.ends_with(&only));
     }
 }
