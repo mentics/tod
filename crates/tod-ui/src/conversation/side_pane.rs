@@ -23,8 +23,8 @@ use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_m
 use tod_store::conversation::ProtocolKind;
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, PLAN_STEP_STATUSES, STATUS_IN_PROGRESS, STATUS_IMPLEMENTED, STATUS_VERIFIED,
-    needs_user,
+    HandoffReason, PLAN_STEP_STATUSES, STATUS_FAILED, STATUS_IN_PROGRESS, STATUS_IMPLEMENTED,
+    STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
 use uuid::Uuid;
@@ -115,6 +115,32 @@ impl ConversationView {
         if self.deliver(&handoff_answer_message(&step, &answer), cx) {
             self.choose_status(step.id, STATUS_IN_PROGRESS, cx);
         }
+    }
+
+    /// Under a step that failed verification: what verification found. The
+    /// agent works it again from this note once implementation runs.
+    fn render_failure(
+        &self,
+        step: &PlanStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if step.status != STATUS_FAILED {
+            return None;
+        }
+        let mut col = v_flex()
+            .gap(style::space::HAIRLINE)
+            .pt(style::space::HAIRLINE)
+            .child(style::text_error(div()).child("Failed verification"));
+        if let Some(note) = &step.note {
+            col = col.child(style::text_dense_muted(div()).child(selectable_text(
+                format!("plan-step-failure-{}", step.id),
+                note.clone(),
+                window,
+                cx,
+            )));
+        }
+        Some(col.into_any_element())
     }
 
     /// Under a step left for the user: why, what is left, and a way to answer
@@ -239,13 +265,18 @@ impl ConversationView {
                     cx.notify();
                 }),
             )
-            .child(
-                style::badge(h_flex())
+            .child({
+                let badge = style::badge(h_flex())
                     .items_center()
                     .gap(style::space::HAIRLINE)
                     .child(status.to_string())
-                    .child(Icon::new(IconName::ChevronDown).xsmall()),
-            )
+                    .child(Icon::new(IconName::ChevronDown).xsmall());
+                if status == STATUS_FAILED {
+                    style::text_error(badge)
+                } else {
+                    badge
+                }
+            })
             .when_some(menu, |el, menu| {
                 el.child(
                     deferred(
@@ -373,6 +404,12 @@ impl ConversationView {
             .iter()
             .filter(|step| needs_user(&step.status))
             .count();
+        let failed = self
+            .data
+            .plan
+            .iter()
+            .filter(|step| step.status == STATUS_FAILED)
+            .count();
         let count = self.side_row_count();
         let cursor = self.side_cursor.filter(|ix| *ix < count);
         let lit = |row: usize| active && cursor == Some(row);
@@ -406,7 +443,9 @@ impl ConversationView {
         for (n, step) in steps.into_iter().enumerate() {
             let id = step.id;
             let badge = self.render_status_badge(id, &step.status, cx);
-            let handoff = self.render_handoff(&step, window, cx);
+            let handoff = self
+                .render_handoff(&step, window, cx)
+                .or_else(|| self.render_failure(&step, window, cx));
             rows.push(
                 h_flex()
                     .when(lit(n), style::highlighted)
@@ -481,10 +520,15 @@ impl ConversationView {
                         .flex_shrink_0()
                         .child("Implementation"),
                     )
-                    .child(style::text_dense_muted(div()).child(if waiting == 0 {
-                        format!("{done}/{total} steps")
-                    } else {
-                        format!("{done}/{total} steps, {waiting} need you")
+                    .child(style::text_dense_muted(div()).child({
+                        let mut summary = format!("{done}/{total} steps");
+                        if failed > 0 {
+                            summary.push_str(&format!(", {failed} failed verification"));
+                        }
+                        if waiting > 0 {
+                            summary.push_str(&format!(", {waiting} need you"));
+                        }
+                        summary
                     }))
                     .when_some(tests, |el, run| {
                         let label = run.label();

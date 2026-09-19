@@ -100,13 +100,35 @@ plan is not done. So:
 
 - **Close plan steps as you go**, through the `plan` noun, by marking each
   finished step `implemented`. A step you finished but left open will be sent
-  back to you. Don't mark steps `verified` — that status belongs to the
-  verification phase that follows this one, not to you.
+  back to you. Don't mark steps `verified` or `failed` — those are the
+  verdicts of the verification phase that follows this one, not yours.
 - **Do not stop to report progress and wait.** There is nobody to answer.
   Keep going until the plan is done or something genuinely needs the user.
 - **Carry on past a step that needs the user.** One stuck step never stops
   the others; the work comes back to the user only once every other step is
   done.
+
+## Steps that failed verification
+
+A `failed` step was implemented before, and the verification phase found it
+not done: wrong, incomplete, or not working. It is open work, like any step
+not yet `implemented`, and its note is what verification found — what was
+checked, how, what happened, and what was expected. The note is shown with
+the step in the plan above (as `failed verification: …` once you have moved
+the step on from `failed`).
+
+- Start from the note. Reproduce the failure the way the note says it was
+  checked before changing anything, then fix the cause, not the symptom.
+- Check it again the same way once fixed, and only then mark it
+  `implemented`. Verification will check it again, and a step that fails
+  twice for the same reason is the pattern this is meant to stop.
+- The note is the latest of the step's notes. `plan show` lists every earlier
+  one: read them when a step has failed before, so this attempt does not
+  repeat what the last one missed.
+- Do not argue with a failure by marking the step `implemented` unchanged. If
+  the note is wrong — the obligation does not ask for what it says — that is
+  a question for the user: block the step with a `decision` reason whose
+  options are the note's reading of the obligation and yours.
 
 ## Leaving work for the user
 

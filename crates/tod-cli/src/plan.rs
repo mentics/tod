@@ -6,7 +6,7 @@ use crate::args::Args;
 use std::collections::HashMap;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
-use tod_store::outline::repos::plan_steps::{HandoffReason, needs_user};
+use tod_store::outline::repos::plan_steps::{HandoffReason, STATUS_FAILED, needs_user};
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
 use uuid::Uuid;
@@ -24,7 +24,7 @@ COMMANDS:
     add       --node <UUID> --body <TEXT> [--after <ID>] [--before] [--depends-on <ID>] [--satisfies <OBLIGATION_ID>]
 
 Use `depend`/`satisfy` to add further links after creation — `add` only takes one of each.
-    update    <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|partial|blocked] [--reason conflict|decision|access|external] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--note <TEXT>]
+    update    <ID> [--body <TEXT>] [--status pending|ready|in_progress|implemented|verified|failed|partial|blocked] [--reason conflict|decision|access|external] [--cites <OBLIGATION_ID>]... [--option <TEXT>]... [--note <TEXT>]
     delete    <ID>
     depend    <ID> --on <ID>
     undepend  <ID> --on <ID>
@@ -42,7 +42,11 @@ the user can unblock it):
   decision   a choice the obligations leave open; --option each choice (two or more)
   access     a secret, account, or permission you do not have
   external   waiting on something outside this node
-Any other status clears the reason and note.
+`failed` is verification's verdict that a step is not done. It requires --note
+(what failed, and the evidence) and takes no --reason; implementation works a
+`failed` step again, starting from that note.
+Any other status clears the reason and note. Every note a step is given is
+kept: `show` lists them, oldest first.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -222,7 +226,7 @@ fn list(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 
 fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let raw = args.target("a plan step id")?;
-    let (row, deps, obligations) = inv.client().read(|conn| {
+    let (row, deps, obligations, notes) = inv.client().read(|conn| {
         let id = InterviewRepo::new(conn).resolve_plan_step_id(raw)?;
         let repo = PlanStepRepo::new(conn);
         let row = repo
@@ -230,17 +234,51 @@ fn show(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
             .ok_or_else(|| anyhow::anyhow!("plan step {raw} not found"))?;
         let deps = repo.list_dependencies(id)?;
         let obligations = repo.list_obligations(id)?;
-        Ok((row, deps, obligations))
+        let notes = repo.list_notes(id)?;
+        Ok((row, deps, obligations, notes))
     })?;
     if inv.json {
-        return Ok(step_json(&row, &deps, &obligations).to_string());
+        let mut item = step_json(&row, &deps, &obligations);
+        if let Some(obj) = item.as_object_mut() {
+            let notes: Vec<_> = notes
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "status": n.status,
+                        "body": n.body,
+                        "created_at": timestamp(n.created_at),
+                    })
+                })
+                .collect();
+            obj.insert("notes".into(), notes.into());
+        }
+        return Ok(item.to_string());
     }
-    Ok(format!(
+    let mut out = format!(
         "{}\non node {}\n{}",
         step_line(&row, &deps, &obligations),
         row.node_id,
         row.body
-    ))
+    );
+    if !notes.is_empty() {
+        out.push_str(&format!("\n\nnotes ({}, oldest first):", notes.len()));
+        for note in &notes {
+            out.push_str(&format!(
+                "\n- {} [{}] {}",
+                timestamp(note.created_at),
+                note.status,
+                note.body
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Milliseconds since the epoch as a UTC time, to the second.
+fn timestamp(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| ms.to_string())
 }
 
 fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
@@ -330,8 +368,8 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
 
 /// The reason a `partial` or `blocked` step needs the user, checked: such a
 /// step must give a reason and a note, `conflict` must cite the obligations
-/// and `decision` offer the options (two or more of each), and no other status
-/// carries any of it.
+/// and `decision` offer the options (two or more of each). A `failed` step
+/// must give a note and nothing else. No other status carries any of it.
 fn handoff(
     status: Option<&str>,
     note: Option<&str>,
@@ -339,14 +377,25 @@ fn handoff(
     cites: Vec<Uuid>,
     options: Vec<String>,
 ) -> anyhow::Result<Option<HandoffReason>> {
+    if status == Some(STATUS_FAILED) {
+        anyhow::ensure!(
+            reason.is_none() && cites.is_empty() && options.is_empty(),
+            "--status failed takes --note alone: --reason, --cites, and --option are for a step left for the user"
+        );
+        anyhow::ensure!(
+            note.is_some(),
+            "--status failed requires --note: what failed, and the evidence"
+        );
+        return Ok(None);
+    }
     let given = note.is_some() || reason.is_some() || !cites.is_empty() || !options.is_empty();
     let status = match status {
         Some(status) if needs_user(status) => status,
         Some(status) if given => anyhow::bail!(
-            "--reason, --note, --cites, and --option go with --status partial or blocked, not {status}"
+            "--reason, --note, --cites, and --option go with --status partial or blocked (--note alone with failed), not {status}"
         ),
         None if given => anyhow::bail!(
-            "--reason, --note, --cites, and --option go with --status partial or blocked"
+            "--reason, --note, --cites, and --option go with --status partial or blocked (--note alone with failed)"
         ),
         _ => return Ok(None),
     };
@@ -503,6 +552,7 @@ mod tests {
             ok(check(Some("blocked"), Some("n"), Some("Decision"), 0, &["a", "b"])),
             Some(HandoffReason::Decision { options }) if options == ["a", "b"]
         ));
+        assert_eq!(ok(check(Some("failed"), Some("still panics"), None, 0, &[])), None);
         assert_eq!(ok(check(Some("implemented"), None, None, 0, &[])), None);
         assert_eq!(ok(check(None, None, None, 0, &[])), None);
     }
@@ -520,6 +570,9 @@ mod tests {
         assert!(err(check(Some("blocked"), Some("n"), Some("conflict"), 2, &["a"])).contains("--option"));
         // Not a reason there is.
         assert!(err(check(Some("blocked"), Some("n"), Some("too-big"), 0, &[])).contains("unknown reason"));
+        // A failed step says what failed, and gives no hand-off reason.
+        assert!(err(check(Some("failed"), None, None, 0, &[])).contains("--note"));
+        assert!(err(check(Some("failed"), Some("n"), Some("access"), 0, &[])).contains("--note alone"));
         // Only for a step left for the user.
         assert!(check(Some("implemented"), Some("n"), None, 0, &[]).is_err());
         assert!(check(None, None, Some("access"), 0, &[]).is_err());

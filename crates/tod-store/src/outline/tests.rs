@@ -867,7 +867,7 @@ fn gate_criteria_seed_on_migration() {
     let ready_active = repo.list_for_transition("ready", "active").unwrap();
     assert_eq!(ready_active.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
-    assert_eq!(verifying_review.len(), 9);
+    assert_eq!(verifying_review.len(), 10);
     assert_eq!(
         design_planning.len() + planning_ready.len() + ready_active.len() + verifying_review.len(),
         GATE_CRITERIA.len() - superseded
@@ -994,6 +994,47 @@ fn plan_step_dependency_graph_and_obligation_links() {
             expected.sort();
             assert_eq!(ready, expected);
             assert_eq!(repo.get(step_b).unwrap().unwrap().status, "ready");
+            Ok(())
+        })
+        .unwrap();
+
+    // Verification fails step_a twice, with implementation in between: each
+    // note is kept, oldest first, and the step's own note is the latest.
+    let set = |status: &str, note: Option<&str>| {
+        store
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: step_a,
+                status: status.into(),
+                note: note.map(str::to_string),
+                reason: None,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+    };
+    set("failed", Some("Empty input panics"));
+    set("implemented", None);
+    set("failed", Some("Still panics on whitespace"));
+    // Setting the same note again, as reversing a change would, adds nothing.
+    set("failed", Some("Empty input panics"));
+    store
+        .read(|conn| {
+            let repo = PlanStepRepo::new(conn);
+            let step = repo.get(step_a).unwrap().unwrap();
+            assert_eq!(step.status, "failed");
+            assert_eq!(step.note.as_deref(), Some("Empty input panics"));
+            let notes: Vec<(String, String)> = repo
+                .list_notes(step_a)
+                .unwrap()
+                .into_iter()
+                .map(|n| (n.status, n.body))
+                .collect();
+            assert_eq!(
+                notes,
+                vec![
+                    ("failed".into(), "Empty input panics".into()),
+                    ("failed".into(), "Still panics on whitespace".into()),
+                ]
+            );
             Ok(())
         })
         .unwrap();
