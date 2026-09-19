@@ -45,6 +45,13 @@ pub enum Next {
     Continue { message: String },
 }
 
+/// Something the user should hear about when a run ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunNotice {
+    Warning(String),
+    Error(String),
+}
+
 /// What [`Protocol::next`] decides from.
 pub struct TurnContext<'a> {
     pub env: &'a ProtocolEnv<'a>,
@@ -122,10 +129,10 @@ pub trait Protocol: Send + Sync {
         Ok(None)
     }
 
-    /// Runs once when the exchange ends and control returns to the user. A
-    /// failure is logged, never shown as a turn error.
-    fn finish(&self, _env: &ProtocolEnv<'_>) -> Result<()> {
-        Ok(())
+    /// Runs once when the exchange ends and control returns to the user.
+    /// What it returns is shown to the user as toasts.
+    fn finish(&self, _env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
+        Vec::new()
     }
 
     /// Whether to hand back to the user, or send another turn without them.

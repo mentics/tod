@@ -11,6 +11,7 @@ use crate::ui::selectable_text::selectable_text;
 
 struct ConfirmToast;
 struct ErrorBannerNotification;
+struct WarningBannerNotification;
 struct CloseGuardToast;
 
 /// Overlay for queued notifications (error banners, confirm toasts).
@@ -47,6 +48,42 @@ pub fn error_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedS
                         // so this banner must not add a second one.
                         div().flex_1().min_w_0().pr_5().child(
                             selectable_text("error-banner-text", message.clone(), window, cx)
+                                .text_sm()
+                                .text_color(gpui::white()),
+                        ),
+                    )
+                    .into_any_element()
+            }),
+        cx,
+    );
+}
+
+/// Amber banner for something the user should know that is not a failure.
+pub fn warning_toast(window: &mut Window, cx: &mut App, message: impl Into<SharedString>) {
+    let message = message.into();
+    window.push_notification(
+        Notification::new()
+            .id::<WarningBannerNotification>()
+            .autohide(false)
+            .bg(gpui::hsla(0., 0., 0., 0.))
+            .border_0()
+            .shadow_none()
+            .p_0()
+            .content(move |_note, window, cx| {
+                h_flex()
+                    .id("warning-banner")
+                    .max_w(px(480.))
+                    .min_w(px(240.))
+                    .px_4()
+                    .py_2p5()
+                    .gap_2()
+                    .bg(gpui::rgb(0xb45309))
+                    .rounded_lg()
+                    .shadow_lg()
+                    .items_start()
+                    .child(
+                        div().flex_1().min_w_0().pr_5().child(
+                            selectable_text("warning-banner-text", message.clone(), window, cx)
                                 .text_sm()
                                 .text_color(gpui::white()),
                         ),

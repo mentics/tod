@@ -12,7 +12,7 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4.
 
-use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_implement_message};
 use crate::gate::PlanStepWithLinks;
 use anyhow::{Context, Result};
@@ -22,10 +22,10 @@ use std::path::PathBuf;
 use std::process::Command;
 use tod_agent::SessionPurpose;
 use tod_store::conversation::ProtocolKind;
-use tod_store::fleet::FleetStore;
 use tod_store::fleet::provision::resolve_launch_cwd;
-use tod_store::outline::EXTRA_CONTENT_DETAILS;
+use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::interview::short_id;
+use tod_store::outline::EXTRA_CONTENT_DETAILS;
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::{
     HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED, needs_user,
@@ -103,8 +103,11 @@ impl Protocol for ImplementationProtocol {
         SessionPurpose::Conversation
     }
 
-    fn finish(&self, env: &ProtocolEnv<'_>) -> Result<()> {
-        commit_run(env, &self.cwd(env)?, "Implement")
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
+        match self.cwd(env) {
+            Ok(cwd) => commit_run(env, &cwd, "Implement"),
+            Err(err) => vec![RunNotice::Error(format!("{err:#}"))],
+        }
     }
 
     /// Its writes are not a reversible change set, so no conversation actor:
@@ -343,9 +346,9 @@ pub fn handoff_answer_message(step: &PlanStep, answer: &HandoffAnswer) -> String
             let choice = options.get(*ix).map(String::as_str).unwrap_or_default();
             format!("Plan step [{id}]: go with \"{choice}\". Carry on with the step.")
         }
-        (Some(HandoffReason::External), _) => format!(
-            "Plan step [{id}]: what it was waiting on is in place now. Carry on with it."
-        ),
+        (Some(HandoffReason::External), _) => {
+            format!("Plan step [{id}]: what it was waiting on is in place now. Carry on with it.")
+        }
         _ => format!("Plan step [{id}]: the access it needed is in place now. Carry on with it."),
     };
     if let Some(note) = &step.note {
@@ -433,8 +436,8 @@ pub(super) fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithL
         .into_iter()
         .map(|mut step| {
             if step.note.is_none() && step_is_open(&step.status) {
-                step.note = latest_failure(fleet, step.id)
-                    .map(|note| format!("{FAILURE_PREFIX}{note}"));
+                step.note =
+                    latest_failure(fleet, step.id).map(|note| format!("{FAILURE_PREFIX}{note}"));
             }
             let depends_on = fleet
                 .list_plan_step_dependencies(step.id)
@@ -511,9 +514,21 @@ pub(super) fn commit_worktree(cwd: &std::path::Path, branch: &str, message: &str
     Ok(true)
 }
 
-/// Commit at the end of an implementation or fix run (see [`Protocol::finish`]).
-pub(super) fn commit_run(env: &ProtocolEnv<'_>, cwd: &std::path::Path, what: &str) -> Result<()> {
-    let node = node_id(env)?;
+/// The branch checked out in `cwd`, or `None` when HEAD is detached or it
+/// cannot be read.
+fn current_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|b| !b.is_empty())
+}
+
+/// What tells one run's commit from another's: which run of the conversation
+/// it is, where the plan stood when it ended, and the last test run.
+fn commit_message(env: &ProtocolEnv<'_>, node: Uuid, what: &str) -> String {
     let title = env
         .fleet
         .get_node(&node.to_string())
@@ -521,10 +536,107 @@ pub(super) fn commit_run(env: &ProtocolEnv<'_>, cwd: &std::path::Path, what: &st
         .flatten()
         .map(|n| n.title)
         .unwrap_or_default();
+    let (run, tests) = env
+        .fleet
+        .read(|conn| {
+            let repo = tod_store::conversation::ConversationRepo::new(conn);
+            let runs = repo
+                .turns(env.conversation_id)?
+                .iter()
+                .filter(|t| t.role == tod_store::conversation::TurnRole::User)
+                .count();
+            Ok((runs, repo.latest_report(env.conversation_id)?))
+        })
+        .unwrap_or_default();
+    let steps = plan_steps(env.fleet, node);
+    let done = steps
+        .iter()
+        .filter(|s| step_is_done(&s.step.status))
+        .count();
+    let mut message = format!(
+        "{what}: {title} (run {})
+",
+        run.max(1)
+    );
+    if !steps.is_empty() {
+        message.push_str(&format!(
+            "
+Plan: {done}/{} steps done
+",
+            steps.len()
+        ));
+        for s in &steps {
+            let first_line = s.step.body.lines().next().unwrap_or_default();
+            message.push_str(&format!(
+                "- [{}] {first_line}
+",
+                s.step.status
+            ));
+        }
+    }
+    if let Some(test) = tests.as_ref().and_then(TestRun::from_report) {
+        message.push_str(&format!(
+            "
+Tests: {}
+",
+            test.label()
+        ));
+    }
+    message.push_str(&format!(
+        "
+Conversation {}",
+        short_id(env.conversation_id)
+    ));
+    message
+}
+
+/// Commit at the end of an implementation or fix run (see [`Protocol::finish`]),
+/// then make the node's Files branch agree with what is checked out.
+pub(super) fn commit_run(
+    env: &ProtocolEnv<'_>,
+    cwd: &std::path::Path,
+    what: &str,
+) -> Vec<RunNotice> {
+    let mut notices = Vec::new();
+    let node = match node_id(env) {
+        Ok(node) => node,
+        Err(err) => return vec![RunNotice::Error(format!("{err:#}"))],
+    };
     let branch = format!("tod/{}", short_id(node));
-    let message = format!("{what}: {title}\n\nCommitted by tod at the end of the run.");
-    commit_worktree(cwd, &branch, message.trim())?;
-    Ok(())
+    if let Err(err) = commit_worktree(cwd, &branch, &commit_message(env, node, what)) {
+        notices.push(RunNotice::Error(format!(
+            "Committing the run failed: {err:#}"
+        )));
+    }
+    notices.extend(sync_branch(env, node, cwd));
+    notices
+}
+
+/// Record the checked-out branch on the Files capability when it has none;
+/// warn when it has a different one.
+fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &std::path::Path) -> Option<RunNotice> {
+    let actual = current_branch(cwd)?;
+    env.fleet.reload_if_stale().ok();
+    let files = env.fleet.resolve_files_for_node(&node.to_string()).ok()??;
+    match files.branch() {
+        Some(recorded) if recorded == actual => None,
+        Some(recorded) => Some(RunNotice::Warning(format!(
+            "The Files branch is \"{recorded}\", but the worktree is on \"{actual}\"."
+        ))),
+        None => {
+            let saved = env
+                .fleet
+                .enqueue(FleetMutation::UpdateTaskBranch {
+                    id: files.source_node_id.clone(),
+                    branch: Some(actual.clone()),
+                })
+                .and_then(|_| env.fleet.writer().flush());
+            env.fleet.reload_if_stale().ok();
+            saved.err().map(|err| {
+                RunNotice::Error(format!("Could not record branch \"{actual}\": {err:#}"))
+            })
+        }
+    }
 }
 
 /// Plays the implementation agent for `--agent mock`: closes the first open
@@ -564,6 +676,43 @@ pub fn mock_turn(
         },
     )?;
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn commits_dirty_tree_on_detached_head_and_skips_clean_one() {
+        let dir = std::env::temp_dir().join(format!("tod-commit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+        git(&dir, &["checkout", "-q", "--detach"]);
+
+        // A clean tree makes no commit and creates no branch.
+        assert!(!commit_worktree(&dir, "tod/x", "nothing").unwrap());
+        assert_eq!(current_branch(&dir), None);
+
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        assert!(commit_worktree(&dir, "tod/x", "second").unwrap());
+        assert_eq!(current_branch(&dir).as_deref(), Some("tod/x"));
+        assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -617,7 +766,10 @@ mod tests {
         let green = continuation_message(&[], Some(&run(24, 0, 0)));
         assert!(!green.contains("not green"), "{green}");
         assert!(!green.contains("No test run"), "{green}");
-        assert!(green.contains("run the tests again after your last change"), "{green}");
+        assert!(
+            green.contains("run the tests again after your last change"),
+            "{green}"
+        );
     }
 
     /// The message opens with what is left, since that is all the
@@ -629,7 +781,10 @@ mod tests {
         let steps = plan_steps(&fx.fleet, fx.node);
         let open: Vec<&PlanStepWithLinks> = steps.iter().collect();
         let message = continuation_message(&open, None);
-        assert!(message.starts_with("3 plan steps are still open"), "{message}");
+        assert!(
+            message.starts_with("3 plan steps are still open"),
+            "{message}"
+        );
         assert!(message.contains("not yours to decide"), "{message}");
         assert!(message.contains("at most a sentence or two"), "{message}");
     }
@@ -742,7 +897,10 @@ mod tests {
             let Next::Continue { message } = decide(&fx, green(), 0, true) else {
                 panic!("an open plan step should continue");
             };
-            assert!(message.starts_with("1 plan step is still open"), "{message}");
+            assert!(
+                message.starts_with("1 plan step is still open"),
+                "{message}"
+            );
             assert!(message.contains("Step 1"), "{message}");
         }
 
@@ -755,8 +913,7 @@ mod tests {
         #[test]
         fn red_tests_keep_the_loop_going_even_with_every_step_closed() {
             let fx = planned(2, 2);
-            let Next::Continue { message } = decide(&fx, Some(run(22, 2, 0)), 0, true)
-            else {
+            let Next::Continue { message } = decide(&fx, Some(run(22, 2, 0)), 0, true) else {
                 panic!("red tests should continue");
             };
             assert!(message.contains("not green"), "{message}");
@@ -794,9 +951,18 @@ mod tests {
                 obligations: vec![a, b],
             });
             let text = handoff_answer_message(&conflict, &HandoffAnswer::Keep(a));
-            assert!(text.starts_with("Plan step [aaaaaaaa]: keep obligation [bbbbbbbb]"), "{text}");
-            assert!(text.contains("Where [cccccccc] disagrees with it"), "{text}");
-            assert!(text.ends_with("Your note on it was: The form outgrew ConfigSchema."), "{text}");
+            assert!(
+                text.starts_with("Plan step [aaaaaaaa]: keep obligation [bbbbbbbb]"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Where [cccccccc] disagrees with it"),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("Your note on it was: The form outgrew ConfigSchema."),
+                "{text}"
+            );
 
             let decision = handed_back(HandoffReason::Decision {
                 options: vec!["Generic".into(), "Linear-specific".into()],
@@ -806,7 +972,10 @@ mod tests {
 
             let access = handed_back(HandoffReason::Access);
             let text = handoff_answer_message(&access, &HandoffAnswer::Retry);
-            assert!(text.contains("the access it needed is in place now"), "{text}");
+            assert!(
+                text.contains("the access it needed is in place now"),
+                "{text}"
+            );
         }
 
         fn hand_over(fx: &Fixture, n: usize, status: &str) {
@@ -829,7 +998,10 @@ mod tests {
             let Next::Continue { message } = decide(&fx, None, 0, true) else {
                 panic!("the other open steps should continue");
             };
-            assert!(message.starts_with("2 plan steps are still open"), "{message}");
+            assert!(
+                message.starts_with("2 plan steps are still open"),
+                "{message}"
+            );
             assert!(!message.contains("Step 1"), "{message}");
         }
 
@@ -865,10 +1037,16 @@ mod tests {
             let Next::Continue { message } = decide(&fx, green(), 0, true) else {
                 panic!("a failed step should continue");
             };
-            assert!(message.starts_with("1 plan step is still open"), "{message}");
+            assert!(
+                message.starts_with("1 plan step is still open"),
+                "{message}"
+            );
             assert!(message.contains("(failed): Step 0"), "{message}");
             assert!(message.contains("note: Empty input panics"), "{message}");
-            assert!(message.contains("failed verification was implemented once"), "{message}");
+            assert!(
+                message.contains("failed verification was implemented once"),
+                "{message}"
+            );
 
             set(&fx, 0, "in_progress", None);
             let Next::Continue { message } = decide(&fx, green(), 0, true) else {

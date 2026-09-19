@@ -23,4 +23,4 @@ mod tests;
 pub use driver::{
     ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, ROTATION_NOTE,
 };
-pub use protocol::{CONTINUATION_CAP, Next, Protocol, ProtocolEnv, protocol_for};
+pub use protocol::{CONTINUATION_CAP, Next, Protocol, ProtocolEnv, RunNotice, protocol_for};

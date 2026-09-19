@@ -84,7 +84,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{
-    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, protocol_for,
+    ConversationConfig, ConversationDriver, ConversationEvent, ConversationStatus, RunNotice,
+    protocol_for,
 };
 use tod_store::conversation::{
     ConversationRepo, ConversationSummary, Entity as ItemEntity, EntitySnapshot, Focus, NetChange,
@@ -94,8 +95,8 @@ use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
-use tod_store::review::{ReviewFinding, ReviewRepo};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
+use tod_store::review::{ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -114,6 +115,9 @@ pub enum ConversationViewEvent {
         node_id: Uuid,
         obligation_id: Option<Uuid>,
     },
+    /// A run ended with something the user should hear about (a failed
+    /// commit, a branch that does not match): the shell shows it as a toast.
+    Notice(RunNotice),
 }
 
 /// Which pane Up/Down act on.
@@ -336,6 +340,8 @@ pub struct ConversationView {
     side_files: Vec<String>,
     /// Turns the protocol's loop has sent since the last user message.
     loop_turns: u32,
+    /// Notices from finished runs, emitted as events on the next poll.
+    pending_notices: Vec<RunNotice>,
     /// The highlighted row of a side pane other than the change set: plan
     /// steps first, then changed files.
     side_cursor: Option<usize>,
@@ -413,6 +419,9 @@ impl ConversationView {
                 }
                 let Ok(want_files) = this.update(cx, |this, cx| {
                     let (changed, want_files) = this.poll(committed);
+                    for notice in std::mem::take(&mut this.pending_notices) {
+                        cx.emit(ConversationViewEvent::Notice(notice));
+                    }
                     if changed {
                         cx.notify();
                     }
@@ -462,6 +471,7 @@ impl ConversationView {
             protocol: ProtocolKind::Outline,
             side_files: Vec::new(),
             loop_turns: 0,
+            pending_notices: Vec::new(),
             tab: Tab::All,
             cursor: None,
             link: None,
@@ -761,6 +771,7 @@ impl ConversationView {
                         ConversationEvent::Continued
                         | ConversationEvent::TurnFinished { error: None } => {}
                         ConversationEvent::Rotated => {}
+                        ConversationEvent::Notice(notice) => self.pending_notices.push(notice),
                     }
                     if driver.conversation_id() == current && current.is_some() {
                         loop_turns = Some(driver.continuations());

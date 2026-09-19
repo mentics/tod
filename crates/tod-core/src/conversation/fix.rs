@@ -19,7 +19,7 @@ use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
     worktree_fingerprint,
 };
-use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
 use crate::dynamic::review_finding_lines;
 use anyhow::{Context, Result};
@@ -59,8 +59,11 @@ impl Protocol for FixProtocol {
         Some("Resolve the open review findings.")
     }
 
-    fn finish(&self, env: &ProtocolEnv<'_>) -> Result<()> {
-        commit_run(env, &self.cwd(env)?, "Fix review findings")
+    fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
+        match self.cwd(env) {
+            Ok(cwd) => commit_run(env, &cwd, "Fix review findings"),
+            Err(err) => vec![RunNotice::Error(format!("{err:#}"))],
+        }
     }
 
     /// The same variables as review: `tod-cli review` defaults to the node,
@@ -364,7 +367,10 @@ mod tests {
         let Next::Continue { message } = decide(&fx, green(), 0, true) else {
             panic!("open findings should continue");
         };
-        assert!(message.starts_with("2 review findings are still open"), "{message}");
+        assert!(
+            message.starts_with("2 review findings are still open"),
+            "{message}"
+        );
         assert!(message.contains(&short_id(ids[1])), "{message}");
         assert!(message.contains("Finding 1"), "{message}");
         assert!(message.contains("`rejected` with a note"), "{message}");
@@ -379,7 +385,10 @@ mod tests {
         let Next::Continue { message } = decide(&fx, None, 0, true) else {
             panic!("no test run should continue");
         };
-        assert!(message.starts_with("Every review finding is resolved"), "{message}");
+        assert!(
+            message.starts_with("Every review finding is resolved"),
+            "{message}"
+        );
         assert!(message.contains("No test run was recorded"), "{message}");
         assert!(matches!(decide(&fx, green(), 0, true), Next::Done));
     }
@@ -387,7 +396,10 @@ mod tests {
     #[test]
     fn the_cap_or_a_turn_that_changed_nothing_stops_the_loop() {
         let (fx, _) = with_findings(1);
-        assert!(matches!(decide(&fx, None, CONTINUATION_CAP, true), Next::Done));
+        assert!(matches!(
+            decide(&fx, None, CONTINUATION_CAP, true),
+            Next::Done
+        ));
         assert!(matches!(decide(&fx, None, 1, false), Next::Done));
     }
 }

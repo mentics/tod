@@ -12,7 +12,9 @@
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
 use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
-use crate::conversation::protocol::{Next, Protocol, ProtocolEnv, TurnContext, protocol_for};
+use crate::conversation::protocol::{
+    Next, Protocol, ProtocolEnv, RunNotice, TurnContext, protocol_for,
+};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
 use crate::session_name::session_name;
@@ -66,6 +68,9 @@ pub enum ConversationEvent {
     /// The protocol's loop sent another turn without the user; a continuation
     /// turn is in the transcript and a run is still in flight.
     Continued,
+    /// The protocol has something to tell the user as the run ended (a failed
+    /// commit, a branch that does not match): a toast.
+    Notice(RunNotice),
 }
 
 /// The turn in flight.
@@ -439,8 +444,8 @@ impl ConversationDriver {
         match next {
             Next::Done => {
                 self.continuations = 0;
-                if let Err(err) = self.protocol.finish(&self.env(fleet, id)) {
-                    tracing::warn!(conversation = %id, "end-of-run commit failed: {err:#}");
+                for notice in self.protocol.finish(&self.env(fleet, id)) {
+                    events.push(ConversationEvent::Notice(notice));
                 }
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
@@ -708,7 +713,10 @@ fn join(changes: &str, text: &str) -> String {
 fn tod_cli_path_env() -> Option<(String, String)> {
     let cli = crate::interview::tod_cli_path();
     let dir = cli.parent().filter(|_| cli.is_file())?;
-    Some(("PATH".to_string(), prepend_path(dir, std::env::var_os("PATH"))?))
+    Some((
+        "PATH".to_string(),
+        prepend_path(dir, std::env::var_os("PATH"))?,
+    ))
 }
 
 fn prepend_path(dir: &std::path::Path, path: Option<std::ffi::OsString>) -> Option<String> {

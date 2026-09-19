@@ -27,7 +27,7 @@ use crate::ui::app_nav::{
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
-use crate::ui::toast::{error_toast, notification_overlay};
+use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::lifecycle_control::LifecycleController;
@@ -45,6 +45,7 @@ use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBa
 use std::path::PathBuf;
 use std::sync::Arc;
 use tod_agent::EngagementState;
+use tod_core::conversation::RunNotice;
 use tod_core::process::{interview_phase_for_lifecycle, interview_phase_label};
 use tod_core::run_transcript;
 use tod_store::agent_traffic::{
@@ -130,6 +131,7 @@ pub struct Shell {
     /// window to open the task list's credential prompt with.
     pending_linear_credentials_for: Option<Uuid>,
     pending_error_toast: Option<String>,
+    pending_warning_toast: Option<String>,
     always_on_top: bool,
     tasks_split_state: Entity<PanelSplitState>,
     _task_list_subscription: Subscription,
@@ -671,7 +673,25 @@ impl Shell {
         cx.notify();
     }
 
+    /// Like [`Self::queue_error_toast`], for something the user should know
+    /// but that is not a failure.
+    fn queue_warning_toast(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.pending_warning_toast = Some(match self.pending_warning_toast.take() {
+            Some(earlier) => format!(
+                "{earlier}
+
+{message}"
+            ),
+            None => message,
+        });
+        cx.notify();
+    }
+
     fn drain_pending_error_toast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(message) = self.pending_warning_toast.take() {
+            warning_toast(window, cx, message);
+        }
         if let Some(message) = self.pending_error_toast.take() {
             error_toast(window, cx, message);
         }
@@ -1776,6 +1796,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                             this.pending_leave_conversation = true;
                                             cx.notify();
                                         }
+                                        ConversationViewEvent::Notice(notice) => match notice {
+                                            RunNotice::Error(message) => {
+                                                this.queue_error_toast(message.clone(), cx)
+                                            }
+                                            RunNotice::Warning(message) => {
+                                                this.queue_warning_toast(message.clone(), cx)
+                                            }
+                                        },
                                         ConversationViewEvent::GoToTasks {
                                             node_id,
                                             obligation_id,
@@ -1835,6 +1863,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_refocus_task_list: false,
                                 pending_linear_credentials_for: None,
                                 pending_error_toast: None,
+                                pending_warning_toast: None,
                                 always_on_top: restore_always_on_top,
                                 tasks_split_state,
                                 _task_list_subscription,
