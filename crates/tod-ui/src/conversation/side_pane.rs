@@ -11,6 +11,7 @@
 //! Spec: `doc/conversation/protocols.md` §4.5.
 
 use super::{ConversationView, Pane};
+use crate::ui::agent_conversation::NoticeTone;
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
@@ -20,7 +21,7 @@ use gpui::{
     deferred, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{Icon, Sizable, h_flex, v_flex};
+use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
 use tod_store::conversation::ProtocolKind;
@@ -421,12 +422,7 @@ impl ConversationView {
                 self.render_plan_pane(window, cx)
             }
             ProtocolKind::Review | ProtocolKind::Fix => self.render_review_pane(window, cx),
-            // The verdict and its blockers sit above the input, and the
-            // criteria rows beside them; this pane says what was run.
-            ProtocolKind::GateCheck => self.render_empty_pane(
-                "Gate check",
-                "The verdict and what blocks it are above the input.",
-            ),
+            ProtocolKind::GateCheck => self.render_gate_pane(window, cx),
             ProtocolKind::OnEntry => self.render_empty_pane(
                 "On entry",
                 "What the state's agent did is in the transcript.",
@@ -926,6 +922,67 @@ impl ConversationView {
                     .overflow_y_scroll()
                     .pb(style::space::RELATED)
                     .children(rows),
+            )
+            .into_any_element()
+    }
+
+    /// The gate check's verdict: why, each blocker with the button that acts
+    /// on it, a Waive per failing criterion, and the recommended next step.
+    fn render_gate_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let (_, notices) = self.lifecycle_controls(cx);
+        if notices.is_empty() {
+            let message = if self.status.running {
+                "The verdict will appear here."
+            } else {
+                "No verdict yet."
+            };
+            return self.render_empty_pane("Gate check", message);
+        }
+        let mut rows = v_flex().gap(style::space::RELATED).p(style::space::INSET);
+        for (ix, notice) in notices.into_iter().enumerate() {
+            let text = selectable_text(
+                format!("gate-pane-notice-{ix}"),
+                notice.text.clone(),
+                window,
+                cx,
+            );
+            let text = match notice.tone {
+                NoticeTone::Error => style::text_error(div()),
+                NoticeTone::Muted | NoticeTone::Busy => style::text_dense_muted(div()),
+            }
+            .flex_1()
+            .min_w_0()
+            .child(text);
+            let button = notice.action.map(|action| {
+                let id = action.id.clone();
+                Button::new(ElementId::Name(format!("gate-pane-action-{ix}").into()))
+                    .label(action.label)
+                    .small()
+                    .flex_shrink_0()
+                    .disabled(action.disabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.lifecycle_action(&id, window, cx);
+                    }))
+            });
+            rows = rows.child(
+                h_flex()
+                    .items_center()
+                    .gap(style::space::RELATED)
+                    .child(text)
+                    .children(button),
+            );
+        }
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .child(style::panel_header(div()).child(style::text_muted(div()).child("Gate check")))
+            .child(
+                div()
+                    .id("gate-pane")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(rows),
             )
             .into_any_element()
     }

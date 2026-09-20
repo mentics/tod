@@ -8,7 +8,7 @@ use crate::ui::agent_conversation::{
 use gpui::{
     AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
 };
-use tod_store::conversation::{ConversationRepo, Turn, TurnRole};
+use tod_store::conversation::{ConversationRepo, ProtocolKind, Turn, TurnRole};
 
 /// The transcript header's button that copies the opening context.
 const COPY_CONTEXT: &str = "transcript:copy-context";
@@ -29,6 +29,18 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         parts: turn.parts.clone(),
         label: None,
     }
+}
+
+/// One line for a gate check's parsed reply; the detail is in the side pane.
+fn gate_reply_line(reply: &tod_core::gate::GateCheckReply) -> String {
+    use tod_core::gate::GateOutcome;
+    let verdict = match reply.result {
+        GateOutcome::Pass => "passed",
+        GateOutcome::Blocked => "blocked",
+        GateOutcome::NeedsHuman => "needs you",
+        GateOutcome::NoChange => "no change",
+    };
+    format!("Gate check {verdict}. Details are in the side pane.")
 }
 
 impl ConversationView {
@@ -112,7 +124,23 @@ impl ConversationView {
     ) -> AnyElement {
         let active =
             self.pane == Pane::Transcript && self.stop == Stop::Transcript && self.picker.is_none();
-        let entries = self.data.turns.iter().map(entry_of).collect();
+        let gate_check = self.data.protocol == ProtocolKind::GateCheck;
+        let entries = self
+            .data
+            .turns
+            .iter()
+            .map(|turn| {
+                let mut entry = entry_of(turn);
+                // The verdict is structured YAML the app records and shows in
+                // the side pane; the transcript says only that it came.
+                if gate_check && turn.role == TurnRole::Agent {
+                    if let Ok(reply) = tod_core::gate::parse_gate_reply(&turn.body) {
+                        entry.body = gate_reply_line(&reply);
+                    }
+                }
+                entry
+            })
+            .collect();
         let empty = format!(
             "No conversation about {} yet. Give direction below.",
             self.data.title
@@ -124,13 +152,26 @@ impl ConversationView {
                 .iter()
                 .find(|c| c.conversation.id == id)
         }) {
+            // App-started kinds open with the app's own prompt, which is not
+            // a name; the picker labels them by kind and transition.
+            Some(c) if c.conversation.protocol != ProtocolKind::Outline => {
+                let kind = super::header::kind_label(c.conversation.protocol);
+                match c.conversation.transition_label() {
+                    Some(label) => format!("{kind} · {label}"),
+                    None => kind.to_string(),
+                }
+            }
             Some(c) if c.opening.is_empty() => "(no messages)".to_string(),
             Some(c) => c.opening.clone(),
             None => super::header::new_label(self.data.protocol).to_string(),
         };
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
-        let (actions, notices) = self.lifecycle_controls(cx);
+        let (actions, mut notices) = self.lifecycle_controls(cx);
+        // A gate check's verdict and its blockers are in the side pane.
+        if gate_check {
+            notices.clear();
+        }
         let header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {

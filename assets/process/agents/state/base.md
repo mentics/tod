@@ -71,12 +71,12 @@ result: pass | blocked | needs_human | no_change
 forward_lifecycle: {string|null}
 paused: {true|false}
 summary: "one sentence: why the gate passed or did not"
-next: implement | verify | fix | waive | interview | ask_user   # the ONE step the user should take next; omit on pass
+next: implement | verify | fix | waive | interview | ask_user   # `verify` only while the node is in `verifying`; the ONE step the user should take next; omit on pass
 blockers:                     # required whenever result is not pass and no gate_results row fails
   - kind: plan_step | test | criterion | finding | other
     ref: "plan step id, test path, or criterion id"
     what: "what is wrong, in one line"
-    do: implement | verify | fix | waive | interview | ask_user
+    do: implement | verify | fix | waive | interview | ask_user   # `verify` only while the node is in `verifying`
 findings: "optional longer detail or multi-line block scalar"
 gate_results:
   - criterion_id: {uuid}

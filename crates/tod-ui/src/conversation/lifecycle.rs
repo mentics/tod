@@ -325,7 +325,7 @@ impl ConversationView {
             notices.push(PanelNotice::new(NoticeTone::Error, error.clone()));
         }
         if let Some(report) = snapshot.gate.as_ref().filter(|_| !gate_stale && !checking) {
-            notices.extend(gate_report_notices(report));
+            notices.extend(gate_report_notices(report, &snapshot.lifecycle));
         }
         for row in gate
             .criteria_detail
@@ -443,7 +443,7 @@ impl ConversationView {
 /// with the button that acts on it when the app can, and the recommended next
 /// step. A verdict that says nothing is said to say nothing, so the user is
 /// never pointed at reasons that are not there.
-fn gate_report_notices(report: &GateReportRecord) -> Vec<PanelNotice> {
+fn gate_report_notices(report: &GateReportRecord, lifecycle: &str) -> Vec<PanelNotice> {
     let mut notices = Vec::new();
     let passed = report.result == "pass";
     if !report.summary.is_empty() {
@@ -474,7 +474,9 @@ fn gate_report_notices(report: &GateReportRecord) -> Vec<PanelNotice> {
         let mut notice = PanelNotice::new(NoticeTone::Error, text);
         let button = match blocker.action.as_str() {
             "implement" => Some(PanelAction::new(IMPLEMENT, "Implement")),
-            "verify" => Some(PanelAction::new(VERIFY, "Verify")),
+            // Verification runs on a node in `verifying`; offered from any
+            // other state it would mislead.
+            "verify" if lifecycle == "verifying" => Some(PanelAction::new(VERIFY, "Verify")),
             "fix" => Some(PanelAction::new(FIX, "Fix")),
             _ => None,
         };

@@ -13,7 +13,7 @@
 
 Execute the **plan steps** (`tod-cli plan`) honoring design-phase and applicable obligations.
 
-- Work steps `tod-cli plan ready --node <NODE>` reports as eligible; advance a step's status (`plan update --status`) as it moves to `in_progress`, `implemented`, then `verified`.
+- Work steps `tod-cli plan ready --node <NODE>` reports as eligible; advance a step's status (`plan update --status`) as it moves to `in_progress`, then `implemented`. A step is never marked `verified` here — that is the `verifying` state's job.
 - Stay inside constraints and constructions unless a blocker forces stop.
 - Decide local/reversible plan detail; ask for product intent, irreversible API/schema choices, and doc conflicts.
 - Add, split, or re-link steps (`plan add`, `plan depend`/`undepend`) as implementation learns; minor plan/obligation edits need not change lifecycle state. **Major** rethinks → move back to `design` or `planning`.
@@ -60,14 +60,14 @@ After a coherent change set, reconcile obligations (including design-phase), pla
 
 Apply these prose rules (no DB checklist items for this transition):
 
-- Implementation is **verified complete** against plan steps (each `implemented`/`verified`) and applicable obligations, including design-phase ones (agent checked—not merely claimed).
+- Implementation is **confirmed complete** against plan steps (each `implemented`; `verified` is not expected yet) and applicable obligations, including design-phase ones (agent checked—not merely claimed).
 - Automated tests that **ship/merge with the code** are complete and included.
 - Runnable surfaces / requirements treated as complete in `active` were **exercised in running context** by the agent — not left for first exercise in `verifying`.
 - Extra local-only harnesses, one-off checks, and the full requirement sweep may still run in `verifying`.
 
 ## Exit
 
-When implementation is verified complete against plan and obligations (including design-phase), ship-with-code tests are done, and runnable slices claimed complete were exercised in context, return `forward_lifecycle: verifying`.
+When implementation is confirmed complete against plan and obligations (including design-phase), ship-with-code tests are done, and runnable slices claimed complete were exercised in context, return `forward_lifecycle: verifying`.
 
 ## Blockers
 
