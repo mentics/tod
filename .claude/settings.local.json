@@ -202,7 +202,8 @@
       "Bash(for id in 13941988 118b90a8 8decf8c1 36a833a4 5a390256 64411b25 45d406c6 828fd9b5)",
       "Bash(C:/data/git/tod/target/dev-fast/tod-cli.exe:*)",
       "Bash(git log:*)",
-      "Bash(awk:*)"
+      "Bash(awk:*)",
+      "Bash(cargo doc:*)"
     ]
   }
 }

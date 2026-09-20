@@ -1749,6 +1749,36 @@ impl TaskEditView {
         }
     }
 
+    /// Ensure all Input entities exist for filter fields that need them.
+    /// Called early in render() to pre-create entities before immutable borrows.
+    fn ensure_linear_filter_inputs_created(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Create Input entities for all Text and DateRange filter values
+        for (field_name, value) in &self.linear_filter_values {
+            match value {
+                LinearFilterValue::Text(_text) => {
+                    self.linear_filter_inputs.text_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx))
+                        });
+                }
+                LinearFilterValue::DateRange { after: _, before: _ } => {
+                    self.linear_filter_inputs.date_after_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).placeholder("After (YYYY-MM-DD)"))
+                        });
+                    self.linear_filter_inputs.date_before_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).placeholder("Before (YYYY-MM-DD)"))
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn load_linear_preset_values(&mut self, filters: &serde_json::Map<String, serde_json::Value>) {
         // Load filter values from preset into linear_filter_values
         for (key, value) in filters {
@@ -1853,6 +1883,7 @@ impl TaskEditView {
                 if exists {
                     // Show confirmation toast for overwrite
                     let view = cx.entity().downgrade();
+                    let view_cancel = view.clone();
                     let preset_name_clone = preset_name.clone();
                     let data_root_clone = data_root.clone();
                     confirm_toast(
@@ -1875,7 +1906,7 @@ impl TaskEditView {
                         },
                         move |_window, cx| {
                             // User cancelled - just clear the action
-                            let _ = view.update(cx, |this, _cx| {
+                            let _ = view_cancel.update(cx, |this, _cx| {
                                 this.linear_preset_action = None;
                             });
                         },
@@ -3933,43 +3964,23 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_ui(
-        &mut self,
+        &self,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let cred_status = self.render_linear_credential_status(muted, cx);
-        let intro_section = self.render_linear_introspection_section(muted, cx);
         let has_cache = self.linear_introspection_cache.is_some();
-
-        let preset_section = if has_cache {
-            Some(self.render_linear_preset_section(muted, window, cx))
-        } else {
-            None
-        };
-
-        let filter_fields = if has_cache {
-            Some(self.render_linear_filter_fields(muted, window, cx))
-        } else {
-            None
-        };
-
-        let result_cap = if has_cache {
-            Some(self.render_linear_result_cap(window, cx))
-        } else {
-            None
-        };
 
         v_flex()
             .gap_3()
-            .child(cred_status)
-            .child(intro_section)
+            .child(self.render_linear_credential_status(muted, cx))
+            .child(self.render_linear_introspection_section(muted, cx))
             .when(has_cache, |el| {
-                el.children(preset_section)
-                    .children(filter_fields)
-                    .children(result_cap)
+                el.child(self.render_linear_preset_section(muted, window, cx))
+                    .child(self.render_linear_filter_fields(muted, window, cx))
+                    .child(self.render_linear_result_cap(window, cx))
             })
-            .when(self.linear_introspection_cache.is_none(), |el| {
+            .when(!has_cache, |el| {
                 el.child(
                     div()
                         .text_xs()
@@ -4136,7 +4147,7 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_fields(
-        &mut self,
+        &self,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -4158,12 +4169,12 @@ impl TaskEditView {
 
         let mut common_elements = Vec::new();
         for field in common {
-            common_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx));
+            common_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx).into_any_element());
         }
 
         let mut additional_elements = Vec::new();
         for field in additional {
-            additional_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx));
+            additional_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx).into_any_element());
         }
 
         v_flex()
@@ -4180,7 +4191,7 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_field(
-        &mut self,
+        &self,
         field: &tod_integration::FilterFieldMetadata,
         _enums: &std::collections::HashMap<String, Vec<String>>,
         window: &mut Window,
@@ -4203,22 +4214,15 @@ impl TaskEditView {
 
         let control = if let Some(value) = self.linear_filter_values.get(&field.name) {
             match value {
-                LinearFilterValue::Text(text) => {
-                    // Create or get text input
-                    let input = self.linear_filter_inputs.text_inputs
-                        .entry(field.name.clone())
-                        .or_insert_with(|| {
-                            cx.new(|cx| InputState::new(window, cx).text(text.clone()))
-                        });
-                    // Update text if needed
-                    input.update(cx, |state, cx| {
-                        if input_text(input, cx) != *text {
-                            state.set_text(text.clone(), cx);
-                        }
-                    });
-                    Input::new(input)
-                        .xsmall()
-                        .into_any_element()
+                LinearFilterValue::Text(_text) => {
+                    // Get pre-created text input (guaranteed to exist)
+                    if let Some(input) = self.linear_filter_inputs.text_inputs.get(&field.name) {
+                        Input::new(input)
+                            .xsmall()
+                            .into_any_element()
+                    } else {
+                        div().text_xs().child("(input not created)").into_any_element()
+                    }
                 }
                 LinearFilterValue::Enum { selected, options } => {
                     let display = selected.clone().unwrap_or_else(|| "(none)".to_string());
@@ -4232,34 +4236,20 @@ impl TaskEditView {
                         }))
                         .into_any_element()
                 }
-                LinearFilterValue::DateRange { after, before } => {
-                    // Create or get date inputs
-                    let after_input = self.linear_filter_inputs.date_after_inputs
-                        .entry(field.name.clone())
-                        .or_insert_with(|| {
-                            cx.new(|cx| InputState::new(window, cx).text(after.clone()).placeholder("After (YYYY-MM-DD)"))
-                        });
-                    let before_input = self.linear_filter_inputs.date_before_inputs
-                        .entry(field.name.clone())
-                        .or_insert_with(|| {
-                            cx.new(|cx| InputState::new(window, cx).text(before.clone()).placeholder("Before (YYYY-MM-DD)"))
-                        });
-                    // Update text if needed
-                    after_input.update(cx, |state, cx| {
-                        if input_text(after_input, cx) != *after {
-                            state.set_text(after.clone(), cx);
-                        }
-                    });
-                    before_input.update(cx, |state, cx| {
-                        if input_text(before_input, cx) != *before {
-                            state.set_text(before.clone(), cx);
-                        }
-                    });
-                    h_flex()
-                        .gap_2()
-                        .child(Input::new(after_input).xsmall())
-                        .child(Input::new(before_input).xsmall())
-                        .into_any_element()
+                LinearFilterValue::DateRange { after: _, before: _ } => {
+                    // Get pre-created date inputs (guaranteed to exist)
+                    if let (Some(after_input), Some(before_input)) = (
+                        self.linear_filter_inputs.date_after_inputs.get(&field.name),
+                        self.linear_filter_inputs.date_before_inputs.get(&field.name)
+                    ) {
+                        h_flex()
+                            .gap_2()
+                            .child(Input::new(after_input).xsmall())
+                            .child(Input::new(before_input).xsmall())
+                            .into_any_element()
+                    } else {
+                        div().text_xs().child("(date inputs not created)").into_any_element()
+                    }
                 }
                 LinearFilterValue::Nullable { state } => {
                     let field_for_click = field.name.clone();
@@ -4900,6 +4890,9 @@ impl Focusable for TaskEditView {
 impl Render for TaskEditView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending(window, cx);
+
+        // Pre-create all Input entities for Linear filter fields before rendering
+        self.ensure_linear_filter_inputs_created(window, cx);
 
         if !self.is_open() {
             return div().size_full().into_any_element();
