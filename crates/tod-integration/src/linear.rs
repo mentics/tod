@@ -423,13 +423,14 @@ fn fetch_introspection(api_key: &str) -> Result<IntrospectionCache, DataSourceEr
         .__type
         .ok_or_else(|| DataSourceError::Service("IssueFilter type not found".into()))?;
 
-    let filter_fields = type_info
-        .input_fields
-        .into_iter()
+    let input_fields = type_info.input_fields;
+
+    let filter_fields: Vec<FilterFieldMetadata> = input_fields
+        .iter()
         .map(|field| FilterFieldMetadata {
-            name: field.name,
-            description: field.description,
-            field_type: field.type_info.name.unwrap_or_else(|| {
+            name: field.name.clone(),
+            description: field.description.clone(),
+            field_type: field.type_info.name.clone().unwrap_or_else(|| {
                 field
                     .type_info
                     .of_type
@@ -441,14 +442,108 @@ fn fetch_introspection(api_key: &str) -> Result<IntrospectionCache, DataSourceEr
         })
         .collect();
 
-    // TODO: Fetch enum types for dropdowns
-    let enums = HashMap::new();
+    // Fetch enum types for dropdowns
+    let enum_types: Vec<String> = input_fields
+        .iter()
+        .filter_map(|field| {
+            let type_name = field.type_info.name.clone().or_else(|| {
+                field
+                    .type_info
+                    .of_type
+                    .as_ref()
+                    .and_then(|t| t.name.clone())
+            });
+
+            if let Some(name) = type_name {
+                if field.type_info.kind == "ENUM"
+                    || (field.type_info.kind == "NON_NULL"
+                        && field.type_info.of_type.as_ref().map(|t| t.kind.as_str()) == Some("ENUM")) {
+                    return Some(name);
+                }
+            }
+            None
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let mut enums = HashMap::new();
+    for enum_type in enum_types {
+        if let Ok(enum_values) = fetch_enum_values(&client, api_key, &enum_type) {
+            enums.insert(enum_type, enum_values);
+        }
+    }
 
     Ok(IntrospectionCache {
         workspace_slug,
         filter_fields,
         enums,
     })
+}
+
+/// Fetch enum values for a specific enum type from Linear API.
+fn fetch_enum_values(
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+    enum_type: &str,
+) -> Result<Vec<String>, DataSourceError> {
+    let query = format!(
+        r#"
+        query {{
+            __type(name: "{}") {{
+                enumValues {{
+                    name
+                }}
+            }}
+        }}
+        "#,
+        enum_type
+    );
+
+    let body = serde_json::json!({
+        "query": query,
+    });
+
+    let response = client
+        .post(LINEAR_GRAPHQL_URL)
+        .headers(build_headers(api_key)?)
+        .json(&body)
+        .send()
+        .map_err(|e| {
+            DataSourceError::Fetch(format!("Failed to fetch enum values for {}: {}", enum_type, e))
+        })?;
+
+    let status = response.status();
+
+    if !status.is_success() && status != StatusCode::OK {
+        return Err(DataSourceError::Fetch(format!(
+            "HTTP error {}: failed to fetch enum values for {}",
+            status, enum_type
+        )));
+    }
+
+    let payload: GraphQlResponse<EnumIntrospectionData> = response.json().map_err(|e| {
+        DataSourceError::Fetch(format!(
+            "Invalid JSON response for enum {} (HTTP {}): {}",
+            enum_type, status, e
+        ))
+    })?;
+
+    handle_graphql_errors(&payload, status)?;
+
+    let data = payload.data.ok_or_else(|| {
+        DataSourceError::Service(format!("empty introspection response for enum {}", enum_type))
+    })?;
+
+    let type_info = data.__type.ok_or_else(|| {
+        DataSourceError::Service(format!("enum type {} not found", enum_type))
+    })?;
+
+    Ok(type_info
+        .enum_values
+        .into_iter()
+        .map(|ev| ev.name)
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,6 +587,22 @@ struct TypeRef {
     kind: String,
     #[serde(rename = "ofType")]
     of_type: Option<Box<TypeRef>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnumIntrospectionData {
+    __type: Option<EnumTypeInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnumTypeInfo {
+    #[serde(rename = "enumValues")]
+    enum_values: Vec<EnumValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnumValue {
+    name: String,
 }
 
 struct FlatIssue {
