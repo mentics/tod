@@ -86,6 +86,23 @@ impl LinearDataSource {
         serde_json::from_str(&contents).ok()
     }
 
+    /// Force-fetch fresh introspection metadata from Linear API and update the cache.
+    pub fn fetch_and_cache_introspection(&self, api_key: &str) -> Result<IntrospectionCache, DataSourceError> {
+        let introspection = fetch_introspection(api_key)?;
+
+        // Write to cache
+        if let Some(cache_path) = self.cache_path() {
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&introspection) {
+                let _ = std::fs::write(&cache_path, json);
+            }
+        }
+
+        Ok(introspection)
+    }
+
 }
 
 impl Default for LinearDataSource {

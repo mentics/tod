@@ -376,6 +376,7 @@ pub struct TaskEditView {
     linear_preset_action: Option<LinearPresetAction>,
     linear_filter_values: HashMap<String, LinearFilterValue>,
     linear_filter_inputs: LinearFilterInputs,
+    linear_result_cap_input: Entity<InputState>,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
     /// Linear metadata (priority, state, assignee, workspace_slug) for managed nodes.
@@ -429,6 +430,8 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
+        let linear_result_cap_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("200"));
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -534,6 +537,7 @@ impl TaskEditView {
             linear_preset_action: None,
             linear_filter_values: HashMap::new(),
             linear_filter_inputs: LinearFilterInputs::default(),
+            linear_result_cap_input,
             managed_link: None,
             managed_source_type: None,
             managed_metadata: None,
@@ -1347,7 +1351,14 @@ impl TaskEditView {
         let link = self.managed_link.as_ref()?;
         match self.managed_source_type.as_deref() {
             Some(tod_core::generator::DATA_SOURCE_LINEAR) => {
-                Some(format!("https://linear.app/issue/{}", link.external_id))
+                // Extract workspace_slug from metadata
+                let workspace_slug = self.managed_metadata
+                    .as_ref()
+                    .and_then(|m| m.as_object())
+                    .and_then(|obj| obj.get("workspace_slug"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("linear");
+                Some(format!("https://linear.app/{}/issue/{}", workspace_slug, link.external_id))
             }
             _ => None,
         }
@@ -1637,19 +1648,10 @@ impl TaskEditView {
                 use tod_integration::LinearDataSource;
                 let ds = LinearDataSource::with_data_root(data_root.clone());
 
-                // Force re-fetch by deleting cache first
-                let cache_path = data_root.join("linear_introspection_cache.json");
-                let _ = std::fs::remove_file(&cache_path);
-
-                // Fetch fresh introspection (this will write the cache)
-                match ds.get_cached_introspection() {
-                    Some(_) => Ok(()),
-                    None => {
-                        // Cache doesn't exist, need to fetch manually
-                        // This is a limitation - LinearDataSource doesn't expose public fetch method
-                        Err("Re-fetch not yet implemented - LinearDataSource needs public fetch_introspection method".to_string())
-                    }
-                }
+                // Fetch fresh introspection and update cache
+                ds.fetch_and_cache_introspection(&api_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("Failed to fetch introspection: {}", e))
             }).await;
 
             let _ = this.update(cx, |this, cx| {
@@ -1849,11 +1851,39 @@ impl TaskEditView {
                 // Check for overwrite
                 let exists = self.linear_presets.iter().any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
                 if exists {
-                    // TODO: Show confirmation toast
-                    // For now, just proceed with overwrite
+                    // Show confirmation toast for overwrite
+                    let view = cx.entity().downgrade();
+                    let preset_name_clone = preset_name.clone();
+                    let data_root_clone = data_root.clone();
+                    confirm_toast(
+                        window,
+                        cx,
+                        format!("Overwrite '{}'?", preset_name),
+                        format!("A preset named '{}' already exists. Overwrite it?", preset_name),
+                        move |_window, cx| {
+                            // User confirmed - save the preset
+                            let _ = view.update(cx, |this, _cx| {
+                                let filters = this.extract_linear_filter_values(_cx);
+                                if let Err(e) = tod_integration::save_preset(&data_root_clone, &preset_name_clone, &filters) {
+                                    this.generator_config_error = Some(format!("Failed to save preset: {}", e));
+                                } else {
+                                    this.linear_presets = tod_integration::load_presets(&data_root_clone).unwrap_or_default();
+                                    this.linear_selected_preset = Some(preset_name_clone.clone());
+                                }
+                                this.linear_preset_action = None;
+                            });
+                        },
+                        move |_window, cx| {
+                            // User cancelled - just clear the action
+                            let _ = view.update(cx, |this, _cx| {
+                                this.linear_preset_action = None;
+                            });
+                        },
+                    );
+                    return; // Don't clear action yet - confirmation will do it
                 }
 
-                // Extract current filter values
+                // No overwrite - save directly
                 let filters = self.extract_linear_filter_values(cx);
 
                 if let Err(e) = tod_integration::save_preset(&data_root, &preset_name, &filters) {
@@ -3903,19 +3933,41 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_ui(
-        &self,
+        &mut self,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let cred_status = self.render_linear_credential_status(muted, cx);
+        let intro_section = self.render_linear_introspection_section(muted, cx);
+        let has_cache = self.linear_introspection_cache.is_some();
+
+        let preset_section = if has_cache {
+            Some(self.render_linear_preset_section(muted, window, cx))
+        } else {
+            None
+        };
+
+        let filter_fields = if has_cache {
+            Some(self.render_linear_filter_fields(muted, window, cx))
+        } else {
+            None
+        };
+
+        let result_cap = if has_cache {
+            Some(self.render_linear_result_cap(window, cx))
+        } else {
+            None
+        };
+
         v_flex()
             .gap_3()
-            .child(self.render_linear_credential_status(muted, cx))
-            .child(self.render_linear_introspection_section(muted, cx))
-            .when(self.linear_introspection_cache.is_some(), |el| {
-                el.child(self.render_linear_preset_section(muted, window, cx))
-                    .child(self.render_linear_filter_fields(muted, window, cx))
-                    .child(self.render_linear_result_cap(window, cx))
+            .child(cred_status)
+            .child(intro_section)
+            .when(has_cache, |el| {
+                el.children(preset_section)
+                    .children(filter_fields)
+                    .children(result_cap)
             })
             .when(self.linear_introspection_cache.is_none(), |el| {
                 el.child(
@@ -4084,12 +4136,12 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_fields(
-        &self,
+        &mut self,
         muted: gpui::Hsla,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let Some(ref cache) = self.linear_introspection_cache else {
+        let Some(cache) = self.linear_introspection_cache.clone() else {
             return v_flex().into_any_element();
         };
 
@@ -4104,13 +4156,15 @@ impl TaskEditView {
             .collect();
         additional.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let common_elements: Vec<_> = common.iter().map(|field| {
-            self.render_linear_filter_field(field, &cache.enums)
-        }).collect();
+        let mut common_elements = Vec::new();
+        for field in common {
+            common_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx));
+        }
 
-        let additional_elements: Vec<_> = additional.iter().map(|field| {
-            self.render_linear_filter_field(field, &cache.enums)
-        }).collect();
+        let mut additional_elements = Vec::new();
+        for field in additional {
+            additional_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx));
+        }
 
         v_flex()
             .gap_2()
@@ -4126,9 +4180,11 @@ impl TaskEditView {
     }
 
     fn render_linear_filter_field(
-        &self,
+        &mut self,
         field: &tod_integration::FilterFieldMetadata,
         _enums: &std::collections::HashMap<String, Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let field_name = field.name.clone();
         let help_text = field.description.clone().unwrap_or_else(|| {
@@ -4148,41 +4204,93 @@ impl TaskEditView {
         let control = if let Some(value) = self.linear_filter_values.get(&field.name) {
             match value {
                 LinearFilterValue::Text(text) => {
-                    let display = if text.is_empty() { "(empty)".to_string() } else { text.clone() };
-                    div()
-                        .text_xs()
-                        .child(display)
+                    // Create or get text input
+                    let input = self.linear_filter_inputs.text_inputs
+                        .entry(field.name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).text(text.clone()))
+                        });
+                    // Update text if needed
+                    input.update(cx, |state, cx| {
+                        if input_text(input, cx) != *text {
+                            state.set_text(text.clone(), cx);
+                        }
+                    });
+                    Input::new(input)
+                        .xsmall()
                         .into_any_element()
                 }
-                LinearFilterValue::Enum { selected, .. } => {
+                LinearFilterValue::Enum { selected, options } => {
                     let display = selected.clone().unwrap_or_else(|| "(none)".to_string());
-                    div()
-                        .text_xs()
-                        .child(display)
+                    let field_for_click = field.name.clone();
+                    Button::new(format!("linear-enum-{}", field.name))
+                        .label(display)
+                        .xsmall()
+                        .outline()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.cycle_linear_enum_filter(&field_for_click, cx);
+                        }))
                         .into_any_element()
                 }
                 LinearFilterValue::DateRange { after, before } => {
-                    div()
-                        .text_xs()
-                        .child(format!("after: {} | before: {}",
-                            if after.is_empty() { "(any)" } else { after },
-                            if before.is_empty() { "(any)" } else { before }))
+                    // Create or get date inputs
+                    let after_input = self.linear_filter_inputs.date_after_inputs
+                        .entry(field.name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).text(after.clone()).placeholder("After (YYYY-MM-DD)"))
+                        });
+                    let before_input = self.linear_filter_inputs.date_before_inputs
+                        .entry(field.name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).text(before.clone()).placeholder("Before (YYYY-MM-DD)"))
+                        });
+                    // Update text if needed
+                    after_input.update(cx, |state, cx| {
+                        if input_text(after_input, cx) != *after {
+                            state.set_text(after.clone(), cx);
+                        }
+                    });
+                    before_input.update(cx, |state, cx| {
+                        if input_text(before_input, cx) != *before {
+                            state.set_text(before.clone(), cx);
+                        }
+                    });
+                    h_flex()
+                        .gap_2()
+                        .child(Input::new(after_input).xsmall())
+                        .child(Input::new(before_input).xsmall())
                         .into_any_element()
                 }
                 LinearFilterValue::Nullable { state } => {
-                    div()
-                        .text_xs()
-                        .child(state.to_label())
+                    let field_for_click = field.name.clone();
+                    Button::new(format!("linear-nullable-{}", field.name))
+                        .label(state.to_label())
+                        .xsmall()
+                        .outline()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.cycle_linear_nullable_filter(&field_for_click, cx);
+                        }))
                         .into_any_element()
                 }
-                LinearFilterValue::MultiSelect { selected, .. } => {
-                    div()
-                        .text_xs()
-                        .child(if selected.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            selected.join(", ")
-                        })
+                LinearFilterValue::MultiSelect { selected, options } => {
+                    // Render as buttons for each option
+                    let buttons: Vec<_> = options.iter().map(|opt| {
+                        let is_selected = selected.contains(opt);
+                        let opt_clone = opt.clone();
+                        let field_for_click = field.name.clone();
+                        Button::new(format!("linear-multi-{}-{}", field.name, opt))
+                            .label(opt.clone())
+                            .xsmall()
+                            .when(is_selected, |btn| btn.primary())
+                            .when(!is_selected, |btn| btn.ghost())
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_linear_multiselect_filter(&field_for_click, &opt_clone, cx);
+                            }))
+                    }).collect();
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(buttons)
                         .into_any_element()
                 }
             }
@@ -4205,7 +4313,11 @@ impl TaskEditView {
         v_flex()
             .gap_1()
             .child(div().text_xs().child("Result cap"))
-            .child(div().text_xs().child("[Input field placeholder - default 200]"))
+            .child(div().text_xs().text_color(gpui::rgb(0x888888)).child("Maximum total items to fetch (default 200)"))
+            .child(
+                Input::new(&self.linear_result_cap_input)
+                    .xsmall()
+            )
     }
 
     /// Save / Refresh. Nothing in this section is ever written on blur — the
