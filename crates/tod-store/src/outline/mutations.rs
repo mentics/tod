@@ -277,13 +277,15 @@ pub enum OutlineMutation {
         generator_node_id: Uuid,
         tags: Vec<String>,
         body: String,
+        metadata: Option<serde_json::Value>,
     },
-    /// Update a managed node's fields from data source (title, tags, body).
+    /// Update a managed node's fields from data source (title, tags, body, metadata).
     UpdateManagedNode {
         node_id: Uuid,
         title: String,
         tags: Vec<String>,
         body: String,
+        metadata: Option<serde_json::Value>,
     },
     /// Bulk-delete managed child nodes under a generator (reconciliation or disable).
     DeleteManagedNodes {
@@ -711,6 +713,7 @@ impl OutlineMutation {
                 generator_node_id,
                 tags,
                 body,
+                metadata,
             } => {
                 let node_id = create_managed_node(
                     conn,
@@ -723,6 +726,7 @@ impl OutlineMutation {
                     *generator_node_id,
                     tags,
                     body,
+                    metadata.as_ref(),
                 )?;
                 let _ = node_id;
             }
@@ -731,8 +735,9 @@ impl OutlineMutation {
                 title,
                 tags,
                 body,
+                metadata,
             } => {
-                update_managed_node(conn, *node_id, title, tags, body)?;
+                update_managed_node(conn, *node_id, title, tags, body, metadata.as_ref())?;
             }
             OutlineMutation::DeleteManagedNodes { generator_node_id } => {
                 GeneratorRepo::new(conn).delete_managed_children(*generator_node_id)?;
@@ -1335,6 +1340,7 @@ fn create_managed_node(
     generator_node_id: Uuid,
     tags: &[String],
     body: &str,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<Uuid> {
     let node_repo = NodeRepo::new(conn);
     let outline = OutlineRepo::new(conn);
@@ -1371,6 +1377,12 @@ fn create_managed_node(
         write_managed_tags(&node_repo, node.id, tags)?;
     }
 
+    // Store metadata as extra content.
+    if let Some(meta) = metadata {
+        let json = serde_json::to_string(meta)?;
+        node_repo.set_extra_content(node.id, crate::outline::types::EXTRA_CONTENT_METADATA, &json)?;
+    }
+
     Ok(node.id)
 }
 
@@ -1393,6 +1405,7 @@ fn update_managed_node(
     title: &str,
     tags: &[String],
     body: &str,
+    metadata: Option<&serde_json::Value>,
 ) -> Result<()> {
     let node_repo = NodeRepo::new(conn);
     node_repo.update_title(node_id, title)?;
@@ -1402,6 +1415,12 @@ fn update_managed_node(
     }
 
     write_managed_tags(&node_repo, node_id, tags)?;
+
+    // Update metadata as extra content.
+    if let Some(meta) = metadata {
+        let json = serde_json::to_string(meta)?;
+        node_repo.set_extra_content(node_id, crate::outline::types::EXTRA_CONTENT_METADATA, &json)?;
+    }
 
     Ok(())
 }
