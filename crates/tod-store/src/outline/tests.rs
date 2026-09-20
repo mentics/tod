@@ -866,6 +866,8 @@ fn gate_criteria_seed_on_migration() {
     assert_eq!(planning_ready.len(), 11);
     let ready_active = repo.list_for_transition("ready", "active").unwrap();
     assert_eq!(ready_active.len(), 1);
+    let active_verifying = repo.list_for_transition("active", "verifying").unwrap();
+    assert_eq!(active_verifying.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
     assert_eq!(verifying_review.len(), 10);
     let review_approved = repo.list_for_transition("review", "approved").unwrap();
@@ -874,6 +876,7 @@ fn gate_criteria_seed_on_migration() {
         design_planning.len()
             + planning_ready.len()
             + ready_active.len()
+            + active_verifying.len()
             + verifying_review.len()
             + review_approved.len(),
         GATE_CRITERIA.len() - superseded

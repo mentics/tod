@@ -21,7 +21,7 @@ use crate::gate::{
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use crate::task::model::next_lifecycle;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -104,6 +104,18 @@ pub fn latest_gate_report(
     };
     // A check of an earlier state says nothing about this one.
     if conversation.from_state.as_deref() != Some(from_state) {
+        return Ok(None);
+    }
+    // ...and so does one from a previous visit: a node sent back and advanced
+    // again starts the state afresh.
+    let entered_at: Option<i64> = conn
+        .query_row(
+            "SELECT updated_at FROM node_lifecycle WHERE node_id = ?1",
+            [node.as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if entered_at.is_some_and(|entered| conversation.created_at < entered) {
         return Ok(None);
     }
     let record = repo

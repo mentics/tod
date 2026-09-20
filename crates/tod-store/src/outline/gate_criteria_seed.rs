@@ -216,6 +216,15 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Does the node have Agent and Files configured (with a ready directory) to do the implementation work?",
         sort_order: 1,
     },
+    // active → verifying — evaluated by the app, not an agent (`tod_core::gate::derived`)
+    GateCriterionSeed {
+        id_str: "a1000007-0007-4007-8007-000000000001",
+        from_state: "active",
+        to_state: "verifying",
+        slug: crate::outline::repos::gate::ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG,
+        label: "Is every plan step implemented (none still open, failed, partial, or blocked)?",
+        sort_order: 1,
+    },
     // verifying → review
     GateCriterionSeed {
         id_str: "a1000003-0003-4003-8003-00000000000a",

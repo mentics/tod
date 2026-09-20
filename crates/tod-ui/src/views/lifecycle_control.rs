@@ -403,8 +403,11 @@ pub fn implement_directory(
 }
 
 /// Whether landing in `state` starts that state's agent on its on-entry work:
-/// the state has an agent, and is not verifying or review, which run in their
-/// own conversations from Verify and Review.
+/// the state has an agent, and is not active, verifying or review, which run
+/// in their own conversations from Implement, Verify and Review. Active's own
+/// on-entry step (checking whether the work is already done) is the
+/// implementation loop's first turn.
 pub fn enters_with_agent(state: &str) -> bool {
-    tod_core::task::model::state_has_agent(state) && !matches!(state, "verifying" | "review")
+    tod_core::task::model::state_has_agent(state)
+        && !matches!(state, "active" | "verifying" | "review")
 }

@@ -423,6 +423,15 @@ impl ConversationView {
             }
             ProtocolKind::Review | ProtocolKind::Fix => self.render_review_pane(window, cx),
             ProtocolKind::GateCheck => self.render_gate_pane(window, cx),
+            // Where the work is the plan, that is what to show, not the
+            // transcript's account of it.
+            ProtocolKind::OnEntry
+                if self.data.lifecycle.as_ref().is_some_and(|s| {
+                    matches!(s.lifecycle.as_str(), "ready" | "active" | "verifying")
+                }) =>
+            {
+                self.render_plan_pane(window, cx)
+            }
             ProtocolKind::OnEntry => self.render_empty_pane(
                 "On entry",
                 "What the state's agent did is in the transcript.",

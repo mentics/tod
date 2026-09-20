@@ -64,6 +64,7 @@ actions!(
         TaskListRowEdit,
         TaskListOpenEditPanel,
         TaskListOpenObligations,
+        TaskListOpenPlan,
         TaskListTag1,
         TaskListTag2,
         TaskListTag3,
@@ -122,6 +123,7 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("r", TaskListRefreshGenerator, context),
         KeyBinding::new("x", TaskListOpenExternal, context),
         KeyBinding::new("o", TaskListOpenObligations, context),
+        KeyBinding::new("p", TaskListOpenPlan, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
         KeyBinding::new("1", TaskListTag1, context),
@@ -197,6 +199,10 @@ pub enum TaskListEvent {
         task_id: String,
     },
     OpenObligations {
+        task_id: String,
+        title: String,
+    },
+    OpenPlan {
         task_id: String,
         title: String,
     },
@@ -1414,6 +1420,20 @@ impl TaskListView {
         cx.notify();
     }
 
+    pub fn open_plan_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::OpenPlan {
+            task_id: task_id.to_string(),
+            title: task.title.clone(),
+        });
+        self.set_status_line(format!("Plan steps: {}", task.title), cx);
+        self.bump_interaction(task_id, window, cx);
+        cx.notify();
+    }
+
     /// Kept in sync by the shell, so Escape in the tree knows to close the drawer.
     pub fn set_drawer_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.drawer_open == open {
@@ -2453,6 +2473,18 @@ impl TaskListView {
         self.open_obligations_panel(&task_id, window, cx);
     }
 
+    fn on_open_plan(&mut self, _: &TaskListOpenPlan, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.open_plan_panel(&task_id, window, cx);
+    }
+
     fn render_header(
         &mut self,
         window: &mut Window,
@@ -2795,6 +2827,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_row_edit))
             .on_action(cx.listener(Self::on_open_edit_panel))
             .on_action(cx.listener(Self::on_open_obligations))
+            .on_action(cx.listener(Self::on_open_plan))
             .on_action(cx.listener(Self::on_tag1))
             .on_action(cx.listener(Self::on_tag2))
             .on_action(cx.listener(Self::on_tag3))

@@ -34,6 +34,7 @@ use crate::views::database::DatabaseView;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
+use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
 use crate::views::visual_design_panel::{
@@ -139,6 +140,7 @@ pub struct Shell {
     _task_list_subscription: Subscription,
     _task_edit_subscription: Subscription,
     _obligations_subscription: Subscription,
+    _plan_subscription: Subscription,
     _lifecycle_panel_subscription: Subscription,
     _visual_design_panel_subscription: Subscription,
     _action_panel_subscription: Subscription,
@@ -491,6 +493,14 @@ impl Shell {
                     });
                 }
             }
+            DrawerRequest::OpenPlan { task_id, title } => {
+                if let Ok(node_id) = Uuid::parse_str(&task_id) {
+                    self.drawer.close_except(Some(DrawerKind::Plan), window, cx);
+                    self.drawer.plan.update(cx, |panel, cx| {
+                        panel.open(node_id, &title, window, cx);
+                    });
+                }
+            }
             DrawerRequest::OpenLifecycle { task_id } => {
                 self.drawer
                     .close_except(Some(DrawerKind::Lifecycle), window, cx);
@@ -812,6 +822,11 @@ impl Shell {
                 }
                 if self.drawer.obligations.read(cx).is_open() {
                     self.drawer.obligations.update(cx, |panel, cx| {
+                        panel.reload(window, cx);
+                    });
+                }
+                if self.drawer.plan.read(cx).is_open() {
+                    self.drawer.plan.update(cx, |panel, cx| {
                         panel.reload(window, cx);
                     });
                 }
@@ -1501,6 +1516,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));
                         let obligations =
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
+                        let plan = cx.new(|cx| PlanStepsView::new(window, cx, fleet.clone()));
                         let lifecycle = cx.new(|_| LifecycleController::new(fleet.clone()));
                         let lifecycle_panel = cx.new(|cx| {
                             LifecyclePanelView::new(cx, fleet.clone(), lifecycle.clone())
@@ -1569,6 +1585,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         TaskListEvent::OpenObligations { task_id, title } => {
                                             this.queue_drawer(
                                                 DrawerRequest::OpenObligations {
+                                                    task_id: task_id.clone(),
+                                                    title: title.clone(),
+                                                },
+                                                cx,
+                                            );
+                                        }
+                                        TaskListEvent::OpenPlan { task_id, title } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenPlan {
                                                     task_id: task_id.clone(),
                                                     title: title.clone(),
                                                 },
@@ -1690,6 +1715,20 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
+                                    }
+                                });
+                            let _plan_subscription =
+                                cx.subscribe(&plan, |this: &mut Shell, _, event, cx| match event {
+                                    PlanStepsEvent::Close => {
+                                        this.on_drawer_panel_closed(cx);
+                                    }
+                                    PlanStepsEvent::FocusTaskList => {
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
+                                    PlanStepsEvent::DeleteSelectedTask => {
+                                        this.pending_delete_selected_task = true;
+                                        cx.notify();
                                     }
                                 });
                             let _lifecycle_panel_subscription =
@@ -1820,6 +1859,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 drawer: RightDrawer {
                                     task_edit,
                                     obligations,
+                                    plan,
                                     lifecycle: lifecycle_panel,
                                     visual_design: visual_design_panel,
                                     action: action_panel,
@@ -1858,6 +1898,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _task_list_subscription,
                                 _task_edit_subscription,
                                 _obligations_subscription,
+                                _plan_subscription,
                                 _lifecycle_panel_subscription,
                                 _visual_design_panel_subscription,
                                 _action_panel_subscription,

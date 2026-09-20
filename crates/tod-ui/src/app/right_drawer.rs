@@ -17,6 +17,7 @@
 use crate::views::action_panel::ActionPanelView;
 use crate::views::lifecycle_panel::LifecyclePanelView;
 use crate::views::obligations::ObligationsView;
+use crate::views::plan_steps::PlanStepsView;
 use crate::views::task_edit::TaskEditView;
 use crate::views::visual_design_panel::VisualDesignPanelView;
 use gpui::{AnyElement, App, Entity, Focusable, IntoElement, Window};
@@ -27,14 +28,16 @@ use uuid::Uuid;
 pub(crate) enum DrawerKind {
     TaskEdit,
     Obligations,
+    Plan,
     Lifecycle,
     VisualDesign,
     Action,
 }
 
-const ALL_KINDS: [DrawerKind; 5] = [
+const ALL_KINDS: [DrawerKind; 6] = [
     DrawerKind::TaskEdit,
     DrawerKind::Obligations,
+    DrawerKind::Plan,
     DrawerKind::Lifecycle,
     DrawerKind::VisualDesign,
     DrawerKind::Action,
@@ -47,6 +50,10 @@ pub(crate) enum DrawerRequest {
         task_id: String,
     },
     OpenObligations {
+        task_id: String,
+        title: String,
+    },
+    OpenPlan {
         task_id: String,
         title: String,
     },
@@ -71,6 +78,7 @@ pub(crate) enum DrawerRequest {
 pub(crate) struct RightDrawer {
     pub task_edit: Entity<TaskEditView>,
     pub obligations: Entity<ObligationsView>,
+    pub plan: Entity<PlanStepsView>,
     pub lifecycle: Entity<LifecyclePanelView>,
     pub visual_design: Entity<VisualDesignPanelView>,
     pub action: Entity<ActionPanelView>,
@@ -81,6 +89,7 @@ impl RightDrawer {
         match kind {
             DrawerKind::TaskEdit => self.task_edit.read(cx).is_open(),
             DrawerKind::Obligations => self.obligations.read(cx).is_open(),
+            DrawerKind::Plan => self.plan.read(cx).is_open(),
             DrawerKind::Lifecycle => self.lifecycle.read(cx).is_open(),
             DrawerKind::VisualDesign => self.visual_design.read(cx).is_open(),
             DrawerKind::Action => self.action.read(cx).is_open(),
@@ -110,6 +119,7 @@ impl RightDrawer {
                 DrawerKind::Obligations => self
                     .obligations
                     .update(cx, |panel, cx| panel.close(window, cx)),
+                DrawerKind::Plan => self.plan.update(cx, |panel, cx| panel.close(window, cx)),
                 DrawerKind::Lifecycle => self.lifecycle.update(cx, |panel, cx| panel.close(cx)),
                 DrawerKind::VisualDesign => {
                     self.visual_design.update(cx, |panel, cx| panel.close(cx))
@@ -132,6 +142,14 @@ impl RightDrawer {
             }
             DrawerKind::Obligations => {
                 self.show_obligations(task_id, fleet, window, cx);
+            }
+            DrawerKind::Plan => {
+                if let Ok(node_id) = Uuid::parse_str(task_id) {
+                    let title = node_title(task_id, fleet);
+                    self.plan.update(cx, |panel, cx| {
+                        panel.retarget(node_id, &title, false, window, cx);
+                    });
+                }
             }
             DrawerKind::Lifecycle => {
                 self.lifecycle
@@ -165,12 +183,7 @@ impl RightDrawer {
         let Ok(node_id) = Uuid::parse_str(task_id) else {
             return;
         };
-        let title = fleet
-            .get_node(task_id)
-            .ok()
-            .flatten()
-            .map(|task| task.title)
-            .unwrap_or_default();
+        let title = node_title(task_id, fleet);
         self.obligations.update(cx, |panel, cx| {
             panel.retarget(node_id, &title, None, false, window, cx);
         });
@@ -184,6 +197,7 @@ impl RightDrawer {
             Some(DrawerKind::Obligations) => {
                 self.obligations.read(cx).focus_handle(cx).focus(window, cx)
             }
+            Some(DrawerKind::Plan) => self.plan.read(cx).focus_handle(cx).focus(window, cx),
             Some(DrawerKind::Lifecycle) => self
                 .lifecycle
                 .update(cx, |panel, cx| panel.focus(window, cx)),
@@ -201,9 +215,19 @@ impl RightDrawer {
         Some(match self.active(cx)? {
             DrawerKind::TaskEdit => self.task_edit.clone().into_any_element(),
             DrawerKind::Obligations => self.obligations.clone().into_any_element(),
+            DrawerKind::Plan => self.plan.clone().into_any_element(),
             DrawerKind::Lifecycle => self.lifecycle.clone().into_any_element(),
             DrawerKind::VisualDesign => self.visual_design.clone().into_any_element(),
             DrawerKind::Action => self.action.clone().into_any_element(),
         })
     }
+}
+
+fn node_title(task_id: &str, fleet: &FleetStore) -> String {
+    fleet
+        .get_node(task_id)
+        .ok()
+        .flatten()
+        .map(|task| task.title)
+        .unwrap_or_default()
 }

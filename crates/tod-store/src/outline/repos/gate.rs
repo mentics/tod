@@ -21,6 +21,11 @@ pub const ACTION_INTERVIEW: &str = "interview";
 /// answers this one itself (`tod_core::gate::derived`); it never goes to an agent.
 pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-configured";
 
+/// `active` → `verifying`: no plan step is still open work — each is `implemented` (or
+/// already `verified`). The app answers this one itself (`tod_core::gate::derived`); it
+/// never goes to an agent, because whether the work is real is what verification is for.
+pub const ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG: &str = "active-verifying.plan-steps-implemented";
+
 /// `verifying` → `review`: every plan step is `verified`, none `failed` or
 /// unchecked. The app answers this one itself from the steps' statuses
 /// (`tod_core::gate::derived`); it never goes to an agent.

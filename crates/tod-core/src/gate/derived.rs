@@ -12,9 +12,9 @@ use tod_store::fleet::node_actions::{
 };
 use tod_store::interview::short_id;
 use tod_store::outline::repos::PlanStepRepo;
-use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
+use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::{
-    GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
+    ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
     VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
@@ -38,6 +38,7 @@ pub fn evaluate_derived_criterion(
 ) -> Result<Option<DerivedOutcome>> {
     match criterion.slug.as_str() {
         READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
+        ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG => plan_implemented_outcome(conn, node_id).map(Some),
         VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => plan_verified_outcome(conn, node_id).map(Some),
         REVIEW_APPROVED_REVIEW_DONE_SLUG => review_done_outcome(conn, node_id).map(Some),
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
@@ -94,6 +95,33 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
             directory.display()
         ),
     })
+}
+
+/// No plan step still open. Whether the work behind an `implemented` step is
+/// real is verification's question, not this gate's: a step verification
+/// fails goes back to open, and this gate is what sends it through again.
+fn plan_implemented_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let steps = PlanStepRepo::new(conn).list_for_node(node_id)?;
+    if steps.is_empty() {
+        return Ok(fail("This node has no plan steps to implement."));
+    }
+    let open: Vec<String> = steps
+        .iter()
+        .filter(|s| s.status != STATUS_IMPLEMENTED && s.status != STATUS_VERIFIED)
+        .map(|s| format!("[{}] {} ({})", short_id(s.id), s.body, s.status))
+        .collect();
+    if open.is_empty() {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("All {} plan steps implemented.", steps.len()),
+        });
+    }
+    Ok(fail(format!(
+        "{} of {} plan steps not implemented yet: {}. Run Implement to finish them.",
+        open.len(),
+        steps.len(),
+        open.join("; ")
+    )))
 }
 
 /// Every plan step `verified`. Verification records its verdict on each step,
@@ -319,6 +347,28 @@ mod tests {
         }
         store.writer().flush().unwrap();
         ids
+    }
+
+    #[test]
+    fn a_plan_leaves_active_once_no_step_is_open() {
+        let slug = ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG;
+        let (store, node) = store_with_node();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "no plan steps");
+
+        plan(&store, node, [STATUS_IMPLEMENTED, STATUS_VERIFIED]);
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+
+        let (store, node) = store_with_node();
+        plan(&store, node, [STATUS_IMPLEMENTED, STATUS_FAILED]);
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(
+            outcome.detail.contains("1 of 2 plan steps not implemented"),
+            "{}",
+            outcome.detail
+        );
     }
 
     #[test]
