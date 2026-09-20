@@ -121,7 +121,11 @@ pub const EXTRA_CONTENT_DETAILS: &str = "details";
 /// `design` and `planning`.
 pub const EXTRA_CONTENT_SUMMARY: &str = "summary";
 
-pub const EXTRA_CONTENT_TYPES: [&str; 5] = ["design", "plan", "notes", "details", "summary"];
+/// `node_extra_content.content_type` value for data-source metadata JSON
+/// (priority, state, assignee, workspace_slug for Linear nodes).
+pub const EXTRA_CONTENT_METADATA: &str = "metadata";
+
+pub const EXTRA_CONTENT_TYPES: [&str; 6] = ["design", "plan", "notes", "details", "summary", "metadata"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineList {

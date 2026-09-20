@@ -20,7 +20,7 @@ use gpui_component::input::{
 use gpui_component::scroll::Scrollbar;
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tod_core::generator::ConfigFieldType;
 use tod_store::fleet::{
@@ -28,6 +28,7 @@ use tod_store::fleet::{
     release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
 };
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
+use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
     parse_platform, platform_storage, resolve_linear_api_key,
@@ -198,6 +199,38 @@ impl GeneratorConfigField {
             .map(|input| any_input_text(input, cx).trim().to_string())
             .unwrap_or_default()
     }
+
+    /// Returns the string representation of the field's value for any field type.
+    fn value_as_string(&self, cx: &App) -> Option<String> {
+        match &self.schema.field_type {
+            tod_core::generator::ConfigFieldType::Text
+            | tod_core::generator::ConfigFieldType::TextArea => {
+                let text = self.text_value(cx);
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            tod_core::generator::ConfigFieldType::Boolean => Some(self.toggle.to_string()),
+            tod_core::generator::ConfigFieldType::Select { .. } => self.choice.clone(),
+            tod_core::generator::ConfigFieldType::Custom { .. } => {
+                // Custom fields are handled by their own widgets; treat as empty here
+                None
+            }
+        }
+    }
+
+    /// Checks if the field has a non-empty value.
+    fn is_empty(&self, cx: &App) -> bool {
+        match &self.schema.field_type {
+            tod_core::generator::ConfigFieldType::Text
+            | tod_core::generator::ConfigFieldType::TextArea => self.text_value(cx).is_empty(),
+            tod_core::generator::ConfigFieldType::Boolean => false, // Boolean always has a value
+            tod_core::generator::ConfigFieldType::Select { .. } => self.choice.is_none(),
+            tod_core::generator::ConfigFieldType::Custom { .. } => true,
+        }
+    }
 }
 
 struct PendingLinearApply {
@@ -206,6 +239,65 @@ struct PendingLinearApply {
     ticket: String,
     issue: Result<tod_store::linear::LinearIssue, String>,
     tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LinearPresetAction {
+    Save,
+    Rename,
+    Delete,
+}
+
+/// Represents the value state of a single Linear filter field.
+#[derive(Clone, Debug)]
+enum LinearFilterValue {
+    /// Text input (for string fields with 'contains' comparator)
+    Text(String),
+    /// Enum selection (cycles through enum values + None)
+    Enum { selected: Option<String>, options: Vec<String> },
+    /// Date range (after/before inputs with gte/lte comparators)
+    DateRange {
+        after: String,
+        before: String,
+    },
+    /// Nullable three-state (any/has value/is empty)
+    Nullable { state: NullableState },
+    /// Multi-select (for team/state/assignee/labels)
+    MultiSelect { selected: Vec<String>, options: Vec<String> },
+}
+
+/// Input entities for filter fields that need text input (text fields, date ranges).
+/// Lazily created during render.
+#[derive(Default)]
+struct LinearFilterInputs {
+    text_inputs: HashMap<String, Entity<InputState>>,
+    date_after_inputs: HashMap<String, Entity<InputState>>,
+    date_before_inputs: HashMap<String, Entity<InputState>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum NullableState {
+    Any,
+    HasValue,
+    IsEmpty,
+}
+
+impl NullableState {
+    fn cycle(&self) -> Self {
+        match self {
+            NullableState::Any => NullableState::HasValue,
+            NullableState::HasValue => NullableState::IsEmpty,
+            NullableState::IsEmpty => NullableState::Any,
+        }
+    }
+
+    fn to_label(&self) -> &'static str {
+        match self {
+            NullableState::Any => "any",
+            NullableState::HasValue => "has value",
+            NullableState::IsEmpty => "is empty",
+        }
+    }
 }
 
 pub struct TaskEditView {
@@ -270,8 +362,25 @@ pub struct TaskEditView {
     generator_last_status: Option<String>,
     generator_last_error: Option<String>,
     generator_config_error: Option<String>,
+    /// When true, show the generator detail view instead of the edit form.
+    generator_show_detail: bool,
+    /// Linear-specific state for filter configuration UI
+    linear_introspection_cache: Option<tod_integration::IntrospectionCache>,
+    linear_introspection_age: Option<String>,
+    linear_introspection_fetching: bool,
+    linear_introspection_error: Option<String>,
+    linear_credential_status: Option<Result<(), String>>,
+    linear_presets: Vec<tod_integration::FilterPreset>,
+    linear_selected_preset: Option<String>,
+    linear_preset_name_input: Entity<InputState>,
+    linear_preset_action: Option<LinearPresetAction>,
+    linear_filter_values: HashMap<String, LinearFilterValue>,
+    linear_filter_inputs: LinearFilterInputs,
+    linear_result_cap_input: Entity<InputState>,
     managed_link: Option<tod_store::outline::repos::ManagedNodeLink>,
     managed_source_type: Option<String>,
+    /// Linear metadata (priority, state, assignee, workspace_slug) for managed nodes.
+    managed_metadata: Option<serde_json::Value>,
     /// This node's own Agent values (unset = follow settings).
     node_agent: NodeAgent,
     resolved_agent: Option<ResolvedAgent>,
@@ -286,6 +395,7 @@ pub struct TaskEditView {
     _details_subscription: Subscription,
     _tag_draft_subscription: Subscription,
     _note_edit_subscription: Subscription,
+    _linear_preset_name_subscription: Subscription,
 }
 
 impl TaskEditView {
@@ -318,6 +428,10 @@ impl TaskEditView {
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
+        let linear_preset_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
+        let linear_result_cap_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("200"));
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -385,6 +499,9 @@ impl TaskEditView {
                 this.commit_tag_draft(cx);
             }
         });
+        let _linear_preset_name_subscription = cx.subscribe(&linear_preset_name_input, |_this: &mut TaskEditView, _, _event: &InputEvent, _cx| {
+            // Preset name input is handled by explicit actions, not on blur/enter
+        });
         Self {
             fleet,
             paths,
@@ -408,8 +525,22 @@ impl TaskEditView {
             generator_last_status: None,
             generator_last_error: None,
             generator_config_error: None,
+            generator_show_detail: false,
+            linear_introspection_cache: None,
+            linear_introspection_age: None,
+            linear_introspection_fetching: false,
+            linear_introspection_error: None,
+            linear_credential_status: None,
+            linear_presets: Vec::new(),
+            linear_selected_preset: None,
+            linear_preset_name_input,
+            linear_preset_action: None,
+            linear_filter_values: HashMap::new(),
+            linear_filter_inputs: LinearFilterInputs::default(),
+            linear_result_cap_input,
             managed_link: None,
             managed_source_type: None,
+            managed_metadata: None,
             node_agent: NodeAgent::default(),
             resolved_agent: None,
             resolved_files: None,
@@ -454,6 +585,7 @@ impl TaskEditView {
             _details_subscription,
             _tag_draft_subscription,
             _note_edit_subscription,
+            _linear_preset_name_subscription,
         }
     }
 
@@ -913,6 +1045,9 @@ impl TaskEditView {
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
         self.load_managed_link();
+        // Show generator detail view by default for configured generators
+        self.generator_show_detail = self.generator_data_source_type.is_some()
+            && self.capability_enabled(Capability::Generator);
         let linear = task.linked_issues.first().cloned().unwrap_or_default();
         let github_pr = task.linked_prs.first().cloned().unwrap_or_default();
         let repo = self.loaded_repo.clone();
@@ -1191,17 +1326,37 @@ impl TaskEditView {
                 .flatten()
                 .map(|config| config.data_source_type)
         });
+        self.managed_metadata = self.node_uuid().and_then(|node_id| {
+            self.fleet
+                .get_extra_content(node_id, EXTRA_CONTENT_METADATA)
+                .ok()
+                .flatten()
+                .and_then(|json_str| serde_json::from_str(&json_str).ok())
+        });
     }
 
     fn is_managed(&self) -> bool {
         self.managed_link.is_some()
     }
 
+    fn is_configured_generator(&self) -> bool {
+        self.generator_show_detail
+            && self.generator_data_source_type.is_some()
+            && self.capability_enabled(Capability::Generator)
+    }
+
     fn managed_external_url(&self) -> Option<String> {
         let link = self.managed_link.as_ref()?;
         match self.managed_source_type.as_deref() {
             Some(tod_core::generator::DATA_SOURCE_LINEAR) => {
-                Some(format!("https://linear.app/issue/{}", link.external_id))
+                // Extract workspace_slug from metadata
+                let workspace_slug = self.managed_metadata
+                    .as_ref()
+                    .and_then(|m| m.as_object())
+                    .and_then(|obj| obj.get("workspace_slug"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("linear");
+                Some(format!("https://linear.app/{}/issue/{}", workspace_slug, link.external_id))
             }
             _ => None,
         }
@@ -1293,6 +1448,11 @@ impl TaskEditView {
                         });
                     (None, false, choice)
                 }
+                ConfigFieldType::Custom { .. } => {
+                    // Custom fields don't use the generic input/toggle/choice pattern.
+                    // They're handled separately in rendering.
+                    (None, false, None)
+                }
             };
             fields.push(GeneratorConfigField {
                 schema: schema_field,
@@ -1302,9 +1462,16 @@ impl TaskEditView {
             });
         }
 
+        // Schema evolution: orphaned field values (fields in stored config but not
+        // in current schema) are kept in generator_extra_config but only temporarily.
+        // They're omitted from the form and removed on next save.
         self.generator_extra_config = stored
             .into_iter()
-            .filter(|(key, _)| !described.contains(key))
+            .filter(|(key, _)| {
+                // Keep only special keys that aren't field names (e.g., result_cap is
+                // in the basic schema, workspace_slug is fetched separately)
+                !described.contains(key) && (key == "workspace_slug")
+            })
             .collect();
         self.generator_fields = fields;
         self.generator_invalid_fields.clear();
@@ -1312,6 +1479,7 @@ impl TaskEditView {
 
     /// The config JSON the form currently describes.
     fn generator_config_value(&self, cx: &App) -> serde_json::Value {
+        // Only include generator_extra_config (which now only has non-field special keys)
         let mut map = self.generator_extra_config.clone();
         for field in &self.generator_fields {
             let name = field.schema.name.clone();
@@ -1338,6 +1506,10 @@ impl TaskEditView {
                         map.remove(&name);
                     }
                 },
+                ConfigFieldType::Custom { .. } => {
+                    // Custom fields don't contribute to the config directly.
+                    // They're placeholders for data-source-specific UI that reads/writes config elsewhere.
+                }
             }
         }
         serde_json::Value::Object(map)
@@ -1370,6 +1542,11 @@ impl TaskEditView {
                 // Compare against the form's own rendering of the stored
                 // config, so a round trip alone never reads as dirty.
                 self.generator_saved_config = Some(self.generator_config_value(cx));
+                // Load Linear-specific data if this is a Linear generator
+                if config.data_source_type == "linear" {
+                    self.load_linear_state();
+                    self.initialize_linear_filter_values();
+                }
             }
             None => {
                 self.generator_data_source_type = None;
@@ -1379,6 +1556,7 @@ impl TaskEditView {
                 self.generator_extra_config.clear();
                 self.generator_invalid_fields.clear();
                 self.generator_saved_config = None;
+                self.clear_linear_state();
             }
         }
         self.clamp_focus_index();
@@ -1392,6 +1570,445 @@ impl TaskEditView {
             self.generator_last_status = config.last_refresh_status;
             self.generator_last_error = config.last_refresh_error;
         }
+    }
+
+    fn load_linear_state(&mut self) {
+        use tod_integration::LinearDataSource;
+
+        // Load introspection cache
+        let data_root = self.paths.data_root();
+        let linear_ds = LinearDataSource::with_data_root(data_root.to_path_buf());
+        self.linear_introspection_cache = linear_ds.get_cached_introspection();
+
+        // Calculate cache age if it exists
+        if self.linear_introspection_cache.is_some() {
+            let cache_path = data_root.join("linear_introspection_cache.json");
+            if let Ok(metadata) = std::fs::metadata(&cache_path) {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(elapsed) = modified.elapsed() {
+                        let days = elapsed.as_secs() / 86400;
+                        self.linear_introspection_age = if days == 0 {
+                            Some("Today".to_string())
+                        } else if days == 1 {
+                            Some("1 day ago".to_string())
+                        } else {
+                            Some(format!("{} days ago", days))
+                        };
+                    }
+                }
+            }
+        }
+
+        // Load presets
+        self.linear_presets = tod_integration::load_presets(data_root)
+            .unwrap_or_else(|_| Vec::new());
+
+        // Check credential status
+        let store = CredentialStore::from_data_root(self.fleet.paths().root());
+        self.linear_credential_status = match resolve_linear_api_key(&store) {
+            Some(_) => Some(Ok(())),
+            None => Some(Err("Linear API key not set".to_string())),
+        };
+    }
+
+    fn clear_linear_state(&mut self) {
+        self.linear_introspection_cache = None;
+        self.linear_introspection_age = None;
+        self.linear_introspection_fetching = false;
+        self.linear_introspection_error = None;
+        self.linear_credential_status = None;
+        self.linear_presets.clear();
+        self.linear_selected_preset = None;
+        self.linear_preset_action = None;
+        self.linear_filter_values.clear();
+        self.linear_filter_inputs = LinearFilterInputs::default();
+    }
+
+    fn trigger_linear_introspection_fetch(&mut self, cx: &mut Context<Self>) {
+        if self.linear_introspection_fetching {
+            return;
+        }
+
+        let data_root = self.paths.data_root().to_path_buf();
+        let fleet = self.fleet.clone();
+
+        self.linear_introspection_fetching = true;
+        self.linear_introspection_error = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = cx.background_executor().spawn(async move {
+                let store = CredentialStore::from_data_root(fleet.paths().root());
+                let Some(api_key) = resolve_linear_api_key(&store) else {
+                    return Err("Linear API key not configured".to_string());
+                };
+
+                use tod_integration::LinearDataSource;
+                let ds = LinearDataSource::with_data_root(data_root.clone());
+
+                // Fetch fresh introspection and update cache
+                ds.fetch_and_cache_introspection(&api_key)
+                    .map(|_| ())
+                    .map_err(|e| format!("Failed to fetch introspection: {}", e))
+            }).await;
+
+            let _ = this.update(cx, |this, cx| {
+                this.linear_introspection_fetching = false;
+                match result {
+                    Ok(()) => {
+                        this.load_linear_state();
+                        this.linear_introspection_error = None;
+                    }
+                    Err(e) => {
+                        this.linear_introspection_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn cycle_linear_preset(&mut self, cx: &mut Context<Self>) {
+        let options: Vec<String> = std::iter::once("None".to_string())
+            .chain(self.linear_presets.iter().map(|p| p.name.clone()))
+            .collect();
+
+        let current = self.linear_selected_preset.as_deref();
+        let current_idx = current.and_then(|c| options.iter().position(|o| o == c));
+
+        let next_idx = match current_idx {
+            None => 0,
+            Some(idx) if idx + 1 >= options.len() => 0,
+            Some(idx) => idx + 1,
+        };
+
+        self.linear_selected_preset = if options[next_idx] == "None" {
+            None
+        } else {
+            Some(options[next_idx].clone())
+        };
+
+        // If a preset was selected, load its values
+        if let Some(ref preset_name) = self.linear_selected_preset {
+            let filters = self.linear_presets.iter()
+                .find(|p| &p.name == preset_name)
+                .map(|p| p.filters.clone());
+            if let Some(filters) = filters {
+                self.load_linear_preset_values(&filters);
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn initialize_linear_filter_values(&mut self) {
+        let Some(ref cache) = self.linear_introspection_cache else {
+            return;
+        };
+
+        self.linear_filter_values.clear();
+
+        for field in &cache.filter_fields {
+            // Skip ID fields
+            if field.field_type.ends_with("ID") {
+                continue;
+            }
+
+            let value = if cache.enums.contains_key(&field.field_type) {
+                // Enum field
+                LinearFilterValue::Enum {
+                    selected: None,
+                    options: cache.enums.get(&field.field_type).cloned().unwrap_or_default(),
+                }
+            } else if field.field_type == "DateTime" {
+                // Date range field
+                LinearFilterValue::DateRange {
+                    after: String::new(),
+                    before: String::new(),
+                }
+            } else if field.is_nullable {
+                // Nullable three-state field
+                LinearFilterValue::Nullable {
+                    state: NullableState::Any,
+                }
+            } else if ["team", "state", "assignee", "labels"].contains(&field.name.as_str()) {
+                // Multi-select field - options would need to be fetched separately
+                // For now, empty options (TODO: fetch entity lists from Linear API)
+                LinearFilterValue::MultiSelect {
+                    selected: Vec::new(),
+                    options: Vec::new(),
+                }
+            } else {
+                // Text field (default)
+                LinearFilterValue::Text(String::new())
+            };
+
+            self.linear_filter_values.insert(field.name.clone(), value);
+        }
+    }
+
+    /// Ensure all Input entities exist for filter fields that need them.
+    /// Called early in render() to pre-create entities before immutable borrows.
+    fn ensure_linear_filter_inputs_created(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Create Input entities for all Text and DateRange filter values
+        for (field_name, value) in &self.linear_filter_values {
+            match value {
+                LinearFilterValue::Text(_text) => {
+                    self.linear_filter_inputs.text_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx))
+                        });
+                }
+                LinearFilterValue::DateRange { after: _, before: _ } => {
+                    self.linear_filter_inputs.date_after_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).placeholder("After (YYYY-MM-DD)"))
+                        });
+                    self.linear_filter_inputs.date_before_inputs
+                        .entry(field_name.clone())
+                        .or_insert_with(|| {
+                            cx.new(|cx| InputState::new(window, cx).placeholder("Before (YYYY-MM-DD)"))
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn load_linear_preset_values(&mut self, filters: &serde_json::Map<String, serde_json::Value>) {
+        // Load filter values from preset into linear_filter_values
+        for (key, value) in filters {
+            if let Some(filter_value) = self.linear_filter_values.get_mut(key) {
+                match filter_value {
+                    LinearFilterValue::Text(text) => {
+                        if let Some(t) = value.as_str() {
+                            *text = t.to_string();
+                        }
+                    }
+                    LinearFilterValue::Enum { selected, .. } => {
+                        if let Some(s) = value.as_str() {
+                            *selected = Some(s.to_string());
+                        }
+                    }
+                    LinearFilterValue::DateRange { after, before } => {
+                        if let Some(obj) = value.as_object() {
+                            if let Some(a) = obj.get("gte").and_then(|v| v.as_str()) {
+                                *after = a.to_string();
+                            }
+                            if let Some(b) = obj.get("lte").and_then(|v| v.as_str()) {
+                                *before = b.to_string();
+                            }
+                        }
+                    }
+                    LinearFilterValue::Nullable { state } => {
+                        if let Some(obj) = value.as_object() {
+                            if obj.get("null") == Some(&serde_json::Value::Bool(true)) {
+                                *state = NullableState::IsEmpty;
+                            } else if obj.get("null") == Some(&serde_json::Value::Bool(false)) {
+                                *state = NullableState::HasValue;
+                            }
+                        }
+                    }
+                    LinearFilterValue::MultiSelect { selected, .. } => {
+                        if let Some(arr) = value.as_array() {
+                            *selected = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cycle_linear_enum_filter(&mut self, field_name: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::Enum { selected, options }) = self.linear_filter_values.get_mut(field_name) {
+            let current_idx = selected.as_ref().and_then(|s| options.iter().position(|o| o == s));
+            let next_idx = match current_idx {
+                None => 0,
+                Some(idx) if idx + 1 >= options.len() => {
+                    // Cycle back to None
+                    *selected = None;
+                    cx.notify();
+                    return;
+                }
+                Some(idx) => idx + 1,
+            };
+            *selected = Some(options[next_idx].clone());
+            cx.notify();
+        }
+    }
+
+    fn cycle_linear_nullable_filter(&mut self, field_name: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::Nullable { state }) = self.linear_filter_values.get_mut(field_name) {
+            *state = state.cycle();
+            cx.notify();
+        }
+    }
+
+    fn toggle_linear_multiselect_filter(&mut self, field_name: &str, option: &str, cx: &mut Context<Self>) {
+        if let Some(LinearFilterValue::MultiSelect { selected, .. }) = self.linear_filter_values.get_mut(field_name) {
+            if let Some(pos) = selected.iter().position(|s| s == option) {
+                selected.remove(pos);
+            } else {
+                selected.push(option.to_string());
+            }
+            cx.notify();
+        }
+    }
+
+    fn confirm_linear_preset_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.linear_preset_action.clone() else {
+            return;
+        };
+
+        let preset_name = input_text(&self.linear_preset_name_input, cx);
+        if preset_name.trim().is_empty() && action != LinearPresetAction::Delete {
+            self.linear_preset_action = None;
+            cx.notify();
+            return;
+        }
+
+        let data_root = self.paths.data_root().to_path_buf();
+
+        match action {
+            LinearPresetAction::Save => {
+                // Check for overwrite
+                let exists = self.linear_presets.iter().any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
+                if exists {
+                    // Show confirmation toast for overwrite
+                    let view = cx.entity().downgrade();
+                    let view_cancel = view.clone();
+                    let preset_name_clone = preset_name.clone();
+                    let data_root_clone = data_root.clone();
+                    confirm_toast(
+                        window,
+                        cx,
+                        format!("Overwrite '{}'?", preset_name),
+                        format!("A preset named '{}' already exists. Overwrite it?", preset_name),
+                        move |_window, cx| {
+                            // User confirmed - save the preset
+                            let _ = view.update(cx, |this, _cx| {
+                                let filters = this.extract_linear_filter_values(_cx);
+                                if let Err(e) = tod_integration::save_preset(&data_root_clone, &preset_name_clone, &filters) {
+                                    this.generator_config_error = Some(format!("Failed to save preset: {}", e));
+                                } else {
+                                    this.linear_presets = tod_integration::load_presets(&data_root_clone).unwrap_or_default();
+                                    this.linear_selected_preset = Some(preset_name_clone.clone());
+                                }
+                                this.linear_preset_action = None;
+                            });
+                        },
+                        move |_window, cx| {
+                            // User cancelled - just clear the action
+                            let _ = view_cancel.update(cx, |this, _cx| {
+                                this.linear_preset_action = None;
+                            });
+                        },
+                    );
+                    return; // Don't clear action yet - confirmation will do it
+                }
+
+                // No overwrite - save directly
+                let filters = self.extract_linear_filter_values(cx);
+
+                if let Err(e) = tod_integration::save_preset(&data_root, &preset_name, &filters) {
+                    self.generator_config_error = Some(format!("Failed to save preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = Some(preset_name);
+                }
+            }
+            LinearPresetAction::Rename => {
+                let Some(ref old_name) = self.linear_selected_preset else {
+                    self.linear_preset_action = None;
+                    cx.notify();
+                    return;
+                };
+
+                if let Err(e) = tod_integration::rename_preset(&data_root, old_name, &preset_name) {
+                    self.generator_config_error = Some(format!("Failed to rename preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = Some(preset_name);
+                }
+            }
+            LinearPresetAction::Delete => {
+                let Some(ref name) = self.linear_selected_preset else {
+                    self.linear_preset_action = None;
+                    cx.notify();
+                    return;
+                };
+
+                if let Err(e) = tod_integration::delete_preset(&data_root, name) {
+                    self.generator_config_error = Some(format!("Failed to delete preset: {}", e));
+                } else {
+                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_selected_preset = None;
+                }
+            }
+        }
+
+        self.linear_preset_name_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+        });
+        self.linear_preset_action = None;
+        cx.notify();
+    }
+
+    fn extract_linear_filter_values(&self, _cx: &Context<Self>) -> serde_json::Map<String, serde_json::Value> {
+        let mut result = serde_json::Map::new();
+
+        for (key, value) in &self.linear_filter_values {
+            let json_value = match value {
+                LinearFilterValue::Text(text) => {
+                    if text.is_empty() {
+                        continue; // Skip empty text fields
+                    }
+                    serde_json::json!({ "contains": text })
+                }
+                LinearFilterValue::Enum { selected, .. } => {
+                    if let Some(s) = selected {
+                        serde_json::json!({ "eq": s })
+                    } else {
+                        continue; // Skip unselected enums
+                    }
+                }
+                LinearFilterValue::DateRange { after, before } => {
+                    if after.is_empty() && before.is_empty() {
+                        continue; // Skip empty date ranges
+                    }
+                    let mut range = serde_json::Map::new();
+                    if !after.is_empty() {
+                        range.insert("gte".to_string(), serde_json::Value::String(after.clone()));
+                    }
+                    if !before.is_empty() {
+                        range.insert("lte".to_string(), serde_json::Value::String(before.clone()));
+                    }
+                    serde_json::Value::Object(range)
+                }
+                LinearFilterValue::Nullable { state } => {
+                    match state {
+                        NullableState::Any => continue, // Skip 'any' state
+                        NullableState::HasValue => serde_json::json!({ "null": false }),
+                        NullableState::IsEmpty => serde_json::json!({ "null": true }),
+                    }
+                }
+                LinearFilterValue::MultiSelect { selected, .. } => {
+                    if selected.is_empty() {
+                        continue; // Skip empty multiselects
+                    }
+                    serde_json::json!({ "in": selected })
+                }
+            };
+
+            result.insert(key.clone(), json_value);
+        }
+
+        result
     }
 
     fn select_generator_data_source(
@@ -1448,6 +2065,7 @@ impl TaskEditView {
                 };
             }
             ConfigFieldType::Text | ConfigFieldType::TextArea => return,
+            ConfigFieldType::Custom { .. } => return,
         }
         self.generator_invalid_fields.remove(&index);
         cx.notify();
@@ -3288,6 +3906,18 @@ impl TaskEditView {
                     cx,
                 )
                 .into_any_element(),
+            ConfigFieldType::Custom { type_hint, .. } => {
+                if type_hint == "linear_filter_fields" {
+                    self.render_linear_filter_ui(muted, window, cx)
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Custom field type: {}", type_hint))
+                        .into_any_element()
+                }
+            }
         };
 
         let mut row = v_flex()
@@ -3329,6 +3959,353 @@ impl TaskEditView {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.enter_field_edit(TaskEditField::GeneratorField(index), window, cx);
             }))
+    }
+
+    fn render_linear_filter_ui(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_cache = self.linear_introspection_cache.is_some();
+
+        v_flex()
+            .gap_3()
+            .child(self.render_linear_credential_status(muted, cx))
+            .child(self.render_linear_introspection_section(muted, cx))
+            .when(has_cache, |el| {
+                el.child(self.render_linear_preset_section(muted, window, cx))
+                    .child(self.render_linear_filter_fields(muted, window, cx))
+                    .child(self.render_linear_result_cap(window, cx))
+            })
+            .when(!has_cache, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Filter configuration requires introspection schema. Use re-fetch button above.")
+                )
+            })
+    }
+
+    fn render_linear_credential_status(
+        &self,
+        muted: gpui::Hsla,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let status_text = match &self.linear_credential_status {
+            Some(Ok(())) => "✓ Linear API key configured".to_string(),
+            Some(Err(msg)) => msg.clone(),
+            None => "Checking credentials...".to_string(),
+        };
+        let status_color = match &self.linear_credential_status {
+            Some(Ok(())) => gpui::white(),
+            _ => muted,
+        };
+        let show_link = matches!(&self.linear_credential_status, Some(Err(_)));
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status_text)
+            )
+            .when(show_link, |el| {
+                el.child(
+                    Button::new("linear-cred-link")
+                        .label("Settings")
+                        .xsmall()
+                        .ghost()
+                )
+            })
+    }
+
+    fn render_linear_introspection_section(
+        &self,
+        muted: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let age_text = self.linear_introspection_age.as_deref().unwrap_or("unknown age");
+        let has_cache = self.linear_introspection_cache.is_some();
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if has_cache { gpui::white() } else { muted })
+                    .child(if self.linear_introspection_fetching {
+                        "Fetching schema...".to_string()
+                    } else if let Some(ref error) = self.linear_introspection_error {
+                        format!("Schema fetch failed: {}", error)
+                    } else if has_cache {
+                        format!("Schema cached ({})", age_text)
+                    } else {
+                        "No cached schema".to_string()
+                    })
+            )
+            .child(
+                Button::new("linear-refetch")
+                    .label(if self.linear_introspection_fetching { "Fetching..." } else { "Re-fetch schema" })
+                    .xsmall()
+                    .ghost()
+                    .disabled(self.linear_introspection_fetching)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.trigger_linear_introspection_fetch(cx);
+                    }))
+            )
+    }
+
+    fn render_linear_preset_section(
+        &self,
+        _muted: gpui::Hsla,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let preset_options: Vec<String> = std::iter::once("None".to_string())
+            .chain(self.linear_presets.iter().map(|p| p.name.clone()))
+            .collect();
+
+        let current_selection = self.linear_selected_preset.as_deref().unwrap_or("None");
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(div().text_xs().child("Preset:"))
+            .child(
+                Button::new("linear-preset-select")
+                    .label(current_selection)
+                    .xsmall()
+                    .outline()
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.cycle_linear_preset(cx);
+                    }))
+            )
+            .when(self.linear_selected_preset.is_some(), |el| {
+                el.child(
+                    Button::new("linear-preset-save")
+                        .label("Save")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Save);
+                            cx.notify();
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-rename")
+                        .label("Rename")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Rename);
+                            cx.notify();
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-delete")
+                        .label("Delete")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = Some(LinearPresetAction::Delete);
+                            cx.notify();
+                        }))
+                )
+            })
+            .when(self.linear_preset_action.is_some(), |el| {
+                el.child(
+                    Input::new(&self.linear_preset_name_input)
+                        .xsmall()
+                )
+                .child(
+                    Button::new("linear-preset-confirm")
+                        .label("Confirm")
+                        .xsmall()
+                        .primary()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.confirm_linear_preset_action(window, cx);
+                        }))
+                )
+                .child(
+                    Button::new("linear-preset-cancel")
+                        .label("Cancel")
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.linear_preset_action = None;
+                            cx.notify();
+                        }))
+                )
+            })
+    }
+
+    fn render_linear_filter_fields(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(cache) = self.linear_introspection_cache.clone() else {
+            return v_flex().into_any_element();
+        };
+
+        let common_fields = ["team", "state", "priority", "assignee", "labels"];
+        let mut common: Vec<_> = cache.filter_fields.iter()
+            .filter(|f| common_fields.contains(&f.name.as_str()))
+            .collect();
+        common.sort_by_key(|f| common_fields.iter().position(|&name| name == f.name).unwrap_or(usize::MAX));
+
+        let mut additional: Vec<_> = cache.filter_fields.iter()
+            .filter(|f| !common_fields.contains(&f.name.as_str()) && !f.field_type.ends_with("ID"))
+            .collect();
+        additional.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut common_elements = Vec::new();
+        for field in common {
+            common_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx).into_any_element());
+        }
+
+        let mut additional_elements = Vec::new();
+        for field in additional {
+            additional_elements.push(self.render_linear_filter_field(field, &cache.enums, window, cx).into_any_element());
+        }
+
+        v_flex()
+            .gap_2()
+            .when(!common_elements.is_empty(), |el| {
+                el.child(div().text_xs().text_color(muted).child("Common filters"))
+                    .child(v_flex().gap_1().children(common_elements))
+            })
+            .when(!additional_elements.is_empty(), |el| {
+                el.child(div().text_xs().text_color(muted).child("Additional filters"))
+                    .child(v_flex().gap_1().children(additional_elements))
+            })
+            .into_any_element()
+    }
+
+    fn render_linear_filter_field(
+        &self,
+        field: &tod_integration::FilterFieldMetadata,
+        _enums: &std::collections::HashMap<String, Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let field_name = field.name.clone();
+        let help_text = field.description.clone().unwrap_or_else(|| {
+            // Generate help text based on field type
+            if field.field_type.contains("Filter") || !field.field_type.is_empty() && field.field_type.chars().next().unwrap().is_uppercase() {
+                // Likely an enum type
+                format!("{} (eq)", field_name)
+            } else if field.field_type == "DateTime" {
+                format!("{} (after/before)", field_name)
+            } else if field.is_nullable {
+                format!("{} (any/has value/is empty)", field_name)
+            } else {
+                format!("{} (contains)", field_name)
+            }
+        });
+
+        let control = if let Some(value) = self.linear_filter_values.get(&field.name) {
+            match value {
+                LinearFilterValue::Text(_text) => {
+                    // Get pre-created text input (guaranteed to exist)
+                    if let Some(input) = self.linear_filter_inputs.text_inputs.get(&field.name) {
+                        Input::new(input)
+                            .xsmall()
+                            .into_any_element()
+                    } else {
+                        div().text_xs().child("(input not created)").into_any_element()
+                    }
+                }
+                LinearFilterValue::Enum { selected, options } => {
+                    let display = selected.clone().unwrap_or_else(|| "(none)".to_string());
+                    let field_for_click = field.name.clone();
+                    Button::new(format!("linear-enum-{}", field.name))
+                        .label(display)
+                        .xsmall()
+                        .outline()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.cycle_linear_enum_filter(&field_for_click, cx);
+                        }))
+                        .into_any_element()
+                }
+                LinearFilterValue::DateRange { after: _, before: _ } => {
+                    // Get pre-created date inputs (guaranteed to exist)
+                    if let (Some(after_input), Some(before_input)) = (
+                        self.linear_filter_inputs.date_after_inputs.get(&field.name),
+                        self.linear_filter_inputs.date_before_inputs.get(&field.name)
+                    ) {
+                        h_flex()
+                            .gap_2()
+                            .child(Input::new(after_input).xsmall())
+                            .child(Input::new(before_input).xsmall())
+                            .into_any_element()
+                    } else {
+                        div().text_xs().child("(date inputs not created)").into_any_element()
+                    }
+                }
+                LinearFilterValue::Nullable { state } => {
+                    let field_for_click = field.name.clone();
+                    Button::new(format!("linear-nullable-{}", field.name))
+                        .label(state.to_label())
+                        .xsmall()
+                        .outline()
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.cycle_linear_nullable_filter(&field_for_click, cx);
+                        }))
+                        .into_any_element()
+                }
+                LinearFilterValue::MultiSelect { selected, options } => {
+                    // Render as buttons for each option
+                    let buttons: Vec<_> = options.iter().map(|opt| {
+                        let is_selected = selected.contains(opt);
+                        let opt_clone = opt.clone();
+                        let field_for_click = field.name.clone();
+                        Button::new(format!("linear-multi-{}-{}", field.name, opt))
+                            .label(opt.clone())
+                            .xsmall()
+                            .when(is_selected, |btn| btn.primary())
+                            .when(!is_selected, |btn| btn.ghost())
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_linear_multiselect_filter(&field_for_click, &opt_clone, cx);
+                            }))
+                    }).collect();
+                    h_flex()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(buttons)
+                        .into_any_element()
+                }
+            }
+        } else {
+            div().text_xs().child("(not initialized)").into_any_element()
+        };
+
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().child(field_name))
+            .child(div().text_xs().text_color(gpui::rgb(0x888888)).child(help_text))
+            .child(control)
+    }
+
+    fn render_linear_result_cap(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_1()
+            .child(div().text_xs().child("Result cap"))
+            .child(div().text_xs().text_color(gpui::rgb(0x888888)).child("Maximum total items to fetch (default 200)"))
+            .child(
+                Input::new(&self.linear_result_cap_input)
+                    .xsmall()
+            )
     }
 
     /// Save / Refresh. Nothing in this section is ever written on blur — the
@@ -3446,6 +4423,72 @@ impl TaskEditView {
                 ),
             );
         }
+
+        // Linear metadata row (priority, state, assignee)
+        if source_type.as_deref() == Some(tod_core::generator::DATA_SOURCE_LINEAR) {
+            if let Some(metadata) = &self.managed_metadata {
+                let priority = metadata
+                    .get("priority")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let state = metadata
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                let assignee = metadata
+                    .get("assignee")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+
+                body = body.child(
+                    h_flex()
+                        .gap_4()
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("Priority:"),
+                                )
+                                .child(div().text_xs().child(priority)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("State:"),
+                                )
+                                .child(div().text_xs().child(state)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("Assignee:"),
+                                )
+                                .child(div().text_xs().child(assignee)),
+                        ),
+                );
+            }
+        }
+
         body = body.child(
             v_flex()
                 .gap_1()
@@ -3552,6 +4595,252 @@ impl TaskEditView {
             .into_any_element()
     }
 
+    fn render_generator_detail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let theme = cx.theme();
+        let border = theme.border;
+        let accent = theme.primary;
+        let background = theme.background;
+        let secondary = theme.secondary;
+        let muted = theme.muted_foreground;
+        let danger = theme.danger;
+
+        // Get data source display name
+        let sources = tod_core::generator::available_data_sources();
+        let source_display_name = self
+            .generator_data_source_type
+            .as_ref()
+            .and_then(|ds_type| {
+                sources
+                    .iter()
+                    .find(|(key, _, _)| key == ds_type)
+                    .map(|(_, name, _)| name.to_string())
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        // Build config summary
+        let config_summary = if self.generator_fields.is_empty() {
+            "No configuration".to_string()
+        } else {
+            let filter_count = self
+                .generator_fields
+                .iter()
+                .filter(|f| !f.is_empty(cx))
+                .count();
+            let result_cap = self
+                .generator_fields
+                .iter()
+                .find(|f| f.schema.name == "result_cap")
+                .and_then(|f| f.value_as_string(cx))
+                .unwrap_or_else(|| "200".to_string());
+            format!("{} filters · cap: {}", filter_count, result_cap)
+        };
+
+        // Check credential status
+        let credential_status = if let Some(data_source_type) = &self.generator_data_source_type {
+            if data_source_type == tod_core::generator::DATA_SOURCE_LINEAR {
+                let store = CredentialStore::from_data_root(self.fleet.paths().root());
+                if resolve_linear_api_key(&store).is_some() {
+                    "Linear API key configured".to_string()
+                } else {
+                    "Linear API key not configured".to_string()
+                }
+            } else {
+                "Credentials OK".to_string()
+            }
+        } else {
+            "No data source selected".to_string()
+        };
+
+        let mut body = v_flex().gap_3().p_3().w_full();
+
+        // Title
+        body = body.child(div().text_lg().font_semibold().child(selectable_text(
+            "task-edit-generator-title",
+            self.loaded_title.clone(),
+            window,
+            cx,
+        )));
+
+        // Data source type
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Data source", cx))
+                .child(selectable_text(
+                    "task-edit-generator-source",
+                    source_display_name,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Configuration summary
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Configuration", cx))
+                .child(selectable_text(
+                    "task-edit-generator-config-summary",
+                    config_summary,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Last refresh status
+        let status_text = if let Some(status) = &self.generator_last_status {
+            format!("Last refresh: {}", status)
+        } else {
+            "Never refreshed".to_string()
+        };
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Status", cx))
+                .child(selectable_text(
+                    "task-edit-generator-status",
+                    status_text,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Detailed error message if present
+        if let Some(error) = &self.generator_last_error {
+            body = body.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_medium()
+                            .text_color(danger)
+                            .child("Error"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(danger)
+                            .child(selectable_text(
+                                "task-edit-generator-error-detail",
+                                error.clone(),
+                                window,
+                                cx,
+                            )),
+                    ),
+            );
+        }
+
+        // Credential status
+        body = body.child(
+            v_flex()
+                .gap_1()
+                .child(Self::render_field_label("Credentials", cx))
+                .child(selectable_text(
+                    "task-edit-generator-credentials",
+                    credential_status,
+                    window,
+                    cx,
+                )),
+        );
+
+        // Action buttons
+        body = body.child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("task-edit-generator-edit-config")
+                        .label("Edit configuration")
+                        .ghost()
+                        .compact()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // Switch to edit view
+                            this.generator_show_detail = false;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("task-edit-generator-refresh")
+                        .label("Refresh")
+                        .ghost()
+                        .compact()
+                        .disabled(self.generator_busy.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.refresh_generator_now(cx);
+                        })),
+                ),
+        );
+
+        v_flex()
+            .key_context(TASK_EDIT_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .h_full()
+            .bg(background)
+            .border_l_2()
+            .border_color(accent)
+            .on_action(cx.listener(Self::on_close))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(secondary)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Generator Detail"),
+                    )
+                    .child(div().flex_1())
+                    .child(chrome_control_with_shortcut(
+                        Button::new("task-edit-generator-close")
+                            .label("Close")
+                            .ghost()
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close(cx);
+                            })),
+                        window,
+                        &TaskEditClose,
+                        TASK_EDIT_CONTEXT,
+                        cx,
+                    )),
+            )
+            .child(
+                div()
+                    .id("task-edit-generator-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("Generator node · manages child items from an external source"),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_capability_section(
         &self,
         cap: Capability,
@@ -3600,12 +4889,19 @@ impl Render for TaskEditView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending(window, cx);
 
+        // Pre-create all Input entities for Linear filter fields before rendering
+        self.ensure_linear_filter_inputs_created(window, cx);
+
         if !self.is_open() {
             return div().size_full().into_any_element();
         }
 
         if self.is_managed() {
             return self.render_managed_detail(window, cx);
+        }
+
+        if self.is_configured_generator() {
+            return self.render_generator_detail(window, cx);
         }
 
         self.sync_input_tab_stops(cx);

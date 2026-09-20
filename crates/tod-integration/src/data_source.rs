@@ -15,6 +15,11 @@ pub struct DataSourceItem {
     pub tags: Vec<String>,
     /// Body text (description, details). May contain markdown.
     pub body: String,
+    /// Optional metadata (priority, state, assignee, etc.) as JSON value.
+    /// Data sources store display-ready strings here; the generator framework
+    /// treats this as opaque and passes it through to managed nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     /// Child items, forming a tree structure (e.g. sub-issues).
     pub children: Vec<DataSourceItem>,
 }
@@ -39,6 +44,15 @@ pub enum ConfigFieldType {
     Boolean,
     /// Select from a fixed set of options.
     Select { options: Vec<String> },
+    /// Data-source-specific custom field type with rendering hints.
+    /// The UI checks the data source type and introspection metadata
+    /// to render these appropriately.
+    Custom {
+        /// Type hint for the UI (e.g., "linear_filter_field").
+        type_hint: String,
+        /// Additional metadata as JSON for UI-specific rendering.
+        metadata: serde_json::Value,
+    },
 }
 
 /// One field in a data source's configuration schema.
@@ -109,6 +123,18 @@ pub trait DataSource: Send + Sync {
     /// Returns `Ok(())` if valid, or `Err(DataSourceError::InvalidConfig(..))`.
     fn validate_config(&self, config: &serde_json::Value) -> Result<(), DataSourceError>;
 
+    /// Validate configuration with a live test query to the external service.
+    /// This is more thorough than `validate_config` but requires credentials and network access.
+    /// Data sources that don't support test queries can leave the default implementation.
+    fn validate_config_with_test_query(
+        &self,
+        config: &serde_json::Value,
+        _credentials: &HashMap<String, String>,
+    ) -> Result<(), DataSourceError> {
+        // Default: fall back to basic validation
+        self.validate_config(config)
+    }
+
     /// Fetch items matching the configuration query.
     ///
     /// The implementation handles pagination internally and returns the complete
@@ -122,4 +148,23 @@ pub trait DataSource: Send + Sync {
         config: &serde_json::Value,
         credentials: &HashMap<String, String>,
     ) -> Result<Vec<DataSourceItem>, DataSourceError>;
+
+    /// Get introspection metadata for this data source, if available.
+    /// Returns None for data sources that don't support introspection.
+    fn introspection_metadata(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Check if introspection cache exists.
+    fn has_introspection_cache(&self) -> bool {
+        false
+    }
+
+    /// Force refresh of introspection metadata (e.g., schema from API).
+    /// Returns an error if introspection is not supported or refresh fails.
+    fn refresh_introspection(&self, _api_key: &str) -> Result<(), DataSourceError> {
+        Err(DataSourceError::InvalidConfig(
+            "introspection not supported".into(),
+        ))
+    }
 }

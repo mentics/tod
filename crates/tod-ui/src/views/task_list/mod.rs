@@ -858,7 +858,23 @@ impl TaskListView {
         let Some(external_id) = &task.external_id else {
             return;
         };
-        cx.open_url(&format!("https://linear.app/issue/{external_id}"));
+
+        // Get workspace_slug from node metadata
+        let workspace_slug = uuid::Uuid::parse_str(task_id)
+            .ok()
+            .and_then(|node_id| {
+                self.fleet
+                    .get_extra_content(node_id, "metadata")
+                    .ok()
+                    .flatten()
+                    .and_then(|json_str| serde_json::from_str::<serde_json::Value>(&json_str).ok())
+                    .and_then(|metadata| metadata.as_object().cloned())
+                    .and_then(|obj| obj.get("workspace_slug").cloned())
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+            .unwrap_or_else(|| "linear".to_string());
+
+        cx.open_url(&format!("https://linear.app/{}/issue/{}", workspace_slug, external_id));
     }
 
     /// Walk up from `task_id` to the nearest ancestor (or itself) that owns

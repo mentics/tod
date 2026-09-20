@@ -8,7 +8,10 @@
 use std::collections::HashMap;
 use tod_integration::{DataSource, DataSourceItem, LinearDataSource, MockDataSource};
 
-pub use tod_integration::{ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement};
+pub use tod_integration::{
+    ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, FilterPreset,
+    delete_preset, load_presets, rename_preset, save_preset,
+};
 use tod_store::credentials::{CredentialStore, resolve_linear_api_key};
 use tod_store::fleet::FleetStore;
 use tod_store::outline::repos::{GeneratorRepo, NodeRepo, OutlineRepo};
@@ -30,8 +33,22 @@ pub const CREDENTIAL_LINEAR_API_KEY: &str = "linear_api_key";
 
 /// Resolve a data source implementation by its persisted `data_source_type`.
 pub fn data_source_for_type(data_source_type: &str) -> Option<Box<dyn DataSource>> {
+    data_source_for_type_with_root(data_source_type, None)
+}
+
+/// Resolve a data source implementation with an optional data root for caching.
+pub fn data_source_for_type_with_root(
+    data_source_type: &str,
+    data_root: Option<&std::path::Path>,
+) -> Option<Box<dyn DataSource>> {
     match data_source_type {
-        DATA_SOURCE_LINEAR => Some(Box::new(LinearDataSource::new())),
+        DATA_SOURCE_LINEAR => {
+            if let Some(root) = data_root {
+                Some(Box::new(LinearDataSource::with_data_root(root.to_path_buf())))
+            } else {
+                Some(Box::new(LinearDataSource::new()))
+            }
+        }
         DATA_SOURCE_MOCK => Some(Box::new(MockDataSource::new())),
         _ => None,
     }
@@ -58,10 +75,42 @@ pub fn config_schema_for_type(data_source_type: &str) -> Option<ConfigSchema> {
     data_source_for_type(data_source_type).map(|ds| ds.configuration_schema())
 }
 
+/// Get introspection metadata for a data source, if available.
+pub fn introspection_metadata_for_type(
+    data_source_type: &str,
+    data_root: Option<&std::path::Path>,
+) -> Option<serde_json::Value> {
+    data_source_for_type_with_root(data_source_type, data_root)
+        .and_then(|ds| ds.introspection_metadata())
+}
+
+/// Check if introspection cache exists for a data source.
+pub fn has_introspection_cache(
+    data_source_type: &str,
+    data_root: Option<&std::path::Path>,
+) -> bool {
+    data_source_for_type_with_root(data_source_type, data_root)
+        .map(|ds| ds.has_introspection_cache())
+        .unwrap_or(false)
+}
+
+/// Force refresh introspection metadata for a data source.
+pub fn refresh_introspection_metadata(
+    data_source_type: &str,
+    data_root: &std::path::Path,
+    api_key: &str,
+) -> Result<(), String> {
+    let ds = data_source_for_type_with_root(data_source_type, Some(data_root))
+        .ok_or_else(|| format!("unknown data source type: {data_source_type}"))?;
+    ds.refresh_introspection(api_key)
+        .map_err(|err| err.to_string())
+}
+
 /// Validate `config_json` against the named data source and persist it via
 /// [`OutlineMutation::SetGeneratorConfig`], **without** refreshing. Rejects
 /// unknown data source types and configs that fail
-/// [`DataSource::validate_config`] without enqueuing anything.
+/// [`DataSource::validate_config`] or test query validation (when credentials available)
+/// without enqueuing anything.
 ///
 /// Returns `true` when this was the node's first config, meaning an initial
 /// refresh is due. Saving is local and fast; refreshing reaches the network,
@@ -74,14 +123,28 @@ pub fn save_generator_config(
     data_source_type: &str,
     config_json: &str,
 ) -> Result<bool, String> {
-    let data_source = data_source_for_type(data_source_type)
+    let data_root = fleet.paths().root();
+    let data_source = data_source_for_type_with_root(data_source_type, Some(data_root))
         .ok_or_else(|| format!("unknown data source type: {data_source_type}"))?;
 
     let config: serde_json::Value =
         serde_json::from_str(config_json).map_err(|err| format!("invalid config JSON: {err}"))?;
-    data_source
-        .validate_config(&config)
-        .map_err(|err| err.to_string())?;
+
+    // Try test query validation if credentials are available
+    let credentials = resolve_credentials(data_root, data_source.as_ref());
+    let missing = missing_credentials(data_source.as_ref(), &credentials);
+
+    if missing.is_empty() {
+        // We have credentials, use test query validation
+        data_source
+            .validate_config_with_test_query(&config, &credentials)
+            .map_err(|err| err.to_string())?;
+    } else {
+        // No credentials, fall back to basic validation
+        data_source
+            .validate_config(&config)
+            .map_err(|err| err.to_string())?;
+    }
 
     let had_existing_config = fleet
         .read(move |conn| Ok(GeneratorRepo::new(conn).get_config(node_id)?.is_some()))
@@ -253,13 +316,15 @@ pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>,
             "node has no generator configuration".into(),
         ));
     };
-    let data_source = data_source_for_type(&config.data_source_type).ok_or_else(|| {
-        RefreshError::Other(format!(
-            "unknown data source type: {}",
-            config.data_source_type
-        ))
-    })?;
-    let credentials = resolve_credentials(fleet.paths().root(), data_source.as_ref());
+    let data_root = fleet.paths().root();
+    let data_source = data_source_for_type_with_root(&config.data_source_type, Some(data_root))
+        .ok_or_else(|| {
+            RefreshError::Other(format!(
+                "unknown data source type: {}",
+                config.data_source_type
+            ))
+        })?;
+    let credentials = resolve_credentials(data_root, data_source.as_ref());
 
     let missing = missing_credentials(data_source.as_ref(), &credentials);
     if !missing.is_empty() {
@@ -431,7 +496,7 @@ fn collect_linked_copy_updates(
             .map_err(|err| err.to_string())?;
         for link in links {
             let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
-            let title = (!dirty("title")).then(|| format!("{}: {}", link.external_id, item.title));
+            let title = (!dirty("title")).then(|| item.title.clone());
             let tags = (!dirty("tags")).then(|| item.tags.clone());
             let body = (!dirty("body")).then(|| item.body.clone());
             if title.is_some() || tags.is_some() || body.is_some() {
@@ -495,6 +560,7 @@ fn reconcile_level(
                 title,
                 tags,
                 body,
+                metadata: item.metadata.clone(),
             });
             existing_item.node_id
         } else {
@@ -509,6 +575,7 @@ fn reconcile_level(
                 generator_node_id,
                 tags: item.tags.clone(),
                 body: item.body.clone(),
+                metadata: item.metadata.clone(),
             });
             new_node_id
         };
@@ -680,11 +747,14 @@ mod tests {
     }
 
     fn item(external_id: &str, title: &str, children: Vec<DataSourceItem>) -> DataSourceItem {
+        // Mirror Linear adapter behavior: title includes identifier prefix
+        let prefixed_title = format!("{}: {}", external_id, title);
         DataSourceItem {
             external_id: external_id.into(),
-            title: title.into(),
+            title: prefixed_title,
             tags: vec![],
             body: String::new(),
+            metadata: None,
             children,
         }
     }
@@ -701,7 +771,7 @@ mod tests {
 
         let children = managed_children(&fleet, list_id, node_id);
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].1, "First");
+        assert_eq!(children[0].1, "EXT-1: First");
 
         let config = read_config(&root, node_id).unwrap();
         assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_SUCCESS));
@@ -728,7 +798,7 @@ mod tests {
         assert_eq!(top.len(), 1);
         let sub = managed_children(&fleet, list_id, top[0].0);
         assert_eq!(sub.len(), 1);
-        assert_eq!(sub[0].1, "Child");
+        assert_eq!(sub[0].1, "EXT-2: Child");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -751,7 +821,7 @@ mod tests {
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, first[0].0, "same node reused across refreshes");
-        assert_eq!(second[0].1, "New title");
+        assert_eq!(second[0].1, "EXT-1: New title");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -794,7 +864,7 @@ mod tests {
 
         let children = managed_children(&fleet, list_id, node_id);
         assert_eq!(
-            children[0].1, "Original",
+            children[0].1, "EXT-1: Original",
             "user-edited title must survive refresh"
         );
 
