@@ -179,8 +179,10 @@ impl ConversationView {
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
         let (actions, mut notices) = self.lifecycle_controls(cx);
-        // A gate check's verdict and its blockers are in the side pane.
-        if gate_check {
+        let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
+        // A gate check's verdict and its blockers are in the side pane when
+        // it has no lifecycle list to show instead.
+        if self.side_list() == super::side_pane::SideList::Gate {
             notices.clear();
         }
         let header_actions = if self.data.has_opening_context {
@@ -193,6 +195,7 @@ impl ConversationView {
             panel.set_header_actions(header_actions, cx);
             panel.set_actions(actions, cx);
             panel.set_notices(notices, cx);
+            panel.set_lifecycle_state(lifecycle_state, cx);
             panel.set_return_focus(return_focus);
             panel.set_entries(entries, cx);
             panel.set_empty_message(empty, cx);
