@@ -177,6 +177,29 @@ impl<'a> VerdictRepo<'a> {
         Ok(verified.len())
     }
 
+    /// Withdraw every `verified` verdict on `obligation_id`, on whichever
+    /// node recorded it, because its wording changed: what was verified was
+    /// the old requirement.
+    pub fn reopen_obligation(&self, obligation_id: Uuid, why: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM obligation_verdicts WHERE obligation_id = ?1 ORDER BY id"
+        ))?;
+        let mut latest: HashMap<Uuid, ObligationVerdict> = HashMap::new();
+        for verdict in stmt.query_map(params![uuid_to_blob(obligation_id)], map_row)? {
+            let verdict = verdict?;
+            latest.insert(verdict.node_id, verdict);
+        }
+        let verified: Vec<Uuid> = latest
+            .into_values()
+            .filter(ObligationVerdict::is_verified)
+            .map(|v| v.node_id)
+            .collect();
+        for node_id in &verified {
+            self.insert(*node_id, obligation_id, None, VERDICT_REOPENED, why)?;
+        }
+        Ok(verified.len())
+    }
+
     /// Each obligation's current verdict for `node_id`, by obligation.
     pub fn latest_for_node(&self, node_id: Uuid) -> Result<HashMap<Uuid, ObligationVerdict>> {
         let mut latest = HashMap::new();
@@ -316,5 +339,22 @@ mod tests {
         let latest = repo.latest_for_node(fx.node).unwrap();
         assert_eq!(latest[&holds].status, VERDICT_REOPENED);
         assert!(latest[&broken].is_failed());
+    }
+
+    /// Rewording an obligation withdraws its `verified` verdict and no other.
+    #[test]
+    fn rewording_an_obligation_reopens_its_verdict() {
+        let fx = setup();
+        let repo = VerdictRepo::new(&fx.conn);
+        let reworded = obligation(&fx, "Old wording");
+        let untouched = obligation(&fx, "Untouched");
+        repo.record(fx.node, reworded, None, "verified", "Saw it work.").unwrap();
+        repo.record(fx.node, untouched, None, "verified", "Saw it work.").unwrap();
+        ObligationRepo::new(&fx.conn)
+            .update_body(reworded, "New wording")
+            .unwrap();
+        let latest = repo.latest_for_node(fx.node).unwrap();
+        assert_eq!(latest[&reworded].status, VERDICT_REOPENED);
+        assert!(latest[&untouched].is_verified());
     }
 }
