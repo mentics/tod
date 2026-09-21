@@ -283,12 +283,14 @@ impl AgentTranscriptsView {
             ),
             parts: Vec::new(),
             label: None,
+            summary: None,
         });
         let read_error = self.read_error.iter().map(|err| Entry {
             kind: EntryKind::Error,
             body: format!("Couldn't read the transcript: {err}"),
             parts: Vec::new(),
             label: None,
+            summary: None,
         });
         format_problems
             .into_iter()
@@ -625,6 +627,7 @@ fn entry_of_turn(turn: &TranscriptTurn) -> Entry {
         body: turn.text(),
         parts,
         label: None,
+        summary: None,
     }
 }
 

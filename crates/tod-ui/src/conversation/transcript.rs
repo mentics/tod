@@ -28,10 +28,12 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         body: turn.body.clone(),
         parts: turn.parts.clone(),
         label: None,
+        summary: None,
     }
 }
 
-/// One line for a gate check's parsed reply; the detail is in the side pane.
+/// One line for a gate check's parsed reply: its verdict and summary. The
+/// criteria are in the side pane, and the raw reply collapsed above this.
 fn gate_reply_line(reply: &tod_core::gate::GateCheckReply) -> String {
     use tod_core::gate::GateOutcome;
     let verdict = match reply.result {
@@ -40,7 +42,10 @@ fn gate_reply_line(reply: &tod_core::gate::GateCheckReply) -> String {
         GateOutcome::NeedsHuman => "needs you",
         GateOutcome::NoChange => "no change",
     };
-    format!("Gate check {verdict}. Details are in the side pane.")
+    match reply.summary.trim() {
+        "" => format!("Gate check {verdict}."),
+        summary => format!("Gate check {verdict}. {summary}"),
+    }
 }
 
 impl ConversationView {
@@ -132,10 +137,16 @@ impl ConversationView {
             .map(|turn| {
                 let mut entry = entry_of(turn);
                 // The verdict is structured YAML the app records and shows in
-                // the side pane; the transcript says only that it came.
+                // the side pane; the transcript reads it in one line and keeps
+                // the YAML collapsed beneath, for digging in.
                 if gate_check && turn.role == TurnRole::Agent {
                     if let Ok(reply) = tod_core::gate::parse_gate_reply(&turn.body) {
-                        entry.body = gate_reply_line(&reply);
+                        entry.summary = Some(gate_reply_line(&reply));
+                        if entry.parts.is_empty() {
+                            entry.parts = vec![tod_agent::ReplyPart::Text {
+                                text: entry.body.clone(),
+                            }];
+                        }
                     }
                 }
                 entry
