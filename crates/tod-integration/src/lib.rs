@@ -14,7 +14,7 @@ pub use data_source::{
     DataSourceError, DataSourceItem,
 };
 pub use linear::{
-    is_filter_key as is_linear_filter_key, is_relation_filter_field,
+    is_filter_key as is_linear_filter_key, is_relation_filter_field, issue_url as linear_issue_url,
     migrate_legacy_filter_keys, relation_filter, relation_filter_selection, FilterFieldMetadata,
     IntrospectionCache, LinearDataSource,
 };

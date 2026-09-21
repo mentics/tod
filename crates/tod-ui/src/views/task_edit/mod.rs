@@ -1562,16 +1562,11 @@ impl TaskEditView {
     fn managed_external_url(&self) -> Option<String> {
         let link = self.managed_link.as_ref()?;
         match self.managed_source_type.as_deref() {
-            Some(tod_core::generator::DATA_SOURCE_LINEAR) => {
-                // Extract workspace_slug from metadata
-                let workspace_slug = self.managed_metadata
-                    .as_ref()
-                    .and_then(|m| m.as_object())
-                    .and_then(|obj| obj.get("workspace_slug"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("linear");
-                Some(format!("https://linear.app/{}/issue/{}", workspace_slug, link.external_id))
-            }
+            Some(tod_core::generator::DATA_SOURCE_LINEAR) => tod_integration::linear_issue_url(
+                self.managed_metadata.as_ref(),
+                self.paths.data_root(),
+                &link.external_id,
+            ),
             _ => None,
         }
     }

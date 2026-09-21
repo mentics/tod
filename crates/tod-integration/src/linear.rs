@@ -402,6 +402,31 @@ fn build_filter_from_config(
     Ok(serde_json::Value::Object(filter))
 }
 
+/// The browser URL of a Linear issue: `https://linear.app/<workspace>/issue/<identifier>`.
+///
+/// The workspace slug comes from the node's own metadata when it has one,
+/// else from the introspection cache under `data_root` (nodes generated
+/// before metadata was stored have none until their next refresh). `None`
+/// when neither knows the workspace — there is no URL that works without it.
+pub fn issue_url(
+    metadata: Option<&serde_json::Value>,
+    data_root: &std::path::Path,
+    identifier: &str,
+) -> Option<String> {
+    let workspace_slug = metadata
+        .and_then(|m| m.get("workspace_slug"))
+        .and_then(|v| v.as_str())
+        .filter(|slug| !slug.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            LinearDataSource::with_data_root(data_root.to_path_buf())
+                .get_cached_introspection()
+                .map(|cache| cache.workspace_slug)
+                .filter(|slug| !slug.is_empty())
+        })?;
+    Some(format!("https://linear.app/{workspace_slug}/issue/{identifier}"))
+}
+
 /// Fetch workspace URL slug from Linear API.
 fn fetch_workspace_slug(api_key: &str) -> Result<String, DataSourceError> {
     let client = build_client()?;
@@ -1433,6 +1458,29 @@ mod tests {
         let tree = build_tree(flat, "test-workspace");
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].title, "TOD-142: Fix bug");
+    }
+
+    #[test]
+    fn issue_url_uses_metadata_slug_then_cache_then_nothing() {
+        let dir = std::env::temp_dir().join(format!("tod-issue-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = serde_json::json!({ "workspace_slug": "mentics" });
+        assert_eq!(
+            issue_url(Some(&meta), &dir, "MEN-4").as_deref(),
+            Some("https://linear.app/mentics/issue/MEN-4"),
+        );
+        assert_eq!(issue_url(None, &dir, "MEN-4"), None);
+
+        std::fs::write(
+            dir.join("linear_introspection_cache.json"),
+            r#"{"workspace_slug":"acme","filter_fields":[],"enums":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            issue_url(None, &dir, "MEN-4").as_deref(),
+            Some("https://linear.app/acme/issue/MEN-4"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
