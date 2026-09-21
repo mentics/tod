@@ -2587,6 +2587,27 @@ impl TaskEditView {
                 }
             }
         }
+        // For Generator capability, only show confirmation if the node has children.
+        if cap == Capability::Generator {
+            if let Some(node_id) = self.node_uuid() {
+                match self.fleet.node_has_children(node_id) {
+                    Ok(false) => {
+                        // No children, disable directly without confirmation.
+                        self.disable_capability(cap, window, cx);
+                        return;
+                    }
+                    Ok(true) => {
+                        // Has children, show confirmation toast below.
+                    }
+                    Err(err) => {
+                        self.pending_toast =
+                            Some(format!("Failed to check children: {err}"));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
         let view = cx.entity().downgrade();
         let title = format!("Disable {}?", cap.label());
         let message = cap.disable_warning().to_string();
