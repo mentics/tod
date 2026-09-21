@@ -13,6 +13,10 @@ pub use data_source::{
     ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, DataSource,
     DataSourceError, DataSourceItem,
 };
-pub use linear::{FilterFieldMetadata, IntrospectionCache, LinearDataSource};
+pub use linear::{
+    is_filter_key as is_linear_filter_key, is_relation_filter_field,
+    migrate_legacy_filter_keys, relation_filter, relation_filter_selection, FilterFieldMetadata,
+    IntrospectionCache, LinearDataSource,
+};
 pub use mock::MockDataSource;
 pub use preset::{delete_preset, load_presets, rename_preset, save_preset, FilterPreset};
