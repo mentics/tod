@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+/// The longest in-flight activity label, in characters.
+const ACTIVITY_MAX_CHARS: usize = 120;
+
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Idle bound on a prompt turn — reset by every notification the agent sends
 /// (tool calls, permission requests, message chunks), so a turn only times
@@ -1160,7 +1163,11 @@ impl AcpClient {
         self.update_reply(Vec::clear);
     }
 
+    /// The activity shows in a one-line status bar, and tool titles can be
+    /// whole shell commands, so it is kept to one short line here.
     fn set_activity(&self, activity: Option<String>) {
+        let activity =
+            activity.map(|text| crate::util::one_line_summary(&text, ACTIVITY_MAX_CHARS));
         *self.activity.lock().unwrap_or_else(|e| e.into_inner()) = activity;
     }
 

@@ -334,7 +334,10 @@ impl ConversationDriver {
             Some(AgentRunState::NeedsPermission(request)) => {
                 // Otherwise the view keeps showing the tool that asked, as
                 // if it were still running.
-                self.activity = Some(format!("Waiting for your permission: {}", request.title));
+                self.activity = Some(format!(
+                    "Waiting for your permission: {}",
+                    tod_agent::util::one_line_summary(&request.title, 120)
+                ));
                 self.permission = Some(request);
                 return self.save_session_id(fleet, agent);
             }

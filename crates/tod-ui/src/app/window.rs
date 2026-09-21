@@ -65,6 +65,10 @@ actions!(
 
 const TASKS_TREE_MIN: f32 = 240.0;
 const TASKS_DRAWER_MIN: f32 = 280.0;
+/// The status bar's fixed height: a compact button plus its padding.
+const STATUS_BAR_HEIGHT: Pixels = px(36.);
+/// The most characters of status text the bar shows before cutting it short.
+const STATUS_BAR_MAX_CHARS: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellView {
@@ -843,7 +847,9 @@ impl Shell {
     }
 
     /// The status bar's message: what the active view last posted to the
-    /// status hub (`ui::status`); views that post nothing show none.
+    /// status hub (`ui::status`); views that post nothing show none. The bar
+    /// is one line, so a longer post (an error chain, say — its toast keeps
+    /// the full text) shows only its first line, cut short.
     fn status_bar_message(&self, cx: &App) -> SharedString {
         let source = match self.active_view {
             ShellView::Tasks => StatusSource::Tasks,
@@ -852,18 +858,22 @@ impl Shell {
                 return SharedString::default();
             }
         };
-        status::current(cx, source).unwrap_or_default()
+        status::current(cx, source)
+            .map(|text| tod_agent::util::one_line_summary(&text, STATUS_BAR_MAX_CHARS).into())
+            .unwrap_or_default()
     }
 
     fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
         let muted = cx.theme().muted_foreground;
         let status = self.status_bar_message(cx);
+        // A fixed height: the bar never resizes to fit what it shows.
         h_flex()
             .w_full()
+            .h(STATUS_BAR_HEIGHT)
             .flex_shrink_0()
+            .overflow_hidden()
             .px_4()
-            .py_1p5()
             .border_t_1()
             .border_color(border)
             .justify_between()
@@ -873,7 +883,9 @@ impl Shell {
                 div()
                     .flex_1()
                     .min_w_0()
+                    .max_h(STATUS_BAR_HEIGHT)
                     .overflow_hidden()
+                    .whitespace_nowrap()
                     .when(!status.is_empty(), |el| {
                         el.child(
                             selectable_text("shell-status", status, window, cx)
