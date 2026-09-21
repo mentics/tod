@@ -21,6 +21,7 @@ use uuid::Uuid;
 const REFRESH_IN_PROGRESS: &str = "in_progress";
 const REFRESH_SUCCESS: &str = "success";
 const REFRESH_ERROR: &str = "error";
+const REFRESH_INTERRUPTED: &str = "the refresh was interrupted before it finished";
 
 pub const DATA_SOURCE_LINEAR: &str = "linear";
 pub const DATA_SOURCE_MOCK: &str = "mock";
@@ -333,16 +334,58 @@ pub fn refresh_generator(fleet: &FleetStore, node_id: Uuid) -> Result<Vec<Uuid>,
         return Err(err);
     }
 
-    refresh_generator_with(fleet, node_id, data_source.as_ref(), &credentials)
-        .map_err(RefreshError::Other)
+    // The fetch is the one step that can outlast any sane wait (a stalled
+    // connection, a rate-limit back-off), so it runs under a deadline: past
+    // it the refresh is recorded as failed and the fetch thread is abandoned,
+    // instead of the row reading "refreshing…" for as long as the app is up.
+    let data_source: std::sync::Arc<dyn DataSource> = std::sync::Arc::from(data_source);
+    refresh_with_fetch(fleet, node_id, move |config| {
+        run_with_deadline(REFRESH_FETCH_DEADLINE, move || {
+            data_source
+                .fetch(&config, &credentials)
+                .map_err(|err| err.to_string())
+        })
+        .and_then(|fetched| fetched)
+    })
+    .map_err(RefreshError::Other)
+}
+
+/// How long a refresh waits on its data source before giving up.
+const REFRESH_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Run `work` on its own thread and wait at most `deadline` for it. On a
+/// timeout the thread is left to finish on its own and its result is dropped;
+/// a panic in `work` comes back as an error rather than unwinding the caller.
+fn run_with_deadline<T: Send + 'static>(
+    deadline: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("generator-fetch".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|err| format!("could not start the fetch: {err}"))?;
+    match rx.recv_timeout(deadline) {
+        Ok(value) => Ok(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "the data source did not answer within {} seconds",
+            deadline.as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the fetch stopped unexpectedly".into())
+        }
+    }
 }
 
 /// Reconcile a generator node's managed subtree against a fetched item tree.
 ///
 /// Refresh is atomic: mutations are only enqueued after `fetch` succeeds in
 /// full, so a failed fetch leaves existing managed nodes untouched. A
-/// refresh already `in_progress` is silently ignored rather than erroring,
-/// so concurrent triggers collapse onto the one in flight. Fields a user has
+/// trigger that arrives while this process is already refreshing the node is
+/// silently ignored rather than erroring, so concurrent triggers collapse
+/// onto the one in flight (see [`InFlightRefresh`]). Fields a user has
 /// edited on a copied-out/managed node (tracked in
 /// [`tod_store::outline::repos::generator::ManagedNodeLink::user_modified_fields`])
 /// are preserved rather than overwritten by the fetched value. Tags are
@@ -356,15 +399,34 @@ pub fn refresh_generator_with(
     data_source: &dyn DataSource,
     credentials: &HashMap<String, String>,
 ) -> Result<Vec<Uuid>, String> {
+    refresh_with_fetch(fleet, node_id, |config| {
+        data_source
+            .fetch(&config, credentials)
+            .map_err(|err| err.to_string())
+    })
+}
+
+/// [`refresh_generator_with`], with the fetch itself supplied by the caller
+/// so it can decide where and for how long the fetch runs.
+fn refresh_with_fetch(
+    fleet: &FleetStore,
+    node_id: Uuid,
+    fetch: impl FnOnce(serde_json::Value) -> Result<Vec<DataSourceItem>, String>,
+) -> Result<Vec<Uuid>, String> {
+    // Whether a refresh is running is a fact about this process, not the
+    // database: a persisted `in_progress` with no claim behind it was left by
+    // a process that died mid-refresh, and must not block the next one.
+    let Some(_claim) = InFlightRefresh::claim(fleet, node_id) else {
+        tracing::info!(%node_id, "generator refresh ignored: one is already in flight");
+        return Ok(Vec::new());
+    };
+
     let loaded = fleet
         .read(move |conn| {
             let gen_repo = GeneratorRepo::new(conn);
             let Some(config) = gen_repo.get_config(node_id)? else {
                 return Ok(None);
             };
-            if config.last_refresh_status.as_deref() == Some(REFRESH_IN_PROGRESS) {
-                return Ok(None);
-            }
             let Some(entry) = OutlineRepo::new(conn).get_entry(node_id)? else {
                 return Ok(None);
             };
@@ -401,8 +463,7 @@ pub fn refresh_generator_with(
         .map_err(|err| err.to_string())?;
 
     let Some((config, list_id, existing)) = loaded else {
-        // No config, no outline entry, or a refresh is already in progress —
-        // nothing to do.
+        // No config or no outline entry — nothing to do.
         return Ok(Vec::new());
     };
 
@@ -415,23 +476,89 @@ pub fn refresh_generator_with(
         .map_err(|err| err.to_string())?;
     fleet.writer().flush().map_err(|err| err.to_string())?;
 
-    let config_value: serde_json::Value = match serde_json::from_str(&config.config_json) {
-        Ok(v) => v,
-        Err(err) => {
-            let msg = format!("invalid stored config JSON: {err}");
-            set_refresh_error(fleet, node_id, &msg)?;
-            return Err(msg);
+    // From here the row says `in_progress`, so every way out has to replace
+    // it: success does below, and any failure is recorded here.
+    tracing::info!(%node_id, source = %config.data_source_type, "generator refresh started");
+    let started = std::time::Instant::now();
+    let result = fetch_and_reconcile(fleet, node_id, list_id, &config, &existing, fetch);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::info!(%node_id, elapsed_ms, "generator refresh finished"),
+        Err(msg) => {
+            tracing::error!(%node_id, elapsed_ms, error = %msg, "generator refresh failed");
+            if let Err(err) = set_refresh_error(fleet, node_id, msg) {
+                tracing::error!(%node_id, error = %err, "could not record the failed refresh");
+            }
         }
-    };
+    }
+    result
+}
 
-    let items = match data_source.fetch(&config_value, credentials) {
-        Ok(items) => items,
-        Err(err) => {
-            let msg = err.to_string();
-            set_refresh_error(fleet, node_id, &msg)?;
-            return Err(msg);
+/// A refresh running in this process. Claims are what collapse concurrent
+/// triggers onto the one in flight; the persisted `in_progress` status is for
+/// display only. Dropping the claim releases it, and a claim dropped by a
+/// panic marks the refresh failed so the row does not read "refreshing…"
+/// until the app restarts.
+struct InFlightRefresh<'a> {
+    fleet: &'a FleetStore,
+    node_id: Uuid,
+}
+
+static IN_FLIGHT_REFRESHES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    std::sync::LazyLock::new(Default::default);
+
+impl<'a> InFlightRefresh<'a> {
+    /// `None` when this process is already refreshing `node_id`.
+    fn claim(fleet: &'a FleetStore, node_id: Uuid) -> Option<Self> {
+        let claimed = IN_FLIGHT_REFRESHES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(node_id);
+        // Built only once claimed: dropping one releases the claim.
+        claimed.then(|| Self { fleet, node_id })
+    }
+}
+
+impl Drop for InFlightRefresh<'_> {
+    fn drop(&mut self) {
+        IN_FLIGHT_REFRESHES
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .remove(&self.node_id);
+        if std::thread::panicking() {
+            tracing::error!(node_id = %self.node_id, "generator refresh panicked");
+            let _ = set_refresh_error(self.fleet, self.node_id, REFRESH_INTERRUPTED);
         }
-    };
+    }
+}
+
+/// Mark every generator still recorded as `in_progress` as failed. Refreshes
+/// run only inside the app, so at launch any such row was orphaned by a
+/// process that exited mid-refresh; left alone it would show "refreshing…"
+/// forever. Call once at app start, before anything can start a refresh.
+pub fn clear_interrupted_refreshes(fleet: &FleetStore) -> Result<usize, String> {
+    let orphaned = fleet
+        .read(|conn| GeneratorRepo::new(conn).nodes_with_refresh_status(REFRESH_IN_PROGRESS))
+        .map_err(|err| err.to_string())?;
+    for node_id in &orphaned {
+        tracing::warn!(%node_id, "generator refresh left in progress by an earlier run");
+        set_refresh_error(fleet, *node_id, REFRESH_INTERRUPTED)?;
+    }
+    Ok(orphaned.len())
+}
+
+fn fetch_and_reconcile(
+    fleet: &FleetStore,
+    node_id: Uuid,
+    list_id: Uuid,
+    config: &tod_store::outline::repos::GeneratorConfig,
+    existing: &HashMap<String, ExistingManaged>,
+    fetch: impl FnOnce(serde_json::Value) -> Result<Vec<DataSourceItem>, String>,
+) -> Result<Vec<Uuid>, String> {
+    let config_value: serde_json::Value = serde_json::from_str(&config.config_json)
+        .map_err(|err| format!("invalid stored config JSON: {err}"))?;
+
+    let items = fetch(config_value)?;
 
     let mut mutations = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -441,11 +568,11 @@ pub fn refresh_generator_with(
         list_id,
         node_id,
         &config.data_source_type,
-        &existing,
+        existing,
         &mut visited,
         &mut mutations,
     );
-    for (external_id, existing_item) in &existing {
+    for (external_id, existing_item) in existing {
         if !visited.contains(external_id) {
             mutations.push(OutlineMutation::DeleteManagedNode {
                 node_id: existing_item.node_id,
@@ -1450,11 +1577,83 @@ mod tests {
     }
 
     #[test]
-    fn refresh_ignored_while_already_in_progress() {
+    fn refresh_ignored_while_already_in_flight() {
         let (root, fleet) = setup();
         let list_id = fleet.list_outline_lists().unwrap()[0].id;
         let node_id = create_generator_node(&fleet, list_id);
         set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Ignored", vec![])]);
+        let claim = InFlightRefresh::claim(&fleet, node_id).unwrap();
+        let result = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new());
+        assert!(result.is_ok());
+        assert_eq!(managed_children(&fleet, list_id, node_id).len(), 0);
+        assert_eq!(
+            ds.fetch_count(),
+            0,
+            "fetch must not run while a refresh is in flight"
+        );
+
+        drop(claim);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert_eq!(
+            managed_children(&fleet, list_id, node_id).len(),
+            1,
+            "the claim is released once the refresh in flight ends"
+        );
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deadline_returns_the_work_when_it_finishes_in_time() {
+        let result = run_with_deadline(std::time::Duration::from_secs(5), || 7);
+        assert_eq!(result, Ok(7));
+    }
+
+    #[test]
+    fn deadline_gives_up_on_work_that_hangs() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let result = run_with_deadline(std::time::Duration::from_millis(50), move || {
+            let _ = hold.recv();
+        });
+        assert!(result.unwrap_err().contains("did not answer"));
+        drop(release);
+    }
+
+    #[test]
+    fn deadline_reports_work_that_panics() {
+        let result = run_with_deadline(std::time::Duration::from_secs(5), || -> u8 {
+            panic!("boom")
+        });
+        assert!(result.unwrap_err().contains("stopped unexpectedly"));
+    }
+
+    /// Whatever goes wrong once the row says `in_progress`, the row must end
+    /// up saying something else, and the next refresh must be free to run.
+    #[test]
+    fn failed_fetch_leaves_the_generator_refreshable() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+
+        let result = refresh_with_fetch(&fleet, node_id, |_| Err("timed out".into()));
+        assert_eq!(result.unwrap_err(), "timed out");
+        let config = read_config(&root, node_id).unwrap();
+        assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_ERROR));
+        assert_eq!(config.last_refresh_error.as_deref(), Some("timed out"));
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Fetched", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+        assert_eq!(managed_children(&fleet, list_id, node_id).len(), 1);
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn orphan_in_progress(fleet: &FleetStore, node_id: Uuid) {
         fleet
             .enqueue_outline(OutlineMutation::SetRefreshStatus {
                 node_id,
@@ -1463,16 +1662,50 @@ mod tests {
             })
             .unwrap();
         fleet.writer().flush().unwrap();
+    }
 
-        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Ignored", vec![])]);
-        let result = refresh_generator_with(&fleet, node_id, &ds, &HashMap::new());
-        assert!(result.is_ok());
-        assert_eq!(managed_children(&fleet, list_id, node_id).len(), 0);
+    /// A process that exits mid-refresh leaves `in_progress` behind. That row
+    /// must not turn every later refresh into a no-op.
+    #[test]
+    fn refresh_runs_despite_in_progress_left_by_a_dead_process() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let node_id = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, "{}").unwrap();
+        orphan_in_progress(&fleet, node_id);
+
+        let ds = MockDataSource::new().with_items(vec![item("EXT-1", "Fetched", vec![])]);
+        refresh_generator_with(&fleet, node_id, &ds, &HashMap::new()).unwrap();
+
+        assert_eq!(managed_children(&fleet, list_id, node_id).len(), 1);
+        let config = read_config(&root, node_id).unwrap();
+        assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_SUCCESS));
+
+        drop(fleet);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_sweep_marks_orphaned_refreshes_failed() {
+        let (root, fleet) = setup();
+        let list_id = fleet.list_outline_lists().unwrap()[0].id;
+        let orphaned = create_generator_node(&fleet, list_id);
+        let settled = create_generator_node(&fleet, list_id);
+        set_generator_config(&fleet, orphaned, DATA_SOURCE_MOCK, "{}").unwrap();
+        set_generator_config(&fleet, settled, DATA_SOURCE_MOCK, "{}").unwrap();
+        orphan_in_progress(&fleet, orphaned);
+
+        assert_eq!(clear_interrupted_refreshes(&fleet).unwrap(), 1);
+
+        let config = read_config(&root, orphaned).unwrap();
+        assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_ERROR));
         assert_eq!(
-            ds.fetch_count(),
-            0,
-            "fetch must not run while a refresh is in progress"
+            config.last_refresh_error.as_deref(),
+            Some(REFRESH_INTERRUPTED)
         );
+        let config = read_config(&root, settled).unwrap();
+        assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_SUCCESS));
+        assert_eq!(clear_interrupted_refreshes(&fleet).unwrap(), 0);
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
