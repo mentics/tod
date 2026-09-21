@@ -18,7 +18,7 @@ pub struct GateCriterionSeed {
     pub sort_order: i32,
 }
 
-/// Stable criterion catalog (33 items across design→planning, planning→ready, verifying→review).
+/// Stable criterion catalog (35 items across design→planning, planning→ready, verifying→review).
 pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     // design → planning
     GateCriterionSeed {
@@ -30,6 +30,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         sort_order: 0,
     },
     // Superseded by `buildable`; deactivated in `seed_gate_criteria`.
+    GateCriterionSeed {
+        id_str: "a1000001-0001-4001-8001-00000000000d",
+        from_state: "design",
+        to_state: "planning",
+        slug: crate::outline::DESIGN_CONSTRAINTS_CRITERION_SLUG,
+        label: "Constraints (this node's and every inherited one) — two questions, yes to both passes: 1. Is the design free of anything a constraint forbids? 2. Does the design do everything a constraint requires? If either is no, set this row's `outcome: fail` (so `result: blocked`) and, in its `detail`, name each constraint and what in the design breaks or misses it.",
+        sort_order: 1,
+    },
     GateCriterionSeed {
         id_str: "a1000001-0001-4001-8001-000000000001",
         from_state: "design",
@@ -142,6 +150,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         slug: "planning-ready.plan-actionable",
         label: "Plan actionable (buildable from) without inventing missing intent?",
         sort_order: 3,
+    },
+    GateCriterionSeed {
+        id_str: "a1000002-0002-4002-8002-00000000000d",
+        from_state: "planning",
+        to_state: "ready",
+        slug: "planning-ready.constraints-satisfied",
+        label: "Constraints (this node's and every inherited one) — two questions, yes to both passes: 1. Is the plan free of anything a constraint forbids? 2. Does the plan do everything a constraint requires? If either is no, set this row's `outcome: fail` (so `result: blocked`) and, in its `detail`, name each constraint and what in the plan breaks or misses it.",
+        sort_order: 4,
     },
     GateCriterionSeed {
         id_str: "a1000002-0002-4002-8002-000000000004",
@@ -263,7 +279,7 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         from_state: "verifying",
         to_state: "review",
         slug: "verifying-review.constraints-hold",
-        label: "Applicable constraints still hold (including inherited)?",
+        label: "Constraints (this node's and every inherited one) — two questions, yes to both passes: 1. Is the implementation free of anything a constraint forbids? 2. Does the implementation do everything a constraint requires? If either is no, set this row's `outcome: fail` (so `result: blocked`) and, in its `detail`, name each constraint and what in the implementation breaks or misses it.",
         sort_order: 3,
     },
     GateCriterionSeed {
@@ -396,11 +412,15 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
         "UPDATE gate_criteria SET active = 0, updated_at = ?1 WHERE slug = 'planning-ready.human-lookover' AND active = 1",
         params![now],
     )?;
-    // design → planning requires `buildable` only.
+    // design → planning requires `buildable` and the constraints check only.
     conn.execute(
         "UPDATE gate_criteria SET active = 0, updated_at = ?1
-         WHERE from_state = 'design' AND to_state = 'planning' AND slug != ?2 AND active = 1",
-        params![now, crate::outline::BUILDABLE_CRITERION_SLUG],
+         WHERE from_state = 'design' AND to_state = 'planning' AND slug NOT IN (?2, ?3) AND active = 1",
+        params![
+            now,
+            crate::outline::BUILDABLE_CRITERION_SLUG,
+            crate::outline::DESIGN_CONSTRAINTS_CRITERION_SLUG
+        ],
     )?;
     Ok(())
 }

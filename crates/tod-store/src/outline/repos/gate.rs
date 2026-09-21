@@ -51,6 +51,10 @@ pub const REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG: &str = "review-approved.findin
 /// `design` → `planning`: the one active criterion for that transition. Any obligation
 /// change on the node resets its evaluation to pending (a schema trigger).
 pub const BUILDABLE_CRITERION_SLUG: &str = "design-planning.buildable";
+/// The design → planning check that the design violates no constraint (the
+/// node's own or inherited) and satisfies every one. Kept active beside
+/// `buildable` when the rest of that transition's checklist is retired.
+pub const DESIGN_CONSTRAINTS_CRITERION_SLUG: &str = "design-planning.constraints-satisfied";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCriterion {

@@ -34,9 +34,13 @@ Visual design is part of writing the spec: for anything the user will see, a moc
 
 ## Forward gate rules (`design` → `planning`)
 
-The gate is **buildable** only: a competent implementer, given the hierarchical context, the node's obligations, the nodes they reference, the mockups, and the codebase, would build it correctly. Any obligation change touching the node resets it to pending.
+The gate is **buildable**, plus the constraints check below: a competent implementer, given the hierarchical context, the node's obligations, the nodes they reference, the mockups, and the codebase, would build it correctly. Any obligation change touching the node resets it to pending.
 
 - Confirming obligations is **never** required.
+- **Constraints, both directions** — check this node's constraints and every inherited one (listed under Inherited context). Answer two questions; the criterion passes only if both are yes:
+  1. Is the design free of anything a constraint forbids? (Many constraints say what must *not* be done.)
+  2. Does the design do everything a constraint requires?
+  If either is no, set that criterion's `gate_results` row to `outcome: fail` (the reply is then `result: blocked`) and, in the row's `detail`, name each constraint and what in the design breaks or misses it.
 - Obligation references resolve (`tod-cli obligations check-refs --node <UUID>` prints `(none)`).
 
 Living checklist items for this transition are stored in the app database; return `gate_results` for each when gate-checking.
