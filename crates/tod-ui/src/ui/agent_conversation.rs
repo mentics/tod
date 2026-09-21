@@ -179,6 +179,7 @@ pub struct AgentConversationPanel {
     header_actions: Vec<PanelAction>,
     /// The host's status lines above the input.
     notices: Vec<PanelNotice>,
+    lifecycle_state: Option<String>,
     input: Entity<TextareaState>,
     editing: bool,
     return_focus: Option<FocusHandle>,
@@ -226,6 +227,7 @@ impl AgentConversationPanel {
             actions: Vec::new(),
             header_actions: Vec::new(),
             notices: Vec::new(),
+            lifecycle_state: None,
             input,
             editing: false,
             return_focus: None,
@@ -308,6 +310,14 @@ impl AgentConversationPanel {
         if actions != self.header_actions {
             self.header_actions = actions;
             self.keep_highlight();
+            cx.notify();
+        }
+    }
+
+    /// The node's lifecycle state, named in the lifecycle footer's heading.
+    pub fn set_lifecycle_state(&mut self, state: Option<String>, cx: &mut Context<Self>) {
+        if state != self.lifecycle_state {
+            self.lifecycle_state = state;
             cx.notify();
         }
     }
@@ -718,7 +728,12 @@ impl Render for AgentConversationPanel {
             .when(has_lifecycle, |el| {
                 el.child(
                     style::panel_footer(v_flex())
-                        .child(style::text_dense_muted(div()).child("Lifecycle"))
+                        .child(style::text_dense_muted(div()).child(
+                            match &self.lifecycle_state {
+                                Some(state) => format!("Lifecycle: {state}"),
+                                None => "Lifecycle".to_string(),
+                            },
+                        ))
                         .when(!self.notices.is_empty(), |el| el.child(notices))
                         .when(!actions.is_empty(), |el| {
                             el.child(
