@@ -1721,7 +1721,11 @@ impl TaskListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        crate::ui::toast::error_toast(window, cx, message.into());
+        // The toast goes away; the status bar keeps the message readable
+        // (and copyable) until the next one replaces it.
+        let message = message.into();
+        crate::ui::toast::error_toast(window, cx, message.clone());
+        self.set_status_line(message, cx);
         cx.notify();
     }
 

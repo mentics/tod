@@ -8,7 +8,7 @@ use crate::{
     ConfigField, ConfigFieldType, ConfigSchema, CredentialRequirement, DataSource,
     DataSourceError, DataSourceItem,
 };
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -220,14 +220,8 @@ impl DataSource for LinearDataSource {
             .send()
             .map_err(|e| DataSourceError::Fetch(format!("Test query failed: {}", e)))?;
 
+        let response = check_status(response, "test query failed")?;
         let status = response.status();
-
-        if !status.is_success() && status != StatusCode::OK {
-            return Err(DataSourceError::Fetch(format!(
-                "HTTP error {}: test query failed",
-                status
-            )));
-        }
 
         let payload: GraphQlResponse<serde_json::Value> = response.json().map_err(|e| {
             DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
@@ -312,6 +306,26 @@ fn build_filter_from_config(
             continue;
         }
 
+        // Configs saved under the first schema (a team key and a "title
+        // contains" text) hold plain strings under names `IssueFilter` does
+        // not have; they mean the same filter that schema's query spelled out.
+        // A filter already given under the real name wins.
+        let legacy = match (key.as_str(), value.as_str().map(str::trim)) {
+            ("team_key", Some(text)) => Some(("team", serde_json::json!({ "key": { "eq": text } }), text)),
+            ("query", Some(text)) => Some((
+                "title",
+                serde_json::json!({ "containsIgnoreCase": text }),
+                text,
+            )),
+            _ => None,
+        };
+        if let Some((name, translated, text)) = legacy {
+            if !text.is_empty() && !obj.get(name).is_some_and(|v| !v.is_null()) {
+                filter.insert(name.into(), translated);
+            }
+            continue;
+        }
+
         // For now, pass through the filter structure as-is
         // The UI is responsible for building the correct GraphQL filter structure
         filter.insert(key.clone(), value.clone());
@@ -344,14 +358,8 @@ fn fetch_workspace_slug(api_key: &str) -> Result<String, DataSourceError> {
         .send()
         .map_err(|e| DataSourceError::Fetch(format!("Failed to fetch workspace slug: {}", e)))?;
 
+    let response = check_status(response, "failed to fetch workspace slug")?;
     let status = response.status();
-
-    if !status.is_success() && status != StatusCode::OK {
-        return Err(DataSourceError::Fetch(format!(
-            "HTTP error {}: failed to fetch workspace slug",
-            status
-        )));
-    }
 
     let payload: GraphQlResponse<WorkspaceData> = response.json().map_err(|e| {
         DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
@@ -417,14 +425,8 @@ fn fetch_introspection(api_key: &str) -> Result<IntrospectionCache, DataSourceEr
         .send()
         .map_err(|e| DataSourceError::Fetch(format!("Failed to fetch introspection: {}", e)))?;
 
+    let response = check_status(response, "failed to fetch introspection")?;
     let status = response.status();
-
-    if !status.is_success() && status != StatusCode::OK {
-        return Err(DataSourceError::Fetch(format!(
-            "HTTP error {}: failed to fetch introspection",
-            status
-        )));
-    }
 
     let payload: GraphQlResponse<IntrospectionData> = response.json().map_err(|e| {
         DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
@@ -530,14 +532,11 @@ fn fetch_enum_values(
             DataSourceError::Fetch(format!("Failed to fetch enum values for {}: {}", enum_type, e))
         })?;
 
+    let response = check_status(
+        response,
+        &format!("failed to fetch enum values for {enum_type}"),
+    )?;
     let status = response.status();
-
-    if !status.is_success() && status != StatusCode::OK {
-        return Err(DataSourceError::Fetch(format!(
-            "HTTP error {}: failed to fetch enum values for {}",
-            status, enum_type
-        )));
-    }
 
     let payload: GraphQlResponse<EnumIntrospectionData> = response.json().map_err(|e| {
         DataSourceError::Fetch(format!(
@@ -713,14 +712,8 @@ fn fetch_all_issues(
             break response;
         };
 
+        let response = check_status(response, "failed to fetch issues")?;
         let status = response.status();
-
-        if !status.is_success() && status != StatusCode::OK {
-            return Err(DataSourceError::Fetch(format!(
-                "HTTP error {}: failed to fetch issues",
-                status
-            )));
-        }
 
         let payload: GraphQlResponse<IssuesData> = response.json().map_err(|e| {
             DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
@@ -876,16 +869,56 @@ fn build_client() -> Result<Client, DataSourceError> {
         .map_err(|e| DataSourceError::Fetch(format!("Failed to build HTTP client: {}", e)))
 }
 
+/// Linear takes a personal API key as the bare `Authorization` value. The
+/// `Bearer` scheme is for OAuth tokens only, and a key sent that way is
+/// refused with a 400.
 fn build_headers(api_key: &str) -> Result<HeaderMap, DataSourceError> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    let bearer = format!("Bearer {}", api_key);
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&bearer)
+        HeaderValue::from_str(api_key.trim())
             .map_err(|e| DataSourceError::Auth(format!("Invalid API key format: {}", e)))?,
     );
     Ok(headers)
+}
+
+/// Pass a successful response through; turn a failed one into an error that
+/// carries what Linear said, since the status line alone ("400 Bad Request")
+/// never says what was wrong with the request.
+fn check_status(response: Response, what: &str) -> Result<Response, DataSourceError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().unwrap_or_default();
+    Err(status_error(status, &body, what))
+}
+
+fn status_error(status: StatusCode, body: &str, what: &str) -> DataSourceError {
+    let detail = serde_json::from_str::<GraphQlResponse<serde_json::Value>>(body)
+        .ok()
+        .and_then(|payload| payload.errors)
+        .filter(|errors| !errors.is_empty())
+        .map(|errors| {
+            errors
+                .iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_else(|| body.trim().chars().take(300).collect());
+
+    if status == StatusCode::UNAUTHORIZED
+        || detail.to_ascii_lowercase().contains("authentication")
+    {
+        return DataSourceError::Auth("Invalid Linear API key".into());
+    }
+    if detail.is_empty() {
+        DataSourceError::Fetch(format!("HTTP error {status}: {what}"))
+    } else {
+        DataSourceError::Fetch(format!("HTTP error {status}: {what}: {detail}"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -983,6 +1016,75 @@ struct AssigneeRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_is_sent_bare_not_as_bearer() {
+        let headers = build_headers(" lin_api_abc123\n").unwrap();
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "lin_api_abc123");
+    }
+
+    #[test]
+    fn status_error_carries_linears_message() {
+        let body = r#"{"errors":[{"message":"Variable \"$filter\" got invalid value"}]}"#;
+        let err = status_error(StatusCode::BAD_REQUEST, body, "failed to fetch issues");
+        let text = err.to_string();
+        assert!(matches!(err, DataSourceError::Fetch(_)));
+        assert!(text.contains("failed to fetch issues"), "{text}");
+        assert!(text.contains("got invalid value"), "{text}");
+    }
+
+    #[test]
+    fn status_error_maps_authentication_failures_to_auth() {
+        let body = r#"{"errors":[{"message":"Authentication required, not authenticated"}]}"#;
+        let err = status_error(StatusCode::BAD_REQUEST, body, "failed to fetch issues");
+        assert!(matches!(err, DataSourceError::Auth(_)));
+        let err = status_error(StatusCode::UNAUTHORIZED, "", "failed to fetch issues");
+        assert!(matches!(err, DataSourceError::Auth(_)));
+    }
+
+    #[test]
+    fn status_error_without_a_body_still_names_the_request() {
+        let err = status_error(StatusCode::BAD_GATEWAY, "", "failed to fetch issues");
+        assert_eq!(
+            err.to_string(),
+            "fetch error: HTTP error 502 Bad Gateway: failed to fetch issues"
+        );
+    }
+
+    #[test]
+    fn legacy_team_key_and_query_become_issue_filter_fields() {
+        let filter = build_filter_from_config(&serde_json::json!({
+            "team_key": " MEN ",
+            "query": "list",
+            "result_cap": 50,
+        }))
+        .unwrap();
+        assert_eq!(
+            filter,
+            serde_json::json!({
+                "team": { "key": { "eq": "MEN" } },
+                "title": { "containsIgnoreCase": "list" },
+            })
+        );
+    }
+
+    #[test]
+    fn blank_legacy_values_add_no_filter_and_real_fields_win() {
+        let filter = build_filter_from_config(&serde_json::json!({
+            "team_key": "MEN",
+            "query": "  ",
+            "team": { "key": { "eq": "TOD" } },
+            "priority": { "eq": 1 },
+        }))
+        .unwrap();
+        assert_eq!(
+            filter,
+            serde_json::json!({
+                "team": { "key": { "eq": "TOD" } },
+                "priority": { "eq": 1 },
+            })
+        );
+    }
 
     #[test]
     fn display_name_is_linear_tickets() {

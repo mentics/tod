@@ -386,11 +386,10 @@ impl ListDelegate for TaskListDelegate {
                             .child("refreshing…"),
                     );
                 }
+                // Only the fact of the failure sits in the row; the message
+                // itself goes to the toast and the status bar, and stays on
+                // the generator's edit panel.
                 Some("error") => {
-                    let message = item
-                        .generator_error
-                        .clone()
-                        .unwrap_or_else(|| "refresh failed".to_string());
                     chips = chips.child(
                         div()
                             .px_2()
@@ -401,12 +400,7 @@ impl ListDelegate for TaskListDelegate {
                             .border_color(danger)
                             .bg(background)
                             .text_color(danger)
-                            .child(crate::ui::selectable_text::selectable_text(
-                                ("generator-error", ix.row),
-                                message,
-                                window,
-                                cx,
-                            )),
+                            .child("refresh failed"),
                     );
                 }
                 _ => {}

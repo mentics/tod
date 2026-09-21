@@ -27,6 +27,7 @@ const BOOKKEEPING: &[&str] = &[
     "last-prompt",
     "mode",
     "permission-mode",
+    "pr-link",
     "progress",
     "queue-operation",
     "summary",

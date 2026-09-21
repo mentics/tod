@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 47;
+pub const CURRENT_USER_VERSION: i32 = 48;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -328,6 +328,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v46_to_v47(conn)?;
         conn.pragma_update(None, "user_version", 47)?;
     }
+    if version < 48 {
+        migrate_v47_to_v48(conn)?;
+        conn.pragma_update(None, "user_version", 48)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -423,7 +427,7 @@ const SUMMARY_STALE_TRIGGER_DROPS: &str = "
 ///   `migrate_v27_to_v28` defined them.
 fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
     const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
-    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    let triggers = extra_content_triggers_sql();
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(&format!(
         "
@@ -464,6 +468,21 @@ fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
         DROP TABLE node_extra_content;
         ALTER TABLE node_extra_content_v34 RENAME TO node_extra_content;
 
+        {triggers}
+        "
+    ))?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The triggers that hang off `node_extra_content`: the interview change log's
+/// and the summary staleness marks. Dropping the table takes the ones defined
+/// on it along, so every rebuild of the table ends by running this.
+fn extra_content_triggers_sql() -> String {
+    const NOW: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)";
+    const ACTOR: &str = "COALESCE((SELECT actor FROM interview_actor WHERE id = 1), 'user')";
+    format!(
+        "
         CREATE TRIGGER IF NOT EXISTS trg_ic_content_insert AFTER INSERT ON node_extra_content BEGIN
             INSERT INTO interview_changes (node_id, entity, entity_id, op, fields, actor, at)
             VALUES (NEW.node_id, 'content', NEW.id, 'insert', NULL, {ACTOR}, {NOW});
@@ -512,6 +531,34 @@ fn migrate_v33_to_v34(conn: &Connection) -> Result<()> {
             UPDATE node_extra_content SET stale = 1
             WHERE node_id = OLD.node_id AND content_type = 'summary';
         END;
+        "
+    )
+}
+
+/// Allow 'metadata' as a `node_extra_content.content_type`: the data-source
+/// fields a generator keeps beside a generated node's details
+/// (`EXTRA_CONTENT_METADATA`). The constant arrived without this, so every
+/// generator refresh that had metadata to write failed the CHECK.
+fn migrate_v47_to_v48(conn: &Connection) -> Result<()> {
+    let triggers = extra_content_triggers_sql();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "
+        {SUMMARY_STALE_TRIGGER_DROPS}
+        CREATE TABLE node_extra_content_v48 (
+            id           BLOB PRIMARY KEY NOT NULL,
+            node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+            content_type TEXT NOT NULL CHECK (content_type IN ('design', 'plan', 'notes', 'details', 'summary', 'metadata')),
+            body         TEXT NOT NULL DEFAULT '',
+            updated_at   INTEGER NOT NULL,
+            stale        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (node_id, content_type)
+        );
+        INSERT INTO node_extra_content_v48 (id, node_id, content_type, body, updated_at, stale)
+        SELECT id, node_id, content_type, body, updated_at, stale FROM node_extra_content;
+        DROP TABLE node_extra_content;
+        ALTER TABLE node_extra_content_v48 RENAME TO node_extra_content;
+        {triggers}
         "
     ))?;
     tx.commit()?;
@@ -3760,6 +3807,82 @@ mod tests {
         )
         .optional()
         .unwrap()
+    }
+
+    #[test]
+    fn v48_allows_metadata_and_keeps_rows_stale_marks_and_triggers() {
+        let (dir, conn) = temp_db();
+        let node = insert_node(&conn, "generated");
+        // Back to the v47 table, which refused 'metadata'.
+        conn.execute_batch(
+            "
+            DROP TABLE node_extra_content;
+            CREATE TABLE node_extra_content (
+                id           BLOB PRIMARY KEY NOT NULL,
+                node_id      BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                content_type TEXT NOT NULL CHECK (content_type IN ('design', 'plan', 'notes', 'details', 'summary')),
+                body         TEXT NOT NULL DEFAULT '',
+                updated_at   INTEGER NOT NULL,
+                stale        INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (node_id, content_type)
+            );
+            PRAGMA user_version = 47;
+            ",
+        )
+        .unwrap();
+        let put = |ty: &str, body: &str, stale: i64| {
+            conn.execute(
+                "INSERT INTO node_extra_content (id, node_id, content_type, body, updated_at, stale)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+                params![
+                    uuid::Uuid::new_v4().as_bytes().as_slice(),
+                    node.as_bytes().as_slice(),
+                    ty,
+                    body,
+                    stale
+                ],
+            )
+        };
+        put("details", "Ticket text.", 0).unwrap();
+        put("summary", "What it covers.", 1).unwrap();
+        assert!(put("metadata", "{}", 0).is_err(), "v47 refuses metadata");
+
+        apply_migrations(&conn).unwrap();
+
+        assert_eq!(
+            content(&conn, node, "details").unwrap(),
+            ("Ticket text.".to_string(), 0)
+        );
+        assert_eq!(
+            content(&conn, node, "summary").unwrap(),
+            ("What it covers.".to_string(), 1),
+            "a stale mark survives the rebuild"
+        );
+        put("metadata", r#"{"priority":1}"#, 0).unwrap();
+        assert!(content(&conn, node, "metadata").is_some());
+
+        // The staleness trigger defined on the table came back with it.
+        conn.execute(
+            "UPDATE node_extra_content SET stale = 0 WHERE content_type = 'summary'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE node_extra_content SET body = 'Edited.' WHERE content_type = 'details'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(content(&conn, node, "summary").unwrap().1, 1);
+        let logged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM interview_changes
+                 WHERE entity = 'content' AND op = 'update' AND fields = 'body'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1, "the change-log triggers came back too");
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
