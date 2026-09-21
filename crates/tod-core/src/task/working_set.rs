@@ -38,6 +38,7 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         tag_filter: persisted.tag_filter,
         selected_id: persisted.selected_id,
         active_list_id: persisted.active_list_id,
+        pending_changes_only: false,
         generator_sorts: persisted
             .generator_sorts
             .into_iter()

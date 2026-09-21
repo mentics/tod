@@ -247,6 +247,11 @@ styles:
     font: title
     text-case: sentence
     text-end: no-period
+  node-title-pending-changes:
+    # A tree row whose node has incoming changes it has not been checked
+    # against: rare, so it must stand out from every other row.
+    extends: text-title
+    color: incoming-text
   scrim:
     background: scrim
 
@@ -339,6 +344,7 @@ tokens:
     stale-fill: "#f9731626"
     stale-edge: "#f97316"
     stale-text: "#fdba74"
+    incoming-text: "#facc15"
     notice-fill: "#ffff00"
     notice-text: "#000000"
     badge-fill: "#262626"

@@ -261,10 +261,15 @@ impl ListDelegate for TaskListDelegate {
             ));
         }
         if item.has_spec {
-            let obl_label = format!(
+            let mut obl_label = format!(
                 "{} req · {} con",
                 item.requirement_count, item.constraint_count
             );
+            // Pending incoming changes: the count joins the Spec chip, and
+            // at zero nothing is added.
+            if item.incoming_count > 0 {
+                obl_label.push_str(&format!(" · {} incoming", item.incoming_count));
+            }
             let task_id_obl = item.id.clone();
             chips = chips.child(action_chip(
                 cx,
@@ -554,6 +559,7 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
+                    item.incoming_count > 0,
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -644,6 +650,7 @@ fn title_label(
     title: String,
     selected: bool,
     managed: bool,
+    pending_changes: bool,
     task_id: String,
     sink: Rc<RefCell<Vec<RowAction>>>,
 ) -> impl gpui::IntoElement {
@@ -652,15 +659,17 @@ fn title_label(
         .flex_1()
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
-        .child(
+        .child(if pending_changes {
+            crate::ui::style::node_title_pending_changes(div()).child(title)
+        } else {
             div()
                 .text_sm()
                 .font_medium()
                 .text_color(foreground)
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(title),
-        )
+                .child(title)
+        })
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
                 let task_id = task_id.clone();

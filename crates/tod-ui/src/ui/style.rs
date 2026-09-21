@@ -81,6 +81,9 @@ pub mod color {
     pub fn stale_text() -> Hsla {
         hex(0xfdba74ff)
     }
+    pub fn incoming_text() -> Hsla {
+        hex(0xfacc15ff)
+    }
 }
 
 /// `tokens.font` sizes (weights are applied by the styles that use them).
@@ -221,6 +224,12 @@ pub fn callout_stale_title<E: Styled>(el: E) -> E {
     el.text_size(font::BODY)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color::stale_text())
+}
+
+/// `styles.node-title-pending-changes`: a tree row title whose node has
+/// incoming changes it has not been checked against.
+pub fn node_title_pending_changes<E: Styled>(el: E) -> E {
+    text_title(el).text_color(color::incoming_text())
 }
 
 /// `styles.scrim`.

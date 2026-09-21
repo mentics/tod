@@ -2626,6 +2626,41 @@ impl TaskListView {
         row
     }
 
+    /// Quick filter toggles above the tree, in the status-filter row style:
+    /// "Pending changes" narrows it to nodes with pending incoming changes
+    /// (and their ancestors). Shown while any node has one, or while on.
+    fn render_quick_filters(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use gpui::IntoElement as _;
+        let pending_nodes = self
+            .all_tasks
+            .iter()
+            .filter(|t| t.incoming_count > 0)
+            .count();
+        if pending_nodes == 0 && !self.working_set.pending_changes_only {
+            return None;
+        }
+        Some(
+            gpui_component::h_flex()
+                .items_center()
+                .gap(crate::ui::style::space::HAIRLINE)
+                .px(crate::ui::style::space::RELATED)
+                .py(crate::ui::style::space::HAIRLINE)
+                .child(crate::ui::style::button_toggle(
+                    Button::new("pending-changes-filter")
+                        .label(format!("Pending changes {pending_nodes}"))
+                        .ghost()
+                        .small()
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.working_set.pending_changes_only =
+                                !this.working_set.pending_changes_only;
+                            this.rebuild_visible_list(window, cx);
+                        })),
+                    self.working_set.pending_changes_only,
+                ))
+                .into_any_element(),
+        )
+    }
+
     fn render_sort_menu_overlay(&self, cx: &mut Context<Self>) -> Option<impl gpui::IntoElement> {
         if !self.sort_menu_open {
             return None;
@@ -2874,6 +2909,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_paste))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
+            .when_some(self.render_quick_filters(cx), |el, bar| el.child(bar))
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
             .when(self.credential_prompt_open, |el| {

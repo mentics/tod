@@ -39,6 +39,8 @@ pub struct TaskItem {
     pub has_agent: bool,
     pub requirement_count: usize,
     pub constraint_count: usize,
+    /// Pending incoming-change entries (`doc/conversation/incoming-changes.md` §6).
+    pub incoming_count: usize,
     pub has_children: bool,
     /// Short status text when a gate-check or on-entry agent turn is
     /// currently running against this node (e.g. "Running gate check…").
@@ -164,6 +166,8 @@ pub struct ListWorkingSet {
     pub active_list_id: Option<String>,
     /// Per-generator-node sort/filter overrides, keyed by the generator node's id.
     pub generator_sorts: HashMap<String, GeneratorSubtreeSort>,
+    /// Show only nodes with pending incoming changes, plus their ancestors.
+    pub pending_changes_only: bool,
 }
 
 impl ListWorkingSet {
@@ -175,6 +179,7 @@ impl ListWorkingSet {
             selected_id: None,
             active_list_id: None,
             generator_sorts: HashMap::new(),
+            pending_changes_only: false,
         }
     }
 
@@ -378,6 +383,25 @@ fn owning_generator_id(by_id: &HashMap<&str, &TaskItem>, start_id: &str) -> Opti
     None
 }
 
+/// Ids of the nodes with pending incoming changes and every ancestor of
+/// one, so the filtered tree keeps its context.
+fn pending_changes_with_ancestors<'a>(
+    tasks: &'a [TaskItem],
+    by_id: &HashMap<&str, &'a TaskItem>,
+) -> HashSet<&'a str> {
+    let mut ids = HashSet::new();
+    for task in tasks.iter().filter(|t| t.incoming_count > 0) {
+        let mut cur = Some(task);
+        while let Some(t) = cur {
+            if !ids.insert(t.id.as_str()) {
+                break;
+            }
+            cur = t.parent_id.as_deref().and_then(|p| by_id.get(p).copied());
+        }
+    }
+    ids
+}
+
 fn task_matches_generator_filter(
     task: &TaskItem,
     by_id: &HashMap<&str, &TaskItem>,
@@ -443,10 +467,16 @@ pub fn filter_and_sort_tasks(
     working_set: &ListWorkingSet,
 ) -> Vec<TaskItem> {
     let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let pending = working_set
+        .pending_changes_only
+        .then(|| pending_changes_with_ancestors(tasks, &by_id));
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
-            task_matches_tag_filter(t, working_set.tag_filter.as_deref())
+            pending
+                .as_ref()
+                .is_none_or(|ids| ids.contains(t.id.as_str()))
+                && task_matches_tag_filter(t, working_set.tag_filter.as_deref())
                 && task_matches_search(t, search_query)
                 && task_matches_generator_filter(t, &by_id, working_set)
         })
@@ -509,6 +539,7 @@ pub fn nearest_visible_id(
             selected_id: None,
             active_list_id: working_set.active_list_id.clone(),
             generator_sorts: working_set.generator_sorts.clone(),
+            pending_changes_only: working_set.pending_changes_only,
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
@@ -552,6 +583,7 @@ mod tests {
             has_agent: false,
             requirement_count: 0,
             constraint_count: 0,
+            incoming_count: 0,
             has_children: false,
             in_flight_activity: None,
             managed: false,
@@ -567,6 +599,30 @@ mod tests {
     fn fuzzy_match_subsequence() {
         assert!(fuzzy_matches("flt", "fleet persistence"));
         assert!(!fuzzy_matches("xyz", "fleet"));
+    }
+
+    #[test]
+    fn pending_changes_filter_keeps_pending_nodes_and_their_ancestors() {
+        let root = sample("root", "Root", "ready", &[]);
+        let mut mid = sample("mid", "Mid", "ready", &[]);
+        mid.parent_id = Some("root".into());
+        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
+        leaf.parent_id = Some("mid".into());
+        leaf.incoming_count = 2;
+        let mut sibling = sample("sib", "Sibling", "ready", &[]);
+        sibling.parent_id = Some("root".into());
+        let other = sample("other", "Other", "ready", &[]);
+        let tasks = vec![root, mid, leaf, sibling, other];
+        let ws = ListWorkingSet {
+            pending_changes_only: true,
+            ..Default::default()
+        };
+        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["root", "mid", "leaf"]);
+        assert_eq!(filter_and_sort_tasks(&tasks, "", &ListWorkingSet::default()).len(), 5);
     }
 
     #[test]

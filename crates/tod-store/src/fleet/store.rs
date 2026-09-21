@@ -659,6 +659,22 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// Pending incoming-change entry count for every node that has any
+    /// (`doc/conversation/incoming-changes.md` §6). One query for all nodes.
+    pub fn incoming_counts(&self) -> Result<HashMap<uuid::Uuid, usize>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        crate::incoming::IncomingRepo::new(&guard.connection()).counts()
+    }
+
+    /// A node's pending incoming changes, netted per item.
+    pub fn incoming_net_pending(
+        &self,
+        node_id: uuid::Uuid,
+    ) -> Result<Vec<crate::incoming::PendingChange>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        crate::incoming::IncomingRepo::new(&guard.connection()).net_pending(node_id)
+    }
+
     /// Enabled capabilities for a node.
     pub fn list_node_capabilities(&self, node_id: uuid::Uuid) -> Result<Vec<Capability>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
