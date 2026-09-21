@@ -64,6 +64,10 @@ pub struct Entry {
     /// Header label, when the kind's own label ("You", "Agent", …) is not
     /// what this entry should say. Required by [`EntryKind::Raw`].
     pub label: Option<SharedString>,
+    /// The host's one-line reading of a structured reply (e.g. a gate
+    /// check's verdict). When set, the reply's answer is shown collapsed as
+    /// [`PieceKind::Structured`] and this is shown in its place.
+    pub summary: Option<String>,
 }
 
 impl Entry {
@@ -74,6 +78,7 @@ impl Entry {
             body: body.into(),
             parts: Vec::new(),
             label: Some(label.into()),
+            summary: None,
         }
     }
 }
@@ -112,6 +117,9 @@ pub enum PieceKind {
     Tool,
     /// Text after the last thought or tool call.
     Answer,
+    /// The answer, when it is structured data the host summarizes: kept for
+    /// digging in, collapsed by default.
+    Structured,
 }
 
 impl PieceKind {
@@ -125,6 +133,7 @@ impl PieceKind {
             PieceKind::Thought => "Thinking",
             PieceKind::Tool => "Tool",
             PieceKind::Answer => "Reply",
+            PieceKind::Structured => "Structured reply",
         }
     }
 }
@@ -143,6 +152,9 @@ pub fn pieces(entry: &Entry) -> Vec<(PieceKind, &ReplyPart)> {
         .filter(|(_, part)| !matches!(part, ReplyPart::Text { text } if text.trim().is_empty()))
         .map(|(ix, part)| {
             let kind = match part {
+                ReplyPart::Text { .. } if ix >= answer_from && entry.summary.is_some() => {
+                    PieceKind::Structured
+                }
                 ReplyPart::Text { .. } if ix >= answer_from => PieceKind::Answer,
                 ReplyPart::Text { .. } => PieceKind::Narration,
                 ReplyPart::Thought { .. } => PieceKind::Thought,
@@ -217,6 +229,8 @@ enum Row {
     },
     /// An expanded agent reply that said nothing.
     NoNotes(usize),
+    /// An expanded structured reply's [`Entry::summary`], below its pieces.
+    Summary(usize),
     Working,
     Empty,
 }
@@ -225,7 +239,7 @@ impl Row {
     fn entry(self) -> Option<usize> {
         match self {
             Row::Entry { entry, .. } | Row::Piece { entry, .. } => Some(entry),
-            Row::AgentBody(entry) | Row::NoNotes(entry) => Some(entry),
+            Row::AgentBody(entry) | Row::NoNotes(entry) | Row::Summary(entry) => Some(entry),
             Row::Working | Row::Empty => None,
         }
     }
@@ -269,7 +283,9 @@ fn rows(entries: &[Entry], toggled: &HashMap<ChunkId, bool>, start: StartState) 
             entry: entry_ix,
             part,
         }));
-        if entry.body.trim().is_empty()
+        if entry.summary.is_some() {
+            rows.push(Row::Summary(entry_ix));
+        } else if entry.body.trim().is_empty()
             && !pieces.iter().any(|(kind, _)| *kind == PieceKind::Answer)
         {
             rows.push(Row::NoNotes(entry_ix));
@@ -569,6 +585,14 @@ impl TranscriptList {
                     .into_any_element()
             }
             Row::Piece { entry, part } => self.render_piece(entry, part, window, cx),
+            Row::Summary(entry_ix) => style::chunk_children(div())
+                .child(style::text(selectable_text(
+                    ElementId::Name(format!("entry-summary-{entry_ix}").into()),
+                    self.entries[entry_ix].summary.clone().unwrap_or_default(),
+                    window,
+                    cx,
+                )))
+                .into_any_element(),
             Row::NoNotes(_) => style::chunk_children(div())
                 .child(style::text_muted(div()).child("Done, no notes"))
                 .into_any_element(),
@@ -665,14 +689,18 @@ impl TranscriptList {
             }
             EntryKind::Agent => {
                 let pieces = pieces(entry);
-                let answer = if entry.body.trim().is_empty() {
+                let answer = if let Some(summary) = &entry.summary {
+                    first_line(summary)
+                } else if entry.body.trim().is_empty() {
                     "Done, no notes".to_string()
                 } else {
                     first_line(&entry.body)
                 };
                 let work = pieces
                     .iter()
-                    .filter(|(kind, _)| *kind != PieceKind::Answer)
+                    .filter(|(kind, _)| {
+                        !matches!(kind, PieceKind::Answer | PieceKind::Structured)
+                    })
                     .count();
                 let summary = match work {
                     0 => answer,
@@ -812,6 +840,7 @@ mod tests {
             body: body.into(),
             parts,
             label: None,
+            summary: None,
         }
     }
 
@@ -829,6 +858,7 @@ mod tests {
             body: body.into(),
             parts: Vec::new(),
             label: None,
+            summary: None,
         }
     }
 
@@ -862,6 +892,38 @@ mod tests {
             kinds
                 .iter()
                 .all(|k| k.expanded_by_default() == (*k == PieceKind::Answer))
+        );
+    }
+
+    #[test]
+    fn a_summarized_reply_keeps_its_answer_collapsed_under_the_summary() {
+        let mut entry = agent(
+            vec![
+                ReplyPart::Tool {
+                    id: "1".into(),
+                    title: "Read".into(),
+                    status: "completed".into(),
+                },
+                text("result: pass"),
+            ],
+            "result: pass",
+        );
+        entry.summary = Some("Gate check passed.".into());
+        let kinds: Vec<PieceKind> = pieces(&entry).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kinds, [PieceKind::Tool, PieceKind::Structured]);
+        assert!(!PieceKind::Structured.expanded_by_default());
+        let entries = vec![entry];
+        assert_eq!(
+            rows(&entries, &HashMap::new(), StartState::Reading),
+            [
+                Row::Entry {
+                    entry: 0,
+                    marker: false
+                },
+                Row::Piece { entry: 0, part: 0 },
+                Row::Piece { entry: 0, part: 1 },
+                Row::Summary(0),
+            ]
         );
     }
 
