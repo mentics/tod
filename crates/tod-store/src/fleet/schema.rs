@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 51;
+pub const CURRENT_USER_VERSION: i32 = 52;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -343,6 +343,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 51 {
         migrate_v50_to_v51(conn)?;
         conn.pragma_update(None, "user_version", 51)?;
+    }
+    if version < 52 {
+        migrate_v51_to_v52(conn)?;
+        conn.pragma_update(None, "user_version", 52)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -936,6 +940,25 @@ fn migrate_v50_to_v51(conn: &Connection) -> Result<()> {
     )?;
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+/// `incoming_changes`: recorded changes a node inherits (an ancestor's
+/// constraint, later a referenced component) and has not yet been checked
+/// against. See `doc/conversation/incoming-changes.md` §4.
+fn migrate_v51_to_v52(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS incoming_changes (
+            node_id     BLOB NOT NULL,
+            action_id   INTEGER NOT NULL,
+            via         TEXT NOT NULL CHECK (via IN ('ancestor','reference')),
+            source_node BLOB NOT NULL,
+            queued_at   INTEGER NOT NULL,
+            PRIMARY KEY (node_id, action_id)
+        );
+        CREATE INDEX IF NOT EXISTS incoming_changes_node ON incoming_changes(node_id);
+        CREATE INDEX IF NOT EXISTS incoming_changes_action ON incoming_changes(action_id);",
+    )?;
     Ok(())
 }
 

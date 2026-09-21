@@ -343,6 +343,18 @@ pub(super) fn apply_recorded(
             "UPDATE conversation_actions SET reversed_by = ?1 WHERE id = ?2",
             params![id, original],
         )?;
+        crate::incoming::cancel(conn, original)?;
+    }
+    // A forward change fans out; so does a reversal that re-applies one
+    // (reversing a reversal), since its original's entries were cancelled.
+    let reapplies = match rec.reverses {
+        None => true,
+        Some(original) => repo
+            .action(original)?
+            .is_some_and(|a| a.kind == ActionKind::Reverse),
+    };
+    if reapplies {
+        crate::incoming::fan_out(conn, id, rec.entity, before.as_ref(), after.as_ref(), now)?;
     }
     if let Some(conversation_id) = rec.conversation_id {
         repo.touch(conversation_id, now)?;

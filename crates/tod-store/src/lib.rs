@@ -3,6 +3,7 @@
 pub mod conversation;
 pub mod credentials;
 pub mod fleet;
+pub mod incoming;
 pub mod install;
 pub mod interview;
 pub mod lifecycle_baseline;
