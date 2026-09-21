@@ -1392,7 +1392,13 @@ impl Render for LifecyclePanelView {
                     .border_b_1()
                     .border_color(border)
                     .bg(secondary)
-                    .child(div().text_sm().font_semibold().child("Lifecycle"))
+                    .child(div().text_sm().font_semibold().child(
+                        if self.lifecycle_capable && !self.lifecycle.is_empty() {
+                            format!("Lifecycle: {}", self.lifecycle)
+                        } else {
+                            "Lifecycle".to_string()
+                        },
+                    ))
                     .child(div().flex_1())
                     .child(
                         div()

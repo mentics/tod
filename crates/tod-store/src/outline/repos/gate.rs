@@ -21,6 +21,13 @@ pub const ACTION_INTERVIEW: &str = "interview";
 /// answers this one itself (`tod_core::gate::derived`); it never goes to an agent.
 pub const READY_ACTIVE_ACTION_CONFIG_SLUG: &str = "ready-active.action-config-configured";
 
+/// `planning` → `ready`: every requirement of the node is satisfied by at least
+/// one plan step (`--satisfies`). The app answers this one itself
+/// (`tod_core::gate::derived`): an agent asked it once passed a plan that
+/// never linked seven requirements added after planning.
+pub const PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG: &str =
+    "planning-ready.requirements-traceable";
+
 /// `active` → `verifying`: no plan step is still open work — each is `implemented` (or
 /// already `verified`). The app answers this one itself (`tod_core::gate::derived`); it
 /// never goes to an agent, because whether the work is real is what verification is for.

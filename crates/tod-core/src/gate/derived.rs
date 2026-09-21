@@ -13,8 +13,11 @@ use tod_store::fleet::node_actions::{
 use tod_store::interview::short_id;
 use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
+use tod_store::outline::repos::obligations::KIND_REQUIREMENT;
+use tod_store::outline::repos::ObligationRepo;
 use tod_store::outline::{
-    ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
+    ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
+    READY_ACTIVE_ACTION_CONFIG_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
     VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
@@ -38,6 +41,9 @@ pub fn evaluate_derived_criterion(
     criterion: &GateCriterion,
 ) -> Result<Option<DerivedOutcome>> {
     match criterion.slug.as_str() {
+        PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG => {
+            requirements_traceable_outcome(conn, node_id).map(Some)
+        }
         READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
         ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG => plan_implemented_outcome(conn, node_id).map(Some),
         VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => plan_verified_outcome(conn, node_id).map(Some),
@@ -99,6 +105,39 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
             directory.display()
         ),
     })
+}
+
+/// Every requirement of the node is satisfied by at least one of its plan
+/// steps. A requirement added after planning (say, in a conversation) has no
+/// step yet, so this is what sends the node back through planning for it.
+fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let requirements: Vec<_> = ObligationRepo::new(conn)
+        .list_for_node(node_id)?
+        .into_iter()
+        .filter(|o| o.kind == KIND_REQUIREMENT)
+        .collect();
+    let steps = PlanStepRepo::new(conn);
+    let mut unplanned = Vec::new();
+    for requirement in &requirements {
+        if steps.list_steps_for_obligation(requirement.id)?.is_empty() {
+            unplanned.push(format!("[{}] {}", short_id(requirement.id), requirement.body));
+        }
+    }
+    if unplanned.is_empty() {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: match requirements.len() {
+                0 => "This node has no requirements of its own to plan for.".into(),
+                n => format!("All {n} requirements are satisfied by a plan step."),
+            },
+        });
+    }
+    Ok(fail(format!(
+        "{} of {} requirements have no plan step satisfying them: {}. Add or extend plan          steps to cover them.",
+        unplanned.len(),
+        requirements.len(),
+        unplanned.join("; ")
+    )))
 }
 
 /// No plan step still open. Whether the work behind an `implemented` step is
@@ -579,6 +618,43 @@ mod tests {
             .unwrap();
         assert_eq!(evaluate(&store, node, done).unwrap().outcome, OUTCOME_PASS);
         let outcome = evaluate(&store, node, answered).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+    }
+
+    #[test]
+    fn planning_needs_a_step_satisfying_every_requirement() {
+        let slug = PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG;
+        let (store, node) = store_with_node();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "nothing required");
+
+        let steps = plan(&store, node, [tod_store::outline::repos::plan_steps::STATUS_PENDING; 2]);
+        let requirement = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: Some(requirement),
+                node_id: node,
+                kind: "requirement".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: "Filters are added from a searchable dropdown".into(),
+                phase: "design".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("searchable dropdown"), "{}", outcome.detail);
+
+        store
+            .enqueue_outline(OutlineMutation::LinkPlanStepObligation {
+                step_id: steps[0],
+                obligation_id: requirement,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
     }
 
