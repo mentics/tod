@@ -1806,7 +1806,7 @@ fn an_active_node_with_open_steps_offers_implement(cx: &mut TestAppContext) {
     let steps = fixture.steps.len();
     assert_eq!(
         lifecycle_labels(&view, cx),
-        vec![format!("Implement ({steps} of {steps} left)")]
+        vec![format!("Implement ({steps} of {steps} left)"), "Back to ready".to_string()]
     );
     // The fixture has no Agent or Files, so it cannot run, and says why.
     view.read_with(cx, |view, cx| {
@@ -1821,7 +1821,7 @@ fn a_design_node_offers_the_gate_check(cx: &mut TestAppContext) {
     let fixture = Fixture::new();
     set_lifecycle(&fixture, "design");
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
-    assert_eq!(lifecycle_labels(&view, cx), vec!["Gate check → planning"]);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Gate check → planning", "Back to proposed"]);
 }
 
 /// `ready` → `active` has only criteria the app answers itself, so the whole
@@ -1851,7 +1851,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     draw(cx);
     assert_eq!(
         lifecycle_labels(&view, cx),
-        vec!["Advance to active", "Check again"]
+        vec!["Advance to active", "Check again", "Back to planning"]
     );
 
     press_lifecycle(&view, "Advance to active", cx);
@@ -1866,7 +1866,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     let steps = fixture.steps.len();
     assert_eq!(
         lifecycle_labels(&view, cx),
-        vec![format!("Implement ({steps} of {steps} left)")]
+        vec![format!("Implement ({steps} of {steps} left)"), "Back to ready".to_string()]
     );
 }
 
@@ -1895,7 +1895,7 @@ fn a_review_node_offers_review_and_holds_the_gate_for_open_findings(cx: &mut Tes
         )
         .unwrap();
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
-    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)"]);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)", "Back to verifying"]);
     assert!(
         lifecycle_notices(&view, cx)
             .iter()
@@ -1992,7 +1992,7 @@ fn a_fix_conversation_lists_the_findings_under_a_status_filter(cx: &mut TestAppC
         .unwrap();
     let node = Focus::Node(fixture.node_id);
     let (view, _, cx) = open_view(&fixture, node, cx);
-    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)"]);
+    assert_eq!(lifecycle_labels(&view, cx), vec!["Review", "Fix (1 open)", "Back to verifying"]);
 
     view.update_in(cx, |view, window, cx| {
         view.open_with(node, ProtocolKind::Fix, false, window, cx);
