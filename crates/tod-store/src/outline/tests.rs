@@ -850,20 +850,23 @@ fn gate_criteria_seed_on_migration() {
     let _store = FleetStore::open(&root).unwrap();
     let conn = schema::open_writer_connection(&db).unwrap();
     let repo = GateRepo::new(&conn);
-    // `buildable` is the only active design → planning criterion.
+    // `buildable` and the constraints check are the only active design → planning criteria.
     let design_planning = repo.list_for_transition("design", "planning").unwrap();
-    assert_eq!(design_planning.len(), 1);
+    let slugs: Vec<&str> = design_planning.iter().map(|c| c.slug.as_str()).collect();
     assert_eq!(
-        design_planning[0].slug,
-        crate::outline::BUILDABLE_CRITERION_SLUG
+        slugs,
+        [
+            crate::outline::BUILDABLE_CRITERION_SLUG,
+            crate::outline::DESIGN_CONSTRAINTS_CRITERION_SLUG
+        ]
     );
     let superseded = GATE_CRITERIA
         .iter()
         .filter(|c| c.from_state == "design" && c.to_state == "planning")
         .count()
-        - 1;
+        - 2;
     let planning_ready = repo.list_for_transition("planning", "ready").unwrap();
-    assert_eq!(planning_ready.len(), 11);
+    assert_eq!(planning_ready.len(), 12);
     let ready_active = repo.list_for_transition("ready", "active").unwrap();
     assert_eq!(ready_active.len(), 1);
     let active_verifying = repo.list_for_transition("active", "verifying").unwrap();

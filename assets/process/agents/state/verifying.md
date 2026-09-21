@@ -55,6 +55,10 @@ Apply these prose rules in addition to checklist criteria the app sends:
 
 - Verification is complete: **every requirement** in applicable obligations (node + ancestors as bound, including design-phase) has been checked (success criteria when present, otherwise the measurable statement) and is **traceable** upstream through the plan steps that satisfy it (each `verified`) and those obligations.
 - Verification was **agent-executed** in the work’s running context (harness built if needed); not deferred to human look-over as the primary check.
+- **Constraints, both directions** — check this node's constraints and every inherited one (listed under Inherited context). Answer two questions; the criterion passes only if both are yes:
+  1. Is the implementation free of anything a constraint forbids? (Many constraints say what must *not* be done.)
+  2. Does the implementation do everything a constraint requires?
+  If either is no, set that criterion's `gate_results` row to `outcome: fail` (the reply is then `result: blocked`) and, in the row's `detail`, name each constraint and what in the implementation breaks or misses it.
 - Upstream conformance **revalidated** (or short-circuited only for unchanged file pairs).
 - **Self-code review** completed.
 - Ancestor or node-specific verification extras (static analysis, etc.) satisfied when defined as obligations.
