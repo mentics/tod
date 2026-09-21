@@ -11,7 +11,7 @@
 //! Spec: `doc/conversation/protocols.md` §4.5.
 
 use super::{ConversationView, Pane};
-use crate::ui::agent_conversation::NoticeTone;
+use crate::ui::agent_conversation::{NoticeTone, PanelNotice};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
@@ -506,20 +506,41 @@ impl ConversationView {
         list.into_any_element()
     }
 
-    /// The side pane for whichever protocol runs the open conversation.
+    /// The side pane for whichever protocol runs the open conversation: the
+    /// list it works on top and, once the node has a gate check verdict, that
+    /// verdict beneath it.
     pub(super) fn render_side_pane(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match self.side_list() {
+        let list = self.side_list();
+        let top = match list {
             SideList::ChangeSet => self.render_change_set(window, cx),
             SideList::Plan => self.render_plan_pane(window, cx),
             SideList::Findings => self.render_review_pane(window, cx),
             SideList::Obligations => self.render_obligations_pane(window, cx),
-            SideList::Gate => self.render_gate_pane(window, cx),
+            SideList::Gate => return self.render_gate_pane(window, cx),
             SideList::Empty(title, message) => self.render_empty_pane(title, message),
+        };
+        let notices = self.gate_notices(cx);
+        if notices.is_empty() {
+            return top;
         }
+        let verdict = self.render_gate_section(notices, window, cx);
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .child(div().flex_1().min_h_0().child(top))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .max_h(relative(0.45))
+                    .border_t_1()
+                    .border_color(style::color::divider())
+                    .child(verdict),
+            )
+            .into_any_element()
     }
 
     /// Which list the side pane shows. A protocol that works a list shows
@@ -527,7 +548,7 @@ impl ConversationView {
     /// lifecycle state is about — obligations while it is being specified,
     /// the plan from planning through verification, the findings in review —
     /// so the user can see where those items stand. (The gate check's own
-    /// verdict is above the input.)
+    /// verdict sits beneath the list.)
     pub(super) fn side_list(&self) -> SideList {
         match self.data.protocol {
             // A chat's outline writes are recorded like an outline
@@ -1136,7 +1157,7 @@ impl ConversationView {
     /// The gate check's verdict: why, each blocker with the button that acts
     /// on it, a Waive per failing criterion, and the recommended next step.
     fn render_gate_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let (_, notices) = self.lifecycle_controls(cx);
+        let notices = self.gate_notices(cx);
         if notices.is_empty() {
             let message = if self.status.running {
                 "The verdict will appear here."
@@ -1145,6 +1166,17 @@ impl ConversationView {
             };
             return self.render_empty_pane("Gate check", message);
         }
+        self.render_gate_section(notices, window, cx)
+    }
+
+    /// The gate check's verdict rows under a "Gate check" header, scrolling
+    /// within whatever height the pane gives them.
+    fn render_gate_section(
+        &mut self,
+        notices: Vec<PanelNotice>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut rows = v_flex().gap(style::space::RELATED).p(style::space::INSET);
         for (ix, notice) in notices.into_iter().enumerate() {
             let text = selectable_text(

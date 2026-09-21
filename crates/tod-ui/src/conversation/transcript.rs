@@ -178,11 +178,7 @@ impl ConversationView {
         };
         let status = self.status.clone();
         let return_focus = self.focus_handle.clone();
-        let (actions, mut notices) = self.lifecycle_controls(cx);
-        // A gate check's verdict and its blockers are in the side pane.
-        if gate_check {
-            notices.clear();
-        }
+        let (actions, notices) = self.lifecycle_controls(cx);
         let header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {
