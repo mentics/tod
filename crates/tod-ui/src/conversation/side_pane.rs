@@ -13,6 +13,7 @@
 use super::{ConversationView, Pane};
 use crate::ui::agent_conversation::NoticeTone;
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::status_filter::{render_status_filter, status_counts};
 use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -20,7 +21,7 @@ use gpui::{
     MouseButton, ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored,
     deferred, div, px, relative,
 };
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::Button;
 use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
@@ -31,6 +32,9 @@ use tod_store::outline::repos::plan_steps::{
     STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
+use tod_store::verification::{
+    LISTING_STATUSES, ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
+};
 use tod_store::review::{
     FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_REJECTED, FINDING_STATUSES,
     ReviewFinding, USER_FINDING_STATUSES,
@@ -228,7 +232,16 @@ impl ConversationView {
         if failed > 0 {
             summary.push_str(&format!(", {failed} failed"));
         }
-        let rows = standings.iter().map(|standing| {
+        let filter = self.render_obligation_filter(
+            "requirement",
+            &["unchecked", VERDICT_REOPENED, VERDICT_FAILED, VERDICT_VERIFIED],
+            |s| s.status().to_string(),
+            cx,
+        );
+        let shown = standings
+            .iter()
+            .filter(|s| self.obligation_filter.admits(s.status()));
+        let rows = shown.map(|standing| {
             let id = standing.obligation.id;
             let badge = style::badge(div()).child(standing.status().to_string());
             let badge = if standing.is_failed() {
@@ -277,6 +290,15 @@ impl ConversationView {
                         .child(style::text_dense_muted(div()).child("Requirements"))
                         .child(style::text_dense_muted(div()).child(summary)),
                 )
+                .children(filter)
+                .when(rows.is_empty(), |el| {
+                    el.child(
+                        style::empty_message(div())
+                            .px(style::space::RELATED)
+                            .py(style::space::INLINE)
+                            .child("No requirements in the chosen statuses."),
+                    )
+                })
                 .child(
                     v_flex()
                         .id("requirements-pane")
@@ -576,17 +598,26 @@ impl ConversationView {
             0 => format!("{}, all in the plan", standings.len()),
             u => format!("{}, {u} not in the plan", standings.len()),
         };
-        let rows: Vec<AnyElement> = standings
+        let filter = self.render_obligation_filter(
+            "obligation",
+            &LISTING_STATUSES,
+            |s| {
+                s.listing_status(planned.contains(&s.obligation.id))
+                    .to_string()
+            },
+            cx,
+        );
+        let mut rows: Vec<AnyElement> = standings
             .iter()
+            .filter(|s| {
+                self.obligation_filter
+                    .admits(s.listing_status(planned.contains(&s.obligation.id)))
+            })
             .map(|standing| {
                 let id = standing.obligation.id;
-                let status = if standing.verdict.is_some() {
-                    standing.status().to_string()
-                } else if planned.contains(&id) {
-                    "planned".to_string()
-                } else {
-                    "not planned".to_string()
-                };
+                let status = standing
+                    .listing_status(planned.contains(&id))
+                    .to_string();
                 let badge = style::badge(div()).child(status);
                 let badge = if standing.is_failed() {
                     style::text_error(badge)
@@ -618,6 +649,14 @@ impl ConversationView {
                     .into_any_element()
             })
             .collect();
+        if rows.is_empty() {
+            rows.push(
+                style::empty_message(div())
+                    .p(style::space::INSET)
+                    .child("No obligations in the chosen statuses.")
+                    .into_any_element(),
+            );
+        }
         v_flex()
             .size_full()
             .min_w_0()
@@ -629,6 +668,7 @@ impl ConversationView {
                         .child(style::text_dense_muted(div()).child(summary)),
                 ),
             )
+            .children(filter)
             .child(
                 v_flex()
                     .id("obligations-pane")
@@ -645,9 +685,7 @@ impl ConversationView {
         self.data
             .plan
             .iter()
-            .filter(|step| {
-                self.status_filter.is_empty() || self.status_filter.contains(step.status.as_str())
-            })
+            .filter(|step| self.status_filter.admits(&step.status))
             .cloned()
             .collect()
     }
@@ -658,19 +696,15 @@ impl ConversationView {
         self.data
             .findings
             .iter()
-            .filter(|f| {
-                self.status_filter.is_empty() || self.status_filter.contains(f.status.as_str())
-            })
+            .filter(|f| self.status_filter.admits(&f.status))
             .cloned()
             .collect()
     }
 
     /// Show or hide plan steps, or findings, in `status`. With no status
     /// toggled on, every row shows.
-    pub(super) fn toggle_status_filter(&mut self, status: &'static str, cx: &mut Context<Self>) {
-        if !self.status_filter.remove(status) {
-            self.status_filter.insert(status);
-        }
+    pub(super) fn toggle_status_filter(&mut self, status: &str, cx: &mut Context<Self>) {
+        self.status_filter.toggle(status);
         // The rows under the highlight have changed; start it over.
         self.side_cursor = None;
         self.status_menu = None;
@@ -687,68 +721,68 @@ impl ConversationView {
     }
 
     /// One toggle per status the pane has a row in — a plan step, or a
-    /// review finding — (and any toggled on that has since emptied), with its
-    /// count, plus "All" to clear them.
+    /// review finding — with its count, plus "All" to clear them.
     fn render_status_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let findings = self.side_list() == SideList::Findings;
-        let (kind, statuses, rows): (&str, &'static [&'static str], Vec<&str>) = if findings {
+        let (id, counts) = if self.side_list() == SideList::Findings {
             (
                 "finding",
-                &FINDING_STATUSES,
-                self.data
-                    .findings
-                    .iter()
-                    .map(|f| f.status.as_str())
-                    .collect(),
+                status_counts(
+                    &FINDING_STATUSES,
+                    self.data.findings.iter().map(|f| f.status.as_str()),
+                ),
             )
         } else {
             (
                 "plan",
-                &PLAN_STEP_STATUSES,
-                self.data.plan.iter().map(|s| s.status.as_str()).collect(),
+                status_counts(
+                    &PLAN_STEP_STATUSES,
+                    self.data.plan.iter().map(|s| s.status.as_str()),
+                ),
             )
         };
-        if rows.is_empty() {
-            return None;
-        }
-        let mut bar = h_flex()
-            .flex_wrap()
-            .items_center()
-            .gap(style::space::HAIRLINE)
-            .px(style::space::RELATED)
-            .py(style::space::HAIRLINE)
-            .child(style::button_toggle(
-                Button::new(ElementId::Name(format!("{kind}-filter-all").into()))
-                    .label("All")
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if !this.status_filter.is_empty() {
-                            this.status_filter.clear();
-                            this.side_cursor = None;
-                            cx.notify();
-                        }
-                    })),
-                self.status_filter.is_empty(),
-            ));
-        for status in statuses.iter().copied() {
-            let n = rows.iter().filter(|s| **s == status).count();
-            let on = self.status_filter.contains(status);
-            if n == 0 && !on {
-                continue;
-            }
-            bar = bar.child(style::button_toggle(
-                Button::new(ElementId::Name(format!("{kind}-filter-{status}").into()))
-                    .label(format!("{status} {n}"))
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_status_filter(status, cx);
-                    })),
-                on,
-            ));
-        }
-        Some(bar.into_any_element())
+        render_status_filter(
+            id,
+            &counts,
+            &self.status_filter,
+            |this: &mut Self, status, _, cx| match status {
+                Some(status) => this.toggle_status_filter(status, cx),
+                None => {
+                    if this.status_filter.clear() {
+                        this.side_cursor = None;
+                        cx.notify();
+                    }
+                }
+            },
+            cx,
+        )
+    }
+
+    /// The same for an obligations list, by each obligation's standing
+    /// (`status_of`).
+    fn render_obligation_filter(
+        &self,
+        id: &str,
+        order: &[&str],
+        status_of: impl Fn(&ObligationStanding) -> String,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let statuses: Vec<String> = self.data.standings.iter().map(status_of).collect();
+        let counts = status_counts(order, statuses.iter().map(String::as_str));
+        render_status_filter(
+            id,
+            &counts,
+            &self.obligation_filter,
+            |this: &mut Self, status, _, cx| {
+                match status {
+                    Some(status) => this.obligation_filter.toggle(status),
+                    None => {
+                        this.obligation_filter.clear();
+                    }
+                }
+                cx.notify();
+            },
+            cx,
+        )
     }
 
     /// Move the plan pane's highlight; entering an unhighlighted

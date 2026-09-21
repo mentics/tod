@@ -30,6 +30,19 @@ pub const VERDICT_FAILED: &str = "failed";
 pub const VERDICT_REOPENED: &str = "reopened";
 
 /// What an agent may record.
+/// An obligation no verdict has ruled on yet that a plan step satisfies.
+pub const STANDING_PLANNED: &str = "planned";
+/// An obligation no verdict has ruled on yet that no plan step satisfies.
+pub const STANDING_NOT_PLANNED: &str = "not planned";
+/// Every status [`ObligationStanding::listing_status`] gives, in the order a
+/// list's filter shows them.
+pub const LISTING_STATUSES: [&str; 5] = [
+    STANDING_NOT_PLANNED,
+    STANDING_PLANNED,
+    VERDICT_REOPENED,
+    VERDICT_FAILED,
+    VERDICT_VERIFIED,
+];
 pub const AGENT_VERDICTS: [&str; 2] = [VERDICT_VERIFIED, VERDICT_FAILED];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +96,16 @@ impl ObligationStanding {
         match &self.verdict {
             Some(verdict) => &verdict.status,
             None => "unchecked",
+        }
+    }
+
+    /// What an obligations list shows as its status: verification's verdict
+    /// once it has one, otherwise whether a plan step (`planned`) satisfies it.
+    pub fn listing_status(&self, planned: bool) -> &str {
+        match &self.verdict {
+            Some(verdict) => &verdict.status,
+            None if planned => STANDING_PLANNED,
+            None => STANDING_NOT_PLANNED,
         }
     }
 }

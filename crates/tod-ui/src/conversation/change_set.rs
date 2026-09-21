@@ -1,6 +1,7 @@
 //! The change-set pane: everything the conversation changed, grouped by node,
 //! with reversal, inline edits, and unsure flags.
 
+use crate::ui::status_filter::{StatusFilter, render_status_filter};
 use super::context_panel::link_label;
 use super::{ChangeAction, ConversationView, Pane};
 use crate::ui::selectable_text::selectable_text;
@@ -18,7 +19,6 @@ use gpui_component::RopeExt;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::scroll::Scrollbar;
-use gpui_component::tab::Tab as TabItem;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
@@ -66,48 +66,30 @@ pub(crate) fn focus_of(change: &NetChange) -> Option<Focus> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Tab {
-    All,
-    Unsure,
-    Deleted,
+/// The change-set filter's toggles: a change flagged as unsure, and one that
+/// deletes its item. They overlap, so both on shows either kind.
+pub(crate) const CHANGE_UNSURE: &str = "unsure";
+pub(crate) const CHANGE_DELETED: &str = "deleted";
+
+/// Whether `filter` lets `change` through; empty shows every change.
+pub(crate) fn change_shows(filter: &StatusFilter, change: &NetChange) -> bool {
+    filter.is_empty()
+        || (filter.contains(CHANGE_UNSURE) && change.flag.is_some())
+        || (filter.contains(CHANGE_DELETED) && change.op == NetOp::Deleted)
 }
 
-impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::All, Tab::Unsure, Tab::Deleted];
-
-    pub fn shows(self, change: &NetChange) -> bool {
-        match self {
-            Tab::All => true,
-            Tab::Unsure => change.flag.is_some(),
-            Tab::Deleted => change.op == NetOp::Deleted,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Tab::All => "All",
-            Tab::Unsure => "Unsure",
-            Tab::Deleted => "Deleted",
-        }
-    }
-
-    fn index(self) -> usize {
-        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
-    }
-
-    fn empty_message(self) -> &'static str {
-        match self {
-            Tab::All => "No changes yet",
-            Tab::Unsure => "Nothing is flagged as unsure",
-            Tab::Deleted => "Nothing was deleted",
-        }
-    }
-}
-
-/// How many changes each tab shows, in [`Tab::ALL`] order.
-pub(crate) fn tab_counts(changes: &[NetChange]) -> [usize; 3] {
-    Tab::ALL.map(|tab| changes.iter().filter(|c| tab.shows(c)).count())
+/// How many changes each toggle matches.
+pub(crate) fn change_counts(changes: &[NetChange]) -> Vec<(String, usize)> {
+    vec![
+        (
+            CHANGE_UNSURE.to_string(),
+            changes.iter().filter(|c| c.flag.is_some()).count(),
+        ),
+        (
+            CHANGE_DELETED.to_string(),
+            changes.iter().filter(|c| c.op == NetOp::Deleted).count(),
+        ),
+    ]
 }
 
 /// One line of the change-set list.
@@ -121,13 +103,14 @@ pub(crate) enum DisplayRow {
     Change(usize),
 }
 
-/// The list for `tab`: groups by node, in the order `net_changes` gives.
-pub(crate) fn display_rows(changes: &[NetChange], tab: Tab) -> Vec<DisplayRow> {
+/// The changes `filter` lets through, grouped by node, in the order
+/// `net_changes` gives.
+pub(crate) fn display_rows(changes: &[NetChange], filter: &StatusFilter) -> Vec<DisplayRow> {
     let mut rows = Vec::new();
     let mut group: Option<Option<Uuid>> = None;
     let mut plan_labelled = false;
     for (ix, change) in changes.iter().enumerate() {
-        if !tab.shows(change) {
+        if !change_shows(filter, change) {
             continue;
         }
         let node = node_of(change);
@@ -330,8 +313,14 @@ pub(crate) fn plan_step_of(change: &NetChange) -> Option<PlanStep> {
 }
 
 impl ConversationView {
-    pub(super) fn set_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
-        self.tab = tab;
+    /// Toggle `toggle` in the change-set filter, or clear it (`None`, "All").
+    pub(super) fn set_change_filter(&mut self, toggle: Option<&str>, cx: &mut Context<Self>) {
+        match toggle {
+            Some(toggle) => self.change_filter.toggle(toggle),
+            None => {
+                self.change_filter.clear();
+            }
+        }
         self.pane = Pane::ChangeSet;
         self.clamp_cursor();
         self.scroll_to_cursor = true;
@@ -540,8 +529,7 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.pane == Pane::ChangeSet;
-        let counts = tab_counts(&self.data.changes);
-        let rows = display_rows(&self.data.changes, self.tab);
+        let rows = display_rows(&self.data.changes, &self.change_filter);
         if std::mem::take(&mut self.scroll_to_cursor)
             && let Some(cursor) = self.cursor
             && let Some(ix) = rows.iter().position(|r| {
@@ -592,21 +580,22 @@ impl ConversationView {
             list.push(
                 style::empty_message(div())
                     .p(style::space::INSET)
-                    .child(self.tab.empty_message())
+                    .child(if self.data.changes.is_empty() {
+                        "No changes yet"
+                    } else {
+                        "No changes in the chosen filters"
+                    })
                     .into_any_element(),
             );
         }
 
-        let tab_bar = super::underline_tab_bar("change-set-tabs", self.tab.index())
-            .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                this.set_tab(Tab::ALL[*ix], cx);
-            }))
-            .children(
-                Tab::ALL
-                    .iter()
-                    .zip(counts)
-                    .map(|(tab, n)| TabItem::new().label(format!("{} {n}", tab.label()))),
-            );
+        let filter = render_status_filter(
+            "change-set",
+            &change_counts(&self.data.changes),
+            &self.change_filter,
+            |this: &mut Self, toggle, _, cx| this.set_change_filter(toggle, cx),
+            cx,
+        );
 
         let selected = self.selected.len();
         let can_reverse_all = self.data.changes.iter().any(|c| c.op != NetOp::Reversed);
@@ -632,9 +621,9 @@ impl ConversationView {
                         }
                         .flex_shrink_0()
                         .child("Changes"),
-                    )
-                    .child(div().flex_1().min_w_0().child(tab_bar)),
+                    ),
             )
+            .children(filter)
             .child(
                 div()
                     .flex_1()
