@@ -50,6 +50,25 @@ fn main() -> anyhow::Result<()> {
     let sub = make("Card validation", Some(feature))?;
     let _draft = make("Receipt email", Some(project))?;
     let _other = make("Unrelated project", None)?;
+    // What `--agent mock` concludes when these nodes are checked against
+    // their incoming changes (`affects none|plan|obligations: <note>`).
+    for (node, details) in [
+        (
+            feature,
+            "affects obligations: the form needs a requirement saying which card digits it may show",
+        ),
+        (
+            sub,
+            "affects plan: the error-logging step has to mask the card number first",
+        ),
+    ] {
+        store.enqueue_outline(M::SetExtraContent {
+            node_id: node,
+            content_type: tod_store::outline::types::EXTRA_CONTENT_DETAILS.into(),
+            body: details.into(),
+        })?;
+    }
+    store.writer().flush()?;
     store.reload_if_stale().ok();
 
     let constraint = |body: &str| -> anyhow::Result<Uuid> {

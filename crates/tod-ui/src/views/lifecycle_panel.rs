@@ -34,6 +34,8 @@ use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
+use crate::views::incoming_check::{IncomingCheck, outcome_line};
+use tod_core::incoming::NodeOutcome;
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
 };
@@ -90,6 +92,7 @@ pub enum LifecyclePanelEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
     MoveBack,
+    CheckIncoming,
     Implement,
     Verify,
     Review,
@@ -157,6 +160,9 @@ impl IncomingRow {
 pub struct LifecyclePanelView {
     fleet: Arc<FleetStore>,
     controller: Entity<LifecycleController>,
+    incoming_check: Entity<IncomingCheck>,
+    /// Mirrors `incoming_check`'s running flag, for the keyboard stops.
+    check_running: bool,
     task_id: Option<String>,
     title: String,
     lifecycle: String,
@@ -179,6 +185,7 @@ pub struct LifecyclePanelView {
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
+    _incoming_check_subscription: Subscription,
 }
 
 impl LifecyclePanelView {
@@ -186,7 +193,13 @@ impl LifecyclePanelView {
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         controller: Entity<LifecycleController>,
+        incoming_check: Entity<IncomingCheck>,
     ) -> Self {
+        let incoming_check_subscription = cx.observe(&incoming_check, |this, check, cx| {
+            this.check_running = check.read(cx).is_running();
+            this.clamp_focus_index();
+            cx.notify();
+        });
         // The controller moves the lifecycle (a gate check that passed, an
         // Advance from the conversation view): re-read the node when it does.
         let subscription = cx.observe(&controller, |this, _, cx| {
@@ -227,6 +240,8 @@ impl LifecyclePanelView {
         Self {
             fleet,
             controller,
+            incoming_check,
+            check_running: false,
             task_id: None,
             title: String::new(),
             lifecycle: String::new(),
@@ -238,6 +253,7 @@ impl LifecyclePanelView {
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
+            _incoming_check_subscription: incoming_check_subscription,
         }
     }
 
@@ -245,6 +261,9 @@ impl LifecyclePanelView {
         let mut stops = Vec::new();
         if self.regression.is_some() {
             stops.push(LifecyclePanelStop::MoveBack);
+        }
+        if self.check_offered() {
+            stops.push(LifecyclePanelStop::CheckIncoming);
         }
         match self.active_control {
             Some(ActiveControl::Implement { .. }) => stops.push(LifecyclePanelStop::Implement),
@@ -315,6 +334,7 @@ impl LifecyclePanelView {
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.focused_stop() {
             Some(LifecyclePanelStop::MoveBack) => self.move_back(cx),
+            Some(LifecyclePanelStop::CheckIncoming) => self.check_incoming(cx),
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
             Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
@@ -399,6 +419,27 @@ impl LifecyclePanelView {
         let changed = rows != self.incoming;
         self.incoming = rows;
         changed
+    }
+
+    fn node_uuid(&self) -> Option<uuid::Uuid> {
+        self.task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    }
+
+    /// Check now is offered while the node has pending changes and no check
+    /// is running (a check of other nodes blocks it too: one at a time).
+    fn check_offered(&self) -> bool {
+        !self.incoming.is_empty() && !self.check_running
+    }
+
+    /// Evaluate the node against its pending incoming changes.
+    fn check_incoming(&mut self, cx: &mut Context<Self>) {
+        let Some(node) = self.node_uuid() else {
+            return;
+        };
+        self.incoming_check
+            .update(cx, |check, cx| check.start(vec![node], cx));
     }
 
     /// Send the node back to the latest state that still holds.
@@ -633,8 +674,51 @@ impl LifecyclePanelView {
             }
             section = section.child(item);
         }
-        // Check now (evaluating the node against these changes) goes here
-        // once evaluation lands (incoming-changes.md build order, step 4).
+        let check = self.incoming_check.read(cx);
+        let node = self.node_uuid();
+        if node.is_some_and(|n| check.covers(n)) {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Checking this node against these changes…"),
+            );
+        } else if check.is_running() {
+            let (done, total) = check.progress().unwrap_or_default();
+            section = section.child(div().text_xs().text_color(muted).child(format!(
+                "Another incoming-changes check is running ({done} of {total});                  Check now is available when it finishes."
+            )));
+        } else {
+            if let Some(failed) = check.results().iter().find(|r| {
+                Some(r.node) == node && matches!(r.outcome, NodeOutcome::Failed(_))
+            }) {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(selectable_text(
+                            "lifecycle-panel-incoming-failed",
+                            outcome_line(failed),
+                            window,
+                            cx,
+                        )),
+                );
+            }
+            let focused = self.is_focused(LifecyclePanelStop::CheckIncoming);
+            let list_active_border = cx.theme().list_active_border;
+            section = section.child(
+                div()
+                    .w_full()
+                    .rounded_md()
+                    .when(focused, |el| el.border_1().border_color(list_active_border))
+                    .child(
+                        Button::new("lifecycle-panel-check-incoming")
+                            .label("Check now")
+                            .w_full()
+                            .on_click(cx.listener(|this, _, _, cx| this.check_incoming(cx))),
+                    ),
+            );
+        }
         section.into_any_element()
     }
 

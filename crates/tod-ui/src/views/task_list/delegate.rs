@@ -50,6 +50,10 @@ pub enum RowAction {
     ToggleCollapsed {
         task_id: String,
     },
+    /// Ctrl+click: add the row to, or take it out of, the marked set.
+    ToggleMark {
+        task_id: String,
+    },
     OpenObligations {
         task_id: String,
     },
@@ -88,6 +92,8 @@ pub struct TaskListDelegate {
     /// The view that owns this delegate, for row popups that drive it directly.
     view: Option<WeakEntity<TaskListView>>,
     recently_updated: std::collections::HashSet<String>,
+    /// Rows marked for a multi-node action (Space / Ctrl+click).
+    marked: std::collections::HashSet<String>,
 }
 
 impl TaskListDelegate {
@@ -105,7 +111,12 @@ impl TaskListDelegate {
             generator_filter_input: None,
             view: None,
             recently_updated: std::collections::HashSet::new(),
+            marked: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn set_marked(&mut self, marked: std::collections::HashSet<String>) {
+        self.marked = marked;
     }
 
     pub fn set_recently_updated(&mut self, recently_updated: std::collections::HashSet<String>) {
@@ -579,6 +590,9 @@ impl ListDelegate for TaskListDelegate {
         let has_spec = item.has_spec;
         let drop_task_id = item.id.clone();
         let drop_sink = sink.clone();
+        let marked = self.marked.contains(&item.id);
+        let mark_task_id = item.id.clone();
+        let mark_sink = sink.clone();
         let row_content = h_flex()
             .h(TREE_ROW_HEIGHT)
             .items_center()
@@ -597,6 +611,28 @@ impl ListDelegate for TaskListDelegate {
                         .bg(primary),
                 )
             })
+            .when(marked, |el| {
+                el.bg(primary.opacity(0.12)).child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(primary),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                    if event.modifiers.control || event.modifiers.platform {
+                        mark_sink.borrow_mut().push(RowAction::ToggleMark {
+                            task_id: mark_task_id.clone(),
+                        });
+                        cx.notify();
+                    }
+                }),
+            )
             .when(has_spec, |el| {
                 el.can_drop(|any, _, _| any.downcast_ref::<ObligationDragPayload>().is_some())
                     .on_drop::<ObligationDragPayload>(cx.listener(

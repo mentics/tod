@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::interview::TodPaths;
+use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -96,6 +97,8 @@ actions!(
         TaskListOpenExternal,
         TaskListCopy,
         TaskListPaste,
+        TaskListToggleMark,
+        TaskListCheckIncoming,
     ]
 );
 
@@ -167,6 +170,8 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("delete", TaskListDelete, context),
         KeyBinding::new("backspace", TaskListDelete, context),
         KeyBinding::new("ctrl-c", TaskListCopy, context),
+        KeyBinding::new("space", TaskListToggleMark, context),
+        KeyBinding::new("i", TaskListCheckIncoming, context),
         KeyBinding::new("ctrl-v", TaskListPaste, context),
         // Inline title edit: Escape cancels; arrows leave the field and move selection.
         KeyBinding::new(
@@ -319,6 +324,12 @@ pub struct TaskListView {
     _compose_subscription: Subscription,
     _credential_subscription: Subscription,
     _inline_edit_subscription: Subscription,
+    /// Rows marked for a multi-node action (Space / Ctrl+click): today,
+    /// "Check incoming changes". Session-only.
+    marked: std::collections::HashSet<String>,
+    /// The shared incoming-changes check (`bind_incoming_check`).
+    incoming_check: Option<Entity<IncomingCheck>>,
+    _incoming_check_subscription: Option<Subscription>,
 }
 
 impl TaskListView {
@@ -471,6 +482,9 @@ impl TaskListView {
             _compose_subscription,
             _credential_subscription,
             _inline_edit_subscription,
+            marked: std::collections::HashSet::new(),
+            incoming_check: None,
+            _incoming_check_subscription: None,
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -587,6 +601,7 @@ impl TaskListView {
             state
                 .delegate_mut()
                 .set_recently_updated(self.recently_updated_copy_ids.clone());
+            state.delegate_mut().set_marked(self.marked.clone());
             state.set_selected_index(selected_ix, window, cx);
             // Only chase the selection when it actually moved. A rebuild the
             // user did not ask for (a background change to the tree) must not
@@ -693,6 +708,9 @@ impl TaskListView {
             }
             RowAction::ToggleCollapsed { task_id } => {
                 self.toggle_collapsed(&task_id, window, cx);
+            }
+            RowAction::ToggleMark { task_id } => {
+                self.toggle_mark(&task_id, cx);
             }
             RowAction::OpenObligations { task_id } => {
                 self.dismiss_compose_for_row_action(window, cx);
@@ -2489,6 +2507,89 @@ impl TaskListView {
         self.open_obligations_panel(&task_id, window, cx);
     }
 
+    /// Share the incoming-changes check with the lifecycle panel, so a
+    /// check started in either shows in both.
+    pub fn bind_incoming_check(&mut self, check: Entity<IncomingCheck>, cx: &mut Context<Self>) {
+        self._incoming_check_subscription = Some(cx.observe(&check, |_, _, cx| cx.notify()));
+        self.incoming_check = Some(check);
+        cx.notify();
+    }
+
+    fn toggle_mark(&mut self, task_id: &str, cx: &mut Context<Self>) {
+        if !self.marked.remove(task_id) {
+            self.marked.insert(task_id.to_string());
+        }
+        self.push_marks(cx);
+    }
+
+    fn clear_marks(&mut self, cx: &mut Context<Self>) {
+        self.marked.clear();
+        self.push_marks(cx);
+    }
+
+    fn push_marks(&mut self, cx: &mut Context<Self>) {
+        let marked = self.marked.clone();
+        self.list_state.update(cx, |state, cx| {
+            state.delegate_mut().set_marked(marked);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn on_toggle_mark(&mut self, _: &TaskListToggleMark, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        self.toggle_mark(&task_id, cx);
+    }
+
+    /// The nodes "Check incoming changes" acts on: the marked rows, else
+    /// the selected one.
+    fn check_targets(&self, cx: &Context<Self>) -> Vec<uuid::Uuid> {
+        if self.marked.is_empty() {
+            return self
+                .working_set
+                .selected_id
+                .clone()
+                .or_else(|| self.selected_task(cx).map(|t| t.id))
+                .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+                .into_iter()
+                .collect();
+        }
+        // In tree order, so the summary reads top to bottom.
+        self.all_tasks
+            .iter()
+            .filter(|t| self.marked.contains(&t.id))
+            .filter_map(|t| uuid::Uuid::parse_str(&t.id).ok())
+            .collect()
+    }
+
+    fn on_check_incoming(
+        &mut self,
+        _: &TaskListCheckIncoming,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.check_incoming(cx);
+    }
+
+    fn check_incoming(&mut self, cx: &mut Context<Self>) {
+        let Some(check) = self.incoming_check.clone() else {
+            return;
+        };
+        let nodes = self.check_targets(cx);
+        if nodes.is_empty() || check.read(cx).is_running() {
+            return;
+        }
+        check.update(cx, |check, cx| check.start(nodes, cx));
+        self.clear_marks(cx);
+    }
+
     fn on_open_plan(&mut self, _: &TaskListOpenPlan, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self
             .working_set
@@ -2629,16 +2730,49 @@ impl TaskListView {
     /// Quick filter toggles above the tree, in the status-filter row style:
     /// "Pending changes" narrows it to nodes with pending incoming changes
     /// (and their ancestors). Shown while any node has one, or while on.
-    fn render_quick_filters(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn render_quick_filters(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         use gpui::IntoElement as _;
         let pending_nodes = self
             .all_tasks
             .iter()
             .filter(|t| t.incoming_count > 0)
             .count();
-        if pending_nodes == 0 && !self.working_set.pending_changes_only {
+        if pending_nodes == 0 && !self.working_set.pending_changes_only && self.marked.is_empty()
+        {
             return None;
         }
+        let running = self
+            .incoming_check
+            .as_ref()
+            .is_some_and(|c| c.read(cx).is_running());
+        let check_label = if self.marked.is_empty() {
+            "Check incoming changes".to_string()
+        } else {
+            format!("Check incoming changes ({} marked)", self.marked.len())
+        };
+        let check_button = chrome_control_with_shortcut(
+            Button::new("check-incoming-changes")
+                .label(check_label)
+                .ghost()
+                .small()
+                .disabled(running || self.incoming_check.is_none())
+                .on_click(cx.listener(|this, _, _, cx| this.check_incoming(cx))),
+            window,
+            &TaskListCheckIncoming,
+            TASK_LIST_CONTEXT,
+            cx,
+        );
+        let clear_marks = (!self.marked.is_empty()).then(|| {
+            Button::new("clear-marks")
+                .label("Clear marks")
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _, _, cx| this.clear_marks(cx)))
+        });
         Some(
             gpui_component::h_flex()
                 .items_center()
@@ -2657,8 +2791,138 @@ impl TaskListView {
                         })),
                     self.working_set.pending_changes_only,
                 ))
+                .child(check_button)
+                .children(clear_marks)
                 .into_any_element(),
         )
+    }
+
+    /// The shared incoming-changes check's progress while it runs, and its
+    /// summary afterwards: every node's outcome, and **Move back all** for
+    /// the ones whose verdict sends them back (one confirmation).
+    fn render_incoming_check(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use crate::ui::selectable_text::selectable_text;
+        use gpui::IntoElement as _;
+        use gpui_component::{h_flex, v_flex};
+        let check = self.incoming_check.clone()?;
+        let check = check.read(cx);
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let card = v_flex()
+            .gap(crate::ui::style::space::HAIRLINE)
+            .mx(crate::ui::style::space::RELATED)
+            .my(crate::ui::style::space::HAIRLINE)
+            .p(crate::ui::style::space::RELATED)
+            .border_1()
+            .border_color(crate::ui::style::color::incoming_text())
+            .rounded_md();
+        if let Some((done, total)) = check.progress() {
+            return Some(
+                card.child(div().text_xs().font_semibold().child(format!(
+                    "Checking incoming changes: {done} of {total} done"
+                )))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("One agent session per node. Keep working meanwhile."),
+                )
+                .into_any_element(),
+            );
+        }
+        if !check.has_summary() {
+            return None;
+        }
+        let affected = check.affected();
+        let heading = match (check.results().len(), affected.len()) {
+            (0, _) => "Incoming-changes check".to_string(),
+            (n, 0) => format!("Checked {n} node(s): none needs to move back"),
+            (n, k) => format!("Checked {n} node(s): {k} should move back"),
+        };
+        let error = check.error().map(str::to_string);
+        let lines: Vec<String> = check.results().iter().map(outcome_line).collect();
+        let moved = check.moved().map(str::to_string);
+        let armed = check.move_back_armed();
+        let mut card = card.child(div().text_xs().font_semibold().child(heading));
+        if let Some(error) = error {
+            card = card.child(div().text_xs().text_color(danger).child(selectable_text(
+                "incoming-check-error",
+                error,
+                window,
+                cx,
+            )));
+        }
+        for (i, line) in lines.into_iter().enumerate() {
+            card = card.child(div().text_xs().child(selectable_text(
+                format!("incoming-check-result-{i}"),
+                format!("* {line}"),
+                window,
+                cx,
+            )));
+        }
+        let offer_move = !affected.is_empty() && moved.is_none();
+        if let Some(moved) = moved {
+            card = card.child(div().text_xs().text_color(muted).child(selectable_text(
+                "incoming-check-moved",
+                moved,
+                window,
+                cx,
+            )));
+        }
+        let mut buttons = h_flex().gap_1();
+        if offer_move {
+            if armed {
+                buttons = buttons
+                    .child(
+                        Button::new("incoming-check-move-back-confirm")
+                            .label(format!("Confirm: move {} node(s) back", affected.len()))
+                            .primary()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| this.move_back_all(cx))),
+                    )
+                    .child(
+                        Button::new("incoming-check-move-back-cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(check) = &this.incoming_check {
+                                    check.update(cx, |c, cx| c.cancel_move_back(cx));
+                                }
+                            })),
+                    );
+            } else {
+                buttons = buttons.child(
+                    Button::new("incoming-check-move-back-all")
+                        .label("Move back all")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.move_back_all(cx))),
+                );
+            }
+        }
+        buttons = buttons.child(
+            Button::new("incoming-check-dismiss")
+                .label("Dismiss")
+                .ghost()
+                .small()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(check) = &this.incoming_check {
+                        check.update(cx, |c, cx| c.dismiss(cx));
+                    }
+                })),
+        );
+        Some(card.child(buttons).into_any_element())
+    }
+
+    fn move_back_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(check) = &self.incoming_check {
+            check.update(cx, |c, cx| c.move_back_all(cx));
+        }
     }
 
     fn render_sort_menu_overlay(&self, cx: &mut Context<Self>) -> Option<impl gpui::IntoElement> {
@@ -2907,9 +3171,12 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_copy))
             .on_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_toggle_mark))
+            .on_action(cx.listener(Self::on_check_incoming))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
-            .when_some(self.render_quick_filters(cx), |el, bar| el.child(bar))
+            .when_some(self.render_quick_filters(window, cx), |el, bar| el.child(bar))
+            .when_some(self.render_incoming_check(window, cx), |el, card| el.child(card))
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
             .when(self.credential_prompt_open, |el| {

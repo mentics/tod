@@ -31,6 +31,7 @@ use crate::ui::status::{self, StatusSource};
 use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
+use crate::views::incoming_check::IncomingCheck;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
@@ -1535,8 +1536,19 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             cx.new(|cx| ObligationsView::new(window, cx, fleet.clone()));
                         let plan = cx.new(|cx| PlanStepsView::new(window, cx, fleet.clone()));
                         let lifecycle = cx.new(|_| LifecycleController::new(fleet.clone()));
+                        let incoming_check = cx.new(|_| {
+                            IncomingCheck::new(fleet.clone(), agent.clone(), lifecycle.clone())
+                        });
+                        task_list.update(cx, |list, cx| {
+                            list.bind_incoming_check(incoming_check.clone(), cx)
+                        });
                         let lifecycle_panel = cx.new(|cx| {
-                            LifecyclePanelView::new(cx, fleet.clone(), lifecycle.clone())
+                            LifecyclePanelView::new(
+                                cx,
+                                fleet.clone(),
+                                lifecycle.clone(),
+                                incoming_check.clone(),
+                            )
                         });
                         let visual_design_panel =
                             cx.new(|cx| VisualDesignPanelView::new(fleet.clone(), cx));
