@@ -60,3 +60,36 @@ pub fn slugify(input: &str) -> String {
     }
     out.trim_end_matches('-').to_string()
 }
+
+/// A one-line label for `text`: its first non-blank line, cut to `max_chars`
+/// with an ellipsis. For status text built from agent-supplied strings (a
+/// shell tool's title is its whole command, heredocs included).
+pub fn one_line_summary(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let more_lines = text.trim().lines().count() > 1;
+    if line.chars().count() <= max_chars && !more_lines {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+#[cfg(test)]
+mod one_line_summary_tests {
+    use super::one_line_summary;
+
+    #[test]
+    fn keeps_short_single_lines() {
+        assert_eq!(one_line_summary("  ls -la ", 20), "ls -la");
+    }
+
+    #[test]
+    fn cuts_long_lines_and_drops_later_lines() {
+        assert_eq!(one_line_summary("abcdefghij", 5), "abcd…");
+        assert_eq!(one_line_summary("\ncat <<EOF\nbody\nEOF", 40), "cat <<EOF…");
+    }
+}
