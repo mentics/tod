@@ -157,23 +157,7 @@ impl DataSource for LinearDataSource {
     }
 
     fn validate_config(&self, config: &serde_json::Value) -> Result<(), DataSourceError> {
-        // Result cap validation
-        if let Some(obj) = config.as_object() {
-            if let Some(cap_value) = obj.get("result_cap") {
-                if let Some(cap_num) = cap_value.as_u64() {
-                    if cap_num == 0 {
-                        return Err(DataSourceError::InvalidConfig(
-                            "result_cap must be greater than 0".into(),
-                        ));
-                    }
-                } else if !cap_value.is_null() {
-                    return Err(DataSourceError::InvalidConfig(
-                        "result_cap must be a number".into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
+        result_cap_from_config(config).map(|_| ())
     }
 
     fn validate_config_with_test_query(
@@ -247,11 +231,8 @@ impl DataSource for LinearDataSource {
             DataSourceError::Auth("Linear API key not configured".into())
         })?;
 
-        let result_cap = config
-            .as_object()
-            .and_then(|obj| obj.get("result_cap"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_RESULT_CAP as u64) as usize;
+        let result_cap =
+            result_cap_from_config(config)?.unwrap_or(DEFAULT_RESULT_CAP as u64) as usize;
 
         // Extract filter from config
         let filter = build_filter_from_config(config)?;
@@ -296,6 +277,115 @@ impl DataSource for LinearDataSource {
     }
 }
 
+/// Whether `key` of a Linear generator config is an `IssueFilter` field, as
+/// opposed to a setting (`result_cap`, `workspace_slug`) or a schema
+/// placeholder (`_linear_filters`).
+pub fn is_filter_key(key: &str) -> bool {
+    key != "result_cap" && key != "workspace_slug" && !key.starts_with('_')
+}
+
+/// Rewrite the first schema's `team_key` / `query` strings as the `team` /
+/// `title` filters they stood for. A filter already present under the new
+/// name wins; the legacy key is removed either way.
+pub fn migrate_legacy_filter_keys(config: &mut serde_json::Map<String, serde_json::Value>) {
+    let legacy: [(&str, &str, fn(&str) -> serde_json::Value); 2] = [
+        ("team_key", "team", |text| serde_json::json!({ "key": { "eq": text } })),
+        ("query", "title", |text| serde_json::json!({ "containsIgnoreCase": text })),
+    ];
+    for (old, new, build) in legacy {
+        let Some(value) = config.remove(old) else {
+            continue;
+        };
+        let text = value.as_str().map(str::trim).unwrap_or_default();
+        if !text.is_empty() && !config.contains_key(new) {
+            config.insert(new.to_string(), build(text));
+        }
+    }
+}
+
+/// The `IssueFilter` fields that filter by a related entity, and how a list
+/// of picked values is expressed for each: the path of object keys down to
+/// the string comparator that takes `{ "in": [...] }`.
+const RELATION_FILTER_PATHS: [(&str, &[&str]); 4] = [
+    ("team", &["key"]),
+    ("state", &["name"]),
+    ("assignee", &["displayName"]),
+    ("labels", &["some", "name"]),
+];
+
+fn relation_filter_path(field: &str) -> Option<&'static [&'static str]> {
+    RELATION_FILTER_PATHS
+        .iter()
+        .find(|(name, _)| *name == field)
+        .map(|(_, path)| *path)
+}
+
+/// Whether `field` is a relation the filter form offers a pick list for.
+pub fn is_relation_filter_field(field: &str) -> bool {
+    relation_filter_path(field).is_some()
+}
+
+/// The filter for `field` matching any of `selected`, e.g.
+/// `team` → `{ "key": { "in": [...] } }`. `None` for a field that is not a
+/// relation or an empty selection.
+pub fn relation_filter(field: &str, selected: &[String]) -> Option<serde_json::Value> {
+    let path = relation_filter_path(field)?;
+    if selected.is_empty() {
+        return None;
+    }
+    let mut value = serde_json::json!({ "in": selected });
+    for key in path.iter().rev() {
+        let mut wrapper = serde_json::Map::new();
+        wrapper.insert((*key).to_string(), value);
+        value = serde_json::Value::Object(wrapper);
+    }
+    Some(value)
+}
+
+/// The inverse of [`relation_filter`]: the values a stored filter picks.
+/// Also reads a single `eq`. `None` when the stored filter is any other
+/// shape, which the form then has to carry through untouched.
+pub fn relation_filter_selection(field: &str, filter: &serde_json::Value) -> Option<Vec<String>> {
+    let mut value = filter;
+    for key in relation_filter_path(field)? {
+        let obj = value.as_object().filter(|obj| obj.len() == 1)?;
+        value = obj.get(*key)?;
+    }
+    let comparator = value.as_object().filter(|obj| obj.len() == 1)?;
+    if let Some(one) = comparator.get("eq") {
+        return Some(vec![one.as_str()?.to_string()]);
+    }
+    comparator
+        .get("in")?
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+/// `result_cap` as a number. The generic config form stores every text field
+/// as a string, so a numeric string counts.
+fn result_cap_from_config(config: &serde_json::Value) -> Result<Option<u64>, DataSourceError> {
+    let Some(value) = config.as_object().and_then(|obj| obj.get("result_cap")) else {
+        return Ok(None);
+    };
+    let cap = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(text) if text.trim().is_empty() => return Ok(None),
+        serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+        other => other.as_u64(),
+    };
+    match cap {
+        Some(0) => Err(DataSourceError::InvalidConfig(
+            "result_cap must be greater than 0".into(),
+        )),
+        Some(cap) => Ok(Some(cap)),
+        None => Err(DataSourceError::InvalidConfig(
+            "result_cap must be a number".into(),
+        )),
+    }
+}
+
 /// Build a Linear GraphQL filter object from config JSON.
 fn build_filter_from_config(
     config: &serde_json::Value,
@@ -304,18 +394,16 @@ fn build_filter_from_config(
         return Ok(serde_json::json!({}));
     };
 
-    let mut filter = serde_json::Map::new();
+    // Configs saved under the first schema still hold `team_key` / `query`.
+    let mut obj = obj.clone();
+    migrate_legacy_filter_keys(&mut obj);
 
-    // Extract filter fields (everything except result_cap and special keys)
-    for (key, value) in obj {
-        if key == "result_cap" || key == "workspace_slug" || value.is_null() {
-            continue;
-        }
-
-        // For now, pass through the filter structure as-is
-        // The UI is responsible for building the correct GraphQL filter structure
-        filter.insert(key.clone(), value.clone());
-    }
+    // Everything that is not a setting is passed through as-is: the UI is
+    // responsible for building the correct GraphQL filter structure.
+    let filter: serde_json::Map<String, serde_json::Value> = obj
+        .into_iter()
+        .filter(|(key, value)| is_filter_key(key) && !value.is_null())
+        .collect();
 
     Ok(serde_json::Value::Object(filter))
 }
@@ -372,6 +460,12 @@ pub struct IntrospectionCache {
     pub workspace_slug: String,
     pub filter_fields: Vec<FilterFieldMetadata>,
     pub enums: HashMap<String, Vec<String>>,
+    /// Pick lists for the relation filters, keyed by filter field (`team`,
+    /// `state`, `assignee`, `labels`). The values are what
+    /// [`relation_filter`] matches on. Absent from caches written before
+    /// this existed.
+    #[serde(default)]
+    pub relation_options: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -491,11 +585,73 @@ fn fetch_introspection(api_key: &str) -> Result<IntrospectionCache, DataSourceEr
         }
     }
 
+    // The schema is still usable without pick lists, so a failure here does
+    // not fail the fetch.
+    let relation_options = fetch_relation_options(&client, api_key).unwrap_or_default();
+
     Ok(IntrospectionCache {
         workspace_slug,
         filter_fields,
         enums,
+        relation_options,
     })
+}
+
+/// Fetch the workspace's teams, workflow states, users, and labels as the
+/// values [`relation_filter`] matches on. First page of each only.
+fn fetch_relation_options(
+    client: &reqwest::blocking::Client,
+    api_key: &str,
+) -> Result<HashMap<String, Vec<String>>, DataSourceError> {
+    let query = r#"
+        query {
+            teams(first: 250) { nodes { key } }
+            workflowStates(first: 250) { nodes { name } }
+            users(first: 250) { nodes { displayName } }
+            issueLabels(first: 250) { nodes { name } }
+        }
+    "#;
+
+    let response = client
+        .post(LINEAR_GRAPHQL_URL)
+        .headers(build_headers(api_key)?)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .map_err(|e| DataSourceError::Fetch(format!("Failed to fetch filter options: {}", e)))?;
+
+    let status = response.status();
+    let payload: GraphQlResponse<serde_json::Value> = response.json().map_err(|e| {
+        DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
+    })?;
+    handle_graphql_errors(&payload, status)?;
+    let data = payload
+        .data
+        .ok_or_else(|| DataSourceError::Service("empty filter options response".into()))?;
+
+    Ok(relation_options_from_response(&data))
+}
+
+fn relation_options_from_response(data: &serde_json::Value) -> HashMap<String, Vec<String>> {
+    let connections = [
+        ("team", "teams", "key"),
+        ("state", "workflowStates", "name"),
+        ("assignee", "users", "displayName"),
+        ("labels", "issueLabels", "name"),
+    ];
+    let mut options = HashMap::new();
+    for (field, connection, property) in connections {
+        // Workflow states repeat per team; the filter matches by name.
+        let values: std::collections::BTreeSet<String> = data
+            .get(connection)
+            .and_then(|c| c.get("nodes"))
+            .and_then(|nodes| nodes.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|node| node.get(property)?.as_str().map(str::to_string))
+            .collect();
+        options.insert(field.to_string(), values.into_iter().collect());
+    }
+    options
 }
 
 /// Fetch enum values for a specific enum type from Linear API.
@@ -1010,6 +1166,125 @@ mod tests {
         assert!(ds
             .validate_config(&serde_json::json!({"result_cap": 0}))
             .is_err());
+    }
+
+    #[test]
+    fn validate_config_accepts_the_form_s_string_result_cap() {
+        let ds = LinearDataSource::new();
+        assert!(ds
+            .validate_config(&serde_json::json!({"result_cap": "50"}))
+            .is_ok());
+        assert!(ds
+            .validate_config(&serde_json::json!({"result_cap": "lots"}))
+            .is_err());
+        assert!(ds
+            .validate_config(&serde_json::json!({"result_cap": "0"}))
+            .is_err());
+    }
+
+    #[test]
+    fn build_filter_translates_legacy_keys() {
+        let filter = build_filter_from_config(&serde_json::json!({
+            "team_key": "TOD",
+            "query": "login",
+            "result_cap": "50",
+            "workspace_slug": "acme",
+        }))
+        .unwrap();
+        assert_eq!(
+            filter,
+            serde_json::json!({
+                "team": { "key": { "eq": "TOD" } },
+                "title": { "containsIgnoreCase": "login" },
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_keys_never_override_a_real_filter() {
+        let mut config = serde_json::json!({
+            "team_key": "OLD",
+            "query": "  ",
+            "team": { "key": { "in": ["NEW"] } },
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+        migrate_legacy_filter_keys(&mut config);
+        assert_eq!(
+            serde_json::Value::Object(config),
+            serde_json::json!({ "team": { "key": { "in": ["NEW"] } } })
+        );
+    }
+
+    #[test]
+    fn relation_filters_nest_under_the_entity_s_comparator() {
+        let picked = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(
+            relation_filter("team", &picked),
+            Some(serde_json::json!({ "key": { "in": ["A", "B"] } }))
+        );
+        assert_eq!(
+            relation_filter("state", &picked),
+            Some(serde_json::json!({ "name": { "in": ["A", "B"] } }))
+        );
+        assert_eq!(
+            relation_filter("assignee", &picked),
+            Some(serde_json::json!({ "displayName": { "in": ["A", "B"] } }))
+        );
+        assert_eq!(
+            relation_filter("labels", &picked),
+            Some(serde_json::json!({ "some": { "name": { "in": ["A", "B"] } } }))
+        );
+        assert_eq!(relation_filter("team", &[]), None);
+        assert_eq!(relation_filter("title", &picked), None);
+    }
+
+    #[test]
+    fn relation_filter_selection_round_trips() {
+        let picked = vec!["A".to_string(), "B".to_string()];
+        for (field, _) in RELATION_FILTER_PATHS {
+            let filter = relation_filter(field, &picked).unwrap();
+            assert_eq!(relation_filter_selection(field, &filter), Some(picked.clone()));
+        }
+        // The migrated legacy team filter reads as a single pick.
+        assert_eq!(
+            relation_filter_selection("team", &serde_json::json!({ "key": { "eq": "TOD" } })),
+            Some(vec!["TOD".to_string()])
+        );
+        // Anything the pick list cannot express is left for pass-through.
+        for other in [
+            serde_json::json!({ "in": ["A"] }),
+            serde_json::json!({ "id": { "in": ["A"] } }),
+            serde_json::json!({ "key": { "in": ["A"] }, "name": { "eq": "x" } }),
+            serde_json::json!({ "key": { "neq": "A" } }),
+        ] {
+            assert_eq!(relation_filter_selection("team", &other), None);
+        }
+    }
+
+    #[test]
+    fn relation_options_are_read_per_field_and_deduplicated() {
+        let options = relation_options_from_response(&serde_json::json!({
+            "teams": { "nodes": [{ "key": "TOD" }, { "key": "OPS" }] },
+            "workflowStates": { "nodes": [{ "name": "Todo" }, { "name": "Done" }, { "name": "Todo" }] },
+            "users": { "nodes": [{ "displayName": "sam" }] },
+        }));
+        assert_eq!(options["team"], vec!["OPS", "TOD"]);
+        assert_eq!(options["state"], vec!["Done", "Todo"]);
+        assert_eq!(options["assignee"], vec!["sam"]);
+        assert!(options["labels"].is_empty());
+    }
+
+    #[test]
+    fn introspection_cache_without_relation_options_still_loads() {
+        let cache: IntrospectionCache = serde_json::from_value(serde_json::json!({
+            "workspace_slug": "acme",
+            "filter_fields": [],
+            "enums": {},
+        }))
+        .unwrap();
+        assert!(cache.relation_options.is_empty());
     }
 
     #[test]
