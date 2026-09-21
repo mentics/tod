@@ -236,6 +236,31 @@ impl LifecycleController {
         moved
     }
 
+    /// Move the node straight back to `target`, several states if need be,
+    /// with no confirmation: the caller's button names the state, and it is
+    /// only offered when the node's current state no longer holds
+    /// (`tod_core::lifecycle_validity`). `true` when the node moved.
+    pub fn revert_to(&mut self, task_id: &str, target: &str, cx: &mut Context<Self>) -> bool {
+        let Ok(node_id) = Uuid::parse_str(task_id) else {
+            return false;
+        };
+        let result = self.set_lifecycle(node_id, target);
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.revert_armed = false;
+        state.force_advance_armed = false;
+        let moved = result.is_ok();
+        match result {
+            Ok(()) => {
+                state.gate_error = None;
+                state.gate_status = format!("Moved back to {target}.");
+                state.criteria_detail.clear();
+            }
+            Err(err) => state.gate_error = Some(format!("Failed to move back: {err}")),
+        }
+        cx.notify();
+        moved
+    }
+
     /// Waive one failing gate criterion — the fine-grained alternative to
     /// `force_advance`. Persists as `SOURCE_HUMAN`. This never advances the
     /// lifecycle by itself: once every row reads pass/waived, the user still

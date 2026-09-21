@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 49;
+pub const CURRENT_USER_VERSION: i32 = 50;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -335,6 +335,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 49 {
         migrate_v48_to_v49(conn)?;
         conn.pragma_update(None, "user_version", 49)?;
+    }
+    if version < 50 {
+        migrate_v49_to_v50(conn)?;
+        conn.pragma_update(None, "user_version", 50)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -860,6 +864,13 @@ fn migrate_v43_to_v44(conn: &Connection) -> Result<()> {
 /// exercised, kept as a history (`crate::verification`).
 fn migrate_v48_to_v49(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::verification::CREATE_TABLE)?;
+    Ok(())
+}
+
+/// `lifecycle_baselines`: each node's obligations and plan as they stood
+/// when it entered `ready` (`crate::lifecycle_baseline`).
+fn migrate_v49_to_v50(conn: &Connection) -> Result<()> {
+    conn.execute_batch(crate::lifecycle_baseline::CREATE_TABLE)?;
     Ok(())
 }
 

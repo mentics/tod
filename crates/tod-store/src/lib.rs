@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod fleet;
 pub mod install;
 pub mod interview;
+pub mod lifecycle_baseline;
 pub mod linear;
 pub mod log_level;
 pub mod outline;

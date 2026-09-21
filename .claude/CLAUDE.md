@@ -107,6 +107,15 @@ shell shares between the conversation view and the lifecycle panel, so a
 check started in either shows in both. The manual escape hatches (force
 advance, revert, open interview) stay in the panel.
 
+A node's state can stop holding after the fact: its obligations or plan
+changed since it entered `ready` (compared with the snapshot
+`tod_store::lifecycle_baseline` takes then, so a reversed change stops
+counting), or verification failed. `tod_core::lifecycle_validity` decides
+that deterministically and names the latest state that still holds; the
+lifecycle panel shows it as an orange callout with **Move back**, re-judged on
+every store change. The app never moves the node itself: the user confirms,
+since a conversation's changes may still be reversed.
+
 Every conversation has a **focus** (project, node, obligation, or plan step) and
 the view lists only that focus's conversations. Ctrl+J opens the focus's most
 recent one, or an empty one that is saved on its first send; new conversations
