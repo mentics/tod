@@ -12,6 +12,7 @@ mod args;
 mod changeset;
 #[cfg(test)]
 mod doc_sync;
+mod incoming;
 mod interview;
 mod node;
 mod obligations;
@@ -50,6 +51,7 @@ NOUNS:
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
     verdicts               What verification found for each obligation of a node
+    incoming               Changes a node inherits, and the verdict that resolves them
     secrets                Run a command with stored secrets, without seeing them
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
@@ -150,9 +152,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "tests" => test_runs::run(invocation),
         "review" => review::run(invocation),
         "verdicts" => verdicts::run(invocation),
+        "incoming" => incoming::run(invocation),
         "secrets" => secrets::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, review, verdicts, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, review, verdicts, incoming, secrets)"
         ),
     }
 }

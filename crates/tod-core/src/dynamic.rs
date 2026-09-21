@@ -76,6 +76,21 @@ pub struct FocusSelection {
     pub sections: Vec<(String, Vec<String>)>,
 }
 
+/// One change a node inherits and has not been checked against, as an agent
+/// is shown it. Built by `crate::incoming::describe`; the block renders it
+/// without knowing where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingChangeItem {
+    /// E.g. "Constraint [1a2b3c4d] added".
+    pub headline: String,
+    /// The node the change was made on.
+    pub source_title: String,
+    /// `ancestor` or `reference`.
+    pub via: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
 /// One section of the dynamic block. A surface lists the ones it wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynamicBlock {
@@ -113,6 +128,10 @@ pub enum DynamicBlock {
     /// The directory the agent was launched in, for a surface whose code
     /// work must stay there.
     WorkingDirectory,
+    /// The changes a node inherits and has not been checked against, each
+    /// with its before and after text, the node it was made on, and how it
+    /// reached this one.
+    IncomingChanges,
     /// What a conversation is about: its kind, path, title, and (by kind) its
     /// full text, its obligations and plan steps, or the top-level nodes.
     Focus,
@@ -136,6 +155,7 @@ pub struct DynamicContext<'a> {
     pub workspace: Option<&'a Workspace>,
     pub working_dir: Option<&'a Path>,
     pub focus: Option<&'a FocusSelection>,
+    pub incoming: &'a [IncomingChangeItem],
 }
 
 /// One finding as a fix session is shown it: a line with its id, severity,
@@ -173,6 +193,23 @@ pub fn obligation_verdict_lines(verdict: &ObligationVerdict) -> String {
         out.push_str("  ");
         out.push_str(line);
         out.push('\n');
+    }
+    out
+}
+
+/// One incoming change: its headline, where it came from, then its before
+/// and after text indented under it.
+pub fn incoming_change_lines(item: &IncomingChangeItem) -> String {
+    let mut out = format!(
+        "- {} on \"{}\" (through {} {})\n",
+        item.headline.trim(),
+        item.source_title.trim(),
+        if item.via == "reference" { "a" } else { "an" },
+        item.via
+    );
+    for (label, text) in [("Before", &item.before), ("After", &item.after)] {
+        let text = text.as_deref().map(str::trim).unwrap_or("(none)");
+        out.push_str(&format!("  - {label}: {text}\n"));
     }
     out
 }
@@ -342,6 +379,16 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                 for finding in ctx.findings {
                     out.push_str(&review_finding_lines(finding));
                 }
+            }
+        }
+
+        DynamicBlock::IncomingChanges => {
+            out.push_str("\n## Incoming changes\n\n");
+            if ctx.incoming.is_empty() {
+                out.push_str("(none)\n");
+            }
+            for item in ctx.incoming {
+                out.push_str(&incoming_change_lines(item));
             }
         }
 

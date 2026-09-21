@@ -13,7 +13,7 @@ use crate::outline::references::subtree_node_ids;
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid, blob_to_uuid_sql, uuid_to_blob};
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -171,6 +171,61 @@ fn committed_spec(conn: &Connection, node: Uuid) -> Result<bool> {
     Ok(state.is_some_and(|s| COMMITTED_STATES.contains(&s.as_str())))
 }
 
+/// Nothing of the node's own work is affected: it stays where it is.
+pub const AFFECTS_NONE: &str = "none";
+/// The obligations still hold, some plan steps don't: back to `planning`.
+pub const AFFECTS_PLAN: &str = "plan";
+/// An obligation must be added, changed, or removed: back to `design`.
+pub const AFFECTS_OBLIGATIONS: &str = "obligations";
+/// Every verdict `--affects` accepts.
+pub const AFFECTS: [&str; 3] = [AFFECTS_NONE, AFFECTS_PLAN, AFFECTS_OBLIGATIONS];
+
+/// Where a verdict sends the node back to, when it sends it back at all.
+pub fn affects_target(affects: &str) -> Option<&'static str> {
+    match affects {
+        AFFECTS_PLAN => Some("planning"),
+        AFFECTS_OBLIGATIONS => Some("design"),
+        _ => None,
+    }
+}
+
+/// Append-only: every verdict an evaluation recorded. A node's latest row is
+/// what `tod_core::lifecycle_validity` reads; the rest is history.
+pub const CREATE_VERDICTS_TABLE: &str = "
+    CREATE TABLE IF NOT EXISTS incoming_verdicts (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        node_id         BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        affects         TEXT NOT NULL CHECK (affects IN ('none','plan','obligations')),
+        note            TEXT NOT NULL,
+        action_ids      TEXT NOT NULL,
+        conversation_id BLOB REFERENCES conversations(id) ON DELETE SET NULL,
+        created_at      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS incoming_verdicts_node ON incoming_verdicts(node_id, id);
+";
+
+/// One evaluation's verdict on a node (`doc/conversation/incoming-changes.md` §5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingVerdict {
+    pub id: i64,
+    pub node_id: Uuid,
+    /// `none`, `plan`, or `obligations`.
+    pub affects: String,
+    pub note: String,
+    /// The recorded actions this verdict resolved.
+    pub action_ids: Vec<i64>,
+    /// The evaluation conversation that recorded it, when one did.
+    pub conversation_id: Option<Uuid>,
+    pub created_at: i64,
+}
+
+impl IncomingVerdict {
+    /// The state this verdict sends the node back to, if any.
+    pub fn target(&self) -> Option<&'static str> {
+        affects_target(&self.affects)
+    }
+}
+
 /// Read and write access to the queue.
 pub struct IncomingRepo<'a> {
     conn: &'a Connection,
@@ -235,6 +290,150 @@ impl<'a> IncomingRepo<'a> {
             "DELETE FROM incoming_changes WHERE node_id = ?1",
             params![uuid_to_blob(node_id)],
         )?)
+    }
+
+    /// Record a verdict on `node_id` and resolve the entries it covers:
+    /// `action_ids`, or every pending entry when `None`. The entries are
+    /// removed and the node's baseline notes it has been checked against
+    /// those actions. Fails when there is nothing to resolve.
+    pub fn resolve(
+        &self,
+        node_id: Uuid,
+        affects: &str,
+        note: &str,
+        action_ids: Option<&[i64]>,
+        conversation_id: Option<Uuid>,
+    ) -> Result<IncomingVerdict> {
+        let affects = AFFECTS
+            .iter()
+            .find(|a| a.eq_ignore_ascii_case(affects.trim()))
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown --affects `{affects}` (expected {})",
+                    AFFECTS.join("|")
+                )
+            })?;
+        let note = note.trim();
+        anyhow::ensure!(!note.is_empty(), "--note is required: say why");
+        let pending: Vec<i64> = self.pending(node_id)?.iter().map(|e| e.action_id).collect();
+        let ids: Vec<i64> = match action_ids {
+            Some(ids) => ids.iter().copied().filter(|id| pending.contains(id)).collect(),
+            None => pending,
+        };
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "node {node_id} has no pending incoming changes to resolve"
+        );
+        let now = crate::outline::uuid_blob::now_ms();
+        self.conn.execute(
+            "INSERT INTO incoming_verdicts
+             (node_id, affects, note, action_ids, conversation_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                uuid_to_blob(node_id),
+                affects,
+                note,
+                serde_json::to_string(&ids)?,
+                conversation_id.map(uuid_to_blob),
+                now
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.remove(node_id, &ids)?;
+        Ok(IncomingVerdict {
+            id,
+            node_id,
+            affects: affects.to_string(),
+            note: note.to_string(),
+            action_ids: ids,
+            conversation_id,
+            created_at: now,
+        })
+    }
+
+    /// Clear the node's entries without a verdict: for a node whose pending
+    /// changes net to nothing. The baseline still records the actions as
+    /// checked. Returns how many entries were removed.
+    pub fn clear_checked(&self, node_id: Uuid) -> Result<usize> {
+        let ids: Vec<i64> = self.pending(node_id)?.iter().map(|e| e.action_id).collect();
+        self.remove(node_id, &ids)?;
+        Ok(ids.len())
+    }
+
+    fn remove(&self, node_id: Uuid, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            self.conn.execute(
+                "DELETE FROM incoming_changes WHERE node_id = ?1 AND action_id = ?2",
+                params![uuid_to_blob(node_id), id],
+            )?;
+        }
+        crate::lifecycle_baseline::BaselineRepo::new(self.conn).record_checked(node_id, ids)
+    }
+
+    /// Every verdict recorded on the node, oldest first.
+    pub fn verdicts(&self, node_id: Uuid) -> Result<Vec<IncomingVerdict>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, node_id, affects, note, action_ids, conversation_id, created_at
+             FROM incoming_verdicts WHERE node_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id)], |r| {
+                let node: Vec<u8> = r.get(1)?;
+                let conversation: Option<Vec<u8>> = r.get(5)?;
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    blob_to_uuid_sql(&node)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    conversation.map(|c| blob_to_uuid_sql(&c)).transpose()?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(id, node_id, affects, note, ids, conversation_id, created_at)| {
+                    Ok(IncomingVerdict {
+                        id,
+                        node_id,
+                        affects,
+                        note,
+                        action_ids: serde_json::from_str(&ids)?,
+                        conversation_id,
+                        created_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// The node's latest verdict.
+    pub fn latest_verdict(&self, node_id: Uuid) -> Result<Option<IncomingVerdict>> {
+        Ok(self.verdicts(node_id)?.pop())
+    }
+
+    /// The verdict a conversation recorded, if it recorded one.
+    pub fn verdict_for_conversation(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Option<IncomingVerdict>> {
+        let node: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT node_id FROM incoming_verdicts WHERE conversation_id = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![uuid_to_blob(conversation_id)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(node) = node else { return Ok(None) };
+        Ok(self
+            .verdicts(blob_to_uuid(&node)?)?
+            .into_iter()
+            .rev()
+            .find(|v| v.conversation_id == Some(conversation_id)))
     }
 
     /// The node's pending entries netted per item, in the order each item

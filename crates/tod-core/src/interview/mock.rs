@@ -35,6 +35,22 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> 
         (env_uuid(IMPLEMENT_NODE_ENV), env_uuid(IMPLEMENT_CONVERSATION_ENV))
     {
         let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
+        // An incoming-changes check carries the actions it was shown.
+        if let Some((_, actions)) = turn
+            .env
+            .iter()
+            .find(|(key, _)| key == crate::incoming::INCOMING_ACTIONS_ENV)
+        {
+            let actions = crate::conversation::incoming::parse_action_ids(Some(actions))?;
+            return crate::conversation::incoming::mock_turn(
+                &client,
+                node,
+                conversation,
+                actions,
+                &turn.blocks.join("\n\n"),
+            )
+            .map(MockReply::from);
+        }
         return crate::conversation::mock::plan_turn(&client, node, conversation)
             .map(MockReply::from);
     }

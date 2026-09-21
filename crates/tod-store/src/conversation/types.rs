@@ -130,6 +130,7 @@ str_enum!(
         VisualDesign => "visual_design",
         GateCheck => "gate_check",
         OnEntry => "on_entry",
+        Incoming => "incoming",
     }
 );
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 52;
+pub const CURRENT_USER_VERSION: i32 = 53;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -347,6 +347,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 52 {
         migrate_v51_to_v52(conn)?;
         conn.pragma_update(None, "user_version", 52)?;
+    }
+    if version < 53 {
+        conn.execute_batch(crate::incoming::CREATE_VERDICTS_TABLE)?;
+        conn.pragma_update(None, "user_version", 53)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

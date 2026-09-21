@@ -10,6 +10,7 @@ pub mod conversation;
 pub mod dynamic;
 pub mod fuzzy;
 pub mod gate;
+pub mod incoming;
 pub mod generator;
 pub mod install;
 pub mod interview;

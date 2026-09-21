@@ -166,6 +166,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::Fix => &super::fix::FixProtocol,
         ProtocolKind::GateCheck => &super::gate_check::GateCheckProtocol,
         ProtocolKind::OnEntry => &super::gate_check::OnEntryProtocol,
+        ProtocolKind::Incoming => &super::incoming::IncomingProtocol,
         ProtocolKind::Chat => &ChatProtocol,
         // Until the visual designer has its own protocol and side pane, a
         // visual-design conversation behaves as a plain chat.
@@ -323,6 +324,7 @@ mod tests {
             ProtocolKind::Fix,
             ProtocolKind::GateCheck,
             ProtocolKind::OnEntry,
+            ProtocolKind::Incoming,
             ProtocolKind::Chat,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");

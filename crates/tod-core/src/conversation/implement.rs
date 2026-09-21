@@ -450,7 +450,7 @@ pub(super) fn node_id(env: &ProtocolEnv<'_>) -> Result<Uuid> {
 /// latest note is a verification failure keeps showing that note even once
 /// the agent has moved it on from `failed` — a status change clears the
 /// step's own note, but the failure is what the step is being fixed for.
-pub(super) fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
+pub fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
     fleet
         .list_plan_steps_for_node(node_id)
         .unwrap_or_default()

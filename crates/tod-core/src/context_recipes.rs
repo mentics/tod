@@ -342,8 +342,37 @@ pub const CHAT: ContextRecipe = ContextRecipe {
     blocks: &[DynamicBlock::DataRoot, DynamicBlock::Focus],
 };
 
+/// An incoming-changes check (`crate::incoming`): one short-lived session
+/// judging whether changes a node inherited touch its own obligations or
+/// plan. Narrower than every other surface: the node's own work and the
+/// changes, and deliberately no ancestor context, siblings, or other
+/// candidates. One-shot, with one scoped exception `surface/incoming-changes`
+/// states: the verdict is recorded through the `incoming` noun.
+pub const INCOMING_CHANGES: ContextRecipe = ContextRecipe {
+    name: "incoming-changes check",
+    layers: &[
+        "stance/one-shot",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/incoming",
+        "surface/incoming-changes",
+    ],
+    blocks: &[
+        DynamicBlock::DataRoot,
+        DynamicBlock::Node,
+        DynamicBlock::IncomingChanges,
+        DynamicBlock::NodeObligations {
+            note: "This node's own, in full. Judge the incoming changes against these.",
+        },
+        DynamicBlock::Plan,
+    ],
+};
+
 /// Every registered surface.
 pub const ALL_RECIPES: &[ContextRecipe] = &[
+    INCOMING_CHANGES,
     CONVERSATION,
     CHAT,
     VISUAL_DESIGN_CHAT,
@@ -514,6 +543,7 @@ mod tests {
             "changeset ",
             "review ",
             "verdicts ",
+            "incoming ",
         ];
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {
@@ -547,15 +577,17 @@ mod tests {
         }
     }
 
-    /// A recipe that renders obligations without `AncestorContext` would claim
-    /// "not the ancestor context below" with nothing below it.
+    /// A recipe whose obligations note points at the ancestor context must
+    /// render it right after, or it would claim "not the ancestor context
+    /// below" with nothing below it. (The incoming-changes check renders a
+    /// node's own obligations with no ancestor context on purpose, and its
+    /// note says nothing about one.)
     #[test]
     fn own_obligations_are_always_followed_by_ancestor_context() {
         for recipe in ALL_RECIPES {
-            let obligations = recipe
-                .blocks
-                .iter()
-                .position(|b| matches!(b, DynamicBlock::NodeObligations { .. }));
+            let obligations = recipe.blocks.iter().position(|b| {
+                matches!(b, DynamicBlock::NodeObligations { note } if note.contains("ancestor"))
+            });
             let Some(idx) = obligations else { continue };
             let ancestors = recipe
                 .blocks

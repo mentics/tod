@@ -229,6 +229,20 @@ pub enum InterviewCommand {
         status: String,
         evidence: String,
     },
+    /// Record an evaluation's verdict on a node's incoming changes and
+    /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
+    /// every pending entry when unset.
+    ResolveIncoming {
+        node_id: Uuid,
+        affects: String,
+        note: String,
+        #[serde(default)]
+        action_ids: Option<Vec<i64>>,
+        #[serde(default)]
+        conversation_id: Option<Uuid>,
+    },
+    /// Clear a node's incoming entries with no verdict: they net to nothing.
+    ClearIncoming { node_id: Uuid },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -853,6 +867,30 @@ pub fn execute(
                 evidence,
             )?;
             Ok(json!({ "id": verdict.id, "status": verdict.status }))
+        }
+        InterviewCommand::ResolveIncoming {
+            node_id,
+            affects,
+            note,
+            action_ids,
+            conversation_id,
+        } => {
+            let verdict = crate::incoming::IncomingRepo::new(conn).resolve(
+                *node_id,
+                affects,
+                note,
+                action_ids.as_deref(),
+                *conversation_id,
+            )?;
+            Ok(json!({
+                "id": verdict.id,
+                "affects": verdict.affects,
+                "resolved": verdict.action_ids.len(),
+            }))
+        }
+        InterviewCommand::ClearIncoming { node_id } => {
+            let cleared = crate::incoming::IncomingRepo::new(conn).clear_checked(*node_id)?;
+            Ok(json!({ "cleared": cleared }))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,

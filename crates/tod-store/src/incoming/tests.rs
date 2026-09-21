@@ -300,3 +300,109 @@ fn direct_edits_fan_out_and_ctrl_z_cancels() {
     drop(store);
     let _ = std::fs::remove_dir_all(root_dir);
 }
+
+#[test]
+fn resolving_records_an_append_only_verdict_clears_entries_and_notes_the_baseline() {
+    use crate::lifecycle_baseline::BaselineRepo;
+    let fx = setup();
+    let c = &fx.conn;
+    let root = node(c, fx.list, None, true, Some("design"));
+    let child = node(c, fx.list, Some(root), true, Some("active"));
+    let sibling = node(c, fx.list, Some(root), true, Some("ready"));
+    BaselineRepo::new(c).take(child).unwrap();
+    let (_, m) = create(root, KIND_CONSTRAINT, "All dialogs close on Escape");
+    outline(c, ACTOR_USER, m);
+    let pending: Vec<i64> = IncomingRepo::new(c)
+        .pending(child)
+        .unwrap()
+        .iter()
+        .map(|e| e.action_id)
+        .collect();
+    assert_eq!(pending.len(), 1);
+
+    // Unknown verdicts and empty notes are refused.
+    let bad = InterviewCommand::ResolveIncoming {
+        node_id: child,
+        affects: "maybe".into(),
+        note: "x".into(),
+        action_ids: None,
+        conversation_id: None,
+    };
+    assert!(crate::interview::execute(c, Path::new("."), ACTOR_USER, &bad).is_err());
+
+    let out = run(
+        c,
+        ACTOR_USER,
+        InterviewCommand::ResolveIncoming {
+            node_id: child,
+            affects: "plan".into(),
+            note: "The confirm dialog has no Escape handling.".into(),
+            action_ids: None,
+            conversation_id: None,
+        },
+    );
+    assert_eq!(out["affects"], "plan");
+    let repo = IncomingRepo::new(c);
+    assert!(repo.pending(child).unwrap().is_empty());
+    // Only this node's entries go: the sibling still has its own.
+    assert_eq!(repo.pending(sibling).unwrap().len(), 1);
+    let verdict = repo.latest_verdict(child).unwrap().unwrap();
+    assert_eq!(verdict.affects, AFFECTS_PLAN);
+    assert_eq!(verdict.target(), Some("planning"));
+    assert_eq!(verdict.action_ids, pending);
+    let baseline = BaselineRepo::new(c).get(child).unwrap().unwrap();
+    assert_eq!(baseline.checked_actions, pending);
+
+    // Nothing left to resolve.
+    let again = InterviewCommand::ResolveIncoming {
+        node_id: child,
+        affects: "none".into(),
+        note: "x".into(),
+        action_ids: None,
+        conversation_id: None,
+    };
+    assert!(crate::interview::execute(c, Path::new("."), ACTOR_USER, &again).is_err());
+
+    // A second change and a second verdict: the first stays as history.
+    let (_, m) = create(root, KIND_CONSTRAINT, "Dialogs trap focus");
+    outline(c, ACTOR_USER, m);
+    run(
+        c,
+        ACTOR_USER,
+        InterviewCommand::ResolveIncoming {
+            node_id: child,
+            affects: "none".into(),
+            note: "No dialogs here.".into(),
+            action_ids: None,
+            conversation_id: None,
+        },
+    );
+    let verdicts = IncomingRepo::new(c).verdicts(child).unwrap();
+    assert_eq!(verdicts.len(), 2);
+    assert_eq!(verdicts[0].affects, AFFECTS_PLAN);
+    assert_eq!(verdicts[1].affects, AFFECTS_NONE);
+    assert_eq!(
+        BaselineRepo::new(c).get(child).unwrap().unwrap().checked_actions.len(),
+        2
+    );
+
+    // Entering ready again snapshots how far the verdicts had got.
+    BaselineRepo::new(c).take(child).unwrap();
+    let baseline = BaselineRepo::new(c).get(child).unwrap().unwrap();
+    assert_eq!(baseline.verdicts_through, verdicts[1].id);
+    assert!(baseline.checked_actions.is_empty());
+}
+
+#[test]
+fn clearing_a_node_whose_changes_net_to_nothing_leaves_no_verdict() {
+    let fx = setup();
+    let c = &fx.conn;
+    let root = node(c, fx.list, None, true, Some("design"));
+    let child = node(c, fx.list, Some(root), true, Some("ready"));
+    let (_, m) = create(root, KIND_CONSTRAINT, "Temporary");
+    outline(c, ACTOR_USER, m);
+    let out = run(c, ACTOR_USER, InterviewCommand::ClearIncoming { node_id: child });
+    assert_eq!(out["cleared"], 1);
+    assert!(IncomingRepo::new(c).pending(child).unwrap().is_empty());
+    assert!(IncomingRepo::new(c).verdicts(child).unwrap().is_empty());
+}
