@@ -396,15 +396,19 @@ fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
 /// its own — it just echoes the `forward_state` and criterion ids the
 /// request's `gate_check:` YAML block already carried.
 pub fn mock_gate_check_reply(message: &str) -> String {
+    // The role doc's response format shows the same keys with placeholders
+    // (`{target lifecycle}`, `{uuid}`); only real values count.
     let forward_state = message
         .lines()
-        .find_map(|line| line.trim().strip_prefix("forward_state:"))
+        .filter_map(|line| line.trim().strip_prefix("forward_state:"))
         .map(str::trim)
+        .rfind(|value| !value.is_empty() && !value.starts_with('{'))
         .unwrap_or("");
     let criterion_ids: Vec<&str> = message
         .lines()
         .filter_map(|line| line.trim().strip_prefix("- id:"))
         .map(str::trim)
+        .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .collect();
 
     let mut reply = format!(
@@ -541,6 +545,19 @@ mod tests {
                 ("task-1".to_string(), "Fleet · Fix login".to_string(), 2),
             ]
         );
+    }
+
+    /// The role doc's response format precedes the request's own block with
+    /// placeholders of the same keys; the reply echoes only the real ones.
+    #[test]
+    fn the_mock_gate_reply_skips_the_response_format_placeholders() {
+        let message = "forward_lifecycle: {target lifecycle}\n\
+             forward_state: {target lifecycle}\n\
+             - id: {uuid}\n\
+             gate_check:\n  forward_state: done\n";
+        let reply = mock_gate_check_reply(message);
+        assert!(reply.contains("forward_lifecycle: done\n"), "{reply}");
+        assert!(!reply.contains("gate_results"), "{reply}");
     }
 
     #[test]

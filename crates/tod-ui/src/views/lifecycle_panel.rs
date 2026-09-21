@@ -32,7 +32,7 @@ use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use tod_core::incoming::NodeOutcome;
@@ -687,7 +687,7 @@ impl LifecyclePanelView {
                         .child("No retrospective was recorded."),
                 )
             } else {
-                item.child(div().text_xs().child(selectable_text(
+                item.child(div().text_xs().child(selectable_markdown(
                     format!("lifecycle-panel-learning-{pass}"),
                     content.clone(),
                     window,

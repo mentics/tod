@@ -440,12 +440,18 @@ pub fn mock_turn(
     let state = access.read(|conn| NodeRepo::new(conn).get_lifecycle(node))?;
     if state.as_deref() == Some("learn") {
         let history = access.read(|conn| crate::node_context::render_work_history(conn, node))?;
-        let content = if history.trim().is_empty() {
+        // What went wrong on this pass: the history's own items, and the
+        // line that says why the pass began.
+        let items: Vec<&str> = history
+            .lines()
+            .filter(|line| line.starts_with("- ") || line.starts_with("This pass began"))
+            .collect();
+        let content = if items.is_empty() {
             "Mock retrospective: a clean pass, nothing to improve.".to_string()
         } else {
             format!(
-                "Mock retrospective of this pass. What it went through:\n{}",
-                history.trim()
+                "Mock retrospective of this pass. What it went through:\n\n{}",
+                items.join("\n")
             )
         };
         access.interview(InterviewCommand::RecordLearnOutput {
