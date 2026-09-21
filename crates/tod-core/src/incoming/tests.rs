@@ -311,3 +311,90 @@ fn a_session_that_records_no_verdict_leaves_the_changes_pending() {
     assert!(matches!(outcome(&runner, node), NodeOutcome::Failed(_)));
     assert_eq!(pending(&fx, node), 1);
 }
+
+/// What a gate check waiting on `node` would do after its check.
+fn before_gate(fx: &Fixture, agent: &mut FakeAgent, node: Uuid) -> BeforeGate {
+    assert!(fx
+        .fleet
+        .read(|conn| needs_check_before_gate(conn, node))
+        .unwrap());
+    let runner = run(fx, agent, 1, vec![node]);
+    BeforeGate::from_outcome(&outcome(&runner, node))
+}
+
+#[test]
+fn a_gate_check_proceeds_when_nothing_inherited_affects_the_node() {
+    let fx = fixture();
+    let node = child(&fx, "Quiet", "");
+    constraint(&fx, "All dialogs close on Escape");
+    let mut agent = FakeAgent::new(&fx);
+    let gate = before_gate(&fx, &mut agent, node);
+    assert_eq!(gate, BeforeGate::Proceed);
+    assert_eq!(gate.report(), None);
+    assert_eq!(pending(&fx, node), 0);
+    assert!(!fx.fleet.read(|conn| needs_check_before_gate(conn, node)).unwrap());
+    assert!(fx
+        .fleet
+        .read(|conn| crate::lifecycle_validity::regression(conn, node))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn a_gate_check_reports_the_regression_when_a_change_affects_the_plan() {
+    let fx = fixture();
+    let node = child(&fx, "Planned", "affects plan: the dialog step has no Escape");
+    constraint(&fx, "All dialogs close on Escape");
+    let mut agent = FakeAgent::new(&fx);
+    let gate = before_gate(&fx, &mut agent, node);
+    assert!(matches!(
+        gate,
+        BeforeGate::Regressed { target: "planning", ref affects, .. } if affects == "plan"
+    ));
+    let report = gate.report().unwrap();
+    assert!(report.contains("affects its plan"), "{report}");
+    assert!(report.contains("planning"), "{report}");
+    let found = fx
+        .fleet
+        .read(|conn| crate::lifecycle_validity::regression(conn, node))
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.target, "planning");
+    assert_eq!(found.incoming.as_deref(), Some("plan"));
+    assert!(!found.own);
+    assert!(found.explanation().starts_with("A change it inherits affects its plan"));
+}
+
+#[test]
+fn a_gate_check_proceeds_after_changes_that_net_to_nothing_are_cleared() {
+    let fx = fixture();
+    let node = child(&fx, "Quiet", "");
+    let id = constraint(&fx, "Temporary");
+    outline(&fx, OutlineMutation::DeleteObligation { obligation_id: id });
+    let mut agent = FakeAgent::new(&fx);
+    assert_eq!(before_gate(&fx, &mut agent, node), BeforeGate::Proceed);
+    assert!(agent.turns.is_empty());
+    assert_eq!(pending(&fx, node), 0);
+}
+
+#[test]
+fn a_gate_check_fails_when_the_check_records_no_verdict() {
+    let fx = fixture();
+    let node = child(&fx, "Quiet", "");
+    constraint(&fx, "All dialogs close on Escape");
+    let mut agent = FakeAgent::new(&fx);
+    agent.silent = true;
+    let gate = before_gate(&fx, &mut agent, node);
+    assert!(matches!(gate, BeforeGate::Failed(_)));
+    assert!(gate.report().unwrap().contains("failed"));
+}
+
+#[test]
+fn nodes_before_ready_are_not_checked_before_a_gate() {
+    let fx = fixture();
+    constraint(&fx, "All dialogs close on Escape");
+    assert!(!fx
+        .fleet
+        .read(|conn| needs_check_before_gate(conn, fx.node))
+        .unwrap());
+}

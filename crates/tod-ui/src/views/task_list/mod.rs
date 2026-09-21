@@ -2807,6 +2807,7 @@ impl TaskListView {
     ) -> Option<gpui::AnyElement> {
         use crate::ui::selectable_text::selectable_text;
         use gpui::IntoElement as _;
+        use gpui_component::scroll::ScrollableElement as _;
         use gpui_component::{h_flex, v_flex};
         let check = self.incoming_check.clone()?;
         let check = check.read(cx);
@@ -2856,14 +2857,22 @@ impl TaskListView {
                 cx,
             )));
         }
+        // Tree order (`IncomingCheck`), capped so a large check scrolls
+        // instead of pushing the tree off screen.
+        let mut list = v_flex()
+            .id("incoming-check-results")
+            .gap(crate::ui::style::space::HAIRLINE)
+            .max_h(crate::ui::style::size::SUMMARY_LIST_MAX)
+            .overflow_y_scrollbar();
         for (i, line) in lines.into_iter().enumerate() {
-            card = card.child(div().text_xs().child(selectable_text(
+            list = list.child(div().text_xs().child(selectable_text(
                 format!("incoming-check-result-{i}"),
                 format!("* {line}"),
                 window,
                 cx,
             )));
         }
+        card = card.child(list);
         let offer_move = !affected.is_empty() && moved.is_none();
         if let Some(moved) = moved {
             card = card.child(div().text_xs().text_color(muted).child(selectable_text(

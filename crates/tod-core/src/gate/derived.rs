@@ -133,7 +133,7 @@ fn requirements_traceable_outcome(conn: &Connection, node_id: Uuid) -> Result<De
         });
     }
     Ok(fail(format!(
-        "{} of {} requirements have no plan step satisfying them: {}. Add or extend plan          steps to cover them.",
+        "{} of {} requirements have no plan step satisfying them: {}. Add or extend plan steps to cover them.",
         unplanned.len(),
         requirements.len(),
         unplanned.join("; ")

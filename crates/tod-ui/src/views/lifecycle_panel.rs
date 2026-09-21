@@ -686,7 +686,7 @@ impl LifecyclePanelView {
         } else if check.is_running() {
             let (done, total) = check.progress().unwrap_or_default();
             section = section.child(div().text_xs().text_color(muted).child(format!(
-                "Another incoming-changes check is running ({done} of {total});                  Check now is available when it finishes."
+                "Another incoming-changes check is running ({done} of {total}); Check now is available when it finishes."
             )));
         } else {
             if let Some(failed) = check.results().iter().find(|r| {
@@ -1120,10 +1120,7 @@ impl Render for LifecyclePanelView {
                         "This node is no longer {} — move it back to {}",
                         self.lifecycle, found.target
                     )))
-                    .child(div().child(
-                        "Its obligations, plan, or verification changed since it got here. \
-                         Reverse those changes, or move it back and take it forward again",
-                    ));
+                    .child(div().child(found.explanation()));
                 for (i, reason) in found.reasons.iter().enumerate() {
                     callout = callout.child(selectable_text(
                         format!("lifecycle-panel-regression-{i}"),

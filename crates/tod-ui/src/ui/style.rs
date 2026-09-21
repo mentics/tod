@@ -112,6 +112,7 @@ pub mod size {
 
     pub const BORDER: Pixels = px(1.);
     pub const PANE_MIN: Pixels = px(320.);
+    pub const SUMMARY_LIST_MAX: Pixels = px(240.);
 }
 
 /// `tokens.radius`.

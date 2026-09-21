@@ -380,6 +380,8 @@ tokens:
     control-small: 24px
     control-xsmall: 20px
     pane-min: 320px
+    # Tallest a summary card's list grows before it scrolls.
+    summary-list-max: 240px
     toast-min: 240px
     toast-max: 480px
     toast-narrow-min: 280px

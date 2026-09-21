@@ -55,6 +55,33 @@ pub struct Regression {
     pub target: &'static str,
     /// Why, one line per item, earliest-state findings first.
     pub reasons: Vec<String>,
+    /// What the latest unacted incoming-changes verdict says it affects
+    /// (`plan` / `obligations`), when that verdict is among the findings.
+    pub incoming: Option<String>,
+    /// Whether any finding comes from the node's own obligations, plan, or
+    /// verification rather than from what it inherits.
+    pub own: bool,
+}
+
+impl Regression {
+    /// One sentence saying why, fitted to the cause: an inherited change, the
+    /// node's own work, or both.
+    pub fn explanation(&self) -> String {
+        match (&self.incoming, self.own) {
+            (Some(affects), false) => format!(
+                "A change it inherits affects its {affects}. \
+                 Move it back and take it forward again"
+            ),
+            (Some(affects), true) => format!(
+                "A change it inherits affects its {affects}, and its own obligations, plan, \
+                 or verification changed since it got here. \
+                 Move it back and take it forward again"
+            ),
+            (None, _) => "Its obligations, plan, or verification changed since it got here. \
+                          Reverse those changes, or move it back and take it forward again"
+                .to_string(),
+        }
+    }
 }
 
 /// Whether `node_id`'s current lifecycle state still holds. `None` when it
@@ -68,6 +95,7 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
         return Ok(None);
     }
     let mut findings: Vec<(&'static str, String)> = Vec::new();
+    let mut incoming = None;
     let baseline = BaselineRepo::new(conn).get(node_id)?;
 
     if let Some(verdict) = IncomingRepo::new(conn).latest_verdict(node_id)? {
@@ -75,6 +103,7 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
             .as_ref()
             .is_some_and(|b| b.verdicts_through >= verdict.id);
         if let (Some(target), false) = (verdict.target(), acted_on) {
+            incoming = Some(verdict.affects.clone());
             let changes = crate::incoming::verdict_changes(conn, &verdict)?;
             let what = if changes.is_empty() {
                 "Incoming changes".to_string()
@@ -92,7 +121,7 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
         }
     }
     if rank > lifecycle_rank("approved") {
-        return Ok(finish(findings));
+        return Ok(finish(findings, incoming));
     }
 
     let obligations = ObligationRepo::new(conn).list_for_node(node_id)?;
@@ -202,11 +231,15 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
         }
     }
 
-    Ok(finish(findings))
+    Ok(finish(findings, incoming))
 }
 
 /// The earliest target among `findings`, with every reason, earliest first.
-fn finish(mut findings: Vec<(&'static str, String)>) -> Option<Regression> {
+fn finish(
+    mut findings: Vec<(&'static str, String)>,
+    incoming: Option<String>,
+) -> Option<Regression> {
+    let own = findings.len() > usize::from(incoming.is_some());
     let target = findings
         .iter()
         .map(|(target, _)| *target)
@@ -215,6 +248,8 @@ fn finish(mut findings: Vec<(&'static str, String)>) -> Option<Regression> {
     Some(Regression {
         target,
         reasons: findings.into_iter().map(|(_, reason)| reason).collect(),
+        incoming,
+        own,
     })
 }
 

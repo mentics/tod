@@ -201,6 +201,64 @@ pub fn opening_message(
     build_message(media, &INCOMING_CHANGES, None, &ctx, "")
 }
 
+/// Whether a gate check on `node` must first check it against its incoming
+/// changes (`doc/conversation/incoming-changes.md` §5, "Before a gate
+/// check"): it is at `ready` or later and has pending entries.
+pub fn needs_check_before_gate(conn: &Connection, node: Uuid) -> Result<bool> {
+    let Some(state) = NodeRepo::new(conn).get_lifecycle(node)? else {
+        return Ok(false);
+    };
+    if crate::task::model::lifecycle_rank(&state) < crate::task::model::lifecycle_rank("ready") {
+        return Ok(false);
+    }
+    Ok(!IncomingRepo::new(conn).pending(node)?.is_empty())
+}
+
+/// What a node's incoming-changes check means for the gate check waiting
+/// on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeforeGate {
+    /// Nothing inherited affects it: run the gate check.
+    Proceed,
+    /// A change it inherits sends it back: the gate check reports this
+    /// instead of passing.
+    Regressed { affects: String, target: &'static str, note: String },
+    /// No verdict: the gate check fails with this reason.
+    Failed(String),
+}
+
+impl BeforeGate {
+    pub fn from_outcome(outcome: &NodeOutcome) -> Self {
+        match outcome {
+            NodeOutcome::Cleared | NodeOutcome::Verdict { target: None, .. } => Self::Proceed,
+            NodeOutcome::Verdict {
+                affects,
+                note,
+                target: Some(target),
+            } => Self::Regressed {
+                affects: affects.clone(),
+                target,
+                note: note.clone(),
+            },
+            NodeOutcome::Failed(err) => Self::Failed(err.clone()),
+        }
+    }
+
+    /// The gate check's report when it does not go ahead.
+    pub fn report(&self) -> Option<String> {
+        match self {
+            Self::Proceed => None,
+            Self::Regressed { affects, target, note } => Some(format!(
+                "Gate check not run: a change it inherits affects its {affects}. \
+                 Move it back to {target} and take it forward again. Note: {note}"
+            )),
+            Self::Failed(err) => Some(format!(
+                "Gate check not run: checking its incoming changes failed — {err}"
+            )),
+        }
+    }
+}
+
 /// How one node's check ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeOutcome {

@@ -161,7 +161,8 @@ impl ConversationView {
         let open_is = |protocol| self.data.protocol == protocol && self.status.running;
 
         let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck);
+        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
+            || self.checking_incoming(snapshot.node, cx);
         let mut gate_offered = next.is_some();
         match snapshot.lifecycle.as_str() {
             "active" => match snapshot.plan {
@@ -330,7 +331,8 @@ impl ConversationView {
         let task_id = snapshot.node.to_string();
         let empty = GateCheckState::default();
         let gate = self.lifecycle.read(cx).state(&task_id).unwrap_or(&empty);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck);
+        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
+            || self.checking_incoming(snapshot.node, cx);
         // A gate check recorded earlier says nothing once the work has moved
         // on: after a verification that failed steps, or a review with open
         // findings, its "all criteria satisfied" would be wrong.
@@ -421,7 +423,15 @@ impl ConversationView {
     /// The gate check: the criteria the app answers itself are answered and
     /// shown at once; an agent conversation starts only when something is left
     /// for it to judge.
-    fn check_gate(&mut self, node: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// A node with pending incoming changes has them checked first
+    /// (`views::incoming_check`); the shell calls this again when they turn
+    /// out to affect nothing.
+    pub fn check_gate(&mut self, node: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.gate_check_waits(Focus::Node(node), ProtocolKind::GateCheck, cx) {
+            cx.notify();
+            return;
+        }
         match settle_derived_criteria(&self.fleet, node) {
             Ok(false) => {
                 let task_id = node.to_string();

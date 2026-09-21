@@ -31,7 +31,7 @@ use crate::ui::status::{self, StatusSource};
 use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
-use crate::views::incoming_check::IncomingCheck;
+use crate::views::incoming_check::{IncomingCheck, IncomingCheckEvent};
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
 use crate::views::obligations::{ObligationsEvent, ObligationsView};
@@ -128,6 +128,8 @@ pub struct Shell {
     /// The conversation's context panel asked to show a node (and maybe an
     /// obligation) in the Tasks view.
     pending_go_to_tasks: Option<(Uuid, Option<Uuid>)>,
+    /// A gate check that waited on the node's incoming changes may run now.
+    pending_gate_check: Option<Uuid>,
     pending_open_lifecycle: Option<PendingOpenLifecycle>,
     pending_return_to_tasks: bool,
     /// Drawer changes queued by event handlers, applied in order on render.
@@ -152,6 +154,7 @@ pub struct Shell {
     _sessions_subscription: Subscription,
     _conversation_subscription: Subscription,
     _settings_subscription: Subscription,
+    _incoming_check_subscription: Subscription,
 }
 
 /// Where "open" goes for a node in `lifecycle`: `proposed` and `design` nodes
@@ -617,6 +620,11 @@ impl Shell {
         if std::mem::take(&mut self.pending_leave_conversation) {
             let view = self.view_before_conversation;
             self.select_view(view, window, cx);
+        }
+        if let Some(node) = self.pending_gate_check.take() {
+            self.select_view(ShellView::Conversation, window, cx);
+            self.conversation
+                .update(cx, |conversation, cx| conversation.check_gate(node, window, cx));
         }
         if let Some((node_id, obligation_id)) = self.pending_go_to_tasks.take() {
             self.go_to_tasks(node_id, obligation_id, window, cx);
@@ -1346,7 +1354,7 @@ fn transcript_format_message(notice: &run_transcript::FormatNotice) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "{}'s transcript format has changed: {problems}.          Transcripts were read as far as possible; the reader needs updating.",
+        "{}'s transcript format has changed: {problems}. Transcripts were read as far as possible; the reader needs updating.",
         notice.platform.label()
     )
 }
@@ -1573,6 +1581,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 fleet.clone(),
                                 lifecycle.clone(),
                             )
+                        });
+                        conversation.update(cx, |conversation, cx| {
+                            conversation.bind_incoming_check(incoming_check.clone(), cx)
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
@@ -1871,6 +1882,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
+                            let _incoming_check_subscription = cx.subscribe(
+                                &incoming_check,
+                                |this: &mut Shell, _, event, cx| match event {
+                                    IncomingCheckEvent::GateReady(node) => {
+                                        this.pending_gate_check = Some(*node);
+                                        cx.notify();
+                                    }
+                                },
+                            );
                             let _settings_subscription = cx.subscribe(
                                 &settings,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -1913,6 +1933,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_conversation: None,
                                 pending_on_entry: None,
                                 pending_go_to_tasks: None,
+                                pending_gate_check: None,
                                 pending_leave_conversation: false,
                                 pending_open_lifecycle: None,
                                 pending_return_to_tasks: false,
@@ -1934,6 +1955,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _sessions_subscription,
                                 _conversation_subscription,
                                 _settings_subscription,
+                                _incoming_check_subscription,
                             };
                             let status_hub = status::hub(cx);
                             cx.observe(&status_hub, |_, _, cx| cx.notify()).detach();
