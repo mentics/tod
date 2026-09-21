@@ -102,6 +102,17 @@ A migration builds the table from existing obligation text.
 Ancestor edges are not stored. The subtree comes from the recursive query in
 `subtree_node_ids`.
 
+How it is kept (`tod_store::outline::references`): deletes cascade through
+foreign keys, a trigger moves an edge's `from_node_id` with its obligation,
+and triggers mark an obligation dirty when its text changes or a node appears
+whose slug its text may name (so a reference written before its node existed
+gains its edge). `OutlineMutation::execute` re-resolves the dirty ones before
+it returns, in the mutation's transaction, whichever path made the change.
+Slugs never change today; if they do, edges keep pointing at the node by id.
+
+A node that both descends from a changed constraint's node and references it
+gets one queue row (the key is node and action), marked `ancestor`.
+
 ## 4. The incoming queue
 
 ```sql

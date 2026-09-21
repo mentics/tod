@@ -66,6 +66,132 @@ pub fn subtree_node_ids(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
     Ok(rows)
 }
 
+/// Reference edges (`doc/conversation/incoming-changes.md` §3): one row per
+/// obligation per node its `[[slug]]`s resolve to. Deletes cascade (an
+/// obligation or a referenced node going away drops its edges), a trigger
+/// follows an obligation moved to another node, and other triggers mark an
+/// obligation dirty when its text changes or a node appears whose slug it may
+/// name. [`sync_reference_edges`] re-resolves the dirty ones; it runs at the end
+/// of every `OutlineMutation::execute`, in the mutation's transaction, so the
+/// edges are maintained whichever writer changed the rows.
+///
+/// A node's slug never changes today; if it ever does, edges keep pointing at
+/// the node by id (the `[[old-slug]]` text is reported broken), and
+/// obligations naming the new slug gain edges.
+pub const CREATE_NODE_REFERENCES: &str = "
+    CREATE TABLE IF NOT EXISTS node_references (
+        obligation_id  BLOB NOT NULL REFERENCES node_obligations(id) ON DELETE CASCADE,
+        from_node_id   BLOB NOT NULL,
+        to_node_id     BLOB NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+        PRIMARY KEY (obligation_id, to_node_id)
+    );
+    CREATE INDEX IF NOT EXISTS node_references_to ON node_references(to_node_id);
+    CREATE TABLE IF NOT EXISTS node_references_dirty (
+        obligation_id  BLOB PRIMARY KEY NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS node_references_obligation_insert
+    AFTER INSERT ON node_obligations WHEN instr(NEW.body, '[[') > 0
+    BEGIN
+        INSERT OR IGNORE INTO node_references_dirty (obligation_id) VALUES (NEW.id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS node_references_obligation_body
+    AFTER UPDATE OF body ON node_obligations
+    WHEN instr(NEW.body, '[[') > 0 OR instr(OLD.body, '[[') > 0
+    BEGIN
+        INSERT OR IGNORE INTO node_references_dirty (obligation_id) VALUES (NEW.id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS node_references_obligation_move
+    AFTER UPDATE OF node_id ON node_obligations
+    BEGIN
+        UPDATE node_references SET from_node_id = NEW.node_id WHERE obligation_id = NEW.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS node_references_node_insert
+    AFTER INSERT ON nodes
+    BEGIN
+        INSERT OR IGNORE INTO node_references_dirty (obligation_id)
+        SELECT id FROM node_obligations
+        WHERE instr(body, '[[') > 0 AND instr(lower(body), lower(NEW.slug)) > 0;
+    END;
+    CREATE TRIGGER IF NOT EXISTS node_references_node_slug
+    AFTER UPDATE OF slug ON nodes
+    BEGIN
+        INSERT OR IGNORE INTO node_references_dirty (obligation_id)
+        SELECT id FROM node_obligations
+        WHERE instr(body, '[[') > 0 AND instr(lower(body), lower(NEW.slug)) > 0;
+    END;
+";
+
+/// Re-resolve every dirty obligation's `[[slug]]`s into edges (unresolved
+/// slugs get none) and clear the dirty marks.
+pub fn sync_reference_edges(conn: &Connection) -> Result<()> {
+    let dirty: Vec<Vec<u8>> = conn
+        .prepare("SELECT obligation_id FROM node_references_dirty")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    for id in &dirty {
+        conn.execute("DELETE FROM node_references WHERE obligation_id = ?1", [id])?;
+        let row: Option<(Vec<u8>, String)> = conn
+            .prepare("SELECT node_id, body FROM node_obligations WHERE id = ?1")?
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .next()
+            .transpose()?;
+        let Some((from, body)) = row else { continue };
+        for slug in referenced_slugs(&body) {
+            conn.execute(
+                "INSERT OR IGNORE INTO node_references (obligation_id, from_node_id, to_node_id)
+                 SELECT ?1, ?2, id FROM nodes WHERE lower(slug) = lower(?3)",
+                params![id, from, slug],
+            )?;
+        }
+    }
+    conn.execute("DELETE FROM node_references_dirty", [])?;
+    Ok(())
+}
+
+/// Build the edges from every existing obligation's text (the migration).
+pub fn backfill_reference_edges(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO node_references_dirty (obligation_id)
+         SELECT id FROM node_obligations WHERE instr(body, '[[') > 0",
+        [],
+    )?;
+    sync_reference_edges(conn)
+}
+
+/// Nodes with an obligation referencing `node_id`, other than itself.
+pub fn referrer_node_ids(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT from_node_id FROM node_references
+         WHERE to_node_id = ?1 AND from_node_id <> ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![uuid_to_blob(node_id)], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            blob_to_uuid_sql(&blob)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Nodes `node_id`'s obligations reference, other than itself, in no
+/// particular order.
+pub fn referenced_node_ids(conn: &Connection, node_id: Uuid) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT to_node_id FROM node_references
+         WHERE from_node_id = ?1 AND to_node_id <> ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![uuid_to_blob(node_id)], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            blob_to_uuid_sql(&blob)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Broken `[[slug]]` references in obligations, on one subtree or everywhere.
 pub fn broken_references(conn: &Connection, scope: Option<Uuid>) -> Result<Vec<BrokenReference>> {
     let nodes = scope.map(|n| subtree_node_ids(conn, n)).transpose()?;

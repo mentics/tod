@@ -406,3 +406,236 @@ fn clearing_a_node_whose_changes_net_to_nothing_leaves_no_verdict() {
     assert!(IncomingRepo::new(c).pending(child).unwrap().is_empty());
     assert!(IncomingRepo::new(c).verdicts(child).unwrap().is_empty());
 }
+
+fn slug_of(conn: &Connection, id: Uuid) -> String {
+    NodeRepo::new(conn).get(id).unwrap().unwrap().slug
+}
+
+/// (obligation, from, to) edges, sorted.
+fn edges(conn: &Connection) -> Vec<(Uuid, Uuid, Uuid)> {
+    let mut out: Vec<(Uuid, Uuid, Uuid)> = conn
+        .prepare("SELECT obligation_id, from_node_id, to_node_id FROM node_references")
+        .unwrap()
+        .query_map([], |r| {
+            let (a, b, c): (Vec<u8>, Vec<u8>, Vec<u8>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            Ok((
+                blob_to_uuid_sql(&a)?,
+                blob_to_uuid_sql(&b)?,
+                blob_to_uuid_sql(&c)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    out.sort();
+    out
+}
+
+fn sorted_edges(mut v: Vec<(Uuid, Uuid, Uuid)>) -> Vec<(Uuid, Uuid, Uuid)> {
+    v.sort();
+    v
+}
+
+fn reword(conn: &Connection, id: Uuid, body: &str) {
+    outline(
+        conn,
+        ACTOR_USER,
+        M::UpdateObligationBody {
+            obligation_id: id,
+            body: body.into(),
+        },
+    );
+}
+
+/// Write an obligation row directly: the agent path refuses unknown slugs,
+/// the store itself does not.
+fn raw_obligation(conn: &Connection, node: Uuid, body: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    conn.execute(
+        "INSERT INTO node_obligations (id, node_id, kind, ordinal, body, created_at, updated_at, phase)
+         VALUES (?1, ?2, 'requirement', 0, ?3, 0, 0, 'requirements')",
+        params![uuid_to_blob(id), uuid_to_blob(node), body],
+    )
+    .unwrap();
+    id
+}
+
+#[test]
+fn reference_edges_follow_obligation_and_node_changes() {
+    let fx = setup();
+    let c = &fx.conn;
+    let comp = node(c, fx.list, None, true, None);
+    let other = node(c, fx.list, None, true, None);
+    let user = node(c, fx.list, None, true, None);
+    let elsewhere = node(c, fx.list, None, true, None);
+    let (cs, os) = (slug_of(c, comp), slug_of(c, other));
+
+    // Create: one edge per resolved slug, case-insensitively.
+    let text = format!("Uses [[{}]] and [[{}]]", cs.to_uppercase(), os);
+    let (ob, m) = create(user, KIND_REQUIREMENT, &text);
+    outline(c, ACTOR_USER, m);
+    assert_eq!(
+        edges(c),
+        sorted_edges(vec![(ob, user, comp), (ob, user, other)])
+    );
+
+    // Reword: the obligation's edges are replaced.
+    reword(c, ob, &format!("Uses [[{cs}]] only"));
+    assert_eq!(edges(c), vec![(ob, user, comp)]);
+
+    // Move to another node: the edge follows.
+    outline(
+        c,
+        ACTOR_USER,
+        M::MoveObligation {
+            obligation_id: ob,
+            target_node_id: elsewhere,
+        },
+    );
+    assert_eq!(edges(c), vec![(ob, elsewhere, comp)]);
+
+    // Delete the obligation: its edges go.
+    outline(c, ACTOR_USER, M::DeleteObligation { obligation_id: ob });
+    assert!(edges(c).is_empty());
+
+    // Delete the referenced node: edges to it go.
+    let (ob2, m) = create(user, KIND_REQUIREMENT, &format!("Uses [[{os}]]"));
+    outline(c, ACTOR_USER, m);
+    assert_eq!(edges(c), vec![(ob2, user, other)]);
+    outline(c, ACTOR_USER, M::DeleteNode { node_id: other });
+    assert!(edges(c).is_empty());
+
+    // Delete the referencing node: its obligations' edges go.
+    let (ob3, m) = create(user, KIND_REQUIREMENT, &format!("Uses [[{cs}]]"));
+    outline(c, ACTOR_USER, m);
+    assert_eq!(edges(c), vec![(ob3, user, comp)]);
+    outline(c, ACTOR_USER, M::DeleteNode { node_id: user });
+    assert!(edges(c).is_empty());
+}
+
+#[test]
+fn an_unresolved_reference_gains_its_edge_when_the_node_appears() {
+    let fx = setup();
+    let c = &fx.conn;
+    let user = node(c, fx.list, None, true, None);
+    let ob = raw_obligation(c, user, "Uses [[future-form]]");
+    crate::outline::references::sync_reference_edges(c).unwrap();
+    assert!(edges(c).is_empty());
+
+    let future = Uuid::new_v4();
+    NodeRepo::new(c)
+        .create_with_id(future, "Future-Form", "Future form")
+        .unwrap();
+    crate::outline::references::sync_reference_edges(c).unwrap();
+    assert_eq!(edges(c), vec![(ob, user, future)]);
+}
+
+#[test]
+fn migration_backfills_reference_edges() {
+    let fx = setup();
+    let c = &fx.conn;
+    let comp = node(c, fx.list, None, true, None);
+    let user = node(c, fx.list, None, true, None);
+    // Wind back to v53 without the table, as a store written before v54.
+    c.execute_batch(
+        "DROP TRIGGER node_references_obligation_insert;
+         DROP TRIGGER node_references_obligation_body;
+         DROP TRIGGER node_references_obligation_move;
+         DROP TRIGGER node_references_node_insert;
+         DROP TRIGGER node_references_node_slug;
+         DROP TABLE node_references;
+         DROP TABLE node_references_dirty;
+         PRAGMA user_version = 53;",
+    )
+    .unwrap();
+    let text = format!("Uses [[{}]] and [[missing]]", slug_of(c, comp));
+    let ob = raw_obligation(c, user, &text);
+    let _plain = raw_obligation(c, comp, "No references here");
+    schema::apply_migrations(c).unwrap();
+    assert_eq!(edges(c), vec![(ob, user, comp)]);
+}
+
+#[test]
+fn component_changes_fan_out_to_committed_referrers() {
+    let fx = setup();
+    let c = &fx.conn;
+    let comp = node(c, fx.list, None, true, Some("approved"));
+    let cs = slug_of(c, comp);
+    let referrer = node(c, fx.list, None, true, Some("ready"));
+    let early = node(c, fx.list, None, true, Some("design"));
+    let child = node(c, fx.list, Some(comp), true, Some("active"));
+    for n in [comp, referrer, early, child] {
+        let (_, m) = create(n, KIND_REQUIREMENT, &format!("Renders a [[{cs}]]"));
+        outline(c, ACTOR_USER, m);
+    }
+    // Referencing a component is not a change to it.
+    assert!(queued(c).is_empty());
+
+    // Any kind of obligation on the component reaches its committed
+    // referrers, never the component itself (which references itself here).
+    let (req, m) = create(comp, KIND_REQUIREMENT, "Fields validate on blur");
+    outline(c, ACTOR_USER, m);
+    assert_eq!(queued(c), sorted(vec![referrer, child]));
+    let entry = &IncomingRepo::new(c).pending(referrer).unwrap()[0];
+    assert_eq!((entry.via, entry.source_node), (Via::Reference, comp));
+    IncomingRepo::new(c).clear(child).unwrap();
+
+    // A constraint reaches the child both ways: it keeps the ancestor row.
+    let (_, m) = create(comp, KIND_CONSTRAINT, "Labels sit above fields");
+    outline(c, ACTOR_USER, m);
+    let child_entries = IncomingRepo::new(c).pending(child).unwrap();
+    assert_eq!(child_entries.len(), 1);
+    assert_eq!(child_entries[0].via, Via::Ancestor);
+
+    // Reword and delete fan out too; a section-only change does not.
+    reword(c, req, "Fields validate on submit");
+    outline(
+        c,
+        ACTOR_USER,
+        M::UpdateObligationSection {
+            obligation_id: req,
+            section: Some("Validation".into()),
+        },
+    );
+    outline(c, ACTOR_USER, M::DeleteObligation { obligation_id: req });
+    assert_eq!(IncomingRepo::new(c).pending(referrer).unwrap().len(), 4);
+    assert!(IncomingRepo::new(c).pending(early).unwrap().is_empty());
+    assert!(IncomingRepo::new(c).pending(comp).unwrap().is_empty());
+}
+
+#[test]
+fn reversing_a_component_change_cancels_its_reference_entries() {
+    let fx = setup();
+    let c = &fx.conn;
+    let comp = node(c, fx.list, None, true, None);
+    let referrer = node(c, fx.list, None, true, Some("review"));
+    let text = format!("Uses [[{}]]", slug_of(c, comp));
+    let (_, m) = create(referrer, KIND_REQUIREMENT, &text);
+    outline(c, ACTOR_USER, m);
+    let conv = ConversationRepo::new(c)
+        .create(
+            Focus::Node(comp),
+            ProtocolKind::Outline,
+            Some("claude"),
+            None,
+            None,
+        )
+        .unwrap()
+        .id;
+    let (_, m) = create(comp, KIND_REQUIREMENT, "one");
+    outline(c, &actor_for(conv), m);
+    let entries = IncomingRepo::new(c).pending(referrer).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].via, Via::Reference);
+    run(
+        c,
+        ACTOR_USER,
+        InterviewCommand::ReverseConversationActions {
+            conversation_id: conv,
+            action_ids: vec![entries[0].action_id],
+            include_dependents: false,
+            force: false,
+        },
+    );
+    assert!(queued(c).is_empty());
+}

@@ -9,7 +9,7 @@
 
 use crate::conversation::{ConversationRepo, Entity, EntitySnapshot, NetOp};
 use crate::outline::KIND_CONSTRAINT;
-use crate::outline::references::subtree_node_ids;
+use crate::outline::references::{referrer_node_ids, subtree_node_ids};
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid, blob_to_uuid_sql, uuid_to_blob};
 use anyhow::Result;
@@ -84,10 +84,11 @@ pub struct PendingChange {
     pub action_ids: Vec<i64>,
 }
 
-/// Queue action `action_id` for every node it could affect. Only
-/// constraint-kind obligations on a Spec node fan out (added, reworded,
-/// re-kinded to or from constraint, deleted), to each strict Spec
-/// descendant in `ready` or later.
+/// Queue action `action_id` for every node it could affect (§2): a
+/// constraint-kind obligation on a Spec node (added, reworded, re-kinded to or
+/// from constraint, deleted) reaches each strict Spec descendant, and any
+/// obligation change on a node reaches every node with a `[[slug]]` reference
+/// edge to it. Targets are filtered to Spec nodes in `ready` or later.
 pub(crate) fn fan_out(
     conn: &Connection,
     action_id: i64,
@@ -124,23 +125,52 @@ pub(crate) fn fan_out(
             continue;
         }
         for target in subtree_node_ids(conn, source)? {
-            if target == source || !committed_spec(conn, target)? {
-                continue;
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO incoming_changes
-                 (node_id, action_id, via, source_node, queued_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    uuid_to_blob(target),
-                    action_id,
-                    Via::Ancestor.as_str(),
-                    uuid_to_blob(source),
-                    now
-                ],
-            )?;
+            enqueue(conn, target, action_id, Via::Ancestor, source, now)?;
         }
     }
+    // Any obligation change on a component reaches the nodes that reference
+    // it. Ancestor rows went in first, and the queue keys on (node, action),
+    // so a node that both descends from and references the source keeps its
+    // `ancestor` row.
+    let mut components = Vec::new();
+    for (node, _, _) in [&b, &a].into_iter().flatten() {
+        if !components.contains(node) {
+            components.push(*node);
+        }
+    }
+    for source in components {
+        for target in referrer_node_ids(conn, source)? {
+            enqueue(conn, target, action_id, Via::Reference, source, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// Queue one entry, if `target` passes the filter (§2): not the source
+/// itself, Spec, `ready` or later.
+fn enqueue(
+    conn: &Connection,
+    target: Uuid,
+    action_id: i64,
+    via: Via,
+    source: Uuid,
+    now: i64,
+) -> Result<()> {
+    if target == source || !committed_spec(conn, target)? {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO incoming_changes
+         (node_id, action_id, via, source_node, queued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            uuid_to_blob(target),
+            action_id,
+            via.as_str(),
+            uuid_to_blob(source),
+            now
+        ],
+    )?;
     Ok(())
 }
 

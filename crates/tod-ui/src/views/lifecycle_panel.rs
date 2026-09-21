@@ -118,7 +118,8 @@ enum ActiveControl {
 /// One net pending incoming change, as the panel shows it.
 #[derive(Clone, Debug, PartialEq)]
 struct IncomingRow {
-    /// E.g. "Constraint added on Parent (ancestor)".
+    /// E.g. "Constraint added on Parent (via ancestor)" or "Requirement
+    /// changed on Card field (via reference)".
     headline: String,
     before: Option<String>,
     after: Option<String>,
@@ -145,9 +146,19 @@ impl IncomingRow {
             NetOp::Reversed => "reversed",
             NetOp::Edited => "changed",
         };
-        let what = match change.entity {
-            tod_store::conversation::Entity::Obligation => "Constraint",
-            _ => "Item",
+        // An ancestor's change is always a constraint; a component's may be
+        // any obligation.
+        let kind = [&change.after, &change.before]
+            .into_iter()
+            .find_map(|s| match s {
+                Some(EntitySnapshot::Obligation { kind, .. }) => Some(kind.as_str()),
+                _ => None,
+            });
+        let what = match kind {
+            Some(tod_store::outline::KIND_CONSTRAINT) => "Constraint",
+            Some(tod_store::outline::KIND_REQUIREMENT) => "Requirement",
+            Some(_) => "Obligation",
+            None => "Item",
         };
         Self {
             headline: format!("{what} {op} on {source} (via {})", change.via.as_str()),

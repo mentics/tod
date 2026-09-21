@@ -49,7 +49,11 @@ fn main() -> anyhow::Result<()> {
     let feature = make("Payment form", Some(project))?;
     let sub = make("Card validation", Some(feature))?;
     let _draft = make("Receipt email", Some(project))?;
-    let _other = make("Unrelated project", None)?;
+    let other = make("Unrelated project", None)?;
+    // A component used by reference: "Saved cards" is not under "Card
+    // field", only names it with `[[slug]]` (§3).
+    let component = make("Card field", Some(other))?;
+    let saved = make("Saved cards", None)?;
     // What `--agent mock` concludes when these nodes are checked against
     // their incoming changes (`affects none|plan|obligations: <note>`).
     for (node, details) in [
@@ -96,6 +100,41 @@ fn main() -> anyhow::Result<()> {
             rusqlite::params![node.as_bytes().to_vec(), state],
         )?;
     }
+
+    let obligation = |node: Uuid, kind: &str, body: &str| -> anyhow::Result<Uuid> {
+        let id = Uuid::new_v4();
+        store.enqueue_outline(M::CreateObligation {
+            obligation_id: Some(id),
+            node_id: node,
+            kind: kind.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: body.into(),
+            phase: "requirements".into(),
+        })?;
+        store.writer().flush()?;
+        Ok(id)
+    };
+    let slug = store
+        .get_node(&component.to_string())?
+        .expect("component")
+        .slug;
+    obligation(
+        component,
+        tod_store::outline::KIND_REQUIREMENT,
+        "Shows the card brand and the last four digits",
+    )?;
+    obligation(
+        saved,
+        tod_store::outline::KIND_REQUIREMENT,
+        &format!("Lists each saved card as a [[{slug}]]"),
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO node_lifecycle (node_id, state, updated_at) VALUES (?1, 'approved', 0)",
+        rusqlite::params![saved.as_bytes().to_vec()],
+    )?;
+    println!("component slug: {slug} (id {component})");
 
     constraint("Every page loads in under 1 second on 3G")?;
     store.enqueue_outline(M::UpdateObligationBody {
