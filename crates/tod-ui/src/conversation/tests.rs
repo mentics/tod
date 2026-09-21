@@ -1834,7 +1834,8 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
     press_lifecycle(&view, "Gate check → active", cx);
 
-    let waive = lifecycle_notices(&view, cx)
+    let waive = view
+        .read_with(cx, |view, cx| view.gate_notices(cx))
         .into_iter()
         .filter_map(|n| n.action)
         .collect::<Vec<_>>();

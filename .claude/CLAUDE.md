@@ -99,9 +99,10 @@ in the title bar (`render_shortcut_pill_in_context(.., &OpenAgentChat, None, ..)
 the app nav's "Conversation" opens it on the project.
 
 On a node with the Lifecycle capability, the step that moves it along —
-Implement, Verify, Review, the gate check, Advance — sits beside Send, with the gate
-check's status and a Waive per failing criterion above the input
-(`conversation/lifecycle.rs`). Gate checks, waiving, advancing, and on-entry
+Implement, Verify, Review, the gate check, Advance — sits beside Send
+(`conversation/lifecycle.rs`). The gate check's verdict, with a Waive per
+failing criterion, sits in the side pane beneath the list the node's state is
+about (obligations, plan, or findings), never above the input. Gate checks, waiving, advancing, and on-entry
 turns run in `views::lifecycle_control::LifecycleController`, one entity the
 shell shares between the conversation view and the lifecycle panel, so a
 check started in either shows in both. The manual escape hatches (force

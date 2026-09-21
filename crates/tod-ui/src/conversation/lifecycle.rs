@@ -3,8 +3,8 @@
 //! the user never has to go to the lifecycle panel to take it. The gate
 //! check's state lives in the shared [`LifecycleController`], so a check
 //! started here shows in the lifecycle panel too, and the other way round;
-//! its status lines, and a Waive on each failing criterion, sit above the
-//! input.
+//! its verdict, and a Waive on each failing criterion, sit in the side pane
+//! ([`ConversationView::gate_notices`]).
 //!
 //! Only the forward path is here. The manual escape hatches (force advance,
 //! revert, open interview) stay in the lifecycle panel — except "Fix failed"
@@ -141,8 +141,9 @@ impl ConversationView {
         })
     }
 
-    /// The buttons beside Send and the status lines above the input, for
-    /// where the focused node's lifecycle stands.
+    /// The buttons beside Send and the short notices above the input (why a
+    /// step cannot run), for where the focused node's lifecycle stands. The
+    /// gate check's verdict is [`Self::gate_notices`].
     pub(super) fn lifecycle_controls(&self, cx: &App) -> (Vec<PanelAction>, Vec<PanelNotice>) {
         let mut actions = Vec::new();
         let mut notices = Vec::new();
@@ -314,6 +315,22 @@ impl ConversationView {
             ));
         }
 
+        (actions, notices)
+    }
+
+    /// The gate check's verdict: its status, why it failed, each blocker with
+    /// the button that acts on it, and a Waive per failing criterion. Shown in
+    /// the side pane, beneath the list the node's state is about, never above
+    /// the input.
+    pub(super) fn gate_notices(&self, cx: &App) -> Vec<PanelNotice> {
+        let mut notices = Vec::new();
+        let Some(snapshot) = self.data.lifecycle.as_ref() else {
+            return notices;
+        };
+        let task_id = snapshot.node.to_string();
+        let empty = GateCheckState::default();
+        let gate = self.lifecycle.read(cx).state(&task_id).unwrap_or(&empty);
+        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck);
         // A gate check recorded earlier says nothing once the work has moved
         // on: after a verification that failed steps, or a review with open
         // findings, its "all criteria satisfied" would be wrong.
@@ -351,7 +368,7 @@ impl ConversationView {
                 )),
             );
         }
-        (actions, notices)
+        notices
     }
 
     /// A lifecycle button or Waive was pressed.
