@@ -123,6 +123,7 @@ impl Protocol for FixProtocol {
                 plan_steps: plan_steps(fleet, node_id),
                 obligations,
                 ancestor_context,
+                verdicts: super::verify::current_verdicts(fleet, node_id),
             },
             &open_findings(fleet, node_id),
         )

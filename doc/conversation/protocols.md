@@ -314,8 +314,12 @@ reasons existed shows its note alone; the message input answers it.
 
 ## 4b. The verification protocol
 
-The mirror of implementation, checking the plan instead of building it
-(`tod_core::conversation::verify`). It replaces the `verifying` on-entry
+The mirror of implementation, checking instead of building
+(`tod_core::conversation::verify`). What it checks is the node's
+**obligations**: the plan only exists to satisfy them, and a plan whose every
+step checks out can still add up to work that does not run. The steps get
+verdicts too, because a `failed` step is how a defect gets back to
+implementation. It replaces the `verifying` on-entry
 turn, whose reply was a wall of narration in the lifecycle panel: entering
 `verifying` no longer runs an agent by itself.
 
@@ -323,21 +327,34 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
   buttons beside the conversation view's Send, show **Verify**
   while any plan step has no verdict and **Verify again** once every step
   has one. Either opens the node's most recent verification conversation (or
-  a new one) and sends the starter, "Verify the plan." The picker offers
+  a new one) and sends the starter, "Verify the requirements." The picker offers
   "New verification" on a `verifying` node with plan steps.
 - **Context.** Implementation's blocks (worktree, node, plan, obligations,
   ancestors) under the `VERIFY_SESSION` recipe, with the `verifying` state
   agent's role doc — whose "On entry" section is how verification is done —
   and `surface/verify`, which scopes it to verdicts (no gate evaluation) and
   sets the reply rule.
-- **What the agent records.** A verdict on every step through `tod-cli
-  plan`: `verified`, or `failed` with a note implementation can start from;
-  and a test run through `tod-cli tests record`, as implementation does
-  (same environment variables). The reply is empty or a sentence or two.
-- **Done.** Every plan step `verified` or `failed`, and a test run recorded
-  this turn, red or green. Otherwise the loop sends the steps still without
-  a verdict back, capped and stopped by a turn that changed no status or
-  note, like §4.4.
+- **What the agent records.** A verdict on every one of the node's own
+  obligations through `tod-cli verdicts record` — `verified` or `failed`,
+  always with evidence: what it ran in the running work and what it saw
+  (`tod_store::verification`, an append-only history per obligation; an
+  inherited constraint may be given one too). A verdict on every step
+  through `tod-cli plan`: `verified`, or `failed` with a note implementation
+  can start from. And a test run through `tod-cli tests record`, as
+  implementation does (same environment variables). The reply is empty or a
+  sentence or two.
+- **Done.** Every obligation and every plan step `verified` or `failed`,
+  every failed obligation satisfied by some `failed` step (implementation
+  works from failed steps, so a failure only on the obligation would never
+  reach it), and a test run recorded this turn, red or green. Otherwise the
+  loop sends back what is still owed, capped and stopped by a turn that
+  changed no verdict, status, or note, like §4.4.
+- **Reopening.** Setting any of the node's steps `implemented` again
+  withdraws its `verified` obligation verdicts (`reopened`): the code they
+  were earned against changed. Failed verdicts stay.
+- **Gate.** `verifying` → `review` has two app-answered criteria:
+  `verifying-review.obligations-verified` (every own obligation `verified`)
+  and `verifying-review.plan-steps-verified`.
 - **Side pane.** The plan pane (§4.5), titled "Verification" and counted by
   verdict ("3/5 verified, 1 failed"), with each failed step's note. A step
   left for the user offers no answers here: that is implementation's.

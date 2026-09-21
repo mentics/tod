@@ -116,6 +116,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
             note: OWN_OBLIGATIONS_NOTE,
         },
         DynamicBlock::AncestorContext,
+        DynamicBlock::ObligationVerdicts,
     ],
 };
 
@@ -135,6 +136,7 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
         "cli/intro",
         "cli/obligations",
         "cli/plan",
+        "cli/verdicts",
         "cli/tests",
         "cli/secrets",
         "surface/verify",
@@ -224,6 +226,7 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
         },
         DynamicBlock::AncestorContext,
         DynamicBlock::Plan,
+        DynamicBlock::WorkHistory,
     ],
 };
 
@@ -510,6 +513,7 @@ mod tests {
             "visual-design ",
             "changeset ",
             "review ",
+            "verdicts ",
         ];
         let mut stack = vec![root];
         while let Some(dir) = stack.pop() {

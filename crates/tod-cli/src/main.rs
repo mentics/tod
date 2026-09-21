@@ -19,6 +19,7 @@ mod plan;
 mod review;
 mod secrets;
 mod test_runs;
+mod verdicts;
 mod visual_design;
 
 use std::path::PathBuf;
@@ -48,6 +49,7 @@ NOUNS:
     changeset              This conversation's net changes and unsure flags
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
+    verdicts               What verification found for each obligation of a node
     secrets                Run a command with stored secrets, without seeing them
 
 Run `tod-cli <NOUN> --help` for that noun's commands.
@@ -147,9 +149,10 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "changeset" => changeset::run(invocation),
         "tests" => test_runs::run(invocation),
         "review" => review::run(invocation),
+        "verdicts" => verdicts::run(invocation),
         "secrets" => secrets::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, review, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, review, verdicts, secrets)"
         ),
     }
 }

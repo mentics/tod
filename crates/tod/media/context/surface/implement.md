@@ -123,6 +123,10 @@ checked, how, what happened, and what was expected. The note is shown with
 the step in the plan above (as `failed verification: …` once you have moved
 the step on from `failed`).
 
+- When the context below has a "Verification verdicts" section, a `failed`
+  verdict is an obligation verification exercised in the running work and
+  found not to hold, with what it ran and saw. That — the behaviour the user
+  was promised — is what has to work when you are done, not only the step.
 - Start from the note. Reproduce the failure the way the note says it was
   checked before changing anything, then fix the cause, not the symptom.
 - Check it again the same way once fixed, and only then mark it

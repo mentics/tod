@@ -399,7 +399,7 @@ impl LifecyclePanelView {
                 })
     }
 
-    /// Start a new verification conversation on the node and send it "Verify the plan.", as Implement does for implementation. See
+    /// Start a new verification conversation on the node and send it "Verify the requirements.", as Implement does for implementation. See
     /// `doc/conversation/protocols.md`.
     fn launch_verification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.launch_node_conversation(ProtocolKind::Verification, window, cx);
@@ -485,8 +485,13 @@ impl LifecyclePanelView {
             .unwrap_or_default();
         let verified = steps.iter().filter(|s| s.status == STATUS_VERIFIED).count();
         let failed = steps.iter().filter(|s| s.status == STATUS_FAILED).count();
-        // "Verify" until every step has a verdict, then "Verify again".
-        let unchecked = steps.len() - verified - failed;
+        let standings = tod_core::conversation::verify::standings(&self.fleet, node_id);
+        let obligations_verified = standings.iter().filter(|s| s.is_verified()).count();
+        let obligations_failed = standings.iter().filter(|s| s.is_failed()).count();
+        // "Verify" until every obligation and step has a verdict, then
+        // "Verify again".
+        let unchecked = steps.len() - verified - failed
+            + standings.iter().filter(|s| s.is_unchecked()).count();
         let status = self
             .task_id
             .as_ref()
@@ -495,7 +500,17 @@ impl LifecyclePanelView {
         let revert_armed = self.current_state(cx, |s| s.revert_armed);
 
         body = body.child(div().text_xs().font_semibold().child("Verification"));
-        let mut summary = format!("{verified} of {} plan steps verified", steps.len());
+        let mut summary = format!(
+            "{obligations_verified} of {} requirements verified",
+            standings.len()
+        );
+        if obligations_failed > 0 {
+            summary.push_str(&format!(", {obligations_failed} failed"));
+        }
+        summary.push_str(&format!(
+            "; {verified} of {} plan steps verified",
+            steps.len()
+        ));
         if failed > 0 {
             summary.push_str(&format!(", {failed} failed"));
         }

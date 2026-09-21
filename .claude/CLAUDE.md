@@ -234,9 +234,19 @@ the app needs, the agent records through `tod-cli` as it works.
 protocol, whose loop keeps sending the agent back to open plan steps until
 the plan is done and a test run it recorded (`tod-cli tests record`) is
 green; a `blocked` plan step hands back to the user. `verify.rs` is its
-mirror for a `verifying` node (the lifecycle panel's Verify): it loops until
-every plan step is `verified` or `failed` and a test run is recorded, and
-replaces the old `verifying` on-entry turn. `review.rs` is the code review
+mirror for a `verifying` node (the lifecycle panel's Verify). What it
+verifies is the node's **obligations**, not only the plan: the agent
+exercises each one in the running work and records a verdict with evidence
+through `tod-cli verdicts` (`tod_store::verification`, an append-only
+history per obligation; reimplementing a step reopens the `verified` ones).
+It loops until every own obligation and every plan step is `verified` or
+`failed`, every failed obligation has a `failed` step to carry it back to
+implementation, and a test run is recorded; it replaces the old `verifying`
+on-entry turn. The `verifying` → `review` gate app-checks both
+(`obligations-verified`, `plan-steps-verified`). The `learn` state agent is
+given the node's work history (`node_context::render_work_history`: failed
+verdicts and steps, review findings, failed gate criteria, conversation
+counts), since the final state alone reads as a clean run. `review.rs` is the code review
 for a node in `review` (the lifecycle panel's Review): the agent records each
 finding through `tod-cli review` (`tod_store::review`, on the node, not the
 conversation) and loops until it records `review done`; it replaces the old

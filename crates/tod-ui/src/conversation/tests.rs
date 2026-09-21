@@ -1369,7 +1369,7 @@ fn the_picker_offers_verification_on_a_verifying_planned_node(cx: &mut TestAppCo
         assert_eq!(view.data.protocol, ProtocolKind::Verification);
         assert_eq!(view.data.plan.len(), fixture.steps.len());
         let input = view.transcript.read(cx).input().read(cx).value();
-        assert_eq!(input.as_ref(), "Verify the plan.");
+        assert_eq!(input.as_ref(), "Verify the requirements.");
     });
 }
 

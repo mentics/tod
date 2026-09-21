@@ -227,6 +227,14 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     },
     // verifying → review
     GateCriterionSeed {
+        id_str: "a1000003-0003-4003-8003-00000000000b",
+        from_state: "verifying",
+        to_state: "review",
+        slug: crate::outline::repos::gate::VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG,
+        label: "Every requirement and constraint verified in the running work (none failed or unchecked)?",
+        sort_order: -1,
+    },
+    GateCriterionSeed {
         id_str: "a1000003-0003-4003-8003-00000000000a",
         from_state: "verifying",
         to_state: "review",

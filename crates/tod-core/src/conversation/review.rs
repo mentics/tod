@@ -128,6 +128,7 @@ impl Protocol for ReviewProtocol {
                 plan_steps: plan_steps(fleet, node_id),
                 obligations,
                 ancestor_context,
+                verdicts: super::verify::current_verdicts(fleet, node_id),
             },
             &role_doc,
         )

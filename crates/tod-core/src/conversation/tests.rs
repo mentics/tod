@@ -958,7 +958,7 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
         Focus::Node(fx.node),
         ProtocolKind::Verification,
     );
-    driver.send(&fx.fleet, &mut agent, "Verify the plan.").unwrap();
+    driver.send(&fx.fleet, &mut agent, "Verify the requirements.").unwrap();
     let id = driver.conversation_id().unwrap();
     let opening = agent.last().prompt_blocks().join("
 ");
@@ -971,7 +971,11 @@ fn a_verification_loops_until_every_step_has_a_verdict() {
     );
     let continuation = agent.last().message.clone();
     assert!(
-        continuation.starts_with("1 plan step has no verdict yet"),
+        continuation.starts_with("Verification is not done yet."),
+        "{continuation}"
+    );
+    assert!(
+        continuation.contains("1 plan step with no verdict"),
         "{continuation}"
     );
     assert_eq!(driver.tick(&fx.fleet, &mut agent), [DONE]);

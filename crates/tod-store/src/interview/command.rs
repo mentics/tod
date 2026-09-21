@@ -218,6 +218,17 @@ pub enum InterviewCommand {
         #[serde(default)]
         response: Option<String>,
     },
+    /// Record verification's verdict on one obligation, as it holds for
+    /// `node_id` (`crate::verification`).
+    RecordObligationVerdict {
+        node_id: Uuid,
+        obligation_id: Uuid,
+        /// The verification conversation recording it.
+        #[serde(default)]
+        conversation_id: Option<Uuid>,
+        status: String,
+        evidence: String,
+    },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -823,6 +834,22 @@ pub fn execute(
         } => {
             crate::review::ReviewRepo::new(conn).respond(*finding_id, status, response.as_deref())?;
             Ok(json!({}))
+        }
+        InterviewCommand::RecordObligationVerdict {
+            node_id,
+            obligation_id,
+            conversation_id,
+            status,
+            evidence,
+        } => {
+            let verdict = crate::verification::VerdictRepo::new(conn).record(
+                *node_id,
+                *obligation_id,
+                *conversation_id,
+                status,
+                evidence,
+            )?;
+            Ok(json!({ "id": verdict.id, "status": verdict.status }))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,

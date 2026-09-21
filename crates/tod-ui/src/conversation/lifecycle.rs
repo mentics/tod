@@ -51,6 +51,9 @@ pub(crate) struct LifecycleSnapshot {
     pub review_started: bool,
     pub review_done: bool,
     pub open_findings: usize,
+    /// The node's own obligations verification has not ruled on (or whose
+    /// verdict was reopened).
+    pub unchecked_obligations: usize,
     /// What the node's latest gate check, of its current transition, said.
     pub gate: Option<GateReportRecord>,
     /// Why implementation, verification, or review cannot run here, when it
@@ -111,6 +114,10 @@ impl LifecycleSnapshot {
             review_started,
             review_done,
             open_findings,
+            unchecked_obligations: tod_core::conversation::verify::standings(fleet, node)
+                .iter()
+                .filter(|standing| standing.is_unchecked())
+                .count(),
             gate,
             lifecycle,
             blocked,
@@ -188,7 +195,8 @@ impl ConversationView {
                 PlanProgress::Complete { .. } => {}
             },
             "verifying" if snapshot.total() > 0 && !open_is(ProtocolKind::Verification) => {
-                let unchecked = snapshot.total() - snapshot.verified - snapshot.failed;
+                let unchecked = snapshot.total() - snapshot.verified - snapshot.failed
+                    + snapshot.unchecked_obligations;
                 if snapshot.failed > 0 && unchecked == 0 {
                     // Failed steps are fixed in `active`, where implementation
                     // works each one again from its note: one press moves the

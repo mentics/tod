@@ -31,6 +31,13 @@ pub const ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG: &str = "active-verifying.plan-
 /// (`tod_core::gate::derived`); it never goes to an agent.
 pub const VERIFYING_REVIEW_PLAN_VERIFIED_SLUG: &str = "verifying-review.plan-steps-verified";
 
+/// `verifying` → `review`: every obligation of the node has a `verified`
+/// verdict (`crate::verification`), none `failed`, unchecked, or reopened.
+/// The plan exists to satisfy the obligations, so this — not the steps — is
+/// what says the work does what was asked. App-answered, like the one above.
+pub const VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG: &str =
+    "verifying-review.obligations-verified";
+
 /// `review` → `approved`: the node's review conversation recorded the review
 /// finished (`tod-cli review done`). The app answers this one itself
 /// (`tod_core::gate::derived`); it never goes to an agent.
@@ -102,6 +109,17 @@ impl<'a> GateRepo<'a> {
              FROM gate_criteria WHERE slug = ?1",
         )?;
         let row = stmt.query_row(params![slug], map_criterion).optional()?;
+        Ok(row)
+    }
+
+    pub fn get(&self, id: Uuid) -> Result<Option<GateCriterion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_state, to_state, slug, label, sort_order, active
+             FROM gate_criteria WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![uuid_to_blob(id)], map_criterion)
+            .optional()?;
         Ok(row)
     }
 

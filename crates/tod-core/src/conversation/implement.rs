@@ -168,6 +168,7 @@ impl Protocol for ImplementationProtocol {
                 plan_steps,
                 obligations,
                 ancestor_context,
+                verdicts: super::verify::current_verdicts(fleet, node_id),
             },
         )
     }

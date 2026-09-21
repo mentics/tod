@@ -54,6 +54,10 @@ pub struct GateCheckRequest<'a> {
     /// This node's plan steps with their dependency and `--satisfies` links,
     /// for the same traceability reason.
     pub plan_steps: Vec<PlanStepWithLinks>,
+    /// Rendered work history — see
+    /// `tod_core::node_context::render_work_history`. Only the `learn`
+    /// retrospective is given it; empty for every other state.
+    pub work_history: String,
     pub from_state: String,
     pub to_state: String,
     /// Criteria for this transition paired with the node's most recent
@@ -180,6 +184,7 @@ fn dynamic_context<'a>(
         obligations: &request.obligations,
         ancestor_context: &request.ancestor_context,
         plan_steps: &request.plan_steps,
+        work_history: &request.work_history,
         ..Default::default()
     }
 }
@@ -265,6 +270,7 @@ mod tests {
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
+            work_history: String::new(),
             from_state: "verifying".into(),
             to_state: "review".into(),
             criteria: Vec::new(),
@@ -287,6 +293,7 @@ mod tests {
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
+            work_history: String::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
             criteria: vec![(
@@ -320,6 +327,7 @@ mod tests {
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
+            work_history: String::new(),
             from_state: "planning".into(),
             to_state: "planning".into(),
             criteria: Vec::new(),
@@ -342,6 +350,7 @@ mod tests {
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
+            work_history: String::new(),
             from_state: "design".into(),
             to_state: "planning".into(),
             criteria: Vec::new(),
@@ -371,6 +380,7 @@ mod tests {
             obligations: Vec::new(),
             ancestor_context: String::new(),
             plan_steps: Vec::new(),
+            work_history: String::new(),
             from_state: "planning".into(),
             to_state: "planning".into(),
             criteria: Vec::new(),

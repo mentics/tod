@@ -17,6 +17,7 @@ use anyhow::Result;
 use std::path::Path;
 use tod_store::outline::NodeObligation;
 use tod_store::review::ReviewFinding;
+use tod_store::verification::ObligationVerdict;
 
 pub use crate::context_recipes::ContextRecipe;
 pub use crate::dynamic::{NodeSelection, ObligationSelection};
@@ -78,6 +79,10 @@ pub struct ImplementRequest<'a> {
     /// never its full requirements) is implemented. Callers build this from a
     /// live connection since `ImplementRequest` itself carries no DB handle.
     pub ancestor_context: String,
+    /// Verification's current verdict on each obligation it has ruled on,
+    /// the node's own or inherited (`tod_store::verification`). A `failed`
+    /// one's evidence is what implementation starts from.
+    pub verdicts: Vec<ObligationVerdict>,
 }
 
 /// Build the full implementation-session first message.
@@ -146,6 +151,7 @@ fn build_plan_session_message_with(
             obligations: &request.obligations,
             ancestor_context: &request.ancestor_context,
             plan_steps: &request.plan_steps,
+            verdicts: &request.verdicts,
             findings,
             ..Default::default()
         },

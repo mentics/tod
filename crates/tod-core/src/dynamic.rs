@@ -15,6 +15,7 @@ use std::path::Path;
 use tod_store::conversation::Focus;
 use tod_store::outline::NodeObligation;
 use tod_store::review::ReviewFinding;
+use tod_store::verification::ObligationVerdict;
 use uuid::Uuid;
 
 /// The node an agent surface was opened against.
@@ -97,6 +98,13 @@ pub enum DynamicBlock {
     AncestorContext,
     /// This node's plan steps with their dependency and `satisfies` links.
     Plan,
+    /// Verification's current verdict on each obligation it has ruled on,
+    /// with the evidence. Omitted until there is one.
+    ObligationVerdicts,
+    /// Pre-rendered record of what failed, was sent back, or was found in
+    /// review on the way here (see
+    /// `crate::node_context::render_work_history`). Omitted when empty.
+    WorkHistory,
     /// The review findings a fix session is to resolve — the open ones,
     /// with their ids, severity, location, and detail.
     ReviewFindings,
@@ -122,6 +130,8 @@ pub struct DynamicContext<'a> {
     pub obligations: &'a [NodeObligation],
     pub ancestor_context: &'a str,
     pub plan_steps: &'a [PlanStepWithLinks],
+    pub verdicts: &'a [ObligationVerdict],
+    pub work_history: &'a str,
     pub findings: &'a [ReviewFinding],
     pub workspace: Option<&'a Workspace>,
     pub working_dir: Option<&'a Path>,
@@ -147,6 +157,22 @@ pub fn review_finding_lines(finding: &ReviewFinding) -> String {
             out.push_str(line);
             out.push('\n');
         }
+    }
+    out
+}
+
+/// One verdict as a session is shown it: the obligation's id and status, then
+/// the evidence indented under it.
+pub fn obligation_verdict_lines(verdict: &ObligationVerdict) -> String {
+    let mut out = format!(
+        "- [{}] {}\n",
+        tod_store::interview::short_id(verdict.obligation_id),
+        verdict.status
+    );
+    for line in verdict.evidence.trim().lines() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
@@ -286,6 +312,25 @@ fn render_block(block: DynamicBlock, ctx: &DynamicContext<'_>, out: &mut String)
                     ));
                     out.push('\n');
                 }
+            }
+        }
+
+        DynamicBlock::ObligationVerdicts => {
+            if !ctx.verdicts.is_empty() {
+                out.push_str(
+                    "\n## Verification verdicts\n\n\
+                     What verification last found for each obligation it has ruled \
+                     on. An obligation not listed here is unchecked.\n\n",
+                );
+                for verdict in ctx.verdicts {
+                    out.push_str(&obligation_verdict_lines(verdict));
+                }
+            }
+        }
+
+        DynamicBlock::WorkHistory => {
+            if !ctx.work_history.is_empty() {
+                out.push_str(ctx.work_history);
             }
         }
 

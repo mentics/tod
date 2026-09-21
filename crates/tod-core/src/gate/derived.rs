@@ -16,9 +16,10 @@ use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, S
 use tod_store::outline::{
     ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, READY_ACTIVE_ACTION_CONFIG_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
-    VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
+    VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
 use tod_store::review::ReviewRepo;
+use tod_store::verification::{ObligationStanding, VerdictRepo};
 use uuid::Uuid;
 
 /// The app's verdict on one derived criterion.
@@ -40,6 +41,9 @@ pub fn evaluate_derived_criterion(
         READY_ACTIVE_ACTION_CONFIG_SLUG => implementation_setup_outcome(conn, node_id).map(Some),
         ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG => plan_implemented_outcome(conn, node_id).map(Some),
         VERIFYING_REVIEW_PLAN_VERIFIED_SLUG => plan_verified_outcome(conn, node_id).map(Some),
+        VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG => {
+            obligations_verified_outcome(conn, node_id).map(Some)
+        }
         REVIEW_APPROVED_REVIEW_DONE_SLUG => review_done_outcome(conn, node_id).map(Some),
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
             findings_answered_outcome(conn, node_id).map(Some)
@@ -164,6 +168,49 @@ fn plan_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutc
     if !unchecked.is_empty() {
         parts.push(format!(
             "{} not verified yet: {}.",
+            unchecked.len(),
+            unchecked.join("; ")
+        ));
+    }
+    Ok(fail(parts.join(" ")))
+}
+
+/// Every obligation of the node `verified`. This is the criterion that says
+/// the work does what was asked: a plan whose every step checks out can still
+/// miss a requirement, or add up to something that does not run. A node with
+/// no obligations of its own passes — there is nothing it promised.
+fn obligations_verified_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let standings = VerdictRepo::new(conn).standings(node_id)?;
+    let line = |s: &ObligationStanding| {
+        format!("[{}] {}", short_id(s.obligation.id), s.obligation.body)
+    };
+    let failed: Vec<String> = standings.iter().filter(|s| s.is_failed()).map(line).collect();
+    let unchecked: Vec<String> = standings
+        .iter()
+        .filter(|s| s.is_unchecked())
+        .map(line)
+        .collect();
+    if failed.is_empty() && unchecked.is_empty() {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: match standings.len() {
+                0 => "This node has no obligations of its own to verify.".into(),
+                n => format!("All {n} obligations verified."),
+            },
+        });
+    }
+    let mut parts = Vec::new();
+    if !failed.is_empty() {
+        parts.push(format!(
+            "{} failed verification: {}. Move the node back to active and implement \
+             again — each verdict's evidence says what was seen.",
+            failed.len(),
+            failed.join("; ")
+        ));
+    }
+    if !unchecked.is_empty() {
+        parts.push(format!(
+            "{} not verified yet: {}. Run Verify.",
             unchecked.len(),
             unchecked.join("; ")
         ));
@@ -369,6 +416,69 @@ mod tests {
             "{}",
             outcome.detail
         );
+    }
+
+    /// Verified steps are not enough: each obligation has to have been
+    /// exercised and found to hold, and reimplementing reopens it.
+    #[test]
+    fn verification_passes_only_when_every_obligation_is_verified() {
+        let slug = VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG;
+        let (store, node) = store_with_node();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "nothing promised");
+
+        let steps = plan(&store, node, [STATUS_VERIFIED, STATUS_VERIFIED]);
+        let obligation = Uuid::new_v4();
+        store
+            .enqueue_outline(OutlineMutation::CreateObligation {
+                obligation_id: Some(obligation),
+                node_id: node,
+                kind: "requirement".into(),
+                after_id: None,
+                before: false,
+                section: None,
+                body: "Tickets sync from Linear".into(),
+                phase: "requirements".into(),
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL);
+        assert!(outcome.detail.contains("1 not verified yet"), "{}", outcome.detail);
+
+        let rule = |status: &str| {
+            store
+                .writer()
+                .execute_interview(
+                    "test",
+                    tod_store::interview::InterviewCommand::RecordObligationVerdict {
+                        node_id: node,
+                        obligation_id: obligation,
+                        conversation_id: None,
+                        status: status.into(),
+                        evidence: "Drove the app and looked.".into(),
+                    },
+                )
+                .unwrap();
+        };
+        rule("failed");
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert!(outcome.detail.contains("1 failed verification"), "{}", outcome.detail);
+        rule("verified");
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
+
+        store
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: steps[0],
+                status: STATUS_IMPLEMENTED.into(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+        store.writer().flush().unwrap();
+        let outcome = evaluate(&store, node, slug).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "reimplemented since");
     }
 
     #[test]

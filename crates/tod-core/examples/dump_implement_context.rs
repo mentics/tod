@@ -80,6 +80,14 @@ fn main() -> Result<()> {
             plan_steps,
             obligations,
             ancestor_context,
+            verdicts: {
+                let mut verdicts: Vec<_> = tod_store::verification::VerdictRepo::new(&conn)
+                    .latest_for_node(node_id)?
+                    .into_values()
+                    .collect();
+                verdicts.sort_by_key(|v| v.id);
+                verdicts
+            },
         },
     )?;
 

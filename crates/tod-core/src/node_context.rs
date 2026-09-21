@@ -21,7 +21,7 @@ use rusqlite::Connection;
 use std::fmt::Write as _;
 use std::path::Path;
 use tod_store::interview::short_id;
-use tod_store::outline::repos::NodeRepo;
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{
     Capability, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, PlanStep, ancestor_chain,
     resolve_obligations,
@@ -240,6 +240,138 @@ pub fn render_inherited_context(
     Ok(out)
 }
 
+/// What went wrong on the way here, for the `learn` retrospective: every
+/// failure verification recorded (on an obligation or a plan step), every
+/// step handed back, every review finding, every gate criterion that did not
+/// pass, and how many conversations of each kind the node needed. The current
+/// plan and obligations only show where the work ended up — all `verified` —
+/// so without this a retrospective reads a hard road as a clean run. Empty
+/// when nothing of the kind was recorded.
+pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
+    use tod_store::conversation::{ConversationRepo, Focus, TurnRole};
+    use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
+    use tod_store::outline::{GateRepo, OUTCOME_PASS};
+    use tod_store::review::ReviewRepo;
+    use tod_store::verification::VerdictRepo;
+
+    let mut out = String::new();
+
+    let verdicts: Vec<_> = VerdictRepo::new(conn)
+        .history_for_node(node_id)?
+        .into_iter()
+        .filter(|verdict| !verdict.is_verified())
+        .collect();
+    if !verdicts.is_empty() {
+        out.push_str("\n### Obligations that did not verify first time\n\n");
+        for verdict in &verdicts {
+            let _ = writeln!(
+                out,
+                "- [{}] {}: {}",
+                short_id(verdict.obligation_id),
+                verdict.status,
+                one_line(&verdict.evidence)
+            );
+        }
+    }
+
+    let steps = PlanStepRepo::new(conn);
+    let mut step_lines = String::new();
+    for step in steps.list_for_node(node_id)? {
+        let notes: Vec<_> = steps
+            .list_notes(step.id)?
+            .into_iter()
+            .filter(|note| note.status != STATUS_IMPLEMENTED && note.status != STATUS_VERIFIED)
+            .collect();
+        if notes.is_empty() {
+            continue;
+        }
+        let _ = writeln!(step_lines, "- [{}] {}", short_id(step.id), one_line(&step.body));
+        for note in notes {
+            let _ = writeln!(step_lines, "  - {}: {}", note.status, one_line(&note.body));
+        }
+    }
+    if !step_lines.is_empty() {
+        out.push_str("\n### Plan steps that failed verification or were handed back\n\n");
+        out.push_str(&step_lines);
+    }
+
+    let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+    if !findings.is_empty() {
+        out.push_str("\n### Code review findings\n\n");
+        for finding in &findings {
+            let response = finding
+                .response
+                .as_deref()
+                .map(|r| format!(" — {}", one_line(r)))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "- [{}] {} {}: {}{response}",
+                short_id(finding.id),
+                finding.severity,
+                finding.status,
+                one_line(&finding.summary)
+            );
+        }
+    }
+
+    let gates = GateRepo::new(conn);
+    let mut gate_lines = String::new();
+    for evaluation in gates.list_evaluations_for_node(node_id)? {
+        if evaluation.outcome == OUTCOME_PASS {
+            continue;
+        }
+        let label = gates
+            .get(evaluation.criterion_id)?
+            .map(|c| format!("{} → {}: {}", c.from_state, c.to_state, c.label))
+            .unwrap_or_else(|| short_id(evaluation.criterion_id));
+        let detail = evaluation
+            .detail
+            .as_deref()
+            .map(|d| format!(" — {}", one_line(d)))
+            .unwrap_or_default();
+        let _ = writeln!(gate_lines, "- {} ({label}){detail}", evaluation.outcome);
+    }
+    if !gate_lines.is_empty() {
+        out.push_str("\n### Gate criteria that did not pass (latest evaluation of each)\n\n");
+        out.push_str(&gate_lines);
+    }
+
+    let conversations = ConversationRepo::new(conn);
+    let mut runs: Vec<(String, usize, usize)> = Vec::new();
+    for summary in conversations.list_for_focus(Focus::Node(node_id))? {
+        let turns = conversations.turns(summary.conversation.id)?;
+        let sent = turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User | TurnRole::Continuation))
+            .count();
+        let kind = summary.conversation.protocol.as_str().to_string();
+        match runs.iter_mut().find(|(k, _, _)| *k == kind) {
+            Some(run) => {
+                run.1 += 1;
+                run.2 += sent;
+            }
+            None => runs.push((kind, 1, sent)),
+        }
+    }
+    if !runs.is_empty() {
+        out.push_str("\n### Conversations this node took\n\n");
+        for (kind, count, sent) in &runs {
+            let _ = writeln!(out, "- {kind}: {count} conversation(s), {sent} turn(s) sent");
+        }
+    }
+
+    if out.is_empty() {
+        return Ok(out);
+    }
+    Ok(format!(
+        "\n## Work history\n\n\
+         What this node went through on the way to its current state. The plan \
+         and obligations above show only where it ended up; this is the record \
+         of what failed, was sent back, or was found in review.\n{out}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +391,51 @@ mod tests {
 
     /// A Spec ancestor's summary reaches its descendants whether or not the
     /// ancestor has obligations; its details never do.
+    /// The retrospective has to see what failed along the way, even once
+    /// every step ends `verified` — and nothing when nothing did.
+    #[test]
+    fn work_history_keeps_failures_the_final_state_no_longer_shows() {
+        use tod_store::outline::OutlineMutation;
+        let fx = crate::interview::test_support::fixture();
+        let history = fx
+            .fleet
+            .read(|conn| render_work_history(conn, fx.node))
+            .unwrap();
+        assert_eq!(history, "", "a node nothing happened to has no history");
+
+        let step = Uuid::new_v4();
+        fx.fleet
+            .enqueue_outline(OutlineMutation::CreatePlanStep {
+                step_id: Some(step),
+                node_id: fx.node,
+                after_id: None,
+                before: false,
+                body: "Sync tickets".into(),
+            })
+            .unwrap();
+        for (status, note) in [
+            ("failed", Some("Sync returns no tickets.")),
+            ("implemented", None),
+            ("verified", None),
+        ] {
+            fx.fleet
+                .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                    step_id: step,
+                    status: status.into(),
+                    note: note.map(str::to_string),
+                    reason: None,
+                })
+                .unwrap();
+        }
+        fx.fleet.writer().flush().unwrap();
+        let history = fx
+            .fleet
+            .read(|conn| render_work_history(conn, fx.node))
+            .unwrap();
+        assert!(history.contains("## Work history"), "{history}");
+        assert!(history.contains("failed: Sync returns no tickets."), "{history}");
+    }
+
     #[test]
     fn an_ancestor_is_inherited_as_its_summary_alone() {
         use tod_store::outline::{CreatePosition, OutlineMutation};

@@ -265,6 +265,18 @@ impl<'a> PlanStepRepo<'a> {
         if let Some(note) = note {
             self.record_note(id, status, note)?;
         }
+        if status == STATUS_IMPLEMENTED {
+            // The code changed under whatever verification had confirmed.
+            let node: Vec<u8> = self.conn.query_row(
+                "SELECT node_id FROM node_plan_steps WHERE id = ?1",
+                params![uuid_to_blob(id)],
+                |row| row.get(0),
+            )?;
+            crate::verification::VerdictRepo::new(self.conn).reopen_verified(
+                blob_to_uuid_sql(&node)?,
+                "A plan step was implemented again after this was verified.",
+            )?;
+        }
         if satisfies_dependency(status) {
             for dependent in self.list_dependents(id)? {
                 self.maybe_promote_to_ready(dependent)?;

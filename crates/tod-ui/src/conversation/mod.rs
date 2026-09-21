@@ -97,6 +97,7 @@ use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
 use tod_store::review::{ReviewFinding, ReviewRepo};
+use tod_store::verification::{ObligationStanding, VerdictRepo};
 use uuid::Uuid;
 
 /// The status-hub key of the agent turn in flight.
@@ -285,6 +286,9 @@ pub(crate) struct Snapshot {
     pub report: Option<serde_json::Value>,
     /// The focus node's code review findings, for the review protocol's pane.
     pub findings: Vec<ReviewFinding>,
+    /// The focus node's own obligations with verification's verdict on each,
+    /// for the protocols that work the plan.
+    pub standings: Vec<ObligationStanding>,
     /// The kinds of conversation the picker offers to start on this focus.
     pub new_kinds: Vec<ProtocolKind>,
     /// Where the focused node's lifecycle stands; `None` unless the focus is
@@ -945,6 +949,12 @@ impl ConversationView {
                 ),
                 _ => (Vec::new(), None),
             };
+            let standings = match (protocol, selection.node) {
+                (protocol, Some(node)) if protocol.works_the_plan() => {
+                    VerdictRepo::new(conn).standings(node)?
+                }
+                _ => Vec::new(),
+            };
             let findings = match (protocol, selection.node) {
                 (protocol, Some(node)) if protocol.works_the_findings() => {
                     ReviewRepo::new(conn).list_for_node(node)?
@@ -980,6 +990,7 @@ impl ConversationView {
                 cited,
                 report,
                 findings,
+                standings,
             })
         });
         let data = match data {

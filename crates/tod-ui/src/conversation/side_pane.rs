@@ -18,7 +18,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
     MouseButton, ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored,
-    deferred, div, px,
+    deferred, div, px, relative,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
@@ -194,6 +194,92 @@ impl ConversationView {
             )));
         }
         Some(col.into_any_element())
+    }
+
+    /// What verification is really ruling on: the node's own obligations, each
+    /// with its verdict and the evidence behind it. Shown in a verification,
+    /// and in an implementation once verification has sent something back.
+    fn render_requirements(
+        &self,
+        verifying: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let standings = &self.data.standings;
+        let ruled = standings.iter().any(|s| s.verdict.is_some());
+        if standings.is_empty() || !(verifying || ruled) {
+            return None;
+        }
+        let verified = standings.iter().filter(|s| s.is_verified()).count();
+        let failed = standings.iter().filter(|s| s.is_failed()).count();
+        let mut summary = format!("{verified}/{} verified", standings.len());
+        if failed > 0 {
+            summary.push_str(&format!(", {failed} failed"));
+        }
+        let rows = standings.iter().map(|standing| {
+            let id = standing.obligation.id;
+            let badge = style::badge(div()).child(standing.status().to_string());
+            let badge = if standing.is_failed() {
+                style::text_error(badge)
+            } else {
+                badge
+            };
+            h_flex()
+                .gap(style::space::INLINE)
+                .px(style::space::RELATED)
+                .py(style::space::INLINE)
+                .items_start()
+                .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(selectable_text(
+                            format!("requirement-{id}"),
+                            standing.obligation.body.clone(),
+                            window,
+                            cx,
+                        ))
+                        .children(standing.verdict.as_ref().map(|verdict| {
+                            style::text_dense_muted(div()).child(selectable_text(
+                                format!("requirement-evidence-{id}"),
+                                verdict.evidence.clone(),
+                                window,
+                                cx,
+                            ))
+                        })),
+                )
+                .into_any_element()
+        });
+        let rows: Vec<AnyElement> = rows.collect();
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .max_h(relative(0.5))
+                .min_h_0()
+                .child(
+                    h_flex()
+                        .gap(style::space::INLINE)
+                        .px(style::space::RELATED)
+                        .pt(style::space::RELATED)
+                        .child(style::text_dense_muted(div()).child("Requirements"))
+                        .child(style::text_dense_muted(div()).child(summary)),
+                )
+                .child(
+                    v_flex()
+                        .id("requirements-pane")
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(rows),
+                )
+                .child(
+                    style::text_dense_muted(div())
+                        .px(style::space::RELATED)
+                        .pt(style::space::RELATED)
+                        .child("Plan steps"),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Under a step left for the user: why, what is left, and a way to answer
@@ -639,6 +725,7 @@ impl ConversationView {
             self.status_menu = None;
         }
 
+        let requirements = self.render_requirements(verifying, window, cx);
         let mut rows: Vec<AnyElement> = Vec::new();
         for (n, step) in shown_steps.into_iter().enumerate() {
             let id = step.id;
@@ -763,6 +850,7 @@ impl ConversationView {
                         )
                     }),
             )
+            .children(requirements)
             .children(self.render_status_filter(cx))
             .child(
                 v_flex()

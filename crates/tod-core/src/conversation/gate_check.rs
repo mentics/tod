@@ -178,6 +178,15 @@ fn build_request<'a>(
             }
         })
         .collect();
+    // The retrospective is the one state agent that has to know what went
+    // wrong along the way; the plan and obligations only show how it ended.
+    let work_history = if from == "learn" {
+        fleet
+            .read(|conn| crate::node_context::render_work_history(conn, node))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Ok(GateCheckRequest {
         data_root: env.data_root,
         node_id: node,
@@ -190,6 +199,7 @@ fn build_request<'a>(
         obligations,
         ancestor_context,
         plan_steps,
+        work_history,
         from_state: from.to_string(),
         to_state: to.to_string(),
         criteria,
