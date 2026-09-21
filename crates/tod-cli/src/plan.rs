@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tod_core::fuzzy::fuzzy_score;
 use tod_store::interview::{InterviewCommand, InterviewRepo, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, STATUS_FAILED, STATUS_PARTIAL, needs_user,
+    HandoffReason, STATUS_FAILED, STATUS_PARTIAL, STATUS_VERIFIED, needs_user,
 };
 use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep};
@@ -324,6 +324,25 @@ fn add(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     Ok(ack(id, inv.json))
 }
 
+/// The only statuses a verification agent may give a step. Anything else —
+/// `implemented` above all — would tell the user the step is ready to verify
+/// when verification has just found it is not.
+const VERIFY_AGENT_STATUSES: [&str; 2] = [STATUS_VERIFIED, STATUS_FAILED];
+
+/// Whether this runs inside a verification conversation.
+fn in_verify_conversation(inv: &Invocation) -> anyhow::Result<bool> {
+    use tod_core::conversation::implement::IMPLEMENT_CONVERSATION_ENV;
+    use tod_store::conversation::{ConversationRepo, ProtocolKind};
+    let Some(conversation) = crate::review::env_uuid(IMPLEMENT_CONVERSATION_ENV)? else {
+        return Ok(false);
+    };
+    inv.client().read(|conn| {
+        Ok(ConversationRepo::new(conn)
+            .get(conversation)?
+            .is_some_and(|c| c.protocol == ProtocolKind::Verification))
+    })
+}
+
 fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let id = resolve(inv, args.target("a plan step id")?)?;
     let body = args.get("--body");
@@ -331,6 +350,15 @@ fn update(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let text = |flag: &str| args.get(flag).map(str::trim).filter(|text| !text.is_empty());
     if body.is_none() && status.is_none() {
         anyhow::bail!("--body and/or --status is required");
+    }
+    if let Some(status) = status.filter(|s| !VERIFY_AGENT_STATUSES.contains(s))
+        && in_verify_conversation(inv)?
+    {
+        anyhow::bail!(
+            "verification gives a step `verified` or `failed`, not `{status}`: a step \
+             that did not check out is `failed` with a --note, so implementation \
+             knows to redo it"
+        );
     }
     let mut cites = Vec::new();
     for raw in args.get_all("--cites") {

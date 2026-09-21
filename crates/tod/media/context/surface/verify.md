@@ -59,8 +59,10 @@ the obligation it falls short of.
 
 - Do not fix product defects here. Verification records them; implementation
   fixes them once the user sends the node back to `active`.
-- Do not mark a step `implemented`, `partial`, or `blocked`: those belong to
-  implementation.
+- A step that did not check out is `failed`, never set back to
+  `implemented`: `implemented` means "ready to verify", and would hide the
+  failure from the user. `implemented`, `partial`, and `blocked` belong to
+  implementation, and `tod-cli` refuses them here.
 - Nobody reads your turns as they arrive. When a turn ends with obligations
   or steps that have no verdict, the app sends you straight back to them, so
   check every one rather than stopping to report progress.

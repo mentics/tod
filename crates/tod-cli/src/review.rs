@@ -71,7 +71,7 @@ fn node(args: &Args) -> anyhow::Result<Uuid> {
         .ok_or_else(|| anyhow::anyhow!("--node <UUID> is required outside a review conversation"))
 }
 
-fn env_uuid(name: &str) -> anyhow::Result<Option<Uuid>> {
+pub(crate) fn env_uuid(name: &str) -> anyhow::Result<Option<Uuid>> {
     match std::env::var(name) {
         Ok(raw) if !raw.trim().is_empty() => Uuid::parse_str(raw.trim())
             .map(Some)
