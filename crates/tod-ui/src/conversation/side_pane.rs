@@ -37,6 +37,18 @@ use tod_store::review::{
 };
 use uuid::Uuid;
 
+/// What the side pane lists; see [`ConversationView::side_list`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SideList {
+    ChangeSet,
+    Plan,
+    Findings,
+    Obligations,
+    /// A gate check on a node with no lifecycle state to go by.
+    Gate,
+    Empty(&'static str, &'static str),
+}
+
 /// The status dropdown open on one plan step or review finding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct StatusMenu {
@@ -500,35 +512,132 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        match self.side_list() {
+            SideList::ChangeSet => self.render_change_set(window, cx),
+            SideList::Plan => self.render_plan_pane(window, cx),
+            SideList::Findings => self.render_review_pane(window, cx),
+            SideList::Obligations => self.render_obligations_pane(window, cx),
+            SideList::Gate => self.render_gate_pane(window, cx),
+            SideList::Empty(title, message) => self.render_empty_pane(title, message),
+        }
+    }
+
+    /// Which list the side pane shows. A protocol that works a list shows
+    /// that list; a gate check or a state's entry shows the list the node's
+    /// lifecycle state is about — obligations while it is being specified,
+    /// the plan from planning through verification, the findings in review —
+    /// so the user can see where those items stand. (The gate check's own
+    /// verdict is above the input.)
+    pub(super) fn side_list(&self) -> SideList {
         match self.data.protocol {
             // A chat's outline writes are recorded like an outline
             // conversation's, so it has a change set too.
-            ProtocolKind::Outline | ProtocolKind::Chat => self.render_change_set(window, cx),
-            ProtocolKind::Implementation | ProtocolKind::Verification => {
-                self.render_plan_pane(window, cx)
+            ProtocolKind::Outline | ProtocolKind::Chat => SideList::ChangeSet,
+            ProtocolKind::Implementation | ProtocolKind::Verification => SideList::Plan,
+            ProtocolKind::Review | ProtocolKind::Fix => SideList::Findings,
+            ProtocolKind::GateCheck | ProtocolKind::OnEntry => {
+                match self.data.lifecycle.as_ref().map(|s| s.lifecycle.as_str()) {
+                    Some("proposed" | "design") => SideList::Obligations,
+                    Some("planning" | "ready" | "active" | "verifying") => SideList::Plan,
+                    Some("review" | "approved") => SideList::Findings,
+                    _ if self.data.protocol == ProtocolKind::GateCheck => SideList::Gate,
+                    _ => SideList::Empty(
+                        "On entry",
+                        "What the state's agent did is in the transcript.",
+                    ),
+                }
             }
-            ProtocolKind::Review | ProtocolKind::Fix => self.render_review_pane(window, cx),
-            ProtocolKind::GateCheck => self.render_gate_pane(window, cx),
-            // Where the work is the plan, that is what to show, not the
-            // transcript's account of it.
-            ProtocolKind::OnEntry
-                if self.data.lifecycle.as_ref().is_some_and(|s| {
-                    matches!(s.lifecycle.as_str(), "ready" | "active" | "verifying")
-                }) =>
-            {
-                self.render_plan_pane(window, cx)
-            }
-            ProtocolKind::OnEntry => self.render_empty_pane(
-                "On entry",
-                "What the state's agent did is in the transcript.",
-            ),
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
-            ProtocolKind::VisualDesign => self.render_empty_pane(
+            ProtocolKind::VisualDesign => SideList::Empty(
                 "Visual design",
                 "The visual designer is not available in conversations yet.",
             ),
         }
+    }
+
+    /// The node's own obligations, each with whether a plan step satisfies
+    /// it yet (or verification's verdict, once it has one).
+    fn render_obligations_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let standings = &self.data.standings;
+        if standings.is_empty() {
+            return self.render_empty_pane("Obligations", "This node has no obligations yet.");
+        }
+        let planned = &self.data.planned;
+        let unplanned = standings
+            .iter()
+            .filter(|s| !planned.contains(&s.obligation.id))
+            .count();
+        let summary = match unplanned {
+            0 => format!("{}, all in the plan", standings.len()),
+            u => format!("{}, {u} not in the plan", standings.len()),
+        };
+        let rows: Vec<AnyElement> = standings
+            .iter()
+            .map(|standing| {
+                let id = standing.obligation.id;
+                let status = if standing.verdict.is_some() {
+                    standing.status().to_string()
+                } else if planned.contains(&id) {
+                    "planned".to_string()
+                } else {
+                    "not planned".to_string()
+                };
+                let badge = style::badge(div()).child(status);
+                let badge = if standing.is_failed() {
+                    style::text_error(badge)
+                } else {
+                    badge
+                };
+                h_flex()
+                    .gap(style::space::INLINE)
+                    .px(style::space::RELATED)
+                    .py(style::space::INLINE)
+                    .items_start()
+                    .child(
+                        v_flex()
+                            .w(STATUS_COLUMN_WIDTH)
+                            .flex_shrink_0()
+                            .gap(style::space::INLINE)
+                            .child(
+                                style::text_dense_muted(div())
+                                    .child(standing.obligation.kind.clone()),
+                            )
+                            .child(badge),
+                    )
+                    .child(div().flex_1().min_w_0().child(selectable_text(
+                        format!("obligation-pane-{id}"),
+                        standing.obligation.body.clone(),
+                        window,
+                        cx,
+                    )))
+                    .into_any_element()
+            })
+            .collect();
+        v_flex()
+            .size_full()
+            .min_w_0()
+            .child(
+                style::panel_header(div()).child(
+                    h_flex()
+                        .gap(style::space::INLINE)
+                        .child(style::text_muted(div()).child("Obligations"))
+                        .child(style::text_dense_muted(div()).child(summary)),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("obligations-pane")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     /// The plan steps the status filter lets through, in plan order.
@@ -570,17 +679,18 @@ impl ConversationView {
 
     /// Rows Up/Down move among in the plan pane, or the review pane.
     fn side_row_count(&self) -> usize {
-        if self.data.protocol.works_the_findings() {
-            return self.shown_findings().len();
+        match self.side_list() {
+            SideList::Findings => self.shown_findings().len(),
+            SideList::Plan => self.shown_plan().len() + self.side_files.len(),
+            _ => 0,
         }
-        self.shown_plan().len() + self.side_files.len()
     }
 
     /// One toggle per status the pane has a row in — a plan step, or a
     /// review finding — (and any toggled on that has since emptied), with its
     /// count, plus "All" to clear them.
     fn render_status_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let findings = self.data.protocol.works_the_findings();
+        let findings = self.side_list() == SideList::Findings;
         let (kind, statuses, rows): (&str, &'static [&'static str], Vec<&str>) = if findings {
             (
                 "finding",

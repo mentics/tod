@@ -289,6 +289,9 @@ pub(crate) struct Snapshot {
     /// The focus node's own obligations with verification's verdict on each,
     /// for the protocols that work the plan.
     pub standings: Vec<ObligationStanding>,
+    /// Which of `standings`' obligations some plan step satisfies; filled
+    /// only for the protocols whose pane may list obligations.
+    pub planned: HashSet<Uuid>,
     /// The kinds of conversation the picker offers to start on this focus.
     pub new_kinds: Vec<ProtocolKind>,
     /// Where the focused node's lifecycle stands; `None` unless the focus is
@@ -941,22 +944,25 @@ impl ConversationView {
                     .unwrap_or(fallback_protocol),
                 None => fallback_protocol,
             };
-            // Only the protocols whose side pane shows them pay for these.
+            // Only the protocols whose side pane shows them pay for these. A
+            // gate check or on-entry turn shows whichever list the node's
+            // lifecycle state is about, so it loads all of them.
+            let lists_state = protocol.has_transition();
             let (plan, report) = match (protocol, selection.node, id) {
-                (protocol, Some(node), id) if protocol.works_the_plan() => (
+                (protocol, Some(node), id) if protocol.works_the_plan() || lists_state => (
                     PlanStepRepo::new(conn).list_for_node(node)?,
                     id.and_then(|id| repo.latest_report(id).ok().flatten()),
                 ),
                 _ => (Vec::new(), None),
             };
             let standings = match (protocol, selection.node) {
-                (protocol, Some(node)) if protocol.works_the_plan() => {
+                (protocol, Some(node)) if protocol.works_the_plan() || lists_state => {
                     VerdictRepo::new(conn).standings(node)?
                 }
                 _ => Vec::new(),
             };
             let findings = match (protocol, selection.node) {
-                (protocol, Some(node)) if protocol.works_the_findings() => {
+                (protocol, Some(node)) if protocol.works_the_findings() || lists_state => {
                     ReviewRepo::new(conn).list_for_node(node)?
                 }
                 _ => Vec::new(),
@@ -972,8 +978,20 @@ impl ConversationView {
                     }
                 }
             }
+            // Which obligations a plan step satisfies, for the obligations
+            // list a gate check shows while the node is being specified.
+            let mut planned = HashSet::new();
+            if lists_state {
+                let steps = PlanStepRepo::new(conn);
+                for standing in &standings {
+                    if !steps.list_steps_for_obligation(standing.obligation.id)?.is_empty() {
+                        planned.insert(standing.obligation.id);
+                    }
+                }
+            }
             let new_kinds = new_kinds(conn, selection.node, focus)?;
             Ok(Snapshot {
+                planned,
                 new_kinds,
                 lifecycle: None,
                 path,
@@ -1216,8 +1234,10 @@ impl ConversationView {
             }
             Pane::Context => {}
             Pane::ChangeSet
-                if self.data.protocol.works_the_plan()
-                    || self.data.protocol.works_the_findings() =>
+                if matches!(
+                    self.side_list(),
+                    side_pane::SideList::Plan | side_pane::SideList::Findings
+                ) =>
             {
                 self.move_side_cursor(delta, cx);
             }
@@ -1268,14 +1288,14 @@ impl ConversationView {
                 }
             },
             Pane::Context => {}
-            Pane::ChangeSet if self.data.protocol.works_the_plan() => {
+            Pane::ChangeSet if self.side_list() == side_pane::SideList::Plan => {
                 // A highlighted plan step's Enter opens its status dropdown.
                 let shown = self.shown_plan();
                 if let Some(step) = self.side_cursor.and_then(|ix| shown.get(ix)) {
                     self.open_status_menu(step.id, cx);
                 }
             }
-            Pane::ChangeSet if self.data.protocol.works_the_findings() => {
+            Pane::ChangeSet if self.side_list() == side_pane::SideList::Findings => {
                 // So does a highlighted finding's.
                 let finding = self
                     .side_cursor

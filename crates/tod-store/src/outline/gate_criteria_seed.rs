@@ -171,8 +171,8 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         id_str: "a1000002-0002-4002-8002-000000000005",
         from_state: "planning",
         to_state: "ready",
-        slug: "planning-ready.requirements-traceable",
-        label: "Each requirement traceable through the plan to its verifiable check?",
+        slug: crate::outline::repos::gate::PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
+        label: "Every requirement satisfied by at least one plan step?",
         sort_order: 5,
     },
     GateCriterionSeed {
