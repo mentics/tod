@@ -63,10 +63,11 @@ use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggl
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
 use crate::ui::status::{self, StatusSource};
+use crate::ui::status_filter::StatusFilter;
 use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
-use change_set::{ChangeKey, PendingReverse, Tab};
+use change_set::{ChangeKey, PendingReverse};
 use context_panel::{ContextPanel, ContextTab};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -362,12 +363,16 @@ pub struct ConversationView {
     side_cursor: Option<usize>,
     /// The plan-step status dropdown, while open.
     status_menu: Option<side_pane::StatusMenu>,
-    /// The plan-step statuses the plan pane shows; empty shows every step.
-    status_filter: HashSet<&'static str>,
+    /// The statuses the plan pane, or the review pane, shows; empty shows
+    /// every row.
+    status_filter: StatusFilter,
+    /// The statuses the obligations pane, or the plan pane's requirements,
+    /// shows; empty shows every obligation.
+    obligation_filter: StatusFilter,
     side_scroll: ScrollHandle,
     side_scroll_pending: bool,
 
-    tab: Tab,
+    change_filter: StatusFilter,
     cursor: Option<ChangeKey>,
     /// The highlighted reference link in the cursor's row, while the
     /// keyboard is on the links.
@@ -496,7 +501,7 @@ impl ConversationView {
             loop_turns: 0,
             pending_notices: Vec::new(),
             pending_entries: Vec::new(),
-            tab: Tab::All,
+            change_filter: StatusFilter::default(),
             cursor: None,
             link: None,
             selected: HashSet::new(),
@@ -507,7 +512,8 @@ impl ConversationView {
             change_scroll: ScrollHandle::new(),
             side_cursor: None,
             status_menu: None,
-            status_filter: HashSet::new(),
+            status_filter: StatusFilter::default(),
+            obligation_filter: StatusFilter::default(),
             side_scroll: ScrollHandle::new(),
             side_scroll_pending: false,
             scroll_to_cursor: false,
@@ -635,6 +641,7 @@ impl ConversationView {
             self.side_cursor = None;
             self.status_menu = None;
             self.status_filter.clear();
+            self.obligation_filter.clear();
             self.side_files.clear();
             self.link = None;
             self.selected.clear();
@@ -645,7 +652,7 @@ impl ConversationView {
             self.nav = None;
             self.error = None;
             self.status_line = SharedString::default();
-            self.tab = Tab::All;
+            self.change_filter.clear();
             self.transcript.update(cx, |panel, cx| panel.reset(cx));
         }
         self.reload();
@@ -1084,7 +1091,7 @@ impl ConversationView {
         self.data
             .changes
             .iter()
-            .filter(|c| self.tab.shows(c))
+            .filter(|c| change_set::change_shows(&self.change_filter, c))
             .map(change_set::key_of)
             .collect()
     }
@@ -1615,19 +1622,19 @@ impl Render for ConversationView {
             if this.pane == Pane::Context {
                 this.set_context_tab(ContextTab::Obligations, window, cx)
             } else {
-                this.set_tab(Tab::All, cx)
+                this.set_change_filter(None, cx)
             }
         });
         let root = nav_action!(root, cx, ConversationTabUnsure, |this, window, cx| {
             if this.pane == Pane::Context {
                 this.set_context_tab(ContextTab::Plan, window, cx)
             } else {
-                this.set_tab(Tab::Unsure, cx)
+                this.set_change_filter(Some(change_set::CHANGE_UNSURE), cx)
             }
         });
         let root = nav_action!(root, cx, ConversationTabDeleted, |this, window, cx| {
             if this.pane != Pane::Context {
-                this.set_tab(Tab::Deleted, cx)
+                this.set_change_filter(Some(change_set::CHANGE_DELETED), cx)
             }
         });
 

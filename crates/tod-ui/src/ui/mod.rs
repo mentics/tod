@@ -11,6 +11,7 @@ pub mod scroll_reveal;
 pub mod panel_split;
 pub mod selectable_text;
 pub mod status;
+pub mod status_filter;
 pub mod style;
 pub mod toast;
 pub mod transcript_list;

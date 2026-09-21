@@ -9,6 +9,7 @@ use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::views::rows::RowHost;
 use delegate::{
     ListAction, NO_SECTION, ObligationListDelegate, ObligationRow, SECTION_EDIT_TAG, group_row_key,
@@ -32,6 +33,8 @@ use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN}
 use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
 };
+use tod_store::outline::repos::PlanStepRepo;
+use tod_store::verification::{LISTING_STATUSES, STANDING_NOT_PLANNED, VerdictRepo};
 use uuid::Uuid;
 
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
@@ -166,6 +169,11 @@ pub struct ObligationsView {
     /// through (the conversation's deleted items). Merged into `items` on
     /// every reload and never editable.
     removed: Vec<NodeObligation>,
+    /// Each obligation's standing — its verdict, else whether a plan step
+    /// satisfies it — which the status filter goes by.
+    standing: HashMap<Uuid, String>,
+    /// The standings the list shows; empty shows every obligation.
+    filter: StatusFilter,
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
@@ -256,6 +264,8 @@ impl ObligationsView {
             host,
             embedded: false,
             removed: Vec::new(),
+            standing: HashMap::new(),
+            filter: StatusFilter::default(),
             editing_id: None,
             draft_id: None,
             edit_original_body: None,
@@ -302,6 +312,7 @@ impl ObligationsView {
             .remove(&section_row_key(&phase, &kind, &section));
         let key = id.to_string();
         if !self.search_matches().iter().any(|o| o.id == id) {
+            self.filter.clear();
             self.search_query.clear();
             self.search_input.update(cx, |input, cx| {
                 input.set_value("", window, cx);
@@ -474,6 +485,18 @@ impl ObligationsView {
             .fleet
             .list_obligations_for_node(node_id)
             .unwrap_or_default();
+        self.standing = self
+            .fleet
+            .read(|conn| {
+                let steps = PlanStepRepo::new(conn);
+                let mut standing = HashMap::new();
+                for s in VerdictRepo::new(conn).standings(node_id)? {
+                    let planned = !steps.list_steps_for_obligation(s.obligation.id)?.is_empty();
+                    standing.insert(s.obligation.id, s.listing_status(planned).to_string());
+                }
+                Ok(standing)
+            })
+            .unwrap_or_default();
         let mut struck = HashSet::new();
         for ghost in &self.removed {
             if ghost.node_id != node_id || self.items.iter().any(|o| o.id == ghost.id) {
@@ -503,7 +526,25 @@ impl ObligationsView {
         ]
     }
 
-    /// Items matching the current search query (body or section text),
+    /// An obligation's standing, as the status filter counts it.
+    fn standing_of(&self, id: Uuid) -> &str {
+        self.standing
+            .get(&id)
+            .map_or(STANDING_NOT_PLANNED, String::as_str)
+    }
+
+    /// Toggle `status` in the filter, or clear it (`None`, "All").
+    fn set_filter(&mut self, status: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        match status {
+            Some(status) => self.filter.toggle(status),
+            None => {
+                self.filter.clear();
+            }
+        }
+        self.rebuild_visible(window, cx);
+    }
+
+    /// Items the status filter lets through that match the current search query (body or section text),
     /// case-insensitive fuzzy match. Space-separated terms are ANDed together:
     /// each term must fuzzily match some word in the item's text (typo-tolerant),
     /// but every term must match for the item to be included. Empty query
@@ -514,11 +555,14 @@ impl ObligationsView {
             .split_whitespace()
             .map(|t| t.to_lowercase())
             .collect();
-        if terms.is_empty() {
-            return self.items.iter().collect();
-        }
-        self.items
+        let admitted = self
+            .items
             .iter()
+            .filter(|o| self.filter.admits(self.standing_of(o.id)));
+        if terms.is_empty() {
+            return admitted.collect();
+        }
+        admitted
             .filter(|o| {
                 let body = o.body.to_lowercase();
                 let section = o.section.as_deref().unwrap_or("").to_lowercase();
@@ -1995,6 +2039,16 @@ impl Render for ObligationsView {
                     ))
                     }),
             )
+            .children(render_status_filter(
+                "obligations",
+                &status_counts(
+                    &LISTING_STATUSES,
+                    self.items.iter().map(|o| self.standing_of(o.id)),
+                ),
+                &self.filter,
+                |this: &mut Self, status, window, cx| this.set_filter(status, window, cx),
+                cx,
+            ))
             .child({
                 let row_count = self.delegate.rows().len();
                 let mut rows = Vec::with_capacity(row_count);
@@ -2094,6 +2148,29 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> Option<Uuid> {
         view.read_with(cx, |view, _| view.selected_obligation_id())
+    }
+
+    #[gpui::test]
+    fn obligations_status_filter_narrows_by_standing(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        let items = |view: &Entity<ObligationsView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, _| {
+                v.delegate
+                    .rows()
+                    .iter()
+                    .filter(|r| matches!(r, ObligationRow::Item { .. }))
+                    .count()
+            })
+        };
+        assert_eq!(items(&view, cx), 3);
+        view.update_in(cx, |v, window, cx| v.set_filter(Some("planned"), window, cx));
+        draw(cx);
+        assert_eq!(items(&view, cx), 0);
+        view.update_in(cx, |v, window, cx| v.set_filter(Some("not planned"), window, cx));
+        assert_eq!(items(&view, cx), 3);
+        view.update_in(cx, |v, window, cx| v.set_filter(None, window, cx));
+        assert_eq!(items(&view, cx), 3);
     }
 
     #[gpui::test]

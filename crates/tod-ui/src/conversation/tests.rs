@@ -1,6 +1,7 @@
 //! ConversationView tests.
 
-use super::change_set::{DisplayRow, Tab, display_rows, tab_counts};
+use super::change_set::{CHANGE_DELETED, CHANGE_UNSURE, DisplayRow, change_counts, display_rows};
+use crate::ui::status_filter::StatusFilter;
 use super::keyboard::*;
 use super::*;
 use crate::ui::agent_conversation::PanelStop;
@@ -349,9 +350,9 @@ fn tabs_count_flags_and_deletions(cx: &mut TestAppContext) {
 
     let (view, _, cx) = open_view(&fixture, node, cx);
     let changes = changes(&view, cx);
-    assert_eq!(tab_counts(&changes), [3, 1, 1]);
+    assert_eq!(counts(&changes), [1, 1]);
 
-    let all = display_rows(&changes, Tab::All);
+    let all = display_rows(&changes, &StatusFilter::default());
     assert_eq!(all[0], DisplayRow::Node(fixture.node_id));
     assert_eq!(
         all.iter()
@@ -365,10 +366,22 @@ fn tabs_count_flags_and_deletions(cx: &mut TestAppContext) {
             .count(),
         3
     );
-    let deleted = display_rows(&changes, Tab::Deleted);
+    let mut filter = StatusFilter::default();
+    filter.toggle(CHANGE_DELETED);
+    let deleted = display_rows(&changes, &filter);
     assert_eq!(deleted.len(), 2);
+    // Unsure and deleted together show either kind.
+    filter.toggle(CHANGE_UNSURE);
+    let either = display_rows(&changes, &filter);
+    assert_eq!(
+        either
+            .iter()
+            .filter(|r| matches!(r, DisplayRow::Change(_)))
+            .count(),
+        2
+    );
 
-    // 2 switches to Unsure; the cursor lands on the flagged item and F clears it.
+    // 2 toggles Unsure on; the cursor lands on the flagged item and F clears it.
     view.update_in(cx, |view, window, cx| {
         view.focus_pane(Pane::ChangeSet, window, cx)
     });
@@ -380,7 +393,7 @@ fn tabs_count_flags_and_deletions(cx: &mut TestAppContext) {
     );
     cx.dispatch_action(ConversationClearFlag);
     let changes = self::changes(&view, cx);
-    assert_eq!(tab_counts(&changes), [3, 0, 1]);
+    assert_eq!(counts(&changes), [0, 1]);
 }
 
 #[gpui::test]
@@ -2048,4 +2061,8 @@ fn a_fix_conversation_lists_the_findings_under_a_status_filter(cx: &mut TestAppC
         response.as_deref(),
         Some("The import is used behind a feature flag.")
     );
+}
+
+fn counts(changes: &[tod_store::conversation::NetChange]) -> Vec<usize> {
+    change_counts(changes).into_iter().map(|(_, n)| n).collect()
 }

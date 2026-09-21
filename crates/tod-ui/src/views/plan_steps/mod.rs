@@ -11,6 +11,7 @@ use crate::ui::list::{
     ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
+use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::views::rows::RowHost;
 use delegate::{ListAction, PlanStepListDelegate, PlanStepRow};
 use gpui::prelude::FluentBuilder;
@@ -107,6 +108,8 @@ pub struct PlanStepsView {
     /// through (the conversation's deleted steps). Merged into `items` on
     /// every reload and never editable.
     removed: Vec<PlanStep>,
+    /// The statuses the list shows; empty shows every step.
+    filter: StatusFilter,
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
@@ -170,6 +173,7 @@ impl PlanStepsView {
             host,
             embedded: false,
             removed: Vec::new(),
+            filter: StatusFilter::default(),
             editing_id: None,
             draft_id: None,
             edit_original_body: None,
@@ -321,6 +325,7 @@ impl PlanStepsView {
     fn build_rows(&self) -> Vec<PlanStepRow> {
         self.items
             .iter()
+            .filter(|step| self.filter.admits(&step.status))
             .cloned()
             .map(|step| {
                 let depends_on = self
@@ -369,6 +374,17 @@ impl PlanStepsView {
             }
         }
         cx.notify();
+    }
+
+    /// Toggle `status` in the filter, or clear it (`None`, "All").
+    fn set_filter(&mut self, status: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        match status {
+            Some(status) => self.filter.toggle(status),
+            None => {
+                self.filter.clear();
+            }
+        }
+        self.rebuild_visible(window, cx);
     }
 
     fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
@@ -980,6 +996,16 @@ impl Render for PlanStepsView {
                         )
                     }),
             )
+            .children(render_status_filter(
+                "plan-steps",
+                &status_counts(
+                    &PLAN_STEP_STATUSES,
+                    self.items.iter().map(|s| s.status.as_str()),
+                ),
+                &self.filter,
+                |this: &mut Self, status, window, cx| this.set_filter(status, window, cx),
+                cx,
+            ))
             .child({
                 let row_count = self.delegate.rows().len();
                 let mut rows = Vec::with_capacity(row_count);
@@ -1092,6 +1118,34 @@ mod tests {
         });
         draw(cx);
         assert_eq!(selected_step(&view, cx), Some(target));
+    }
+
+    #[gpui::test]
+    fn plan_steps_status_filter_narrows_the_list(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
+                step_id: fixture.steps[1],
+                status: "implemented".into(),
+                note: None,
+                reason: None,
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        let shown = |view: &Entity<PlanStepsView>, cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, _| {
+                v.delegate.rows().iter().map(|r| r.step.id).collect::<Vec<_>>()
+            })
+        };
+        view.update_in(cx, |v, window, cx| v.reload(window, cx));
+        assert_eq!(shown(&view, cx).len(), 2);
+        view.update_in(cx, |v, window, cx| v.set_filter(Some("implemented"), window, cx));
+        draw(cx);
+        assert_eq!(shown(&view, cx), vec![fixture.steps[1]]);
+        view.update_in(cx, |v, window, cx| v.set_filter(None, window, cx));
+        assert_eq!(shown(&view, cx).len(), 2);
     }
 
     #[gpui::test]
