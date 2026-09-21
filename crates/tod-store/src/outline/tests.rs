@@ -872,7 +872,7 @@ fn gate_criteria_seed_on_migration() {
     let active_verifying = repo.list_for_transition("active", "verifying").unwrap();
     assert_eq!(active_verifying.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
-    assert_eq!(verifying_review.len(), 10);
+    assert_eq!(verifying_review.len(), 11);
     let review_approved = repo.list_for_transition("review", "approved").unwrap();
     assert_eq!(review_approved.len(), 2);
     assert_eq!(
