@@ -358,6 +358,9 @@ pub struct ConversationView {
     /// Nodes a finished gate check advanced, whose new state's on-entry work
     /// starts on the next poll.
     pending_entries: Vec<Uuid>,
+    /// Nodes whose gate check just finished a turn: the criteria rows it
+    /// recorded are re-read on the next poll, so Advance appears on a pass.
+    pending_gate_reloads: Vec<Uuid>,
     /// The highlighted row of a side pane other than the change set: plan
     /// steps first, then changed files.
     side_cursor: Option<usize>,
@@ -450,6 +453,11 @@ impl ConversationView {
                     for node_id in std::mem::take(&mut this.pending_entries) {
                         cx.emit(ConversationViewEvent::EnterState { node_id });
                     }
+                    for node_id in std::mem::take(&mut this.pending_gate_reloads) {
+                        let task_id = node_id.to_string();
+                        this.lifecycle
+                            .update(cx, |c, cx| c.reload_criteria(&task_id, cx));
+                    }
                     if changed {
                         cx.notify();
                     }
@@ -501,6 +509,7 @@ impl ConversationView {
             loop_turns: 0,
             pending_notices: Vec::new(),
             pending_entries: Vec::new(),
+            pending_gate_reloads: Vec::new(),
             change_filter: StatusFilter::default(),
             cursor: None,
             link: None,
@@ -820,6 +829,11 @@ impl ConversationView {
                         // counter moved.
                         ConversationEvent::Continued => {}
                         ConversationEvent::TurnFinished { error: None } => {
+                            if let (ProtocolKind::GateCheck, Focus::Node(node)) =
+                                (driver.protocol().kind(), driver.focus())
+                            {
+                                self.pending_gate_reloads.push(node);
+                            }
                             if let Some(node) = entered_state(&self.fleet, driver) {
                                 self.pending_entries.push(node);
                             }
