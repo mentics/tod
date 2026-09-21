@@ -1511,6 +1511,11 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             app_settings,
                         );
                         let _ = crate::interview::bootstrap(fleet.clone());
+                        // Before the tree is built, so no row is ever drawn as
+                        // "refreshing…" for a refresh the last run never finished.
+                        if let Err(err) = tod_core::generator::clear_interrupted_refreshes(&fleet) {
+                            tracing::error!("clearing interrupted generator refreshes failed: {err}");
+                        }
                         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
                         let task_edit = cx
                             .new(|cx| TaskEditView::new(window, cx, fleet.clone(), paths.clone()));

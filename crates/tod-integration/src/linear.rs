@@ -23,6 +23,7 @@ const DEFAULT_RESULT_CAP: usize = 200;
 #[allow(dead_code)] // Used in retry logic
 const MAX_RETRIES: u32 = 3;
 const INITIAL_RETRY_DELAY_SECS: u64 = 5;
+const MAX_RETRY_DELAY_SECS: u64 = 30;
 
 /// Fetches Linear issues via the DataSource trait with dynamic filter discovery.
 pub struct LinearDataSource {
@@ -864,7 +865,10 @@ fn fetch_all_issues(
                     .get("Retry-After")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(retry_delay_secs);
+                    .unwrap_or(retry_delay_secs)
+                    // Linear's limit resets hourly, so the header can ask for
+                    // far longer than anyone should wait on a refresh.
+                    .min(MAX_RETRY_DELAY_SECS);
 
                 std::thread::sleep(Duration::from_secs(wait_secs));
                 retry_delay_secs *= 2; // Exponential backoff

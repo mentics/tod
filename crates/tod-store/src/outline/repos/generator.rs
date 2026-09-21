@@ -98,6 +98,18 @@ impl<'a> GeneratorRepo<'a> {
         Ok(())
     }
 
+    /// Generators whose persisted refresh status is `status`.
+    pub fn nodes_with_refresh_status(&self, status: &str) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id FROM node_generator_config WHERE last_refresh_status = ?1",
+        )?;
+        let rows = stmt.query_map(params![status], |row| {
+            let id_blob: Vec<u8> = row.get(0)?;
+            blob_to_uuid_sql(&id_blob)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     // ── Managed nodes ───────────────────────────────────────────────────
 
     pub fn set_managed(&self, node_id: Uuid, managed: bool) -> Result<()> {
