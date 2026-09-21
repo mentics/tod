@@ -657,7 +657,7 @@ impl ObligationsView {
         );
         if let Some(ix) = selected_ix {
             if previous_index != selected_ix {
-                self.scroll_handle.scroll_to_top_of_item(ix);
+                self.scroll_handle.scroll_to_item(ix);
             }
         }
         cx.notify();

@@ -2,6 +2,7 @@ use crate::interview::{TodPaths, TodSettings};
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_pane_nav};
+use crate::ui::scroll_reveal::ScrollReveal;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::toast::{confirm_toast, error_toast};
 use crate::views::linear_import::parse_ticket_reference;
@@ -9,7 +10,7 @@ use crate::views::linear_import::{apply_linear_fields_to_node, tags_with_linear}
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollAnchor, ScrollHandle,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollHandle,
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
 };
 use gpui_base::input::{InputBaseState, InputModeKind};
@@ -529,7 +530,7 @@ pub struct TaskEditView {
     focus_index: usize,
     editing: Option<TaskEditField>,
     body_scroll_handle: ScrollHandle,
-    scroll_anchor: ScrollAnchor,
+    scroll_anchor: ScrollReveal,
     linear_fetch_generation: u64,
     linear_busy: bool,
     /// Default launch options from settings, read from disk once per task load
@@ -650,7 +651,7 @@ impl TaskEditView {
             }
         })
         .detach();
-        let scroll_anchor = ScrollAnchor::for_handle(body_scroll_handle.clone());
+        let scroll_anchor = ScrollReveal::for_handle(body_scroll_handle.clone());
 
         let _title_subscription = cx.subscribe(&title_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
@@ -935,17 +936,17 @@ impl TaskEditView {
 
     fn apply_focus_scroll_anchor<E>(&self, field: TaskEditField, el: E) -> E
     where
-        E: StatefulInteractiveElement,
+        E: ParentElement + Styled,
     {
         if self.field_nav_focused(field) {
-            el.anchor_scroll(Some(self.scroll_anchor.clone()))
+            self.scroll_anchor.mark(el)
         } else {
             el
         }
     }
 
     fn ensure_focused_visible(&self, window: &mut Window, cx: &mut App) {
-        self.scroll_anchor.scroll_to(window, cx);
+        self.scroll_anchor.reveal(window, cx);
     }
 
     fn move_field_stop(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
