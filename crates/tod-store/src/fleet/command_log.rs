@@ -13,6 +13,9 @@ pub struct CommandEntry {
     pub label: String,
     pub created_at: i64,
     pub inverses: Vec<FleetMutation>,
+    /// The action row the undone mutation recorded, so undoing it is
+    /// recorded as that action's reversal.
+    pub action_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -53,6 +56,16 @@ impl CommandLog {
     }
 
     pub fn push(&mut self, label: String, inverses: Vec<FleetMutation>) {
+        self.push_for_action(label, inverses, None);
+    }
+
+    /// [`Self::push`] for a mutation that recorded action `action_id`.
+    pub fn push_for_action(
+        &mut self,
+        label: String,
+        inverses: Vec<FleetMutation>,
+        action_id: Option<i64>,
+    ) {
         if inverses.is_empty() {
             return;
         }
@@ -61,6 +74,7 @@ impl CommandLog {
             label,
             created_at: crate::outline::uuid_blob::now_ms(),
             inverses,
+            action_id,
         };
         self.entries.push(entry);
         if self.entries.len() > MAX_ENTRIES {

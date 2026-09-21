@@ -410,6 +410,7 @@ pub fn execute(
                 (Some(proposal), Some(1)) => Some(apply_proposal(
                     conn,
                     media_root,
+                    actor,
                     &q,
                     proposal,
                     edited.as_deref(),
@@ -739,7 +740,9 @@ pub fn execute(
             } else {
                 mutation
             };
-            mutation.execute(conn, media_root)?;
+            // Outside a conversation: still recorded, as this actor's.
+            let mutation = crate::conversation::normalize(mutation.clone());
+            crate::conversation::record_direct(conn, actor, &mutation, media_root)?;
             Ok(json!({}))
         }
 
@@ -1040,6 +1043,7 @@ fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) ->
 fn apply_proposal(
     conn: &Connection,
     media_root: &Path,
+    actor: &str,
     q: &InterviewQuestion,
     p: &Proposal,
     edited_text: Option<&str>,
@@ -1053,8 +1057,9 @@ fn apply_proposal(
         Ok(plan) => plan,
         Err(message) => return Ok(json!({ "error": message })),
     };
-    for mutation in &mutations {
-        mutation.execute(conn, media_root)?;
+    for mutation in mutations {
+        let mutation = crate::conversation::normalize(mutation);
+        crate::conversation::record_direct(conn, actor, &mutation, media_root)?;
     }
     Ok(json!({ "ops": ops }))
 }

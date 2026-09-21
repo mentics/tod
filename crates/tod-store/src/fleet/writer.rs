@@ -466,6 +466,11 @@ enum WriterCommand {
         respond: oneshot::Sender<Result<serde_json::Value>>,
     },
     Flush(oneshot::Sender<Result<()>>),
+    Undo {
+        inverses: Vec<FleetMutation>,
+        reverses: Option<i64>,
+        respond: oneshot::Sender<Result<()>>,
+    },
     SwitchDatabase {
         path: PathBuf,
         respond: oneshot::Sender<Result<()>>,
@@ -604,6 +609,28 @@ impl FleetWriter {
             .map_err(|_| FleetWriterError::Closed)??)
     }
 
+    /// Apply a Ctrl+Z entry's inverses in one transaction, after anything
+    /// still pending. When the undone mutation recorded action `reverses`,
+    /// its outline inverse is recorded as that action's reversal.
+    pub fn apply_undo(
+        &self,
+        inverses: Vec<FleetMutation>,
+        reverses: Option<i64>,
+    ) -> Result<(), FleetWriterError> {
+        let (respond, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCommand::Undo {
+                inverses,
+                reverses,
+                respond,
+            })
+            .map_err(|_| FleetWriterError::Closed)?;
+        self.runtime
+            .block_on(rx)
+            .map_err(|_| FleetWriterError::Closed)??;
+        Ok(())
+    }
+
     pub fn commit_notify(&self) -> Arc<tokio::sync::Notify> {
         self.commit_notify.clone()
     }
@@ -705,6 +732,17 @@ async fn writer_loop(
                             commit_notify.notify_waiters();
                         }
                     }
+                    Some(WriterCommand::Undo { inverses, reverses, respond }) => {
+                        let batch = std::mem::take(&mut pending);
+                        debounce_deadline = None;
+                        let result = flush_batch(&conn, &media_root, &batch, ACTOR_USER, &command_log)
+                            .and_then(|()| run_undo(&conn, &media_root, &inverses, reverses));
+                        let committed = result.is_ok();
+                        let _ = respond.send(result);
+                        if committed {
+                            commit_notify.notify_waiters();
+                        }
+                    }
                     Some(WriterCommand::SwitchDatabase { path, respond }) => {
                         if !pending.is_empty() {
                             let batch = std::mem::take(&mut pending);
@@ -764,6 +802,16 @@ fn flush_batch(
 ) -> Result<()> {
     let guard = conn.lock().expect("fleet writer connection mutex");
     for mutation in batch {
+        // A create gets its id now, so the undo entry and the action row
+        // name the item the mutation makes.
+        let normalized;
+        let mutation = match mutation {
+            FleetMutation::Outline(m) => {
+                normalized = FleetMutation::Outline(crate::conversation::normalize(m.clone()));
+                &normalized
+            }
+            other => other,
+        };
         let suppressed = command_log
             .lock()
             .expect("command log mutex")
@@ -788,33 +836,62 @@ fn flush_batch(
         };
         let tx = guard.unchecked_transaction()?;
         set_actor(&guard, actor)?;
-        let archive_id = mutation.execute_with_outcome(&guard, media_root)?;
+        let applied = match mutation {
+            FleetMutation::Outline(m) => {
+                crate::conversation::record_direct(&guard, actor, m, media_root)?
+            }
+            other => crate::conversation::Applied {
+                archive_id: other.execute_with_outcome(&guard, media_root)?,
+                action_id: None,
+            },
+        };
         set_actor(&guard, ACTOR_USER)?;
         tx.commit()?;
         if suppressed {
             continue;
         }
-        if let Some(entry) = pre_undo {
-            command_log
-                .lock()
-                .expect("command log mutex")
-                .push(entry.label, entry.inverses);
-        } else if let (Some(archive_id), Some(root_id)) = (archive_id, delete_root) {
-            if let Some(entry) = capture_inverse_after_delete(&guard, archive_id, root_id)? {
-                command_log
-                    .lock()
-                    .expect("command log mutex")
-                    .push(entry.label, entry.inverses);
-            }
+        let entry = if let Some(entry) = pre_undo {
+            Some(entry)
+        } else if let (Some(archive_id), Some(root_id)) = (applied.archive_id, delete_root) {
+            capture_inverse_after_delete(&guard, archive_id, root_id)?
         } else if let Some(root_id) = restore_root {
-            if let Some(entry) = capture_inverse_after_restore(&guard, root_id)? {
-                command_log
-                    .lock()
-                    .expect("command log mutex")
-                    .push(entry.label, entry.inverses);
+            capture_inverse_after_restore(&guard, root_id)?
+        } else {
+            None
+        };
+        if let Some(entry) = entry {
+            command_log.lock().expect("command log mutex").push_for_action(
+                entry.label,
+                entry.inverses,
+                applied.action_id,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Apply one Ctrl+Z entry's inverses as the user, in one transaction. The
+/// first outline inverse of a recorded action is recorded as its reversal.
+fn run_undo(
+    conn: &Arc<Mutex<Connection>>,
+    media_root: &Path,
+    inverses: &[FleetMutation],
+    mut reverses: Option<i64>,
+) -> Result<()> {
+    let guard = conn.lock().expect("fleet writer connection mutex");
+    let tx = guard.unchecked_transaction()?;
+    for inverse in inverses {
+        match (inverse, reverses) {
+            (FleetMutation::Outline(m), Some(original)) => {
+                crate::conversation::record_undo(&guard, original, m, media_root)?;
+                reverses = None;
+            }
+            _ => {
+                inverse.execute_with_outcome(&guard, media_root)?;
             }
         }
     }
+    tx.commit()?;
     Ok(())
 }
 

@@ -208,14 +208,14 @@ impl FleetStore {
             .lock()
             .expect("command log mutex")
             .set_suppressed(true);
-        for inverse in &entry.inverses {
-            self.writer.enqueue(inverse.clone())?;
-        }
-        self.writer.flush()?;
+        let applied = self
+            .writer
+            .apply_undo(entry.inverses.clone(), entry.action_id);
         self.command_log
             .lock()
             .expect("command log mutex")
             .set_suppressed(false);
+        applied?;
         self.projection
             .lock()
             .expect("fleet projection mutex")

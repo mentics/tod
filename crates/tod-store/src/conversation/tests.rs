@@ -1395,7 +1395,7 @@ fn unsure_flags_live_on_the_change_set() {
 }
 
 #[test]
-fn agent_writes_record_one_action_and_other_actors_record_none() {
+fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_it() {
     let fx = setup();
     let o = add_obligation(&fx.conn, fx.n1, "Original.");
     let out = fx
@@ -1422,7 +1422,7 @@ fn agent_writes_record_one_action_and_other_actors_record_none() {
     .unwrap();
     assert_eq!(fx.action_count(), 1);
 
-    // Users and interview agents write exactly as before, unrecorded.
+    // Users and interview agents are recorded too, outside the conversation.
     for actor in [ACTOR_USER.to_string(), Uuid::new_v4().to_string()] {
         run(
             &fx.conn,
@@ -1437,7 +1437,8 @@ fn agent_writes_record_one_action_and_other_actors_record_none() {
         )
         .unwrap();
     }
-    assert_eq!(fx.action_count(), 1);
+    assert_eq!(fx.action_count(), 3);
+    assert_eq!(ConversationRepo::new(&fx.conn).actions(fx.conv).unwrap().len(), 1);
 
     // An unknown conversation is an error, and nothing is written.
     let err = run(
@@ -1649,4 +1650,195 @@ fn a_gate_check_and_an_on_entry_run_name_the_transition_they_belong_to() {
     // Other kinds carry none.
     let plain = repo.get(fx.conv).unwrap().unwrap();
     assert_eq!(plain.transition_label(), None);
+}
+
+/// Every action row outside any conversation, oldest first.
+fn direct_actions(conn: &Connection) -> Vec<ActionRow> {
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM conversation_actions WHERE conversation_id IS NULL ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let repo = ConversationRepo::new(conn);
+    ids.into_iter()
+        .map(|id| repo.action(id).unwrap().unwrap())
+        .collect()
+}
+
+fn obligation_body(snapshot: &Option<EntitySnapshot>) -> Option<&str> {
+    match snapshot {
+        Some(EntitySnapshot::Obligation { body, .. }) => Some(body),
+        _ => None,
+    }
+}
+
+#[test]
+fn direct_obligation_edits_are_recorded_and_ctrl_z_reverses_them() {
+    use crate::fleet::store::FleetStore;
+    let root = std::env::temp_dir().join(format!("tod-direct-actions-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let store = FleetStore::open(&root).unwrap();
+    store
+        .enqueue_outline(M::CreateList {
+            slug: "d".into(),
+            title: "D".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let list_id = store.list_outline_lists().unwrap()[0].id;
+    let node = Uuid::new_v4();
+    store
+        .enqueue_outline(M::CreateNode {
+            node_id: Some(node),
+            list_id,
+            parent_id: None,
+            anchor_id: None,
+            position: CreatePosition::Below,
+            title: "Node".into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(M::EnableCapabilities {
+            node_id: node,
+            capabilities: vec![Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    // No id: the writer gives the create one, and records under it.
+    store
+        .enqueue_outline(M::CreateObligation {
+            obligation_id: None,
+            node_id: node,
+            kind: KIND_REQUIREMENT.into(),
+            after_id: None,
+            before: false,
+            section: None,
+            body: "first".into(),
+            phase: PHASE_REQUIREMENTS.into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let conn = schema::open_writer_connection(store.writer().db_path()).unwrap();
+    let obligation = direct_actions(&conn)
+        .iter()
+        .find(|a| a.entity == Entity::Obligation)
+        .unwrap()
+        .entity_id;
+
+    store
+        .enqueue_outline(M::UpdateObligationBody {
+            obligation_id: obligation,
+            body: "second".into(),
+        })
+        .unwrap();
+    // An edit that changes nothing is not recorded.
+    store
+        .enqueue_outline(M::UpdateObligationBody {
+            obligation_id: obligation,
+            body: "second".into(),
+        })
+        .unwrap();
+    store
+        .enqueue_outline(M::DeleteObligation {
+            obligation_id: obligation,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let actions = direct_actions(&conn);
+    let summary: Vec<_> = actions
+        .iter()
+        .map(|a| (a.entity, a.kind, a.actor, a.source.as_str()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (Entity::Node, ActionKind::Create, ActionActor::User, "user"),
+            (Entity::Obligation, ActionKind::Create, ActionActor::User, "user"),
+            (Entity::Obligation, ActionKind::Edit, ActionActor::User, "user"),
+            (Entity::Obligation, ActionKind::Delete, ActionActor::User, "user"),
+        ]
+    );
+    let (create, edit, delete) = (&actions[1], &actions[2], &actions[3]);
+    assert!(actions.iter().all(|a| a.conversation_id.is_none()));
+    assert_eq!(create.before, None);
+    assert_eq!(obligation_body(&create.after), Some("first"));
+    assert_eq!(obligation_body(&edit.before), Some("first"));
+    assert_eq!(obligation_body(&edit.after), Some("second"));
+    assert_eq!(obligation_body(&delete.before), Some("second"));
+    assert_eq!(delete.after, None);
+    assert_eq!(delete.node_id, Some(node));
+
+    // Ctrl+Z of the delete is recorded as its reversal.
+    store.undo_last().unwrap().expect("undo entry");
+    let actions = direct_actions(&conn);
+    let undo = actions.last().unwrap();
+    assert_eq!(undo.kind, ActionKind::Reverse);
+    assert_eq!(undo.reverses, Some(delete.id));
+    assert_eq!(undo.entity_id, obligation);
+    assert_eq!(undo.before, None);
+    assert_eq!(obligation_body(&undo.after), Some("second"));
+    assert_eq!(
+        ConversationRepo::new(&conn).action(delete.id).unwrap().unwrap().reversed_by,
+        Some(undo.id)
+    );
+
+    // And of the edit before it.
+    store.undo_last().unwrap().expect("undo entry");
+    let undo = direct_actions(&conn).pop().unwrap();
+    assert_eq!(undo.reverses, Some(edit.id));
+    assert_eq!(obligation_body(&undo.after), Some("first"));
+    assert_eq!(
+        ObligationRepo::new(&conn).get(obligation).unwrap().unwrap().body,
+        "first"
+    );
+
+    drop(conn);
+    drop(store);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn writes_outside_a_conversation_stay_out_of_its_projections() {
+    let fx = setup();
+    let ours = add_obligation(&fx.conn, fx.n1, "ours");
+    let theirs = add_obligation(&fx.conn, fx.n2, "theirs");
+    fx.agent(M::UpdateObligationBody {
+        obligation_id: ours,
+        body: "ours, edited".into(),
+    })
+    .unwrap();
+    // `tod-cli` as an actor that is not a conversation: recorded, as its own.
+    run(
+        &fx.conn,
+        "some-agent",
+        InterviewCommand::Outline {
+            mutation: M::UpdateObligationBody {
+                obligation_id: theirs,
+                body: "theirs, edited".into(),
+            },
+            target: None,
+        },
+    )
+    .unwrap();
+    let direct = direct_actions(&fx.conn);
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].source, "some-agent");
+    assert_eq!(direct[0].actor, ActionActor::Agent);
+    assert_eq!(direct[0].entity_id, theirs);
+
+    // The conversation's own write was recorded once, as the conversation's.
+    let repo = ConversationRepo::new(&fx.conn);
+    let own = repo.actions(fx.conv).unwrap();
+    assert_eq!(own.len(), 1);
+    assert_eq!(own[0].entity_id, ours);
+    assert_eq!(own[0].conversation_id, Some(fx.conv));
+    assert_eq!(own[0].source, SOURCE_CONVERSATION);
+
+    let changes = fx.changes();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, ours);
+    assert!(fx.reverse(vec![direct[0].id], false, false).is_err());
 }

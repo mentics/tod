@@ -4,7 +4,11 @@
 //! Every node, obligation, and plan-step mutation a conversation's agent makes
 //! (actor `conversation:<uuid>`) is recorded in the same transaction with the
 //! item's state before and after, so any action can be reversed later without
-//! the Ctrl+Z history. Writes are [`crate::interview::InterviewCommand`]
+//! the Ctrl+Z history. The same mutations made outside a conversation (direct
+//! edits, `tod-cli` as another actor) are recorded too, with no conversation
+//! ([`record_direct`]); Ctrl+Z of one is recorded as its reversal
+//! ([`record_undo`]). A conversation's projections read only its own rows.
+//! Writes are [`crate::interview::InterviewCommand`]
 //! variants, run on the fleet writer. Spec: `doc/conversation/spec.md`.
 
 mod inverse;
@@ -19,10 +23,14 @@ mod tests;
 pub use inverse::{inverse, reverse_actions};
 pub use project::{dependents, net_changes, stale};
 pub use record::{
-    apply_user_edit, classify, clear_flag, flag_item, normalize, record_and_execute, snapshot,
+    Applied, apply_user_edit, classify, clear_flag, flag_item, normalize, record_and_execute,
+    record_direct, record_undo, snapshot,
 };
 pub use repo::ConversationRepo;
 pub use types::*;
+
+/// `conversation_actions.source` of a row written by a conversation.
+pub const SOURCE_CONVERSATION: &str = "conversation";
 
 /// Prefix of the interview actor a conversation's agent writes as (D13).
 pub const ACTOR_PREFIX: &str = "conversation:";

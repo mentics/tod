@@ -29,6 +29,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: format!("Renamed task to \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskTitle {
                     id: id.clone(),
                     title: old.unwrap_or_default(),
@@ -47,6 +48,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated notes".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskNotes {
                     id: id.clone(),
                     notes: old,
@@ -62,6 +64,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated repository".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskRepo {
                     id: id.clone(),
                     repo: old,
@@ -77,6 +80,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated branch".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskBranch {
                     id: id.clone(),
                     branch: old,
@@ -92,6 +96,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated tags".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskTags {
                     id: id.clone(),
                     tags: old.unwrap_or_default(),
@@ -107,6 +112,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated linked issues".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskLinkedIssues {
                     id: id.clone(),
                     linked_issues: old.unwrap_or_default(),
@@ -122,6 +128,7 @@ pub fn capture_inverse_before(
                 id: Uuid::new_v4(),
                 label: "Updated linked PRs".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::UpdateTaskLinkedPrs {
                     id: id.clone(),
                     linked_prs: old.unwrap_or_default(),
@@ -149,6 +156,7 @@ pub fn capture_inverse_after_delete(
         id: Uuid::new_v4(),
         label,
         created_at: crate::outline::uuid_blob::now_ms(),
+        action_id: None,
         inverses: vec![FleetMutation::Outline(
             OutlineMutation::RestoreNodeSubtree {
                 archive_id,
@@ -172,6 +180,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: format!("Renamed \"{old}\" to \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::UpdateNodeTitle {
                     node_id: *node_id,
                     title: old,
@@ -184,6 +193,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: format!("Created \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::DeleteNode {
                     node_id: id,
                 })],
@@ -199,6 +209,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: format!("Moved \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::ReorderSibling {
                     node_id: *node_id,
                     direction: inverse,
@@ -224,6 +235,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: format!("Reparented \"{title}\""),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::ReparentNode {
                     node_id: *node_id,
                     parent_id: old_parent,
@@ -250,6 +262,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label,
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::SetNodeCollapsed {
                     node_id: *node_id,
                     collapsed: old,
@@ -275,6 +288,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: "Updated obligation".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(
                     OutlineMutation::UpdateObligationBody {
                         obligation_id: *obligation_id,
@@ -299,6 +313,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: "Updated visual design".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(
                     OutlineMutation::UpdateObligationVisualDesign {
                         obligation_id: *obligation_id,
@@ -335,6 +350,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: format!("Deleted obligation"),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::CreateObligation {
                     obligation_id: Some(*obligation_id),
                     node_id,
@@ -371,6 +387,7 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
                 id: Uuid::new_v4(),
                 label: "Moved obligation".into(),
                 created_at: crate::outline::uuid_blob::now_ms(),
+                action_id: None,
                 inverses: vec![FleetMutation::Outline(OutlineMutation::MoveObligation {
                     obligation_id: *obligation_id,
                     target_node_id: old_node_id,
@@ -450,6 +467,7 @@ pub fn capture_inverse_after_restore(
         id: Uuid::new_v4(),
         label,
         created_at: crate::outline::uuid_blob::now_ms(),
+        action_id: None,
         inverses: vec![FleetMutation::Outline(OutlineMutation::DeleteNode {
             node_id: root_id,
         })],

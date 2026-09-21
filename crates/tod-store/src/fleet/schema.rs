@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 50;
+pub const CURRENT_USER_VERSION: i32 = 51;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -339,6 +339,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 50 {
         migrate_v49_to_v50(conn)?;
         conn.pragma_update(None, "user_version", 50)?;
+    }
+    if version < 51 {
+        migrate_v50_to_v51(conn)?;
+        conn.pragma_update(None, "user_version", 51)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -871,6 +875,67 @@ fn migrate_v48_to_v49(conn: &Connection) -> Result<()> {
 /// when it entered `ready` (`crate::lifecycle_baseline`).
 fn migrate_v49_to_v50(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::lifecycle_baseline::CREATE_TABLE)?;
+    Ok(())
+}
+
+/// `conversation_actions` records every node, obligation, and plan-step
+/// change, not only a conversation's: `conversation_id` becomes nullable and
+/// `source` says who wrote a row outside a conversation (the fleet writer's
+/// actor, e.g. `user` for a direct edit). Dropping `NOT NULL` means a table
+/// rebuild; ids are copied as-is so `reverses` / `reversed_by` still line up.
+fn migrate_v50_to_v51(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_actions') WHERE name = 'source'")?
+        .exists([])?;
+    if present {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS conversation_actions_conv;
+         DROP INDEX IF EXISTS conversation_actions_entity;
+         ALTER TABLE conversation_actions RENAME TO conversation_actions_v50;",
+    )?;
+    tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+    tx.execute_batch(
+        "
+        CREATE TABLE conversation_actions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id BLOB REFERENCES conversations(id) ON DELETE CASCADE,
+            source          TEXT NOT NULL DEFAULT 'conversation',
+            turn_seq        INTEGER NOT NULL,
+            actor           TEXT NOT NULL CHECK (actor IN ('agent','user')),
+            kind            TEXT NOT NULL
+                CHECK (kind IN ('create','edit','move','delete','reverse')),
+            entity          TEXT NOT NULL CHECK (entity IN ('node','obligation','plan_step')),
+            entity_id       BLOB NOT NULL,
+            node_id         BLOB,
+            mutation        TEXT NOT NULL,
+            before          TEXT,
+            after           TEXT,
+            archive_id      BLOB,
+            reverses        INTEGER REFERENCES conversation_actions(id),
+            reversed_by     INTEGER REFERENCES conversation_actions(id),
+            at              INTEGER NOT NULL,
+            CHECK ((conversation_id IS NOT NULL) = (source = 'conversation'))
+        );
+        INSERT INTO conversation_actions
+            (id, conversation_id, source, turn_seq, actor, kind, entity, entity_id, node_id,
+             mutation, before, after, archive_id, reverses, reversed_by, at)
+        SELECT id, conversation_id, 'conversation', turn_seq, actor, kind, entity, entity_id,
+             node_id, mutation, before, after, archive_id, reverses, reversed_by, at
+        FROM conversation_actions_v50;
+        DROP TABLE conversation_actions_v50;
+        CREATE INDEX conversation_actions_conv
+            ON conversation_actions(conversation_id, id);
+        CREATE INDEX conversation_actions_entity
+            ON conversation_actions(entity_id);
+        ",
+    )?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())
 }
 
