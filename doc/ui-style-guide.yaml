@@ -234,6 +234,19 @@ styles:
     padding-y: related
     gap: related
     border-bottom: divider
+  callout-stale:
+    color: stale-text
+    background: stale-fill
+    border: stale-edge
+    radius: control
+    padding-x: inset
+    padding-y: related
+    gap: related
+  callout-stale-title:
+    extends: callout-stale
+    font: title
+    text-case: sentence
+    text-end: no-period
   scrim:
     background: scrim
 
@@ -323,6 +336,9 @@ tokens:
     warning-fill: "#3a2c2c"
     warning-icon: "#f0a0a0"
     warning-text: "#d9d9d9"
+    stale-fill: "#f9731626"
+    stale-edge: "#f97316"
+    stale-text: "#fdba74"
     notice-fill: "#ffff00"
     notice-text: "#000000"
     badge-fill: "#262626"

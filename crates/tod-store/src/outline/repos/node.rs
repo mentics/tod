@@ -219,6 +219,13 @@ impl<'a> NodeRepo<'a> {
              ON CONFLICT(node_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at",
             params![uuid_to_blob(node_id), state, now],
         )?;
+        // What `ready` onwards is built on; see `crate::lifecycle_baseline`.
+        let baselines = crate::lifecycle_baseline::BaselineRepo::new(self.conn);
+        match state {
+            "ready" => baselines.take(node_id)?,
+            "proposed" | "design" | "planning" => baselines.clear(node_id)?,
+            _ => {}
+        }
         Ok(())
     }
 

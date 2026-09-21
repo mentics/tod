@@ -72,6 +72,15 @@ pub mod color {
     pub fn scrim() -> Hsla {
         hex(0x00000073)
     }
+    pub fn stale_fill() -> Hsla {
+        hex(0xf9731626)
+    }
+    pub fn stale_edge() -> Hsla {
+        hex(0xf97316ff)
+    }
+    pub fn stale_text() -> Hsla {
+        hex(0xfdba74ff)
+    }
 }
 
 /// `tokens.font` sizes (weights are applied by the styles that use them).
@@ -189,6 +198,29 @@ pub fn badge<E: Styled>(el: E) -> E {
 /// `styles.panel`.
 pub fn panel<E: Styled>(el: E) -> E {
     el.bg(color::surface())
+}
+
+/// `styles.callout-stale`: an orange-edged block for a state that no longer
+/// holds and needs the user to act.
+pub fn callout_stale<E: Styled>(el: E) -> E {
+    el.flex()
+        .flex_col()
+        .gap(space::RELATED)
+        .px(space::INSET)
+        .py(space::RELATED)
+        .rounded(radius::CONTROL)
+        .border(size::BORDER)
+        .border_color(color::stale_edge())
+        .bg(color::stale_fill())
+        .text_size(font::DENSE)
+        .text_color(color::stale_text())
+}
+
+/// `styles.callout-stale-title`.
+pub fn callout_stale_title<E: Styled>(el: E) -> E {
+    el.text_size(font::BODY)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color::stale_text())
 }
 
 /// `styles.scrim`.

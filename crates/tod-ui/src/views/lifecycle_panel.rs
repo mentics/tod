@@ -20,12 +20,20 @@
 //! plan-step generation from `design`). Force advance and Revert both
 //! require a confirming second click (`GateCheckState::force_advance_armed` /
 //! `revert_armed`).
+//!
+//! When the node's state no longer holds — its obligations or plan changed
+//! since it left `planning`, or verification failed
+//! (`tod_core::lifecycle_validity`) — an orange callout at the top says why
+//! and offers **Move back** to the latest state that still holds. The app
+//! never moves it on its own: the change may yet be reversed, which clears
+//! the callout.
 
 use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
 };
@@ -41,6 +49,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::gate::GateAction;
+use tod_core::lifecycle_validity::{Regression, regression};
 use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
@@ -80,6 +89,7 @@ pub enum LifecyclePanelEvent {
 /// Keyboard-navigable stops within the panel, in visual order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
+    MoveBack,
     Implement,
     Verify,
     Review,
@@ -117,6 +127,9 @@ pub struct LifecyclePanelView {
     /// `None` outside `active`. Refreshed on open and each render, so the
     /// keyboard stops and the rendered control agree.
     active_control: Option<ActiveControl>,
+    /// The node's state no longer holds and should go back; re-read on open
+    /// and whenever the store changes.
+    regression: Option<Regression>,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
@@ -137,6 +150,33 @@ impl LifecyclePanelView {
             }
             cx.notify();
         });
+        // Obligations, plan steps, and verdicts change from anywhere — a
+        // conversation's agent, another panel: re-judge the state when they do.
+        let poll_entity = cx.weak_entity();
+        let fleet_for_poll = fleet.clone();
+        cx.spawn(async move |_, cx| {
+            let mut fleet_rx = fleet_for_poll.subscribe_changes();
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let mut changed = false;
+                while fleet_rx.try_recv().is_ok() {
+                    changed = true;
+                }
+                if changed {
+                    let Ok(()) = poll_entity.update(cx, |this: &mut Self, cx| {
+                        if this.refresh_regression() {
+                            this.clamp_focus_index();
+                            cx.notify();
+                        }
+                    }) else {
+                        break;
+                    };
+                }
+            }
+        })
+        .detach();
         Self {
             fleet,
             controller,
@@ -146,6 +186,7 @@ impl LifecyclePanelView {
             lifecycle_capable: false,
             implement_status: HashMap::new(),
             active_control: None,
+            regression: None,
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
@@ -154,6 +195,9 @@ impl LifecyclePanelView {
 
     fn stops(&self) -> Vec<LifecyclePanelStop> {
         let mut stops = Vec::new();
+        if self.regression.is_some() {
+            stops.push(LifecyclePanelStop::MoveBack);
+        }
         match self.active_control {
             Some(ActiveControl::Implement { .. }) => stops.push(LifecyclePanelStop::Implement),
             Some(ActiveControl::NoPlan) => {}
@@ -222,6 +266,7 @@ impl LifecyclePanelView {
 
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.focused_stop() {
+            Some(LifecyclePanelStop::MoveBack) => self.move_back(cx),
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
             Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
@@ -276,6 +321,28 @@ impl LifecyclePanelView {
         if state.is_some_and(enters_with_agent) {
             self.launch_node_conversation(ProtocolKind::OnEntry, window, cx);
         }
+    }
+
+    /// Re-judge whether the node's state still holds. `true` when the answer
+    /// changed.
+    fn refresh_regression(&mut self) -> bool {
+        let found = self
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .filter(|_| self.lifecycle_capable)
+            .and_then(|node| self.fleet.read(|conn| regression(conn, node)).ok().flatten());
+        let changed = found != self.regression;
+        self.regression = found;
+        changed
+    }
+
+    /// Send the node back to the latest state that still holds.
+    fn move_back(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.regression.as_ref().map(|r| r.target) else {
+            return;
+        };
+        self.with_controller(cx, |c, id, cx| c.revert_to(id, target, cx));
     }
 
     fn revert_lifecycle(&mut self, cx: &mut Context<Self>) {
@@ -689,6 +756,7 @@ impl LifecyclePanelView {
                         caps.contains(&tod_store::outline::types::Capability::Lifecycle)
                     });
                 self.refresh_active_control();
+                self.refresh_regression();
                 true
             }
             _ => false,
@@ -848,6 +916,42 @@ impl Render for LifecyclePanelView {
                     .text_color(muted)
                     .child(format!("Current: {}", self.lifecycle)),
             );
+
+            if let Some(found) = self.regression.clone() {
+                let focused = self.is_focused(LifecyclePanelStop::MoveBack);
+                let mut callout = style::callout_stale(div().w_full())
+                    .child(style::callout_stale_title(div()).child(format!(
+                        "This node is no longer {} — move it back to {}",
+                        self.lifecycle, found.target
+                    )))
+                    .child(div().child(
+                        "Its obligations, plan, or verification changed since it got here. \
+                         Reverse those changes, or move it back and take it forward again",
+                    ));
+                for (i, reason) in found.reasons.iter().enumerate() {
+                    callout = callout.child(selectable_text(
+                        format!("lifecycle-panel-regression-{i}"),
+                        format!("• {reason}"),
+                        window,
+                        cx,
+                    ));
+                }
+                body = body.child(
+                    callout.child(
+                        div()
+                            .w_full()
+                            .rounded_md()
+                            .when(focused, |el| el.border_1().border_color(list_active_border))
+                            .child(
+                                Button::new("lifecycle-panel-move-back")
+                                    .label(format!("Move back to {}", found.target))
+                                    .primary()
+                                    .w_full()
+                                    .on_click(cx.listener(|this, _, _, cx| this.move_back(cx))),
+                            ),
+                    ),
+                );
+            }
 
             if let Some(control) = self.active_control {
                 body = body.child(div().text_xs().font_semibold().child("Implementation"));

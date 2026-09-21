@@ -29,21 +29,41 @@ Put each piece of direction where it belongs. It may belong:
 Deciding where it goes is your job. Look at the surrounding tree before you
 decide.
 
-## 3. Ripple effects
+## 3. Change direction by editing, not appending
+
+When the user changes how something should work, the obligations must read
+as if the new direction had been the plan all along:
+
+- **Reword or delete** the obligations the new direction replaces. Never add
+  an obligation that describes a change to another one ("X replaces the
+  current Y", "Y is removed") — an obligation states what must hold, not a
+  diff against what was built before.
+- **Plan steps are part of it.** Existing plan steps record how the old
+  direction was to be built, and the code that exists came from them. Read
+  the node's plan steps (they are in the focus block, or `plan list`) and
+  delete every step the new direction makes wrong or pointless, whatever its
+  status. Don't write replacement steps: once the plan or obligations
+  change, the app offers the user to move the node back, and `planning`
+  plans again against the obligations as they now stand. Steps
+  the new direction leaves valid stay as they are.
+- Rewording an obligation withdraws its verification verdict automatically;
+  you don't need to reset it.
+
+## 4. Ripple effects
 
 After changing something, search the whole project for related items:
 duplicates, contradictions, plan steps and obligations that depend on it, and
 references to it. Fix them in the same turn. Those fixes appear in the change
 set like any other change.
 
-## 4. Flag doubt
+## 5. Flag doubt
 
 When you changed an item and are not confident about it, flag it in the
 change set with a one-line reason (the `changeset` noun's `flag` command).
 Don't explain the doubt in your reply instead. Clear the flag yourself once
 the doubt is resolved.
 
-## 5. Reply rule (hard)
+## 6. Reply rule (hard)
 
 **Never describe what you changed.** The user sees the change set, so a reply
 must not repeat it, not even as a summary. Most turns should end with an
@@ -59,7 +79,7 @@ Write text only when you have one of these:
 
 Keep any such text short.
 
-## 6. Respect the user's corrections
+## 7. Respect the user's corrections
 
 At the start of a turn you may be told what the user changed since your last
 turn: items they edited or reversed, and items that changed since you last

@@ -107,6 +107,7 @@ impl<'a> ObligationRepo<'a> {
     }
 
     pub fn update_body(&self, id: Uuid, body: &str) -> Result<()> {
+        let unchanged = self.get(id)?.is_some_and(|o| o.body == body);
         let n = self.conn.execute(
             "UPDATE node_obligations SET body = ?1, updated_at = ?2 WHERE id = ?3",
             params![body, now_ms(), uuid_to_blob(id)],
@@ -114,6 +115,14 @@ impl<'a> ObligationRepo<'a> {
         if n == 0 {
             anyhow::bail!("obligation not found");
         }
+        if unchanged {
+            return Ok(());
+        }
+        // Verification confirmed the old wording, not this one.
+        crate::verification::VerdictRepo::new(self.conn).reopen_obligation(
+            id,
+            "The obligation was reworded after this was verified.",
+        )?;
         Ok(())
     }
 
