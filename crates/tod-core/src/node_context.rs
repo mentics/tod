@@ -305,6 +305,16 @@ Constraints:
 /// plan and obligations only show where the work ended up — all `verified` —
 /// so without this a retrospective reads a hard road as a clean run. Empty
 /// when nothing of the kind was recorded.
+///
+/// Only the **current pass** is shown (`doc/conversation/incoming-changes.md`
+/// §9): what happened after the node's latest stored `learn` output, or
+/// everything when there is none. An earlier pass is summed up by its own
+/// output. The pass opens with the incoming-changes verdict that sent the
+/// node back, when one did. The records themselves are all kept; each is
+/// filtered by its own timestamp: a verdict or step note by when it was
+/// recorded, a review finding by when it was found, a gate evaluation by
+/// when it was last evaluated (only the latest per criterion is kept), and
+/// conversations by the turns sent in them since.
 pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
     use tod_store::conversation::{ConversationRepo, Focus, TurnRole};
     use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
@@ -312,12 +322,34 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
     use tod_store::review::ReviewRepo;
     use tod_store::verification::VerdictRepo;
 
+    let since = tod_store::learn::LearnRepo::new(conn).current_pass_start(node_id)?;
+    let in_pass = |at: i64| since.is_none_or(|since| at > since);
+
     let mut out = String::new();
+
+    let openers: Vec<_> = tod_store::incoming::IncomingRepo::new(conn)
+        .verdicts(node_id)?
+        .into_iter()
+        .filter(|verdict| verdict.target().is_some() && in_pass(verdict.created_at))
+        .collect();
+    for verdict in &openers {
+        let changes = crate::incoming::verdict_changes(conn, verdict)?;
+        let what = if changes.is_empty() {
+            "incoming changes affected its ".to_string() + &verdict.affects
+        } else {
+            lowercase_first(&changes.join("; "))
+        };
+        let _ = writeln!(
+            out,
+            "\nThis pass began because {what}. Note: {}",
+            one_line(&verdict.note)
+        );
+    }
 
     let verdicts: Vec<_> = VerdictRepo::new(conn)
         .history_for_node(node_id)?
         .into_iter()
-        .filter(|verdict| !verdict.is_verified())
+        .filter(|verdict| !verdict.is_verified() && in_pass(verdict.created_at))
         .collect();
     if !verdicts.is_empty() {
         out.push_str("\n### Obligations that did not verify first time\n\n");
@@ -338,7 +370,11 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
         let notes: Vec<_> = steps
             .list_notes(step.id)?
             .into_iter()
-            .filter(|note| note.status != STATUS_IMPLEMENTED && note.status != STATUS_VERIFIED)
+            .filter(|note| {
+                note.status != STATUS_IMPLEMENTED
+                    && note.status != STATUS_VERIFIED
+                    && in_pass(note.created_at)
+            })
             .collect();
         if notes.is_empty() {
             continue;
@@ -353,7 +389,11 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
         out.push_str(&step_lines);
     }
 
-    let findings = ReviewRepo::new(conn).list_for_node(node_id)?;
+    let findings: Vec<_> = ReviewRepo::new(conn)
+        .list_for_node(node_id)?
+        .into_iter()
+        .filter(|finding| in_pass(finding.created_at))
+        .collect();
     if !findings.is_empty() {
         out.push_str("\n### Code review findings\n\n");
         for finding in &findings {
@@ -376,7 +416,7 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
     let gates = GateRepo::new(conn);
     let mut gate_lines = String::new();
     for evaluation in gates.list_evaluations_for_node(node_id)? {
-        if evaluation.outcome == OUTCOME_PASS {
+        if evaluation.outcome == OUTCOME_PASS || !in_pass(evaluation.evaluated_at) {
             continue;
         }
         let label = gates
@@ -399,9 +439,13 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
     let mut runs: Vec<(String, usize, usize)> = Vec::new();
     for summary in conversations.list_for_focus(Focus::Node(node_id))? {
         let turns = conversations.turns(summary.conversation.id)?;
+        if !turns.iter().any(|t| in_pass(t.created_at)) {
+            continue;
+        }
         let sent = turns
             .iter()
             .filter(|t| matches!(t.role, TurnRole::User | TurnRole::Continuation))
+            .filter(|t| in_pass(t.created_at))
             .count();
         let kind = summary.conversation.protocol.as_str().to_string();
         match runs.iter_mut().find(|(k, _, _)| *k == kind) {
@@ -428,6 +472,15 @@ pub fn render_work_history(conn: &Connection, node_id: Uuid) -> Result<String> {
          and obligations above show only where it ended up; this is the record \
          of what failed, was sent back, or was found in review.\n{out}"
     ))
+}
+
+/// "Ancestor constraint …" as it reads mid-sentence.
+fn lowercase_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +545,78 @@ mod tests {
             .unwrap();
         assert!(history.contains("## Work history"), "{history}");
         assert!(history.contains("failed: Sync returns no tickets."), "{history}");
+    }
+
+    /// Each pass's history starts after the previous pass's stored `learn`
+    /// output, and opens with the verdict that sent the node back.
+    #[test]
+    fn work_history_covers_only_the_current_pass() {
+        use tod_store::learn::LearnRepo;
+        use tod_store::outline::uuid_blob::{now_ms, uuid_to_blob};
+        use tod_store::verification::VerdictRepo;
+        let dir = std::env::temp_dir().join(format!("tod-pass-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = tod_store::fleet::schema::open_writer_connection(&dir.join("tod.db")).unwrap();
+        let node = Uuid::new_v4();
+        let nodes = NodeRepo::new(&conn);
+        nodes.create_with_id(node, "n", "N").unwrap();
+        let ob = NodeObligation {
+            node_id: node,
+            ..obligation(7, KIND_REQUIREMENT, None)
+        };
+        ObligationRepo::new(&conn).insert(&ob).unwrap();
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
+
+        // Pass one: a failure, then learn → done.
+        VerdictRepo::new(&conn)
+            .record(node, ob.id, None, "failed", "Escape did nothing")
+            .unwrap();
+        nodes.set_lifecycle(node, "learn").unwrap();
+        LearnRepo::new(&conn).record_draft(node, "Missed Escape.").unwrap();
+        tick();
+        nodes.set_lifecycle(node, "done").unwrap();
+        tick();
+        let history = render_work_history(&conn, node).unwrap();
+        assert_eq!(history, "", "pass one is summed up by its output: {history}");
+
+        // An incoming change sends it back; pass two fails differently.
+        conn.execute(
+            "INSERT INTO incoming_verdicts (node_id, affects, note, action_ids, created_at)
+             VALUES (?1, 'plan', 'the confirm dialog had no Escape handling', '[]', ?2)",
+            rusqlite::params![uuid_to_blob(node), now_ms()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO incoming_verdicts (node_id, affects, note, action_ids, created_at)
+             VALUES (?1, 'none', 'unrelated', '[]', ?2)",
+            rusqlite::params![uuid_to_blob(node), now_ms()],
+        )
+        .unwrap();
+        nodes.set_lifecycle(node, "planning").unwrap();
+        VerdictRepo::new(&conn)
+            .record(node, ob.id, None, "failed", "Enter closed it too")
+            .unwrap();
+        let history = render_work_history(&conn, node).unwrap();
+        assert!(
+            history.contains(
+                "This pass began because incoming changes affected its plan. Note: the confirm dialog had no Escape handling"
+            ),
+            "{history}"
+        );
+        assert!(!history.contains("unrelated"), "a `none` verdict changed nothing: {history}");
+        assert!(history.contains("Enter closed it too"), "{history}");
+        assert!(!history.contains("Escape did nothing"), "pass one's: {history}");
+
+        // Through learn again: pass two's output closes it, and the opener
+        // belongs to the pass it opened.
+        nodes.set_lifecycle(node, "learn").unwrap();
+        tick();
+        nodes.set_lifecycle(node, "done").unwrap();
+        let outputs = LearnRepo::new(&conn).outputs(node).unwrap();
+        assert_eq!(outputs.iter().map(|o| o.pass).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(render_work_history(&conn, node).unwrap(), "");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -230,6 +230,27 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
     ],
 };
 
+/// The `learn` → `done` gate check: the node's retrospective. The same turn
+/// as [`GATE_CHECK`], with one scoped exception `surface/learn` states: it
+/// records the retrospective through `tod-cli learn` before it answers, so
+/// the app stores it per pass (`doc/conversation/incoming-changes.md` §9).
+pub const LEARN_GATE_CHECK: ContextRecipe = ContextRecipe {
+    name: "learn gate check",
+    layers: &[
+        "stance/one-shot",
+        "domain/outline",
+        "domain/obligations",
+        "domain/lifecycle",
+        "domain/capabilities",
+        "domain/plan",
+        "cli/intro",
+        "cli/learn",
+        "surface/gate-check",
+        "surface/learn",
+    ],
+    blocks: GATE_CHECK.blocks,
+};
+
 /// An on-entry turn. Unlike gate-check this turn does real work (e.g.
 /// `planning` writing plan steps), so its stance is `autonomous-session` and
 /// it loads the CLI nouns it writes through.
@@ -381,6 +402,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     REVIEW_SESSION,
     FIX_SESSION,
     GATE_CHECK,
+    LEARN_GATE_CHECK,
     ON_ENTRY,
     FLEET_AUTONOMOUS,
     INTERVIEW_AGENT,

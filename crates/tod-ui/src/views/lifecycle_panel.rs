@@ -193,6 +193,9 @@ pub struct LifecyclePanelView {
     /// (`doc/conversation/incoming-changes.md` §6); re-read on open and
     /// whenever the store changes.
     incoming: Vec<IncomingRow>,
+    /// The node's stored `learn` retrospectives, one per completed pass, as
+    /// `(pass, content)` (`doc/conversation/incoming-changes.md` §9).
+    learnings: Vec<(i64, String)>,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
@@ -237,7 +240,8 @@ impl LifecyclePanelView {
                 if changed {
                     let Ok(()) = poll_entity.update(cx, |this: &mut Self, cx| {
                         let incoming_changed = this.refresh_incoming();
-                        if this.refresh_regression() | incoming_changed {
+                        let learnings_changed = this.refresh_learnings();
+                        if this.refresh_regression() | incoming_changed | learnings_changed {
                             this.clamp_focus_index();
                             cx.notify();
                         }
@@ -261,6 +265,7 @@ impl LifecyclePanelView {
             active_control: None,
             regression: None,
             incoming: Vec::new(),
+            learnings: Vec::new(),
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
@@ -429,6 +434,24 @@ impl LifecyclePanelView {
             .collect::<Vec<_>>();
         let changed = rows != self.incoming;
         self.incoming = rows;
+        changed
+    }
+
+    /// Re-read the node's stored retrospectives. `true` when they changed.
+    fn refresh_learnings(&mut self) -> bool {
+        let rows = self
+            .node_uuid()
+            .and_then(|node| {
+                self.fleet
+                    .read(|conn| tod_store::learn::LearnRepo::new(conn).outputs(node))
+                    .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|output| (output.pass, output.content))
+            .collect::<Vec<_>>();
+        let changed = rows != self.learnings;
+        self.learnings = rows;
         changed
     }
 
@@ -643,6 +666,39 @@ impl LifecyclePanelView {
     /// and — when any failed — the way back to implementation. Failed steps
     /// are fixed in `active`, where implementation works each one again from
     /// its note; they cannot be fixed from here.
+    /// "Past learnings": the retrospective each completed pass stored, read
+    /// only. Earlier passes' work history is summed up here, not re-shown.
+    fn render_learnings(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mut section =
+            v_flex().gap_2().child(div().text_xs().font_semibold().child("Past learnings"));
+        for (pass, content) in self.learnings.iter().rev() {
+            let mut item = v_flex()
+                .gap_1()
+                .pl_2()
+                .border_l_2()
+                .border_color(cx.theme().border)
+                .child(div().text_xs().text_color(muted).child(format!("Pass {pass}")));
+            item = if content.is_empty() {
+                item.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("No retrospective was recorded."),
+                )
+            } else {
+                item.child(div().text_xs().child(selectable_text(
+                    format!("lifecycle-panel-learning-{pass}"),
+                    content.clone(),
+                    window,
+                    cx,
+                )))
+            };
+            section = section.child(item);
+        }
+        section.into_any_element()
+    }
+
     /// "N incoming changes": each net pending change the node inherits and
     /// has not been checked against.
     fn render_incoming(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -964,6 +1020,7 @@ impl LifecyclePanelView {
                 self.refresh_active_control();
                 self.refresh_regression();
                 self.refresh_incoming();
+                self.refresh_learnings();
                 true
             }
             _ => false,
@@ -1159,6 +1216,10 @@ impl Render for LifecyclePanelView {
 
             if !self.incoming.is_empty() {
                 body = body.child(self.render_incoming(window, cx));
+            }
+
+            if !self.learnings.is_empty() {
+                body = body.child(self.render_learnings(window, cx));
             }
 
             if let Some(control) = self.active_control {

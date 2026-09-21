@@ -82,9 +82,15 @@ pub fn build_gate_check_message(
     role_doc: &str,
 ) -> Result<String> {
     let node = node_selection(request);
+    // `learn` is the one gate check that records something: its retrospective.
+    let recipe = if request.from_state == "learn" {
+        &context_recipes::LEARN_GATE_CHECK
+    } else {
+        GATE_CHECK_RECIPE
+    };
     context_recipes::build_message(
         paths,
-        GATE_CHECK_RECIPE,
+        recipe,
         Some(role_doc),
         &dynamic_context(request, "gate_check", &node),
         &gate_check_tail(request),

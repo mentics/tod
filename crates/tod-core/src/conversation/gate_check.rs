@@ -376,6 +376,14 @@ impl Protocol for GateCheckProtocol {
         state_cwd(env)
     }
 
+    /// The node, so `tod-cli learn` records the `learn` retrospective on it
+    /// without being told.
+    fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
+        node_id(env)
+            .map(|node| vec![(super::implement::IMPLEMENT_NODE_ENV.to_string(), node.to_string())])
+            .unwrap_or_default()
+    }
+
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String> {
         let (from, to) = transition(env)?;
         let node = node_id(env)?;
@@ -419,6 +427,33 @@ pub fn settle_derived_criteria(fleet: &FleetStore, node: Uuid) -> Result<bool> {
     let (had_derived, agent_criteria) =
         GateCheckProtocol::agent_criteria(fleet, node, &lifecycle, next)?;
     Ok(!had_derived || !agent_criteria.is_empty())
+}
+
+/// `--agent mock`'s gate check: a pass, echoing the request's forward state
+/// and criteria. In `learn` it first records a retrospective through the
+/// same path `tod-cli learn record` takes, so a mock run stores a pass.
+pub fn mock_turn(
+    access: &impl super::mock::Access,
+    node: Uuid,
+    request: &str,
+) -> Result<String> {
+    let state = access.read(|conn| NodeRepo::new(conn).get_lifecycle(node))?;
+    if state.as_deref() == Some("learn") {
+        let history = access.read(|conn| crate::node_context::render_work_history(conn, node))?;
+        let content = if history.trim().is_empty() {
+            "Mock retrospective: a clean pass, nothing to improve.".to_string()
+        } else {
+            format!(
+                "Mock retrospective of this pass. What it went through:\n{}",
+                history.trim()
+            )
+        };
+        access.interview(InterviewCommand::RecordLearnOutput {
+            node_id: node,
+            content,
+        })?;
+    }
+    Ok(tod_agent::mock_gate_check_reply(request))
 }
 
 // ── On entry ────────────────────────────────────────────────────────────
@@ -488,6 +523,48 @@ mod tests {
             advanced_to: None,
         };
         assert_eq!(GateReportRecord::from_value(&record.to_value()), Some(record));
+    }
+
+    /// The mock `learn` gate check records a retrospective the way a real
+    /// agent does, and it is stored as the node's pass when it reaches `done`.
+    #[test]
+    fn the_mock_learn_check_records_the_pass() {
+        let fx = crate::interview::test_support::fixture();
+        let set = |state: &str| {
+            fx.outline(OutlineMutation::SetLifecycle {
+                node_id: fx.node,
+                state: state.into(),
+            });
+            fx.fleet.writer().flush().unwrap();
+        };
+        let access = super::super::mock::Direct {
+            fleet: &fx.fleet,
+            actor: ACTOR_USER.to_string(),
+        };
+        let request = "- **phase_purpose:** gate_check\n  forward_state: done\n";
+
+        set("released");
+        mock_turn(&access, fx.node, request).unwrap();
+        let draft = |fleet: &FleetStore| {
+            fleet
+                .read(|conn| tod_store::learn::LearnRepo::new(conn).draft(fx.node))
+                .unwrap()
+        };
+        assert_eq!(draft(&fx.fleet), None, "only `learn` records one");
+
+        set("learn");
+        let reply = mock_turn(&access, fx.node, request).unwrap();
+        assert!(reply.contains("result: pass"), "{reply}");
+        assert!(draft(&fx.fleet).is_some_and(|d| d.starts_with("Mock retrospective")));
+
+        set("done");
+        let outputs = fx
+            .fleet
+            .read(|conn| tod_store::learn::LearnRepo::new(conn).outputs(fx.node))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].pass, 1);
+        assert!(outputs[0].content.starts_with("Mock retrospective"));
     }
 
     #[test]

@@ -395,7 +395,7 @@ fn mock_session_reply(message_number: u32, turn: &SessionTurn) -> String {
 /// for the format this must satisfy). The mock has no lifecycle policy of
 /// its own — it just echoes the `forward_state` and criterion ids the
 /// request's `gate_check:` YAML block already carried.
-fn mock_gate_check_reply(message: &str) -> String {
+pub fn mock_gate_check_reply(message: &str) -> String {
     let forward_state = message
         .lines()
         .find_map(|line| line.trim().strip_prefix("forward_state:"))

@@ -243,6 +243,9 @@ pub enum InterviewCommand {
     },
     /// Clear a node's incoming entries with no verdict: they net to nothing.
     ClearIncoming { node_id: Uuid },
+    /// Record the `learn` retrospective of the pass a node is finishing
+    /// (`crate::learn`); stored for good when the node reaches `done`.
+    RecordLearnOutput { node_id: Uuid, content: String },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -891,6 +894,10 @@ pub fn execute(
         InterviewCommand::ClearIncoming { node_id } => {
             let cleared = crate::incoming::IncomingRepo::new(conn).clear_checked(*node_id)?;
             Ok(json!({ "cleared": cleared }))
+        }
+        InterviewCommand::RecordLearnOutput { node_id, content } => {
+            crate::learn::LearnRepo::new(conn).record_draft(*node_id, content)?;
+            Ok(json!({ "recorded": true }))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,

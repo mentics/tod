@@ -28,6 +28,7 @@ pub(crate) fn nouns() -> Vec<(&'static str, &'static str)> {
         ("review", crate::review::USAGE),
         ("verdicts", crate::verdicts::USAGE),
         ("incoming", crate::incoming::USAGE),
+        ("learn", crate::learn::USAGE),
         ("secrets", crate::secrets::USAGE),
     ]
 }
