@@ -219,6 +219,14 @@ styles:
     extends: text-dense-muted
     width: control-xsmall
 
+  # The left gutter a marking list's selection checkbox sits in. Fixed, so
+  # the rows' content — and a group heading's label, offset by the same
+  # amount — line up down the list.
+  list-mark-gutter:
+    width: mark-gutter
+    padding-top: snug
+    padding-left: inline
+
   # Columns: a list that is a table declares them once, so every row and the
   # header agree on where a value starts. A grouping is never a column — a
   # heading's label lines up with the content column, past the fixed ones.
@@ -456,6 +464,7 @@ tokens:
     pane-min: 320px
     group-row: 28px
     group-indent: 16px
+  mark-gutter: 24px
     # Tallest a summary card's list grows before it scrolls.
     summary-list-max: 240px
     toast-min: 240px

@@ -172,6 +172,7 @@ pub mod size {
     pub const CONTROL_XSMALL: Pixels = px(20.);
     pub const GROUP_ROW: Pixels = px(28.);
     pub const GROUP_INDENT: Pixels = px(16.);
+    pub const MARK_GUTTER: Pixels = px(24.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
 }
 
@@ -285,6 +286,16 @@ pub fn list_group<E: Styled>(el: E, depth: usize, lead: Pixels) -> E {
         1 => el.font_weight(FontWeight::SEMIBOLD),
         _ => el.font_weight(FontWeight::MEDIUM),
     }
+}
+
+/// `styles.list-mark-gutter`: the left gutter a marking list's selection
+/// checkbox sits in. Fixed, so the rows' content — and a group heading's
+/// label, which is offset by the same amount — line up down the list.
+pub fn list_mark_gutter<E: Styled>(el: E) -> E {
+    el.w(size::MARK_GUTTER)
+        .flex_shrink_0()
+        .pt(space::SNUG)
+        .pl(space::INLINE)
 }
 
 /// `styles.list-cell`: one column's cell. A fixed column holds the same

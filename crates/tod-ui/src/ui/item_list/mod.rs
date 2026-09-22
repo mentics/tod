@@ -335,19 +335,24 @@ impl<T, G> ItemList<T, G> {
         self
     }
 
-    /// How wide the fixed columns ahead of the content column are — where a
-    /// group heading's label starts.
+    /// Where a group heading's label starts: past the selection gutter and
+    /// the fixed columns, so it lines up with the content beneath it.
     fn lead_width(&self) -> gpui::Pixels {
         let gap = if self.columns.is_empty() {
             px(0.)
         } else {
             style::space::INLINE
         };
+        let mark = if self.marking {
+            style::size::MARK_GUTTER
+        } else {
+            px(0.)
+        };
         self.columns
             .iter()
             .take_while(|column| column.width.is_some())
             .filter_map(|column| column.width)
-            .fold(px(0.), |total, width| total + width + gap)
+            .fold(mark, |total, width| total + width + gap)
     }
 
     /// Let the user select several items: each row carries a checkbox, and
@@ -806,7 +811,7 @@ impl<T, G> ItemList<T, G> {
             .w_full()
             .items_start()
             .child(
-                div().flex_shrink_0().pt(px(6.)).pl(px(4.)).child(
+                style::list_mark_gutter(div()).child(
                     Checkbox::new(("item-list-mark", row_ix))
                         .checked(marked)
                         .on_click(move |_, _, cx| {
@@ -1083,6 +1088,16 @@ mod tests {
         ]);
         let gap = style::space::INLINE;
         assert_eq!(list.lead_width(), px(64.) + gap + px(120.) + gap);
+    }
+
+    #[test]
+    fn a_marking_list_indents_its_headings_past_the_checkbox_gutter() {
+        // The selection checkbox sits outside the row, so without this the
+        // heading's label and the text beneath it would not line up.
+        let plain: ItemList<&str, ()> = ItemList::new();
+        let marking: ItemList<&str, ()> = ItemList::new().with_marking();
+        assert_eq!(plain.lead_width(), px(0.));
+        assert_eq!(marking.lead_width(), style::size::MARK_GUTTER);
     }
 
     #[test]
