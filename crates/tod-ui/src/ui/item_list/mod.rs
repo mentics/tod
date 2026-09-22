@@ -1,0 +1,835 @@
+//! The item list: one list component for every list-shaped view in the app.
+//!
+//! A list of items that *happens* to group. Inside any group, however deeply
+//! nested, there is one flat run of items and an item never owns another item
+//! — that, not how deep the grouping goes, is what separates this from the
+//! node tree, where nodes own nodes. See `doc/ui/item-list.md`.
+//!
+//! The component owns the cursor, the selection, the collapsed groups, the
+//! scrolling, the group headings, and the key set
+//! ([`keyboard::bind_item_list_keys`]). The caller owns what an item *is*: it
+//! flattens its data into [`ItemListRow`]s and renders each item, and it
+//! carries out the changes the keys ask for.
+//!
+//! The same item affords the same actions wherever it is shown, so a list
+//! leaves a capability out only where the data cannot take it.
+
+pub mod keyboard;
+pub mod search;
+
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use crate::ui::style;
+use crate::views::rows::{RowAction, RowHost};
+use gpui::{
+    AnyElement, App, Div, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollHandle,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    px,
+};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{Input, InputState};
+use gpui_component::scroll::Scrollbar;
+use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
+
+pub use keyboard::{ItemListKeys, bind_item_list_keys, bind_single_line_commit};
+
+/// Height of a group heading, and the unit page/viewport maths goes by.
+pub const GROUP_ROW_HEIGHT: gpui::Pixels = px(28.);
+
+/// How far each grouping level indents.
+const INDENT: gpui::Pixels = px(16.);
+
+/// What the user did to the list itself. A host's action type converts from
+/// it, so a view keeps one action queue for rows and list alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemListEvent {
+    /// Clicked a row; `row_ix` is where it was rendered.
+    Select { row_ix: usize },
+    /// Clicked a group heading's chevron.
+    ToggleGroup { key: String },
+}
+
+/// A group heading: a label over a run of items, never an item itself.
+pub struct GroupSpec {
+    pub key: String,
+    /// Nesting of the *group*. Open-ended: a list groups by as many levels as
+    /// it needs. Items carry no depth.
+    pub depth: usize,
+    pub label: SharedString,
+    /// Shown after the label as `(n)`.
+    pub count: Option<usize>,
+    pub collapsed: bool,
+    /// The name is being typed (a rename, or a group not created yet).
+    pub editing: bool,
+    /// A group that cannot be collapsed yet (one being created) has no
+    /// chevron.
+    pub chevron: bool,
+    /// Buttons at the end of the heading, always visible.
+    pub actions: Vec<RowAction>,
+    /// Double-clicking the heading's label when it is under the cursor.
+    pub on_rename: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+}
+
+impl GroupSpec {
+    pub fn new(key: impl Into<String>, depth: usize, label: impl Into<SharedString>) -> Self {
+        Self {
+            key: key.into(),
+            depth,
+            label: label.into(),
+            count: None,
+            collapsed: false,
+            editing: false,
+            chevron: true,
+            actions: Vec::new(),
+            on_rename: None,
+        }
+    }
+
+    pub fn count(mut self, count: usize) -> Self {
+        self.count = Some(count);
+        self
+    }
+
+    pub fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+
+    pub fn editing(mut self, editing: bool) -> Self {
+        self.editing = editing;
+        self
+    }
+
+    pub fn chevron(mut self, chevron: bool) -> Self {
+        self.chevron = chevron;
+        self
+    }
+
+    pub fn action(mut self, action: RowAction) -> Self {
+        self.actions.push(action);
+        self
+    }
+
+    pub fn on_rename(mut self, on_rename: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_rename = Some(Rc::new(on_rename));
+        self
+    }
+}
+
+/// One row: a group heading, or an item carrying the caller's payload.
+pub enum ItemListRow<T> {
+    Group(GroupSpec),
+    Item { key: String, item: T },
+}
+
+impl<T> ItemListRow<T> {
+    pub fn item(key: impl Into<String>, item: T) -> Self {
+        Self::Item {
+            key: key.into(),
+            item,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Group(group) => &group.key,
+            Self::Item { key, .. } => key,
+        }
+    }
+
+    pub fn as_item(&self) -> Option<&T> {
+        match self {
+            Self::Item { item, .. } => Some(item),
+            Self::Group(_) => None,
+        }
+    }
+
+    pub fn as_group(&self) -> Option<&GroupSpec> {
+        match self {
+            Self::Group(group) => Some(group),
+            Self::Item { .. } => None,
+        }
+    }
+
+    fn depth(&self) -> Option<usize> {
+        self.as_group().map(|group| group.depth)
+    }
+}
+
+/// How an item row is being shown, for the caller's renderer.
+pub struct ItemRowState<'a> {
+    /// Where the row was rendered, reported back on select.
+    pub row_ix: usize,
+    pub key: &'a str,
+    /// Under the cursor.
+    pub highlighted: bool,
+    /// In the selection (multi-select).
+    pub marked: bool,
+    /// Being edited.
+    pub editing: bool,
+}
+
+/// What [`ItemList::collapse_step`] did, so the caller knows whether to
+/// rebuild its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollapseStep {
+    /// The group under the cursor collapsed; rebuild the rows.
+    Collapsed,
+    /// The cursor moved to the enclosing group.
+    MovedToParent,
+    Nothing,
+}
+
+/// The list's own state: rows, cursor, selection, collapsed groups, scroll.
+pub struct ItemList<T> {
+    rows: Vec<ItemListRow<T>>,
+    cursor: Option<usize>,
+    cursor_key: Option<String>,
+    marked: HashSet<String>,
+    collapsed: HashSet<String>,
+    editing_key: Option<String>,
+    /// The field a group's name is typed into, and the tag that scopes plain
+    /// Enter to it.
+    group_editor: Option<gpui::Entity<InputState>>,
+    group_edit_tag: Option<&'static str>,
+    scroll: ScrollHandle,
+    drag: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
+    context_menu: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
+}
+
+impl<T> Default for ItemList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> ItemList<T> {
+    pub fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            cursor: None,
+            cursor_key: None,
+            marked: HashSet::new(),
+            collapsed: HashSet::new(),
+            editing_key: None,
+            group_editor: None,
+            group_edit_tag: None,
+            scroll: ScrollHandle::new(),
+            drag: None,
+            context_menu: None,
+        }
+    }
+
+    /// Where a group's name is typed, and the tag that scopes plain Enter to
+    /// that field (see [`keyboard::bind_single_line_commit`]).
+    pub fn with_group_editor(
+        mut self,
+        editor: gpui::Entity<InputState>,
+        tag: &'static str,
+    ) -> Self {
+        self.group_editor = Some(editor);
+        self.group_edit_tag = Some(tag);
+        self
+    }
+
+    /// Make item rows draggable. The hook applies the caller's own payload
+    /// type to the row the component built, so the gesture lives here once
+    /// while the payload stays the caller's.
+    pub fn with_drag(
+        mut self,
+        drag: impl Fn(&T, Stateful<Div>) -> Stateful<Div> + 'static,
+    ) -> Self {
+        self.drag = Some(Rc::new(drag));
+        self
+    }
+
+    /// Give item rows a context menu, the same way.
+    pub fn with_context_menu(
+        mut self,
+        menu: impl Fn(&T, Stateful<Div>) -> Stateful<Div> + 'static,
+    ) -> Self {
+        self.context_menu = Some(Rc::new(menu));
+        self
+    }
+
+    // -- rows ------------------------------------------------------------
+
+    /// Replace the rows, keeping the cursor on the same *key* rather than the
+    /// same index, so a change that reorders rows does not move it. Falls back
+    /// to the first row. Selection drops keys that are gone.
+    pub fn set_rows(&mut self, rows: Vec<ItemListRow<T>>) {
+        let previous = self.cursor;
+        let ix = self
+            .cursor_key
+            .as_ref()
+            .and_then(|key| rows.iter().position(|row| row.key() == key.as_str()))
+            .or_else(|| (!rows.is_empty()).then_some(0));
+        self.rows = rows;
+        match ix {
+            Some(ix) => {
+                self.cursor = Some(ix);
+                self.cursor_key = Some(self.rows[ix].key().to_string());
+            }
+            None => {
+                self.cursor = None;
+                self.cursor_key = None;
+            }
+        }
+        self.marked
+            .retain(|key| self.rows.iter().any(|row| row.key() == key.as_str()));
+        if let Some(ix) = self.cursor {
+            if previous != Some(ix) {
+                self.scroll.scroll_to_item(ix);
+            }
+        }
+    }
+
+    pub fn rows(&self) -> &[ItemListRow<T>] {
+        &self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Item rows only, in order.
+    pub fn items(&self) -> impl Iterator<Item = &T> {
+        self.rows.iter().filter_map(ItemListRow::as_item)
+    }
+
+    // -- cursor ----------------------------------------------------------
+
+    pub fn cursor(&self) -> Option<usize> {
+        self.cursor
+    }
+
+    pub fn cursor_key(&self) -> Option<&str> {
+        self.cursor_key.as_deref()
+    }
+
+    pub fn cursor_row(&self) -> Option<&ItemListRow<T>> {
+        self.cursor.and_then(|ix| self.rows.get(ix))
+    }
+
+    /// The item under the cursor, when the cursor is on an item rather than a
+    /// group heading.
+    pub fn cursor_item(&self) -> Option<&T> {
+        self.cursor_row().and_then(ItemListRow::as_item)
+    }
+
+    /// Put the cursor on `key` when the next [`set_rows`](Self::set_rows)
+    /// finds it — how a caller keeps the cursor on something it just created,
+    /// renamed, or was asked to reveal.
+    pub fn set_cursor_key(&mut self, key: Option<String>) {
+        self.cursor_key = key;
+    }
+
+    /// Move the cursor to `row_ix`. `false` when it was already there.
+    pub fn set_cursor(&mut self, row_ix: usize) -> bool {
+        if self.cursor == Some(row_ix) || row_ix >= self.rows.len() {
+            return false;
+        }
+        self.cursor = Some(row_ix);
+        self.cursor_key = Some(self.rows[row_ix].key().to_string());
+        self.scroll.scroll_to_item(row_ix);
+        true
+    }
+
+    /// Move the cursor by `delta` rows, stopping at either end.
+    pub fn move_cursor(&mut self, delta: i32) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
+        let current = self.cursor.unwrap_or(0);
+        let next = if delta < 0 {
+            current.saturating_sub((-delta) as usize)
+        } else {
+            (current + delta as usize).min(self.rows.len() - 1)
+        };
+        self.set_cursor(next)
+    }
+
+    /// A page is as many rows as the viewport shows.
+    pub fn page_rows(viewport_height: gpui::Pixels) -> usize {
+        (viewport_height / GROUP_ROW_HEIGHT).floor().max(1.) as usize
+    }
+
+    pub fn cursor_home(&mut self) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
+        let moved = self.set_cursor(0);
+        self.scroll.scroll_to_top_of_item(0);
+        moved
+    }
+
+    pub fn cursor_end(&mut self) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
+        let last = self.rows.len() - 1;
+        let moved = self.set_cursor(last);
+        self.scroll.scroll_to_top_of_item(last);
+        moved
+    }
+
+    pub fn scroll_to_cursor(&self) {
+        if let Some(ix) = self.cursor {
+            self.scroll.scroll_to_item(ix);
+        }
+    }
+
+    // -- selection -------------------------------------------------------
+
+    /// Add or remove the row under the cursor from the selection.
+    pub fn toggle_mark(&mut self) {
+        let Some(key) = self.cursor_key.clone() else {
+            return;
+        };
+        if !self.marked.remove(&key) {
+            self.marked.insert(key);
+        }
+    }
+
+    pub fn is_marked(&self, key: &str) -> bool {
+        self.marked.contains(key)
+    }
+
+    /// The selection, in row order; the row under the cursor when nothing is
+    /// marked, so an action works on "this one" without a marking step.
+    pub fn selection(&self) -> Vec<&str> {
+        if self.marked.is_empty() {
+            return self.cursor_key.as_deref().into_iter().collect();
+        }
+        self.rows
+            .iter()
+            .map(ItemListRow::key)
+            .filter(|key| self.marked.contains(*key))
+            .collect()
+    }
+
+    pub fn clear_marks(&mut self) {
+        self.marked.clear();
+    }
+
+    // -- groups ----------------------------------------------------------
+
+    pub fn is_collapsed(&self, key: &str) -> bool {
+        self.collapsed.contains(key)
+    }
+
+    pub fn set_collapsed(&mut self, key: impl Into<String>, collapsed: bool) {
+        let key = key.into();
+        if collapsed {
+            self.collapsed.insert(key);
+        } else {
+            self.collapsed.remove(&key);
+        }
+    }
+
+    pub fn toggle_collapsed(&mut self, key: &str) {
+        if !self.collapsed.remove(key) {
+            self.collapsed.insert(key.to_string());
+        }
+    }
+
+    pub fn expand_all(&mut self) {
+        self.collapsed.clear();
+    }
+
+    /// Carry a group's collapsed state over to the key it now has (a rename).
+    pub fn rekey_collapsed(&mut self, old: &str, new: impl Into<String>) {
+        if self.collapsed.remove(old) {
+            self.collapsed.insert(new.into());
+        }
+    }
+
+    /// Left: collapse the group under the cursor, else move to the group that
+    /// encloses the cursor.
+    pub fn collapse_step(&mut self) -> CollapseStep {
+        let Some(ix) = self.cursor else {
+            return CollapseStep::Nothing;
+        };
+        match self.rows.get(ix) {
+            Some(ItemListRow::Group(group)) if !self.collapsed.contains(&group.key) => {
+                let key = group.key.clone();
+                self.collapsed.insert(key);
+                CollapseStep::Collapsed
+            }
+            Some(_) => {
+                if self.move_cursor_to_parent(ix) {
+                    CollapseStep::MovedToParent
+                } else {
+                    CollapseStep::Nothing
+                }
+            }
+            None => CollapseStep::Nothing,
+        }
+    }
+
+    /// Right: expand the collapsed group under the cursor. `true` when
+    /// something changed and the rows need rebuilding.
+    pub fn expand_step(&mut self) -> bool {
+        let Some(ItemListRow::Group(group)) = self.cursor.and_then(|ix| self.rows.get(ix)) else {
+            return false;
+        };
+        self.collapsed.remove(&group.key)
+    }
+
+    /// The group that encloses row `ix`: the nearest heading above it that is
+    /// shallower than it (or any heading, for an item).
+    pub fn parent_group_key(&self, ix: usize) -> Option<&str> {
+        let own_depth = self.rows.get(ix)?.depth();
+        self.rows[..ix].iter().rev().find_map(|row| {
+            let group = row.as_group()?;
+            match own_depth {
+                Some(depth) if group.depth >= depth => None,
+                _ => Some(group.key.as_str()),
+            }
+        })
+    }
+
+    fn move_cursor_to_parent(&mut self, ix: usize) -> bool {
+        let Some(key) = self.parent_group_key(ix).map(str::to_string) else {
+            return false;
+        };
+        let Some(parent_ix) = self.rows.iter().position(|row| row.key() == key.as_str()) else {
+            return false;
+        };
+        self.set_cursor(parent_ix)
+    }
+
+    // -- editing ---------------------------------------------------------
+
+    /// The row whose text is being edited, if any.
+    pub fn editing_key(&self) -> Option<&str> {
+        self.editing_key.as_deref()
+    }
+
+    pub fn set_editing_key(&mut self, key: Option<String>) {
+        self.editing_key = key;
+    }
+
+    pub fn is_editing(&self) -> bool {
+        self.editing_key.is_some()
+    }
+
+    // -- rendering -------------------------------------------------------
+
+    /// The scrolling list: every row, plus the scrollbar.
+    ///
+    /// `render_item` draws one item; the component wraps it with the row's id,
+    /// its drag and its context menu, and draws the group headings itself.
+    pub fn render<A, F>(
+        &self,
+        id: &'static str,
+        host: &RowHost<A>,
+        render_item: F,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement
+    where
+        A: From<ItemListEvent> + 'static,
+        F: Fn(&T, ItemRowState<'_>, &mut Window, &mut App) -> AnyElement,
+    {
+        let mut elements = Vec::with_capacity(self.rows.len());
+        for (row_ix, row) in self.rows.iter().enumerate() {
+            let highlighted = self.cursor == Some(row_ix);
+            let content = match row {
+                ItemListRow::Group(group) => {
+                    self.render_group(group, row_ix, highlighted, host, cx)
+                }
+                ItemListRow::Item { key, item } => {
+                    let state = ItemRowState {
+                        row_ix,
+                        key,
+                        highlighted,
+                        marked: self.marked.contains(key),
+                        editing: self.editing_key.as_deref() == Some(key.as_str()),
+                    };
+                    render_item(item, state, window, cx)
+                }
+            };
+            let mut wrapper = div().id(("item-list-row", row_ix)).w_full().child(content);
+            if let Some(item) = row.as_item() {
+                if let Some(drag) = &self.drag {
+                    wrapper = drag(item, wrapper);
+                }
+                if let Some(menu) = &self.context_menu {
+                    wrapper = menu(item, wrapper);
+                }
+            }
+            elements.push(wrapper.into_any_element());
+        }
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .child(
+                div()
+                    .id(id)
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .children(elements),
+            )
+            .child(
+                // Narrow right-edge strip, not the full row area: the
+                // Scrollbar element installs a click-to-jump handler across
+                // its entire bounds, which would otherwise swallow every
+                // mouse click meant for the rows below.
+                div()
+                    .occlude()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(px(16.))
+                    .child(Scrollbar::vertical(&self.scroll)),
+            )
+            .into_any_element()
+    }
+
+    fn render_group<A>(
+        &self,
+        group: &GroupSpec,
+        row_ix: usize,
+        highlighted: bool,
+        host: &RowHost<A>,
+        cx: &mut App,
+    ) -> AnyElement
+    where
+        A: From<ItemListEvent> + 'static,
+    {
+        let theme = cx.theme();
+        let border = theme.muted_foreground.opacity(0.5);
+        let select_host = host.clone();
+        let mut header = h_flex()
+            .h(GROUP_ROW_HEIGHT)
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .pl(px(8.) + INDENT * group.depth as f32)
+            .border_b_1()
+            .border_color(border)
+            // The outermost level of grouping reads as a band, the inner ones
+            // as headings within it.
+            .when(group.depth == 0, |el| el.bg(theme.secondary.opacity(0.5)))
+            .when(highlighted, style::highlighted)
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                select_host.push(ItemListEvent::Select { row_ix }.into(), cx);
+            });
+
+        if group.chevron {
+            let toggle_host = host.clone();
+            let key = group.key.clone();
+            let collapsed = group.collapsed;
+            header = header.child(
+                div()
+                    .w(px(16.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        toggle_host.push(
+                            ItemListEvent::ToggleGroup {
+                                key: key.clone(),
+                            }
+                            .into(),
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    })
+                    .child(if collapsed { "▸" } else { "▾" }),
+            );
+        }
+
+        if group.editing {
+            if let Some(editor) = &self.group_editor {
+                let mut field = div().flex_1().min_w_0();
+                if let Some(tag) = self.group_edit_tag {
+                    field = field.key_context(tag);
+                }
+                return header
+                    .child(field.child(Input::new(editor).w_full()))
+                    .into_any_element();
+            }
+        }
+
+        let label = match group.count {
+            Some(count) => format!("{} ({count})", group.label),
+            None => group.label.to_string(),
+        };
+        let mut text = div().flex_1().min_w_0().child(label);
+        text = match group.depth {
+            0 => text.text_sm().font_bold(),
+            1 => text.text_sm().font_semibold(),
+            _ => text.text_sm().font_medium(),
+        };
+        if let Some(on_rename) = group.on_rename.clone() {
+            // Renaming from the heading follows the cursor, as double-click to
+            // edit does on an item row.
+            text = text.when(highlighted, |el| {
+                el.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    if event.click_count >= 2 {
+                        on_rename(window, cx);
+                        cx.stop_propagation();
+                    }
+                })
+            });
+        }
+        header = header.child(text);
+
+        for action in &group.actions {
+            let on_click = action.on_click.clone();
+            header = header.child(
+                Button::new(gpui::ElementId::Name(
+                    format!("group-action-{}-{}", group.key, action.id).into(),
+                ))
+                .label(action.label.clone())
+                .ghost()
+                .xsmall()
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_click(window, cx);
+                }),
+            );
+        }
+        header.into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// phase 0
+    ///   kind 1
+    ///     section 2
+    ///       item, item
+    fn fixture() -> ItemList<&'static str> {
+        let mut list = ItemList::new();
+        list.set_rows(vec![
+            ItemListRow::Group(GroupSpec::new("phase", 0, "Requirements phase").count(2)),
+            ItemListRow::Group(GroupSpec::new("kind", 1, "Requirements").count(2)),
+            ItemListRow::Group(GroupSpec::new("section", 2, "Offline").count(2)),
+            ItemListRow::item("a", "Works offline"),
+            ItemListRow::item("b", "Syncs later"),
+        ]);
+        list
+    }
+
+    #[test]
+    fn the_cursor_starts_on_the_first_row_and_stops_at_either_end() {
+        let mut list = fixture();
+        assert_eq!(list.cursor(), Some(0));
+        assert!(!list.move_cursor(-1));
+        list.move_cursor(99);
+        assert_eq!(list.cursor(), Some(4));
+        assert!(!list.move_cursor(1));
+    }
+
+    #[test]
+    fn the_cursor_follows_its_key_when_the_rows_change() {
+        let mut list = fixture();
+        list.move_cursor(4);
+        assert_eq!(list.cursor_key(), Some("b"));
+        // "b" moved above "a" and a group was added above them both.
+        list.set_rows(vec![
+            ItemListRow::Group(GroupSpec::new("phase", 0, "Requirements phase")),
+            ItemListRow::Group(GroupSpec::new("kind", 1, "Requirements")),
+            ItemListRow::item("b", "Syncs later"),
+            ItemListRow::item("a", "Works offline"),
+        ]);
+        assert_eq!(list.cursor(), Some(2));
+        assert_eq!(list.cursor_key(), Some("b"));
+    }
+
+    #[test]
+    fn a_cursor_key_that_is_gone_falls_back_to_the_first_row() {
+        let mut list = fixture();
+        list.move_cursor(3);
+        list.set_rows(vec![ItemListRow::item("c", "Something else")]);
+        assert_eq!(list.cursor_key(), Some("c"));
+        list.set_rows(Vec::new());
+        assert_eq!(list.cursor(), None);
+        assert_eq!(list.cursor_key(), None);
+    }
+
+    #[test]
+    fn left_collapses_the_group_then_walks_out_to_the_enclosing_one() {
+        let mut list = fixture();
+        // On an item: out to its section.
+        list.move_cursor(3);
+        assert_eq!(list.collapse_step(), CollapseStep::MovedToParent);
+        assert_eq!(list.cursor_key(), Some("section"));
+        // On an expanded group: collapse it.
+        assert_eq!(list.collapse_step(), CollapseStep::Collapsed);
+        assert!(list.is_collapsed("section"));
+        // On a collapsed group: out to the group above it, whatever the depth
+        // distance.
+        assert_eq!(list.collapse_step(), CollapseStep::MovedToParent);
+        assert_eq!(list.cursor_key(), Some("kind"));
+        assert_eq!(list.collapse_step(), CollapseStep::Collapsed);
+        assert_eq!(list.collapse_step(), CollapseStep::MovedToParent);
+        assert_eq!(list.cursor_key(), Some("phase"));
+        // The outermost group has nowhere to walk out to.
+        assert_eq!(list.collapse_step(), CollapseStep::Collapsed);
+        assert_eq!(list.collapse_step(), CollapseStep::Nothing);
+    }
+
+    #[test]
+    fn right_expands_only_a_collapsed_group() {
+        let mut list = fixture();
+        assert!(!list.expand_step());
+        list.set_collapsed("phase", true);
+        assert!(list.expand_step());
+        assert!(!list.is_collapsed("phase"));
+        // On an item, never.
+        list.move_cursor(3);
+        assert!(!list.expand_step());
+    }
+
+    #[test]
+    fn the_selection_is_the_cursor_until_something_is_marked() {
+        let mut list = fixture();
+        list.move_cursor(3);
+        assert_eq!(list.selection(), vec!["a"]);
+        list.toggle_mark();
+        list.move_cursor(1);
+        list.toggle_mark();
+        assert_eq!(list.selection(), vec!["a", "b"]);
+        list.toggle_mark();
+        assert_eq!(list.selection(), vec!["a"]);
+        list.clear_marks();
+        assert_eq!(list.selection(), vec!["b"]);
+    }
+
+    #[test]
+    fn a_marked_row_that_goes_away_leaves_the_selection() {
+        let mut list = fixture();
+        list.move_cursor(3);
+        list.toggle_mark();
+        list.set_rows(vec![ItemListRow::item("b", "Syncs later")]);
+        assert!(!list.is_marked("a"));
+        assert_eq!(list.selection(), vec!["b"]);
+    }
+
+    #[test]
+    fn a_renamed_group_keeps_its_collapsed_state() {
+        let mut list = fixture();
+        list.set_collapsed("section", true);
+        list.rekey_collapsed("section", "section:renamed");
+        assert!(!list.is_collapsed("section"));
+        assert!(list.is_collapsed("section:renamed"));
+    }
+}

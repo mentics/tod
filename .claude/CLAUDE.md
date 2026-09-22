@@ -306,6 +306,10 @@ GPUI views live under `views/` (task list, obligations, agent panels, transcript
 
 [doc/ui-style-guide.yaml](../doc/ui-style-guide.yaml) is the source of truth for how the UI looks. Implement each style once, named after its guide entry; views use those implementations, never raw colors, sizes, or spacing.
 
+### Lists
+
+Every list-shaped view (obligations, plan steps, findings, the change set, the conversation side pane, command history) is converging on one item-list component, which owns the cursor, selection, navigation keys, the row menu, drag reordering, and edit mode. It groups to any depth but its *content rows never nest* — that, not grouping depth, is what separates it from the node tree, where nodes own nodes. The node tree and the transcript are out of scope. The same item affords the same actions wherever it is shown. Spec, including the keyboard-focus rules and the migration order: [doc/ui/item-list.md](../doc/ui/item-list.md).
+
 ### GPUI keyboard focus: navigation mode vs. edit mode
 
 Multi-line and single-line text fields must not trap keyboard navigation. The established pattern (see `crates/tod-ui/src/interview/views/workspace.rs` for the reference implementation):
