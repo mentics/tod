@@ -23,7 +23,7 @@ const REFRESH_SUCCESS: &str = "success";
 const REFRESH_ERROR: &str = "error";
 const REFRESH_INTERRUPTED: &str = "the refresh was interrupted before it finished";
 
-pub const DATA_SOURCE_LINEAR: &str = "linear";
+pub const DATA_SOURCE_LINEAR: &str = tod_store::outline::repos::generator::SOURCE_TYPE_LINEAR;
 pub const DATA_SOURCE_MOCK: &str = "mock";
 
 /// Credential key the Linear data source declares. The UI matches a missing
@@ -624,10 +624,7 @@ fn collect_linked_copy_updates(
             .map_err(|err| err.to_string())?;
         for link in links {
             let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
-            // A copy is an ordinary node, so nothing shows the id beside
-            // it: its title carries it, as when it was copied out.
-            let title =
-                (!dirty("title")).then(|| format!("{}: {}", item.external_id, item.title));
+            let title = (!dirty("title")).then(|| link.copy_title(&item.title));
             let tags = (!dirty("tags")).then(|| item.tags.clone());
             let body = (!dirty("body")).then(|| item.body.clone());
             if title.is_some() || tags.is_some() || body.is_some() {

@@ -3,6 +3,7 @@
 use crate::fleet::store::FleetStore;
 use crate::interview::PHASE_REQUIREMENTS;
 use crate::outline::types::Capability;
+use crate::outline::repos::{NodeRepo, OutlineRepo};
 use crate::outline::{CreatePosition, OutlineMutation};
 use std::fs;
 use std::path::PathBuf;
@@ -1268,6 +1269,26 @@ fn create_managed_node_for_test(
     external_id: &str,
     title: &str,
 ) -> Uuid {
+    create_managed_node_of_type(
+        store,
+        list_id,
+        parent_id,
+        generator_node_id,
+        external_id,
+        title,
+        "mock",
+    )
+}
+
+fn create_managed_node_of_type(
+    store: &FleetStore,
+    list_id: Uuid,
+    parent_id: Uuid,
+    generator_node_id: Uuid,
+    external_id: &str,
+    title: &str,
+    source_type: &str,
+) -> Uuid {
     let node_id = Uuid::new_v4();
     store
         .enqueue_outline(OutlineMutation::CreateManagedNode {
@@ -1276,7 +1297,7 @@ fn create_managed_node_for_test(
             parent_id,
             title: title.into(),
             external_id: external_id.into(),
-            source_type: "mock".into(),
+            source_type: source_type.into(),
             generator_node_id,
             tags: vec![],
             body: String::new(),
@@ -1285,6 +1306,70 @@ fn create_managed_node_for_test(
         .unwrap();
     store.writer().flush().unwrap();
     node_id
+}
+
+fn paste_copy_of(store: &FleetStore, list_id: Uuid, source: Uuid, parent: Uuid) -> Uuid {
+    store
+        .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
+            source_node_id: source,
+            list_id,
+            parent_id: Some(parent),
+            ordinal: 0,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            Ok(OutlineRepo::new(conn)
+                .list_for_list(list_id)?
+                .into_iter()
+                .find(|e| e.parent_id == Some(parent))
+                .unwrap()
+                .node_id)
+        })
+        .unwrap()
+}
+
+#[test]
+fn pasted_linear_copy_carries_its_id_as_a_ticket_not_in_its_title() {
+    let (store, root, list_id) = setup_store_with_list();
+    let generator_id = create_node_in(&store, list_id, None, "Generator");
+    let outside = create_node_in(&store, list_id, None, "Outside");
+    let linear = create_managed_node_of_type(
+        &store,
+        list_id,
+        generator_id,
+        generator_id,
+        "ENG-42",
+        "Fix it",
+        "linear",
+    );
+    let other =
+        create_managed_node_for_test(&store, list_id, generator_id, generator_id, "EXT-1", "Other");
+
+    let linear_copy = paste_copy_of(&store, list_id, linear, outside);
+    store
+        .read(|conn| {
+            let nodes = NodeRepo::new(conn);
+            assert_eq!(nodes.get(linear_copy)?.unwrap().title, "Fix it");
+            assert!(nodes.list_capabilities(linear_copy)?.contains(&Capability::Ticket));
+            assert_eq!(nodes.get_ticket_id(linear_copy)?.as_deref(), Some("ENG-42"));
+            Ok(())
+        })
+        .unwrap();
+
+    let other_copy = paste_copy_of(&store, list_id, other, outside);
+    store
+        .read(|conn| {
+            let nodes = NodeRepo::new(conn);
+            assert_eq!(nodes.get(other_copy)?.unwrap().title, "EXT-1: Other");
+            assert!(!nodes.list_capabilities(other_copy)?.contains(&Capability::Ticket));
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

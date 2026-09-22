@@ -11,8 +11,7 @@
 //! fragments are read from the source tree, not through `MediaPaths`.
 
 /// Every noun, as `(noun, usage text)`. The fragment is
-/// `media/context/cli/<noun>.md`.
-#[cfg(test)]
+/// `media/context/cli/<noun>.md`. `help` searches these too.
 pub(crate) fn nouns() -> &'static [(&'static str, &'static str)] {
     crate::NOUNS
 }

@@ -2,7 +2,7 @@
 //! `CONVERSATION` recipe), the per-turn delta of the user's corrections, and
 //! the snapshot a fresh session gets when the driver rotates.
 
-use crate::context_recipes::{CONVERSATION, ContextRecipe, build_message};
+use crate::context_recipes::{CONVERSATION, ContextRecipe, build_message_with};
 use crate::dynamic::{DynamicContext, FocusSelection};
 use crate::interview::context::estimate_tokens;
 use crate::media::MediaPaths;
@@ -175,9 +175,15 @@ pub fn opening_with(
         .get(conversation_id)?
         .with_context(|| format!("conversation {conversation_id} not found"))?;
     let focus = focus_selection(conn, conversation.focus)?;
-    build_message(
+    let extra = if recipe.situational {
+        situational_cli(conn, conversation.focus)?
+    } else {
+        Vec::new()
+    };
+    build_message_with(
         media,
         recipe,
+        &extra,
         None,
         &DynamicContext {
             data_root: Some(data_root),
@@ -186,6 +192,37 @@ pub fn opening_with(
         },
         "",
     )
+}
+
+/// The `cli/` nouns a conversation on `focus` is likely to need, beyond the
+/// recipe's own: what the focus's state is about. The rest the agent finds
+/// through `tod-cli help`.
+pub fn situational_cli(conn: &Connection, focus: Focus) -> Result<Vec<&'static str>> {
+    use tod_store::outline::Capability;
+    const OBLIGATIONS: &str = "cli/obligations";
+    const CONTENT: &str = "cli/content";
+    const PLAN: &str = "cli/plan";
+    let node = match focus {
+        Focus::Project => return Ok(Vec::new()),
+        Focus::Obligation { .. } => return Ok(vec![OBLIGATIONS]),
+        Focus::PlanStep { .. } => return Ok(vec![PLAN, OBLIGATIONS]),
+        Focus::Node(node) => node,
+    };
+    let nodes = NodeRepo::new(conn);
+    let capabilities = nodes.list_capabilities(node)?;
+    if capabilities.contains(&Capability::Lifecycle) {
+        let state = nodes.get_lifecycle(node)?.unwrap_or_default();
+        return Ok(match state.as_str() {
+            "planning" | "ready" => vec![OBLIGATIONS, PLAN],
+            "proposed" | "design" | "" => vec![OBLIGATIONS, CONTENT],
+            _ => vec![PLAN],
+        });
+    }
+    Ok(if capabilities.contains(&Capability::Spec) {
+        vec![OBLIGATIONS, CONTENT]
+    } else {
+        Vec::new()
+    })
 }
 
 fn op_label(op: NetOp) -> &'static str {

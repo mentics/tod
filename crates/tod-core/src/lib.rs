@@ -4,6 +4,10 @@
 //! process-doc resolution, path/settings resolution, and the task model.
 //! Persistence lives in `tod-store`; agent transport lives in `tod-agent`.
 
+/// A hash of the source `tod-cli` is compiled from (see `build.rs`). The app
+/// and a `tod-cli` built from the same source report the same stamp.
+pub const CLI_BUILD_STAMP: &str = env!("TOD_CLI_BUILD_STAMP");
+
 pub mod agent_context;
 pub mod context_recipes;
 pub mod conversation;

@@ -227,7 +227,9 @@ which surface it is serving.
 11 Conversation
   stance/interactive-chat, domain/outline, domain/obligations, domain/plan,
   domain/lifecycle, domain/capabilities, cli/intro, cli/node,
-  cli/obligations, cli/plan, cli/content, cli/capabilities, cli/changeset, surface/conversation
+  cli/changeset, surface/conversation
+  + situational (by focus and lifecycle state): cli/obligations, cli/content,
+    cli/plan; every other noun through `tod-cli help`
   dyn: DataRoot, Focus
   (+ per turn: conversation::context::delta; on rotation:
    conversation::context::resume_snapshot)

@@ -13,6 +13,31 @@ pub struct Args {
     /// Every flag value in order, repeats included, for [`Args::get_all`].
     all: Vec<(String, String)>,
     switches: Vec<String>,
+    /// Flags and switches some command asked about, for the warning on drop.
+    read: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+/// A flag no command asked about was ignored: say so, rather than letting an
+/// agent believe `--lifecycle` did something.
+impl Drop for Args {
+    fn drop(&mut self) {
+        let read = self.read.borrow();
+        let mut ignored: Vec<&str> = self
+            .all
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(self.switches.iter().map(String::as_str))
+            .filter(|name| !read.contains(*name))
+            .collect();
+        ignored.sort();
+        ignored.dedup();
+        if !ignored.is_empty() && !std::thread::panicking() {
+            eprintln!(
+                "tod-cli: warning: ignored unknown option(s) {}; see `tod-cli <NOUN> --help`",
+                ignored.join(", ")
+            );
+        }
+    }
 }
 
 impl Args {
@@ -71,13 +96,19 @@ impl Args {
         Ok(out)
     }
 
+    fn mark(&self, flag: &str) {
+        self.read.borrow_mut().insert(flag.to_string());
+    }
+
     pub fn get(&self, flag: &str) -> Option<&str> {
+        self.mark(flag);
         self.flags.get(flag).map(String::as_str)
     }
 
     /// Every value a repeatable flag was given, in order. [`Args::get`] sees
     /// only the last.
     pub fn get_all(&self, flag: &str) -> Vec<&str> {
+        self.mark(flag);
         self.all
             .iter()
             .filter(|(name, _)| name == flag)
@@ -91,6 +122,7 @@ impl Args {
     }
 
     pub fn has(&self, switch: &str) -> bool {
+        self.mark(switch);
         self.switches.iter().any(|s| s == switch)
     }
 

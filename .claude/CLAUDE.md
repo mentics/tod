@@ -32,6 +32,12 @@ cargo build --release -p tod --no-default-features
 tod --verify-process-bundle
 ```
 
+`cargo run -p tod` rebuilds only `tod`, never the `tod-cli` beside it. After
+changing anything `tod-cli` is built from, run `cargo build -p tod-cli` too: a
+conversation refuses to send a turn when the two were built from different
+source (`tod_core::CLI_BUILD_STAMP`), rather than let the agent work from
+stale commands.
+
 CI runs `cargo check --workspace --all-targets` on Ubuntu, Windows, and macOS. Code behind `#[cfg(target_os = "...")]` is only type-checked on the matching OS — a change can pass locally and still fail on another platform until CI or a same-OS build runs it.
 
 ### Running builds/tests without getting stuck
@@ -207,7 +213,13 @@ repeatedly, so startup cost is a feature.
 `media/context/cli/` is the one canonical place `tod-cli` command syntax is
 documented for agents — one `cli/<noun>.md` per noun the binary dispatches,
 which surfaces opt into, instead of being re-explained inline wherever it's
-used. Adding a noun means adding its fragment and putting it in the recipes
+used. A prompt carries only the nouns its job is most likely to need: the
+conversation and chat recipes are `situational`, adding obligations, content,
+or plan by the focus and its lifecycle state
+(`conversation::context::situational_cli`), and `cli/intro` always explains
+how to find the rest (`tod-cli help <words>` searches every noun's commands).
+An option no command reads is ignored with a warning on stderr.
+Adding a noun means adding its fragment and putting it in the recipes
 that need it. Three sets of tests hold this together:
 
 - `tod_cli::doc_sync` pins each fragment to that noun's own `USAGE` string —

@@ -30,6 +30,28 @@ pub struct ManagedNodeLink {
     pub user_modified_fields: Vec<String>,
 }
 
+/// Data-source type whose items are Linear issues.
+pub const SOURCE_TYPE_LINEAR: &str = "linear";
+
+impl ManagedNodeLink {
+    /// Whether a copy of this node carries its external id as a ticket
+    /// (the Ticket capability) rather than in its title.
+    pub fn is_ticket(&self) -> bool {
+        self.source_type == SOURCE_TYPE_LINEAR
+    }
+
+    /// Title for a copied-out node. A copy is an ordinary node, so nothing
+    /// shows the external id beside it: its title carries it, unless the
+    /// copy's Ticket capability already does.
+    pub fn copy_title(&self, title: &str) -> String {
+        if self.is_ticket() {
+            title.to_string()
+        } else {
+            format!("{}: {}", self.external_id, title)
+        }
+    }
+}
+
 impl<'a> GeneratorRepo<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
