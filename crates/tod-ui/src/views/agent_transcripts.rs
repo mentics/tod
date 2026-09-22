@@ -1,21 +1,39 @@
+//! The agent transcripts window: a list of recorded agent sessions, and the
+//! transcript of the one under the cursor.
+//!
+//! The session list — the cursor, the keys, the day groups, the scrolling and
+//! the column header — is [`crate::ui::item_list`]. Only what a session *is*
+//! lives here: when it was last active, what to call it, and what it was.
+//! The transcript beside it is [`crate::ui::transcript_list`], a chat log
+//! rather than a list of items, and is not this component's business.
+
 use crate::app::transcript_window::TranscriptWindowControl;
 use crate::ui::actionable::{
     chrome_control_with_shortcut, render_label_badge, render_shortcut_pill,
 };
+use crate::ui::item_list::keyboard::{
+    ItemListCollapse, ItemListDown, ItemListEnd, ItemListExpand, ItemListHome, ItemListPageDown,
+    ItemListPageUp, ItemListUp,
+};
+use crate::ui::item_list::{
+    CollapseStep, ColumnSpec, GroupSpec, ItemList, ItemListEvent, ItemListKeys, ItemListRow,
+    ItemRowState, bind_item_list_keys,
+};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
 use crate::ui::transcript_list::{
     self, ChunkId, Entry, EntryKind, StartState, TranscriptList, TranscriptListEvent,
 };
-use chrono::{Local, TimeZone};
+use crate::views::rows::RowHost;
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
-    Window, actions, div, px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Pixels, Render, SharedString, Styled,
+    Subscription, Window, actions, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -42,11 +60,81 @@ struct AgentRow {
     traffic_key: Option<String>,
 }
 
-fn format_timestamp_ms(ms: i64) -> String {
-    match Local.timestamp_millis_opt(ms).single() {
-        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
-        None => String::new(),
+/// The day a row's last activity fell on, as a group key and a heading.
+///
+/// Sessions are listed newest first, so a day is a contiguous run and grouping
+/// by it does not reorder anything. It also makes the time column readable: a
+/// row under a day heading only has to say the time of day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityDay {
+    key: String,
+    label: SharedString,
+}
+
+fn activity_day(ms: Option<i64>, today: NaiveDate) -> ActivityDay {
+    match ms.and_then(local_time) {
+        Some(when) => {
+            let date = when.date_naive();
+            let label = match (today - date).num_days() {
+                0 => "Today".to_string(),
+                1 => "Yesterday".to_string(),
+                _ => date.format("%Y-%m-%d").to_string(),
+            };
+            ActivityDay {
+                key: format!("day-{date}"),
+                label: label.into(),
+            }
+        }
+        // A row whose activity we have no time for still belongs somewhere,
+        // and the sort already puts it last.
+        None => ActivityDay {
+            key: "day-unknown".to_string(),
+            label: "No recorded activity".into(),
+        },
     }
+}
+
+/// The sessions grouped by the day each was last active, in list order. The
+/// sessions arrive newest first, so a day is one contiguous run and grouping
+/// never reorders anything.
+fn day_runs(agents: &[AgentRow], today: NaiveDate) -> Vec<(ActivityDay, Vec<&AgentRow>)> {
+    let mut runs: Vec<(ActivityDay, Vec<&AgentRow>)> = Vec::new();
+    for agent in agents {
+        let day = activity_day(agent.last_activity_ms, today);
+        match runs.last_mut() {
+            Some((open, run)) if open.key == day.key => run.push(agent),
+            _ => runs.push((day, vec![agent])),
+        }
+    }
+    runs
+}
+
+fn local_time(ms: i64) -> Option<DateTime<Local>> {
+    Local.timestamp_millis_opt(ms).single()
+}
+
+/// The time of day a row was last active. The day itself is the group heading
+/// above it.
+fn format_time_of_day(ms: Option<i64>) -> String {
+    match ms.and_then(local_time) {
+        Some(when) => when.format("%H:%M").to_string(),
+        None => "—".to_string(),
+    }
+}
+
+const COLUMN_TIME: &str = "time";
+const COLUMN_AGENT: &str = "agent";
+
+/// The list is a table of the two values every row has: when it was last
+/// active, and what it is. What it *ran on* — the platform, and how much
+/// traffic was logged — is only sometimes known (traffic under a key no
+/// session was recorded for has no platform), so it stays inside the content
+/// column as trailing context.
+fn agent_columns() -> Vec<ColumnSpec> {
+    vec![
+        ColumnSpec::fixed(COLUMN_TIME, COLUMN_TIME, style::size::TIMESTAMP_COLUMN),
+        ColumnSpec::content(COLUMN_AGENT, COLUMN_AGENT),
+    ]
 }
 
 const AGENT_TRANSCRIPTS_CONTEXT: &str = "AgentTranscripts";
@@ -59,8 +147,6 @@ actions!(
     [
         AgentTranscriptsClose,
         AgentTranscriptsRefresh,
-        AgentTranscriptsSelectUp,
-        AgentTranscriptsSelectDown,
         AgentTranscriptsPick1,
         AgentTranscriptsPick2,
         AgentTranscriptsPick3,
@@ -75,11 +161,13 @@ actions!(
 
 pub fn register_agent_transcripts_keyboard_bindings(cx: &mut App) {
     use crate::ui::key_context;
+    // An agent session is a record of what already happened: it cannot be
+    // edited, created, reordered or marked, so the window takes navigation and
+    // nothing else from the one key set.
+    bind_item_list_keys(cx, AGENT_TRANSCRIPTS_CONTEXT, ItemListKeys::default());
     let context = Some(key_context::excluding_input(AGENT_TRANSCRIPTS_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("r", AgentTranscriptsRefresh, context),
-        KeyBinding::new("up", AgentTranscriptsSelectUp, context),
-        KeyBinding::new("down", AgentTranscriptsSelectDown, context),
         KeyBinding::new("1", AgentTranscriptsPick1, context),
         KeyBinding::new("2", AgentTranscriptsPick2, context),
         KeyBinding::new("3", AgentTranscriptsPick3, context),
@@ -93,12 +181,43 @@ pub fn register_agent_transcripts_keyboard_bindings(cx: &mut App) {
     key_context::bind_panel_escape(cx, AgentTranscriptsClose, AGENT_TRANSCRIPTS_CONTEXT);
 }
 
+/// What the user did in the session list, queued for the view to apply.
+#[derive(Debug, Clone)]
+enum AgentListAction {
+    Select {
+        row_ix: usize,
+    },
+    ToggleGroup {
+        key: String,
+    },
+    /// Something the list can report but a read-only list never does.
+    Ignored,
+}
+
+impl From<ItemListEvent> for AgentListAction {
+    fn from(event: ItemListEvent) -> Self {
+        match event {
+            ItemListEvent::Select { row_ix } => Self::Select { row_ix },
+            ItemListEvent::ToggleGroup { key } => Self::ToggleGroup { key },
+            ItemListEvent::ToggleMark { .. } => Self::Ignored,
+        }
+    }
+}
+
 pub struct AgentTranscriptsView {
     fleet: Arc<FleetStore>,
     traffic_log: SharedAgentTrafficLog,
     window_control: TranscriptWindowControl,
     focus_handle: FocusHandle,
+    /// Every session, newest first: what the list's rows are built from, and
+    /// rebuilt from when a day group collapses.
     agents: Vec<AgentRow>,
+    /// The rows, the cursor, the collapsed days and the scrolling: everything
+    /// every list in the app shares.
+    list: ItemList<AgentRow>,
+    host: RowHost<AgentListAction>,
+    /// The session the transcript beside the list is showing. It follows the
+    /// cursor, and stays put while the cursor is on a day heading.
     selected_agent_id: Option<String>,
     /// The selected run's transcript as stored, read after the fact from
     /// the platform's own record of the session.
@@ -152,6 +271,8 @@ impl AgentTranscriptsView {
             window_control,
             focus_handle: cx.focus_handle(),
             agents: Vec::new(),
+            list: ItemList::new().with_columns(agent_columns()),
+            host: RowHost::for_entity(cx.weak_entity()),
             selected_agent_id: None,
             history: None,
             read_error: None,
@@ -186,6 +307,28 @@ impl AgentTranscriptsView {
 
     fn first_agent_id(&self) -> Option<String> {
         self.agents.first().map(|a| a.id.clone())
+    }
+
+    /// The rows the list shows: a heading per day of last activity, and the
+    /// sessions under it. A collapsed day contributes its heading alone.
+    fn rebuild_rows(&mut self) {
+        let today = Local::now().date_naive();
+        let mut rows: Vec<ItemListRow<AgentRow>> = Vec::new();
+        for (day, run) in day_runs(&self.agents, today) {
+            let collapsed = self.list.is_collapsed(&day.key);
+            rows.push(ItemListRow::heading(
+                GroupSpec::new(day.key, 0, day.label)
+                    .count(run.len())
+                    .collapsed(collapsed),
+            ));
+            if !collapsed {
+                rows.extend(
+                    run.into_iter()
+                        .map(|agent| ItemListRow::item(agent.id.clone(), agent.clone())),
+                );
+            }
+        }
+        self.list.set_rows(rows);
     }
 
     /// Every recorded agent session, newest first. A session's live
@@ -225,6 +368,7 @@ impl AgentTranscriptsView {
                 .then_with(|| a.label.cmp(&b.label))
         });
         self.agents = rows;
+        self.rebuild_rows();
     }
 
     /// Expand or collapse one chunk.
@@ -368,6 +512,17 @@ impl AgentTranscriptsView {
     }
 
     fn select_agent(&mut self, agent_id: String, cx: &mut Context<Self>) {
+        // The cursor and the shown transcript are one selection: whichever
+        // way a session was picked, the list ends up highlighting it.
+        self.list.set_cursor_key(Some(agent_id.clone()));
+        if let Some(ix) = self
+            .list
+            .rows()
+            .iter()
+            .position(|row| row.key() == agent_id.as_str())
+        {
+            self.list.set_cursor(ix);
+        }
         if self.selected_agent_id.as_deref() != Some(agent_id.as_str()) {
             self.toggled.clear();
             self.transcript.update(cx, |list, cx| list.reset(cx));
@@ -446,28 +601,14 @@ impl AgentTranscriptsView {
         }
     }
 
-    fn flat_agent_ids(&self) -> Vec<String> {
-        self.agents.iter().map(|agent| agent.id.clone()).collect()
-    }
-
-    fn select_adjacent(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let ids = self.flat_agent_ids();
-        if ids.is_empty() {
-            return;
-        }
-        let current = self
-            .selected_agent_id
-            .as_ref()
-            .and_then(|id| ids.iter().position(|candidate| candidate == id))
-            .unwrap_or(0);
-        let next = (current as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize;
-        if next != current {
-            self.select_agent(ids[next].clone(), cx);
-        }
+    /// The sessions the list is showing, in order. A collapsed day's sessions
+    /// are not among them, so a number badge always names a row on screen.
+    fn visible_agent_ids(&self) -> Vec<String> {
+        self.list.items().map(|agent| agent.id.clone()).collect()
     }
 
     fn pick_by_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        let ids = self.flat_agent_ids();
+        let ids = self.visible_agent_ids();
         if let Some(id) = ids.get(index) {
             self.select_agent(id.clone(), cx);
         }
@@ -475,104 +616,151 @@ impl AgentTranscriptsView {
 
     fn agent_pick_badges(&self) -> BTreeMap<String, String> {
         let mut badges = BTreeMap::new();
-        for (index, id) in self.flat_agent_ids().into_iter().take(9).enumerate() {
+        for (index, id) in self.visible_agent_ids().into_iter().take(9).enumerate() {
             badges.insert(id, (index + 1).to_string());
         }
         badges
     }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn render_agent_section(
-    title: &'static str,
-    rows: &[AgentRow],
-    index_offset: usize,
-    selected_agent_id: &Option<String>,
-    pick_badges: &BTreeMap<String, String>,
-    window: &mut Window,
-    cx: &mut Context<AgentTranscriptsView>,
-    border: gpui::Hsla,
-    muted: gpui::Hsla,
-    muted_bg: gpui::Hsla,
-    foreground: gpui::Hsla,
-    accent: gpui::Hsla,
-) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .px_2()
-                .text_xs()
-                .font_semibold()
-                .text_color(muted)
-                .child(title),
-        )
-        .children(rows.iter().enumerate().map(|(ix, agent)| {
-            let selected = selected_agent_id.as_deref() == Some(agent.id.as_str());
-            let badge = pick_badges.get(&agent.id).cloned();
-            let subtitle = match agent.last_activity_ms {
-                Some(ms) => format!("{} · {}", agent.detail, format_timestamp_ms(ms)),
-                None => agent.detail.clone(),
-            };
-            div()
-                .id(("agent-pick", index_offset + ix))
-                .relative()
-                .px_2()
-                .py_1p5()
-                .rounded_md()
-                .cursor_pointer()
-                .border_1()
-                .border_color(if selected { accent } else { border })
-                .bg(if selected {
-                    accent.opacity(0.12)
-                } else {
-                    muted_bg
-                })
-                .hover(|s| s.bg(border.opacity(0.35)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener({
-                        let id = agent.id.clone();
-                        move |this, _, _, cx| {
-                            this.select_agent(id.clone(), cx);
-                        }
-                    }),
-                )
-                .child(
-                    v_flex()
-                        .gap_0p5()
-                        .pr(if badge.is_some() { px(18.) } else { px(0.) })
-                        .child(
-                            selectable_text(
-                                gpui::SharedString::from(format!("agent-pick-label-{}", agent.id)),
+    /// Apply what the rows and the list reported, in order.
+    fn drain_row_actions(&mut self, cx: &mut Context<Self>) {
+        for action in self.host.drain() {
+            match action {
+                AgentListAction::Select { row_ix } => {
+                    if self.list.set_cursor(row_ix) {
+                        self.follow_cursor(cx);
+                    }
+                }
+                AgentListAction::ToggleGroup { key } => {
+                    self.list.toggle_collapsed(&key);
+                    self.rebuild_rows();
+                    cx.notify();
+                }
+                AgentListAction::Ignored => {}
+            }
+        }
+    }
+
+    /// Show the transcript of whatever the cursor is now on. A day heading is
+    /// not a session, so the cursor resting on one leaves the transcript as it
+    /// was.
+    fn follow_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.list.cursor_item().map(|agent| agent.id.clone()) {
+            Some(id) if self.selected_agent_id.as_deref() != Some(id.as_str()) => {
+                self.select_agent(id, cx)
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.list.move_cursor(delta) {
+            self.follow_cursor(cx);
+        }
+    }
+
+    fn on_arrow_up(&mut self, _: &ItemListUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(-1, cx);
+    }
+
+    fn on_arrow_down(&mut self, _: &ItemListDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_cursor(1, cx);
+    }
+
+    fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<AgentRow>::page_rows(window.viewport_size().height) as i32;
+        self.move_cursor(-page, cx);
+    }
+
+    fn on_page_down(&mut self, _: &ItemListPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<AgentRow>::page_rows(window.viewport_size().height) as i32;
+        self.move_cursor(page, cx);
+    }
+
+    fn on_home(&mut self, _: &ItemListHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_home() {
+            self.follow_cursor(cx);
+        }
+    }
+
+    fn on_end(&mut self, _: &ItemListEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_end() {
+            self.follow_cursor(cx);
+        }
+    }
+
+    fn on_collapse(&mut self, _: &ItemListCollapse, _: &mut Window, cx: &mut Context<Self>) {
+        match self.list.collapse_step() {
+            CollapseStep::Collapsed => {
+                self.rebuild_rows();
+                cx.notify();
+            }
+            CollapseStep::MovedToParent => cx.notify(),
+            CollapseStep::Nothing => {}
+        }
+    }
+
+    fn on_expand(&mut self, _: &ItemListExpand, _: &mut Window, cx: &mut Context<Self>) {
+        if self.list.expand_step() {
+            self.rebuild_rows();
+            cx.notify();
+        }
+    }
+
+    /// One session: when it was last active, what to call it, and what it was.
+    fn render_agent(
+        agent: &AgentRow,
+        state: ItemRowState<'_>,
+        badge: Option<String>,
+        host: &RowHost<AgentListAction>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let row_ix = state.row_ix;
+        let select_host = host.clone();
+        style::row(h_flex())
+            .w_full()
+            .items_start()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                select_host.push(AgentListAction::Select { row_ix }, cx);
+            })
+            .when(state.highlighted, style::highlighted)
+            .child(
+                state
+                    .column(COLUMN_TIME, style::text_dense_muted(div()))
+                    .child(selectable_text(
+                        SharedString::from(format!("agent-pick-time-{}", agent.id)),
+                        format_time_of_day(agent.last_activity_ms),
+                        window,
+                        cx,
+                    )),
+            )
+            .child(
+                state
+                    .column(COLUMN_AGENT, v_flex())
+                    .gap(style::space::HAIRLINE)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(style::space::INLINE)
+                            .child(div().flex_1().min_w_0().child(selectable_text(
+                                SharedString::from(format!("agent-pick-label-{}", agent.id)),
                                 agent.label.clone(),
                                 window,
                                 cx,
-                            )
-                            .text_sm()
-                            .text_color(foreground),
-                        )
-                        .child(
-                            selectable_text(
-                                gpui::SharedString::from(format!("agent-pick-turns-{}", agent.id)),
-                                subtitle,
-                                window,
-                                cx,
-                            )
-                            .text_xs()
-                            .text_color(muted),
-                        ),
-                )
-                .when_some(badge, |row, label| {
-                    row.child(
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .right_0()
-                            .child(render_label_badge(label, cx)),
+                            )))
+                            .children(badge.map(|label| render_label_badge(label, cx))),
                     )
-                })
-        }))
+                    .child(style::text_dense_muted(div()).child(selectable_text(
+                        SharedString::from(format!("agent-pick-detail-{}", agent.id)),
+                        agent.detail.clone(),
+                        window,
+                        cx,
+                    ))),
+            )
+            .into_any_element()
+    }
 }
 
 fn agent_row_from_session(session: AgentSession, traffic: Option<AgentSummary>) -> AgentRow {
@@ -661,11 +849,10 @@ impl Focusable for AgentTranscriptsView {
 
 impl Render for AgentTranscriptsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drain_row_actions(cx);
         let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
         let muted_bg = cx.theme().muted;
-        let accent = cx.theme().primary;
         let pick_badges = self.agent_pick_badges();
 
         h_flex()
@@ -678,12 +865,14 @@ impl Render for AgentTranscriptsView {
             .on_action(cx.listener(|this, _: &AgentTranscriptsRefresh, _, cx| {
                 this.refresh(cx);
             }))
-            .on_action(cx.listener(|this, _: &AgentTranscriptsSelectUp, _, cx| {
-                this.select_adjacent(-1, cx);
-            }))
-            .on_action(cx.listener(|this, _: &AgentTranscriptsSelectDown, _, cx| {
-                this.select_adjacent(1, cx);
-            }))
+            .on_action(cx.listener(Self::on_arrow_up))
+            .on_action(cx.listener(Self::on_arrow_down))
+            .on_action(cx.listener(Self::on_page_up))
+            .on_action(cx.listener(Self::on_page_down))
+            .on_action(cx.listener(Self::on_home))
+            .on_action(cx.listener(Self::on_end))
+            .on_action(cx.listener(Self::on_collapse))
+            .on_action(cx.listener(Self::on_expand))
             .on_action(cx.listener(|this, _: &AgentTranscriptsPick1, _, cx| {
                 this.pick_by_index(0, cx);
             }))
@@ -744,7 +933,7 @@ impl Render for AgentTranscriptsView {
                                                     .when_some(
                                                         render_shortcut_pill(
                                                             window,
-                                                            &AgentTranscriptsSelectUp,
+                                                            &ItemListUp,
                                                             AGENT_TRANSCRIPTS_CONTEXT,
                                                             cx,
                                                         ),
@@ -753,7 +942,7 @@ impl Render for AgentTranscriptsView {
                                                     .when_some(
                                                         render_shortcut_pill(
                                                             window,
-                                                            &AgentTranscriptsSelectDown,
+                                                            &ItemListDown,
                                                             AGENT_TRANSCRIPTS_CONTEXT,
                                                             cx,
                                                         ),
@@ -795,40 +984,26 @@ impl Render for AgentTranscriptsView {
                                                     )),
                                             ),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_h_0()
-                                            .overflow_y_scrollbar()
-                                            .p_2()
-                                            .v_flex()
-                                            .gap_2()
-                                            .when(self.agents.is_empty(), |el| {
-                                                el.child(
-                                                    div()
-                                                        .px_2()
-                                                        .text_xs()
-                                                        .text_color(muted)
-                                                        .child("No agent sessions recorded yet."),
+                                    .child(if self.list.is_empty() {
+                                        style::empty_message(div())
+                                            .p(style::space::INSET)
+                                            .child("No agent sessions recorded yet.")
+                                            .into_any_element()
+                                    } else {
+                                        let host = self.host.clone();
+                                        self.list.render(
+                                            "agent-transcripts-list",
+                                            &self.host,
+                                            move |agent, state, window, cx| {
+                                                let badge = pick_badges.get(&agent.id).cloned();
+                                                Self::render_agent(
+                                                    agent, state, badge, &host, window, cx,
                                                 )
-                                            })
-                                            .when(!self.agents.is_empty(), |el| {
-                                                el.child(render_agent_section(
-                                                    "Agent sessions",
-                                                    &self.agents,
-                                                    0,
-                                                    &self.selected_agent_id,
-                                                    &pick_badges,
-                                                    window,
-                                                    cx,
-                                                    border,
-                                                    muted,
-                                                    muted_bg,
-                                                    foreground,
-                                                    accent,
-                                                ))
-                                            }),
-                                    ),
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    }),
                             ),
                     )
                     .child(
@@ -878,5 +1053,94 @@ impl Render for AgentTranscriptsView {
                     this.focus(window, cx);
                 }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Days;
+
+    fn agent(id: &str, ms: Option<i64>) -> AgentRow {
+        AgentRow {
+            id: id.to_string(),
+            label: id.to_string(),
+            detail: "mock".to_string(),
+            last_activity_ms: ms,
+            session: true,
+            traffic_key: None,
+        }
+    }
+
+    /// Noon local on `date`, so a day's rows land on that day whatever the
+    /// zone offset is.
+    fn noon(date: NaiveDate) -> i64 {
+        Local
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0).expect("noon"))
+            .single()
+            .expect("an unambiguous local noon")
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn the_list_is_a_table_of_the_time_and_the_session() {
+        let columns = agent_columns();
+        let labels: Vec<&str> = columns.iter().map(|c| c.label.as_ref()).collect();
+        assert_eq!(labels, vec![COLUMN_TIME, COLUMN_AGENT]);
+        assert_eq!(columns[0].width, Some(style::size::TIMESTAMP_COLUMN));
+        // The session is the content column: exactly one, as the component
+        // requires.
+        assert_eq!(columns[1].width, None);
+    }
+
+    #[test]
+    fn a_day_is_named_by_how_recent_it_is() {
+        let today = Local::now().date_naive();
+        let yesterday = today.checked_sub_days(Days::new(1)).expect("yesterday");
+        let older = today.checked_sub_days(Days::new(5)).expect("last week");
+        assert_eq!(activity_day(Some(noon(today)), today).label, "Today");
+        assert_eq!(
+            activity_day(Some(noon(yesterday)), today).label,
+            "Yesterday"
+        );
+        assert_eq!(
+            activity_day(Some(noon(older)), today).label,
+            older.format("%Y-%m-%d").to_string()
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_recorded_time_still_has_a_group_and_a_cell() {
+        let today = Local::now().date_naive();
+        let day = activity_day(None, today);
+        assert_eq!(day.key, "day-unknown");
+        assert_eq!(day.label, "No recorded activity");
+        assert_eq!(format_time_of_day(None), "—");
+        assert_eq!(format_time_of_day(Some(i64::MAX)), "—");
+    }
+
+    #[test]
+    fn sessions_from_the_same_day_share_one_heading() {
+        let today = Local::now().date_naive();
+        let yesterday = today.checked_sub_days(Days::new(1)).expect("yesterday");
+        let agents = vec![
+            agent("a", Some(noon(today))),
+            agent("b", Some(noon(today) - 60_000)),
+            agent("c", Some(noon(yesterday))),
+            agent("d", None),
+        ];
+        let runs = day_runs(&agents, today);
+        let shape: Vec<(String, usize)> = runs
+            .iter()
+            .map(|(day, run)| (day.label.to_string(), run.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Today".to_string(), 2),
+                ("Yesterday".to_string(), 1),
+                ("No recorded activity".to_string(), 1),
+            ]
+        );
     }
 }

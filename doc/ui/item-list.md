@@ -16,27 +16,29 @@ leaves out is a claim about the item, and should be justifiable as one.
 
 ## Why
 
-Every list feature the app needs exists somewhere, and no list has all of them.
+Every list feature the app needs existed somewhere, and no list had all of
+them. This is how it stood when the migration started:
 
 | | groups | keyboard | selection | editing | row menu | virtualized |
 |---|---|---|---|---|---|---|
 | Obligations panel (`views/obligations/`) | 3 levels | full | single | inline | — | — |
-| Conversation side pane, obligations (`conversation/side_pane.rs:605`) | — | — | — | — | — | — |
-| Review findings, conversation side pane (`views/rows/finding_row.rs`) | — | cursor | — | status only | — | — |
+| Conversation side pane, obligations | — | — | — | — | — | — |
+| Review findings, conversation side pane | — | cursor | — | status only | — | — |
 | Change set (`conversation/change_set.rs`) | 2 levels | full | multi | inline | — | — |
-| Plan steps, panel and conversation side pane (`views/plan_steps/`) | — | full | single | inline | — | — |
-| Agent transcripts, agent sidebar (`views/agent_transcripts.rs`) | — | — | single | — | — | — |
+| Plan steps, panel and conversation side pane | — | full | single | inline | — | — |
+| Command history, database results, agent transcripts | — | up/down | single | — | — | — |
 
-The same obligation therefore looks and behaves differently depending on which
-panel it is in: the Tasks-view panel groups it, lets the user edit and reorder
-it, and moves a cursor through it; the conversation side pane shows a flat
-hand-built row with no cursor at all, even though the shared `obligation_row`
-it could use is already there and the change set already uses it in compact
-mode.
+The same obligation therefore looked and behaved differently depending on
+which panel it was in: the Tasks-view panel grouped it, let the user edit and
+reorder it, and moved a cursor through it; the conversation side pane showed a
+flat hand-built row with no cursor at all, even though the shared
+`obligation_row` it could use was already there and the change set already
+used it in compact mode.
 
 Fixing this list by list means re-deciding, each time, which keys work, whether
 there is a context menu, and which component owns focus. Doing it once means
-every list gets the full set.
+every list gets the full set. Every list in the table is now the one component,
+so the row above is history, not a to-do list.
 
 ## Scope
 
@@ -116,8 +118,9 @@ and gets a cell of the declared width.
   `&'static str`.
 
 Today: findings are `severity | answer | finding`, a plan is `# | status |
-step`, command history is `time | change`, and a query result is its own
-columns. Obligations and the change set declare none.
+step`, command history is `time | change`, the agent-transcripts session list
+is `time | agent`, and a query result is its own columns. Obligations and the
+change set declare none.
 
 ## What the component owns
 
@@ -252,10 +255,29 @@ the component, so no view sets a heading's colour, weight or indent itself.
    another. The results are the last of the view's focus stops: Down past Run
    moves into the rows, Up off the first row hands the keyboard back.
 
-7. Move over the agent-transcripts sidebar — the last hand-rolled list. The
-   transcript beside it stays out of scope (`ui/transcript_list.rs`).
+7. **Done.** Move over the agent-transcripts sidebar — the last hand-rolled
+   list. The transcript beside it stays out of scope
+   (`ui/transcript_list.rs`): it is a chat log, not a list of items.
 
-Each step is complete on its own; the list of views above is the checklist.
+   **The session list is `time | agent`**, and it **groups by the day a
+   session was last active** — "Today", "Yesterday", then the date. The
+   sessions already arrive newest first, so a day is one contiguous run and
+   the grouping reorders nothing; it also earns the time column, which now
+   says only the time of day because the heading above it says which day.
+   What a session *ran on* — its platform, and how much traffic was logged
+   for it — is trailing context inside the content column, not a column,
+   because traffic logged under a key no session was recorded for has no
+   platform to show.
+
+   The list takes navigation and nothing else: an agent session is a record
+   of what already happened, so there is nothing to edit, create, reorder or
+   mark. The cursor is the selection — moving it shows that session's
+   transcript, and resting on a day heading leaves the transcript as it was.
+   The 1–9 number badges now number the rows on screen, so a collapsed day
+   does not leave a badge pointing at something hidden.
+
+Each step is complete on its own; the list of views above is the checklist,
+and every step on it is done.
 
 Where a view already exists for the items — obligations, plan steps — a second
 list is never built for them. The pane hosts that view embedded. A hand-built
