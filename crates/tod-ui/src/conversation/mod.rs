@@ -706,16 +706,18 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// What the agent is doing and the last action, for the status bar
-    /// (`ui::status`). Posting the same state again changes nothing.
+    /// Whether the agent is working and the last action, for the status bar
+    /// (`ui::status`). Posting the same state again changes nothing. The
+    /// agent's step-by-step activity (each tool call) stays in the
+    /// transcript; the bar only says a turn is under way.
     fn publish_status(&self, cx: &mut Context<Self>) {
         if self.status.running {
-            let text = self
-                .status
-                .activity
-                .clone()
-                .unwrap_or_else(|| "Agent working…".into());
-            status::begin_activity(cx, StatusSource::Conversation, AGENT_TURN, text);
+            status::begin_activity(
+                cx,
+                StatusSource::Conversation,
+                AGENT_TURN,
+                "Agent working…",
+            );
         } else {
             status::end_activity(cx, StatusSource::Conversation, AGENT_TURN);
         }
