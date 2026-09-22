@@ -32,7 +32,7 @@ use agent_traffic::SharedAgentTrafficLog;
 #[allow(unused_imports)]
 pub use cursor_acp::CursorAcpProvider;
 pub use mock::{
-    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply,
+    MockAgentProvider, MockInterviewHandler, MockInterviewTurn, MockReply, mock_gate_check_reply,
     set_mock_interview_handler,
 };
 pub use provider::{

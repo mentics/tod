@@ -112,6 +112,25 @@ impl LifecycleController {
         cx.notify();
     }
 
+    /// Show where a gate check waiting on the node's incoming changes stands
+    /// (`views::incoming_check`): `status` while it waits, `error` when it
+    /// will not run. Both empty clears the line, as the gate check starts.
+    pub fn report_before_gate(
+        &mut self,
+        task_id: &str,
+        status: Option<String>,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.gate_states.entry(task_id.to_string()).or_default();
+        state.gate_status = status.unwrap_or_default();
+        if error.is_some() {
+            state.criteria_detail.clear();
+        }
+        state.gate_error = error;
+        cx.notify();
+    }
+
     /// Drop the state kept for `task_id`.
     pub fn forget(&mut self, task_id: &str) {
         self.gate_states.remove(task_id);

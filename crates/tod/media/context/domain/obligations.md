@@ -28,3 +28,12 @@ The two kinds inherit differently down the outline, and the difference matters:
 So when you are given an ancestor's context, expect its constraints in full and
 only a summary of its requirements. That is deliberate, not truncation.
 
+## References
+
+A `[[slug]]` in an obligation names another node, usually a reusable
+component this node uses. A referenced node is not inherited: none of its
+obligations are in your context. When you need them, most often when
+planning, since the component's requirements and constraints can call for plan
+steps here, look the node up by its slug and list its obligations with
+`tod-cli`.
+

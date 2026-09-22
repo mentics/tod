@@ -133,6 +133,7 @@ impl SettingsSection {
                 Agent(AgentRole::Chat),
                 Agent(AgentRole::Interview),
                 ChatLaunchMode,
+                MaxParallelSessions,
             ],
             Self::QuestionMaker => &[ReplenishThreshold],
             Self::AnswerProcessor => &[ContextBudget, PromptCacheIdle, AnsweredHistoryCap],
@@ -156,6 +157,7 @@ enum SettingField {
     LogLevel,
     LogMaxSize,
     ChatLaunchMode,
+    MaxParallelSessions,
 }
 
 impl SettingField {
@@ -174,6 +176,7 @@ impl SettingField {
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::ChatLaunchMode => "chat-launch-mode",
+            Self::MaxParallelSessions => "max-parallel-sessions",
         }
     }
 }
@@ -534,6 +537,7 @@ impl SettingsView {
             SettingField::AnsweredHistoryCap => self.step_answered_history_cap(delta, cx),
             SettingField::WorktreeBackend => self.cycle_worktree_backend(delta, cx),
             SettingField::ChatLaunchMode => self.cycle_chat_launch_mode(delta, cx),
+            SettingField::MaxParallelSessions => self.step_max_parallel_sessions(delta, cx),
             SettingField::TreehouseWorktreesRoot | SettingField::TerminalProgram => {}
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
@@ -748,6 +752,19 @@ impl SettingsView {
         } else {
             cap.saturating_sub(10).max(10)
         };
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn step_max_parallel_sessions(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let (min, max) = tod_store::settings::MAX_PARALLEL_AGENT_SESSIONS_RANGE;
+        let value = &mut self.settings.max_parallel_agent_sessions;
+        *value = if delta >= 0 {
+            value.saturating_add(1)
+        } else {
+            value.saturating_sub(1)
+        }
+        .clamp(min, max);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1148,6 +1165,17 @@ impl SettingsView {
                     theme,
                     |this, _, cx| this.cycle_chat_launch_mode(-1, cx),
                     |this, _, cx| this.cycle_chat_launch_mode(1, cx),
+                ));
+                rows = rows.child(stepper_row(
+                    cx,
+                    self,
+                    SettingField::MaxParallelSessions,
+                    self.settings.max_parallel_agent_sessions.to_string(),
+                    "Parallel agent sessions",
+                    "Most agent sessions a batch job runs at once, such as checking incoming changes on several nodes. Default 4.",
+                    theme,
+                    |this, _, cx| this.step_max_parallel_sessions(-1, cx),
+                    |this, _, cx| this.step_max_parallel_sessions(1, cx),
                 ));
                 rows.into_any_element()
             }

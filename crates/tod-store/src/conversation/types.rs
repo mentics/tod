@@ -130,6 +130,7 @@ str_enum!(
         VisualDesign => "visual_design",
         GateCheck => "gate_check",
         OnEntry => "on_entry",
+        Incoming => "incoming",
     }
 );
 
@@ -316,7 +317,11 @@ pub fn reply_answer(parts: &[ReplyPart]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRow {
     pub id: i64,
-    pub conversation_id: Uuid,
+    /// `None` for a change made outside any conversation.
+    pub conversation_id: Option<Uuid>,
+    /// [`SOURCE_CONVERSATION`], or who made a change outside a conversation
+    /// (the fleet writer's actor: `user` for a direct edit).
+    pub source: String,
     pub turn_seq: i64,
     pub actor: ActionActor,
     pub kind: ActionKind,

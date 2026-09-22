@@ -13,7 +13,7 @@ const OPENING_WORDS: usize = 8;
 const CONVERSATION_COLUMNS: &str = "id, focus_kind, focus_id, focus_node_id, agent_session_id, \
      session_name, platform, model, effort, created_at, updated_at, protocol, agent_run_id, from_state, to_state";
 
-const ACTION_COLUMNS: &str = "id, conversation_id, turn_seq, actor, kind, entity, entity_id, \
+const ACTION_COLUMNS: &str = "id, conversation_id, source, turn_seq, actor, kind, entity, entity_id, \
      node_id, mutation, before, after, archive_id, reverses, reversed_by, at";
 
 pub struct ConversationRepo<'a> {
@@ -516,7 +516,8 @@ fn map_conversation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Conversa
 /// An action row as read, before its text columns are parsed.
 struct RawAction {
     id: i64,
-    conversation_id: Uuid,
+    conversation_id: Option<Uuid>,
+    source: String,
     turn_seq: i64,
     actor: String,
     kind: String,
@@ -534,24 +535,24 @@ struct RawAction {
 
 impl RawAction {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
-        let conversation: Vec<u8> = row.get(1)?;
-        let entity_id: Vec<u8> = row.get(6)?;
+        let entity_id: Vec<u8> = row.get(7)?;
         Ok(Self {
             id: row.get(0)?,
-            conversation_id: blob_to_uuid_sql(&conversation)?,
-            turn_seq: row.get(2)?,
-            actor: row.get(3)?,
-            kind: row.get(4)?,
-            entity: row.get(5)?,
+            conversation_id: opt_uuid(row, 1)?,
+            source: row.get(2)?,
+            turn_seq: row.get(3)?,
+            actor: row.get(4)?,
+            kind: row.get(5)?,
+            entity: row.get(6)?,
             entity_id: blob_to_uuid_sql(&entity_id)?,
-            node_id: opt_uuid(row, 7)?,
-            mutation: row.get(8)?,
-            before: row.get(9)?,
-            after: row.get(10)?,
-            archive_id: opt_uuid(row, 11)?,
-            reverses: row.get(12)?,
-            reversed_by: row.get(13)?,
-            at: row.get(14)?,
+            node_id: opt_uuid(row, 8)?,
+            mutation: row.get(9)?,
+            before: row.get(10)?,
+            after: row.get(11)?,
+            archive_id: opt_uuid(row, 12)?,
+            reverses: row.get(13)?,
+            reversed_by: row.get(14)?,
+            at: row.get(15)?,
         })
     }
 
@@ -563,6 +564,7 @@ impl RawAction {
         Ok(ActionRow {
             id: self.id,
             conversation_id: self.conversation_id,
+            source: self.source,
             turn_seq: self.turn_seq,
             actor: ActionActor::parse(&self.actor)?,
             kind: ActionKind::parse(&self.kind)?,

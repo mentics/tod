@@ -263,7 +263,8 @@ pub fn reverse_actions(
         let action = by_id[id];
         for mutation in inverse(action)? {
             let rec = Recorded {
-                conversation_id,
+                conversation_id: Some(conversation_id),
+                source: super::SOURCE_CONVERSATION.to_string(),
                 actor: ActionActor::User,
                 turn_seq,
                 kind: ActionKind::Reverse,
@@ -271,7 +272,7 @@ pub fn reverse_actions(
                 entity_id: action.entity_id,
                 reverses: Some(action.id),
             };
-            if let Some(new_id) = apply_recorded(conn, &rec, &mutation, media_root)? {
+            if let Some(new_id) = apply_recorded(conn, &rec, &mutation, media_root)?.action_id {
                 new_action_ids.push(new_id);
             }
         }

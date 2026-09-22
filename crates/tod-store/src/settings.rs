@@ -222,6 +222,15 @@ fn default_chat_launch_mode() -> ChatLaunchMode {
     ChatLaunchMode::default()
 }
 
+/// Default for [`TodSettings::max_parallel_agent_sessions`].
+pub const DEFAULT_MAX_PARALLEL_AGENT_SESSIONS: u32 = 4;
+/// Bounds for [`TodSettings::max_parallel_agent_sessions`].
+pub const MAX_PARALLEL_AGENT_SESSIONS_RANGE: (u32, u32) = (1, 16);
+
+fn default_max_parallel_agent_sessions() -> u32 {
+    DEFAULT_MAX_PARALLEL_AGENT_SESSIONS
+}
+
 /// How Tod provisions git worktrees for interview / agent workspaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -304,6 +313,10 @@ pub struct TodSettings {
     /// Where "chat with agent" opens a session: app window or external terminal.
     #[serde(default = "default_chat_launch_mode")]
     pub chat_launch_mode: ChatLaunchMode,
+    /// How many agent sessions batch work (checking incoming changes on
+    /// several nodes) runs at once.
+    #[serde(default = "default_max_parallel_agent_sessions")]
+    pub max_parallel_agent_sessions: u32,
     /// Which agent platform runs interview question-maker / answer-processor work.
     #[serde(default = "default_agent_platform")]
     pub agent_platform: AgentPlatform,
@@ -338,6 +351,7 @@ impl Default for TodSettings {
             default_agent: AgentRoleSettings::default(),
             chat_agent: AgentRoleSettings::default(),
             chat_launch_mode: ChatLaunchMode::default(),
+            max_parallel_agent_sessions: DEFAULT_MAX_PARALLEL_AGENT_SESSIONS,
             agent_platform: AgentPlatform::default(),
             agent_launch: AgentLaunchByPlatform::default(),
             legacy_agent_model: None,
@@ -514,6 +528,12 @@ impl TodSettings {
         Ok(())
     }
 
+    /// The parallel-session cap, within its bounds.
+    pub fn parallel_agent_sessions(&self) -> usize {
+        let (lo, hi) = MAX_PARALLEL_AGENT_SESSIONS_RANGE;
+        self.max_parallel_agent_sessions.clamp(lo, hi) as usize
+    }
+
     pub fn clamp_log_max_size_kb(value: u64) -> u64 {
         value.clamp(MIN_LOG_MAX_SIZE_KB, MAX_LOG_MAX_SIZE_KB)
     }
@@ -618,6 +638,7 @@ mod tests {
             },
             chat_agent: AgentRoleSettings::default(),
             chat_launch_mode: ChatLaunchMode::Terminal,
+            max_parallel_agent_sessions: 2,
             agent_platform: AgentPlatform::Claude,
             agent_launch: AgentLaunchByPlatform {
                 claude: PlatformLaunchSettings {

@@ -1,5 +1,6 @@
-//! Recording outline mutations as conversation actions.
+//! Recording outline mutations as actions, in a conversation or outside one.
 
+use super::SOURCE_CONVERSATION;
 use super::repo::ConversationRepo;
 use super::types::{ActionActor, ActionKind, Entity, EntitySnapshot};
 use crate::outline::OutlineMutation;
@@ -171,25 +172,104 @@ pub fn record_and_execute(
         mutation.execute(conn, media_root)?;
         return Ok(None);
     };
-    apply_recorded(
-        conn,
-        &Recorded {
-            conversation_id,
-            actor,
-            turn_seq,
-            kind,
-            entity,
-            entity_id,
-            reverses: None,
-        },
-        &mutation,
-        media_root,
-    )
+    let rec = Recorded {
+        conversation_id: Some(conversation_id),
+        source: SOURCE_CONVERSATION.to_string(),
+        actor,
+        turn_seq,
+        kind,
+        entity,
+        entity_id,
+        reverses: None,
+    };
+    Ok(apply_recorded(conn, &rec, &mutation, media_root)?.action_id)
+}
+
+/// Execute a mutation written outside any conversation (a direct edit in
+/// the app, or `tod-cli` as an actor that is not a conversation) and record
+/// it the same way a conversation's change is, with `writer_actor` (the
+/// fleet writer's actor) as its source. Pass a [`normalize`]d mutation, so
+/// an undo entry captured beforehand names the same item.
+pub fn record_direct(
+    conn: &Connection,
+    writer_actor: &str,
+    mutation: &OutlineMutation,
+    media_root: &Path,
+) -> Result<Applied> {
+    let Some((kind, entity, entity_id)) = classify(mutation) else {
+        let archive_id = mutation.execute(conn, media_root)?;
+        return Ok(Applied {
+            archive_id,
+            action_id: None,
+        });
+    };
+    let rec = Recorded {
+        conversation_id: None,
+        source: writer_actor.to_string(),
+        actor: direct_actor(writer_actor),
+        turn_seq: 0,
+        kind,
+        entity,
+        entity_id,
+        reverses: None,
+    };
+    apply_recorded(conn, &rec, mutation, media_root)
+}
+
+/// Apply `mutation`, a Ctrl+Z inverse of action `original`, and record it
+/// as that action's reversal, as reversing it from a conversation would.
+/// When the action is gone or already reversed, the mutation is only
+/// executed.
+pub fn record_undo(
+    conn: &Connection,
+    original: i64,
+    mutation: &OutlineMutation,
+    media_root: &Path,
+) -> Result<Applied> {
+    let action = ConversationRepo::new(conn).action(original)?;
+    let Some(action) = action.filter(|a| a.reversed_by.is_none()) else {
+        let archive_id = mutation.execute(conn, media_root)?;
+        return Ok(Applied {
+            archive_id,
+            action_id: None,
+        });
+    };
+    let rec = Recorded {
+        conversation_id: action.conversation_id,
+        source: action.source,
+        actor: ActionActor::User,
+        turn_seq: action.turn_seq,
+        kind: ActionKind::Reverse,
+        entity: action.entity,
+        entity_id: action.entity_id,
+        reverses: Some(original),
+    };
+    apply_recorded(conn, &rec, mutation, media_root)
+}
+
+/// The actor a direct write records as: the user's own edits are the
+/// user's; anything else writing through the fleet writer is an agent.
+fn direct_actor(writer_actor: &str) -> ActionActor {
+    if writer_actor == crate::interview::ACTOR_USER {
+        ActionActor::User
+    } else {
+        ActionActor::Agent
+    }
+}
+
+/// What applying a mutation produced: the `DeleteNode` archive, if any, and
+/// the action row, when one was recorded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Applied {
+    pub archive_id: Option<Uuid>,
+    pub action_id: Option<i64>,
 }
 
 /// Where an applied mutation is recorded.
 pub(super) struct Recorded {
-    pub conversation_id: Uuid,
+    /// `None` outside a conversation; `source` then says who wrote it.
+    pub conversation_id: Option<Uuid>,
+    pub source: String,
     pub actor: ActionActor,
     pub turn_seq: i64,
     pub kind: ActionKind,
@@ -200,22 +280,35 @@ pub(super) struct Recorded {
 
 /// Snapshot, execute, snapshot, and insert the action row. A forward
 /// mutation that found no item and made none (e.g. deleting what is already
-/// gone) is not recorded; a reversal always is, so its original is marked.
+/// gone) is not recorded, nor is a direct one that changed nothing; a
+/// reversal always is, so its original is marked.
+///
+/// This is the one place an action row is written.
 pub(super) fn apply_recorded(
     conn: &Connection,
     rec: &Recorded,
     mutation: &OutlineMutation,
     media_root: &Path,
-) -> Result<Option<i64>> {
+) -> Result<Applied> {
     let repo = ConversationRepo::new(conn);
-    if repo.get(rec.conversation_id)?.is_none() {
-        bail!("conversation {} not found", rec.conversation_id);
+    if let Some(conversation_id) = rec.conversation_id {
+        if repo.get(conversation_id)?.is_none() {
+            bail!("conversation {conversation_id} not found");
+        }
     }
     let before = snapshot(conn, rec.entity, rec.entity_id)?;
     let archive_id = mutation.execute(conn, media_root)?;
     let after = snapshot(conn, rec.entity, rec.entity_id)?;
-    if before.is_none() && after.is_none() && rec.reverses.is_none() {
-        return Ok(None);
+    let unchanged = if rec.conversation_id.is_some() {
+        before.is_none() && after.is_none()
+    } else {
+        before == after
+    };
+    if unchanged && rec.reverses.is_none() {
+        return Ok(Applied {
+            archive_id,
+            action_id: None,
+        });
     }
     let node_id = after
         .as_ref()
@@ -224,11 +317,12 @@ pub(super) fn apply_recorded(
     let now = now_ms();
     conn.execute(
         "INSERT INTO conversation_actions
-         (conversation_id, turn_seq, actor, kind, entity, entity_id, node_id, mutation,
+         (conversation_id, source, turn_seq, actor, kind, entity, entity_id, node_id, mutation,
           before, after, archive_id, reverses, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
-            uuid_to_blob(rec.conversation_id),
+            rec.conversation_id.map(uuid_to_blob),
+            rec.source,
             rec.turn_seq,
             rec.actor.as_str(),
             rec.kind.as_str(),
@@ -249,9 +343,26 @@ pub(super) fn apply_recorded(
             "UPDATE conversation_actions SET reversed_by = ?1 WHERE id = ?2",
             params![id, original],
         )?;
+        crate::incoming::cancel(conn, original)?;
     }
-    repo.touch(rec.conversation_id, now)?;
-    Ok(Some(id))
+    // A forward change fans out; so does a reversal that re-applies one
+    // (reversing a reversal), since its original's entries were cancelled.
+    let reapplies = match rec.reverses {
+        None => true,
+        Some(original) => repo
+            .action(original)?
+            .is_some_and(|a| a.kind == ActionKind::Reverse),
+    };
+    if reapplies {
+        crate::incoming::fan_out(conn, id, rec.entity, before.as_ref(), after.as_ref(), now)?;
+    }
+    if let Some(conversation_id) = rec.conversation_id {
+        repo.touch(conversation_id, now)?;
+    }
+    Ok(Applied {
+        archive_id,
+        action_id: Some(id),
+    })
 }
 
 /// A user edit made from the conversation view: recorded as the user's, and

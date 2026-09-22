@@ -31,10 +31,35 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> 
             .find(|(key, _)| key == name)
             .and_then(|(_, value)| Uuid::parse_str(value).ok())
     };
+    // A gate check carries only its node.
+    let text = turn.blocks.join("\n\n");
+    if let Some(node) = env_uuid(IMPLEMENT_NODE_ENV)
+        && text.contains("phase_purpose:** gate_check")
+    {
+        let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
+        return crate::conversation::gate_check::mock_turn(&client, node, &text)
+            .map(MockReply::from);
+    }
     if let (Some(node), Some(conversation)) =
         (env_uuid(IMPLEMENT_NODE_ENV), env_uuid(IMPLEMENT_CONVERSATION_ENV))
     {
         let client = InterviewClient::new(data_root, ACTOR_USER.to_string());
+        // An incoming-changes check carries the actions it was shown.
+        if let Some((_, actions)) = turn
+            .env
+            .iter()
+            .find(|(key, _)| key == crate::incoming::INCOMING_ACTIONS_ENV)
+        {
+            let actions = crate::conversation::incoming::parse_action_ids(Some(actions))?;
+            return crate::conversation::incoming::mock_turn(
+                &client,
+                node,
+                conversation,
+                actions,
+                &turn.blocks.join("\n\n"),
+            )
+            .map(MockReply::from);
+        }
         return crate::conversation::mock::plan_turn(&client, node, conversation)
             .map(MockReply::from);
     }

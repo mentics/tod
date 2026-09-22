@@ -65,6 +65,7 @@ use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
 use crate::ui::status::{self, StatusSource};
 use crate::ui::status_filter::StatusFilter;
 use crate::ui::style;
+use crate::views::incoming_check::IncomingCheck;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
 use change_set::{ChangeKey, PendingReverse};
@@ -394,6 +395,9 @@ pub struct ConversationView {
     /// Runs gate checks and lifecycle moves; shared with the lifecycle panel.
     lifecycle: Entity<LifecycleController>,
     _lifecycle_changes: Subscription,
+    /// The shared incoming-changes check a gate check waits on first
+    /// (`views::incoming_check`); bound by the shell.
+    incoming_check: Option<(Entity<IncomingCheck>, Subscription)>,
 
     error: Option<SharedString>,
     /// The error last shown as a toast, so a lingering error toasts once.
@@ -529,6 +533,7 @@ impl ConversationView {
             context,
             lifecycle,
             _lifecycle_changes: lifecycle_changes,
+            incoming_check: None,
             error: None,
             toasted_error: None,
             toasted_agent_error: None,
@@ -612,9 +617,36 @@ impl ConversationView {
         self.protocol = protocol;
         self.show(focus, running.flatten(), true, cx);
         self.settle_on_transcript(window, cx);
-        if running.is_none() {
+        if running.is_none() && !self.gate_check_waits(focus, protocol, cx) {
             self.start(window, cx);
         }
+    }
+
+    /// Let the view start gate checks through `check`: one on a node with
+    /// pending incoming changes waits for them to be checked first.
+    pub fn bind_incoming_check(&mut self, check: Entity<IncomingCheck>, cx: &mut Context<Self>) {
+        let observed = cx.observe(&check, |_, _, cx| cx.notify());
+        self.incoming_check = Some((check, observed));
+    }
+
+    /// A gate check on a node with pending incoming changes waits for them
+    /// to be checked (`doc/conversation/incoming-changes.md` §5); the shell
+    /// starts it when they affect nothing.
+    pub(super) fn gate_check_waits(
+        &self, focus: Focus, protocol: ProtocolKind, cx: &mut Context<Self>) -> bool {
+        let (ProtocolKind::GateCheck, Focus::Node(node), Some((check, _))) =
+            (protocol, focus, self.incoming_check.as_ref())
+        else {
+            return false;
+        };
+        check.update(cx, |check, cx| check.hold_gate_check(node, cx))
+    }
+
+    /// Whether `node`'s gate check is waiting on its incoming changes.
+    pub(super) fn checking_incoming(&self, node: Uuid, cx: &App) -> bool {
+        self.incoming_check
+            .as_ref()
+            .is_some_and(|(check, _)| check.read(cx).holds_gate_check(node))
     }
 
     /// Put the keyboard on the transcript's input, as opening a

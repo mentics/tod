@@ -229,6 +229,23 @@ pub enum InterviewCommand {
         status: String,
         evidence: String,
     },
+    /// Record an evaluation's verdict on a node's incoming changes and
+    /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
+    /// every pending entry when unset.
+    ResolveIncoming {
+        node_id: Uuid,
+        affects: String,
+        note: String,
+        #[serde(default)]
+        action_ids: Option<Vec<i64>>,
+        #[serde(default)]
+        conversation_id: Option<Uuid>,
+    },
+    /// Clear a node's incoming entries with no verdict: they net to nothing.
+    ClearIncoming { node_id: Uuid },
+    /// Record the `learn` retrospective of the pass a node is finishing
+    /// (`crate::learn`); stored for good when the node reaches `done`.
+    RecordLearnOutput { node_id: Uuid, content: String },
     /// Point a conversation at the fleet run its agent process belongs to.
     SetConversationAgentRun {
         conversation_id: Uuid,
@@ -410,6 +427,7 @@ pub fn execute(
                 (Some(proposal), Some(1)) => Some(apply_proposal(
                     conn,
                     media_root,
+                    actor,
                     &q,
                     proposal,
                     edited.as_deref(),
@@ -739,7 +757,9 @@ pub fn execute(
             } else {
                 mutation
             };
-            mutation.execute(conn, media_root)?;
+            // Outside a conversation: still recorded, as this actor's.
+            let mutation = crate::conversation::normalize(mutation.clone());
+            crate::conversation::record_direct(conn, actor, &mutation, media_root)?;
             Ok(json!({}))
         }
 
@@ -850,6 +870,34 @@ pub fn execute(
                 evidence,
             )?;
             Ok(json!({ "id": verdict.id, "status": verdict.status }))
+        }
+        InterviewCommand::ResolveIncoming {
+            node_id,
+            affects,
+            note,
+            action_ids,
+            conversation_id,
+        } => {
+            let verdict = crate::incoming::IncomingRepo::new(conn).resolve(
+                *node_id,
+                affects,
+                note,
+                action_ids.as_deref(),
+                *conversation_id,
+            )?;
+            Ok(json!({
+                "id": verdict.id,
+                "affects": verdict.affects,
+                "resolved": verdict.action_ids.len(),
+            }))
+        }
+        InterviewCommand::ClearIncoming { node_id } => {
+            let cleared = crate::incoming::IncomingRepo::new(conn).clear_checked(*node_id)?;
+            Ok(json!({ "cleared": cleared }))
+        }
+        InterviewCommand::RecordLearnOutput { node_id, content } => {
+            crate::learn::LearnRepo::new(conn).record_draft(*node_id, content)?;
+            Ok(json!({ "recorded": true }))
         }
         InterviewCommand::SetConversationAgentRun {
             conversation_id,
@@ -1040,6 +1088,7 @@ fn normalize_proposal(repo: &InterviewRepo<'_>, phase: &str, mut p: Proposal) ->
 fn apply_proposal(
     conn: &Connection,
     media_root: &Path,
+    actor: &str,
     q: &InterviewQuestion,
     p: &Proposal,
     edited_text: Option<&str>,
@@ -1053,8 +1102,9 @@ fn apply_proposal(
         Ok(plan) => plan,
         Err(message) => return Ok(json!({ "error": message })),
     };
-    for mutation in &mutations {
-        mutation.execute(conn, media_root)?;
+    for mutation in mutations {
+        let mutation = crate::conversation::normalize(mutation);
+        crate::conversation::record_direct(conn, actor, &mutation, media_root)?;
     }
     Ok(json!({ "ops": ops }))
 }

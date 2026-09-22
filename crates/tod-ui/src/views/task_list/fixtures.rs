@@ -25,6 +25,8 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
         .capability_sources_for_list(list_id, Capability::Files)
         .unwrap_or_default();
     let live_run_counts = store.live_run_counts_for_list(list_id).unwrap_or_default();
+    // Every node's pending incoming-change count, in one query.
+    let incoming = store.incoming_counts().unwrap_or_default();
     let mut shells_by_node = store.shells_for_list(list_id).unwrap_or_default();
     rows.into_iter()
         .map(|row| {
@@ -75,6 +77,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 has_agent,
                 requirement_count: counts.requirements,
                 constraint_count: counts.constraints,
+                incoming_count: incoming.get(&row.node.id).copied().unwrap_or(0),
                 has_children: row.has_children,
                 in_flight_activity: None,
                 managed: row.managed,
@@ -121,6 +124,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             has_agent: false,
             requirement_count: 0,
             constraint_count: 0,
+            incoming_count: 0,
             has_children: false,
             in_flight_activity: None,
             managed: false,

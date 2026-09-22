@@ -44,6 +44,16 @@ pub struct BaselineStep {
 pub struct Baseline {
     pub obligations: Vec<BaselineObligation>,
     pub plan_steps: Vec<BaselineStep>,
+    /// Recorded actions the node has been checked against since this
+    /// snapshot (`crate::incoming`): an evaluation resolved them, so the node
+    /// counts as current against them.
+    #[serde(default)]
+    pub checked_actions: Vec<i64>,
+    /// The id of the node's latest incoming verdict when the snapshot was
+    /// taken. A later `plan`/`obligations` verdict is one the node has not
+    /// yet been back through planning or design for.
+    #[serde(default)]
+    pub verdicts_through: i64,
 }
 
 pub struct BaselineRepo<'a> {
@@ -76,14 +86,24 @@ impl<'a> BaselineRepo<'a> {
                     body: s.body,
                 })
                 .collect(),
+            checked_actions: Vec::new(),
+            verdicts_through: self.conn.query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM incoming_verdicts WHERE node_id = ?1",
+                params![uuid_to_blob(node_id)],
+                |row| row.get(0),
+            )?,
         };
+        self.write(node_id, &baseline)
+    }
+
+    fn write(&self, node_id: Uuid, baseline: &Baseline) -> Result<()> {
         self.conn.execute(
             "INSERT INTO lifecycle_baselines (node_id, snapshot, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(node_id) DO UPDATE SET snapshot = excluded.snapshot,
                                                 created_at = excluded.created_at",
             params![
                 uuid_to_blob(node_id),
-                serde_json::to_string(&baseline)?,
+                serde_json::to_string(baseline)?,
                 now_ms()
             ],
         )?;
@@ -102,6 +122,20 @@ impl<'a> BaselineRepo<'a> {
         snapshot
             .map(|s| serde_json::from_str(&s).map_err(Into::into))
             .transpose()
+    }
+
+    /// Note that the node has been checked against `action_ids`. A node
+    /// with no snapshot (not yet `ready`) has nothing to note it in.
+    pub fn record_checked(&self, node_id: Uuid, action_ids: &[i64]) -> Result<()> {
+        let Some(mut baseline) = self.get(node_id)? else {
+            return Ok(());
+        };
+        for id in action_ids {
+            if !baseline.checked_actions.contains(id) {
+                baseline.checked_actions.push(*id);
+            }
+        }
+        self.write(node_id, &baseline)
     }
 
     pub fn clear(&self, node_id: Uuid) -> Result<()> {

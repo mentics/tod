@@ -32,8 +32,10 @@ use crate::ui::actionable::chrome_control_with_shortcut;
 use crate::ui::agent_chat::OpenConversation;
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
+use crate::views::incoming_check::{IncomingCheck, outcome_line};
+use tod_core::incoming::NodeOutcome;
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
 };
@@ -90,6 +92,7 @@ pub enum LifecyclePanelEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LifecyclePanelStop {
     MoveBack,
+    CheckIncoming,
     Implement,
     Verify,
     Review,
@@ -112,9 +115,65 @@ enum ActiveControl {
     Complete { total: usize },
 }
 
+/// One net pending incoming change, as the panel shows it.
+#[derive(Clone, Debug, PartialEq)]
+struct IncomingRow {
+    /// E.g. "Constraint added on Parent (via ancestor)" or "Requirement
+    /// changed on Card field (via reference)".
+    headline: String,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+impl IncomingRow {
+    fn new(fleet: &FleetStore, change: tod_store::incoming::PendingChange) -> Self {
+        use tod_store::conversation::{EntitySnapshot, NetOp};
+        let source = fleet
+            .get_node(&change.source_node.to_string())
+            .ok()
+            .flatten()
+            .map(|n| n.title)
+            .unwrap_or_else(|| change.source_node.to_string());
+        let text = |snap: &Option<EntitySnapshot>| match snap {
+            Some(EntitySnapshot::Obligation { kind, body, .. }) => Some(format!("[{kind}] {body}")),
+            Some(other) => Some(format!("{other:?}")),
+            None => None,
+        };
+        let op = match change.op {
+            NetOp::Added => "added",
+            NetOp::Deleted => "deleted",
+            NetOp::Moved => "moved",
+            NetOp::Reversed => "reversed",
+            NetOp::Edited => "changed",
+        };
+        // An ancestor's change is always a constraint; a component's may be
+        // any obligation.
+        let kind = [&change.after, &change.before]
+            .into_iter()
+            .find_map(|s| match s {
+                Some(EntitySnapshot::Obligation { kind, .. }) => Some(kind.as_str()),
+                _ => None,
+            });
+        let what = match kind {
+            Some(tod_store::outline::KIND_CONSTRAINT) => "Constraint",
+            Some(tod_store::outline::KIND_REQUIREMENT) => "Requirement",
+            Some(_) => "Obligation",
+            None => "Item",
+        };
+        Self {
+            headline: format!("{what} {op} on {source} (via {})", change.via.as_str()),
+            before: text(&change.before),
+            after: text(&change.after),
+        }
+    }
+}
+
 pub struct LifecyclePanelView {
     fleet: Arc<FleetStore>,
     controller: Entity<LifecycleController>,
+    incoming_check: Entity<IncomingCheck>,
+    /// Mirrors `incoming_check`'s running flag, for the keyboard stops.
+    check_running: bool,
     task_id: Option<String>,
     title: String,
     lifecycle: String,
@@ -130,9 +189,17 @@ pub struct LifecyclePanelView {
     /// The node's state no longer holds and should go back; re-read on open
     /// and whenever the store changes.
     regression: Option<Regression>,
+    /// The node's pending incoming changes, netted per item
+    /// (`doc/conversation/incoming-changes.md` §6); re-read on open and
+    /// whenever the store changes.
+    incoming: Vec<IncomingRow>,
+    /// The node's stored `learn` retrospectives, one per completed pass, as
+    /// `(pass, content)` (`doc/conversation/incoming-changes.md` §9).
+    learnings: Vec<(i64, String)>,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
+    _incoming_check_subscription: Subscription,
 }
 
 impl LifecyclePanelView {
@@ -140,7 +207,13 @@ impl LifecyclePanelView {
         cx: &mut Context<Self>,
         fleet: Arc<FleetStore>,
         controller: Entity<LifecycleController>,
+        incoming_check: Entity<IncomingCheck>,
     ) -> Self {
+        let incoming_check_subscription = cx.observe(&incoming_check, |this, check, cx| {
+            this.check_running = check.read(cx).is_running();
+            this.clamp_focus_index();
+            cx.notify();
+        });
         // The controller moves the lifecycle (a gate check that passed, an
         // Advance from the conversation view): re-read the node when it does.
         let subscription = cx.observe(&controller, |this, _, cx| {
@@ -166,7 +239,9 @@ impl LifecyclePanelView {
                 }
                 if changed {
                     let Ok(()) = poll_entity.update(cx, |this: &mut Self, cx| {
-                        if this.refresh_regression() {
+                        let incoming_changed = this.refresh_incoming();
+                        let learnings_changed = this.refresh_learnings();
+                        if this.refresh_regression() | incoming_changed | learnings_changed {
                             this.clamp_focus_index();
                             cx.notify();
                         }
@@ -180,6 +255,8 @@ impl LifecyclePanelView {
         Self {
             fleet,
             controller,
+            incoming_check,
+            check_running: false,
             task_id: None,
             title: String::new(),
             lifecycle: String::new(),
@@ -187,9 +264,12 @@ impl LifecyclePanelView {
             implement_status: HashMap::new(),
             active_control: None,
             regression: None,
+            incoming: Vec::new(),
+            learnings: Vec::new(),
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
+            _incoming_check_subscription: incoming_check_subscription,
         }
     }
 
@@ -197,6 +277,9 @@ impl LifecyclePanelView {
         let mut stops = Vec::new();
         if self.regression.is_some() {
             stops.push(LifecyclePanelStop::MoveBack);
+        }
+        if self.check_offered() {
+            stops.push(LifecyclePanelStop::CheckIncoming);
         }
         match self.active_control {
             Some(ActiveControl::Implement { .. }) => stops.push(LifecyclePanelStop::Implement),
@@ -267,6 +350,7 @@ impl LifecyclePanelView {
     fn activate_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.focused_stop() {
             Some(LifecyclePanelStop::MoveBack) => self.move_back(cx),
+            Some(LifecyclePanelStop::CheckIncoming) => self.check_incoming(cx),
             Some(LifecyclePanelStop::Implement) => self.launch_implementation(window, cx),
             Some(LifecyclePanelStop::Verify) => self.launch_verification(window, cx),
             Some(LifecyclePanelStop::Review) => self.launch_review(window, cx),
@@ -335,6 +419,61 @@ impl LifecyclePanelView {
         let changed = found != self.regression;
         self.regression = found;
         changed
+    }
+
+    /// Re-read the node's pending incoming changes. `true` when they changed.
+    fn refresh_incoming(&mut self) -> bool {
+        let rows = self
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .and_then(|node| self.fleet.incoming_net_pending(node).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|change| IncomingRow::new(&self.fleet, change))
+            .collect::<Vec<_>>();
+        let changed = rows != self.incoming;
+        self.incoming = rows;
+        changed
+    }
+
+    /// Re-read the node's stored retrospectives. `true` when they changed.
+    fn refresh_learnings(&mut self) -> bool {
+        let rows = self
+            .node_uuid()
+            .and_then(|node| {
+                self.fleet
+                    .read(|conn| tod_store::learn::LearnRepo::new(conn).outputs(node))
+                    .ok()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|output| (output.pass, output.content))
+            .collect::<Vec<_>>();
+        let changed = rows != self.learnings;
+        self.learnings = rows;
+        changed
+    }
+
+    fn node_uuid(&self) -> Option<uuid::Uuid> {
+        self.task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    }
+
+    /// Check now is offered while the node has pending changes and no check
+    /// is running (a check of other nodes blocks it too: one at a time).
+    fn check_offered(&self) -> bool {
+        !self.incoming.is_empty() && !self.check_running
+    }
+
+    /// Evaluate the node against its pending incoming changes.
+    fn check_incoming(&mut self, cx: &mut Context<Self>) {
+        let Some(node) = self.node_uuid() else {
+            return;
+        };
+        self.incoming_check
+            .update(cx, |check, cx| check.start(vec![node], cx));
     }
 
     /// Send the node back to the latest state that still holds.
@@ -527,6 +666,129 @@ impl LifecyclePanelView {
     /// and — when any failed — the way back to implementation. Failed steps
     /// are fixed in `active`, where implementation works each one again from
     /// its note; they cannot be fixed from here.
+    /// "Past learnings": the retrospective each completed pass stored, read
+    /// only. Earlier passes' work history is summed up here, not re-shown.
+    fn render_learnings(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let mut section =
+            v_flex().gap_2().child(div().text_xs().font_semibold().child("Past learnings"));
+        for (pass, content) in self.learnings.iter().rev() {
+            let mut item = v_flex()
+                .gap_1()
+                .pl_2()
+                .border_l_2()
+                .border_color(cx.theme().border)
+                .child(div().text_xs().text_color(muted).child(format!("Pass {pass}")));
+            item = if content.is_empty() {
+                item.child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("No retrospective was recorded."),
+                )
+            } else {
+                item.child(div().text_xs().child(selectable_markdown(
+                    format!("lifecycle-panel-learning-{pass}"),
+                    content.clone(),
+                    window,
+                    cx,
+                )))
+            };
+            section = section.child(item);
+        }
+        section.into_any_element()
+    }
+
+    /// "N incoming changes": each net pending change the node inherits and
+    /// has not been checked against.
+    fn render_incoming(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let n = self.incoming.len();
+        let mut section = v_flex().gap_2().child(
+            div().text_xs().font_semibold().child(if n == 1 {
+                "1 incoming change".to_string()
+            } else {
+                format!("{n} incoming changes")
+            }),
+        );
+        for (i, row) in self.incoming.iter().enumerate() {
+            let mut item = v_flex()
+                .gap_1()
+                .pl_2()
+                .border_l_2()
+                .border_color(style::color::incoming_text())
+                .child(div().text_xs().child(selectable_text(
+                    format!("lifecycle-panel-incoming-{i}-head"),
+                    row.headline.clone(),
+                    window,
+                    cx,
+                )));
+            if let Some(before) = &row.before {
+                item = item.child(div().text_xs().text_color(muted).child(selectable_text(
+                    format!("lifecycle-panel-incoming-{i}-before"),
+                    format!("Before: {before}"),
+                    window,
+                    cx,
+                )));
+            }
+            if let Some(after) = &row.after {
+                item = item.child(div().text_xs().child(selectable_text(
+                    format!("lifecycle-panel-incoming-{i}-after"),
+                    format!("After: {after}"),
+                    window,
+                    cx,
+                )));
+            }
+            section = section.child(item);
+        }
+        let check = self.incoming_check.read(cx);
+        let node = self.node_uuid();
+        if node.is_some_and(|n| check.covers(n)) {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("Checking this node against these changes…"),
+            );
+        } else if check.is_running() {
+            let (done, total) = check.progress().unwrap_or_default();
+            section = section.child(div().text_xs().text_color(muted).child(format!(
+                "Another incoming-changes check is running ({done} of {total}); Check now is available when it finishes."
+            )));
+        } else {
+            if let Some(failed) = check.results().iter().find(|r| {
+                Some(r.node) == node && matches!(r.outcome, NodeOutcome::Failed(_))
+            }) {
+                section = section.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().danger)
+                        .child(selectable_text(
+                            "lifecycle-panel-incoming-failed",
+                            outcome_line(failed),
+                            window,
+                            cx,
+                        )),
+                );
+            }
+            let focused = self.is_focused(LifecyclePanelStop::CheckIncoming);
+            let list_active_border = cx.theme().list_active_border;
+            section = section.child(
+                div()
+                    .w_full()
+                    .rounded_md()
+                    .when(focused, |el| el.border_1().border_color(list_active_border))
+                    .child(
+                        Button::new("lifecycle-panel-check-incoming")
+                            .label("Check now")
+                            .w_full()
+                            .on_click(cx.listener(|this, _, _, cx| this.check_incoming(cx))),
+                    ),
+            );
+        }
+        section.into_any_element()
+    }
+
     fn render_verification(
         &self,
         mut body: Stateful<Div>,
@@ -757,6 +1019,8 @@ impl LifecyclePanelView {
                     });
                 self.refresh_active_control();
                 self.refresh_regression();
+                self.refresh_incoming();
+                self.refresh_learnings();
                 true
             }
             _ => false,
@@ -924,10 +1188,7 @@ impl Render for LifecyclePanelView {
                         "This node is no longer {} — move it back to {}",
                         self.lifecycle, found.target
                     )))
-                    .child(div().child(
-                        "Its obligations, plan, or verification changed since it got here. \
-                         Reverse those changes, or move it back and take it forward again",
-                    ));
+                    .child(div().child(found.explanation()));
                 for (i, reason) in found.reasons.iter().enumerate() {
                     callout = callout.child(selectable_text(
                         format!("lifecycle-panel-regression-{i}"),
@@ -951,6 +1212,14 @@ impl Render for LifecyclePanelView {
                             ),
                     ),
                 );
+            }
+
+            if !self.incoming.is_empty() {
+                body = body.child(self.render_incoming(window, cx));
+            }
+
+            if !self.learnings.is_empty() {
+                body = body.child(self.render_learnings(window, cx));
             }
 
             if let Some(control) = self.active_control {

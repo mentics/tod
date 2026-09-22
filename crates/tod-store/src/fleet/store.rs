@@ -208,14 +208,14 @@ impl FleetStore {
             .lock()
             .expect("command log mutex")
             .set_suppressed(true);
-        for inverse in &entry.inverses {
-            self.writer.enqueue(inverse.clone())?;
-        }
-        self.writer.flush()?;
+        let applied = self
+            .writer
+            .apply_undo(entry.inverses.clone(), entry.action_id);
         self.command_log
             .lock()
             .expect("command log mutex")
             .set_suppressed(false);
+        applied?;
         self.projection
             .lock()
             .expect("fleet projection mutex")
@@ -657,6 +657,22 @@ impl FleetStore {
         ObligationRepo::new(&guard.connection())
             .counts_for_list(list_id)
             .map_err(Into::into)
+    }
+
+    /// Pending incoming-change entry count for every node that has any
+    /// (`doc/conversation/incoming-changes.md` §6). One query for all nodes.
+    pub fn incoming_counts(&self) -> Result<HashMap<uuid::Uuid, usize>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        crate::incoming::IncomingRepo::new(&guard.connection()).counts()
+    }
+
+    /// A node's pending incoming changes, netted per item.
+    pub fn incoming_net_pending(
+        &self,
+        node_id: uuid::Uuid,
+    ) -> Result<Vec<crate::incoming::PendingChange>> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        crate::incoming::IncomingRepo::new(&guard.connection()).net_pending(node_id)
     }
 
     /// Enabled capabilities for a node.

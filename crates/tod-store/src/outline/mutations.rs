@@ -397,7 +397,15 @@ impl OutlineMutation {
     }
 
     /// When `DeleteNode` runs, the archive id is stored here for post-execute undo capture.
+    /// Every write path ends by re-resolving the `[[slug]]` reference edges
+    /// its row changes marked dirty, in the same transaction.
     pub fn execute(&self, conn: &Connection, media_root: &Path) -> Result<Option<uuid::Uuid>> {
+        let out = self.execute_rows(conn, media_root)?;
+        crate::outline::references::sync_reference_edges(conn)?;
+        Ok(out)
+    }
+
+    fn execute_rows(&self, conn: &Connection, media_root: &Path) -> Result<Option<uuid::Uuid>> {
         match self {
             OutlineMutation::CreateList { slug, title } => {
                 let repo = ListRepo::new(conn);

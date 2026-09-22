@@ -39,6 +39,9 @@ pub const GATE_CHECK_SURFACE: &str = "gate check";
 /// The surface label a state's on-entry session is named with.
 pub const ON_ENTRY_SURFACE: &str = "on entry";
 
+/// Checking a node against its incoming changes.
+pub const INCOMING_SURFACE: &str = "incoming check";
+
 /// Name a session, e.g. `Obligations · Ship the chat context fix · Sep 10, 2:41 PM`.
 ///
 /// `context_key` is the agent-context key the chat was opened with (see

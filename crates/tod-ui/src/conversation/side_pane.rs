@@ -590,6 +590,7 @@ impl ConversationView {
                     ),
                 }
             }
+            ProtocolKind::Incoming => SideList::Obligations,
             // A stub until the designer is rebuilt as this pane. The working
             // designer is still `views::visual_design_panel`.
             ProtocolKind::VisualDesign => SideList::Empty(

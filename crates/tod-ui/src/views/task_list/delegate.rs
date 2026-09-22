@@ -50,6 +50,10 @@ pub enum RowAction {
     ToggleCollapsed {
         task_id: String,
     },
+    /// Ctrl+click: add the row to, or take it out of, the marked set.
+    ToggleMark {
+        task_id: String,
+    },
     OpenObligations {
         task_id: String,
     },
@@ -88,6 +92,8 @@ pub struct TaskListDelegate {
     /// The view that owns this delegate, for row popups that drive it directly.
     view: Option<WeakEntity<TaskListView>>,
     recently_updated: std::collections::HashSet<String>,
+    /// Rows marked for a multi-node action (Space / Ctrl+click).
+    marked: std::collections::HashSet<String>,
 }
 
 impl TaskListDelegate {
@@ -105,7 +111,12 @@ impl TaskListDelegate {
             generator_filter_input: None,
             view: None,
             recently_updated: std::collections::HashSet::new(),
+            marked: std::collections::HashSet::new(),
         }
+    }
+
+    pub fn set_marked(&mut self, marked: std::collections::HashSet<String>) {
+        self.marked = marked;
     }
 
     pub fn set_recently_updated(&mut self, recently_updated: std::collections::HashSet<String>) {
@@ -261,10 +272,15 @@ impl ListDelegate for TaskListDelegate {
             ));
         }
         if item.has_spec {
-            let obl_label = format!(
+            let mut obl_label = format!(
                 "{} req · {} con",
                 item.requirement_count, item.constraint_count
             );
+            // Pending incoming changes: the count joins the Spec chip, and
+            // at zero nothing is added.
+            if item.incoming_count > 0 {
+                obl_label.push_str(&format!(" · {} incoming", item.incoming_count));
+            }
             let task_id_obl = item.id.clone();
             chips = chips.child(action_chip(
                 cx,
@@ -554,6 +570,7 @@ impl ListDelegate for TaskListDelegate {
                     display_title.clone(),
                     selected,
                     managed,
+                    item.incoming_count > 0,
                     item.id.clone(),
                     sink.clone(),
                 ),
@@ -573,6 +590,9 @@ impl ListDelegate for TaskListDelegate {
         let has_spec = item.has_spec;
         let drop_task_id = item.id.clone();
         let drop_sink = sink.clone();
+        let marked = self.marked.contains(&item.id);
+        let mark_task_id = item.id.clone();
+        let mark_sink = sink.clone();
         let row_content = h_flex()
             .h(TREE_ROW_HEIGHT)
             .items_center()
@@ -591,6 +611,28 @@ impl ListDelegate for TaskListDelegate {
                         .bg(primary),
                 )
             })
+            .when(marked, |el| {
+                el.bg(primary.opacity(0.12)).child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(primary),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
+                    if event.modifiers.control || event.modifiers.platform {
+                        mark_sink.borrow_mut().push(RowAction::ToggleMark {
+                            task_id: mark_task_id.clone(),
+                        });
+                        cx.notify();
+                    }
+                }),
+            )
             .when(has_spec, |el| {
                 el.can_drop(|any, _, _| any.downcast_ref::<ObligationDragPayload>().is_some())
                     .on_drop::<ObligationDragPayload>(cx.listener(
@@ -644,6 +686,7 @@ fn title_label(
     title: String,
     selected: bool,
     managed: bool,
+    pending_changes: bool,
     task_id: String,
     sink: Rc<RefCell<Vec<RowAction>>>,
 ) -> impl gpui::IntoElement {
@@ -652,15 +695,17 @@ fn title_label(
         .flex_1()
         .min_w_0()
         .when(selected, |el| el.cursor_pointer())
-        .child(
+        .child(if pending_changes {
+            crate::ui::style::node_title_pending_changes(div()).child(title)
+        } else {
             div()
                 .text_sm()
                 .font_medium()
                 .text_color(foreground)
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(title),
-        )
+                .child(title)
+        })
         .when(selected, |el| {
             el.on_mouse_down(MouseButton::Left, {
                 let task_id = task_id.clone();

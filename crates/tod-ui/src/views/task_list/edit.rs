@@ -79,6 +79,7 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             has_agent: false,
             requirement_count: 0,
             constraint_count: 0,
+            incoming_count: 0,
             has_children: false,
             in_flight_activity: None,
             managed: false,

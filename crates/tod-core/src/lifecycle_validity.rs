@@ -20,17 +20,28 @@
 //! | `ready` … `approved` | a plan step was deleted or reworded since `ready` | `planning` |
 //! | `verifying` … `approved` | a plan step is open or failed, or an obligation failed verification | `active` |
 //! | `review`, `approved` | a plan step or obligation is not verified | `verifying` |
+//! | `ready` … `done` | the latest incoming-changes verdict is `plan`, not acted on | `planning` |
+//! | `ready` … `done` | the latest incoming-changes verdict is `obligations`, not acted on | `design` |
 //!
 //! Plan steps added after `ready` are not a finding in themselves: they are
 //! open work, which the `active` rule catches once the node is past it.
-//! `merged` and later are left alone: the work has shipped, and a change to
-//! it is new work, not a reason to un-ship.
+//! `merged` and later are left alone by the node's own edits: the work has
+//! shipped, and a change to it is new work, not a reason to un-ship.
+//!
+//! Incoming-changes verdicts (`tod_store::incoming`) are the deliberate
+//! exception, at every state from `ready` through `done`: something the node
+//! inherits changed, and a product-model node is reworked when that happens
+//! (`doc/conversation/incoming-changes.md` §5). A verdict is acted on once the
+//! node has been back to its target: going back before `ready` drops the
+//! baseline, and entering `ready` again takes one that records the verdicts
+//! it already covers (`Baseline::verdicts_through`).
 
 use crate::task::model::lifecycle_rank;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use tod_store::interview::short_id;
+use tod_store::incoming::IncomingRepo;
 use tod_store::lifecycle_baseline::BaselineRepo;
 use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
@@ -44,6 +55,33 @@ pub struct Regression {
     pub target: &'static str,
     /// Why, one line per item, earliest-state findings first.
     pub reasons: Vec<String>,
+    /// What the latest unacted incoming-changes verdict says it affects
+    /// (`plan` / `obligations`), when that verdict is among the findings.
+    pub incoming: Option<String>,
+    /// Whether any finding comes from the node's own obligations, plan, or
+    /// verification rather than from what it inherits.
+    pub own: bool,
+}
+
+impl Regression {
+    /// One sentence saying why, fitted to the cause: an inherited change, the
+    /// node's own work, or both.
+    pub fn explanation(&self) -> String {
+        match (&self.incoming, self.own) {
+            (Some(affects), false) => format!(
+                "A change it inherits affects its {affects}. \
+                 Move it back and take it forward again"
+            ),
+            (Some(affects), true) => format!(
+                "A change it inherits affects its {affects}, and its own obligations, plan, \
+                 or verification changed since it got here. \
+                 Move it back and take it forward again"
+            ),
+            (None, _) => "Its obligations, plan, or verification changed since it got here. \
+                          Reverse those changes, or move it back and take it forward again"
+                .to_string(),
+        }
+    }
 }
 
 /// Whether `node_id`'s current lifecycle state still holds. `None` when it
@@ -53,15 +91,43 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
         return Ok(None);
     };
     let rank = lifecycle_rank(&state);
-    if rank < lifecycle_rank("ready") || rank > lifecycle_rank("approved") {
+    if rank < lifecycle_rank("ready") || rank > lifecycle_rank("done") {
         return Ok(None);
     }
     let mut findings: Vec<(&'static str, String)> = Vec::new();
+    let mut incoming = None;
+    let baseline = BaselineRepo::new(conn).get(node_id)?;
+
+    if let Some(verdict) = IncomingRepo::new(conn).latest_verdict(node_id)? {
+        let acted_on = baseline
+            .as_ref()
+            .is_some_and(|b| b.verdicts_through >= verdict.id);
+        if let (Some(target), false) = (verdict.target(), acted_on) {
+            incoming = Some(verdict.affects.clone());
+            let changes = crate::incoming::verdict_changes(conn, &verdict)?;
+            let what = if changes.is_empty() {
+                "Incoming changes".to_string()
+            } else {
+                changes.join("; ")
+            };
+            findings.push((
+                target,
+                format!(
+                    "{what} (affects {}). Note: {}",
+                    verdict.affects,
+                    verdict.note.trim()
+                ),
+            ));
+        }
+    }
+    if rank > lifecycle_rank("approved") {
+        return Ok(finish(findings, incoming));
+    }
 
     let obligations = ObligationRepo::new(conn).list_for_node(node_id)?;
     let steps = PlanStepRepo::new(conn).list_for_node(node_id)?;
 
-    if let Some(baseline) = BaselineRepo::new(conn).get(node_id)? {
+    if let Some(baseline) = baseline {
         let now: HashMap<Uuid, _> = obligations.iter().map(|o| (o.id, o)).collect();
         for before in &baseline.obligations {
             match now.get(&before.id) {
@@ -165,18 +231,26 @@ pub fn regression(conn: &Connection, node_id: Uuid) -> Result<Option<Regression>
         }
     }
 
-    let Some(target) = findings
+    Ok(finish(findings, incoming))
+}
+
+/// The earliest target among `findings`, with every reason, earliest first.
+fn finish(
+    mut findings: Vec<(&'static str, String)>,
+    incoming: Option<String>,
+) -> Option<Regression> {
+    let own = findings.len() > usize::from(incoming.is_some());
+    let target = findings
         .iter()
         .map(|(target, _)| *target)
-        .min_by_key(|target| lifecycle_rank(target))
-    else {
-        return Ok(None);
-    };
+        .min_by_key(|target| lifecycle_rank(target))?;
     findings.sort_by_key(|(target, _)| lifecycle_rank(target));
-    Ok(Some(Regression {
+    Some(Regression {
         target,
         reasons: findings.into_iter().map(|(_, reason)| reason).collect(),
-    }))
+        incoming,
+        own,
+    })
 }
 
 fn capitalized(kind: &str) -> String {
@@ -298,6 +372,58 @@ mod tests {
         VerdictRepo::new(&fx.conn)
             .record(fx.node, fx.obligation, None, "verified", "Saw it.")
             .unwrap();
+        assert_eq!(check(&fx), None);
+    }
+
+    /// Queue one incoming change on the node and resolve it with `affects`.
+    fn incoming_verdict(fx: &Fx, affects: &str) {
+        let conn = &fx.conn;
+        conn.execute(
+            "INSERT INTO conversation_actions
+             (conversation_id, source, turn_seq, actor, kind, entity, entity_id, node_id,
+              mutation, before, after, at)
+             VALUES (NULL, 'user', 0, 'user', 'create', 'obligation', ?1, ?1, '{}', NULL, NULL, 0)",
+            [Uuid::new_v4().as_bytes().to_vec()],
+        )
+        .unwrap();
+        let action = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO incoming_changes (node_id, action_id, via, source_node, queued_at)
+             VALUES (?1, ?2, 'ancestor', ?1, 0)",
+            rusqlite::params![fx.node.as_bytes().to_vec(), action],
+        )
+        .unwrap();
+        IncomingRepo::new(conn)
+            .resolve(fx.node, affects, "The dialog has no Escape.", None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn an_incoming_plan_verdict_goes_back_to_planning_even_from_done() {
+        let fx = planned("done");
+        assert_eq!(check(&fx), None);
+        incoming_verdict(&fx, "plan");
+        let found = check(&fx).unwrap();
+        assert_eq!(found.target, "planning");
+        assert!(found.reasons[0].contains("affects plan"), "{:?}", found.reasons);
+        assert!(found.reasons[0].contains("no Escape"), "{:?}", found.reasons);
+        // Moved back and through ready again: acted on.
+        let nodes = NodeRepo::new(&fx.conn);
+        nodes.set_lifecycle(fx.node, "planning").unwrap();
+        assert_eq!(check(&fx), None);
+        nodes.set_lifecycle(fx.node, "ready").unwrap();
+        assert_eq!(check(&fx), None);
+    }
+
+    #[test]
+    fn an_incoming_obligations_verdict_goes_back_to_design_and_none_changes_nothing() {
+        let fx = planned("merged");
+        incoming_verdict(&fx, "none");
+        assert_eq!(check(&fx), None);
+        incoming_verdict(&fx, "obligations");
+        assert_eq!(check(&fx).unwrap().target, "design");
+        // The latest verdict is what counts.
+        incoming_verdict(&fx, "none");
         assert_eq!(check(&fx), None);
     }
 
