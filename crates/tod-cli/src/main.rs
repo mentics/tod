@@ -61,6 +61,26 @@ NOUNS:
 Run `tod-cli <NOUN> --help` for that noun's commands.
 ";
 
+/// Every noun and its usage text, so `<noun> --help` needs no data root.
+const NOUNS: &[(&str, &str)] = &[
+    ("node", crate::node::USAGE),
+    ("obligations", crate::obligations::USAGE),
+    ("plan", crate::plan::USAGE),
+    ("visual-design", crate::visual_design::USAGE),
+    ("content", crate::interview::CONTENT_USAGE),
+    ("questions", crate::interview::QUESTIONS_USAGE),
+    ("memory", crate::interview::MEMORY_USAGE),
+    ("interview", crate::interview::INTERVIEW_USAGE),
+    ("capabilities", crate::capabilities::USAGE),
+    ("changeset", crate::changeset::USAGE),
+    ("tests", crate::test_runs::USAGE),
+    ("review", crate::review::USAGE),
+    ("verdicts", crate::verdicts::USAGE),
+    ("incoming", crate::incoming::USAGE),
+    ("learn", crate::learn::USAGE),
+    ("secrets", crate::secrets::USAGE),
+];
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
@@ -127,6 +147,18 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         return Ok(USAGE.trim_end().to_string());
     }
 
+    // Help needs no data root: answer it before requiring one.
+    let wants_help = rest
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "-h" || a == "--help");
+    if wants_help {
+        return match NOUNS.iter().find(|(noun, _)| *noun == rest[0]) {
+            Some((_, usage)) => Ok(usage.trim_end().to_string()),
+            None => Ok(USAGE.trim_end().to_string()),
+        };
+    }
+
     let data_root = data_root.ok_or_else(|| {
         anyhow::anyhow!(
             "--data-root <PATH> is required (the agent context message supplies the value)"
@@ -175,6 +207,15 @@ mod tests {
     use tod_store::fleet::FleetStore;
     use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
     use uuid::Uuid;
+
+    #[test]
+    fn noun_help_needs_no_data_root() {
+        let help = |args: &[&str]| run(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        assert_eq!(help(&["secrets", "--help"]).unwrap(), crate::secrets::USAGE.trim_end());
+        assert_eq!(help(&["secrets", "run", "-h"]).unwrap(), crate::secrets::USAGE.trim_end());
+        // After `--` the flag belongs to the command `secrets run` starts.
+        assert!(help(&["secrets", "run", "--", "tool", "--help"]).is_err());
+    }
 
     /// A data root holding one Spec node and its interview session. The store
     /// is closed again so `tod-cli` opens it itself, as with no app running.

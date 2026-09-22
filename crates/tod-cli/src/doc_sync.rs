@@ -13,25 +13,8 @@
 /// Every noun, as `(noun, usage text)`. The fragment is
 /// `media/context/cli/<noun>.md`.
 #[cfg(test)]
-pub(crate) fn nouns() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("node", crate::node::USAGE),
-        ("obligations", crate::obligations::USAGE),
-        ("plan", crate::plan::USAGE),
-        ("visual-design", crate::visual_design::USAGE),
-        ("content", crate::interview::CONTENT_USAGE),
-        ("questions", crate::interview::QUESTIONS_USAGE),
-        ("memory", crate::interview::MEMORY_USAGE),
-        ("interview", crate::interview::INTERVIEW_USAGE),
-        ("capabilities", crate::capabilities::USAGE),
-        ("changeset", crate::changeset::USAGE),
-        ("tests", crate::test_runs::USAGE),
-        ("review", crate::review::USAGE),
-        ("verdicts", crate::verdicts::USAGE),
-        ("incoming", crate::incoming::USAGE),
-        ("learn", crate::learn::USAGE),
-        ("secrets", crate::secrets::USAGE),
-    ]
+pub(crate) fn nouns() -> &'static [(&'static str, &'static str)] {
+    crate::NOUNS
 }
 
 /// The verbs listed under `COMMANDS:` — lines indented exactly four spaces and
@@ -80,7 +63,7 @@ mod tests {
     /// Without one, a recipe has no way to tell an agent the noun exists.
     #[test]
     fn every_noun_has_a_cli_fragment() {
-        for (noun, _) in nouns() {
+        for &(noun, _) in nouns() {
             assert!(
                 fragment(noun).is_some(),
                 "tod-cli dispatches `{noun}` but media/context/cli/{noun}.md does not exist"
@@ -91,7 +74,7 @@ mod tests {
     /// The fragment must mention every verb the noun actually accepts.
     #[test]
     fn every_verb_is_documented_in_its_fragment() {
-        for (noun, usage) in nouns() {
+        for &(noun, usage) in nouns() {
             let Some(doc) = fragment(noun) else { continue };
             for verb in verbs(usage) {
                 assert!(
@@ -106,7 +89,7 @@ mod tests {
     /// And must not invent verbs the binary would reject.
     #[test]
     fn fragments_do_not_document_verbs_that_do_not_exist() {
-        for (noun, usage) in nouns() {
+        for &(noun, usage) in nouns() {
             let Some(doc) = fragment(noun) else { continue };
             let real = verbs(usage);
             // Only the invocation lines, never prose — "a top-level node with
@@ -134,7 +117,7 @@ mod tests {
     /// two tests above pass for any fragment at all.
     #[test]
     fn the_verb_extractor_finds_verbs() {
-        for (noun, usage) in nouns() {
+        for &(noun, usage) in nouns() {
             assert!(
                 !verbs(usage).is_empty(),
                 "no verbs parsed out of `{noun}`'s usage string"
