@@ -66,6 +66,7 @@ use crate::ui::status::{self, StatusSource};
 use crate::ui::status_filter::StatusFilter;
 use crate::ui::style;
 use crate::views::incoming_check::IncomingCheck;
+use crate::views::obligations::ObligationsView;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
 use change_set::{ChangeKey, PendingReverse};
@@ -391,6 +392,10 @@ pub struct ConversationView {
     /// Scroll the cursor's row into view on the next render.
     scroll_to_cursor: bool,
     context: ContextPanel,
+    /// The side pane's obligations list: the real [`ObligationsView`], hosted
+    /// embedded, so it edits, reorders and groups exactly as it does on the
+    /// node tree.
+    side_obligations: Entity<ObligationsView>,
 
     /// Runs gate checks and lifecycle moves; shared with the lifecycle panel.
     lifecycle: Entity<LifecycleController>,
@@ -489,6 +494,14 @@ impl ConversationView {
             }
         });
         let context = ContextPanel::new(fleet.clone(), window, cx);
+        // The side pane's obligations list is the real panel, hosted here, so
+        // an obligation affords the same actions in a conversation as it does
+        // on the node tree (`doc/ui/item-list.md`).
+        let side_obligations = cx.new(|cx| {
+            let mut view = ObligationsView::new(window, cx, fleet.clone());
+            view.set_embedded(true, cx);
+            view
+        });
         Self {
             host: RowHost::for_entity(cx.weak_entity()),
             fleet,
@@ -531,6 +544,7 @@ impl ConversationView {
             side_scroll_pending: false,
             scroll_to_cursor: false,
             context,
+            side_obligations,
             lifecycle,
             _lifecycle_changes: lifecycle_changes,
             incoming_check: None,
@@ -1416,8 +1430,17 @@ impl ConversationView {
         }
         match pane {
             Pane::ChangeSet => {
-                self.clamp_cursor();
-                self.focus_handle.focus(window, cx);
+                // The obligations pane is a hosted list with its own keys; the
+                // rest of the side pane is this view's own.
+                if self.side_list() == side_pane::SideList::Obligations {
+                    self.side_obligations
+                        .read(cx)
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                } else {
+                    self.clamp_cursor();
+                    self.focus_handle.focus(window, cx);
+                }
             }
             Pane::Context => {
                 if self.context.target.is_none() {
@@ -1459,7 +1482,11 @@ impl ConversationView {
         }
         match self.pane {
             Pane::ChangeSet => {
-                if let Some(key) = self.cursor {
+                if self.side_list() == side_pane::SideList::Obligations {
+                    if let Some(focus) = self.side_obligations.read(cx).conversation_focus() {
+                        self.open(focus, true, window, cx);
+                    }
+                } else if let Some(key) = self.cursor {
                     self.talk_about(key, window, cx);
                 }
             }

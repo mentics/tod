@@ -2063,6 +2063,50 @@ fn a_fix_conversation_lists_the_findings_under_a_status_filter(cx: &mut TestAppC
     );
 }
 
+/// The obligations side pane is the real obligations panel, hosted: the same
+/// grouping, and the same editing and reordering, as on the node tree.
+#[gpui::test]
+fn conversation_obligations_pane_hosts_the_obligations_list(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    fixture
+        .store
+        .enqueue_outline(OutlineMutation::EnableCapabilities {
+            node_id: fixture.node_id,
+            capabilities: vec![tod_store::outline::Capability::Lifecycle],
+        })
+        .unwrap();
+    fixture.store.writer().flush().unwrap();
+    let id = Uuid::new_v4();
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::CreateConversation {
+                id,
+                protocol: ProtocolKind::OnEntry,
+                focus: Focus::Node(fixture.node_id),
+                platform: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+    let (view, _events, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    draw(cx);
+
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.side_list(), side_pane::SideList::Obligations);
+        let list = v.side_obligations.read(cx);
+        assert!(list.is_open(), "the hosted panel is targeted at the node");
+        // Grouped, not the flat run the pane used to build by hand.
+        assert!(
+            list.group_labels().iter().any(|l| l == "Requirements"),
+            "the hosted panel groups: {:?}",
+            list.group_labels()
+        );
+    });
+}
+
 fn counts(changes: &[tod_store::conversation::NetChange]) -> Vec<usize> {
     change_counts(changes).into_iter().map(|(_, n)| n).collect()
 }

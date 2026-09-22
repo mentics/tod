@@ -277,6 +277,16 @@ impl ObligationsView {
         cx.notify();
     }
 
+    /// The labels of the group headings currently shown, outermost first.
+    #[cfg(test)]
+    pub(crate) fn group_labels(&self) -> Vec<String> {
+        self.list
+            .rows()
+            .iter()
+            .filter_map(|row| Some(row.as_group()?.label.to_string()))
+            .collect()
+    }
+
     /// Whether `id` is shown as a removed (struck-through) row.
     pub(crate) fn is_struck(&self, id: Uuid) -> bool {
         self.struck.contains(&id)
@@ -284,7 +294,6 @@ impl ObligationsView {
 
     /// Also show `items`, which no longer exist, struck through at their old
     /// place. Ones that exist again (a reversed deletion) show as normal.
-    /// Whether `id` is shown as a removed (struck-through) row.
     pub fn set_removed_items(
         &mut self,
         items: Vec<NodeObligation>,
@@ -624,6 +633,7 @@ impl ObligationsView {
                     ObligationItem {
                         struck: self.struck.contains(&id),
                         marker: self.change_markers.get(&id).copied(),
+                        standing: self.standing.get(&id).cloned(),
                         obligation,
                     },
                 ));

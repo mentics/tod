@@ -33,7 +33,7 @@ use tod_store::outline::repos::plan_steps::{
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
 use tod_store::verification::{
-    LISTING_STATUSES, ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
+    ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
 };
 use tod_store::review::{
     FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_REJECTED, FINDING_STATUSES,
@@ -600,85 +600,32 @@ impl ConversationView {
         }
     }
 
-    /// The node's own obligations, each with whether a plan step satisfies
-    /// it yet (or verification's verdict, once it has one).
+    /// The node's own obligations: the real obligations panel, hosted here,
+    /// so they group, edit and reorder exactly as they do on the node tree.
+    /// Each row carries its standing — its verdict, else whether a plan step
+    /// satisfies it — as a trailing badge.
     fn render_obligations_pane(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let Some(node) = self.data.focus_node else {
+            return self.render_empty_pane("Obligations", "This conversation is not about a node.");
+        };
+        let title = self.data.title.clone();
+        self.side_obligations.update(cx, |list, cx| {
+            list.retarget(node, &title, None, false, window, cx);
+        });
         let standings = &self.data.standings;
-        if standings.is_empty() {
-            return self.render_empty_pane("Obligations", "This node has no obligations yet.");
-        }
-        let planned = &self.data.planned;
         let unplanned = standings
             .iter()
-            .filter(|s| !planned.contains(&s.obligation.id))
+            .filter(|s| !self.data.planned.contains(&s.obligation.id))
             .count();
-        let summary = match unplanned {
-            0 => format!("{}, all in the plan", standings.len()),
-            u => format!("{}, {u} not in the plan", standings.len()),
+        let summary = match (standings.len(), unplanned) {
+            (0, _) => "none yet".to_string(),
+            (n, 0) => format!("{n}, all in the plan"),
+            (n, u) => format!("{n}, {u} not in the plan"),
         };
-        let filter = self.render_obligation_filter(
-            "obligation",
-            &LISTING_STATUSES,
-            |s| {
-                s.listing_status(planned.contains(&s.obligation.id))
-                    .to_string()
-            },
-            cx,
-        );
-        let mut rows: Vec<AnyElement> = standings
-            .iter()
-            .filter(|s| {
-                self.obligation_filter
-                    .admits(s.listing_status(planned.contains(&s.obligation.id)))
-            })
-            .map(|standing| {
-                let id = standing.obligation.id;
-                let status = standing
-                    .listing_status(planned.contains(&id))
-                    .to_string();
-                let badge = style::badge(div()).child(status);
-                let badge = if standing.is_failed() {
-                    style::text_error(badge)
-                } else {
-                    badge
-                };
-                h_flex()
-                    .gap(style::space::INLINE)
-                    .px(style::space::RELATED)
-                    .py(style::space::INLINE)
-                    .items_start()
-                    .child(
-                        v_flex()
-                            .w(STATUS_COLUMN_WIDTH)
-                            .flex_shrink_0()
-                            .gap(style::space::INLINE)
-                            .child(
-                                style::text_dense_muted(div())
-                                    .child(standing.obligation.kind.clone()),
-                            )
-                            .child(badge),
-                    )
-                    .child(div().flex_1().min_w_0().child(selectable_text(
-                        format!("obligation-pane-{id}"),
-                        standing.obligation.body.clone(),
-                        window,
-                        cx,
-                    )))
-                    .into_any_element()
-            })
-            .collect();
-        if rows.is_empty() {
-            rows.push(
-                style::empty_message(div())
-                    .p(style::space::INSET)
-                    .child("No obligations in the chosen statuses.")
-                    .into_any_element(),
-            );
-        }
         v_flex()
             .size_full()
             .min_w_0()
@@ -690,14 +637,11 @@ impl ConversationView {
                         .child(style::text_dense_muted(div()).child(summary)),
                 ),
             )
-            .children(filter)
             .child(
-                v_flex()
-                    .id("obligations-pane")
+                div()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .children(rows),
+                    .child(self.side_obligations.clone()),
             )
             .into_any_element()
     }
