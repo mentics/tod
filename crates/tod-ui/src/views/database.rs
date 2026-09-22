@@ -1,17 +1,25 @@
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
+use crate::ui::item_list::keyboard::{
+    ItemListDown, ItemListEnd, ItemListHome, ItemListPageDown, ItemListPageUp, ItemListUp,
+};
+use crate::ui::item_list::{
+    ColumnSpec, ItemList, ItemListEvent, ItemListKeys, ItemListRow, ItemRowState,
+    bind_item_list_keys,
+};
 use crate::ui::key_context;
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
+use crate::views::rows::RowHost;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
-    px,
+    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString, Styled, Subscription,
+    Window, actions, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Textarea, TextareaState};
-use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, Selectable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Selectable, h_flex, v_flex};
 use std::sync::Arc;
 use tod_store::fleet::{FleetStore, explore};
 
@@ -24,21 +32,69 @@ enum DatabaseStop {
     Table,
     Sql,
     Run,
+    /// The result rows. While the cursor is here Up/Down move it through the
+    /// list; Up off its first row returns to the controls above.
+    Results,
 }
 
-const DATABASE_STOPS: [DatabaseStop; 3] =
-    [DatabaseStop::Table, DatabaseStop::Sql, DatabaseStop::Run];
+const DATABASE_STOPS: [DatabaseStop; 4] = [
+    DatabaseStop::Table,
+    DatabaseStop::Sql,
+    DatabaseStop::Run,
+    DatabaseStop::Results,
+];
 
 actions!(
     database_view,
-    [
-        DatabaseRunSql,
-        DatabaseStopUp,
-        DatabaseStopDown,
-        DatabaseActivate,
-        DatabaseEscape,
-    ]
+    [DatabaseRunSql, DatabaseActivate, DatabaseEscape]
 );
+
+/// One row of the result: its cells, in the result's column order.
+#[derive(Debug, Clone)]
+struct ResultRow {
+    cells: Vec<String>,
+}
+
+/// What the user did in the results list, queued for the view to apply.
+#[derive(Debug, Clone)]
+enum ResultAction {
+    Select { row_ix: usize },
+    /// Something the list can report but a flat, read-only one never does.
+    Ignored,
+}
+
+impl From<ItemListEvent> for ResultAction {
+    fn from(event: ItemListEvent) -> Self {
+        match event {
+            ItemListEvent::Select { row_ix } => Self::Select { row_ix },
+            ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignored,
+        }
+    }
+}
+
+/// The result's own columns, in its order: a query row has a value for every
+/// one of them, which is what makes them columns. The last takes the slack,
+/// since no column of a query result means more than another. They are keyed
+/// by position, so a query that selects the same name twice still lines up.
+fn result_columns(names: &[String]) -> Vec<ColumnSpec> {
+    let last = names.len().saturating_sub(1);
+    names
+        .iter()
+        .enumerate()
+        .map(|(ix, name)| {
+            let key = column_key(ix);
+            if ix == last {
+                ColumnSpec::content(key, name.clone())
+            } else {
+                ColumnSpec::fixed(key, name.clone(), style::size::TABLE_CELL)
+            }
+        })
+        .collect()
+}
+
+fn column_key(ix: usize) -> String {
+    format!("c{ix}")
+}
 
 pub struct DatabaseView {
     fleet: Arc<FleetStore>,
@@ -48,6 +104,10 @@ pub struct DatabaseView {
     table_select: Entity<SelectState<Vec<String>>>,
     sql_input: Entity<TextareaState>,
     result: explore::QueryRows,
+    /// The rows, the cursor, the columns and the scrolling: everything every
+    /// list in the app shares.
+    list: ItemList<ResultRow>,
+    host: RowHost<ResultAction>,
     status_line: SharedString,
     error: Option<String>,
     focus_stop: DatabaseStop,
@@ -80,6 +140,8 @@ impl DatabaseView {
             table_select,
             sql_input,
             result: explore::QueryRows::default(),
+            list: ItemList::new(),
+            host: RowHost::for_entity(cx.weak_entity()),
             status_line: SharedString::from("Select a table or run SQL"),
             error: None,
             focus_stop: DatabaseStop::Table,
@@ -156,6 +218,9 @@ impl DatabaseView {
             }
             DatabaseStop::Sql => self.enter_sql_edit(window, cx),
             DatabaseStop::Run => self.run_sql(window, cx),
+            // A result row is a read-only value: there is nothing to
+            // activate.
+            DatabaseStop::Results => {}
         }
     }
 
@@ -195,7 +260,7 @@ impl DatabaseView {
         match explore::query_table(&conn, table) {
             Ok(rows) => {
                 let count = rows.rows.len();
-                self.result = rows;
+                self.show_result(rows);
                 self.error = None;
                 self.status_line = SharedString::from(format!(
                     "Table {table} — {count} row{}",
@@ -203,7 +268,7 @@ impl DatabaseView {
                 ));
             }
             Err(err) => {
-                self.result = explore::QueryRows::default();
+                self.show_result(explore::QueryRows::default());
                 self.error = Some(err.to_string());
                 self.status_line = SharedString::from(format!("Table {table}"));
             }
@@ -220,7 +285,7 @@ impl DatabaseView {
         match explore::execute_sql(&conn, &sql, 500) {
             Ok(rows) => {
                 let count = rows.rows.len();
-                self.result = rows;
+                self.show_result(rows);
                 self.error = None;
                 self.status_line = SharedString::from(format!(
                     "Query — {count} row{}",
@@ -228,13 +293,139 @@ impl DatabaseView {
                 ));
             }
             Err(err) => {
-                self.result = explore::QueryRows::default();
+                self.show_result(explore::QueryRows::default());
                 self.error = Some(err.to_string());
                 self.status_line = SharedString::from("Query failed");
             }
         }
         cx.notify();
         self.focus_handle.focus(window, cx);
+    }
+
+    /// Show `result`: its columns become the list's columns and its rows the
+    /// list's rows. A new result starts at the top — the cursor is held by
+    /// key, and one result's row keys mean nothing in another's.
+    fn show_result(&mut self, result: explore::QueryRows) {
+        self.list.set_columns(result_columns(&result.columns));
+        self.list.set_cursor_key(None);
+        self.list.set_rows(
+            result
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(ix, cells)| {
+                    ItemListRow::item(
+                        format!("r{ix}"),
+                        ResultRow {
+                            cells: cells.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        self.result = result;
+    }
+
+    fn drain_row_actions(&mut self, cx: &mut Context<Self>) {
+        for action in self.host.drain() {
+            match action {
+                ResultAction::Select { row_ix } => {
+                    self.focus_stop = DatabaseStop::Results;
+                    self.list.set_cursor(row_ix);
+                    cx.notify();
+                }
+                ResultAction::Ignored => {}
+            }
+        }
+    }
+
+    /// Up/Down: the results list owns them while the cursor is in it, the ring
+    /// of controls otherwise. Up off the list's first row hands them back.
+    fn on_arrow_up(&mut self, _: &ItemListUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_stop == DatabaseStop::Results && !self.list.is_empty() {
+            if self.list.move_cursor(-1) {
+                cx.notify();
+                return;
+            }
+            self.move_stop(-1, window, cx);
+            return;
+        }
+        self.move_stop(-1, window, cx);
+    }
+
+    fn on_arrow_down(&mut self, _: &ItemListDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_stop == DatabaseStop::Results && !self.list.is_empty() {
+            if self.list.move_cursor(1) {
+                cx.notify();
+            }
+            return;
+        }
+        self.move_stop(1, window, cx);
+    }
+
+    fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<ResultRow>::page_rows(window.viewport_size().height) as i32;
+        self.move_list_cursor(-page, cx);
+    }
+
+    fn on_page_down(&mut self, _: &ItemListPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<ResultRow>::page_rows(window.viewport_size().height) as i32;
+        self.move_list_cursor(page, cx);
+    }
+
+    fn on_home(&mut self, _: &ItemListHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.in_results() && self.list.cursor_home() {
+            cx.notify();
+        }
+    }
+
+    fn on_end(&mut self, _: &ItemListEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.in_results() && self.list.cursor_end() {
+            cx.notify();
+        }
+    }
+
+    /// Whether the list is the thing the keyboard is on.
+    fn in_results(&self) -> bool {
+        self.focus_stop == DatabaseStop::Results && !self.text_editing()
+    }
+
+    fn move_list_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.in_results() && self.list.move_cursor(delta) {
+            cx.notify();
+        }
+    }
+
+    /// One result row: a cell per column, each selectable so a value can be
+    /// copied out.
+    fn render_result_row(
+        row: &ResultRow,
+        state: ItemRowState<'_>,
+        host: &RowHost<ResultAction>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let row_ix = state.row_ix;
+        let select_host = host.clone();
+        style::row(h_flex())
+            .w_full()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                select_host.push(ResultAction::Select { row_ix }.into(), cx);
+            })
+            .when(state.highlighted, style::highlighted)
+            .children(row.cells.iter().enumerate().map(|(col_ix, cell)| {
+                state
+                    .column(&column_key(col_ix), style::text_dense(div()))
+                    .child(selectable_text(
+                        ("db-cell", row_ix * 1000 + col_ix),
+                        cell.clone(),
+                        window,
+                        cx,
+                    ))
+            }))
+            .into_any_element()
     }
 }
 
@@ -260,6 +451,7 @@ impl Focusable for DatabaseView {
 
 impl Render for DatabaseView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.drain_row_actions(cx);
         self.refresh_tables(window, cx);
         key_context::set_input_tab_stop(&self.sql_input, self.sql_editing, cx);
         if !self.sql_editing && self.sql_input.read(cx).focus_handle(cx).is_focused(window) {
@@ -271,7 +463,6 @@ impl Render for DatabaseView {
         let muted = theme.muted_foreground;
         let foreground = theme.foreground;
         let danger = theme.danger;
-        let muted_bg = theme.muted;
         let list_active = theme.list_active;
         let list_active_border = theme.list_active_border;
 
@@ -291,14 +482,12 @@ impl Render for DatabaseView {
             .size_full()
             .bg(theme.background)
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &DatabaseStopUp, window, cx| {
-                this.move_stop(-1, window, cx);
-                cx.stop_propagation();
-            }))
-            .on_action(cx.listener(|this, _: &DatabaseStopDown, window, cx| {
-                this.move_stop(1, window, cx);
-                cx.stop_propagation();
-            }))
+            .on_action(cx.listener(Self::on_arrow_up))
+            .on_action(cx.listener(Self::on_arrow_down))
+            .on_action(cx.listener(Self::on_page_up))
+            .on_action(cx.listener(Self::on_page_down))
+            .on_action(cx.listener(Self::on_home))
+            .on_action(cx.listener(Self::on_end))
             .on_action(cx.listener(|this, _: &DatabaseActivate, window, cx| {
                 this.activate_stop(window, cx);
                 cx.stop_propagation();
@@ -390,15 +579,10 @@ impl Render for DatabaseView {
                             .text_sm()
                             .text_color(status_color),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child("↑↓ control · Enter activate · Esc exit SQL edit"),
-                    )
-                    .child(
-                        self.render_results_table(window, cx, border, foreground, muted, muted_bg),
-                    ),
+                    .child(style::text_dense_muted(div()).child(
+                        "↑↓ move · Enter activate · ↓ past Run moves through the rows · Esc exit SQL edit",
+                    ))
+                    .child(self.render_results(window, cx)),
             )
             .on_action(cx.listener(|this, _: &DatabaseRunSql, window, cx| {
                 this.run_sql(window, cx);
@@ -409,91 +593,48 @@ impl Render for DatabaseView {
 }
 
 impl DatabaseView {
-    fn render_results_table(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        border: gpui::Hsla,
-        foreground: gpui::Hsla,
-        muted: gpui::Hsla,
-        muted_bg: gpui::Hsla,
-    ) -> impl IntoElement {
-        if self.result.columns.is_empty() && self.error.is_none() {
-            return div()
+    /// The result, as the item list: the query's columns are the list's
+    /// columns, so the header names them and every cell lines up under its
+    /// own.
+    fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.list.is_empty() {
+            return style::empty_message(div())
                 .flex_1()
                 .min_h_0()
-                .text_sm()
-                .text_color(muted)
-                .child("No results")
+                .child(if self.error.is_some() {
+                    "No results"
+                } else if self.result.columns.is_empty() {
+                    "No results"
+                } else {
+                    "No rows"
+                })
                 .into_any_element();
         }
 
-        let header = h_flex()
-            .border_b_1()
-            .border_color(border)
-            .bg(muted_bg)
-            .children(
-                self.result
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(col_ix, name)| {
-                        div()
-                            .id(("db-col-header", col_ix))
-                            .min_w(px(120.))
-                            .max_w(px(360.))
-                            .px_2()
-                            .py_1()
-                            .overflow_hidden()
-                            .child(
-                                selectable_text(("db-col-name", col_ix), name.clone(), window, cx)
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(foreground),
-                            )
-                    }),
-            );
-
-        let body = v_flex().children(self.result.rows.iter().enumerate().map(|(row_ix, row)| {
-            h_flex()
-                .id(("db-row", row_ix))
-                .border_b_1()
-                .border_color(border)
-                .children(row.iter().enumerate().map(|(col_ix, cell)| {
-                    div()
-                        .id(("db-cell", row_ix * 1000 + col_ix))
-                        .min_w(px(120.))
-                        .max_w(px(360.))
-                        .px_2()
-                        .py_1()
-                        .overflow_hidden()
-                        .child(
-                            selectable_text(
-                                ("db-cell-text", row_ix * 1000 + col_ix),
-                                cell.clone(),
-                                window,
-                                cx,
-                            )
-                            .text_xs()
-                            .text_color(foreground),
-                        )
-                }))
-        }));
-
+        let host = self.host.clone();
+        let edge = if self.in_results() {
+            cx.theme().list_active_border
+        } else {
+            cx.theme().border
+        };
         div()
             .flex_1()
             .min_h_0()
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .border_1()
-            .border_color(border)
+            .border_color(edge)
             .rounded_md()
-            .child(
-                v_flex()
-                    .size_full()
-                    .overflow_y_scrollbar()
-                    .child(header)
-                    .child(body),
-            )
+            .child(self.list.render(
+                "database-results",
+                &self.host,
+                move |row, state, window, cx| {
+                    Self::render_result_row(row, state, &host, window, cx)
+                },
+                window,
+                cx,
+            ))
             .into_any_element()
     }
 }
@@ -501,9 +642,11 @@ impl DatabaseView {
 pub fn register_database_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(DATABASE_CONTEXT));
     let input_context = Some(key_context::including_input(DATABASE_CONTEXT));
+    // The results are an item list: navigation comes from the one key set. A
+    // query row is a read-only value, so editing, creation, reordering,
+    // marking and search stay unbound.
+    bind_item_list_keys(cx, DATABASE_CONTEXT, ItemListKeys::default());
     cx.bind_keys([
-        KeyBinding::new("up", DatabaseStopUp, context),
-        KeyBinding::new("down", DatabaseStopDown, context),
         KeyBinding::new("enter", DatabaseActivate, context),
         KeyBinding::new("space", DatabaseActivate, context),
         KeyBinding::new("escape", DatabaseEscape, context),
@@ -511,4 +654,55 @@ pub fn register_database_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("ctrl-enter", DatabaseRunSql, context),
         KeyBinding::new("ctrl-enter", DatabaseRunSql, input_context),
     ]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_result_columns_are_the_querys_own_and_the_last_takes_the_slack() {
+        let columns = result_columns(&["id".into(), "title".into(), "status".into()]);
+        let labels: Vec<&str> = columns.iter().map(|c| c.label.as_ref()).collect();
+        assert_eq!(labels, vec!["id", "title", "status"]);
+        assert_eq!(columns[0].width, Some(style::size::TABLE_CELL));
+        assert_eq!(columns[1].width, Some(style::size::TABLE_CELL));
+        // Exactly one content column, as the component requires.
+        assert_eq!(columns[2].width, None);
+    }
+
+    #[test]
+    fn a_query_that_names_a_column_twice_still_gets_two_of_them() {
+        // Columns are keyed by position, so `SELECT a.id, b.id` lines up.
+        let columns = result_columns(&["id".into(), "id".into()]);
+        assert_eq!(columns[0].key.as_ref(), "c0");
+        assert_eq!(columns[1].key.as_ref(), "c1");
+        assert_eq!(columns[0].width, Some(style::size::TABLE_CELL));
+        assert_eq!(columns[1].width, None);
+    }
+
+    #[test]
+    fn a_single_column_result_is_all_content() {
+        let columns = result_columns(&["count(*)".into()]);
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].width, None);
+    }
+
+    #[test]
+    fn no_columns_at_all_declares_none() {
+        assert!(result_columns(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_rows_are_the_last_stop_so_down_from_run_reaches_them() {
+        assert_eq!(
+            DATABASE_STOPS.last(),
+            Some(&DatabaseStop::Results),
+            "Down past Run is how the keyboard gets into the results"
+        );
+        assert_eq!(
+            DatabaseView::stop_index(DatabaseStop::Results),
+            DATABASE_STOPS.len() - 1
+        );
+    }
 }

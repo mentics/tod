@@ -173,6 +173,8 @@ pub mod size {
     pub const GROUP_ROW: Pixels = px(28.);
     pub const GROUP_INDENT: Pixels = px(16.);
     pub const MARK_GUTTER: Pixels = px(24.);
+    pub const TIMESTAMP_COLUMN: Pixels = px(72.);
+    pub const TABLE_CELL: Pixels = px(160.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
 }
 

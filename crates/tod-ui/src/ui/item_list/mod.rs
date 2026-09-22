@@ -62,10 +62,12 @@ pub enum ItemListEvent {
 /// finding's severity. A value only some rows carry stays inside the content
 /// column, where empty space costs nothing.
 pub struct ColumnSpec {
-    /// How a row asks for this column: [`ItemRowState::column`].
-    pub key: &'static str,
+    /// How a row asks for this column: [`ItemRowState::column`]. Owned rather
+    /// than `&'static str` because a list's columns are not always known when
+    /// it is written — the database view's are the query's.
+    pub key: SharedString,
     /// Named in the header row, in capitals.
-    pub label: &'static str,
+    pub label: SharedString,
     /// Fixed width, or `None` for the content column, which takes what the
     /// fixed ones leave. Exactly one column has `None`, and it is the one a
     /// group heading aligns to.
@@ -74,19 +76,23 @@ pub struct ColumnSpec {
 
 impl ColumnSpec {
     /// A fixed-width column.
-    pub fn fixed(key: &'static str, label: &'static str, width: gpui::Pixels) -> Self {
+    pub fn fixed(
+        key: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        width: gpui::Pixels,
+    ) -> Self {
         Self {
-            key,
-            label,
+            key: key.into(),
+            label: label.into(),
             width: Some(width),
         }
     }
 
     /// The content column: what the row is actually about.
-    pub fn content(key: &'static str, label: &'static str) -> Self {
+    pub fn content(key: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
         Self {
-            key,
-            label,
+            key: key.into(),
+            label: label.into(),
             width: None,
         }
     }
@@ -247,7 +253,7 @@ impl ItemRowState<'_> {
 /// [`ItemRowState::column`], for a row that was handed the columns rather
 /// than the whole state.
 pub fn column_cell<E: Styled>(columns: &[ColumnSpec], key: &str, el: E) -> E {
-    match columns.iter().find(|column| column.key == key) {
+    match columns.iter().find(|column| column.key.as_ref() == key) {
         Some(column) => style::list_cell(el, column.width),
         None => el,
     }
@@ -327,12 +333,23 @@ impl<T, G> ItemList<T, G> {
     /// for a column by key through [`ItemRowState::column`]; nothing else sets
     /// a width, which is what keeps the columns aligned.
     pub fn with_columns(mut self, columns: Vec<ColumnSpec>) -> Self {
+        self.set_columns(columns);
+        self
+    }
+
+    /// Replace the columns. A list whose columns are its *data* — the
+    /// database view's are whatever the query returned — declares them again
+    /// each time the data changes.
+    pub fn set_columns(&mut self, columns: Vec<ColumnSpec>) {
         debug_assert!(
-            columns.iter().filter(|c| c.width.is_none()).count() == 1,
+            columns.is_empty() || columns.iter().filter(|c| c.width.is_none()).count() == 1,
             "a list's columns need exactly one content column to take the rest"
         );
         self.columns = columns;
-        self
+    }
+
+    pub fn columns(&self) -> &[ColumnSpec] {
+        &self.columns
     }
 
     /// Where a group heading's label starts: past the selection gutter and

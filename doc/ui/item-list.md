@@ -25,7 +25,7 @@ Every list feature the app needs exists somewhere, and no list has all of them.
 | Review findings, conversation side pane (`views/rows/finding_row.rs`) | — | cursor | — | status only | — | — |
 | Change set (`conversation/change_set.rs`) | 2 levels | full | multi | inline | — | — |
 | Plan steps, panel and conversation side pane (`views/plan_steps/`) | — | full | single | inline | — | — |
-| Command history, agent transcripts, database | — | up/down | single | — | — | — |
+| Agent transcripts, agent sidebar (`views/agent_transcripts.rs`) | — | — | single | — | — | — |
 
 The same obligation therefore looks and behaves differently depending on which
 panel it is in: the Tasks-view panel groups it, lets the user edit and reorder
@@ -108,10 +108,16 @@ and gets a cell of the declared width.
   across it.
 - **A header names the columns** — above the rows, outside the scrolling area,
   so it does not scroll away. A list that declares no columns has no header
-  and is a plain list, which is what the change set and command history want.
+  and is a plain list, which is what the change set wants.
+- **A list whose columns are its data declares them again when the data
+  changes** (`ItemList::set_columns`). The database view's columns are
+  whatever the query returned, so they are not known when the view is
+  written; a column's key and label are therefore owned strings, not
+  `&'static str`.
 
 Today: findings are `severity | answer | finding`, a plan is `# | status |
-step`. Obligations declare none.
+step`, command history is `time | change`, and a query result is its own
+columns. Obligations and the change set declare none.
 
 ## What the component owns
 
@@ -228,7 +234,26 @@ the component, so no view sets a heading's colour, weight or indent itself.
    up. A row's own disclosure — showing a change in full with its
    field-by-field detail — stays the view's, since it is about the row's
    content, not its place in the list.
-6. Move over command history, agent transcripts, and the database view.
+6. **Done.** Move over command history and the database view, the two
+   read-only lists. Both get the cursor by key, click to select, scrolling
+   and the navigation keys; neither takes editing, creation, reordering,
+   marking or search, because a change that already happened and a row of a
+   query result are not things the user can change here.
+
+   **Command history is `time | change`** — a table, since every entry has
+   both, and the times now line up in a fixed column under a header instead
+   of floating at the right edge of each row. Clicking a row now *selects*
+   it, where it used to undo through it on the first click; Enter and Ctrl+Z
+   undo, as they already did, and the footer says so.
+
+   **A query result is a table of its own columns**, one per column the query
+   returned, keyed by position so `select a.id, b.id` still lines up. The
+   last is the content column, since no column of a result means more than
+   another. The results are the last of the view's focus stops: Down past Run
+   moves into the rows, Up off the first row hands the keyboard back.
+
+7. Move over the agent-transcripts sidebar — the last hand-rolled list. The
+   transcript beside it stays out of scope (`ui/transcript_list.rs`).
 
 Each step is complete on its own; the list of views above is the checklist.
 

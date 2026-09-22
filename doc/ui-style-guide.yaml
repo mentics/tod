@@ -464,7 +464,12 @@ tokens:
     pane-min: 320px
     group-row: 28px
     group-indent: 16px
-  mark-gutter: 24px
+    mark-gutter: 24px
+    # A timestamp column: wide enough for a wall-clock time.
+    timestamp-column: 72px
+    # One cell of a table whose columns are its data (a query's rows), where
+    # no column means more than another.
+    table-cell: 160px
     # Tallest a summary card's list grows before it scrolls.
     summary-list-max: 240px
     toast-min: 240px
