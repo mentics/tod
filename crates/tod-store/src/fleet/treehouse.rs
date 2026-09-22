@@ -37,6 +37,8 @@ pub fn resolve_worktrees_parent(settings: &TodSettings) -> Result<Option<PathBuf
 /// Env overrides applied to every Treehouse subprocess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreehouseInvocation {
+    /// The executable to run (`TodSettings::treehouse_program`).
+    pub program: PathBuf,
     pub treehouse_home: PathBuf,
     pub worktrees_parent: Option<PathBuf>,
 }
@@ -47,9 +49,17 @@ impl TreehouseInvocation {
         let worktrees_parent = resolve_worktrees_parent(settings)?;
         ensure_user_config(&treehouse_home)?;
         Ok(Self {
+            program: settings.treehouse_program(),
             treehouse_home,
             worktrees_parent,
         })
+    }
+
+    /// A command for the configured executable with Tod's env applied.
+    pub fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        self.apply_to(&mut command);
+        command
     }
 
     pub fn apply_to(&self, command: &mut Command) {
@@ -77,9 +87,10 @@ fn ensure_user_config(treehouse_home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Returns true when the `treehouse` CLI is on PATH and responds.
-pub fn treehouse_available() -> bool {
-    if Command::new("treehouse")
+/// Returns true when the configured Treehouse executable runs and responds.
+pub fn treehouse_available(settings: &TodSettings) -> bool {
+    let program = settings.treehouse_program();
+    if Command::new(&program)
         .arg("env")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -89,7 +100,7 @@ pub fn treehouse_available() -> bool {
     {
         return true;
     }
-    Command::new("treehouse")
+    Command::new(&program)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -157,6 +168,7 @@ mod tests {
             .unwrap_or(invocation.treehouse_home);
         let expected_home = expected_home.canonicalize().unwrap_or(expected_home);
         assert_eq!(actual_home, expected_home);
+        assert_eq!(invocation.program, PathBuf::from("treehouse"));
         let worktrees = invocation.worktrees_parent.unwrap();
         assert_eq!(worktrees, custom.canonicalize().unwrap_or(custom));
         clear_data_root_override();
