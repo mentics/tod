@@ -3,27 +3,28 @@
 //! the list is flat (no phase/kind/section grouping) since a plan step's
 //! ordering and structure come from its dependency graph, not a hierarchy.
 
-mod delegate;
+mod rows;
 
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
-use crate::ui::key_context;
-use crate::ui::list::{
-    ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
+use crate::ui::item_list::keyboard::{
+    ItemListActivate, ItemListCommitEdit, ItemListCreateAbove, ItemListCreateBelow, ItemListDelete,
+    ItemListDown, ItemListEdit, ItemListEnd, ItemListHome, ItemListMoveDown, ItemListMoveUp,
+    ItemListPageDown, ItemListPageUp, ItemListUp,
 };
+use crate::ui::item_list::{ItemList, ItemListKeys, ItemListRow, bind_item_list_keys};
+use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::views::rows::RowHost;
-use delegate::{ListAction, PlanStepListDelegate, PlanStepRow};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div,
+    IntoElement, KeyBinding, ParentElement, Render, Styled, Subscription, Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{InputEvent, TextareaState};
-use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use rows::{ListAction, PlanRow, PlanStepItem};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tod_store::conversation::{Focus, NetOp};
@@ -34,52 +35,28 @@ use uuid::Uuid;
 const PLAN_STEPS_CONTEXT: &str = "PlanSteps";
 const INLINE_EDIT_ROWS: usize = 2;
 
-actions!(
-    plan_steps,
-    [
-        PlanStepsClose,
-        PlanStepsEnter,
-        PlanStepsCreateBelow,
-        PlanStepsCreateAbove,
-        PlanStepsMoveUp,
-        PlanStepsMoveDown,
-        PlanStepsEdit,
-        PlanStepsCommitEdit,
-        PlanStepsDelete,
-        PlanStepsCycleStatus,
-    ]
-);
+actions!(plan_steps, [PlanStepsClose, PlanStepsCycleStatus]);
 
 pub fn register_plan_steps_keyboard_bindings(cx: &mut App) {
-    let context = Some(key_context::excluding_input(PLAN_STEPS_CONTEXT));
-    cx.bind_keys([
-        KeyBinding::new("up", ListArrowUp, context),
-        KeyBinding::new("down", ListArrowDown, context),
-        KeyBinding::new("pageup", ListPageUp, context),
-        KeyBinding::new("pagedown", ListPageDown, context),
-        KeyBinding::new("home", ListHome, context),
-        KeyBinding::new("end", ListEnd, context),
-        KeyBinding::new("enter", PlanStepsEnter, context),
-        KeyBinding::new("n", PlanStepsCreateBelow, context),
-        KeyBinding::new("f2", PlanStepsEdit, context),
-        KeyBinding::new("alt-enter", PlanStepsCreateAbove, context),
-        KeyBinding::new("secondary-up", PlanStepsMoveUp, context),
-        KeyBinding::new("secondary-down", PlanStepsMoveDown, context),
-        KeyBinding::new("backspace", PlanStepsDelete, context),
-        KeyBinding::new("delete", PlanStepsDelete, context),
-        KeyBinding::new("t", PlanStepsCycleStatus, context),
-        // Inline edit is a multi-line text area: arrows move the cursor as
-        // usual, Escape abandons the edit, and Ctrl+Enter commits it.
-        KeyBinding::new(
-            "ctrl-enter",
-            PlanStepsCommitEdit,
-            Some(key_context::including_input(PLAN_STEPS_CONTEXT)),
-        ),
-    ]);
-    // Left/Right are reserved for possible future collapse/expand, so
-    // crossing back to the tree uses Ctrl+arrows, same as Obligations.
+    // The panel is an item list: navigation, editing, creation and reordering
+    // come from the one key set. A plan is flat and single-select, with no
+    // search field, so grouping, marking and search stay unbound.
+    bind_item_list_keys(
+        cx,
+        PLAN_STEPS_CONTEXT,
+        ItemListKeys::default().editing().creation().reordering(),
+    );
+    // Left/Right belong to the list, so crossing back to the tree uses
+    // Ctrl+arrows, same as Obligations.
     bind_modified_pane_nav(cx, PLAN_STEPS_CONTEXT);
     key_context::bind_panel_escape(cx, PlanStepsClose, PLAN_STEPS_CONTEXT);
+    // Cycling a step's status is about what a plan step is, not about what a
+    // list does, so it stays the panel's own key.
+    cx.bind_keys([KeyBinding::new(
+        "t",
+        PlanStepsCycleStatus,
+        Some(key_context::excluding_input(PLAN_STEPS_CONTEXT)),
+    )]);
 }
 
 #[derive(Debug, Clone)]
@@ -97,9 +74,9 @@ pub struct PlanStepsView {
     title: String,
     items: Vec<PlanStep>,
     focus_handle: FocusHandle,
-    delegate: PlanStepListDelegate,
-    scroll_handle: ScrollHandle,
-    selected_index: Option<usize>,
+    /// The rows, the cursor and the scrolling: everything every list in the
+    /// app shares.
+    list: ItemList<PlanStepItem>,
     host: RowHost<ListAction>,
     /// Hosted inside another view (the conversation view's context panel):
     /// no Close button, and Escape / Ctrl+Left go to the host.
@@ -108,6 +85,10 @@ pub struct PlanStepsView {
     /// through (the conversation's deleted steps). Merged into `items` on
     /// every reload and never editable.
     removed: Vec<PlanStep>,
+    /// Which of `items` are those removed ones.
+    struck: HashSet<Uuid>,
+    /// Change-set operations by step id, shown as a leading op icon.
+    change_markers: HashMap<Uuid, NetOp>,
     /// The statuses the list shows; empty shows every step.
     filter: StatusFilter,
     editing_id: Option<Uuid>,
@@ -116,7 +97,6 @@ pub struct PlanStepsView {
     inline_edit_input: Entity<TextareaState>,
     pending_abandon_edit: bool,
     pending_live_refresh: bool,
-    selected_key: Option<String>,
     _inline_edit_subscription: Subscription,
 }
 
@@ -134,8 +114,6 @@ impl PlanStepsView {
                 cx.notify();
             }
         });
-
-        let delegate = PlanStepListDelegate::new(Vec::new(), host.clone());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -167,12 +145,12 @@ impl PlanStepsView {
             title: String::new(),
             items: Vec::new(),
             focus_handle: cx.focus_handle(),
-            delegate,
-            scroll_handle: ScrollHandle::new(),
-            selected_index: None,
+            list: ItemList::new(),
             host,
             embedded: false,
             removed: Vec::new(),
+            struck: HashSet::new(),
+            change_markers: HashMap::new(),
             filter: StatusFilter::default(),
             editing_id: None,
             draft_id: None,
@@ -180,7 +158,6 @@ impl PlanStepsView {
             inline_edit_input,
             pending_abandon_edit: false,
             pending_live_refresh: false,
-            selected_key: None,
             _inline_edit_subscription,
         }
     }
@@ -203,27 +180,25 @@ impl PlanStepsView {
         if !self.items.iter().any(|s| s.id == id) {
             return;
         }
-        self.selected_key = Some(id.to_string());
+        self.list.set_cursor_key(Some(id.to_string()));
         self.rebuild_visible(window, cx);
-        if let Some(ix) = self.selected_index {
-            self.scroll_handle.scroll_to_item(ix);
-        }
+        self.list.scroll_to_cursor();
     }
 
     /// Show a leading op icon on each plan step in `markers`.
     pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
-        self.delegate.set_change_markers(markers);
+        self.change_markers = markers;
+        self.list.set_rows(self.flat_rows());
         cx.notify();
+    }
+
+    /// Whether `id` is shown as a removed (struck-through) row.
+    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
+        self.struck.contains(&id)
     }
 
     /// Also show `steps`, which no longer exist, struck through at their old
     /// place. Ones that exist again (a reversed deletion) show as normal.
-    /// Whether `id` is shown as a removed (struck-through) row.
-    #[cfg(test)]
-    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
-        self.delegate.is_struck(id)
-    }
-
     pub fn set_removed_items(
         &mut self,
         steps: Vec<PlanStep>,
@@ -286,7 +261,7 @@ impl PlanStepsView {
         self.node_id = None;
         self.title.clear();
         self.items.clear();
-        self.selected_key = None;
+        self.list.set_cursor_key(None);
         cx.emit(PlanStepsEvent::Close);
         cx.notify();
     }
@@ -318,11 +293,13 @@ impl PlanStepsView {
                 .unwrap_or(self.items.len());
             self.items.insert(at, ghost.clone());
         }
-        self.delegate.set_struck(struck);
+        self.struck = struck;
         self.rebuild_visible(window, cx);
     }
 
-    fn build_rows(&self) -> Vec<PlanStepRow> {
+    /// The rows the list shows: the steps the status filter lets through, in
+    /// plan order.
+    fn flat_rows(&self) -> Vec<PlanRow> {
         self.items
             .iter()
             .filter(|step| self.filter.admits(&step.status))
@@ -336,43 +313,27 @@ impl PlanStepsView {
                     .fleet
                     .list_plan_step_obligations(step.id)
                     .unwrap_or_default();
-                PlanStepRow {
-                    step,
-                    depends_on,
-                    satisfies,
-                }
+                let id = step.id;
+                ItemListRow::item(
+                    id.to_string(),
+                    PlanStepItem {
+                        struck: self.struck.contains(&id),
+                        marker: self.change_markers.get(&id).copied(),
+                        step,
+                        depends_on,
+                        satisfies,
+                    },
+                )
             })
             .collect()
     }
 
+    /// Rebuild the rows from the store data, keeping the cursor on whatever it
+    /// was on.
     fn rebuild_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.build_rows();
-        let selected = self.selected_key.clone();
-        let previous_index = self.selected_index;
-        let selected_ix = selected
-            .as_ref()
-            .and_then(|key| rows.iter().position(|r| r.key() == *key))
-            .or(Some(0).filter(|_| !rows.is_empty()));
-
-        if let Some(ix) = selected_ix {
-            self.selected_key = Some(rows[ix].key());
-            self.selected_index = Some(ix);
-        } else {
-            self.selected_key = None;
-            self.selected_index = None;
-        }
-
-        self.delegate.set_rows(rows);
-        self.delegate.set_selected_index(self.selected_index);
-        self.delegate.set_inline_edit(
-            self.editing_id.map(|id| id.to_string()),
-            self.inline_edit_input.clone(),
-        );
-        if let Some(ix) = selected_ix {
-            if previous_index != selected_ix {
-                self.scroll_handle.scroll_to_item(ix);
-            }
-        }
+        self.list
+            .set_editing_key(self.editing_id.map(|id| id.to_string()));
+        self.list.set_rows(self.flat_rows());
         cx.notify();
     }
 
@@ -388,17 +349,14 @@ impl PlanStepsView {
     }
 
     fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
-        let key = self.delegate.rows().get(row_ix).map(|r| r.key());
-        if self.selected_index != Some(row_ix) {
-            if self.editing_id.is_some() {
-                self.pending_abandon_edit = true;
-            }
-            self.selected_index = Some(row_ix);
-            self.selected_key = key;
-            self.delegate.set_selected_index(self.selected_index);
-            self.scroll_handle.scroll_to_item(row_ix);
-            cx.notify();
+        if self.list.cursor() == Some(row_ix) {
+            return;
         }
+        if self.editing_id.is_some() {
+            self.pending_abandon_edit = true;
+        }
+        self.list.set_cursor(row_ix);
+        cx.notify();
     }
 
     /// Ctrl+J: the conversation about the selected step, or about the node
@@ -428,30 +386,20 @@ impl PlanStepsView {
     }
 
     fn selected_step(&self) -> Option<PlanStep> {
-        self.delegate
-            .selected_row()
-            .map(|r| r.step.clone())
+        self.list
+            .cursor_item()
+            .map(|item| item.step.clone())
             .or_else(|| {
-                let key = self.selected_key.as_ref()?;
-                self.items
-                    .iter()
-                    .find(|s| &s.id.to_string() == key)
-                    .cloned()
+                // The cursor's step can be filtered out of the rows while the
+                // key still names it.
+                let key = self.list.cursor_key()?;
+                self.items.iter().find(|s| s.id.to_string() == key).cloned()
             })
     }
 
     /// The selected step, unless it is a removed one.
     fn selected_live_step(&self) -> Option<PlanStep> {
-        self.selected_step()
-            .filter(|step| !self.delegate.is_struck(step.id))
-    }
-
-    fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
-        self.delegate.set_inline_edit(
-            self.editing_id.map(|id| id.to_string()),
-            self.inline_edit_input.clone(),
-        );
-        cx.notify();
+        self.selected_step().filter(|step| !self.is_struck(step.id))
     }
 
     fn clear_inline_edit_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -461,7 +409,8 @@ impl PlanStepsView {
         self.inline_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.sync_delegate_editing(cx);
+        self.list.set_editing_key(None);
+        cx.notify();
     }
 
     fn is_editing(&self) -> bool {
@@ -485,7 +434,7 @@ impl PlanStepsView {
     }
 
     fn start_inline_edit(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.delegate.is_struck(id) {
+        if self.is_struck(id) {
             return;
         }
         let body = self
@@ -496,7 +445,7 @@ impl PlanStepsView {
             .unwrap_or_default();
         self.editing_id = Some(id);
         self.edit_original_body = Some(body.clone());
-        self.selected_key = Some(id.to_string());
+        self.list.set_cursor_key(Some(id.to_string()));
         self.inline_edit_input.update(cx, |input, cx| {
             input.set_value(&body, window, cx);
             input.focus(window, cx);
@@ -583,7 +532,7 @@ impl PlanStepsView {
         }
         self.draft_id = None;
         self.clear_inline_edit_state(window, cx);
-        self.selected_key = Some(editing_id.to_string());
+        self.list.set_cursor_key(Some(editing_id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
         true
@@ -626,7 +575,7 @@ impl PlanStepsView {
                 return;
             }
             if let Some(id) = saved {
-                self.selected_key = Some(id.to_string());
+                self.list.set_cursor_key(Some(id.to_string()));
                 self.create_relative(Some(id), false, window, cx);
             }
             return;
@@ -663,7 +612,7 @@ impl PlanStepsView {
             return;
         }
         let _ = self.fleet.writer().flush();
-        self.selected_key = next_key;
+        self.list.set_cursor_key(next_key);
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
@@ -689,7 +638,7 @@ impl PlanStepsView {
             return;
         }
         let _ = self.fleet.writer().flush();
-        self.selected_key = Some(id.to_string());
+        self.list.set_cursor_key(Some(id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
@@ -716,21 +665,20 @@ impl PlanStepsView {
             return;
         }
         let _ = self.fleet.writer().flush();
-        self.selected_key = Some(step.id.to_string());
+        self.list.set_cursor_key(Some(step.id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
 
     fn move_selection(&mut self, delta: i32, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
+        if self.list.is_empty() {
             return;
         }
-        let current = self.selected_index.unwrap_or(0);
+        let current = self.list.cursor().unwrap_or(0);
         let next = if delta < 0 {
             current.saturating_sub((-delta) as usize)
         } else {
-            (current + delta as usize).min(count.saturating_sub(1))
+            (current + delta as usize).min(self.list.len() - 1)
         };
         self.select_row(next, cx);
     }
@@ -744,6 +692,7 @@ impl PlanStepsView {
                 ListAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
                 }
+                ListAction::Ignored => {}
             }
         }
     }
@@ -760,13 +709,13 @@ impl PlanStepsView {
         self.close(window, cx);
     }
 
-    fn on_enter(&mut self, _: &PlanStepsEnter, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_enter(&mut self, _: &ItemListActivate, window: &mut Window, cx: &mut Context<Self>) {
         self.on_smart_enter(window, cx);
     }
 
     fn on_create_below(
         &mut self,
-        _: &PlanStepsCreateBelow,
+        _: &ItemListCreateBelow,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -779,7 +728,7 @@ impl PlanStepsView {
 
     fn on_create_above(
         &mut self,
-        _: &PlanStepsCreateAbove,
+        _: &ItemListCreateAbove,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -790,15 +739,15 @@ impl PlanStepsView {
         self.create_relative(after, true, window, cx);
     }
 
-    fn on_move_up(&mut self, _: &PlanStepsMoveUp, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_move_up(&mut self, _: &ItemListMoveUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selected(ReorderDirection::Up, window, cx);
     }
 
-    fn on_move_down(&mut self, _: &PlanStepsMoveDown, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_move_down(&mut self, _: &ItemListMoveDown, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selected(ReorderDirection::Down, window, cx);
     }
 
-    fn on_edit(&mut self, _: &PlanStepsEdit, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_edit(&mut self, _: &ItemListEdit, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(step) = self.selected_step() {
             self.start_inline_edit(step.id, window, cx);
         }
@@ -806,7 +755,7 @@ impl PlanStepsView {
 
     fn on_commit_edit(
         &mut self,
-        _: &PlanStepsCommitEdit,
+        _: &ItemListCommitEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -816,7 +765,7 @@ impl PlanStepsView {
         let _ = self.commit_inline_edit(window, cx);
     }
 
-    fn on_delete(&mut self, _: &PlanStepsDelete, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete(&mut self, _: &ItemListDelete, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() {
             return;
         }
@@ -839,41 +788,34 @@ impl PlanStepsView {
         self.cycle_status(window, cx);
     }
 
-    fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_arrow_up(&mut self, _: &ItemListUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
 
-    fn on_arrow_down(&mut self, _: &ListArrowDown, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_arrow_down(&mut self, _: &ItemListDown, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(1, window, cx);
     }
 
-    fn on_page_up(&mut self, _: &ListPageUp, window: &mut Window, cx: &mut Context<Self>) {
-        let page = viewport_row_count(window.viewport_size().height).max(1);
+    fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<PlanStepItem>::page_rows(window.viewport_size().height);
         self.move_selection(-(page as i32), window, cx);
     }
 
-    fn on_page_down(&mut self, _: &ListPageDown, window: &mut Window, cx: &mut Context<Self>) {
-        let page = viewport_row_count(window.viewport_size().height).max(1);
+    fn on_page_down(&mut self, _: &ItemListPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<PlanStepItem>::page_rows(window.viewport_size().height);
         self.move_selection(page as i32, window, cx);
     }
 
-    fn on_home(&mut self, _: &ListHome, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
-            return;
+    fn on_home(&mut self, _: &ItemListHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_home() {
+            cx.notify();
         }
-        self.select_row(0, cx);
-        self.scroll_handle.scroll_to_top_of_item(0);
     }
 
-    fn on_end(&mut self, _: &ListEnd, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
-            return;
+    fn on_end(&mut self, _: &ItemListEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_end() {
+            cx.notify();
         }
-        let last = count - 1;
-        self.select_row(last, cx);
-        self.scroll_handle.scroll_to_top_of_item(last);
     }
 }
 
@@ -1007,39 +949,17 @@ impl Render for PlanStepsView {
                 cx,
             ))
             .child({
-                let row_count = self.delegate.rows().len();
-                let mut rows = Vec::with_capacity(row_count);
-                for ix in 0..row_count {
-                    if let Some(row) = self.delegate.render_row(ix, window, cx) {
-                        rows.push(row);
-                    }
-                }
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        div()
-                            .id("plan-steps-scroll")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .children(rows),
-                    )
-                    .child(
-                        // Narrow right-edge strip, not the full row area: the
-                        // Scrollbar element installs a click-to-jump handler
-                        // across its entire bounds, which would otherwise
-                        // swallow every mouse click meant for the rows below.
-                        div()
-                            .occlude()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(gpui::px(16.))
-                            .child(Scrollbar::vertical(&self.scroll_handle)),
-                    )
+                let editor = self.inline_edit_input.clone();
+                let row_host = self.host.clone();
+                self.list.render(
+                    "plan-steps-scroll",
+                    &self.host,
+                    move |item, state, window, cx| {
+                        rows::render_plan_step(item, state, &editor, &row_host, window, cx)
+                    },
+                    window,
+                    cx,
+                )
             })
             .child(
                 div()
@@ -1136,12 +1056,14 @@ mod tests {
         let (view, _, cx) = open_view(&fixture, true, cx);
         let shown = |view: &Entity<PlanStepsView>, cx: &mut VisualTestContext| {
             view.read_with(cx, |v, _| {
-                v.delegate.rows().iter().map(|r| r.step.id).collect::<Vec<_>>()
+                v.list.items().map(|item| item.step.id).collect::<Vec<_>>()
             })
         };
         view.update_in(cx, |v, window, cx| v.reload(window, cx));
         assert_eq!(shown(&view, cx).len(), 2);
-        view.update_in(cx, |v, window, cx| v.set_filter(Some("implemented"), window, cx));
+        view.update_in(cx, |v, window, cx| {
+            v.set_filter(Some("implemented"), window, cx)
+        });
         draw(cx);
         assert_eq!(shown(&view, cx), vec![fixture.steps[1]]);
         view.update_in(cx, |v, window, cx| v.set_filter(None, window, cx));
