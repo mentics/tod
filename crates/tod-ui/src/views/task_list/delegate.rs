@@ -479,20 +479,6 @@ impl ListDelegate for TaskListDelegate {
             ));
         }
         if is_work {
-            if let Some(activity) = item.in_flight_activity.clone() {
-                chips = chips.child(
-                    div()
-                        .px_2()
-                        .py_0p5()
-                        .rounded_md()
-                        .text_xs()
-                        .border_1()
-                        .border_color(border)
-                        .bg(muted_bg)
-                        .text_color(muted_foreground)
-                        .child(activity),
-                );
-            }
             for (tag_ix, tag) in item.sorted_tags().iter().enumerate() {
                 let tag = tag.clone();
                 let active = tag_filter

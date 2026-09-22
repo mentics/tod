@@ -883,14 +883,17 @@ impl SettingsView {
         cx.notify();
     }
 
+    #[cfg(feature = "agent-socket")]
     pub(crate) fn cycle_agent_platform(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.cycle_platform_for(AgentRole::Interview, delta, cx);
     }
 
+    #[cfg(feature = "agent-socket")]
     pub fn set_agent_platform(&mut self, platform: AgentPlatform, cx: &mut Context<Self>) {
         self.set_platform_for(AgentRole::Interview, platform, cx);
     }
 
+    #[cfg(feature = "agent-socket")]
     pub fn agent_platform(&self) -> AgentPlatform {
         self.settings.agent_platform
     }

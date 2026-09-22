@@ -42,12 +42,6 @@ pub struct TaskItem {
     /// Pending incoming-change entries (`doc/conversation/incoming-changes.md` §6).
     pub incoming_count: usize,
     pub has_children: bool,
-    /// Short status text when a gate-check or on-entry agent turn is
-    /// currently running against this node (e.g. "Running gate check…").
-    /// Sourced from `LifecyclePanelView::in_flight_activity` — these turns
-    /// aren't recorded as agent runs, so without this they'd be invisible in
-    /// the task list while running.
-    pub in_flight_activity: Option<String>,
     /// True when this node was produced/is owned by a generator ancestor.
     pub managed: bool,
     /// The data-source external id, for managed nodes.
@@ -581,7 +575,6 @@ mod tests {
             constraint_count: 0,
             incoming_count: 0,
             has_children: false,
-            in_flight_activity: None,
             managed: false,
             external_id: None,
             source_type: None,

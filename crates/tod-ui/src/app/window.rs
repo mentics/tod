@@ -1308,6 +1308,7 @@ pub(crate) fn fallback_focus(selected_node: Option<Uuid>) -> Focus {
     selected_node.map_or(Focus::Project, Focus::Node)
 }
 
+#[cfg(feature = "agent-socket")]
 fn platform_label(platform: AgentPlatform) -> &'static str {
     match platform {
         AgentPlatform::Cursor => "cursor",
@@ -1315,6 +1316,7 @@ fn platform_label(platform: AgentPlatform) -> &'static str {
     }
 }
 
+#[cfg(feature = "agent-socket")]
 fn parse_agent_platform(raw: &str) -> Result<AgentPlatform, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "cursor" => Ok(AgentPlatform::Cursor),
@@ -1395,6 +1397,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let transcript_window = TranscriptWindowControl::new();
     let interactive_agent_window = InteractiveAgentWindowControl::new();
     let history_window = HistoryWindowControl::new();
+    #[cfg(feature = "agent-socket")]
     let transcript_for_socket = transcript_window.clone();
 
     #[cfg(feature = "agent-socket")]
@@ -1408,6 +1411,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
     let shell_for_socket =
         std::sync::Arc::new(std::sync::Mutex::new(None::<gpui::WeakEntity<Shell>>));
 
+    // Only the agent socket consumes the handle; the window itself lives on regardless.
+    #[cfg_attr(not(feature = "agent-socket"), allow(unused_variables))]
     let handle = cx.open_window(
         WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use tod_store::agent_traffic::SharedAgentTrafficLog;
 use tod_store::fleet::FleetStore;
 
+#[cfg(feature = "agent-socket")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptWindowStatus {
     Closed,
@@ -40,6 +41,7 @@ impl TranscriptWindowControl {
             .expect("transcript window traffic mutex") = Some(traffic_log);
     }
 
+    #[cfg(feature = "agent-socket")]
     pub fn status(&self, cx: &mut App) -> TranscriptWindowStatus {
         if self.live_handle(cx).is_some() {
             TranscriptWindowStatus::Open
@@ -126,6 +128,7 @@ impl TranscriptWindowControl {
     }
 
     /// Focus the transcript window if it is open.
+    #[cfg(feature = "agent-socket")]
     pub fn focus_if_open(&self, cx: &mut App) -> Result<(), String> {
         let Some(handle) = self.live_handle(cx) else {
             return Err("transcript window is not open".into());

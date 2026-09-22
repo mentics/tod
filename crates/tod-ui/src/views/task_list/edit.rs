@@ -81,7 +81,6 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             constraint_count: 0,
             incoming_count: 0,
             has_children: false,
-            in_flight_activity: None,
             managed: false,
             external_id: None,
             source_type: None,
@@ -370,7 +369,6 @@ impl TaskListView {
         let id = draft.id.to_string();
         self.draft = Some(draft);
         self.reload_all_tasks();
-        self.apply_agent_activity();
         self.select_created_task(&id, window, cx);
         self.start_inline_edit(&id, window, cx);
     }
@@ -441,7 +439,6 @@ impl TaskListView {
         };
         self.clear_inline_edit_state(window, cx);
         self.reload_all_tasks();
-        self.apply_agent_activity();
         self.working_set.selected_id = draft.anchor_id.or(draft.parent_id).map(|id| id.to_string());
         self.rebuild_visible_list(window, cx);
     }
@@ -494,7 +491,6 @@ impl TaskListView {
             self.set_collapsed(&anchor.to_string(), false, window, cx);
         }
         self.reload_all_tasks();
-        self.apply_agent_activity();
         self.rebuild_visible_list(window, cx);
     }
 }
