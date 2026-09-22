@@ -289,16 +289,18 @@ impl ConversationView {
         }
 
         if let Some(next) = next.filter(|_| gate_offered) {
-            if gate.all_clear() {
+            // A running check supersedes any earlier verdict: nothing may
+            // advance until it finishes.
+            if checking {
+                actions.push(PanelAction::new(GATE_CHECK, "Checking gate…").disabled(true));
+            } else if gate.all_clear() {
                 actions.push(PanelAction::new(ADVANCE, format!("Advance to {next}")).primary(true));
                 actions.push(PanelAction::new(GATE_CHECK, "Check again"));
             } else {
                 let primary = !actions.iter().any(|a| a.primary);
-                actions.push(if checking {
-                    PanelAction::new(GATE_CHECK, "Checking gate…").disabled(true)
-                } else {
-                    PanelAction::new(GATE_CHECK, format!("Gate check → {next}")).primary(primary)
-                });
+                actions.push(
+                    PanelAction::new(GATE_CHECK, format!("Gate check → {next}")).primary(primary),
+                );
             }
         }
 
@@ -395,6 +397,11 @@ impl ConversationView {
             // the data root, and needs no worktree.
             GATE_CHECK => self.check_gate(node, window, cx),
             ADVANCE => {
+                if self.protocol_running(node, ProtocolKind::GateCheck)
+                    || self.checking_incoming(node, cx)
+                {
+                    return;
+                }
                 let entered = lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx));
                 if entered.is_some_and(enters_with_agent) {
                     self.run(Focus::Node(node), ProtocolKind::OnEntry, window, cx);
