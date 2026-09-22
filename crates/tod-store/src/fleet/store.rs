@@ -574,6 +574,15 @@ impl FleetStore {
     }
 
     /// Managed-node data-source link for a node, if it has one.
+    /// Whether the node is owned by its generator. A pasted copy keeps its
+    /// link to the external item but is not managed.
+    pub fn is_managed_node(&self, node_id: uuid::Uuid) -> Result<bool> {
+        let guard = self.projection.lock().expect("fleet projection mutex");
+        GeneratorRepo::new(&guard.connection())
+            .is_managed(node_id)
+            .map_err(Into::into)
+    }
+
     pub fn get_managed_link(&self, node_id: uuid::Uuid) -> Result<Option<ManagedNodeLink>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
         GeneratorRepo::new(&guard.connection())

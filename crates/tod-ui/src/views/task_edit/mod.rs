@@ -1588,8 +1588,11 @@ impl TaskEditView {
     }
 
     fn load_managed_link(&mut self) {
+        // A pasted copy keeps its link (so incoming changes reach it) but is
+        // the user's to edit; only generator-owned nodes get the read-only view.
         self.managed_link = self
             .node_uuid()
+            .filter(|node_id| self.fleet.is_managed_node(*node_id).unwrap_or(false))
             .and_then(|node_id| self.fleet.get_managed_link(node_id).ok().flatten());
         self.managed_source_type = self.managed_link.as_ref().and_then(|link| {
             self.fleet
