@@ -11,7 +11,7 @@ use crate::ui::item_list::keyboard::{
     ItemListDown, ItemListEdit, ItemListEnd, ItemListHome, ItemListMoveDown, ItemListMoveUp,
     ItemListPageDown, ItemListPageUp, ItemListUp,
 };
-use crate::ui::item_list::{ItemList, ItemListKeys, ItemListRow, bind_item_list_keys};
+use crate::ui::item_list::{ItemDropped, ItemList, ItemListKeys, ItemListRow, bind_item_list_keys};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
@@ -169,6 +169,7 @@ impl PlanStepsView {
             focus_handle: cx.focus_handle(),
             list: ItemList::new()
                 .with_columns(plan_step_columns())
+                .with_reorder(rows::DRAG_LIST)
                 .with_row_actions({
                     let host = host.clone();
                     move |item| rows::plan_step_actions(item, &host)
@@ -698,6 +699,41 @@ impl PlanStepsView {
         self.focus_list(window, cx);
     }
 
+    /// Carry out a dragged step: it lands ahead of the step it was dropped on,
+    /// or last when it was dropped past the end.
+    ///
+    /// A plan is one flat run of steps, so where the row landed *is* the
+    /// ordinal — there is no grouping between the two, as there is for an
+    /// obligation.
+    fn drop_row(&mut self, dropped: ItemDropped, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(id) = Uuid::parse_str(&dropped.from.key) else {
+            return;
+        };
+        let order: Vec<Uuid> = self
+            .items
+            .iter()
+            .map(|step| step.id)
+            .filter(|step| *step != id)
+            .collect();
+        let index = dropped
+            .before
+            .as_deref()
+            .and_then(|key| Uuid::parse_str(key).ok())
+            .and_then(|before| order.iter().position(|step| *step == before))
+            .unwrap_or(order.len());
+        // `PlacePlanStep` counts from 1; the landing index from 0.
+        if let Err(err) = self.apply(OutlineMutation::PlacePlanStep {
+            id,
+            ordinal: index as i32 + 1,
+        }) {
+            crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+            return;
+        }
+        self.list.set_cursor_key(Some(id.to_string()));
+        self.reload(window, cx);
+        self.focus_list(window, cx);
+    }
+
     fn move_selected(
         &mut self,
         direction: ReorderDirection,
@@ -812,6 +848,9 @@ impl PlanStepsView {
                     self.on_delete(&ItemListDelete, window, cx);
                 }
                 ListAction::Ignored => {}
+                ListAction::Drop(dropped) => {
+                    self.drop_row(dropped, window, cx);
+                }
             }
         }
     }

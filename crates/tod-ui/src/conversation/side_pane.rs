@@ -37,11 +37,9 @@ use tod_store::outline::repos::plan_steps::{
     needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
+use tod_store::review::{FINDING_REJECTED, FINDING_STATUSES, ReviewFinding, USER_FINDING_STATUSES};
 use tod_store::verification::{
     ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
-};
-use tod_store::review::{
-    FINDING_REJECTED, FINDING_STATUSES, ReviewFinding, USER_FINDING_STATUSES,
 };
 use uuid::Uuid;
 
@@ -245,7 +243,12 @@ impl ConversationView {
         }
         let filter = self.render_obligation_filter(
             "requirement",
-            &["unchecked", VERDICT_REOPENED, VERDICT_FAILED, VERDICT_VERIFIED],
+            &[
+                "unchecked",
+                VERDICT_REOPENED,
+                VERDICT_FAILED,
+                VERDICT_VERIFIED,
+            ],
             |s| s.status().to_string(),
             cx,
         );
@@ -1000,4 +1003,3 @@ impl ConversationView {
             .into_any_element()
     }
 }
-

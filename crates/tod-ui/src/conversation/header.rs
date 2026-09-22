@@ -443,9 +443,12 @@ impl ConversationView {
                     )
                     // Which transition a gate check checks, or which state an
                     // on-entry run set up.
-                    .children(summary.conversation.transition_label().map(|label| {
-                        style::badge(div()).flex_shrink_0().child(label)
-                    }))
+                    .children(
+                        summary
+                            .conversation
+                            .transition_label()
+                            .map(|label| style::badge(div()).flex_shrink_0().child(label)),
+                    )
                     .child(
                         selectable_text(
                             ElementId::Name(format!("picker-opening-{ix}").into()),

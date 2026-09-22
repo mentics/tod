@@ -10,10 +10,7 @@
 /// Every term must match some word in some field (case-insensitive, fuzzy);
 /// an empty query matches everything.
 pub fn matches_query(query: &str, fields: &[&str]) -> bool {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.to_lowercase())
-        .collect();
+    let terms: Vec<String> = query.split_whitespace().map(|t| t.to_lowercase()).collect();
     if terms.is_empty() {
         return true;
     }

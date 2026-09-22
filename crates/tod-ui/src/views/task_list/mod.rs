@@ -20,7 +20,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::interview::TodPaths;
-use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -30,6 +29,7 @@ use crate::ui::list::{
     viewport_row_count,
 };
 use crate::ui::pane_nav::{PaneFocusRight, bind_modified_pane_nav};
+use crate::views::incoming_check::{IncomingCheck, outcome_line};
 use delegate::{RowAction, TaskListDelegate};
 use fixtures::load_tasks_from_store;
 use gpui::{
@@ -2761,8 +2761,7 @@ impl TaskListView {
             .iter()
             .filter(|t| t.incoming_count > 0)
             .count();
-        if pending_nodes == 0 && !self.working_set.pending_changes_only && self.marked.is_empty()
-        {
+        if pending_nodes == 0 && !self.working_set.pending_changes_only && self.marked.is_empty() {
             return None;
         }
         let running = self
@@ -2843,9 +2842,12 @@ impl TaskListView {
             .rounded_md();
         if let Some((done, total)) = check.progress() {
             return Some(
-                card.child(div().text_xs().font_semibold().child(format!(
-                    "Checking incoming changes: {done} of {total} done"
-                )))
+                card.child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .child(format!("Checking incoming changes: {done} of {total} done")),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -3204,8 +3206,12 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_check_incoming))
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .child(self.render_header(window, cx))
-            .when_some(self.render_quick_filters(window, cx), |el, bar| el.child(bar))
-            .when_some(self.render_incoming_check(window, cx), |el, card| el.child(card))
+            .when_some(self.render_quick_filters(window, cx), |el, bar| {
+                el.child(bar)
+            })
+            .when_some(self.render_incoming_check(window, cx), |el, card| {
+                el.child(card)
+            })
             .child(body)
             .when_some(self.render_sort_menu_overlay(cx), |el, menu| el.child(menu))
             .when(self.credential_prompt_open, |el| {

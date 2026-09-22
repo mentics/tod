@@ -13,8 +13,8 @@ use crate::views::rows::RowHost;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString, Styled, Subscription,
-    Window, actions, div, px,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString, Styled,
+    Subscription, Window, actions, div, px,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Textarea, TextareaState};
@@ -58,7 +58,9 @@ struct ResultRow {
 /// What the user did in the results list, queued for the view to apply.
 #[derive(Debug, Clone)]
 enum ResultAction {
-    Select { row_ix: usize },
+    Select {
+        row_ix: usize,
+    },
     /// Something the list can report but a flat, read-only one never does.
     Ignored,
 }
@@ -67,7 +69,10 @@ impl From<ItemListEvent> for ResultAction {
     fn from(event: ItemListEvent) -> Self {
         match event {
             ItemListEvent::Select { row_ix } => Self::Select { row_ix },
-            ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignored,
+            // The rows are a query's result, in the order it returned them.
+            ItemListEvent::ToggleGroup { .. }
+            | ItemListEvent::ToggleMark { .. }
+            | ItemListEvent::Drop(_) => Self::Ignored,
         }
     }
 }

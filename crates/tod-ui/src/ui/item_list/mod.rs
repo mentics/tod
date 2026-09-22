@@ -18,6 +18,7 @@
 // migration, not only the one migrated so far.
 #![allow(dead_code)]
 
+pub mod drag;
 pub mod keyboard;
 pub mod row_menu;
 pub mod search;
@@ -28,9 +29,9 @@ use std::rc::Rc;
 use crate::ui::style;
 use crate::views::rows::{RowAction, RowHost, RowOptions};
 use gpui::{
-    AnyElement, App, Div, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollHandle,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
-    px,
+    AnyElement, App, AppContext, Div, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
@@ -38,6 +39,7 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{Sizable as _, h_flex};
 
+pub use drag::{ItemDrag, ItemDropped};
 pub use keyboard::{ItemListKeys, bind_item_list_keys, bind_single_line_commit};
 pub use row_menu::RowMenu;
 
@@ -54,6 +56,10 @@ pub enum ItemListEvent {
     ToggleGroup { key: String },
     /// Clicked an item's selection checkbox.
     ToggleMark { row_ix: usize },
+    /// Dropped a dragged row onto this list. Reported even when the row lands
+    /// where it already was: whether that changes anything depends on the
+    /// view's own ordinal space, which the component does not know.
+    Drop(ItemDropped),
 }
 
 /// One column of a list that is a table.
@@ -307,7 +313,11 @@ pub struct ItemList<T, G = ()> {
     columns: Vec<ColumnSpec>,
     /// Items carry a selection checkbox and answer Space.
     marking: bool,
-    drag: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
+    /// The list's name while a row of it is being dragged, set by
+    /// [`Self::with_reorder`]. `None` in a list whose rows do not drag.
+    drag_list: Option<SharedString>,
+    /// Which of the places a row could land this list actually allows.
+    drop_filter: Option<Rc<dyn Fn(&ItemDropped) -> bool>>,
     /// What an item affords: its hover buttons and its menu entries, declared
     /// once.
     row_actions: Option<Rc<dyn Fn(&T) -> Vec<RowAction>>>,
@@ -335,7 +345,8 @@ impl<T, G> ItemList<T, G> {
             scroll: ScrollHandle::new(),
             columns: Vec::new(),
             marking: false,
-            drag: None,
+            drag_list: None,
+            drop_filter: None,
             row_actions: None,
             row_text: None,
         }
@@ -404,15 +415,110 @@ impl<T, G> ItemList<T, G> {
         self
     }
 
-    /// Make item rows draggable. The hook applies the caller's own payload
-    /// type to the row the component built, so the gesture lives here once
-    /// while the payload stays the caller's.
-    pub fn with_drag(
-        mut self,
-        drag: impl Fn(&T, Stateful<Div>) -> Stateful<Div> + 'static,
-    ) -> Self {
-        self.drag = Some(Rc::new(drag));
+    /// Let the user drag a row to a new place. `list` names this list in the
+    /// [`ItemDrag`] payload, so a drop target can tell a row of this list from
+    /// a row of another one; the drop arrives as [`ItemListEvent::Drop`].
+    ///
+    /// The component owns the whole gesture — the payload, the preview chip
+    /// that follows the pointer, which row is the target, the line showing
+    /// where the row will land, and scrolling the list when the pointer
+    /// reaches its edge. What it does *not* decide is what the drop means:
+    /// it reports the neighbour the row landed ahead of, and the view turns
+    /// that into its own mutation.
+    ///
+    /// A list that wants the preview chip to say what the row says declares
+    /// [`Self::with_row_text`] as well.
+    pub fn with_reorder(mut self, list: impl Into<SharedString>) -> Self {
+        self.drag_list = Some(list.into());
         self
+    }
+
+    /// Which of the places a row could land this list allows. The component
+    /// works out where a row *would* go; only the view knows whether going
+    /// there means anything it can carry out — an obligation moves between
+    /// sections, but not between kinds, because its kind is what it is rather
+    /// than where it sits. A refused target takes no drop and shows no
+    /// landing line.
+    ///
+    /// A list with no filter allows every target in it.
+    pub fn with_drop_filter(mut self, filter: impl Fn(&ItemDropped) -> bool + 'static) -> Self {
+        self.drop_filter = Some(Rc::new(filter));
+        self
+    }
+
+    /// The caller's payload for the group heading keyed `key`, so a view can
+    /// read a dropped-on group as its own type instead of parsing the key it
+    /// made. [`ItemDropped::group`] names the headings; this resolves them.
+    pub fn group_payload_for(&self, key: &str) -> Option<&G> {
+        self.rows
+            .iter()
+            .find(|row| row.as_group().is_some_and(|group| group.key == key))
+            .and_then(ItemListRow::group_payload)
+    }
+
+    /// The headings enclosing `row_ix`, outermost first. Each enclosing
+    /// heading is the nearest one above with a smaller depth than the one
+    /// found before it, which is what makes an item's group chain readable off
+    /// a flat row list.
+    ///
+    /// `row_ix` may be one past the last row, which is the chain the end of
+    /// the list is in.
+    fn group_chain(&self, row_ix: usize) -> Vec<String> {
+        self.enclosing(row_ix, None)
+    }
+
+    /// [`Self::group_chain`], but only the headings shallower than `below`.
+    ///
+    /// An item is enclosed by the nearest heading at any depth. A *heading* is
+    /// not: the nearest heading above it is usually its own previous sibling,
+    /// which encloses nothing of its. So a heading's chain has to be taken
+    /// from strictly shallower than itself.
+    fn enclosing(&self, row_ix: usize, below: Option<usize>) -> Vec<String> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut depth = below;
+        for row in self.rows[..row_ix.min(self.rows.len())].iter().rev() {
+            let Some(group) = row.as_group() else {
+                continue;
+            };
+            if depth.is_none_or(|found| group.depth < found) {
+                depth = Some(group.depth);
+                chain.push(group.key.clone());
+                if group.depth == 0 {
+                    break;
+                }
+            }
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Where a row dropped on `row_ix` lands. `None` is the strip past the
+    /// last row, which means the end of the list.
+    ///
+    /// Dropping on an item row puts the dragged row ahead of it; dropping on
+    /// a heading puts it first under that heading, which is the only way to
+    /// reach an empty group.
+    fn drop_position(&self, row_ix: Option<usize>) -> (Vec<String>, Option<String>) {
+        let Some(row_ix) = row_ix else {
+            // The end of the list: past the last row, and so under whichever
+            // headings that row was under.
+            return (self.group_chain(self.rows.len()), None);
+        };
+        match &self.rows[row_ix] {
+            ItemListRow::Item { key, .. } => (self.group_chain(row_ix), Some(key.clone())),
+            ItemListRow::Group { spec, .. } => {
+                let mut chain = self.enclosing(row_ix, Some(spec.depth));
+                chain.push(spec.key.clone());
+                // First under this heading: the next row, when that row is one
+                // of its items rather than a nested heading or the next group.
+                let before = self
+                    .rows
+                    .get(row_ix + 1)
+                    .and_then(ItemListRow::as_item)
+                    .and(self.rows.get(row_ix + 1).map(|row| row.key().to_string()));
+                (chain, before)
+            }
+        }
     }
 
     /// What an item affords, declared once: the buttons the row shows while it
@@ -814,10 +920,10 @@ impl<T, G> ItemList<T, G> {
             let mut wrapper = div().id(("item-list-row", row_ix)).w_full().child(content);
             let mut menu = None;
             if let Some(item) = row.as_item() {
-                if let Some(drag) = &self.drag {
-                    wrapper = drag(item, wrapper);
-                }
                 menu = self.row_menu(item);
+            }
+            if self.drag_list.is_some() {
+                wrapper = self.with_row_drag(wrapper, row_ix, host);
             }
             match menu {
                 Some(menu) => {
@@ -848,7 +954,11 @@ impl<T, G> ItemList<T, G> {
                     .w_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
-                    .children(elements),
+                    .when_some(self.autoscroll(), |el, autoscroll| {
+                        el.on_drag_move::<ItemDrag>(autoscroll)
+                    })
+                    .children(elements)
+                    .children(self.render_drop_strip(host)),
             )
             .child(
                 // Narrow right-edge strip, not the full row area: the
@@ -871,6 +981,182 @@ impl<T, G> ItemList<T, G> {
             .into_any_element()
     }
 
+    /// The drag gesture on one row: the payload when the row is an item, and
+    /// the drop target every row is — a heading included, since dropping on
+    /// one is the only way to reach a group with nothing in it yet.
+    fn with_row_drag<A>(
+        &self,
+        wrapper: Stateful<Div>,
+        row_ix: usize,
+        host: &RowHost<A>,
+    ) -> Stateful<Div>
+    where
+        A: From<ItemListEvent> + 'static,
+    {
+        let Some(list) = self.drag_list.clone() else {
+            return wrapper;
+        };
+        let row = &self.rows[row_ix];
+        let row_key = row.key().to_string();
+        let mut wrapper = wrapper;
+        if let Some(item) = row.as_item() {
+            let label: SharedString = self
+                .row_text
+                .as_ref()
+                .map(|text| text(item))
+                .unwrap_or_else(|| row_key.clone())
+                .into();
+            wrapper = wrapper.on_drag(
+                ItemDrag {
+                    list: list.clone(),
+                    key: row_key.clone(),
+                    group: self.group_chain(row_ix),
+                    label,
+                },
+                |drag, _offset, _window, cx| {
+                    let label = drag.label.clone();
+                    cx.new(|_| drag::ItemDragPreview { label })
+                },
+            );
+        }
+        // A heading for a group that is not created yet (no chevron, because
+        // there is nothing to collapse) has nowhere to put a row.
+        if row.as_group().is_some_and(|group| !group.chevron) {
+            return wrapper;
+        }
+        let (group, before) = self.drop_position(Some(row_ix));
+        let takes = self.accepts(group.clone(), before.clone(), list.clone(), Some(row_key));
+        wrapper
+            .can_drop({
+                let takes = takes.clone();
+                move |any, _, _| any.downcast_ref::<ItemDrag>().is_some_and(&*takes)
+            })
+            .drag_over::<ItemDrag>({
+                let takes = takes.clone();
+                move |style, drag, _, _| {
+                    if takes(drag) {
+                        style::list_drop_indicator(style)
+                    } else {
+                        style.cursor_not_allowed()
+                    }
+                }
+            })
+            .on_drop::<ItemDrag>(self.report_drop(group, before, host))
+    }
+
+    /// Whether this target takes the row being dragged: a row of this same
+    /// list, never the row itself (dropping a row where it already is moves
+    /// nothing), and a place [the list allows](Self::with_drop_filter).
+    fn accepts(
+        &self,
+        group: Vec<String>,
+        before: Option<String>,
+        list: SharedString,
+        own_key: Option<String>,
+    ) -> Rc<dyn Fn(&ItemDrag) -> bool> {
+        let filter = self.drop_filter.clone();
+        Rc::new(move |drag: &ItemDrag| {
+            if drag.list != list || own_key.as_deref() == Some(drag.key.as_str()) {
+                return false;
+            }
+            let Some(filter) = &filter else { return true };
+            filter(&ItemDropped {
+                from: drag.clone(),
+                group: group.clone(),
+                before: before.clone(),
+            })
+        })
+    }
+
+    /// Report the drop this target is, for the view to carry out.
+    fn report_drop<A>(
+        &self,
+        group: Vec<String>,
+        before: Option<String>,
+        host: &RowHost<A>,
+    ) -> impl Fn(&ItemDrag, &mut Window, &mut App) + 'static
+    where
+        A: From<ItemListEvent> + 'static,
+    {
+        let host = host.clone();
+        move |drag: &ItemDrag, _: &mut Window, cx: &mut App| {
+            host.push(
+                ItemListEvent::Drop(ItemDropped {
+                    from: drag.clone(),
+                    group: group.clone(),
+                    before: before.clone(),
+                })
+                .into(),
+                cx,
+            );
+        }
+    }
+
+    /// The strip past the last row: how a list that drags says "the end".
+    /// Without it the last position would be the one place a row could not be
+    /// dropped, since every other target is a row that the drop goes *ahead*
+    /// of.
+    fn render_drop_strip<A>(&self, host: &RowHost<A>) -> Option<AnyElement>
+    where
+        A: From<ItemListEvent> + 'static,
+    {
+        let list = self.drag_list.clone()?;
+        let (group, before) = self.drop_position(None);
+        let takes = self.accepts(group.clone(), before.clone(), list, None);
+        Some(
+            div()
+                .id("item-list-drop-strip")
+                .w_full()
+                .h(style::size::DROP_STRIP)
+                .flex_shrink_0()
+                .can_drop({
+                    let takes = takes.clone();
+                    move |any, _, _| any.downcast_ref::<ItemDrag>().is_some_and(&*takes)
+                })
+                .drag_over::<ItemDrag>({
+                    let takes = takes.clone();
+                    move |style, drag, _, _| {
+                        if takes(drag) {
+                            style::list_drop_indicator(style)
+                        } else {
+                            style.cursor_not_allowed()
+                        }
+                    }
+                })
+                .on_drop::<ItemDrag>(self.report_drop(group, before, host))
+                .into_any_element(),
+        )
+    }
+
+    /// Scroll the list while a row is dragged to its top or bottom edge, so a
+    /// row can reach a place that is not on screen when the drag starts.
+    ///
+    /// The handler goes on the scrolling container rather than the row: a drag
+    /// reports its moves to the elements that were under the pointer when it
+    /// started, which is the row *and* everything around it, and the container
+    /// is the one that is still under the pointer once the row has moved on.
+    fn autoscroll(
+        &self,
+    ) -> Option<impl Fn(&gpui::DragMoveEvent<ItemDrag>, &mut Window, &mut App) + 'static> {
+        self.drag_list.as_ref()?;
+        let scroll = self.scroll.clone();
+        Some(
+            move |event: &gpui::DragMoveEvent<ItemDrag>, _: &mut Window, _: &mut App| {
+                let bounds = event.bounds;
+                let y = event.event.position.y;
+                let step = if y < bounds.top() + drag::AUTOSCROLL_EDGE {
+                    drag::AUTOSCROLL_STEP
+                } else if y > bounds.bottom() - drag::AUTOSCROLL_EDGE {
+                    -drag::AUTOSCROLL_STEP
+                } else {
+                    return;
+                };
+                let offset = scroll.offset();
+                scroll.set_offset(gpui::point(offset.x, offset.y + step));
+            },
+        )
+    }
+
     /// The column names, above the rows and outside the scrolling area. A
     /// list with no columns has no header.
     fn render_header(&self) -> Option<AnyElement> {
@@ -879,9 +1165,8 @@ impl<T, G> ItemList<T, G> {
         }
         let mut header = style::list_header(h_flex()).w_full().items_center();
         for column in &self.columns {
-            header = header.child(
-                style::list_cell(div(), column.width).child(column.label.to_uppercase()),
-            );
+            header = header
+                .child(style::list_cell(div(), column.width).child(column.label.to_uppercase()));
         }
         Some(header.into_any_element())
     }
@@ -943,13 +1228,8 @@ impl<T, G> ItemList<T, G> {
                 style::list_group_chevron(div())
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                        toggle_host.push(
-                            ItemListEvent::ToggleGroup {
-                                key: key.clone(),
-                            }
-                            .into(),
-                            cx,
-                        );
+                        toggle_host
+                            .push(ItemListEvent::ToggleGroup { key: key.clone() }.into(), cx);
                         cx.stop_propagation();
                     })
                     .child(if collapsed { "▸" } else { "▾" }),
@@ -1024,6 +1304,87 @@ mod tests {
             ItemListRow::item("b", "Syncs later"),
         ]);
         list
+    }
+
+    /// Two sections under one kind, so a drop can cross a grouping boundary.
+    ///
+    /// phase 0
+    ///   kind 1
+    ///     offline 2 -> a, b
+    ///     sync 2    -> c
+    fn two_sections() -> ItemList<&'static str> {
+        let mut list = ItemList::new();
+        list.set_rows(vec![
+            ItemListRow::heading(GroupSpec::new("phase", 0, "Requirements phase")),
+            ItemListRow::heading(GroupSpec::new("kind", 1, "Requirements")),
+            ItemListRow::heading(GroupSpec::new("offline", 2, "Offline")),
+            ItemListRow::item("a", "Works offline"),
+            ItemListRow::item("b", "Syncs later"),
+            ItemListRow::heading(GroupSpec::new("sync", 2, "Sync")),
+            ItemListRow::item("c", "Resolves conflicts"),
+        ]);
+        list
+    }
+
+    #[test]
+    fn an_item_reads_the_headings_it_sits_under_off_the_flat_rows() {
+        let list = two_sections();
+        assert_eq!(list.group_chain(3), vec!["phase", "kind", "offline"]);
+        assert_eq!(list.group_chain(6), vec!["phase", "kind", "sync"]);
+        // One past the last row: the end of the list is in the last group.
+        assert_eq!(list.group_chain(7), vec!["phase", "kind", "sync"]);
+    }
+
+    #[test]
+    fn dropping_on_a_row_lands_ahead_of_it_and_dropping_past_the_end_lands_last() {
+        let list = two_sections();
+        assert_eq!(
+            list.drop_position(Some(4)),
+            (
+                vec!["phase".into(), "kind".into(), "offline".into()],
+                Some("b".into())
+            )
+        );
+        // The strip past the last row: the end of the last group.
+        assert_eq!(
+            list.drop_position(None),
+            (vec!["phase".into(), "kind".into(), "sync".into()], None)
+        );
+    }
+
+    #[test]
+    fn dropping_on_a_heading_lands_first_under_it() {
+        let list = two_sections();
+        // The heading's own key joins the chain, and the row lands ahead of
+        // the first item under it.
+        assert_eq!(
+            list.drop_position(Some(5)),
+            (
+                vec!["phase".into(), "kind".into(), "sync".into()],
+                Some("c".into())
+            )
+        );
+    }
+
+    #[test]
+    fn a_heading_with_nothing_under_it_yet_takes_a_drop_at_its_end() {
+        let mut list: ItemList<&'static str> = ItemList::new();
+        list.set_rows(vec![
+            ItemListRow::heading(GroupSpec::new("kind", 0, "Requirements")),
+            ItemListRow::heading(GroupSpec::new("empty", 1, "Nothing here")),
+        ]);
+        // No item to land ahead of, so the drop is the group's end --- which is
+        // how an item reaches a section that has nothing in it.
+        assert_eq!(
+            list.drop_position(Some(1)),
+            (vec!["kind".into(), "empty".into()], None)
+        );
+    }
+
+    #[test]
+    fn an_empty_list_still_has_somewhere_to_drop() {
+        let list: ItemList<&'static str> = ItemList::new();
+        assert_eq!(list.drop_position(None), (Vec::new(), None));
     }
 
     #[test]

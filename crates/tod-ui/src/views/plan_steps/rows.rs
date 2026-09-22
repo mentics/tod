@@ -4,7 +4,7 @@
 //! The list itself — cursor, keys, scrolling — is [`crate::ui::item_list`].
 //! Only what a plan step *is* lives here.
 
-use crate::ui::item_list::{ItemListEvent, ItemListRow, ItemRowState};
+use crate::ui::item_list::{ItemDropped, ItemListEvent, ItemListRow, ItemRowState};
 use crate::views::rows::{
     PlanStepRowEvent, PlanStepRowProps, RowAction, RowHost, RowOptions, StatusMenu, op_icon,
     plan_step_row,
@@ -33,12 +33,17 @@ pub struct PlanStepItem {
 /// dependency graph, not from a hierarchy, so there is nothing to group by.
 pub type PlanRow = ItemListRow<PlanStepItem>;
 
+/// This list's name in an [`crate::ui::item_list::ItemDrag`] payload.
+pub const DRAG_LIST: &str = "plan-steps";
+
 /// What the user did in the list, queued for `PlanStepsView` to apply.
 #[derive(Debug, Clone)]
 pub enum ListAction {
     Select {
         row_ix: usize,
     },
+    /// Dragged a step to a new place in the plan.
+    Drop(ItemDropped),
     StartEdit {
         step_id: Uuid,
     },
@@ -79,6 +84,7 @@ impl From<ItemListEvent> for ListAction {
             // A flat, single-select list has neither a group heading to
             // collapse nor a checkbox to tick, so neither event arrives.
             ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignored,
+            ItemListEvent::Drop(dropped) => Self::Drop(dropped),
         }
     }
 }

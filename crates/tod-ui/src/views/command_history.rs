@@ -71,9 +71,13 @@ struct HistoryItem {
 /// What the user did in the list, queued for the view to apply.
 #[derive(Debug, Clone)]
 enum HistoryAction {
-    Select { row_ix: usize },
+    Select {
+        row_ix: usize,
+    },
     /// Undo this entry and every one after it.
-    Undo { id: Uuid },
+    Undo {
+        id: Uuid,
+    },
     /// Something the list can report but a flat, read-only one never does.
     Ignored,
 }
@@ -82,7 +86,11 @@ impl From<ItemListEvent> for HistoryAction {
     fn from(event: ItemListEvent) -> Self {
         match event {
             ItemListEvent::Select { row_ix } => Self::Select { row_ix },
-            ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignored,
+            // History is in the order it happened; nothing about it can be
+            // rearranged.
+            ItemListEvent::ToggleGroup { .. }
+            | ItemListEvent::ToggleMark { .. }
+            | ItemListEvent::Drop(_) => Self::Ignored,
         }
     }
 }
@@ -321,16 +329,12 @@ impl CommandHistoryView {
                         cx,
                     )),
             )
-            .child(
-                state
-                    .column(COLUMN_CHANGE, div())
-                    .child(selectable_text(
-                        format!("history-label-{}", item.id),
-                        item.label.clone(),
-                        window,
-                        cx,
-                    )),
-            )
+            .child(state.column(COLUMN_CHANGE, div()).child(selectable_text(
+                format!("history-label-{}", item.id),
+                item.label.clone(),
+                window,
+                cx,
+            )))
             // The row's own actions, shown while it is hovered or under the
             // cursor: the same declaration its right-click menu is built from.
             .children(row_action_buttons(
@@ -391,14 +395,12 @@ impl Render for CommandHistoryView {
                         "↑↓ select · Undo, or Enter or Ctrl+Z, undoes through the selected change",
                     ))
                     .when(!self.status_line.is_empty(), |el| {
-                        el.child(
-                            style::text_dense_muted(div()).child(selectable_text(
-                                "command-history-status",
-                                self.status_line.clone(),
-                                window,
-                                cx,
-                            )),
-                        )
+                        el.child(style::text_dense_muted(div()).child(selectable_text(
+                            "command-history-status",
+                            self.status_line.clone(),
+                            window,
+                            cx,
+                        )))
                     }),
             )
     }

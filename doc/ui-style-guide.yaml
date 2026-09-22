@@ -234,6 +234,23 @@ styles:
     # A fixed column holds its width on every row; the content column, which
     # has no width, takes what is left.
     width: declared-or-fill
+  # Where a dragged row will land: a line along the leading edge of the row it
+  # will push down, and the same line on the strip past the last row, which is
+  # how a list says "the end".
+  list-drop-indicator:
+    border-top: drag-edge
+  # What follows the pointer while a row is dragged: what the row says, as a
+  # floating chip, so the row is identifiable once it is far from where it
+  # started.
+  drag-preview:
+    extends: text-dense
+    background: surface
+    border: divider
+    radius: control
+    padding-x: related
+    padding-y: inline
+    shadow: floating
+    overflow: single-line
   # The column names, above the rows and outside the scrolling area.
   list-header:
     extends: text-dense-muted
@@ -465,6 +482,8 @@ tokens:
     group-row: 28px
     group-indent: 16px
     mark-gutter: 24px
+    # The graspable strip past the last row, where a drag means "the end".
+    drop-strip: 28px
     # A timestamp column: wide enough for a wall-clock time.
     timestamp-column: 72px
     # One cell of a table whose columns are its data (a query's rows), where

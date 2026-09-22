@@ -173,6 +173,7 @@ pub mod size {
     pub const GROUP_ROW: Pixels = px(28.);
     pub const GROUP_INDENT: Pixels = px(16.);
     pub const MARK_GUTTER: Pixels = px(24.);
+    pub const DROP_STRIP: Pixels = px(28.);
     pub const TIMESTAMP_COLUMN: Pixels = px(72.);
     pub const TABLE_CELL: Pixels = px(160.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
@@ -309,6 +310,28 @@ pub fn list_cell<E: Styled>(el: E, width: Option<Pixels>) -> E {
         Some(width) => el.w(width).flex_shrink_0(),
         None => el.flex_1().min_w_0(),
     }
+}
+
+/// `styles.list-drop-indicator`: where a dragged row will land — a line along
+/// the leading edge of the row it will push down. Applied to the dragged-over
+/// style rather than the row, so it appears without a re-render.
+pub fn list_drop_indicator<E: Styled>(el: E) -> E {
+    el.border_t(size::BORDER).border_color(color::drag_edge())
+}
+
+/// `styles.drag-preview`: the chip that follows the pointer while a row is
+/// dragged.
+pub fn drag_preview<E: Styled>(el: E) -> E {
+    el.px(space::RELATED)
+        .py(space::INLINE)
+        .rounded(radius::CONTROL)
+        .border(size::BORDER)
+        .border_color(color::divider())
+        .bg(color::surface())
+        .shadow_lg()
+        .text_size(font::DENSE)
+        .text_color(color::text())
+        .whitespace_nowrap()
 }
 
 /// `styles.list-header`: the column names above a list that has columns. It

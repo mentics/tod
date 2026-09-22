@@ -175,12 +175,14 @@ mod tests {
         let list: ItemList<&'static str> = ItemList::new().with_row_actions(move |item: &&str| {
             let fired = fired.clone();
             let item = *item;
-            vec![
-                RowAction::new("edit", "Edit", move |_, _| fired.set(Some(item))).menu_only(),
-            ]
+            vec![RowAction::new("edit", "Edit", move |_, _| fired.set(Some(item))).menu_only()]
         });
         let (cursor, cx) = right_click_second_row(list, cx);
-        assert_eq!(cursor.get(), Some(1), "right-click moves the cursor to the row");
+        assert_eq!(
+            cursor.get(),
+            Some(1),
+            "right-click moves the cursor to the row"
+        );
         cx.simulate_click(first_entry(), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
@@ -192,7 +194,8 @@ mod tests {
 
     #[gpui::test]
     fn right_click_copy_copies_the_whole_row_when_nothing_is_selected(cx: &mut TestAppContext) {
-        let list: ItemList<&'static str> = ItemList::new().with_row_text(|item: &&str| item.to_string());
+        let list: ItemList<&'static str> =
+            ItemList::new().with_row_text(|item: &&str| item.to_string());
         let (_, cx) = right_click_second_row(list, cx);
         cx.simulate_click(first_entry(), Modifiers::default());
         cx.run_until_parked();

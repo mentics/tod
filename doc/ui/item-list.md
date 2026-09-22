@@ -147,7 +147,29 @@ Today, in `ui/item_list/`:
 - **Columns**, with `with_columns()` / `set_columns()`: the declared widths,
   the header row, and the heading offset that keeps a grouping from reading as
   a column. See above.
-- **Scrolling** and the scrollbar, and keeping the cursor in view.
+- **Scrolling** and the scrollbar, and keeping the cursor in view, and
+  scrolling the list under a drag held near its top or bottom edge.
+- **Drag reordering**, with `with_reorder(list)`: the gesture, the preview
+  chip that follows the pointer, the landing line, the drop strip past the
+  last row that is the only way to reach the end, and the autoscroll. A row
+  in flight is an `ItemDrag` — the list's name, the item's key, the headings
+  it came from, and its text — and one payload type serves every list in the
+  app, so a target elsewhere (a node on the task tree) reads the same thing a
+  target inside the list does.
+
+  **Where it landed is reported as a neighbour, not an index**: `ItemDropped`
+  says which headings it landed under and which item it landed *ahead of*
+  (`None` at the end of that group). A list's grouping and its ordinal space
+  are not always the same space — an obligation is ordered across the whole of
+  its kind but grouped by section inside it — so an index counted in the rows
+  would be an index into the wrong list. Each view turns the neighbour into
+  whatever its own mutation counts in, and the component reports the drop even
+  when nothing moved, since only the view can tell.
+
+  **Which drops are legal is the view's**, through `with_drop_filter`: what a
+  group *means* is the view's, so only it knows that an obligation may change
+  section but not kind or phase. The component owns the gesture; the view owns
+  the rule. A list without the filter accepts any row from its own list.
 - **The right-click row menu** (`ui/item_list/row_menu.rs`): the gesture, the
   anchoring at the pointer, the chrome, and moving the cursor onto the row
   that was clicked. It is the same `ContextMenuExt` `selectable_text` uses,
@@ -170,12 +192,6 @@ Today, in `ui/item_list/`:
 
 What it does *not* own yet, and where that work lives instead:
 
-- **Drag reordering.** `with_drag()` hands the caller the row the component
-  built and takes back a draggable one, so the payload stays the caller's —
-  but the drop indicator and the autoscroll are still the obligations panel's,
-  and only that panel drags. Lifting them is the next thing worth doing, since
-  it is the one capability a list can have that another list over the same
-  items does not.
 - **Search.** `item_list::search::matches_query` is a shared matcher, called by
   the obligations panel. There is no component-owned Ctrl+F.
 - **Filter chips.** `ui/status_filter.rs` is the view's; the component never
@@ -187,8 +203,8 @@ What it does *not* own yet, and where that work lives instead:
 ## What the caller supplies
 
 There is no delegate trait. The component is a plain struct the view owns, and
-a view configures it with builder hooks (`with_marking`, `with_drag`,
-`with_columns`, `with_group_editor`) and drives it with method calls. A hook
+a view configures it with builder hooks (`with_marking`, `with_reorder`,
+`with_drop_filter`, `with_columns`, `with_group_editor`) and drives it with method calls. A hook
 left off is a capability the list does not have.
 
 The caller supplies three things:

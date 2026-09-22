@@ -609,13 +609,7 @@ impl Shell {
             self.open_conversation(focus, window, cx);
         }
         if let Some(node) = self.pending_on_entry.take() {
-            self.open_conversation_with(
-                Focus::Node(node),
-                ProtocolKind::OnEntry,
-                true,
-                window,
-                cx,
-            );
+            self.open_conversation_with(Focus::Node(node), ProtocolKind::OnEntry, true, window, cx);
         }
         if std::mem::take(&mut self.pending_leave_conversation) {
             let view = self.view_before_conversation;
@@ -623,8 +617,9 @@ impl Shell {
         }
         if let Some(node) = self.pending_gate_check.take() {
             self.select_view(ShellView::Conversation, window, cx);
-            self.conversation
-                .update(cx, |conversation, cx| conversation.check_gate(node, window, cx));
+            self.conversation.update(cx, |conversation, cx| {
+                conversation.check_gate(node, window, cx)
+            });
         }
         if let Some((node_id, obligation_id)) = self.pending_go_to_tasks.take() {
             self.go_to_tasks(node_id, obligation_id, window, cx);

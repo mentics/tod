@@ -349,6 +349,144 @@ fn send_click_windows(
     Ok(())
 }
 
+/// One step of a drag held open: press, move, or release.
+///
+/// `drag` does the whole gesture in one message and is what a test wants. This
+/// is for looking at the UI *during* a drag — the landing line a list draws
+/// under the pointer only exists while the button is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragStep {
+    Press,
+    Move,
+    Release,
+}
+
+pub fn send_drag_step(
+    step: DragStep,
+    logical_x: f32,
+    logical_y: f32,
+    logical_width: u32,
+    logical_height: u32,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        send_drag_step_windows(step, logical_x, logical_y, logical_width, logical_height)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (step, logical_x, logical_y, logical_width, logical_height);
+        Err("drag steps unsupported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+fn send_drag_step_windows(
+    step: DragStep,
+    logical_x: f32,
+    logical_y: f32,
+    logical_width: u32,
+    logical_height: u32,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    };
+
+    const MK_LBUTTON: usize = 0x0001;
+    let hwnd = main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
+    let (cw, ch) = unsafe {
+        let mut client = windows::Win32::Foundation::RECT::default();
+        GetClientRect(hwnd, &mut client).map_err(|e| format!("GetClientRect: {e}"))?;
+        (
+            (client.right - client.left).max(1) as f32,
+            (client.bottom - client.top).max(1) as f32,
+        )
+    };
+    let x = (logical_x * cw / logical_width.max(1) as f32).round() as i32;
+    let y = (logical_y * ch / logical_height.max(1) as f32).round() as i32;
+    let lp = mouse_lparam(x, y);
+    let (message, held) = match step {
+        DragStep::Press => (WM_LBUTTONDOWN, MK_LBUTTON),
+        DragStep::Move => (WM_MOUSEMOVE, MK_LBUTTON),
+        DragStep::Release => (WM_LBUTTONUP, 0),
+    };
+    unsafe {
+        if step == DragStep::Press {
+            SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lp);
+        }
+        SendMessageW(hwnd, message, WPARAM(held), lp);
+    }
+    Ok(())
+}
+
+/// Press at one point, move to another in steps, and release: a drag.
+///
+/// The steps matter. A drag is not a click with a different end point — the UI
+/// starts one only after the pointer has moved while held, and a drop target
+/// only lights up once the pointer has been reported over it.
+pub fn send_drag(
+    from: (f32, f32),
+    to: (f32, f32),
+    logical_width: u32,
+    logical_height: u32,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        send_drag_windows(from, to, logical_width, logical_height)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (from, to, logical_width, logical_height);
+        Err("drag unsupported on this platform".into())
+    }
+}
+
+#[cfg(windows)]
+fn send_drag_windows(
+    from: (f32, f32),
+    to: (f32, f32),
+    logical_width: u32,
+    logical_height: u32,
+) -> Result<(), String> {
+    use windows::Win32::Foundation::WPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    };
+
+    /// Enough intermediate moves for the drag to start and for the target
+    /// under the pointer to be seen before the button comes up.
+    const STEPS: i32 = 12;
+    const MK_LBUTTON: usize = 0x0001;
+
+    let hwnd = main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
+    let (cw, ch) = unsafe {
+        let mut client = windows::Win32::Foundation::RECT::default();
+        GetClientRect(hwnd, &mut client).map_err(|e| format!("GetClientRect: {e}"))?;
+        (
+            (client.right - client.left).max(1) as f32,
+            (client.bottom - client.top).max(1) as f32,
+        )
+    };
+    let scale_x = cw / logical_width.max(1) as f32;
+    let scale_y = ch / logical_height.max(1) as f32;
+    let at = |x: f32, y: f32| mouse_lparam((x * scale_x).round() as i32, (y * scale_y).round() as i32);
+
+    unsafe {
+        // SendMessage blocks until the window proc has handled each message,
+        // so the frames in between happen without any sleeping here.
+        SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), at(from.0, from.1));
+        SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), at(from.0, from.1));
+        for step in 1..=STEPS {
+            let progress = step as f32 / STEPS as f32;
+            let x = from.0 + (to.0 - from.0) * progress;
+            let y = from.1 + (to.1 - from.1) * progress;
+            SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(MK_LBUTTON), at(x, y));
+        }
+        SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), at(to.0, to.1));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn mouse_lparam(x: i32, y: i32) -> windows::Win32::Foundation::LPARAM {
     use windows::Win32::Foundation::LPARAM;

@@ -26,6 +26,7 @@
 //! store is read once when a node's session starts and once when it ends.
 
 use crate::interview::agent::SharedAgent;
+use crate::interview::{TodPaths, TodSettings};
 use crate::views::lifecycle_control::LifecycleController;
 use gpui::{Context, Entity, EventEmitter, Task};
 use std::sync::Arc;
@@ -36,7 +37,6 @@ use tod_core::incoming::{
 };
 use tod_core::lifecycle_validity::regression;
 use tod_store::fleet::FleetStore;
-use crate::interview::{TodPaths, TodSettings};
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
@@ -385,7 +385,8 @@ fn tree_order(fleet: &FleetStore) -> std::collections::HashMap<Uuid, usize> {
 fn driver_config(fleet: &FleetStore) -> Result<(ConversationConfig, usize), String> {
     let paths = TodPaths::discover().map_err(|e| format!("{e:#}"))?;
     let settings = TodSettings::load(&paths).unwrap_or_default();
-    let media = tod_core::media::MediaPaths::discover().map_err(|e| format!("Media bundle: {e}"))?;
+    let media =
+        tod_core::media::MediaPaths::discover().map_err(|e| format!("Media bundle: {e}"))?;
     Ok((
         ConversationConfig {
             data_root: fleet.paths().root().to_path_buf(),
@@ -405,7 +406,10 @@ pub fn outcome_line(result: &NodeResult) -> String {
             affects,
             note,
             target: Some(target),
-        } => format!("{}: affects {affects} → back to {target}. {note}", result.title),
+        } => format!(
+            "{}: affects {affects} → back to {target}. {note}",
+            result.title
+        ),
         NodeOutcome::Verdict { note, .. } => format!("{}: not affected. {note}", result.title),
         NodeOutcome::Failed(err) => format!("{}: check failed — {err}", result.title),
     }

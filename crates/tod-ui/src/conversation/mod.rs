@@ -67,25 +67,25 @@ use crate::ui::status::{self, StatusSource};
 use crate::ui::status_filter::StatusFilter;
 use crate::ui::style;
 use crate::views::incoming_check::IncomingCheck;
+use crate::views::lifecycle_control::LifecycleController;
 use crate::views::obligations::ObligationsView;
 use crate::views::plan_steps::PlanStepsView;
-use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{
     FindingRowEvent, NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost, finding_columns,
 };
 use change_set::{ChangeGroup, ChangeItem, ChangeKey, PendingReverse};
-use side_pane::FindingItem;
 use context_panel::{ContextPanel, ContextTab};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
-    Task, Window, div, px,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task, Window,
+    div, px,
 };
 use gpui_component::input::TextareaState;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use keyboard::*;
 use nav::NavMenu;
+use side_pane::FindingItem;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -215,6 +215,9 @@ pub(crate) enum ChangeAction {
     ToggleGroup {
         key: String,
     },
+    /// Something a list can report that neither of the side pane's lists
+    /// answers to.
+    Ignored,
     /// Show all of the row, or back to one line.
     Expand(ChangeKey),
     Edit(ChangeKey),
@@ -265,6 +268,10 @@ impl From<ItemListEvent> for ChangeAction {
             ItemListEvent::Select { row_ix } => Self::SelectRow { row_ix },
             ItemListEvent::ToggleGroup { key } => Self::ToggleGroup { key },
             ItemListEvent::ToggleMark { row_ix } => Self::ToggleMark { row_ix },
+            // Neither list here is ordered by the user: the change set is in
+            // the order the changes happened, the findings in the order the
+            // review recorded them.
+            ItemListEvent::Drop(_) => Self::Ignored,
         }
     }
 }
@@ -708,7 +715,11 @@ impl ConversationView {
     /// to be checked (`doc/conversation/incoming-changes.md` §5); the shell
     /// starts it when they affect nothing.
     pub(super) fn gate_check_waits(
-        &self, focus: Focus, protocol: ProtocolKind, cx: &mut Context<Self>) -> bool {
+        &self,
+        focus: Focus,
+        protocol: ProtocolKind,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let (ProtocolKind::GateCheck, Focus::Node(node), Some((check, _))) =
             (protocol, focus, self.incoming_check.as_ref())
         else {
@@ -788,12 +799,7 @@ impl ConversationView {
     /// transcript; the bar only says a turn is under way.
     fn publish_status(&self, cx: &mut Context<Self>) {
         if self.status.running {
-            status::begin_activity(
-                cx,
-                StatusSource::Conversation,
-                AGENT_TURN,
-                "Agent working…",
-            );
+            status::begin_activity(cx, StatusSource::Conversation, AGENT_TURN, "Agent working…");
         } else {
             status::end_activity(cx, StatusSource::Conversation, AGENT_TURN);
         }
@@ -1115,7 +1121,10 @@ impl ConversationView {
             if lists_state {
                 let steps = PlanStepRepo::new(conn);
                 for standing in &standings {
-                    if !steps.list_steps_for_obligation(standing.obligation.id)?.is_empty() {
+                    if !steps
+                        .list_steps_for_obligation(standing.obligation.id)?
+                        .is_empty()
+                    {
                         planned.insert(standing.obligation.id);
                     }
                 }
@@ -1650,6 +1659,7 @@ impl ConversationView {
                     self.changes.toggle_mark_at(row_ix);
                     cx.notify();
                 }
+                ChangeAction::Ignored => {}
                 ChangeAction::ToggleGroup { key } => {
                     self.changes.toggle_collapsed(&key);
                     cx.notify();
@@ -1820,9 +1830,7 @@ impl Render for ConversationView {
         let root = nav_action!(root, cx, ConversationForward, |this, window, cx| this
             .go_forward(window, cx));
         let root = nav_action!(root, cx, ConversationToggleSelect, |this, window, cx| {
-            if this.pane == Pane::ChangeSet
-                && this.side_list() == side_pane::SideList::ChangeSet
-            {
+            if this.pane == Pane::ChangeSet && this.side_list() == side_pane::SideList::ChangeSet {
                 this.changes.toggle_mark();
                 cx.notify();
             }
@@ -1962,7 +1970,9 @@ fn entered_state(fleet: &FleetStore, driver: &ConversationDriver) -> Option<Uuid
         .read(|conn| ConversationRepo::new(conn).latest_report(id))
         .ok()
         .flatten()
-        .and_then(|report| tod_core::conversation::gate_check::GateReportRecord::from_stored(&report))
+        .and_then(|report| {
+            tod_core::conversation::gate_check::GateReportRecord::from_stored(&report)
+        })
         .and_then(|report| report.advanced_to)?;
     crate::views::lifecycle_control::enters_with_agent(&advanced_to).then_some(node)
 }

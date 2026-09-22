@@ -218,6 +218,8 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `text <string>` | Insert into the focused GPUI input |
 | `click <x> <y>` | Left click at logical client coords |
 | `rclick <x> <y>` | Right click at the same coords (opens a list row's context menu) |
+| `drag <x1> <y1> <x2> <y2>` | Press at the first coords, move to the second, release (drags a list row to a new place) |
+| `press` / `moveto` / `release` `<x> <y>` | The same gesture one step at a time, so a `shot` can catch what only exists mid-drag (a list's landing line) |
 | `sync` | Wait one UI frame |
 | `shot <path>` | PNG screenshot of the window |
 
