@@ -11,8 +11,8 @@ familiar data in a second place and finding it inert is the thing this is meant
 to end.
 
 So a list is read-only only where the *data* does not permit the action — not
-because that particular panel never grew the feature. A capability the delegate
-leaves out is a claim about the item, and should be justifiable as one.
+because that particular panel never grew the feature. A capability a list does
+not configure is a claim about the item, and should be justifiable as one.
 
 ## Why
 
@@ -68,23 +68,28 @@ list of items.
 ## The model
 
 The caller flattens its data into rows, as `views/obligations/mod.rs`'s
-`flat_rows` already does:
+`flat_rows` does:
 
 ```rust
-enum ItemRow<K> {
-    Group { depth: usize, label: SharedString, count: usize, key: K },
-    Item  { key: K, render: ..., columns: ... },
+enum ItemListRow<T, G = ()> {
+    Group { spec: GroupSpec, group: G },
+    Item  { key: String, item: T },
 }
 ```
+
+Both carry the caller's own payload — `T` for an item, `G` for a group — so a
+view reads a row's meaning off the row instead of parsing its key back. A list
+that groups by one thing, or not at all, leaves `G` as `()`.
 
 - `depth` is the nesting of the *group*, and is open-ended: a list declares how
   many levels it groups by and the component indents headings accordingly. A
   list with no grouping emits no group rows. Item rows carry no depth — that
   absence is the whole distinction in the scope section above, and it is what
   keeps the type from drifting into a tree.
-- `K` is the caller's stable key (obligation id, plan step id, node id). The
-  component tracks the cursor, the selection, and which groups are collapsed by
-  key, so a store change that reorders rows does not move the cursor.
+- The key is the caller's stable one (obligation id, plan step id, session id).
+  The component tracks the cursor, the marks, and which groups are collapsed by
+  key, so a store change that reorders rows does not move the cursor and a
+  collapsed group does not lose a mark.
 - Item rows render through `views/rows/` (`obligation_row`, `plan_step_row`,
   `node_row`) or a caller-supplied renderer. The component owns the row
   container — padding, hover, highlight, the `row` / `row-wrapped` styles — and
@@ -124,49 +129,67 @@ change set declare none.
 
 ## What the component owns
 
-- The cursor and every navigation key: `ListArrowUp/Down`, `ListPageUp/Down`,
-  `ListHome`, `ListEnd` from `ui/list/keyboard.rs`; Left/Right to collapse and
-  expand a group, or to jump to the group heading.
-- Selection: single, or multiple with Space and Ctrl+click, as a capability.
-- Drag reordering, including the drop indicator and the autoscroll, lifted from
-  the obligations panel's `ObligationDragPayload`. Whether a given list accepts
-  a drop is the delegate's `reorder`; the drag gesture itself is never
-  reimplemented per list.
-- Scrolling, keeping the cursor in view, and virtualization. Today only the task
-  tree and the transcript are virtualized; every other list renders every row.
-- Filter chips (`ui/status_filter.rs`) and Ctrl+F search.
-- The right-click row menu — currently only the task tree has one
-  (`views/task_list/row_menu.rs`), and `ContextMenuExt` is otherwise used only
-  by `selectable_text`. Standard entries (copy, the row's own actions) come
-  free; the delegate adds more.
-- Navigation mode vs edit mode, per CLAUDE.md: the disabled input, the
-  `set_input_tab_stop` removal, Escape to leave, Ctrl+Enter to commit a
-  multi-line field and Enter a single-line one.
-- Empty state, via `style::empty_message`.
+Today, in `ui/item_list/`:
 
-## What the delegate supplies
+- **The cursor**, tracked by key, and the navigation keys — up/down, page
+  up/down, home/end, and Left/Right to collapse a group or jump to its
+  heading. `keyboard::bind_item_list_keys(cx, surface, keys)` registers them
+  under the surface's own key context; the flags on `ItemListKeys` say which
+  of editing, creation, reordering, marking, grouping and search that surface
+  also binds.
+- **Group headings**: the band, the indent per level, the chevron, the count,
+  the collapsed set (by key, so a rename or a reorder does not expand
+  everything), and the rename field.
+- **Marking**, with `with_marking()`: the checkbox gutter, Space on the row
+  under the cursor, and `selection()`, which falls back to the cursor so an
+  action can mean "this one" without a marking step. Marks are held by key and
+  survive a row being hidden by a collapsed group.
+- **Columns**, with `with_columns()` / `set_columns()`: the declared widths,
+  the header row, and the heading offset that keeps a grouping from reading as
+  a column. See above.
+- **Scrolling** and the scrollbar, and keeping the cursor in view.
 
-Capabilities are opt-in at the type level, but per **The rule** above, two lists
-over the same kind of item implement the same set. Opting out is for items that
-genuinely cannot take the action — a command-history entry is not editable, a
-reversed change is not reorderable.
+What it does *not* own yet, and where that work lives instead:
 
-```rust
-trait ItemListDelegate {
-    type Key;
-    fn rows(&self, cx: &App) -> Vec<ItemRow<Self::Key>>;
-    // opt-in, each with a default of "not supported":
-    fn edit(..);            // inline edit, commit, abandon
-    fn create(..);          // below / above / as a child
-    fn reorder(..);         // Cmd+Up/Down, drag
-    fn delete(..);
-    fn context_entries(..); // extra row-menu entries
-    fn activate(..);        // Enter
-}
-```
+- **Drag reordering.** `with_drag()` hands the caller the row the component
+  built and takes back a draggable one, so the payload stays the caller's —
+  but the drop indicator and the autoscroll are still the obligations panel's,
+  and only that panel drags. Lifting them is the next thing worth doing, since
+  it is the one capability a list can have that another list over the same
+  items does not.
+- **Search.** `item_list::search::matches_query` is a shared matcher, called by
+  the obligations panel. There is no component-owned Ctrl+F.
+- **Filter chips.** `ui/status_filter.rs` is the view's; the component never
+  sees a filter, it only sees whatever rows survived one.
+- **The empty state.** Each view still renders its own `style::empty_message`.
+- **Virtualization.** Every list renders every row. Only the task tree and the
+  transcript — both out of scope — virtualize.
 
-Where lists genuinely differ, the difference goes here. The component does not
-grow a per-list flag for it.
+## What the caller supplies
+
+There is no delegate trait. The component is a plain struct the view owns, and
+a view configures it with builder hooks (`with_marking`, `with_drag`,
+`with_columns`, `with_group_editor`) and drives it with method calls. A hook
+left off is a capability the list does not have.
+
+The caller supplies three things:
+
+1. **The rows** — it flattens its data into `ItemListRow`s each render, and
+   the component reconciles the cursor and the marks by key.
+2. **The item renderer** — a closure the component calls per item row, given
+   an `ItemRowState` (its index, its key, whether it is highlighted, marked or
+   being edited, and the list's columns). Item rows render through
+   `views/rows/` so the same item looks the same everywhere.
+3. **What the keys mean** — the component reports what the user did as
+   `ItemListEvent`s through a `RowHost`, and the view converts them into its
+   own action type and carries them out. This is why a conversation's edit can
+   route through `ConversationEdit` while the same list outside a conversation
+   writes a plain outline mutation: the list does not know the difference.
+
+Per **The rule** above, two lists over the same kind of item configure the same
+set. Opting out is for items that genuinely cannot take the action — a
+command-history entry is not editable, an agent session is a record of
+something that already happened.
 
 ## Keyboard focus
 
@@ -187,11 +210,12 @@ This is the part to get right, since it is what is inconsistent today.
 4. **The host routes, the list does not.** A list emits a focus event (as the
    Tasks drawers emit `FocusTaskList`) and the shell moves focus. The list never
    reaches for another panel's handle.
-5. **The conversation view converts.** It routes Up/Down through its own
-   `ConversationUp/Down` (`conversation/keyboard.rs:63`) and hand-rolls a
-   `side_cursor`. Once the side pane holds an item list, those keys reach the
-   list through its own context while it is focused, and the ad-hoc cursor goes
-   away.
+5. **The conversation view converts.** It still routes Up/Down through its own
+   `ConversationUp/Down` (`conversation/keyboard.rs`), because the side pane is
+   one of several panes it moves between and the key has to mean different
+   things in each. What went away is the *state*: there is no `side_cursor` any
+   more. The view drives the pane's `ItemList`, and the list is the cursor, the
+   marks and the rows. A view may own the key set; no view owns a cursor.
 
 ## Styling
 
@@ -201,6 +225,13 @@ The list around it is `list-group` and its per-level variants
 (`list-group-outer`, `list-group-inner`), plus `list-group-count` and
 `list-group-chevron`; each is implemented once in `ui::style` and used only by
 the component, so no view sets a heading's colour, weight or indent itself.
+
+The table styles are `list-cell` (one column's cell: a declared width, or the
+fill for the content column), `list-header` (the column names) and
+`list-mark-gutter` (where the selection checkbox sits). The last two are
+widths a heading has to be offset by, which is why they are named rather than
+inlined: `list_group` takes the lead offset and every list computes it the
+same way.
 
 ## Migration
 
@@ -289,8 +320,16 @@ Editing in the side pane does not compete with the change set — it feeds it.
 A user edit made there goes through `ConversationEdit`, the path that already
 exists for exactly this, so the edit is recorded as the user's own action in
 `conversation_actions`, shows up in the change set beside the agent's, and is
-reversible the same way. The list does not know any of this: it calls the
-delegate, and the conversation's delegate routes the edit.
+reversible the same way. The list does not know any of this: it reports what
+the user did, and the view routes it.
+
+The plan list is where this is concrete. `PlanStepsView` holds one
+`MutationRouter` — an optional closure wrapping an `OutlineMutation` into an
+`InterviewCommand` — and every mutation it makes goes through the one `apply`
+that consults it. Hosted in a conversation, the router wraps each edit as a
+`ConversationEdit`; hosted in the Tasks view, there is no router and the edit
+is a plain queued outline mutation. One choke point, set once, rather than a
+conversation-aware branch at each call site.
 
 The same holds for reordering and deletion in a conversation's side pane.
 
