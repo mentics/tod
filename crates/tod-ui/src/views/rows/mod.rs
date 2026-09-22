@@ -247,6 +247,59 @@ fn flag_dot(id: ElementId, reason: String) -> AnyElement {
         .into_any_element()
 }
 
+/// The buttons a row shows for what it affords: the actions offered in the
+/// menu only are not among them, so a row with nothing but menu entries shows
+/// no strip at all. `group` is the row's hover group ([`row_group`]), which the
+/// row element itself must carry; `highlighted` keeps the buttons visible
+/// without hover.
+///
+/// Implemented here once so a row that is not one of this module's own — a
+/// table row a list renders itself — shows its actions the same way.
+pub fn row_action_buttons(
+    key: &str,
+    group: &SharedString,
+    highlighted: bool,
+    actions: Vec<RowAction>,
+) -> Option<AnyElement> {
+    let actions = hover_actions(actions);
+    if actions.is_empty() {
+        return None;
+    }
+    let group = group.clone();
+    Some(
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(style::space::INLINE)
+            // Hidden rather than absent, so showing the buttons never moves
+            // whatever sits beside them.
+            .when(!highlighted, |el| {
+                el.invisible().group_hover(group, |style| style.visible())
+            })
+            .children(actions.into_iter().map(|action| {
+                let on_click = action.on_click.clone();
+                let mut button = Button::new(ElementId::Name(
+                    format!("row-action-{key}-{}", action.id).into(),
+                ))
+                .label(action.label.clone())
+                .ghost()
+                .xsmall()
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    on_click(window, cx);
+                });
+                if let Some(icon) = action.icon {
+                    button = button.icon(Icon::new(icon));
+                }
+                if let Some(tooltip) = action.tooltip.clone() {
+                    button = button.tooltip(tooltip);
+                }
+                button.into_any_element()
+            }))
+            .into_any_element(),
+    )
+}
+
 /// The shared tail of a row: flag, hover actions, then trailing context.
 /// `group` names the row's hover group; `highlighted` keeps the actions
 /// visible without hover.
@@ -263,41 +316,13 @@ fn row_tail(
             reason,
         ));
     }
-    let actions = hover_actions(std::mem::take(&mut opts.actions));
-    if !actions.is_empty() {
-        let group = group.clone();
-        tail.push(
-            h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap(style::space::INLINE)
-                // Hidden rather than absent, so showing the buttons never
-                // moves the context beside them.
-                .when(!highlighted, |el| {
-                    el.invisible().group_hover(group, |style| style.visible())
-                })
-                .children(actions.into_iter().map(|action| {
-                    let on_click = action.on_click.clone();
-                    let mut button = Button::new(ElementId::Name(
-                        format!("row-action-{key}-{}", action.id).into(),
-                    ))
-                    .label(action.label.clone())
-                    .ghost()
-                    .xsmall()
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        on_click(window, cx);
-                    });
-                    if let Some(icon) = action.icon {
-                        button = button.icon(Icon::new(icon));
-                    }
-                    if let Some(tooltip) = action.tooltip.clone() {
-                        button = button.tooltip(tooltip);
-                    }
-                    button.into_any_element()
-                }))
-                .into_any_element(),
-        );
+    if let Some(buttons) = row_action_buttons(
+        key,
+        group,
+        highlighted,
+        std::mem::take(&mut opts.actions),
+    ) {
+        tail.push(buttons);
     }
     if let Some(context) = opts.trailing_context.take() {
         tail.push(
@@ -312,7 +337,7 @@ fn row_tail(
 }
 
 /// The hover group name for the row with `key`.
-fn row_group(key: &str) -> SharedString {
+pub fn row_group(key: &str) -> SharedString {
     format!("row-{key}").into()
 }
 
