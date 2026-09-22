@@ -176,6 +176,7 @@ pub mod size {
     pub const TIMESTAMP_COLUMN: Pixels = px(72.);
     pub const TABLE_CELL: Pixels = px(160.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
+    pub const ROW_MENU_MIN: Pixels = px(160.);
 }
 
 /// `tokens.radius`.

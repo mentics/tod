@@ -6,7 +6,8 @@
 
 use crate::ui::item_list::{ItemListEvent, ItemListRow, ItemRowState};
 use crate::views::rows::{
-    PlanStepRowEvent, PlanStepRowProps, RowHost, RowOptions, StatusMenu, op_icon, plan_step_row,
+    PlanStepRowEvent, PlanStepRowProps, RowAction, RowHost, RowOptions, StatusMenu, op_icon,
+    plan_step_row,
 };
 use gpui::{AnyElement, App, Entity, Window};
 use gpui_component::input::TextareaState;
@@ -49,6 +50,10 @@ pub enum ListAction {
         status: &'static str,
     },
     DismissStatusMenu,
+    /// Add a step below the selected one (what `n` does).
+    CreateBelow,
+    /// Delete the selection (what Del does).
+    DeleteSelected,
     /// Something the list can report but this one never does.
     Ignored,
 }
@@ -78,6 +83,36 @@ impl From<ItemListEvent> for ListAction {
     }
 }
 
+/// What a plan step affords, wherever it is shown: what its keys do, as
+/// entries in its right-click menu. The panel shows no buttons for them --- the
+/// rows stay as they were --- so each is
+/// [menu-only](crate::views::rows::RowAction::menu_only). Setting the status
+/// opens the same dropdown the status chip and `t` open.
+pub fn plan_step_actions(item: &PlanStepItem, host: &RowHost<ListAction>) -> Vec<RowAction> {
+    if item.struck {
+        // A removed step shown at its old place is not a thing to edit.
+        return Vec::new();
+    }
+    let step_id = item.step.id;
+    let action = |id: &'static str, label: &'static str, list_action: ListAction| {
+        let host = host.clone();
+        RowAction::new(id, label, move |_, cx| {
+            host.push(list_action.clone(), cx);
+        })
+        .menu_only()
+    };
+    vec![
+        action("edit", "Edit", ListAction::StartEdit { step_id }),
+        action(
+            "status",
+            "Set status...",
+            ListAction::ToggleStatusMenu { step_id },
+        ),
+        action("add-below", "Add below", ListAction::CreateBelow),
+        action("delete", "Delete", ListAction::DeleteSelected),
+    ]
+}
+
 /// Render one plan step for the item list. `menu` is the open status
 /// dropdown, whichever step it is on, and `detail` what the host has to add
 /// under this step's body.
@@ -97,7 +132,7 @@ pub fn render_plan_step(
             .map(|op| op_icon(("plan-step-op", state.row_ix), op)),
         detail,
         struck: item.struck,
-        ..RowOptions::default()
+        ..state.row_options()
     };
     let props = PlanStepRowProps {
         step: &item.step,

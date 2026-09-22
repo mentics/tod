@@ -106,7 +106,13 @@ impl TaskListView {
         let view = cx.weak_entity();
         let focus = self.focus_handle.clone();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            build_row_menu(menu.action_context(focus).min_w(px(160.)), kind, task, view)
+            build_row_menu(
+            menu.action_context(focus)
+                .min_w(crate::ui::style::size::ROW_MENU_MIN),
+            kind,
+            task,
+            view,
+        )
         });
         self._row_menu_subscription = Some(cx.subscribe(&menu, |this, _, _: &DismissEvent, cx| {
             this.close_row_menu(cx);

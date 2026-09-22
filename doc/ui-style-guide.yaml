@@ -472,6 +472,9 @@ tokens:
     table-cell: 160px
     # Tallest a summary card's list grows before it scrolls.
     summary-list-max: 240px
+    # Narrowest a row's right-click menu gets, so a one-word entry does not
+    # make a sliver of a menu.
+    row-menu-min: 160px
     toast-min: 240px
     toast-max: 480px
     toast-narrow-min: 280px

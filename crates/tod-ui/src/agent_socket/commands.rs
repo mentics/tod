@@ -27,6 +27,8 @@ pub enum Command {
     Click {
         x: f32,
         y: f32,
+        /// The right button, for a row's context menu (`rclick`).
+        right: bool,
     },
     Shot {
         path: PathBuf,
@@ -66,19 +68,20 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 text: rest.to_string(),
             })
         }
-        "click" => {
+        "click" | "rclick" => {
             let x = parts
                 .next()
-                .ok_or_else(|| "click requires x y".to_string())?;
+                .ok_or_else(|| format!("{verb} requires x y"))?;
             let y = parts
                 .next()
-                .ok_or_else(|| "click requires x y".to_string())?;
+                .ok_or_else(|| format!("{verb} requires x y"))?;
             if parts.next().is_some() {
-                return Err("click takes exactly two numbers".into());
+                return Err(format!("{verb} takes exactly two numbers"));
             }
             Ok(Command::Click {
                 x: parse_coord(x, "x")?,
                 y: parse_coord(y, "y")?,
+                right: verb == "rclick",
             })
         }
         "shot" => {
@@ -185,12 +188,23 @@ mod tests {
     fn parses_click_shot_and_sync() {
         let c = parse_line("click 10 20.5").unwrap();
         match c {
-            Command::Click { x, y } => {
+            Command::Click { x, y, right } => {
                 assert_eq!(x, 10.0);
                 assert_eq!(y, 20.5);
+                assert!(!right);
             }
             _ => panic!(),
         }
+        // The same coordinates, right button: what opens a row's menu.
+        let c = parse_line("rclick 10 20").unwrap();
+        match c {
+            Command::Click { x, y, right } => {
+                assert_eq!((x, y), (10.0, 20.0));
+                assert!(right);
+            }
+            _ => panic!(),
+        }
+        assert!(parse_line("rclick 10").is_err());
         let c = parse_line("shot out.png 0 80 640 400").unwrap();
         match c {
             Command::Shot { path, crop } => {

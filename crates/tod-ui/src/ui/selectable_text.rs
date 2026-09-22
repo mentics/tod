@@ -55,23 +55,51 @@ fn plain_text_html(text: &str) -> SharedString {
 ///
 /// The selection is read when the menu opens: the left mouse-down that clicks
 /// Copy clears the window's selection before the item's handler runs.
-fn with_copy_menu(id: ElementId, view: TextView) -> SelectableText {
-    div().id(id).child(view).context_menu(|menu, window, cx| {
-        let text = TextSelection::selected_text(window, cx).trim().to_string();
-        menu.item(
-            PopupMenuItem::new("Copy")
-                .disabled(text.is_empty())
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                }),
-        )
-    })
+///
+/// `own_menu` is false where the surface *around* this text already has a
+/// right-click menu carrying Copy — an item-list row. One right-click hovers
+/// both hitboxes, so two menus would open on top of each other; the row's,
+/// which also offers what the row affords, is the one to keep.
+fn with_copy_menu(id: ElementId, view: TextView, own_menu: bool) -> SelectableText {
+    div()
+        .id(id)
+        .child(view)
+        .context_menu(move |menu, window, cx| {
+            if !own_menu {
+                // An empty menu is never shown, so the row's menu is the only
+                // one that opens.
+                return menu;
+            }
+            let text = TextSelection::selected_text(window, cx).trim().to_string();
+            menu.item(
+                PopupMenuItem::new("Copy")
+                    .disabled(text.is_empty())
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    }),
+            )
+        })
 }
 
 /// Plain data text the user can drag-select and copy (Ctrl/Cmd+C or right-click).
 pub fn selectable_text(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) -> SelectableText {
+    selectable_text_with_menu(id, text, true, window, cx)
+}
+
+/// The same, with its own Copy menu only when `own_menu`.
+///
+/// A row whose host installs a right-click menu passes false
+/// (`RowOptions::menu_hosted`): that menu carries Copy, and two menus must not
+/// open on the one click.
+pub fn selectable_text_with_menu(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    own_menu: bool,
     _window: &mut Window,
     _cx: &mut App,
 ) -> SelectableText {
@@ -80,7 +108,7 @@ pub fn selectable_text(
     let view = TextView::html(id.clone(), plain_text_html(&text))
         .selectable(true)
         .style(TextViewStyle::default().paragraph_gap(rems(0.)));
-    with_copy_menu(id, view)
+    with_copy_menu(id, view, own_menu)
 }
 
 /// Markdown text the user can drag-select and copy (Ctrl/Cmd+C or right-click).
@@ -111,7 +139,7 @@ pub fn selectable_markdown(
                 ),
         )
         .selectable(true);
-    with_copy_menu(id, view)
+    with_copy_menu(id, view, true)
 }
 
 #[cfg(test)]

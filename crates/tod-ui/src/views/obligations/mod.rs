@@ -206,7 +206,12 @@ impl ObligationsView {
             list: ItemList::new()
                 .with_group_editor(section_edit_input.clone(), SECTION_EDIT_TAG)
                 .with_marking()
-                .with_drag(rows::draggable),
+                .with_drag(rows::draggable)
+                .with_row_actions({
+                    let host = host.clone();
+                    move |item| rows::obligation_actions(item, &host)
+                })
+                .with_row_text(|item: &ObligationItem| item.obligation.body.clone()),
             host,
             embedded: false,
             removed: Vec::new(),
@@ -1335,6 +1340,12 @@ impl ObligationsView {
                 }
                 ListAction::AddSection { phase, kind } => {
                     self.add_section(&phase, kind, window, cx);
+                }
+                ListAction::CreateBelow => {
+                    self.on_create_below(&ItemListCreateBelow, window, cx);
+                }
+                ListAction::DeleteSelected => {
+                    self.on_delete(&ItemListDelete, window, cx);
                 }
                 ListAction::OpenVisualDesign { obligation_id } => {
                     if let Some(node_id) = self.node_id {

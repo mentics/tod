@@ -9,7 +9,8 @@ use crate::ui::drag_payload::ObligationDragPayload;
 use crate::ui::item_list::{ItemListEvent, ItemListRow, ItemRowState};
 use crate::ui::style;
 use crate::views::rows::{
-    ObligationRowEvent, ObligationRowProps, RowHost, RowOptions, obligation_row, op_icon,
+    ObligationRowEvent, ObligationRowProps, RowAction, RowHost, RowOptions, obligation_row,
+    op_icon,
 };
 use gpui::{
     AnyElement, App, AppContext, Context, Div, Entity, IntoElement, ParentElement, Render,
@@ -144,6 +145,10 @@ pub enum ListAction {
     OpenVisualDesign {
         obligation_id: Uuid,
     },
+    /// Add an obligation below the selected one (what `n` does).
+    CreateBelow,
+    /// Delete the selection (what Del does).
+    DeleteSelected,
 }
 
 impl From<ObligationRowEvent> for ListAction {
@@ -168,6 +173,33 @@ impl From<ItemListEvent> for ListAction {
     }
 }
 
+/// What an obligation affords, wherever it is shown: what its keys do, as
+/// entries in its right-click menu. The panel shows no buttons for them --- the
+/// rows stay as they were --- so each is
+/// [menu-only](crate::views::rows::RowAction::menu_only).
+///
+/// Edit names the obligation the user clicked; the rest act on the list's
+/// selection, which the right-click has just moved the cursor onto.
+pub fn obligation_actions(item: &ObligationItem, host: &RowHost<ListAction>) -> Vec<RowAction> {
+    if item.struck {
+        // A removed obligation shown at its old place is not a thing to edit.
+        return Vec::new();
+    }
+    let obligation_id = item.obligation.id;
+    let action = |id: &'static str, label: &'static str, list_action: ListAction| {
+        let host = host.clone();
+        RowAction::new(id, label, move |_, cx| {
+            host.push(list_action.clone(), cx);
+        })
+        .menu_only()
+    };
+    vec![
+        action("edit", "Edit", ListAction::StartEdit { obligation_id }),
+        action("add-below", "Add below", ListAction::CreateBelow),
+        action("delete", "Delete", ListAction::DeleteSelected),
+    ]
+}
+
 /// Render one obligation for the item list.
 pub fn render_obligation(
     item: &ObligationItem,
@@ -183,7 +215,7 @@ pub fn render_obligation(
             .map(|op| op_icon(("obligation-op", state.row_ix), op)),
         trailing_context: item.standing.as_deref().map(standing_badge),
         struck: item.struck,
-        ..RowOptions::default()
+        ..state.row_options()
     };
     let props = ObligationRowProps {
         obligation: &item.obligation,

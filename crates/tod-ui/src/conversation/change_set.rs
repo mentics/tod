@@ -835,6 +835,9 @@ impl ConversationView {
             detail: None,
             struck: matches!(change.op, NetOp::Deleted | NetOp::Reversed),
             flag: change.flag.clone(),
+            // The change set's rows carry no menu of their own yet, so their
+            // text keeps its own Copy one.
+            menu_hosted: false,
         };
         let editor = (self.editing == Some(key)).then_some(&self.edit_input);
         let row = match change.entity {

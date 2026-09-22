@@ -167,7 +167,13 @@ impl PlanStepsView {
             title: String::new(),
             items: Vec::new(),
             focus_handle: cx.focus_handle(),
-            list: ItemList::new().with_columns(plan_step_columns()),
+            list: ItemList::new()
+                .with_columns(plan_step_columns())
+                .with_row_actions({
+                    let host = host.clone();
+                    move |item| rows::plan_step_actions(item, &host)
+                })
+                .with_row_text(|item: &PlanStepItem| item.step.body.clone()),
             host,
             embedded: false,
             removed: Vec::new(),
@@ -798,6 +804,12 @@ impl PlanStepsView {
                 }
                 ListAction::DismissStatusMenu => {
                     self.close_status_menu(cx);
+                }
+                ListAction::CreateBelow => {
+                    self.on_create_below(&ItemListCreateBelow, window, cx);
+                }
+                ListAction::DeleteSelected => {
+                    self.on_delete(&ItemListDelete, window, cx);
                 }
                 ListAction::Ignored => {}
             }

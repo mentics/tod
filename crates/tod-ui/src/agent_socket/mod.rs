@@ -4,6 +4,7 @@
 //! - `key <keystroke>`
 //! - `text <string>` — insert into focused input (after focus click + sync)
 //! - `click <x> <y>`
+//! - `rclick <x> <y>` — right-click, e.g. to open a list row's context menu
 //! - `shot <path> [x0 y0 x1 y1]`
 //! - `sync` — wait one UI frame (use before a shot after clicks if paint must settle)
 //! - `transcripts open` — open or focus the agent transcript window (single instance)
@@ -153,8 +154,9 @@ fn handle_client(
             }
             Ok(Command::Key { keystroke }) => dispatch_ui(&tx, UiRequest::Key(keystroke)),
             Ok(Command::Text { text }) => dispatch_ui(&tx, UiRequest::Text(text)),
-            Ok(Command::Click { x, y }) => {
-                capture::send_click(x, y, logical_width, logical_height).map(|()| "ok".to_string())
+            Ok(Command::Click { x, y, right }) => {
+                capture::send_click(x, y, logical_width, logical_height, right)
+                    .map(|()| "ok".to_string())
             }
             Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
             Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),

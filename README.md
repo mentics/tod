@@ -217,6 +217,7 @@ If the chosen port is already in use, startup fails immediately with a bind erro
 | `key <keystroke>` | GPUI `dispatch_keystroke` (e.g. `down`, `a`, `ctrl-1`) |
 | `text <string>` | Insert into the focused GPUI input |
 | `click <x> <y>` | Left click at logical client coords |
+| `rclick <x> <y>` | Right click at the same coords (opens a list row's context menu) |
 | `sync` | Wait one UI frame |
 | `shot <path>` | PNG screenshot of the window |
 

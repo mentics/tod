@@ -85,7 +85,13 @@ impl<A: 'static> RowHost<A> {
     }
 }
 
-/// A button shown on a row while it is hovered or highlighted.
+/// Something a row affords: a button on the row while it is hovered or
+/// highlighted, and an entry in the row's right-click menu.
+///
+/// One action, listed once. A list declares its rows' actions through
+/// [`crate::ui::item_list::ItemList::with_row_actions`], and the component
+/// puts them in both places — the same item affords the same actions wherever
+/// it is shown.
 #[derive(Clone)]
 pub struct RowAction {
     /// Unique within the row.
@@ -93,6 +99,10 @@ pub struct RowAction {
     pub label: SharedString,
     pub icon: Option<IconName>,
     pub tooltip: Option<SharedString>,
+    /// Offered in the row's menu only, never as a button on the row. For an
+    /// action the row has no room to show — the panels' own Edit, Delete and
+    /// Add, which are keys and menu entries, not buttons on every row.
+    pub menu_only: bool,
     pub on_click: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
@@ -107,8 +117,15 @@ impl RowAction {
             label: label.into(),
             icon: None,
             tooltip: None,
+            menu_only: false,
             on_click: Rc::new(on_click),
         }
+    }
+
+    /// Offer this action in the row's menu only.
+    pub fn menu_only(mut self) -> Self {
+        self.menu_only = true;
+        self
     }
 
     pub fn icon(mut self, icon: IconName) -> Self {
@@ -135,6 +152,8 @@ pub struct RowOptions {
     pub leading: Option<AnyElement>,
     /// Shown last. Never covered and never shrunk: the text truncates first.
     pub trailing_context: Option<AnyElement>,
+    /// What the row affords. The menu-only ones ([`RowAction::menu_only`]) are
+    /// not shown as buttons; they reach the user through the row's menu.
     /// Shown while the row is hovered or highlighted, beside the trailing
     /// context and never on top of it.
     pub actions: Vec<RowAction>,
@@ -146,6 +165,12 @@ pub struct RowOptions {
     pub struck: bool,
     /// An unsure dot, with this reason as its tooltip.
     pub flag: Option<String>,
+    /// The host installs a right-click menu on this row
+    /// ([`crate::ui::item_list::ItemList::with_row_actions`]), and that menu
+    /// carries Copy. The row's own text therefore adds no Copy menu of its
+    /// own: both hitboxes are hovered by the one click, so two menus would
+    /// open on top of each other.
+    pub menu_hosted: bool,
 }
 
 impl RowOptions {
@@ -160,8 +185,17 @@ impl RowOptions {
     /// The row gets the `hover-row` state. The lists never had one, so it is
     /// only added where the row is used in a new way.
     fn hoverable(&self) -> bool {
-        self.compact || !self.actions.is_empty()
+        self.compact || self.actions.iter().any(|action| !action.menu_only)
     }
+}
+
+/// The actions shown as buttons on the row: what is offered in the menu only
+/// is not one of them.
+fn hover_actions(actions: Vec<RowAction>) -> Vec<RowAction> {
+    actions
+        .into_iter()
+        .filter(|action| !action.menu_only)
+        .collect()
 }
 
 /// The icon-set icon for a change-set operation.
@@ -229,7 +263,7 @@ fn row_tail(
             reason,
         ));
     }
-    let actions = std::mem::take(&mut opts.actions);
+    let actions = hover_actions(std::mem::take(&mut opts.actions));
     if !actions.is_empty() {
         let group = group.clone();
         tail.push(
@@ -392,6 +426,26 @@ mod tests {
         assert_eq!(notified.get(), 2);
         assert_eq!(observer.drain(), vec![1, 2]);
         assert!(host.drain().is_empty());
+    }
+
+    #[test]
+    fn a_menu_only_action_is_no_button_on_the_row() {
+        let actions = vec![
+            RowAction::new("reverse", "Reverse", |_, _| {}),
+            RowAction::new("delete", "Delete", |_, _| {}).menu_only(),
+        ];
+        let shown: Vec<_> = hover_actions(actions.clone())
+            .into_iter()
+            .map(|action| action.id)
+            .collect();
+        assert_eq!(shown, vec![SharedString::from("reverse")]);
+        // A row whose only actions are menu entries does not become hoverable
+        // for buttons it never shows.
+        let opts = RowOptions {
+            actions: vec![actions[1].clone()],
+            ..RowOptions::default()
+        };
+        assert!(!opts.hoverable());
     }
 
     #[test]

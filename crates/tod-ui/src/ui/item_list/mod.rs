@@ -19,13 +19,14 @@
 #![allow(dead_code)]
 
 pub mod keyboard;
+pub mod row_menu;
 pub mod search;
 
 use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ui::style;
-use crate::views::rows::{RowAction, RowHost};
+use crate::views::rows::{RowAction, RowHost, RowOptions};
 use gpui::{
     AnyElement, App, Div, InteractiveElement, IntoElement, MouseButton, ParentElement, ScrollHandle,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
@@ -38,6 +39,7 @@ use gpui_component::scroll::Scrollbar;
 use gpui_component::{Sizable as _, h_flex};
 
 pub use keyboard::{ItemListKeys, bind_item_list_keys, bind_single_line_commit};
+pub use row_menu::RowMenu;
 
 /// Height of a group heading, and the unit page/viewport maths goes by.
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = px(28.);
@@ -239,6 +241,13 @@ pub struct ItemRowState<'a> {
     pub editing: bool,
     /// The list's columns, empty when it is not a table.
     pub columns: &'a [ColumnSpec],
+    /// What this row affords, as the list declared it
+    /// ([`ItemList::with_row_actions`]). Already in [`Self::row_options`],
+    /// which is how a renderer passes it on.
+    pub actions: &'a [RowAction],
+    /// The component installed a right-click menu on this row, so the row's
+    /// text must not add a Copy menu of its own.
+    pub menu_hosted: bool,
 }
 
 impl ItemRowState<'_> {
@@ -247,6 +256,17 @@ impl ItemRowState<'_> {
     /// declare leaves the element as it is.
     pub fn column<E: Styled>(&self, key: &str, el: E) -> E {
         column_cell(self.columns, key, el)
+    }
+
+    /// The row's options as the list already decided them: its actions, and
+    /// whether the menu on it is the component's. A renderer fills in what
+    /// only it knows on top --- `RowOptions { leading: .., ..state.row_options() }`.
+    pub fn row_options(&self) -> RowOptions {
+        RowOptions {
+            actions: self.actions.to_vec(),
+            menu_hosted: self.menu_hosted,
+            ..RowOptions::default()
+        }
     }
 }
 
@@ -288,7 +308,11 @@ pub struct ItemList<T, G = ()> {
     /// Items carry a selection checkbox and answer Space.
     marking: bool,
     drag: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
-    context_menu: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
+    /// What an item affords: its hover buttons and its menu entries, declared
+    /// once.
+    row_actions: Option<Rc<dyn Fn(&T) -> Vec<RowAction>>>,
+    /// An item's text, for the menu's Copy.
+    row_text: Option<Rc<dyn Fn(&T) -> String>>,
 }
 
 impl<T, G> Default for ItemList<T, G> {
@@ -312,7 +336,8 @@ impl<T, G> ItemList<T, G> {
             columns: Vec::new(),
             marking: false,
             drag: None,
-            context_menu: None,
+            row_actions: None,
+            row_text: None,
         }
     }
 
@@ -390,13 +415,45 @@ impl<T, G> ItemList<T, G> {
         self
     }
 
-    /// Give item rows a context menu, the same way.
-    pub fn with_context_menu(
-        mut self,
-        menu: impl Fn(&T, Stateful<Div>) -> Stateful<Div> + 'static,
-    ) -> Self {
-        self.context_menu = Some(Rc::new(menu));
+    /// What an item affords, declared once: the buttons the row shows while it
+    /// is hovered, and the entries its right-click menu offers. An action the
+    /// row has no room for is [`RowAction::menu_only`] and reaches the user
+    /// through the menu alone.
+    ///
+    /// The component owns the menu --- the gesture, the anchoring, the chrome,
+    /// moving the cursor onto the row that was clicked, and the standard Copy
+    /// entry. A list that declares neither actions nor
+    /// [text](Self::with_row_text) has no menu.
+    pub fn with_row_actions(mut self, actions: impl Fn(&T) -> Vec<RowAction> + 'static) -> Self {
+        self.row_actions = Some(Rc::new(actions));
         self
+    }
+
+    /// What an item's text is, for the menu's Copy when nothing is selected.
+    /// The component cannot read it off the row: `T` is the caller's payload
+    /// and the rendered row is an opaque element.
+    pub fn with_row_text(mut self, text: impl Fn(&T) -> String + 'static) -> Self {
+        self.row_text = Some(Rc::new(text));
+        self
+    }
+
+    /// Whether item rows carry a right-click menu.
+    pub fn has_row_menu(&self) -> bool {
+        self.row_actions.is_some() || self.row_text.is_some()
+    }
+
+    /// The menu for one item, as the component will build it. `None` when the
+    /// list declared nothing to put in one.
+    fn row_menu(&self, item: &T) -> Option<RowMenu> {
+        let menu = RowMenu {
+            actions: self
+                .row_actions
+                .as_ref()
+                .map(|actions| actions(item))
+                .unwrap_or_default(),
+            text: self.row_text.as_ref().map(|text| text(item)),
+        };
+        (!menu.is_empty()).then_some(menu)
     }
 
     // -- rows ------------------------------------------------------------
@@ -731,6 +788,11 @@ impl<T, G> ItemList<T, G> {
                 }
                 ItemListRow::Item { key, item } => {
                     let marked = self.marked.contains(key);
+                    let actions = self
+                        .row_actions
+                        .as_ref()
+                        .map(|actions| actions(item))
+                        .unwrap_or_default();
                     let state = ItemRowState {
                         row_ix,
                         key,
@@ -738,6 +800,8 @@ impl<T, G> ItemList<T, G> {
                         marked,
                         editing: self.editing_key.as_deref() == Some(key.as_str()),
                         columns: &self.columns,
+                        actions: &actions,
+                        menu_hosted: self.has_row_menu(),
                     };
                     let row = render_item(item, state, window, cx);
                     if self.marking {
@@ -748,15 +812,25 @@ impl<T, G> ItemList<T, G> {
                 }
             };
             let mut wrapper = div().id(("item-list-row", row_ix)).w_full().child(content);
+            let mut menu = None;
             if let Some(item) = row.as_item() {
                 if let Some(drag) = &self.drag {
                     wrapper = drag(item, wrapper);
                 }
-                if let Some(menu) = &self.context_menu {
-                    wrapper = menu(item, wrapper);
-                }
+                menu = self.row_menu(item);
             }
-            elements.push(wrapper.into_any_element());
+            match menu {
+                Some(menu) => {
+                    // Right-clicking a row moves the cursor to it, as it does
+                    // in any list; the menu then acts on what is under it.
+                    let select_host = host.clone();
+                    wrapper = wrapper.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                        select_host.push(ItemListEvent::Select { row_ix }.into(), cx);
+                    });
+                    elements.push(row_menu::with_row_menu(wrapper, menu).into_any_element());
+                }
+                None => elements.push(wrapper.into_any_element()),
+            }
         }
 
         div()
@@ -1115,6 +1189,42 @@ mod tests {
         let marking: ItemList<&str, ()> = ItemList::new().with_marking();
         assert_eq!(plain.lead_width(), px(0.));
         assert_eq!(marking.lead_width(), style::size::MARK_GUTTER);
+    }
+
+    #[test]
+    fn a_row_menu_offers_what_the_row_affords_and_the_row_shows_only_some_of_it() {
+        let list: ItemList<&str> = ItemList::new()
+            .with_row_actions(|item: &&str| {
+                vec![
+                    RowAction::new("reverse", "Reverse", |_, _| {}),
+                    RowAction::new("delete", format!("Delete {item}"), |_, _| {}).menu_only(),
+                ]
+            })
+            .with_row_text(|item| item.to_string());
+        assert!(list.has_row_menu());
+        let menu = list.row_menu(&"Works offline").expect("a menu");
+        let labels: Vec<_> = menu
+            .actions
+            .iter()
+            .map(|action| action.label.to_string())
+            .collect();
+        assert_eq!(labels, vec!["Reverse", "Delete Works offline"]);
+        assert_eq!(menu.text.as_deref(), Some("Works offline"));
+        // The row itself shows only the action that is not menu-only.
+        let shown: Vec<_> = menu
+            .actions
+            .iter()
+            .filter(|action| !action.menu_only)
+            .map(|action| action.id.to_string())
+            .collect();
+        assert_eq!(shown, vec!["reverse"]);
+    }
+
+    #[test]
+    fn a_list_that_declares_neither_actions_nor_text_has_no_menu() {
+        let list: ItemList<&str> = ItemList::new();
+        assert!(!list.has_row_menu());
+        assert!(list.row_menu(&"Works offline").is_none());
     }
 
     #[test]

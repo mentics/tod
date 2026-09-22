@@ -1,7 +1,7 @@
 //! One obligation, as a row.
 
 use super::{RowHost, RowOptions, row_group, row_tail};
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::selectable_text_with_menu;
 use crate::ui::style;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -131,9 +131,10 @@ pub fn obligation_row<A: From<ObligationRowEvent> + 'static>(
             obligation.body.clone()
         };
         let edit_host = host.clone();
-        let text = selectable_text(
+        let text = selectable_text_with_menu(
             ("obligation-body", row_ix),
             SharedString::from(body),
+            !opts.menu_hosted,
             window,
             cx,
         )

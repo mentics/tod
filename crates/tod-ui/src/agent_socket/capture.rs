@@ -291,14 +291,15 @@ pub fn send_click(
     logical_y: f32,
     logical_width: u32,
     logical_height: u32,
+    right: bool,
 ) -> Result<(), String> {
     #[cfg(windows)]
     {
-        send_click_windows(logical_x, logical_y, logical_width, logical_height)
+        send_click_windows(logical_x, logical_y, logical_width, logical_height, right)
     }
     #[cfg(not(windows))]
     {
-        let _ = (logical_x, logical_y, logical_width, logical_height);
+        let _ = (logical_x, logical_y, logical_width, logical_height, right);
         Err("click unsupported on this platform".into())
     }
 }
@@ -309,10 +310,12 @@ fn send_click_windows(
     logical_y: f32,
     logical_width: u32,
     logical_height: u32,
+    right: bool,
 ) -> Result<(), String> {
     use windows::Win32::Foundation::WPARAM;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        GetClientRect, SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
     };
 
     let hwnd = main_hwnd().ok_or_else(|| "tod window not found".to_string())?;
@@ -330,12 +333,18 @@ fn send_click_windows(
     let y = (logical_y * scale_y).round() as i32;
     let lp = mouse_lparam(x, y);
     const MK_LBUTTON: usize = 0x0001;
+    const MK_RBUTTON: usize = 0x0002;
+    let (down, up, held) = if right {
+        (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON)
+    } else {
+        (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON)
+    };
 
     unsafe {
         // SendMessage blocks until the window proc handles the message — no sleep needed.
         SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lp);
-        SendMessageW(hwnd, WM_LBUTTONDOWN, WPARAM(MK_LBUTTON), lp);
-        SendMessageW(hwnd, WM_LBUTTONUP, WPARAM(0), lp);
+        SendMessageW(hwnd, down, WPARAM(held), lp);
+        SendMessageW(hwnd, up, WPARAM(0), lp);
     }
     Ok(())
 }

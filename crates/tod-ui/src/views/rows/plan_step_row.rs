@@ -9,7 +9,7 @@ use super::obligation_row::one_line;
 use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
 use crate::ui::item_list::{ColumnSpec, column_cell};
-use crate::ui::selectable_text::selectable_text;
+use crate::ui::selectable_text::selectable_text_with_menu;
 use crate::ui::style;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -100,6 +100,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     // One line, truncated; a wrapped compact row shows all of its text.
     let one_line_text = compact && !opts.wrap;
     let hoverable = opts.hoverable();
+    let menu_hosted = opts.menu_hosted;
     let theme = cx.theme();
     let muted = theme.muted_foreground;
     let divider = muted.opacity(0.5);
@@ -118,9 +119,10 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
             step.body.clone()
         };
         let edit_host = host.clone();
-        let text = selectable_text(
+        let text = selectable_text_with_menu(
             ("plan-step-body", row_ix),
             SharedString::from(text),
+            !menu_hosted,
             window,
             cx,
         )
@@ -266,9 +268,10 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         div()
             .text_xs()
             .text_color(status_color)
-            .child(selectable_text(
+            .child(selectable_text_with_menu(
                 ("plan-step-note", row_ix),
                 SharedString::from(note.clone()),
+                !menu_hosted,
                 window,
                 cx,
             ))

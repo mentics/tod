@@ -148,6 +148,25 @@ Today, in `ui/item_list/`:
   the header row, and the heading offset that keeps a grouping from reading as
   a column. See above.
 - **Scrolling** and the scrollbar, and keeping the cursor in view.
+- **The right-click row menu** (`ui/item_list/row_menu.rs`): the gesture, the
+  anchoring at the pointer, the chrome, and moving the cursor onto the row
+  that was clicked. It is the same `ContextMenuExt` `selectable_text` uses,
+  not a second implementation. A list declares what an item affords
+  (`with_row_actions`) and what its text is (`with_row_text`); it never builds
+  a menu, and one that declares neither has none.
+
+  **The row's own actions come free.** One `Vec<RowAction>` feeds the hover
+  buttons and the menu both, so a list cannot let the two drift apart; an
+  action there is no room to show as a button is `RowAction::menu_only()`.
+  Copy is standard, and copies the drag selection if there is one, else the
+  whole row — the component cannot read a row's text off the row, since `T`
+  is the caller's payload and the rendered row an opaque element, so a list
+  that wants Copy says what its rows say.
+
+  Where the row carries a menu, the row's text gives up its own Copy menu
+  (`RowOptions.menu_hosted`). One right-click hovers both hitboxes, so
+  otherwise two menus open stacked on each other; the row's is the one to
+  keep, because it offers what the row affords as well as Copy.
 
 What it does *not* own yet, and where that work lives instead:
 
@@ -180,7 +199,11 @@ The caller supplies three things:
    an `ItemRowState` (its index, its key, whether it is highlighted, marked or
    being edited, and the list's columns). Item rows render through
    `views/rows/` so the same item looks the same everywhere.
-3. **What the keys mean** — the component reports what the user did as
+3. **What an item affords** — `with_row_actions` returns the item's
+   `RowAction`s, which become both its hover buttons and its menu entries.
+   There is no separate "extra menu entries" hook: an entry that is only in
+   the menu is a `menu_only()` action.
+4. **What the keys mean** — the component reports what the user did as
    `ItemListEvent`s through a `RowHost`, and the view converts them into its
    own action type and carries them out. This is why a conversation's edit can
    route through `ConversationEdit` while the same list outside a conversation
