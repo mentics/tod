@@ -23,10 +23,10 @@ COMMANDS:
     enable  <NODE> <CAP>...
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
-            <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
-            <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
-            <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
-            <NODE> generator --source <TYPE> --config <JSON>
+    set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
+    set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
+    set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
+    set     <NODE> generator --source <TYPE> --config <JSON>
 
 `list` shows the enabled capabilities and each one's settings. `enable` adds
 capabilities with their defaults; generator and lifecycle cannot both be on.

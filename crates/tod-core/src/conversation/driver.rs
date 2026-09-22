@@ -605,6 +605,7 @@ impl ConversationDriver {
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let cold_resume = resume.is_some();
+        check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
             let mut turn_env = self.protocol.turn_env(&env);
@@ -722,6 +723,35 @@ fn join(changes: &str, text: &str) -> String {
     } else {
         format!("{}\n\n# Message\n\n{text}", changes.trim_end())
     }
+}
+
+/// Refuse to send a turn when the `tod-cli` beside the app was built from
+/// different source: the agent would be working from commands that no longer
+/// match what it is told (`cargo run -p tod` rebuilds only `tod`). A match is
+/// remembered; a mismatch is checked again on the next turn, after a rebuild.
+fn check_tod_cli() -> Result<()> {
+    static MATCHED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if MATCHED.get().is_some() {
+        return Ok(());
+    }
+    let cli = crate::interview::tod_cli_path();
+    if !cli.is_file() {
+        // Tests, or no install: nothing the agent could run anyway.
+        return Ok(());
+    }
+    let out = std::process::Command::new(&cli)
+        .arg("--build-stamp")
+        .output()
+        .with_context(|| format!("run {}", cli.display()))?;
+    let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || stamp != crate::CLI_BUILD_STAMP {
+        anyhow::bail!(
+            "{} was built from different source than this app, so the agent              would get commands that do not match its instructions. Rebuild it              (`cargo build -p tod-cli`) and send again.",
+            cli.display()
+        );
+    }
+    let _ = MATCHED.set(());
+    Ok(())
 }
 
 /// `PATH` with the directory holding the installed `tod-cli` first, so the
