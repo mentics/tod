@@ -18,7 +18,6 @@ use crate::fleet::projection::FleetProjection;
 use crate::fleet::reattach;
 use crate::fleet::repos::agent_run::{AgentRun, AgentRunRepo, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::agent_session::{AgentSession, AgentSessionRepo};
-use crate::fleet::repos::node_files::NodeFilesRepo;
 use crate::fleet::repos::shell::{ShellRepo, ShellSession};
 use crate::fleet::repos::task::{FleetTask, TaskRepo};
 use crate::fleet::runtime::{GuestLivenessCheck, NoopGuestLiveness};
@@ -358,39 +357,8 @@ impl FleetStore {
         cap: Capability,
     ) -> Result<Option<String>> {
         let guard = self.projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        match cap {
-            Capability::Agent => {
-                let live = AgentRunRepo::new(&conn).list_live_for_node(node_id)?;
-                if live.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some(format!(
-                    "{} agent(s) on this task are still running. Stop them before disabling Agent.",
-                    live.len()
-                )))
-            }
-            Capability::Files => {
-                let shells = ShellRepo::new(&conn).list_for_node(node_id)?;
-                if !shells.is_empty() {
-                    return Ok(Some(format!(
-                        "{} shell(s) on this task are still open. Close them before disabling Files.",
-                        shells.len()
-                    )));
-                }
-                let has_worktree = NodeFilesRepo::new(&conn)
-                    .get(node_id)?
-                    .is_some_and(|files| files.worktree_path().is_some());
-                if has_worktree {
-                    return Ok(Some(
-                        "This task has a set-up worktree. Release the worktree before disabling Files."
-                            .into(),
-                    ));
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
+        let node_id = uuid::Uuid::parse_str(node_id)?;
+        crate::outline::repos::NodeRepo::new(&guard.connection()).disable_blocker(node_id, cap)
     }
 
     /// Why the worktree set up for `owner_node_id`'s Files can't be released yet:
@@ -713,16 +681,6 @@ impl FleetStore {
     }
 
     /// Build JSON archive payload before disabling a capability.
-    pub fn build_capability_disable_payload(
-        &self,
-        node_id: uuid::Uuid,
-        cap: Capability,
-    ) -> Result<String> {
-        let guard = self.projection.lock().expect("fleet projection mutex");
-        crate::outline::archive::build_capability_disable_payload(&guard.connection(), node_id, cap)
-            .map_err(Into::into)
-    }
-
     /// Enqueue an outline mutation.
     pub fn enqueue_outline(&self, mutation: OutlineMutation) -> Result<(), FleetWriterError> {
         self.enqueue(FleetMutation::Outline(mutation))

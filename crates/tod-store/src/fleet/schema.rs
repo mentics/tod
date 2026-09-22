@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 55;
+pub const CURRENT_USER_VERSION: i32 = 56;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -360,6 +360,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
     if version < 55 {
         conn.execute_batch(crate::learn::CREATE_LEARN_TABLES)?;
         conn.pragma_update(None, "user_version", 55)?;
+    }
+    if version < 56 {
+        migrate_v55_to_v56(conn)?;
+        conn.pragma_update(None, "user_version", 56)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -951,6 +955,54 @@ fn migrate_v50_to_v51(conn: &Connection) -> Result<()> {
             ON conversation_actions(entity_id);
         ",
     )?;
+    tx.commit()?;
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+    Ok(())
+}
+
+/// Conversation actions and flags may be about a node's capabilities
+/// (`entity = 'capabilities'`). Widening a CHECK means a rebuild; each table
+/// is recreated from its own stored definition with only the entity list
+/// changed, and its rows (ids included) copied across.
+fn migrate_v55_to_v56(conn: &Connection) -> Result<()> {
+    const OLD: &str = "'node','obligation','plan_step')";
+    const NEW: &str = "'node','obligation','plan_step','capabilities')";
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    for table in ["conversation_actions", "conversation_flags"] {
+        let Some(sql) = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        if !sql.contains(OLD) {
+            continue;
+        }
+        let indexes: Vec<(String, String)> = tx
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+            )?
+            .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let old = format!("{table}_v55");
+        for (name, _) in &indexes {
+            tx.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))?;
+        }
+        tx.execute_batch("PRAGMA legacy_alter_table = ON;")?;
+        tx.execute_batch(&format!("ALTER TABLE {table} RENAME TO {old};"))?;
+        tx.execute_batch("PRAGMA legacy_alter_table = OFF;")?;
+        tx.execute_batch(&sql.replace(OLD, NEW))?;
+        tx.execute_batch(&format!("INSERT INTO {table} SELECT * FROM {old}; DROP TABLE {old};"))?;
+        for (_, index) in &indexes {
+            tx.execute_batch(index)?;
+        }
+    }
     tx.commit()?;
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     Ok(())

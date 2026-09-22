@@ -25,6 +25,7 @@ use gpui_kit_assets::IconName;
 use std::collections::HashMap;
 use tod_store::conversation::{
     Entity as ItemEntity, EntitySnapshot, Focus, NetChange, NetOp, ReverseOutcome,
+    capabilities_changes,
 };
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::HandoffReason;
@@ -63,7 +64,19 @@ pub(crate) fn focus_of(change: &NetChange) -> Option<Focus> {
             node,
             id: change.id,
         },
+        ItemEntity::Capabilities => Focus::Node(change.id),
     })
+}
+
+/// A capabilities row's text: what changed, e.g. "Capabilities: enabled
+/// Lifecycle; disabled Spec, removing 3 obligation(s)".
+pub(crate) fn capabilities_title(change: &NetChange) -> String {
+    let changes = capabilities_changes(change.before.as_ref(), change.current.as_ref());
+    if changes.is_empty() {
+        "Capabilities".to_string()
+    } else {
+        format!("Capabilities: {}", changes.join("; "))
+    }
 }
 
 /// The change-set filter's toggles: a change flagged as unsure, and one that
@@ -499,6 +512,8 @@ impl ConversationView {
                 step_id: id,
                 body: text,
             },
+            // Changed from the node's capability settings, not edited here.
+            ItemEntity::Capabilities => return,
         };
         if self
             .command(InterviewCommand::ConversationEdit {
@@ -742,7 +757,10 @@ impl ConversationView {
             })
             .icon(icon)
         };
-        if change.current.is_some() && change.op != NetOp::Reversed {
+        if change.current.is_some()
+            && change.op != NetOp::Reversed
+            && change.entity != ItemEntity::Capabilities
+        {
             actions.push(action(
                 "edit",
                 "Edit",
@@ -808,10 +826,28 @@ impl ConversationView {
                 node_row(
                     NodeRowProps {
                         node_id: change.id,
-                        title,
+                        title: &title,
                         row_ix: ix,
                         highlighted,
                         editor,
+                        editable: true,
+                    },
+                    &host,
+                    opts,
+                    window,
+                    cx,
+                )
+            }
+            ItemEntity::Capabilities => {
+                let title = capabilities_title(&change);
+                node_row(
+                    NodeRowProps {
+                        node_id: change.id,
+                        title: &title,
+                        row_ix: ix,
+                        highlighted,
+                        editor: None,
+                        editable: false,
                     },
                     &host,
                     opts,

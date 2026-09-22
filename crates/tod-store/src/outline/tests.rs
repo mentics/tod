@@ -1313,7 +1313,6 @@ fn disabling_generator_deletes_managed_children_and_config() {
         .enqueue_outline(OutlineMutation::DisableCapability {
             node_id: generator_id,
             capability: Capability::Generator,
-            archive_payload: "{}".into(),
         })
         .unwrap();
     store.writer().flush().unwrap();
@@ -1403,7 +1402,6 @@ fn re_enabling_generator_after_disable_starts_with_no_config() {
         .enqueue_outline(OutlineMutation::DisableCapability {
             node_id: generator_id,
             capability: Capability::Generator,
-            archive_payload: "{}".into(),
         })
         .unwrap();
     store.writer().flush().unwrap();
@@ -1989,6 +1987,58 @@ fn paste_managed_node_copy_blocked_inside_generator_subtree() {
             "paste inside a generator subtree must be rejected"
         );
     }
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn restoring_a_disabled_generator_brings_back_its_managed_tree() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, parent_id, child_id) = setup_generator_with_managed_tree(&store, list_id);
+
+    store
+        .enqueue_outline(OutlineMutation::DisableCapability {
+            node_id: generator_id,
+            capability: Capability::Generator,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    let archive_id: Uuid = store
+        .read(|conn| {
+            assert!(crate::outline::repos::NodeRepo::new(conn).get(child_id)?.is_none());
+            let id: Vec<u8> = conn.query_row(
+                "SELECT id FROM capability_archives WHERE node_id = ?1",
+                [generator_id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )?;
+            Ok(Uuid::from_slice(&id)?)
+        })
+        .unwrap();
+
+    store
+        .enqueue_outline(OutlineMutation::RestoreCapability {
+            node_id: generator_id,
+            capability: Capability::Generator,
+            archive_id,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let nodes = crate::outline::repos::NodeRepo::new(conn);
+            let generators = crate::outline::repos::GeneratorRepo::new(conn);
+            assert!(nodes.list_capabilities(generator_id)?.contains(&Capability::Generator));
+            assert_eq!(generators.get_config(generator_id)?.unwrap().data_source_type, "mock");
+            assert!(nodes.get(child_id)?.is_some() && nodes.get(parent_id)?.is_some());
+            assert_eq!(generators.get_link(child_id)?.unwrap().external_id, "EXT-2");
+            let archives: i64 =
+                conn.query_row("SELECT COUNT(*) FROM capability_archives", [], |row| row.get(0))?;
+            assert_eq!(archives, 0);
+            Ok(())
+        })
+        .unwrap();
 
     drop(store);
     let _ = fs::remove_dir_all(root);

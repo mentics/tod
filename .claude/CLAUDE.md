@@ -232,7 +232,12 @@ transaction** (only inside `run_interview`, never the batched flush).
 `net_changes` projects the change set (net per item, never by turn; created then
 deleted is hidden), `reverse_actions` applies inverse mutations and reports
 conflicts and dependents for confirmation, and user edits from the view go
-through `ConversationEdit`. Content and lifecycle mutations are not recorded.
+through `ConversationEdit`. Capability changes (enable, disable, each
+capability's settings) are recorded too, as one `capabilities` item per node;
+a disable archives every row it removes (`outline::archive`, following
+`ON DELETE CASCADE` from the schema) so reversing it restores them. Content and
+lifecycle mutations are not recorded, and nothing sets a lifecycle state
+except the lifecycle process.
 
 **Protocols.** A conversation's `protocol` (schema v39) decides what kind of
 conversation it is: the context recipe, the working directory, the turn

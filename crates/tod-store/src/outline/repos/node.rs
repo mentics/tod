@@ -366,12 +366,57 @@ impl<'a> NodeRepo<'a> {
             .map(|(body, stale)| NodeSummary { body, stale }))
     }
 
-    pub fn disable_capability_archive(
-        &self,
-        node_id: Uuid,
-        cap: Capability,
-        payload: &str,
-    ) -> Result<()> {
+    /// Why `cap` can't be disabled on `node_id` right now, if it can't:
+    /// something is still running off it.
+    pub fn disable_blocker(&self, node_id: Uuid, cap: Capability) -> Result<Option<String>> {
+        use crate::fleet::repos::agent_run::AgentRunRepo;
+        use crate::fleet::repos::node_files::NodeFilesRepo;
+        use crate::fleet::repos::shell::ShellRepo;
+        let id = node_id.to_string();
+        Ok(match cap {
+            Capability::Agent => {
+                let live = AgentRunRepo::new(self.conn).list_live_for_node(&id)?;
+                (!live.is_empty()).then(|| {
+                    format!(
+                        "{} agent(s) on this task are still running. Stop them before disabling Agent.",
+                        live.len()
+                    )
+                })
+            }
+            Capability::Files => {
+                let shells = ShellRepo::new(self.conn).list_for_node(&id)?;
+                if !shells.is_empty() {
+                    Some(format!(
+                        "{} shell(s) on this task are still open. Close them before disabling Files.",
+                        shells.len()
+                    ))
+                } else if NodeFilesRepo::new(self.conn)
+                    .get(&id)?
+                    .is_some_and(|files| files.worktree_path().is_some())
+                {
+                    Some(
+                        "This task has a set-up worktree. Release the worktree before disabling Files."
+                            .into(),
+                    )
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// Disable `cap`, keeping everything it removes in a capability archive
+    /// ([`crate::outline::archive::restore_capability`] puts it back).
+    /// Returns the archive id; `None` when `cap` was not enabled.
+    pub fn disable_capability_archive(&self, node_id: Uuid, cap: Capability) -> Result<Option<Uuid>> {
+        if !self.list_capabilities(node_id)?.contains(&cap) {
+            return Ok(None);
+        }
+        if let Some(reason) = self.disable_blocker(node_id, cap)? {
+            bail!("{reason}");
+        }
+        let archive = crate::outline::archive::build_capability_archive(self.conn, node_id, cap)?;
         let archive_id = Uuid::new_v4();
         self.conn.execute(
             "INSERT INTO capability_archives (id, node_id, capability, archived_at, payload)
@@ -381,7 +426,7 @@ impl<'a> NodeRepo<'a> {
                 uuid_to_blob(node_id),
                 cap.as_str(),
                 now_ms(),
-                payload
+                serde_json::to_string(&archive)?
             ],
         )?;
         self.delete_capability_data(node_id, cap)?;
@@ -389,7 +434,7 @@ impl<'a> NodeRepo<'a> {
             "DELETE FROM node_capabilities WHERE node_id = ?1 AND capability = ?2",
             params![uuid_to_blob(node_id), cap.as_str()],
         )?;
-        Ok(())
+        Ok(Some(archive_id))
     }
 
     fn delete_capability_data(&self, node_id: Uuid, cap: Capability) -> Result<()> {

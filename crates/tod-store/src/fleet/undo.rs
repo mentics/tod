@@ -398,6 +398,11 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         OutlineMutation::DeleteNode { .. } => Ok(None),
         OutlineMutation::CreateList { .. }
         | OutlineMutation::DisableCapability { .. }
+        | OutlineMutation::RestoreCapability { .. }
+        | OutlineMutation::SetNodeAgent { .. }
+        | OutlineMutation::SetNodeFiles { .. }
+        | OutlineMutation::SetNodeTicket { .. }
+        | OutlineMutation::SetNodeTags { .. }
         | OutlineMutation::EnableCapabilities { .. }
         | OutlineMutation::CreateObligation { .. }
         | OutlineMutation::RestoreObligation { .. }

@@ -61,10 +61,44 @@ pub enum OutlineMutation {
         node_id: Uuid,
         capabilities: Vec<Capability>,
     },
+    /// Disable a capability, archiving everything it removes; the archive
+    /// id is returned for [`OutlineMutation::RestoreCapability`]. Refused
+    /// while something still runs off it (a live agent, an open shell).
     DisableCapability {
         node_id: Uuid,
         capability: Capability,
-        archive_payload: String,
+    },
+    /// Undo a [`OutlineMutation::DisableCapability`]: put back what its
+    /// archive kept and enable the capability again.
+    RestoreCapability {
+        node_id: Uuid,
+        capability: Capability,
+        archive_id: Uuid,
+    },
+    /// The Agent capability's settings; `None` follows the launch role's.
+    SetNodeAgent {
+        node_id: Uuid,
+        platform: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// The Files capability's settings.
+    SetNodeFiles {
+        node_id: Uuid,
+        repo: Option<String>,
+        branch: Option<String>,
+        use_worktree: bool,
+    },
+    /// The Ticket capability's linked issues and pull requests.
+    SetNodeTicket {
+        node_id: Uuid,
+        linked_issues: Vec<String>,
+        linked_prs: Vec<String>,
+    },
+    /// The Tags capability's tags.
+    SetNodeTags {
+        node_id: Uuid,
+        tags: Vec<String>,
     },
     CreateObligation {
         obligation_id: Option<Uuid>,
@@ -348,6 +382,11 @@ impl OutlineMutation {
             OutlineMutation::CreateList { .. }
                 | OutlineMutation::CreateNode { .. }
                 | OutlineMutation::DisableCapability { .. }
+                | OutlineMutation::RestoreCapability { .. }
+                | OutlineMutation::SetNodeAgent { .. }
+                | OutlineMutation::SetNodeFiles { .. }
+                | OutlineMutation::SetNodeTicket { .. }
+                | OutlineMutation::SetNodeTags { .. }
                 | OutlineMutation::UpdateNodeTitle { .. }
                 | OutlineMutation::ReorderSibling { .. }
                 | OutlineMutation::ReparentNode { .. }
@@ -458,13 +497,65 @@ impl OutlineMutation {
             OutlineMutation::DisableCapability {
                 node_id,
                 capability,
-                archive_payload,
             } => {
-                NodeRepo::new(conn).disable_capability_archive(
-                    *node_id,
-                    *capability,
-                    archive_payload,
+                return NodeRepo::new(conn).disable_capability_archive(*node_id, *capability);
+            }
+            OutlineMutation::RestoreCapability {
+                node_id,
+                capability,
+                archive_id,
+            } => {
+                let (restored_node, restored) =
+                    crate::outline::archive::restore_capability(conn, *archive_id)?;
+                if (restored_node, restored) != (*node_id, *capability) {
+                    anyhow::bail!("archive {archive_id} is not {} on {node_id}", capability.label());
+                }
+            }
+            OutlineMutation::SetNodeAgent {
+                node_id,
+                platform,
+                model,
+                effort,
+            } => {
+                require_capability(conn, *node_id, Capability::Agent)?;
+                crate::fleet::repos::node_agent::NodeAgentRepo::new(conn).upsert(
+                    &node_id.to_string(),
+                    platform.as_deref(),
+                    model.as_deref(),
+                    effort.as_deref(),
                 )?;
+            }
+            OutlineMutation::SetNodeFiles {
+                node_id,
+                repo,
+                branch,
+                use_worktree,
+            } => {
+                require_capability(conn, *node_id, Capability::Files)?;
+                let id = node_id.to_string();
+                let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
+                tasks.update_repo(&id, repo.as_deref())?;
+                tasks.update_branch(&id, branch.as_deref())?;
+                crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
+                    .set_use_worktree(&id, *use_worktree)?;
+            }
+            OutlineMutation::SetNodeTicket {
+                node_id,
+                linked_issues,
+                linked_prs,
+            } => {
+                require_capability(conn, *node_id, Capability::Ticket)?;
+                let id = node_id.to_string();
+                let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
+                tasks.update_linked_issues(&id, linked_issues)?;
+                tasks.update_linked_prs(&id, linked_prs)?;
+            }
+            OutlineMutation::SetNodeTags { node_id, tags } => {
+                guard_not_managed(conn, *node_id)?;
+                require_capability(conn, *node_id, Capability::Tags)?;
+                crate::fleet::repos::task::TaskRepo::new(conn)
+                    .update_tags(&node_id.to_string(), tags)?;
+                GeneratorRepo::new(conn).mark_field_modified(*node_id, "tags")?;
             }
             OutlineMutation::CreateObligation {
                 obligation_id,
@@ -709,6 +800,7 @@ impl OutlineMutation {
                 data_source_type,
                 config_json,
             } => {
+                require_capability(conn, *node_id, Capability::Generator)?;
                 GeneratorRepo::new(conn).set_config(*node_id, data_source_type, config_json)?;
             }
             OutlineMutation::DeleteGeneratorConfig { node_id } => {
@@ -818,6 +910,14 @@ impl OutlineMutation {
 
 /// Guard: reject if the target parent is inside a generator subtree.
 /// Only generator refresh mutations (CreateManagedNode) may add children there.
+/// Refuse to configure a capability the node does not have.
+fn require_capability(conn: &Connection, node_id: Uuid, cap: Capability) -> Result<()> {
+    if !NodeRepo::new(conn).list_capabilities(node_id)?.contains(&cap) {
+        anyhow::bail!("{} is not enabled on node {node_id}", cap.label());
+    }
+    Ok(())
+}
+
 fn guard_not_in_generator_subtree(conn: &Connection, parent_id: Option<Uuid>) -> Result<()> {
     if let Some(pid) = parent_id {
         if GeneratorRepo::new(conn).is_in_generator_subtree(pid)? {

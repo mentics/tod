@@ -23,6 +23,7 @@ pub(crate) fn nouns() -> Vec<(&'static str, &'static str)> {
         ("questions", crate::interview::QUESTIONS_USAGE),
         ("memory", crate::interview::MEMORY_USAGE),
         ("interview", crate::interview::INTERVIEW_USAGE),
+        ("capabilities", crate::capabilities::USAGE),
         ("changeset", crate::changeset::USAGE),
         ("tests", crate::test_runs::USAGE),
         ("review", crate::review::USAGE),

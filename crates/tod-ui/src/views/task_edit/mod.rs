@@ -2815,20 +2815,11 @@ impl TaskEditView {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
-        let archive_payload = match self.fleet.build_capability_disable_payload(node_id, cap) {
-            Ok(payload) => payload,
-            Err(err) => {
-                self.pending_toast = Some(format!("Failed to archive {} data: {err}", cap.label()));
-                cx.notify();
-                return;
-            }
-        };
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::DisableCapability {
                 node_id,
                 capability: cap,
-                archive_payload,
             })
         {
             self.pending_toast = Some(format!("Failed to disable {}: {err}", cap.label()));

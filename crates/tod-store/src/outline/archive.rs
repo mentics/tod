@@ -1,6 +1,7 @@
 //! Archive snapshots for subtree delete / restore.
 
 use crate::outline::repos::{NodeRepo, OutlineRepo};
+use crate::outline::row_archive::{self, TableRows};
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
@@ -473,91 +474,193 @@ fn restore_plan_step_edges(conn: &Connection, archived: &ArchivedNode) -> Result
     Ok(())
 }
 
-/// JSON snapshot of capability-owned data before disable (for undo archives).
-pub fn build_capability_disable_payload(
+/// Current capability archive format: whole rows (see `row_archive`).
+const CAPABILITY_ARCHIVE_VERSION: u32 = 2;
+
+/// Everything disabling a capability removes from a node, kept so that
+/// [`restore_capability`] can put it all back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityArchive {
+    /// Absent (0) in archives written before capabilities could be restored.
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub rows: Vec<TableRows>,
+    /// Files: `node_fields.repo` / `branch`, which disable clears in place.
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Ticket: `node_fields.linked_issues` / `linked_prs` (JSON arrays).
+    #[serde(default)]
+    pub linked_issues: Option<String>,
+    #[serde(default)]
+    pub linked_prs: Option<String>,
+}
+
+/// Rows of `table` whose `column` is one of `keys`, followed by every row
+/// that deleting them would cascade to, parents before children.
+fn collect_cascade(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    keys: &[rusqlite::types::Value],
+    seen: &mut Vec<(String, String)>,
+    out: &mut Vec<TableRows>,
+) -> Result<()> {
+    let visit = (table.to_string(), column.to_string());
+    if seen.contains(&visit) || keys.is_empty() {
+        return Ok(());
+    }
+    seen.push(visit);
+    let rows = row_archive::collect(conn, table, column, keys)?;
+    if rows.rows.is_empty() {
+        return Ok(());
+    }
+    let children = row_archive::referencing_table(conn, table)?;
+    out.push(rows.clone());
+    for (child, child_col, parent_col) in children {
+        let parent_keys = row_archive::keys(&rows, &parent_col)?;
+        collect_cascade(conn, &child, &child_col, &parent_keys, seen, out)?;
+    }
+    Ok(())
+}
+
+/// Snapshot what disabling `cap` on `node_id` will remove. Run in the same
+/// transaction as the disable.
+pub fn build_capability_archive(
     conn: &Connection,
     node_id: Uuid,
     cap: Capability,
-) -> Result<String> {
-    let payload = match cap {
+) -> Result<CapabilityArchive> {
+    let node = vec![rusqlite::types::Value::Blob(uuid_to_blob(node_id))];
+    let mut rows = Vec::new();
+    let mut seen = Vec::new();
+    let mut archive = CapabilityArchive {
+        version: CAPABILITY_ARCHIVE_VERSION,
+        rows: Vec::new(),
+        repo: None,
+        branch: None,
+        linked_issues: None,
+        linked_prs: None,
+    };
+    let fields = snapshot_fields(conn, node_id)?;
+    match cap {
         Capability::Spec => {
-            let obligations = snapshot_obligations(conn, node_id)?;
-            serde_json::json!({ "obligations": obligations })
+            for table in [
+                "node_obligations",
+                "node_extra_content",
+                "interview_transcripts",
+                "node_media_links",
+            ] {
+                collect_cascade(conn, table, "node_id", &node, &mut seen, &mut rows)?;
+            }
         }
-        Capability::Lifecycle => {
-            let state: Option<String> = conn
-                .query_row(
-                    "SELECT state FROM node_lifecycle WHERE node_id = ?1",
-                    params![uuid_to_blob(node_id)],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            serde_json::json!({ "lifecycle": state })
-        }
-        Capability::Agent => {
-            serde_json::json!({ "agent": snapshot_node_agent(conn, node_id)? })
-        }
+        Capability::Lifecycle => collect_cascade(conn, "node_lifecycle", "node_id", &node, &mut seen, &mut rows)?,
+        Capability::Agent => collect_cascade(conn, "node_agent", "node_id", &node, &mut seen, &mut rows)?,
         Capability::Files => {
-            let fields = snapshot_fields(conn, node_id)?;
-            serde_json::json!({
-                "repo": fields.as_ref().and_then(|f| f.repo.clone()),
-                "branch": fields.as_ref().and_then(|f| f.branch.clone()),
-                "files": snapshot_node_files(conn, node_id)?,
-            })
+            collect_cascade(conn, "node_files", "node_id", &node, &mut seen, &mut rows)?;
+            archive.repo = fields.as_ref().and_then(|f| f.repo.clone());
+            archive.branch = fields.as_ref().and_then(|f| f.branch.clone());
         }
         Capability::Ticket => {
-            let fields = snapshot_fields(conn, node_id)?;
-            serde_json::json!({
-                "linked_issues": fields.as_ref().map(|f| f.linked_issues.clone()),
-                "linked_prs": fields.as_ref().map(|f| f.linked_prs.clone()),
-            })
+            archive.linked_issues = fields.as_ref().map(|f| f.linked_issues.clone());
+            archive.linked_prs = fields.as_ref().map(|f| f.linked_prs.clone());
         }
-        Capability::Tags => {
-            let tags = conn
-                .query_row(
-                    "SELECT tags, updated_at FROM node_tags WHERE node_id = ?1",
-                    params![uuid_to_blob(node_id)],
-                    |row| {
-                        Ok(ArchivedTags {
-                            tags: row.get(0)?,
-                            updated_at: row.get(1)?,
-                        })
-                    },
-                )
-                .optional()?;
-            serde_json::json!({ "tags": tags })
-        }
+        Capability::Tags => collect_cascade(conn, "node_tags", "node_id", &node, &mut seen, &mut rows)?,
         Capability::Generator => {
-            // Generator config archival will be implemented with the generator schema tables.
-            serde_json::json!({ "generator": {} })
+            collect_cascade(conn, "node_generator_config", "node_id", &node, &mut seen, &mut rows)?;
+            // Managed children, with everything hanging off them.
+            let managed: Vec<_> = crate::outline::repos::GeneratorRepo::new(conn)
+                .managed_descendants(node_id)?
+                .into_iter()
+                .map(|id| rusqlite::types::Value::Blob(uuid_to_blob(id)))
+                .collect();
+            collect_cascade(conn, "nodes", "id", &managed, &mut seen, &mut rows)?;
+            // Links on nodes copied out of this generator.
+            collect_cascade(
+                conn,
+                "managed_node_links",
+                "generator_node_id",
+                &node,
+                &mut seen,
+                &mut rows,
+            )?;
         }
-    };
-    serde_json::to_string(&payload).context("serialize capability archive")
+    }
+    archive.rows = rows;
+    Ok(archive)
 }
 
-fn snapshot_obligations(conn: &Connection, node_id: Uuid) -> Result<Vec<ArchivedObligation>> {
-    let mut obligations = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT id, kind, ordinal, section, body, phase, created_at, updated_at
-         FROM node_obligations WHERE node_id = ?1 ORDER BY kind, ordinal",
-    )?;
-    let rows = stmt.query_map(params![uuid_to_blob(node_id)], |row| {
-        let id_blob: Vec<u8> = row.get(0)?;
-        Ok(ArchivedObligation {
-            id: blob_to_uuid_sql(&id_blob)?,
-            kind: row.get(1)?,
-            ordinal: row.get(2)?,
-            section: row.get(3)?,
-            body: row.get(4)?,
-            phase: row.get(5)?,
-            created_at: row.get(6)?,
-            updated_at: row.get(7)?,
-        })
-    })?;
-    for row in rows {
-        obligations.push(row?);
+/// Put back what a disable archived and enable the capability again.
+/// Returns the node and capability. Removes the archive row on success.
+pub fn restore_capability(conn: &Connection, archive_id: Uuid) -> Result<(Uuid, Capability)> {
+    let (node_blob, cap, payload): (Vec<u8>, String, String) = conn
+        .query_row(
+            "SELECT node_id, capability, payload FROM capability_archives WHERE id = ?1",
+            params![uuid_to_blob(archive_id)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .with_context(|| format!("capability archive {archive_id} not found"))?;
+    let node_id = blob_to_uuid_sql(&node_blob)?;
+    let cap = Capability::parse(&cap)
+        .with_context(|| format!("archive {archive_id} names unknown capability `{cap}`"))?;
+    let archive: CapabilityArchive =
+        serde_json::from_str(&payload).context("deserialize capability archive")?;
+    if archive.version < CAPABILITY_ARCHIVE_VERSION {
+        anyhow::bail!(
+            "{} was disabled before disabling could be reversed; its data was not fully kept",
+            cap.label()
+        );
     }
-    Ok(obligations)
+    let nodes = NodeRepo::new(conn);
+    let enabled = nodes.list_capabilities(node_id)?;
+    for excluded in cap.mutually_exclusive() {
+        if enabled.contains(excluded) {
+            anyhow::bail!(
+                "Cannot restore {} while {} is enabled",
+                cap.label(),
+                excluded.label()
+            );
+        }
+    }
+    row_archive::restore(conn, &archive.rows)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO node_capabilities (node_id, capability, enabled_at) VALUES (?1, ?2, ?3)",
+        params![uuid_to_blob(node_id), cap.as_str(), now_ms()],
+    )?;
+    match cap {
+        Capability::Files => {
+            conn.execute(
+                "UPDATE node_fields SET repo = ?2, branch = ?3, updated_at = ?4 WHERE node_id = ?1",
+                params![uuid_to_blob(node_id), archive.repo, archive.branch, now_ms()],
+            )?;
+        }
+        Capability::Ticket => {
+            conn.execute(
+                "UPDATE node_fields SET linked_issues = COALESCE(?2, linked_issues),
+                     linked_prs = COALESCE(?3, linked_prs), updated_at = ?4
+                 WHERE node_id = ?1",
+                params![
+                    uuid_to_blob(node_id),
+                    archive.linked_issues,
+                    archive.linked_prs,
+                    now_ms()
+                ],
+            )?;
+        }
+        // Its config and children came back with the rows; enabling again
+        // would refuse a node that has children.
+        Capability::Generator => {}
+        // A capability whose own row was never there gets its defaults.
+        _ => nodes.enable_capability(node_id, cap)?,
+    }
+    conn.execute(
+        "DELETE FROM capability_archives WHERE id = ?1",
+        params![uuid_to_blob(archive_id)],
+    )?;
+    Ok((node_id, cap))
 }
 
 fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {

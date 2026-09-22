@@ -2,7 +2,7 @@
 
 use super::SOURCE_CONVERSATION;
 use super::repo::ConversationRepo;
-use super::types::{ActionActor, ActionKind, Entity, EntitySnapshot};
+use super::types::{ActionActor, ActionKind, CapabilitySettings, Entity, EntitySnapshot};
 use crate::outline::OutlineMutation;
 use crate::outline::repos::{NodeRepo, ObligationRepo, OutlineRepo, PlanStepRepo};
 use crate::outline::uuid_blob::{now_ms, uuid_to_blob};
@@ -69,12 +69,56 @@ pub fn snapshot(conn: &Connection, entity: Entity, id: Uuid) -> Result<Option<En
                 satisfies,
             })
         }
+        Entity::Capabilities => capabilities_snapshot(conn, id)?,
     })
 }
 
+/// A node's capabilities and their settings; `None` when the node is gone.
+fn capabilities_snapshot(conn: &Connection, node_id: Uuid) -> Result<Option<EntitySnapshot>> {
+    use crate::fleet::repos::{node_agent::NodeAgentRepo, node_files::NodeFilesRepo, task::TaskRepo};
+    use crate::outline::Capability;
+    use crate::outline::repos::GeneratorRepo;
+    if NodeRepo::new(conn).get(node_id)?.is_none() {
+        return Ok(None);
+    }
+    let have = NodeRepo::new(conn).list_capabilities(node_id)?;
+    let enabled: Vec<Capability> = Capability::ALL
+        .into_iter()
+        .filter(|c| have.contains(c))
+        .collect();
+    let id = node_id.to_string();
+    let mut settings = CapabilitySettings::default();
+    if let Some(agent) = NodeAgentRepo::new(conn).get(&id)? {
+        settings.agent_platform = agent.platform;
+        settings.agent_model = agent.model;
+        settings.agent_effort = agent.effort;
+    }
+    if let Some(task) = TaskRepo::new(conn).get(&id)? {
+        settings.repo = task.repo;
+        settings.branch = task.branch;
+        settings.tags = task.tags;
+        settings.linked_issues = task.linked_issues;
+        settings.linked_prs = task.linked_prs;
+    }
+    settings.use_worktree = NodeFilesRepo::new(conn)
+        .get(&id)?
+        .is_some_and(|f| f.use_worktree);
+    let generators = GeneratorRepo::new(conn);
+    settings.generator = generators
+        .get_config(node_id)?
+        .map(|c| (c.data_source_type, c.config_json));
+    settings.managed_nodes = generators.managed_descendants(node_id)?.len();
+    settings.obligations = ObligationRepo::new(conn).list_for_node(node_id)?.len();
+    Ok(Some(EntitySnapshot::Capabilities {
+        node_id,
+        enabled,
+        settings,
+    }))
+}
+
 /// The action a mutation records as, and the item it acts on. `None` for
-/// mutations a conversation does not record (content, lifecycle, generator,
-/// restore, …; D11). Call on a [`normalize`]d mutation: a create without an
+/// mutations a conversation does not record (content, lifecycle, managed
+/// generator nodes, restore, …; D11). Call on a [`normalize`]d mutation: a create without an
 /// id has no item yet and is not recorded.
 pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)> {
     use ActionKind::*;
@@ -111,13 +155,20 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         M::PlacePlanStep { id, .. } => (Move, Entity::PlanStep, *id),
 
         M::DeleteNode { node_id } => (Delete, Entity::Node, *node_id),
+
+        M::EnableCapabilities { node_id, .. }
+        | M::DisableCapability { node_id, .. }
+        | M::RestoreCapability { node_id, .. }
+        | M::SetNodeAgent { node_id, .. }
+        | M::SetNodeFiles { node_id, .. }
+        | M::SetNodeTicket { node_id, .. }
+        | M::SetNodeTags { node_id, .. }
+        | M::SetGeneratorConfig { node_id, .. } => (Edit, Entity::Capabilities, *node_id),
         M::DeleteObligation { obligation_id } => (Delete, Entity::Obligation, *obligation_id),
         M::DeletePlanStep { step_id } => (Delete, Entity::PlanStep, *step_id),
 
         M::CreateList { .. }
         | M::SetNodeCollapsed { .. }
-        | M::EnableCapabilities { .. }
-        | M::DisableCapability { .. }
         | M::RenameObligationSection { .. }
         | M::RestoreObligation { .. }
         | M::RestoreNodeSubtree { .. }
@@ -126,7 +177,6 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::SetExtraContent { .. }
         | M::SetLifecycle { .. }
         | M::ApplyGateResults { .. }
-        | M::SetGeneratorConfig { .. }
         | M::DeleteGeneratorConfig { .. }
         | M::CreateManagedNode { .. }
         | M::UpdateManagedNode { .. }
@@ -299,7 +349,9 @@ pub(super) fn apply_recorded(
     let before = snapshot(conn, rec.entity, rec.entity_id)?;
     let archive_id = mutation.execute(conn, media_root)?;
     let after = snapshot(conn, rec.entity, rec.entity_id)?;
-    let unchanged = if rec.conversation_id.is_some() {
+    // Enabling what is already enabled, or setting what is already set,
+    // changed nothing a conversation could show or reverse.
+    let unchanged = if rec.conversation_id.is_some() && rec.entity != Entity::Capabilities {
         before.is_none() && after.is_none()
     } else {
         before == after

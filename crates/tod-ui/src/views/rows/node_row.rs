@@ -31,6 +31,9 @@ pub struct NodeRowProps<'a> {
     pub highlighted: bool,
     /// The inline editor, when this row is being edited.
     pub editor: Option<&'a Entity<TextareaState>>,
+    /// Double-clicking the title starts editing it. Off for a row that is
+    /// about the node's capabilities rather than its title.
+    pub editable: bool,
 }
 
 /// Render one node as a one-line row: the short id, then the title. Nodes
@@ -48,6 +51,7 @@ pub fn node_row<A: From<NodeRowEvent> + 'static>(
         row_ix,
         highlighted,
         editor,
+        editable,
     } = props;
     let key = node_id.to_string();
     let group = row_group(&key);
@@ -103,7 +107,7 @@ pub fn node_row<A: From<NodeRowEvent> + 'static>(
                 .min_w_0()
                 .when(!wrap, |el| el.overflow_hidden())
                 .when(opts.struck, |el| el.line_through())
-                .when(highlighted, |el| {
+                .when(highlighted && editable, |el| {
                     el.on_mouse_down(MouseButton::Left, move |event, _, cx| {
                         if event.click_count >= 2 {
                             edit_host.push(NodeRowEvent::StartEdit { node_id }.into(), cx);
