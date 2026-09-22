@@ -352,6 +352,11 @@ impl<'a> GeneratorRepo<'a> {
         Ok(())
     }
 
+    /// Every managed node under `parent_id`, at any depth.
+    pub fn managed_descendants(&self, parent_id: Uuid) -> Result<Vec<Uuid>> {
+        self.collect_managed_descendants(parent_id)
+    }
+
     fn collect_managed_descendants(&self, parent_id: Uuid) -> Result<Vec<Uuid>> {
         let mut result = Vec::new();
         let mut stack = vec![parent_id];

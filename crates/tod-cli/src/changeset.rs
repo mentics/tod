@@ -19,11 +19,12 @@ tod-cli changeset — this conversation's net changes and unsure flags
 Only works inside a conversation (TOD_INTERVIEW_ACTOR=conversation:<UUID>).
 <ID> is whatever the matching `show` accepts: a node slug or UUID, or an
 obligation or plan step id in full or as its 8-character prefix.
+`--capabilities` takes the node whose capabilities changed.
 
 COMMANDS:
     list
-    flag      (--node <ID> | --obligation <ID> | --plan-step <ID>) --why <TEXT>
-    unflag    (--node <ID> | --obligation <ID> | --plan-step <ID>)
+    flag      (--node <ID> | --obligation <ID> | --plan-step <ID> | --capabilities <ID>) --why <TEXT>
+    unflag    (--node <ID> | --obligation <ID> | --plan-step <ID> | --capabilities <ID>)
 
 `list` shows one line per item this conversation changed, net of every turn:
 `<op> <entity> <id> on <node>: <text>`, then any context and `<unsure: reason>`.
@@ -89,12 +90,15 @@ fn flag(inv: &Invocation, args: &Args, set: bool) -> anyhow::Result<String> {
         (Entity::Node, "--node"),
         (Entity::Obligation, "--obligation"),
         (Entity::PlanStep, "--plan-step"),
+        (Entity::Capabilities, "--capabilities"),
     ]
     .into_iter()
     .filter_map(|(entity, flag)| args.get(flag).map(|raw| (entity, raw)))
     .collect();
     let [(entity, raw)] = given[..] else {
-        anyhow::bail!("give exactly one of --node, --obligation, or --plan-step <ID>");
+        anyhow::bail!(
+            "give exactly one of --node, --obligation, --plan-step, or --capabilities <ID>"
+        );
     };
     let why = if set {
         let why = args
@@ -135,7 +139,7 @@ fn resolve(inv: &Invocation, conversation: Uuid, entity: Entity, raw: &str) -> a
         return Ok(id);
     }
     let shown = match entity {
-        Entity::Node => crate::node::resolve(inv, raw),
+        Entity::Node | Entity::Capabilities => crate::node::resolve(inv, raw),
         Entity::Obligation => inv
             .client()
             .read(|conn| InterviewRepo::new(conn).resolve_obligation_id(raw)),

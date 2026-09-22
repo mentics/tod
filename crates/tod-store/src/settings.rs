@@ -304,6 +304,9 @@ pub struct TodSettings {
     /// Parent directory for Treehouse worktree pools (`TREEHOUSE_WORKTREES`). When unset, pools live under `TREEHOUSE_HOME`.
     #[serde(default)]
     pub treehouse_worktrees_root: Option<PathBuf>,
+    /// The Treehouse executable. When unset, `treehouse` is looked up on PATH.
+    #[serde(default)]
+    pub treehouse_executable: Option<PathBuf>,
     /// Platform / model / effort for coding agents, where the node's Agent capability leaves them unset.
     #[serde(default)]
     pub default_agent: AgentRoleSettings,
@@ -337,6 +340,9 @@ pub struct TodSettings {
     pub window_geometry: Option<WindowGeometry>,
 }
 
+/// The Treehouse executable when none is configured: found on PATH.
+pub const DEFAULT_TREEHOUSE_EXECUTABLE: &str = "treehouse";
+
 impl Default for TodSettings {
     fn default() -> Self {
         Self {
@@ -348,6 +354,7 @@ impl Default for TodSettings {
             always_on_top: false,
             worktree_backend: WorktreeBackend::default(),
             treehouse_worktrees_root: None,
+            treehouse_executable: None,
             default_agent: AgentRoleSettings::default(),
             chat_agent: AgentRoleSettings::default(),
             chat_launch_mode: ChatLaunchMode::default(),
@@ -547,6 +554,14 @@ impl TodSettings {
         crate::fleet::paths::normalize_absolute(&root)
     }
 
+    /// The Treehouse executable to run: the configured one, else `treehouse`
+    /// from PATH.
+    pub fn treehouse_program(&self) -> PathBuf {
+        self.treehouse_executable
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_TREEHOUSE_EXECUTABLE))
+    }
+
     /// Write Treehouse user config under the data root after settings change.
     pub fn sync_treehouse_config(&self, paths: &TodPaths) -> Result<()> {
         crate::fleet::treehouse::sync_user_config(self, paths)
@@ -626,6 +641,7 @@ mod tests {
             always_on_top: true,
             worktree_backend: WorktreeBackend::default(),
             treehouse_worktrees_root: None,
+            treehouse_executable: Some(PathBuf::from("C:/tools/treehouse.exe")),
             default_agent: AgentRoleSettings {
                 platform: AgentPlatform::Cursor,
                 launch: AgentLaunchByPlatform {

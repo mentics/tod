@@ -199,3 +199,50 @@ fn changeset_needs_a_conversation_actor() {
     let err = cli(&root.0, Some(&missing), &["changeset", "list"]).unwrap_err();
     assert!(err.contains("not found"), "{err}");
 }
+
+/// `capabilities`: enabling, configuring, and disabling are recorded like any
+/// other change, and reversing them puts back everything a disable removed.
+#[test]
+fn capability_changes_are_recorded_and_reversible() {
+    let (root, node, conversation) = setup();
+    let root_path = root.0.clone();
+    let actor = actor_for(conversation);
+    let run = |args: &[&str]| cli(&root_path, Some(&actor), args);
+    let node_str = node.to_string();
+
+    // Spec was on before the conversation, with an obligation of its own.
+    let obligation = short(&cli(&root_path, None, &[
+        "obligations", "add", "--node", &node_str, "--kind", "req", "--body", "Sessions expire.",
+    ]).unwrap());
+
+    assert!(run(&["capabilities", "set", &node_str, "tags", "--tags", "a"]).unwrap_err().contains("not enabled"));
+    run(&["capabilities", "enable", &node_str, "tags", "agent"]).unwrap();
+    run(&["capabilities", "set", &node_str, "tags", "--tags", "a, b", "--add", "c", "--remove", "a"]).unwrap();
+    run(&["capabilities", "set", &node_str, "agent", "--model", "opus"]).unwrap();
+    assert!(run(&["capabilities", "set", &node_str, "lifecycle"]).is_err());
+    run(&["capabilities", "disable", &node_str, "spec"]).unwrap();
+
+    let listed = run(&["capabilities", "list", &node_str]).unwrap();
+    assert!(listed.contains("tags: b, c"), "{listed}");
+    assert!(listed.contains("model opus"), "{listed}");
+    assert!(!listed.contains("spec"), "{listed}");
+    assert!(cli(&root_path, None, &["obligations", "show", &obligation]).is_err());
+
+    let changes = run(&["changeset", "list"]).unwrap();
+    assert!(changes.contains("disabled Spec, removing 1 obligation(s)"), "{changes}");
+
+    let actions = with_repo(&root_path, |repo| repo.actions(conversation).unwrap());
+    assert!(actions.iter().all(|a| a.entity == Entity::Capabilities));
+    let ids: Vec<i64> = actions.iter().map(|a| a.id).collect();
+    let conn = schema::open_writer_connection(FleetPaths::new(&root_path).unwrap().db()).unwrap();
+    let outcome = tod_store::conversation::reverse_actions(
+        &conn, conversation, &ids, true, false, &root_path,
+    )
+    .unwrap();
+    assert!(matches!(outcome, tod_store::conversation::ReverseOutcome::Applied { .. }), "{outcome:?}");
+    drop(conn);
+
+    let listed = cli(&root_path, None, &["capabilities", "list", &node_str]).unwrap();
+    assert_eq!(listed, "spec: 1 obligation(s)");
+    assert!(cli(&root_path, None, &["obligations", "show", &obligation]).unwrap().contains("Sessions expire."));
+}

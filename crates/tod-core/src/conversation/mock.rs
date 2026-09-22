@@ -252,6 +252,7 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
                 step_id,
                 body: text.into(),
             },
+            (Entity::Capabilities, _) => bail!("capabilities are not an item to address"),
         };
         outline(mutation)?;
         return Ok(None);
@@ -263,6 +264,7 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
                 OutlineMutation::DeleteObligation { obligation_id }
             }
             (Entity::PlanStep, step_id) => OutlineMutation::DeletePlanStep { step_id },
+            (Entity::Capabilities, _) => bail!("capabilities are not an item to address"),
         };
         outline(mutation)?;
         return Ok(None);
@@ -293,6 +295,7 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
                 target_node_id: target,
             },
             (Entity::PlanStep, _) => bail!("plan steps cannot move between nodes"),
+            (Entity::Capabilities, _) => bail!("capabilities are not an item to address"),
         };
         outline(mutation)?;
         return Ok(None);

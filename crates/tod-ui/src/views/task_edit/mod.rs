@@ -19,6 +19,7 @@ use gpui_component::input::{
     AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_component::scroll::Scrollbar;
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
@@ -262,9 +263,9 @@ struct PendingLinearApply {
 
 #[derive(Debug, Clone, PartialEq)]
 enum LinearPresetAction {
-    Save,
+    /// Save the form's filters under a new name.
+    SaveAs,
     Rename,
-    Delete,
 }
 
 /// Key context wrapping the query editor, so its dropdown keys win over
@@ -353,6 +354,13 @@ pub struct TaskEditView {
     linear_selected_preset: Option<String>,
     linear_preset_name_input: Entity<InputState>,
     linear_preset_action: Option<LinearPresetAction>,
+    /// The loaded preset's filters as the form renders them, so "Modified"
+    /// compares like with like. Edits never write the preset; only Overwrite.
+    linear_preset_baseline: Option<serde_json::Map<String, serde_json::Value>>,
+    linear_preset_select: Entity<SelectState<SearchableVec<String>>>,
+    /// What `linear_preset_select` was last given: its items and selection.
+    linear_preset_select_synced: std::cell::RefCell<(Vec<String>, Option<String>)>,
+    _linear_preset_select_subscription: Subscription,
     /// The filter query editor: one field that grows as the query wraps.
     linear_query_input: Entity<TextareaState>,
     /// Query text to put in `linear_query_input` once a window is at hand.
@@ -425,6 +433,18 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
+        let linear_preset_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx)
+                .searchable(true)
+        });
+        let _linear_preset_select_subscription = cx.subscribe(
+            &linear_preset_select,
+            |this: &mut TaskEditView, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(name)) = event {
+                    this.load_linear_preset(name.clone(), cx);
+                }
+            },
+        );
         let linear_query_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, LINEAR_QUERY_MAX_ROWS)
@@ -547,6 +567,10 @@ impl TaskEditView {
             linear_selected_preset: None,
             linear_preset_name_input,
             linear_preset_action: None,
+            linear_preset_baseline: None,
+            linear_preset_select,
+            linear_preset_select_synced: Default::default(),
+            _linear_preset_select_subscription,
             linear_query_input,
             linear_query_pending: None,
             linear_query_completion: Completion::default(),
@@ -1345,8 +1369,11 @@ impl TaskEditView {
     }
 
     fn load_managed_link(&mut self) {
+        // A pasted copy keeps its link (so incoming changes reach it) but is
+        // the user's to edit; only generator-owned nodes get the read-only view.
         self.managed_link = self
             .node_uuid()
+            .filter(|node_id| self.fleet.is_managed_node(*node_id).unwrap_or(false))
             .and_then(|node_id| self.fleet.get_managed_link(node_id).ok().flatten());
         self.managed_source_type = self.managed_link.as_ref().and_then(|link| {
             self.fleet
@@ -1690,6 +1717,7 @@ impl TaskEditView {
         self.linear_presets.clear();
         self.linear_selected_preset = None;
         self.linear_preset_action = None;
+        self.linear_preset_baseline = None;
         self.linear_filter_passthrough.clear();
         self.linear_query_pending = Some(String::new());
     }
@@ -1747,38 +1775,96 @@ impl TaskEditView {
         }).detach();
     }
 
-    fn cycle_linear_preset(&mut self, cx: &mut Context<Self>) {
-        let options: Vec<String> = std::iter::once("None".to_string())
-            .chain(self.linear_presets.iter().map(|p| p.name.clone()))
-            .collect();
-
-        let current = self.linear_selected_preset.as_deref();
-        let current_idx = current.and_then(|c| options.iter().position(|o| o == c));
-
-        let next_idx = match current_idx {
-            None => 0,
-            Some(idx) if idx + 1 >= options.len() => 0,
-            Some(idx) => idx + 1,
+    /// Copy a preset's filters into the form. The preset itself is left
+    /// alone: later edits change only this generator's config.
+    fn load_linear_preset(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(filters) = self
+            .linear_presets
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.filters.clone())
+        else {
+            return;
         };
+        // A preset is a whole filter set: it replaces the form's.
+        self.initialize_linear_filter_values(filters);
+        self.clamp_focus_index();
+        self.linear_selected_preset = Some(name);
+        self.linear_preset_baseline = Some(self.linear_filter_config(cx));
+        self.linear_preset_action = None;
+        cx.notify();
+    }
 
-        self.linear_selected_preset = if options[next_idx] == "None" {
-            None
-        } else {
-            Some(options[next_idx].clone())
+    fn linear_preset_modified(&self, cx: &App) -> bool {
+        self.linear_preset_baseline
+            .as_ref()
+            .is_some_and(|baseline| *baseline != self.linear_filter_config(cx))
+    }
+
+    /// Write the form's filters over the loaded preset: the only way an edit
+    /// reaches a preset.
+    fn overwrite_linear_preset(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.linear_selected_preset.clone() else {
+            return;
         };
-
-        // If a preset was selected, load its values
-        if let Some(ref preset_name) = self.linear_selected_preset {
-            let filters = self.linear_presets.iter()
-                .find(|p| &p.name == preset_name)
-                .map(|p| p.filters.clone());
-            if let Some(filters) = filters {
-                // A preset is a whole filter set: it replaces the form's.
-                self.initialize_linear_filter_values(filters);
-                self.clamp_focus_index();
+        let data_root = self.paths.data_root().to_path_buf();
+        let filters = self.linear_filter_config(cx);
+        match tod_integration::save_preset(&data_root, &name, &filters) {
+            Err(e) => self.generator_config_error = Some(format!("Failed to save preset: {e}")),
+            Ok(()) => {
+                self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                self.linear_preset_baseline = Some(filters);
             }
         }
+        cx.notify();
+    }
 
+    fn delete_linear_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.linear_selected_preset.clone() else {
+            return;
+        };
+        let view = cx.entity().downgrade();
+        let data_root = self.paths.data_root().to_path_buf();
+        confirm_toast(
+            window,
+            cx,
+            format!("Delete '{name}'?"),
+            "The preset is removed. The filters in this form stay as they are.",
+            move |_window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    match tod_integration::delete_preset(&data_root, &name) {
+                        Err(e) => {
+                            this.generator_config_error =
+                                Some(format!("Failed to delete preset: {e}"));
+                        }
+                        Ok(_) => {
+                            this.linear_presets =
+                                tod_integration::load_presets(&data_root).unwrap_or_default();
+                            this.linear_selected_preset = None;
+                            this.linear_preset_baseline = None;
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+            |_, _| {},
+        );
+    }
+
+    fn start_linear_preset_action(
+        &mut self,
+        action: LinearPresetAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = match action {
+            LinearPresetAction::SaveAs => String::new(),
+            LinearPresetAction::Rename => self.linear_selected_preset.clone().unwrap_or_default(),
+        };
+        self.linear_preset_name_input.update(cx, |input, cx| {
+            input.set_value(initial, window, cx);
+        });
+        self.linear_preset_action = Some(action);
         cx.notify();
     }
 
@@ -1952,7 +2038,8 @@ impl TaskEditView {
         };
 
         let preset_name = input_text(&self.linear_preset_name_input, cx);
-        if preset_name.trim().is_empty() && action != LinearPresetAction::Delete {
+        let preset_name = preset_name.trim().to_string();
+        if preset_name.is_empty() {
             self.linear_preset_action = None;
             cx.notify();
             return;
@@ -1961,7 +2048,7 @@ impl TaskEditView {
         let data_root = self.paths.data_root().to_path_buf();
 
         match action {
-            LinearPresetAction::Save => {
+            LinearPresetAction::SaveAs => {
                 // Check for overwrite
                 let exists = self.linear_presets.iter().any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
                 if exists {
@@ -1984,6 +2071,7 @@ impl TaskEditView {
                                 } else {
                                     this.linear_presets = tod_integration::load_presets(&data_root_clone).unwrap_or_default();
                                     this.linear_selected_preset = Some(preset_name_clone.clone());
+                                    this.linear_preset_baseline = Some(filters);
                                 }
                                 this.linear_preset_action = None;
                             });
@@ -2006,6 +2094,7 @@ impl TaskEditView {
                 } else {
                     self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
                     self.linear_selected_preset = Some(preset_name);
+                    self.linear_preset_baseline = Some(filters);
                 }
             }
             LinearPresetAction::Rename => {
@@ -2020,20 +2109,6 @@ impl TaskEditView {
                 } else {
                     self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
                     self.linear_selected_preset = Some(preset_name);
-                }
-            }
-            LinearPresetAction::Delete => {
-                let Some(ref name) = self.linear_selected_preset else {
-                    self.linear_preset_action = None;
-                    cx.notify();
-                    return;
-                };
-
-                if let Err(e) = tod_integration::delete_preset(&data_root, name) {
-                    self.generator_config_error = Some(format!("Failed to delete preset: {}", e));
-                } else {
-                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
-                    self.linear_selected_preset = None;
                 }
             }
         }
@@ -2424,20 +2499,11 @@ impl TaskEditView {
         let Some(node_id) = self.node_uuid() else {
             return;
         };
-        let archive_payload = match self.fleet.build_capability_disable_payload(node_id, cap) {
-            Ok(payload) => payload,
-            Err(err) => {
-                self.pending_toast = Some(format!("Failed to archive {} data: {err}", cap.label()));
-                cx.notify();
-                return;
-            }
-        };
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::DisableCapability {
                 node_id,
                 capability: cap,
-                archive_payload,
             })
         {
             self.pending_toast = Some(format!("Failed to disable {}: {err}", cap.label()));
@@ -4129,82 +4195,130 @@ impl TaskEditView {
 
     fn render_linear_preset_section(
         &self,
-        _muted: gpui::Hsla,
-        _window: &mut Window,
+        muted: gpui::Hsla,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let current_selection = self.linear_selected_preset.as_deref().unwrap_or("None");
+        let names: Vec<String> = self.linear_presets.iter().map(|p| p.name.clone()).collect();
+        let wanted = (names.clone(), self.linear_selected_preset.clone());
+        if *self.linear_preset_select_synced.borrow() != wanted {
+            self.linear_preset_select.update(cx, |select, cx| {
+                select.set_items(SearchableVec::new(names), window, cx);
+                match &wanted.1 {
+                    Some(name) => select.set_selected_value(name, window, cx),
+                    None => select.set_selected_index(None, window, cx),
+                }
+            });
+            *self.linear_preset_select_synced.borrow_mut() = wanted;
+        }
 
-        h_flex()
+        let selected = self.linear_selected_preset.clone();
+        let modified = self.linear_preset_modified(cx);
+
+        let mut row = h_flex()
             .gap_2()
             .items_center()
+            .flex_wrap()
             .child(div().text_xs().child("Preset:"))
             .child(
-                Button::new("linear-preset-select")
-                    .label(current_selection)
-                    .xsmall()
-                    .outline()
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.cycle_linear_preset(cx);
-                    }))
-            )
-            .when(self.linear_selected_preset.is_some(), |el| {
-                el.child(
-                    Button::new("linear-preset-save")
-                        .label("Save")
+                div().w(px(220.)).child(
+                    Select::new(&self.linear_preset_select)
+                        .placeholder(if self.linear_presets.is_empty() {
+                            "No saved presets"
+                        } else {
+                            "Load a preset"
+                        })
                         .xsmall()
-                        .ghost()
+                        .menu_width(px(240.)),
+                ),
+            );
+
+        if let Some(name) = &selected {
+            row = row
+                .when(modified, |el| {
+                    el.child(div().text_xs().text_color(muted).child("Modified"))
+                })
+                .child(
+                    Button::new("linear-preset-overwrite")
+                        .label(format!("Overwrite \"{name}\""))
+                        .xsmall()
+                        .outline()
+                        .disabled(!modified)
                         .on_click(cx.listener(|this, _, _window, cx| {
-                            this.linear_preset_action = Some(LinearPresetAction::Save);
-                            cx.notify();
-                        }))
-                )
+                            this.overwrite_linear_preset(cx);
+                        })),
+                );
+        }
+        row = row.child(
+            Button::new("linear-preset-save-as")
+                .label("Save as new preset…")
+                .xsmall()
+                .ghost()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.start_linear_preset_action(LinearPresetAction::SaveAs, window, cx);
+                })),
+        );
+        if selected.is_some() {
+            row = row
                 .child(
                     Button::new("linear-preset-rename")
-                        .label("Rename")
+                        .label("Rename…")
                         .xsmall()
                         .ghost()
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.linear_preset_action = Some(LinearPresetAction::Rename);
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.start_linear_preset_action(LinearPresetAction::Rename, window, cx);
+                        })),
                 )
                 .child(
                     Button::new("linear-preset-delete")
                         .label("Delete")
                         .xsmall()
                         .ghost()
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.linear_preset_action = Some(LinearPresetAction::Delete);
-                            cx.notify();
-                        }))
-                )
-            })
-            .when(self.linear_preset_action.is_some(), |el| {
-                el.child(
-                    Input::new(&self.linear_preset_name_input)
-                        .xsmall()
-                )
-                .child(
-                    Button::new("linear-preset-confirm")
-                        .label("Confirm")
-                        .xsmall()
-                        .primary()
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_linear_preset_action(window, cx);
-                        }))
-                )
-                .child(
-                    Button::new("linear-preset-cancel")
-                        .label("Cancel")
-                        .xsmall()
-                        .ghost()
-                        .on_click(cx.listener(|this, _, _window, cx| {
-                            this.linear_preset_action = None;
-                            cx.notify();
-                        }))
-                )
-            })
+                            this.delete_linear_preset(window, cx);
+                        })),
+                );
+        }
+
+        let action = self.linear_preset_action.clone();
+        v_flex().gap_1().child(row).when_some(action, |el, action| {
+            el.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_xs().child(match action {
+                        LinearPresetAction::SaveAs => "New preset name:",
+                        LinearPresetAction::Rename => "Rename to:",
+                    }))
+                    .child(
+                        div()
+                            .w(px(220.))
+                            .child(Input::new(&self.linear_preset_name_input).xsmall()),
+                    )
+                    .child(
+                        Button::new("linear-preset-confirm")
+                            .label(match action {
+                                LinearPresetAction::SaveAs => "Save",
+                                LinearPresetAction::Rename => "Rename",
+                            })
+                            .xsmall()
+                            .primary()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_linear_preset_action(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("linear-preset-cancel")
+                            .label("Cancel")
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.linear_preset_action = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+        })
     }
 
     /// The query editor: one long input, with a dropdown of what may come

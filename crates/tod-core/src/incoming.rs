@@ -52,6 +52,7 @@ fn snapshot_kind(snapshot: &EntitySnapshot) -> String {
         EntitySnapshot::Obligation { kind, .. } => kind.clone(),
         EntitySnapshot::PlanStep { .. } => "plan step".to_string(),
         EntitySnapshot::Node { .. } => "node".to_string(),
+        EntitySnapshot::Capabilities { .. } => "capabilities".to_string(),
     }
 }
 
@@ -60,6 +61,7 @@ fn snapshot_text(snapshot: &EntitySnapshot) -> String {
         EntitySnapshot::Obligation { kind, body, .. } => format!("[{kind}] {body}"),
         EntitySnapshot::PlanStep { body, .. } => body.clone(),
         EntitySnapshot::Node { title, .. } => title.clone(),
+        EntitySnapshot::Capabilities { .. } => snapshot.text(),
     }
 }
 

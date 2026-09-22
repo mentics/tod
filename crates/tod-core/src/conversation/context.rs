@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use tod_store::conversation::{
     ActionActor, ActionKind, ActionRow, ContextTarget, ConversationRepo, Entity, EntitySnapshot,
-    Focus, NetChange, NetOp, TurnRole, net_changes, snapshot, stale,
+    Focus, NetChange, NetOp, TurnRole, capabilities_changes, net_changes, snapshot, stale,
 };
 use tod_store::interview::short_id;
 use tod_store::outline::ancestor_chain;
@@ -204,6 +204,7 @@ pub fn entity_label(entity: Entity) -> &'static str {
         Entity::Node => "node",
         Entity::Obligation => "obligation",
         Entity::PlanStep => "plan-step",
+        Entity::Capabilities => "capabilities",
     }
 }
 
@@ -219,14 +220,16 @@ fn node_slugs(conn: &Connection) -> Result<HashMap<Uuid, String>> {
 /// (its full id once it is gone), anything else by its short id.
 fn item_id(slugs: &HashMap<Uuid, String>, entity: Entity, id: Uuid) -> String {
     match entity {
-        Entity::Node => slugs.get(&id).cloned().unwrap_or_else(|| id.to_string()),
+        Entity::Node | Entity::Capabilities => {
+            slugs.get(&id).cloned().unwrap_or_else(|| id.to_string())
+        }
         Entity::Obligation | Entity::PlanStep => short_id(id),
     }
 }
 
 fn on_node(slugs: &HashMap<Uuid, String>, entity: Entity, node: Option<Uuid>) -> String {
     match (entity, node) {
-        (Entity::Node, _) | (_, None) => String::new(),
+        (Entity::Node | Entity::Capabilities, _) | (_, None) => String::new(),
         (_, Some(node)) => format!(
             " on {}",
             slugs
@@ -245,12 +248,15 @@ pub fn change_set_lines(conn: &Connection, changes: &[NetChange]) -> Result<Vec<
     Ok(changes
         .iter()
         .map(|c| {
-            let text = c
-                .current
-                .as_ref()
-                .or(c.before.as_ref())
-                .map(|s| one_line(s.text()))
-                .unwrap_or_default();
+            let text = if c.entity == Entity::Capabilities {
+                capabilities_changes(c.before.as_ref(), c.current.as_ref()).join("; ")
+            } else {
+                c.current
+                    .as_ref()
+                    .or(c.before.as_ref())
+                    .map(|s| one_line(&s.text()))
+                    .unwrap_or_default()
+            };
             let context: Vec<String> =
                 c.context
                     .iter()
@@ -430,6 +436,9 @@ fn describe_state(state: Option<&EntitySnapshot>) -> String {
         }
         Some(EntitySnapshot::PlanStep { status, body, .. }) => {
             format!("{status} \"{}\"", one_line(body))
+        }
+        Some(snapshot @ EntitySnapshot::Capabilities { .. }) => {
+            format!("capabilities: {}", snapshot.text())
         }
     }
 }

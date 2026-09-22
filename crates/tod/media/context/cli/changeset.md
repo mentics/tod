@@ -1,17 +1,20 @@
 ## `tod-cli changeset`
 
 The change set is everything this conversation has changed — nodes,
-obligations, and plan steps — shown to the user net of every turn. It only
+obligations, plan steps, and nodes' capabilities — shown to the user net of
+every turn. It only
 exists inside a conversation; outside one these commands fail.
 
 ```
 tod-cli --data-root <DATA_ROOT> changeset list
-tod-cli --data-root <DATA_ROOT> changeset flag   (--node <ID> | --obligation <ID> | --plan-step <ID>) --why <TEXT>
-tod-cli --data-root <DATA_ROOT> changeset unflag (--node <ID> | --obligation <ID> | --plan-step <ID>)
+tod-cli --data-root <DATA_ROOT> changeset flag   (--node <ID> | --obligation <ID> | --plan-step <ID> | --capabilities <ID>) --why <TEXT>
+tod-cli --data-root <DATA_ROOT> changeset unflag (--node <ID> | --obligation <ID> | --plan-step <ID> | --capabilities <ID>)
 ```
 
 `<ID>` is whatever that item's `show` command accepts: a node slug or UUID, or
 an obligation or plan-step id in full or as its 8-character prefix.
+`--capabilities` takes the node whose capabilities changed; its `list` line
+names what changed (`enabled Lifecycle; model: default → opus`).
 
 `list` prints one line per changed item:
 `<op> <entity> <id> on <node-slug>: <text>`, followed by any context in

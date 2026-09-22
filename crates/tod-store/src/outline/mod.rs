@@ -9,6 +9,7 @@ pub mod mutations;
 pub mod references;
 pub mod repos;
 pub mod resolve;
+pub mod row_archive;
 pub mod slug;
 pub mod types;
 pub mod uuid_blob;

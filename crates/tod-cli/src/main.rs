@@ -9,6 +9,7 @@
 //! that changed since the session's context was built.
 
 mod args;
+mod capabilities;
 mod changeset;
 #[cfg(test)]
 mod doc_sync;
@@ -48,6 +49,7 @@ NOUNS:
     memory                 Interview memory notes for a node
     interview              Interview session state
     visual-design          the UI mockup associated with one obligation
+    capabilities           A node's capabilities and their settings
     changeset              This conversation's net changes and unsure flags
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
@@ -150,6 +152,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "memory" => interview::memory(invocation),
         "interview" => interview::interview(invocation),
         "visual-design" => visual_design::run(invocation),
+        "capabilities" => capabilities::run(invocation),
         "changeset" => changeset::run(invocation),
         "tests" => test_runs::run(invocation),
         "review" => review::run(invocation),
@@ -158,7 +161,7 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, changeset, tests, review, verdicts, incoming, learn, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, verdicts, incoming, learn, secrets)"
         ),
     }
 }

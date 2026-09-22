@@ -756,7 +756,7 @@ fn reverse_all_undoes_every_change(cx: &mut TestAppContext) {
     assert!(gone.current.is_none());
     assert_eq!(
         gone.before.as_ref().map(|s| s.text()),
-        Some("Added then reversed")
+        Some("Added then reversed".to_string())
     );
 }
 

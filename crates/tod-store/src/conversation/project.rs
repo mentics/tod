@@ -34,11 +34,22 @@ pub fn net_changes(conn: &Connection, conversation_id: Uuid) -> Result<Vec<NetCh
             .push(action);
     }
 
+    // A node the conversation added shows as added; how its capabilities
+    // were set up is part of that, not a change of its own.
+    let added_nodes: HashSet<Uuid> = actions
+        .iter()
+        .filter(|a| a.entity == Entity::Node && creates(&a.mutation) && !undone(a, &by_id))
+        .map(|a| a.entity_id)
+        .collect();
+
     let mut changes = Vec::new();
     let mut first_ids = HashMap::new();
     for key in keys {
         let acts = &groups[&key];
         let (entity, id) = key;
+        if entity == Entity::Capabilities && added_nodes.contains(&id) {
+            continue;
+        }
         let current = snapshot(conn, entity, id)?;
         let Some(op) = net_op(acts, &by_id, current.is_some()) else {
             continue;
@@ -246,7 +257,7 @@ fn duplicate_of(
             .join(" ")
             .to_lowercase()
     };
-    let text = norm(before.text());
+    let text = norm(&before.text());
     Ok(match (entity, before) {
         (Entity::Obligation, _) => ObligationRepo::new(conn)
             .list_for_node(home)?
@@ -280,7 +291,7 @@ fn duplicate_of(
             }
             found
         }
-        (Entity::Node, _) => None,
+        (Entity::Node, _) | (Entity::Capabilities, _) => None,
     })
 }
 
@@ -334,8 +345,9 @@ fn sort_changes(
         let state = c.current.as_ref().or(c.before.as_ref());
         let rank = match c.entity {
             Entity::Node => 0,
-            Entity::Obligation => 1,
-            Entity::PlanStep => 2,
+            Entity::Capabilities => 1,
+            Entity::Obligation => 2,
+            Entity::PlanStep => 3,
         };
         let kind = match state {
             Some(EntitySnapshot::Obligation { kind, .. }) => kind.clone(),
@@ -419,6 +431,11 @@ fn same_ignoring_position(a: &EntitySnapshot, b: &EntitySnapshot) -> bool {
             EntitySnapshot::Node { ordinal, .. }
             | EntitySnapshot::Obligation { ordinal, .. }
             | EntitySnapshot::PlanStep { ordinal, .. } => *ordinal = 0,
+            // The counts follow other items' changes, which are their own.
+            EntitySnapshot::Capabilities { settings, .. } => {
+                settings.obligations = 0;
+                settings.managed_nodes = 0;
+            }
         }
         s
     };
@@ -427,8 +444,9 @@ fn same_ignoring_position(a: &EntitySnapshot, b: &EntitySnapshot) -> bool {
 
 /// Unselected, not-yet-reversed actions that reversing `action_ids` would
 /// pull the rug from under: actions on items that live under a node a
-/// selected action created, and on plan steps that depend on a step a
-/// selected action created. Only items that still exist count.
+/// selected action created, on plan steps that depend on a step a selected
+/// action created, and on obligations of a node whose Spec a selected action
+/// enabled. Only items that still exist count.
 pub fn dependents(
     conn: &Connection,
     conversation_id: Uuid,
@@ -438,23 +456,31 @@ pub fn dependents(
     let selected: BTreeSet<i64> = action_ids.iter().copied().collect();
     let mut created_nodes = HashSet::new();
     let mut created_steps = HashSet::new();
+    let mut spec_nodes = HashSet::new();
     for action in actions.iter().filter(|a| selected.contains(&a.id)) {
+        if enables_spec(&action.mutation) {
+            spec_nodes.insert(action.entity_id);
+        }
         if !creates(&action.mutation) {
             continue;
         }
         match action.entity {
             Entity::Node => created_nodes.insert(action.entity_id),
             Entity::PlanStep => created_steps.insert(action.entity_id),
-            Entity::Obligation => false,
+            Entity::Obligation | Entity::Capabilities => false,
         };
     }
-    if created_nodes.is_empty() && created_steps.is_empty() {
+    if created_nodes.is_empty() && created_steps.is_empty() && spec_nodes.is_empty() {
         return Ok(Vec::new());
     }
     let outline = OutlineRepo::new(conn);
     let mut out = Vec::new();
     for action in &actions {
         if selected.contains(&action.id) || action.reversed_by.is_some() {
+            continue;
+        }
+        // Part of the node itself; see `folded_into_created`.
+        if action.entity == Entity::Capabilities && created_nodes.contains(&action.entity_id) {
             continue;
         }
         let Some(current) = snapshot(conn, action.entity, action.entity_id)? else {
@@ -475,11 +501,53 @@ pub fn dependents(
         if let EntitySnapshot::PlanStep { depends_on, .. } = &current {
             depends |= depends_on.iter().any(|d| created_steps.contains(d));
         }
+        if let EntitySnapshot::Obligation { node_id, .. } = &current {
+            depends |= spec_nodes.contains(node_id);
+        }
         if depends {
             out.push(action.id);
         }
     }
     Ok(out)
+}
+
+/// Not-yet-reversed changes to the capabilities of nodes that `action_ids`
+/// created. The change set shows them as part of adding the node, so
+/// reversing the node reverses them too, without asking.
+pub fn folded_into_created(
+    conn: &Connection,
+    conversation_id: Uuid,
+    action_ids: &[i64],
+) -> Result<Vec<i64>> {
+    let actions = ConversationRepo::new(conn).actions(conversation_id)?;
+    let created: HashSet<Uuid> = actions
+        .iter()
+        .filter(|a| action_ids.contains(&a.id) && a.entity == Entity::Node && creates(&a.mutation))
+        .map(|a| a.entity_id)
+        .collect();
+    Ok(actions
+        .iter()
+        .filter(|a| {
+            a.entity == Entity::Capabilities
+                && a.kind != ActionKind::Reverse
+                && a.reversed_by.is_none()
+                && created.contains(&a.entity_id)
+        })
+        .map(|a| a.id)
+        .collect())
+}
+
+/// Whether applying `mutation` turned Spec on (so reversing it removes the
+/// node's obligations).
+fn enables_spec(mutation: &OutlineMutation) -> bool {
+    use crate::outline::Capability;
+    match mutation {
+        OutlineMutation::EnableCapabilities { capabilities, .. } => {
+            capabilities.contains(&Capability::Spec)
+        }
+        OutlineMutation::RestoreCapability { capability, .. } => *capability == Capability::Spec,
+        _ => false,
+    }
 }
 
 /// Whether applying `mutation` brought its item into existence.

@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 /// The mutations that undo `action`.
 pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
+    if action.entity == Entity::Capabilities {
+        return capabilities_inverse(action);
+    }
     use OutlineMutation as M;
     let id = action.entity_id;
     let before = || {
@@ -187,6 +190,72 @@ pub fn inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
     Ok(vec![inverse])
 }
 
+/// Undo a change to a node's capabilities: disable what it enabled, restore
+/// what it disabled from the archive it kept, and put settings back as
+/// `before` had them.
+fn capabilities_inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
+    use OutlineMutation as M;
+    let node_id = action.entity_id;
+    let Some(EntitySnapshot::Capabilities {
+        enabled, settings, ..
+    }) = action.before.clone()
+    else {
+        bail!("action {} recorded no prior capabilities", action.id);
+    };
+    let s = settings;
+    Ok(match &action.mutation {
+        M::EnableCapabilities { capabilities, .. } => capabilities
+            .iter()
+            .filter(|c| !enabled.contains(c))
+            .map(|c| M::DisableCapability {
+                node_id,
+                capability: *c,
+            })
+            .collect(),
+        M::DisableCapability { capability, .. } => vec![M::RestoreCapability {
+            node_id,
+            capability: *capability,
+            archive_id: action
+                .archive_id
+                .with_context(|| format!("action {} kept no archive", action.id))?,
+        }],
+        M::RestoreCapability { capability, .. } => vec![M::DisableCapability {
+            node_id,
+            capability: *capability,
+        }],
+        M::SetNodeAgent { .. } => vec![M::SetNodeAgent {
+            node_id,
+            platform: s.agent_platform,
+            model: s.agent_model,
+            effort: s.agent_effort,
+        }],
+        M::SetNodeFiles { .. } => vec![M::SetNodeFiles {
+            node_id,
+            repo: s.repo,
+            branch: s.branch,
+            use_worktree: s.use_worktree,
+        }],
+        M::SetNodeTicket { .. } => vec![M::SetNodeTicket {
+            node_id,
+            linked_issues: s.linked_issues,
+            linked_prs: s.linked_prs,
+        }],
+        M::SetNodeTags { .. } => vec![M::SetNodeTags {
+            node_id,
+            tags: s.tags,
+        }],
+        M::SetGeneratorConfig { .. } | M::DeleteGeneratorConfig { .. } => vec![match s.generator {
+            Some((data_source_type, config_json)) => M::SetGeneratorConfig {
+                node_id,
+                data_source_type,
+                config_json,
+            },
+            None => M::DeleteGeneratorConfig { node_id },
+        }],
+        other => bail!("action {} has no inverse ({other:?})", action.id),
+    })
+}
+
 /// See [`crate::interview::InterviewCommand::ReverseConversationActions`].
 /// Runs inside the caller's transaction; an error part-way leaves the caller
 /// to roll everything back.
@@ -214,6 +283,12 @@ pub fn reverse_actions(
         }
     }
 
+    let folded = project::folded_into_created(
+        conn,
+        conversation_id,
+        &selected.iter().copied().collect::<Vec<_>>(),
+    )?;
+    selected.extend(folded);
     let dependents = project::dependents(
         conn,
         conversation_id,

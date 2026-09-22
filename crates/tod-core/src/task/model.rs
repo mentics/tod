@@ -297,21 +297,17 @@ pub fn fuzzy_matches(query: &str, text: &str) -> bool {
 }
 
 pub fn task_matches_search(task: &TaskItem, query: &str) -> bool {
-    if query.trim().is_empty() {
-        return true;
-    }
-    if fuzzy_matches(query, &task.title) {
-        return true;
-    }
-    if let Some(ticket) = &task.ticket_id {
-        if fuzzy_matches(query, ticket) {
-            return true;
-        }
-    }
-    if fuzzy_matches(query, &task.lifecycle) {
-        return true;
-    }
-    task.tags.iter().any(|tag| fuzzy_matches(query, tag))
+    // Each whitespace-separated term must match at least one field, but the
+    // terms may land in different fields ("ENG-12 login" finds the ticket
+    // ENG-12 titled "Fix login"). Managed nodes carry their ticket id as
+    // `external_id`.
+    query.split_whitespace().all(|term| {
+        fuzzy_matches(term, &task.title)
+            || task.ticket_id.as_deref().is_some_and(|t| fuzzy_matches(term, t))
+            || task.external_id.as_deref().is_some_and(|t| fuzzy_matches(term, t))
+            || fuzzy_matches(term, &task.lifecycle)
+            || task.tags.iter().any(|tag| fuzzy_matches(term, tag))
+    })
 }
 
 pub fn task_matches_tag_filter(task: &TaskItem, tag_filter: Option<&str>) -> bool {
@@ -649,6 +645,26 @@ mod tests {
         let visible = filter_and_sort_tasks(&tasks, "login", &ws);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "m1");
+    }
+
+    #[test]
+    fn main_tree_search_matches_ticket_ids_per_term() {
+        let mut managed = managed_sample("m1", "Fix login bug", "gen", 1);
+        managed.external_id = Some("ENG-123".into());
+        let mut local = sample("l1", "Dark mode", "ready", &[]);
+        local.ticket_id = Some("ENG-456".into());
+        let tasks = vec![generator_sample("gen", "Generator"), managed, local];
+        let ws = ListWorkingSet::default_sort();
+        let ids = |q: &str| -> Vec<String> {
+            filter_and_sort_tasks(&tasks, q, &ws)
+                .into_iter()
+                .map(|t| t.id)
+                .collect()
+        };
+        assert_eq!(ids("ENG-123"), vec!["m1"]);
+        assert_eq!(ids("eng-123 login"), vec!["m1"]);
+        assert_eq!(ids("ENG-456 dark"), vec!["l1"]);
+        assert!(ids("ENG-456 login").is_empty());
     }
 
     #[test]

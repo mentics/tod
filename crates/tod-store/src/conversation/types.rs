@@ -94,8 +94,14 @@ str_enum!(
 );
 
 str_enum!(
-    /// The kind of outline item an action touched.
-    Entity { Node => "node", Obligation => "obligation", PlanStep => "plan_step" }
+    /// The kind of outline item an action touched. `Capabilities` is a
+    /// node's capabilities and their settings, one item keyed by the node's id.
+    Entity {
+        Node => "node",
+        Obligation => "obligation",
+        PlanStep => "plan_step",
+        Capabilities => "capabilities",
+    }
 );
 
 str_enum!(
@@ -199,6 +205,138 @@ pub enum EntitySnapshot {
         /// Obligations this step is linked to. Sorted.
         satisfies: Vec<Uuid>,
     },
+    /// A node's capabilities and their settings.
+    Capabilities {
+        node_id: Uuid,
+        /// In [`crate::outline::Capability::ALL`] order.
+        enabled: Vec<crate::outline::Capability>,
+        settings: CapabilitySettings,
+    },
+}
+
+/// What a node's capabilities hold, as far as the change set shows it. The
+/// obligation and generated-node counts are only there so a change that
+/// removed them can say so; they are not compared when checking whether the
+/// item changed since (those items' own changes are their own).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilitySettings {
+    #[serde(default)]
+    pub agent_platform: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    #[serde(default)]
+    pub agent_effort: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub use_worktree: bool,
+    #[serde(default)]
+    pub linked_issues: Vec<String>,
+    #[serde(default)]
+    pub linked_prs: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// `(data_source_type, config_json)`.
+    #[serde(default)]
+    pub generator: Option<(String, String)>,
+    #[serde(default)]
+    pub obligations: usize,
+    #[serde(default)]
+    pub managed_nodes: usize,
+}
+
+/// What changed between two states of a node's capabilities, one phrase per
+/// change: `enabled Lifecycle`, `disabled Spec, removing 12 obligations`,
+/// `model: opus → sonnet`. Either side may be missing (the node is gone, or
+/// was not there yet); anything that is not a capabilities state reads as
+/// none enabled.
+pub fn capabilities_changes(
+    before: Option<&EntitySnapshot>,
+    after: Option<&EntitySnapshot>,
+) -> Vec<String> {
+    use crate::outline::Capability;
+    let empty = (Vec::new(), CapabilitySettings::default());
+    let parts = |s: Option<&EntitySnapshot>| match s {
+        Some(EntitySnapshot::Capabilities {
+            enabled, settings, ..
+        }) => (enabled.clone(), settings.clone()),
+        _ => empty.clone(),
+    };
+    let (was, old) = parts(before);
+    let (now, new) = parts(after);
+    let mut out = Vec::new();
+    for cap in Capability::ALL {
+        match (was.contains(&cap), now.contains(&cap)) {
+            (false, true) => out.push(format!("enabled {}", cap.label())),
+            (true, false) => {
+                let removed = match cap {
+                    Capability::Spec if old.obligations > 0 => {
+                        format!(", removing {} obligation(s)", old.obligations)
+                    }
+                    Capability::Generator if old.managed_nodes > 0 => {
+                        format!(", removing {} generated node(s)", old.managed_nodes)
+                    }
+                    _ => String::new(),
+                };
+                out.push(format!("disabled {}{removed}", cap.label()));
+            }
+            _ => {}
+        }
+    }
+    let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "default".into());
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    // Settings that went away with their capability are covered by "disabled".
+    let both = |cap: Capability| was.contains(&cap) && now.contains(&cap);
+    let generator = (both(Capability::Generator) && old.generator != new.generator).then(|| {
+        let source = |g: &Option<(String, String)>| {
+            g.as_ref()
+                .map(|(t, _)| t.clone())
+                .unwrap_or_else(|| "none".into())
+        };
+        let (a, b) = (source(&old.generator), source(&new.generator));
+        if a == b {
+            format!("{a} generator reconfigured")
+        } else {
+            format!("generator source: {a} \u{2192} {b}")
+        }
+    });
+    let mut setting = |name: &str, a: String, b: String| {
+        if a != b {
+            out.push(format!("{name}: {a} \u{2192} {b}"));
+        }
+    };
+    if both(Capability::Agent) {
+        setting("platform", opt(&old.agent_platform), opt(&new.agent_platform));
+        setting("model", opt(&old.agent_model), opt(&new.agent_model));
+        setting("effort", opt(&old.agent_effort), opt(&new.agent_effort));
+    }
+    if both(Capability::Files) {
+        let none = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+        setting("directory", none(&old.repo), none(&new.repo));
+        setting("branch", none(&old.branch), none(&new.branch));
+        setting(
+            "worktree",
+            if old.use_worktree { "on" } else { "off" }.into(),
+            if new.use_worktree { "on" } else { "off" }.into(),
+        );
+    }
+    if both(Capability::Ticket) {
+        setting("tickets", list(&old.linked_issues), list(&new.linked_issues));
+        setting("pull requests", list(&old.linked_prs), list(&new.linked_prs));
+    }
+    if both(Capability::Tags) {
+        setting("tags", list(&old.tags), list(&new.tags));
+    }
+    out.extend(generator);
+    out
 }
 
 impl EntitySnapshot {
@@ -207,15 +345,18 @@ impl EntitySnapshot {
             EntitySnapshot::Node { .. } => Entity::Node,
             EntitySnapshot::Obligation { .. } => Entity::Obligation,
             EntitySnapshot::PlanStep { .. } => Entity::PlanStep,
+            EntitySnapshot::Capabilities { .. } => Entity::Capabilities,
         }
     }
 
-    /// The node an item with this state lives on; a node lives on itself.
+    /// The node an item with this state lives on; a node (and its
+    /// capabilities) lives on itself.
     pub fn node_id(&self, id: Uuid) -> Uuid {
         match self {
             EntitySnapshot::Node { .. } => id,
             EntitySnapshot::Obligation { node_id, .. }
-            | EntitySnapshot::PlanStep { node_id, .. } => *node_id,
+            | EntitySnapshot::PlanStep { node_id, .. }
+            | EntitySnapshot::Capabilities { node_id, .. } => *node_id,
         }
     }
 
@@ -224,14 +365,23 @@ impl EntitySnapshot {
             EntitySnapshot::Node { ordinal, .. }
             | EntitySnapshot::Obligation { ordinal, .. }
             | EntitySnapshot::PlanStep { ordinal, .. } => *ordinal,
+            EntitySnapshot::Capabilities { .. } => 0,
         }
     }
 
-    /// The item's text: a node's title, an obligation's or step's body.
-    pub fn text(&self) -> &str {
+    /// The item's text: a node's title, an obligation's or step's body, the
+    /// labels of a node's enabled capabilities.
+    pub fn text(&self) -> String {
         match self {
-            EntitySnapshot::Node { title, .. } => title,
-            EntitySnapshot::Obligation { body, .. } | EntitySnapshot::PlanStep { body, .. } => body,
+            EntitySnapshot::Node { title, .. } => title.clone(),
+            EntitySnapshot::Obligation { body, .. } | EntitySnapshot::PlanStep { body, .. } => {
+                body.clone()
+            }
+            EntitySnapshot::Capabilities { enabled, .. } => enabled
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(", "),
         }
     }
 }

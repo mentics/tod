@@ -123,18 +123,6 @@ pub trait DataSource: Send + Sync {
     /// Returns `Ok(())` if valid, or `Err(DataSourceError::InvalidConfig(..))`.
     fn validate_config(&self, config: &serde_json::Value) -> Result<(), DataSourceError>;
 
-    /// Validate configuration with a live test query to the external service.
-    /// This is more thorough than `validate_config` but requires credentials and network access.
-    /// Data sources that don't support test queries can leave the default implementation.
-    fn validate_config_with_test_query(
-        &self,
-        config: &serde_json::Value,
-        _credentials: &HashMap<String, String>,
-    ) -> Result<(), DataSourceError> {
-        // Default: fall back to basic validation
-        self.validate_config(config)
-    }
-
     /// Fetch items matching the configuration query.
     ///
     /// The implementation handles pagination internally and returns the complete

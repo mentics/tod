@@ -110,14 +110,15 @@ pub fn refresh_introspection_metadata(
 /// Validate `config_json` against the named data source and persist it via
 /// [`OutlineMutation::SetGeneratorConfig`], **without** refreshing. Rejects
 /// unknown data source types and configs that fail
-/// [`DataSource::validate_config`] or test query validation (when credentials available)
-/// without enqueuing anything.
+/// [`DataSource::validate_config`] without enqueuing anything.
 ///
 /// Returns `true` when a refresh is due: the node's first config, or one
 /// that differs from what was stored, since the children reflect the old
-/// config until they are fetched again. Re-saving an unchanged config
-/// (the panel's autosave does) is not a reason to reach the network.
-/// Saving is local and fast; refreshing reaches the network, so the two are
+/// config until they are fetched again. That refresh is also where the
+/// config meets the service — a filter Linear rejects fails there, on the
+/// generator's refresh status — so the save itself never reaches the
+/// network. Re-saving an unchanged config (the panel's autosave does) is
+/// a no-op. Saving is local and fast; refreshing is not, so the two are
 /// separate calls and the caller decides where the refresh runs — a UI
 /// caller must run [`refresh_generator`] off its main thread. See
 /// [`set_generator_config`] for the combined, fully blocking version.
@@ -134,21 +135,9 @@ pub fn save_generator_config(
     let config: serde_json::Value =
         serde_json::from_str(config_json).map_err(|err| format!("invalid config JSON: {err}"))?;
 
-    // Try test query validation if credentials are available
-    let credentials = resolve_credentials(data_root, data_source.as_ref());
-    let missing = missing_credentials(data_source.as_ref(), &credentials);
-
-    if missing.is_empty() {
-        // We have credentials, use test query validation
-        data_source
-            .validate_config_with_test_query(&config, &credentials)
-            .map_err(|err| err.to_string())?;
-    } else {
-        // No credentials, fall back to basic validation
-        data_source
-            .validate_config(&config)
-            .map_err(|err| err.to_string())?;
-    }
+    data_source
+        .validate_config(&config)
+        .map_err(|err| err.to_string())?;
 
     // Compared as JSON so a re-serialisation with the same content does
     // not count as a change.
@@ -160,6 +149,9 @@ pub fn save_generator_config(
                 && serde_json::from_str::<serde_json::Value>(&existing.config_json)
                     .is_ok_and(|stored| stored == config)
         });
+    if unchanged {
+        return Ok(false);
+    }
 
     fleet
         .enqueue_outline(OutlineMutation::SetGeneratorConfig {
@@ -170,7 +162,7 @@ pub fn save_generator_config(
         .map_err(|err| err.to_string())?;
     fleet.writer().flush().map_err(|err| err.to_string())?;
 
-    Ok(!unchanged)
+    Ok(true)
 }
 
 /// [`save_generator_config`] plus the refresh it reports as due, run

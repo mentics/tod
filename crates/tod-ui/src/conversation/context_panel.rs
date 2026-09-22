@@ -60,7 +60,9 @@ impl ContextTab {
     fn for_entity(entity: ItemEntity) -> Self {
         match entity {
             ItemEntity::PlanStep => ContextTab::Plan,
-            ItemEntity::Node | ItemEntity::Obligation => ContextTab::Obligations,
+            ItemEntity::Node | ItemEntity::Obligation | ItemEntity::Capabilities => {
+                ContextTab::Obligations
+            }
         }
     }
 }
@@ -89,7 +91,7 @@ impl PanelTarget {
 /// shows its former parent's, or nothing when it was top level.
 pub(crate) fn target_for_change(change: &NetChange) -> Option<PanelTarget> {
     match change.entity {
-        ItemEntity::Node => {
+        ItemEntity::Node | ItemEntity::Capabilities => {
             if change.current.is_some() {
                 return Some(PanelTarget::node(change.id));
             }
@@ -120,7 +122,7 @@ pub(crate) fn target_for_ref(
         ContextTarget::Node { id, .. } => return Ok(Some(PanelTarget::node(*id))),
         ContextTarget::Item { entity, id, .. } => (*entity, *id),
     };
-    if entity == ItemEntity::Node {
+    if matches!(entity, ItemEntity::Node | ItemEntity::Capabilities) {
         return Ok(Some(PanelTarget::node(id)));
     }
     if let Some(change) = changes.iter().find(|c| key_of(c) == (entity, id)) {
@@ -129,7 +131,7 @@ pub(crate) fn target_for_ref(
     let node = match entity {
         ItemEntity::Obligation => ObligationRepo::new(conn).get(id)?.map(|o| o.node_id),
         ItemEntity::PlanStep => PlanStepRepo::new(conn).get(id)?.map(|s| s.node_id),
-        ItemEntity::Node => unreachable!("handled above"),
+        ItemEntity::Node | ItemEntity::Capabilities => unreachable!("handled above"),
     };
     Ok(node.map(|node| PanelTarget {
         node,
@@ -152,7 +154,7 @@ pub(crate) fn change_markers(
             ItemEntity::PlanStep => {
                 steps.insert(change.id, change.op);
             }
-            ItemEntity::Node => {}
+            ItemEntity::Node | ItemEntity::Capabilities => {}
         }
     }
     (obligations, steps)

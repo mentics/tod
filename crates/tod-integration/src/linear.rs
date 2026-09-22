@@ -161,62 +161,6 @@ impl DataSource for LinearDataSource {
         result_cap_from_config(config).map(|_| ())
     }
 
-    fn validate_config_with_test_query(
-        &self,
-        config: &serde_json::Value,
-        credentials: &HashMap<String, String>,
-    ) -> Result<(), DataSourceError> {
-        // First, do basic validation
-        self.validate_config(config)?;
-
-        // Get API key from credentials
-        let api_key = credentials
-            .get(LINEAR_API_KEY)
-            .ok_or_else(|| DataSourceError::Auth("Linear API key not configured".into()))?;
-
-        // Build filter from config
-        let filter = build_filter_from_config(config)?;
-
-        // Send a test query with first=1 to validate filter syntax
-        let client = build_client()?;
-        let query = r#"
-            query TestFilter($filter: IssueFilter, $first: Int!) {
-                issues(first: $first, filter: $filter) {
-                    nodes {
-                        id
-                    }
-                }
-            }
-        "#;
-
-        let body = serde_json::json!({
-            "query": query,
-            "variables": {
-                "filter": filter,
-                "first": 1,
-            },
-        });
-
-        let response = client
-            .post(LINEAR_GRAPHQL_URL)
-            .headers(build_headers(api_key)?)
-            .json(&body)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .map_err(|e| DataSourceError::Fetch(format!("Test query failed: {}", e)))?;
-
-        let response = check_status(response, "test query failed")?;
-        let status = response.status();
-
-        let payload: GraphQlResponse<serde_json::Value> = response.json().map_err(|e| {
-            DataSourceError::Fetch(format!("Invalid JSON response (HTTP {}): {}", status, e))
-        })?;
-
-        handle_graphql_errors(&payload, status)?;
-
-        Ok(())
-    }
-
     fn fetch(
         &self,
         config: &serde_json::Value,
@@ -304,10 +248,11 @@ pub fn migrate_legacy_filter_keys(config: &mut serde_json::Map<String, serde_jso
 /// The `IssueFilter` fields that filter by a related entity, and how a list
 /// of picked values is expressed for each: the path of object keys down to
 /// the string comparator that takes `{ "in": [...] }`.
-const RELATION_FILTER_PATHS: [(&str, &[&str]); 4] = [
+const RELATION_FILTER_PATHS: [(&str, &[&str]); 5] = [
     ("team", &["key"]),
     ("state", &["name"]),
     ("assignee", &["displayName"]),
+    ("creator", &["displayName"]),
     ("labels", &["some", "name"]),
 ];
 
@@ -662,6 +607,7 @@ fn relation_options_from_response(data: &serde_json::Value) -> HashMap<String, V
         ("team", "teams", "key"),
         ("state", "workflowStates", "name"),
         ("assignee", "users", "displayName"),
+        ("creator", "users", "displayName"),
         ("labels", "issueLabels", "name"),
         ("project", "projects", "name"),
     ];
@@ -1401,6 +1347,7 @@ mod tests {
         assert_eq!(options["team"], vec!["OPS", "TOD"]);
         assert_eq!(options["state"], vec!["Done", "Todo"]);
         assert_eq!(options["assignee"], vec!["sam"]);
+        assert_eq!(options["creator"], vec!["sam"]);
         assert!(options["labels"].is_empty());
     }
 

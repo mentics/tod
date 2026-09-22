@@ -270,15 +270,55 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
                 node_id: id(),
                 capabilities: vec![],
             },
-            None,
+            Some(Edit),
         ),
         (
             M::DisableCapability {
                 node_id: id(),
                 capability: Capability::Spec,
-                archive_payload: String::new(),
             },
-            None,
+            Some(Edit),
+        ),
+        (
+            M::RestoreCapability {
+                node_id: id(),
+                capability: Capability::Spec,
+                archive_id: id(),
+            },
+            Some(Edit),
+        ),
+        (
+            M::SetNodeAgent {
+                node_id: id(),
+                platform: None,
+                model: None,
+                effort: None,
+            },
+            Some(Edit),
+        ),
+        (
+            M::SetNodeFiles {
+                node_id: id(),
+                repo: None,
+                branch: None,
+                use_worktree: false,
+            },
+            Some(Edit),
+        ),
+        (
+            M::SetNodeTicket {
+                node_id: id(),
+                linked_issues: vec![],
+                linked_prs: vec![],
+            },
+            Some(Edit),
+        ),
+        (
+            M::SetNodeTags {
+                node_id: id(),
+                tags: vec![],
+            },
+            Some(Edit),
         ),
         (
             M::CreateObligation {
@@ -488,7 +528,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
                 data_source_type: String::new(),
                 config_json: String::new(),
             },
-            None,
+            Some(Edit),
         ),
         (M::DeleteGeneratorConfig { node_id: id() }, None),
         (
@@ -599,6 +639,14 @@ fn classify_covers_every_mutation_kind() {
                 | M::RemovePlanStepDependency { .. }
                 | M::LinkPlanStepObligation { .. }
                 | M::UnlinkPlanStepObligation { .. } => Entity::PlanStep,
+                M::EnableCapabilities { .. }
+                | M::DisableCapability { .. }
+                | M::RestoreCapability { .. }
+                | M::SetNodeAgent { .. }
+                | M::SetNodeFiles { .. }
+                | M::SetNodeTicket { .. }
+                | M::SetNodeTags { .. }
+                | M::SetGeneratorConfig { .. } => Entity::Capabilities,
                 _ => Entity::Obligation,
             };
             assert_eq!(entity, expected_entity, "{mutation:?}");
@@ -1260,8 +1308,9 @@ fn reversing_a_created_node_offers_its_dependents() {
         depends_on_step_id: step,
     })
     .unwrap();
-    // The capability change is not recorded (D11).
-    assert_eq!(fx.action_count(), 4);
+    // The capability change is recorded, but the change set folds it into
+    // the node it added.
+    assert_eq!(fx.action_count(), 5);
 
     let node_actions = fx.change(node).unwrap().action_ids;
     let obligation_actions = fx.change(o).unwrap().action_ids;
@@ -1287,8 +1336,9 @@ fn reversing_a_created_node_offers_its_dependents() {
     }
     assert!(fx.snap(Entity::Node, node).is_some());
 
+    // The node, its capabilities (folded into it), and the obligation.
     let applied_ids = applied(fx.reverse(node_actions, true, false).unwrap());
-    assert_eq!(applied_ids.len(), 2);
+    assert_eq!(applied_ids.len(), 3);
     assert!(fx.snap(Entity::Node, node).is_none());
     assert!(fx.snap(Entity::Obligation, o).is_none());
     assert_eq!(fx.change(node).unwrap().op, NetOp::Reversed);
@@ -1756,12 +1806,13 @@ fn direct_obligation_edits_are_recorded_and_ctrl_z_reverses_them() {
         summary,
         vec![
             (Entity::Node, ActionKind::Create, ActionActor::User, "user"),
+            (Entity::Capabilities, ActionKind::Edit, ActionActor::User, "user"),
             (Entity::Obligation, ActionKind::Create, ActionActor::User, "user"),
             (Entity::Obligation, ActionKind::Edit, ActionActor::User, "user"),
             (Entity::Obligation, ActionKind::Delete, ActionActor::User, "user"),
         ]
     );
-    let (create, edit, delete) = (&actions[1], &actions[2], &actions[3]);
+    let (create, edit, delete) = (&actions[2], &actions[3], &actions[4]);
     assert!(actions.iter().all(|a| a.conversation_id.is_none()));
     assert_eq!(create.before, None);
     assert_eq!(obligation_body(&create.after), Some("first"));

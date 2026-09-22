@@ -210,8 +210,7 @@ fn treehouse_get_lease(
     paths: &TodPaths,
 ) -> Result<WorktreeHandle> {
     let invocation = TreehouseInvocation::resolve(settings, paths)?;
-    let mut command = Command::new("treehouse");
-    invocation.apply_to(&mut command);
+    let mut command = invocation.command();
     let output = command
         .current_dir(repo)
         .arg("get")
@@ -311,7 +310,7 @@ pub fn ensure_worktree(
                 treehouse_get_lease(repo, lease_holder, settings, paths)?
             }
             WorktreeBackend::TreehouseWithGitFallback => {
-                if treehouse_available() {
+                if treehouse_available(settings) {
                     match treehouse_get_lease(repo, lease_holder, settings, paths) {
                         Ok(h) => h,
                         Err(err) => {
@@ -408,8 +407,7 @@ pub fn treehouse_return(
     paths: &TodPaths,
 ) -> Result<()> {
     let invocation = TreehouseInvocation::resolve(settings, paths)?;
-    let mut command = Command::new("treehouse");
-    invocation.apply_to(&mut command);
+    let mut command = invocation.command();
     let output = command
         .arg("return")
         .arg(worktree)

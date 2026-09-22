@@ -148,6 +148,7 @@ tod stores in general — only about the concepts it will handle.
 | `cli/node.md` | `node` noun |
 | `cli/obligations.md` | `obligations` noun |
 | `cli/plan.md` | `plan` noun |
+| `cli/capabilities.md` | `capabilities` noun (enable, disable, and configure a node's capabilities) |
 | `cli/changeset.md` | `changeset` noun (a conversation's change set and flags) |
 | `cli/visual-design.md` | `visual-design save` (currently inlined in `design/visual-design.md`) |
 
@@ -225,8 +226,8 @@ which surface it is serving.
 
 11 Conversation
   stance/interactive-chat, domain/outline, domain/obligations, domain/plan,
-  domain/lifecycle, cli/intro, cli/node, cli/obligations, cli/plan,
-  cli/content, cli/changeset, surface/conversation
+  domain/lifecycle, domain/capabilities, cli/intro, cli/node,
+  cli/obligations, cli/plan, cli/content, cli/capabilities, cli/changeset, surface/conversation
   dyn: DataRoot, Focus
   (+ per turn: conversation::context::delta; on rotation:
    conversation::context::resume_snapshot)
