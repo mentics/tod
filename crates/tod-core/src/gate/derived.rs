@@ -10,8 +10,9 @@ use rusqlite::Connection;
 use tod_store::fleet::node_actions::{
     FilesDirectory, resolve_agent_for_node, resolve_files_for_node,
 };
+use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::interview::short_id;
-use tod_store::outline::repos::PlanStepRepo;
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::repos::obligations::KIND_REQUIREMENT;
 use tod_store::outline::repos::ObligationRepo;
@@ -58,6 +59,29 @@ pub fn evaluate_derived_criterion(
     }
 }
 
+/// Give the node's Files capability the branch `task/<slug>` when it has
+/// none, so the `ready` → `active` check that requires one always finds it.
+/// The slug is the node's own, even when Files is inherited from an ancestor.
+pub fn generate_missing_branch(fleet: &FleetStore, node_id: Uuid) -> Result<()> {
+    fleet.reload_if_stale().ok();
+    let Some(files) = fleet.resolve_files_for_node(&node_id.to_string())? else {
+        return Ok(());
+    };
+    if files.branch().is_some() {
+        return Ok(());
+    }
+    let Some(node) = fleet.read(|conn| Ok(NodeRepo::new(conn).get(node_id)?))? else {
+        return Ok(());
+    };
+    fleet.enqueue(FleetMutation::UpdateTaskBranch {
+        id: files.source_node_id,
+        branch: Some(format!("task/{}", node.slug)),
+    })?;
+    fleet.writer().flush()?;
+    fleet.reload_if_stale().ok();
+    Ok(())
+}
+
 fn fail(detail: impl Into<String>) -> DerivedOutcome {
     DerivedOutcome {
         outcome: OUTCOME_FAIL,
@@ -81,6 +105,12 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
              directory before starting implementation.",
         ));
     };
+    if files.branch().is_none() {
+        return Ok(fail(format!(
+            "Files on \"{}\" has no branch — set one before starting implementation.",
+            files.source_title
+        )));
+    }
     let directory = match files.directory() {
         FilesDirectory::Ready(path) => path,
         FilesDirectory::NeedsWorktreeSetup => {
@@ -403,6 +433,17 @@ mod tests {
         enable(&store, node, vec![Capability::Agent, Capability::Files]);
         let dir = std::env::temp_dir();
         set_repo(&store, node, &dir.to_string_lossy());
+        let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
+        assert_eq!(outcome.outcome, OUTCOME_FAIL, "no branch");
+        assert!(outcome.detail.contains("branch"), "{}", outcome.detail);
+        generate_missing_branch(&store, node).unwrap();
+        let slug = store
+            .read(|conn| Ok(NodeRepo::new(conn).get(node)?))
+            .unwrap()
+            .unwrap()
+            .slug;
+        let files = store.resolve_files_for_node(&node.to_string()).unwrap().unwrap();
+        assert_eq!(files.branch(), Some(format!("task/{slug}").as_str()));
         let outcome = evaluate(&store, node, READY_ACTIVE_ACTION_CONFIG_SLUG).unwrap();
         assert_eq!(outcome.outcome, OUTCOME_PASS, "{}", outcome.detail);
         assert!(outcome.detail.contains("Ready node"), "{}", outcome.detail);
