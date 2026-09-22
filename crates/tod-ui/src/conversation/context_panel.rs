@@ -321,7 +321,7 @@ impl ConversationView {
 
     /// Enter on a highlighted link.
     pub(super) fn open_highlighted_link(&mut self, cx: &mut Context<Self>) -> bool {
-        let (Some(key), Some(n)) = (self.cursor, self.link) else {
+        let (Some(key), Some(n)) = (self.cursor(), self.link) else {
             return false;
         };
         let Some(ix) = self.data.changes.iter().position(|c| key_of(c) == key) else {
@@ -333,7 +333,7 @@ impl ConversationView {
 
     /// How many links the cursor's row has.
     pub(super) fn cursor_links(&self) -> usize {
-        self.cursor
+        self.cursor()
             .and_then(|k| self.change(k))
             .map_or(0, |c| c.context.len())
     }

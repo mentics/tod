@@ -60,7 +60,7 @@ use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
-use crate::ui::item_list::{ItemList, ItemListEvent};
+use crate::ui::item_list::{ItemList, ItemListEvent, ItemListRow};
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
 use crate::ui::status::{self, StatusSource};
@@ -73,13 +73,13 @@ use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{
     FindingRowEvent, NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost, finding_columns,
 };
-use change_set::{ChangeKey, PendingReverse};
+use change_set::{ChangeGroup, ChangeItem, ChangeKey, PendingReverse};
 use side_pane::FindingItem;
 use context_panel::{ContextPanel, ContextTab};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, ScrollHandle, SharedString, Styled, Subscription,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
     Task, Window, div, px,
 };
 use gpui_component::input::TextareaState;
@@ -203,9 +203,18 @@ impl FocusHistory {
 /// What the change-set rows report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ChangeAction {
-    /// Clicked the row for `changes[ix]`.
-    Select(usize),
-    Toggle(ChangeKey),
+    /// Clicked the row at `row_ix` of whichever list the side pane shows.
+    SelectRow {
+        row_ix: usize,
+    },
+    /// Ticked a change's selection checkbox.
+    ToggleMark {
+        row_ix: usize,
+    },
+    /// Clicked a group heading's chevron.
+    ToggleGroup {
+        key: String,
+    },
     /// Show all of the row, or back to one line.
     Expand(ChangeKey),
     Edit(ChangeKey),
@@ -218,10 +227,6 @@ pub(crate) enum ChangeAction {
     OpenLink {
         ix: usize,
         link: usize,
-    },
-    /// Clicked the review pane's row at `row_ix`.
-    SelectFinding {
-        row_ix: usize,
     },
     /// Clicked a finding's status chip.
     ToggleFindingStatusMenu {
@@ -240,7 +245,7 @@ pub(crate) enum ChangeAction {
 impl From<FindingRowEvent> for ChangeAction {
     fn from(event: FindingRowEvent) -> Self {
         match event {
-            FindingRowEvent::Select { row_ix } => Self::SelectFinding { row_ix },
+            FindingRowEvent::Select { row_ix } => Self::SelectRow { row_ix },
             FindingRowEvent::ToggleStatusMenu { finding_id } => {
                 Self::ToggleFindingStatusMenu { finding_id }
             }
@@ -254,11 +259,12 @@ impl From<FindingRowEvent> for ChangeAction {
 
 impl From<ItemListEvent> for ChangeAction {
     fn from(event: ItemListEvent) -> Self {
+        // One side pane is shown at a time, so both its lists — the findings
+        // and the change set — report through the same actions.
         match event {
-            ItemListEvent::Select { row_ix } => Self::SelectFinding { row_ix },
-            // The findings list is flat and single-select, so it has neither
-            // a group heading to collapse nor a checkbox to tick.
-            ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignore,
+            ItemListEvent::Select { row_ix } => Self::SelectRow { row_ix },
+            ItemListEvent::ToggleGroup { key } => Self::ToggleGroup { key },
+            ItemListEvent::ToggleMark { row_ix } => Self::ToggleMark { row_ix },
         }
     }
 }
@@ -266,7 +272,7 @@ impl From<ItemListEvent> for ChangeAction {
 impl From<ObligationRowEvent> for ChangeAction {
     fn from(event: ObligationRowEvent) -> Self {
         match event {
-            ObligationRowEvent::Select { row_ix } => Self::Select(row_ix),
+            ObligationRowEvent::Select { row_ix } => Self::SelectRow { row_ix },
             ObligationRowEvent::StartEdit { obligation_id } => {
                 Self::Edit((ItemEntity::Obligation, obligation_id))
             }
@@ -278,7 +284,7 @@ impl From<ObligationRowEvent> for ChangeAction {
 impl From<PlanStepRowEvent> for ChangeAction {
     fn from(event: PlanStepRowEvent) -> Self {
         match event {
-            PlanStepRowEvent::Select { row_ix } => Self::Select(row_ix),
+            PlanStepRowEvent::Select { row_ix } => Self::SelectRow { row_ix },
             PlanStepRowEvent::StartEdit { step_id } => Self::Edit((ItemEntity::PlanStep, step_id)),
             // The change set shows compact rows, which carry no status chip.
             PlanStepRowEvent::ToggleStatusMenu { .. }
@@ -291,7 +297,7 @@ impl From<PlanStepRowEvent> for ChangeAction {
 impl From<NodeRowEvent> for ChangeAction {
     fn from(event: NodeRowEvent) -> Self {
         match event {
-            NodeRowEvent::Select { row_ix } => Self::Select(row_ix),
+            NodeRowEvent::Select { row_ix } => Self::SelectRow { row_ix },
             NodeRowEvent::StartEdit { node_id } => Self::Edit((ItemEntity::Node, node_id)),
         }
     }
@@ -425,19 +431,20 @@ pub struct ConversationView {
     obligation_filter: StatusFilter,
 
     change_filter: StatusFilter,
-    cursor: Option<ChangeKey>,
+    /// The change set, on the shared item list: it owns the cursor, the marks
+    /// (Space, and "Reverse selected"), the collapsed node groups, and the
+    /// scrolling.
+    changes: ItemList<ChangeItem, ChangeGroup>,
     /// The highlighted reference link in the cursor's row, while the
     /// keyboard is on the links.
     link: Option<usize>,
-    selected: HashSet<ChangeKey>,
+    /// Changes shown in full, with their field-by-field detail beneath. Not
+    /// the list's business: a row's own disclosure, not its place in the list.
     expanded: HashSet<ChangeKey>,
     editing: Option<ChangeKey>,
     edit_input: Entity<TextareaState>,
     confirm: Option<PendingReverse>,
     host: RowHost<ChangeAction>,
-    change_scroll: ScrollHandle,
-    /// Scroll the cursor's row into view on the next render.
-    scroll_to_cursor: bool,
     context: ContextPanel,
     /// The side pane's obligations list: the real [`ObligationsView`], hosted
     /// embedded, so it edits, reorders and groups exactly as it does on the
@@ -584,19 +591,18 @@ impl ConversationView {
             pending_entries: Vec::new(),
             pending_gate_reloads: Vec::new(),
             change_filter: StatusFilter::default(),
-            cursor: None,
+            // No columns: a change set is a plain list of items of several
+            // kinds, not a table of one value per row.
+            changes: ItemList::new().with_marking(),
             link: None,
-            selected: HashSet::new(),
             expanded: HashSet::new(),
             editing: None,
             edit_input,
             confirm: None,
-            change_scroll: ScrollHandle::new(),
             findings: ItemList::new().with_columns(finding_columns()),
             status_menu: None,
             status_filter: StatusFilter::default(),
             obligation_filter: StatusFilter::default(),
-            scroll_to_cursor: false,
             context,
             side_obligations,
             side_plan,
@@ -747,14 +753,15 @@ impl ConversationView {
         self.conversation_id = conversation;
         if switching {
             self.data = Snapshot::default();
-            self.cursor = None;
+            self.changes.set_cursor_key(None);
+            self.changes.clear_marks();
+            self.changes.expand_all();
             self.findings.set_cursor_key(None);
             self.status_menu = None;
             self.status_filter.clear();
             self.obligation_filter.clear();
             self.side_files.clear();
             self.link = None;
-            self.selected.clear();
             self.expanded.clear();
             self.editing = None;
             self.confirm = None;
@@ -1150,12 +1157,12 @@ impl ConversationView {
         }
         self.data = data;
         let keys: HashSet<ChangeKey> = self.data.changes.iter().map(change_set::key_of).collect();
-        self.selected.retain(|k| keys.contains(k));
         self.expanded.retain(|k| keys.contains(k));
         if self.editing.is_some_and(|k| !keys.contains(&k)) {
             self.editing = None;
         }
-        self.clamp_cursor();
+        // The cursor and the marks follow their keys when the rows are next
+        // rebuilt ([`Self::render_change_set`]); the list owns both.
         // Markers and removed items may have changed.
         self.context.stale = true;
         true
@@ -1168,47 +1175,103 @@ impl ConversationView {
             .find(|c| change_set::key_of(c) == key)
     }
 
+    /// The highlighted change, `None` when the change-set cursor is on a group
+    /// heading. The list owns the cursor and tracks it by key.
+    pub(crate) fn cursor(&self) -> Option<ChangeKey> {
+        self.changes
+            .cursor_item()
+            .map(|item| change_set::key_of(&item.change))
+    }
+
     /// The highlighted change; the context panel follows it.
     pub(crate) fn highlighted_change(&self) -> Option<&NetChange> {
-        self.change(self.cursor?)
+        self.changes.cursor_item().map(|item| &item.change)
     }
 
-    /// Move the change-set highlight. Every cursor change goes through here
-    /// (or [`Self::clamp_cursor`]), so it is where the context panel
-    /// retargets.
+    /// Move the change-set highlight onto `key`'s row. A key whose row is not
+    /// in the list yet (one the store has only just grown) is remembered and
+    /// picked up when the rows are next rebuilt.
     pub(crate) fn set_cursor(&mut self, key: Option<ChangeKey>, cx: &mut Context<Self>) {
-        if self.cursor != key {
-            self.cursor = key;
-            self.link = None;
-            self.scroll_to_cursor = true;
-            if self.editing.is_some() && self.editing != key {
-                self.editing = None;
+        if self.cursor() == key {
+            return;
+        }
+        match key {
+            Some(key) => {
+                let target = change_set::row_key(key);
+                match self
+                    .changes
+                    .rows()
+                    .iter()
+                    .position(|row| row.key() == target.as_str())
+                {
+                    Some(ix) => {
+                        self.changes.set_cursor(ix);
+                    }
+                    None => self.changes.set_cursor_key(Some(target)),
+                }
             }
-            self.follow_cursor();
-            cx.notify();
+            None => self.changes.set_cursor_key(None),
         }
+        self.link = None;
+        if self.editing.is_some() && self.editing != key {
+            self.editing = None;
+        }
+        self.follow_cursor();
+        cx.notify();
     }
 
-    /// Keep the cursor on a visible change.
-    fn clamp_cursor(&mut self) {
-        let visible = self.visible_keys();
-        if self.cursor.is_none_or(|k| !visible.contains(&k)) {
-            self.cursor = visible.first().copied();
-            self.link = None;
-            self.follow_cursor();
-        }
-        if self.link.is_some_and(|n| n >= self.cursor_links()) {
-            self.link = None;
-        }
-    }
-
-    fn visible_keys(&self) -> Vec<ChangeKey> {
-        self.data
+    /// Put the cursor on the first change rather than the group heading above
+    /// it: the change set's cursor is about changes.
+    fn cursor_to_first_change(&mut self) {
+        if let Some(ix) = self
             .changes
+            .rows()
             .iter()
-            .filter(|c| change_set::change_shows(&self.change_filter, c))
-            .map(change_set::key_of)
-            .collect()
+            .position(|row| row.as_item().is_some())
+        {
+            self.changes.set_cursor(ix);
+        }
+    }
+
+    /// The group heading under the change-set cursor, if it is on one.
+    fn cursor_change_group(&self) -> Option<String> {
+        self.changes
+            .cursor_row()
+            .and_then(ItemListRow::as_group)
+            .map(|spec| spec.key.clone())
+    }
+
+    /// Left on a change-set group heading collapses it; `false` leaves the key
+    /// to the links and then to pane navigation.
+    fn collapse_change_group(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pane != Pane::ChangeSet || self.side_list() != side_pane::SideList::ChangeSet {
+            return false;
+        }
+        let Some(key) = self.cursor_change_group() else {
+            return false;
+        };
+        if self.changes.is_collapsed(&key) {
+            return false;
+        }
+        self.changes.toggle_collapsed(&key);
+        cx.notify();
+        true
+    }
+
+    /// Right on a collapsed change-set group heading expands it.
+    fn expand_change_group(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pane != Pane::ChangeSet || self.side_list() != side_pane::SideList::ChangeSet {
+            return false;
+        }
+        let Some(key) = self.cursor_change_group() else {
+            return false;
+        };
+        if !self.changes.is_collapsed(&key) {
+            return false;
+        }
+        self.changes.toggle_collapsed(&key);
+        cx.notify();
+        true
     }
 
     /// Run `command` as the user, showing any error.
@@ -1359,17 +1422,11 @@ impl ConversationView {
                 self.move_side_cursor(delta, cx);
             }
             Pane::ChangeSet => {
-                let keys = self.visible_keys();
-                if keys.is_empty() {
-                    return;
+                if self.changes.move_cursor(delta as i32) {
+                    self.link = None;
+                    self.follow_cursor();
+                    cx.notify();
                 }
-                let ix = self
-                    .cursor
-                    .and_then(|k| keys.iter().position(|v| *v == k))
-                    .map_or(0, |ix| {
-                        (ix as isize + delta).clamp(0, keys.len() as isize - 1)
-                    }) as usize;
-                self.set_cursor(Some(keys[ix]), cx);
             }
         }
     }
@@ -1415,7 +1472,13 @@ impl ConversationView {
                 if self.open_highlighted_link(cx) {
                     return;
                 }
-                if let Some(key) = self.cursor {
+                // On a group heading, Enter collapses or expands it.
+                if let Some(key) = self.cursor_change_group() {
+                    self.changes.toggle_collapsed(&key);
+                    cx.notify();
+                    return;
+                }
+                if let Some(key) = self.cursor() {
                     self.toggle_expanded(key, cx);
                 }
             }
@@ -1443,8 +1506,8 @@ impl ConversationView {
             self.cancel_edit(window, cx);
         } else if self.input_editing {
             self.exit_input_edit(window, cx);
-        } else if !self.selected.is_empty() {
-            self.selected.clear();
+        } else if self.changes.marked_count() > 0 {
+            self.changes.clear_marks();
             cx.notify();
         } else {
             cx.propagate();
@@ -1481,10 +1544,7 @@ impl ConversationView {
                     side_pane::SideList::Plan => {
                         self.side_plan.read(cx).focus_handle(cx).focus(window, cx)
                     }
-                    _ => {
-                        self.clamp_cursor();
-                        self.focus_handle.focus(window, cx);
-                    }
+                    _ => self.focus_handle.focus(window, cx),
                 }
             }
             Pane::Context => {
@@ -1537,7 +1597,7 @@ impl ConversationView {
                 match hosted {
                     Some(focus) => self.open(focus, true, window, cx),
                     None => {
-                        if let Some(key) = self.cursor {
+                        if let Some(key) = self.cursor() {
                             self.talk_about(key, window, cx);
                         }
                     }
@@ -1560,18 +1620,38 @@ impl ConversationView {
     fn drain_row_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for action in self.host.drain() {
             match action {
-                ChangeAction::Select(ix) => {
-                    let key = self.data.changes.get(ix).map(change_set::key_of);
-                    if key.is_some() {
-                        self.pane = Pane::ChangeSet;
-                        self.picker = None;
-                        self.set_cursor(key, cx);
-                        if !self.text_editing() {
-                            self.focus_handle.focus(window, cx);
+                ChangeAction::SelectRow { row_ix } => {
+                    self.pane = Pane::ChangeSet;
+                    self.picker = None;
+                    // One side pane at a time, so the row belongs to whichever
+                    // list that pane shows.
+                    match self.side_list() {
+                        side_pane::SideList::Findings => {
+                            self.findings.set_cursor(row_ix);
+                        }
+                        _ => {
+                            if self.changes.set_cursor(row_ix) {
+                                self.link = None;
+                                if self.editing.is_some() && self.editing != self.cursor() {
+                                    self.editing = None;
+                                }
+                                self.follow_cursor();
+                            }
                         }
                     }
+                    if !self.text_editing() {
+                        self.focus_handle.focus(window, cx);
+                    }
+                    cx.notify();
                 }
-                ChangeAction::Toggle(key) => self.toggle_selected(key, cx),
+                ChangeAction::ToggleMark { row_ix } => {
+                    self.changes.toggle_mark_at(row_ix);
+                    cx.notify();
+                }
+                ChangeAction::ToggleGroup { key } => {
+                    self.changes.toggle_collapsed(&key);
+                    cx.notify();
+                }
                 ChangeAction::Expand(key) => self.toggle_expanded(key, cx),
                 ChangeAction::Edit(key) => {
                     self.set_cursor(Some(key), cx);
@@ -1584,15 +1664,6 @@ impl ConversationView {
                 ChangeAction::OpenLink { ix, link } => {
                     self.link = Some(link);
                     self.open_link(ix, link, cx);
-                }
-                ChangeAction::SelectFinding { row_ix } => {
-                    self.pane = Pane::ChangeSet;
-                    self.picker = None;
-                    self.findings.set_cursor(row_ix);
-                    if !self.text_editing() {
-                        self.focus_handle.focus(window, cx);
-                    }
-                    cx.notify();
                 }
                 ChangeAction::ToggleFindingStatusMenu { finding_id } => {
                     if !self
@@ -1718,12 +1789,18 @@ impl Render for ConversationView {
                 if this.nav_collapse(cx) {
                     return;
                 }
+                if !this.text_editing() && this.collapse_change_group(cx) {
+                    return;
+                }
                 if this.text_editing() || !this.link_left(cx) {
                     cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &ConversationLinkRight, _, cx| {
                 if this.nav_expand(cx) {
+                    return;
+                }
+                if !this.text_editing() && this.expand_change_group(cx) {
                     return;
                 }
                 if this.text_editing() || !this.link_right(cx) {
@@ -1742,9 +1819,10 @@ impl Render for ConversationView {
             .go_forward(window, cx));
         let root = nav_action!(root, cx, ConversationToggleSelect, |this, window, cx| {
             if this.pane == Pane::ChangeSet
-                && let Some(key) = this.cursor
+                && this.side_list() == side_pane::SideList::ChangeSet
             {
-                this.toggle_selected(key, cx)
+                this.changes.toggle_mark();
+                cx.notify();
             }
         });
         let root = nav_action!(root, cx, ConversationReverse, |this, window, cx| {
@@ -1764,7 +1842,7 @@ impl Render for ConversationView {
         });
         let root = nav_action!(root, cx, ConversationClearFlag, |this, window, cx| {
             if this.pane == Pane::ChangeSet
-                && let Some(key) = this.cursor
+                && let Some(key) = this.cursor()
             {
                 this.clear_flag(key, cx)
             }

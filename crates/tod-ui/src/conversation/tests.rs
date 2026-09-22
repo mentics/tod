@@ -1,6 +1,8 @@
 //! ConversationView tests.
 
-use super::change_set::{CHANGE_DELETED, CHANGE_UNSURE, DisplayRow, change_counts, display_rows};
+use super::change_set::{
+    CHANGE_DELETED, CHANGE_UNSURE, ChangeGroup, change_counts, change_rows, node_group_key,
+};
 use crate::ui::status_filter::StatusFilter;
 use super::keyboard::*;
 use super::*;
@@ -352,34 +354,33 @@ fn tabs_count_flags_and_deletions(cx: &mut TestAppContext) {
     let changes = changes(&view, cx);
     assert_eq!(counts(&changes), [1, 1]);
 
-    let all = display_rows(&changes, &StatusFilter::default());
-    assert_eq!(all[0], DisplayRow::Node(fixture.node_id));
-    assert_eq!(
-        all.iter()
-            .filter(|r| matches!(r, DisplayRow::PlanLabel(_)))
-            .count(),
-        1
-    );
-    assert_eq!(
-        all.iter()
-            .filter(|r| matches!(r, DisplayRow::Change(_)))
-            .count(),
-        3
-    );
+    let titles = HashMap::from([(fixture.node_id, "Web client".to_string())]);
+    let items = |rows: &[super::change_set::ChangeRow]| {
+        rows.iter().filter(|r| r.as_item().is_some()).count()
+    };
+    let groups = |rows: &[super::change_set::ChangeRow], want: ChangeGroup| {
+        rows.iter()
+            .filter(|r| r.group_payload() == Some(&want))
+            .count()
+    };
+    let all = change_rows(&changes, &titles, &StatusFilter::default(), |_| false);
+    assert_eq!(all[0].key(), node_group_key(fixture.node_id));
+    assert_eq!(groups(&all, ChangeGroup::Plan(fixture.node_id)), 1);
+    assert_eq!(items(&all), 3);
     let mut filter = StatusFilter::default();
     filter.toggle(CHANGE_DELETED);
-    let deleted = display_rows(&changes, &filter);
+    let deleted = change_rows(&changes, &titles, &filter, |_| false);
     assert_eq!(deleted.len(), 2);
     // Unsure and deleted together show either kind.
     filter.toggle(CHANGE_UNSURE);
-    let either = display_rows(&changes, &filter);
-    assert_eq!(
-        either
-            .iter()
-            .filter(|r| matches!(r, DisplayRow::Change(_)))
-            .count(),
-        2
-    );
+    let either = change_rows(&changes, &titles, &filter, |_| false);
+    assert_eq!(items(&either), 2);
+    // A collapsed node group hides its run, heading and all.
+    let collapsed = change_rows(&changes, &titles, &StatusFilter::default(), |key| {
+        key == node_group_key(fixture.node_id)
+    });
+    assert_eq!(collapsed.len(), 1);
+    assert_eq!(items(&collapsed), 0);
 
     // 2 toggles Unsure on; the cursor lands on the flagged item and F clears it.
     view.update_in(cx, |view, window, cx| {
@@ -388,12 +389,83 @@ fn tabs_count_flags_and_deletions(cx: &mut TestAppContext) {
     cx.dispatch_action(ConversationTabUnsure);
     draw(cx);
     assert_eq!(
-        view.read_with(cx, |v, _| v.cursor),
+        view.read_with(cx, |v, _| v.cursor()),
         Some((ItemEntity::Obligation, fixture.offline_obligation))
     );
     cx.dispatch_action(ConversationClearFlag);
     let changes = self::changes(&view, cx);
     assert_eq!(counts(&changes), [0, 1]);
+}
+
+/// Two changes on the fixture's node: a reworded obligation and a renamed
+/// plan step.
+fn two_changes(fixture: &Fixture) -> Uuid {
+    let conversation = create_conversation(fixture, Focus::Node(fixture.node_id));
+    agent_edit(
+        fixture,
+        conversation,
+        reword(fixture.offline_obligation, "Works offline for a day"),
+    );
+    agent_edit(fixture, conversation, rename_step(fixture, 0, "Build it"));
+    conversation
+}
+
+#[gpui::test]
+fn space_marks_a_change_and_reverse_acts_on_the_marks(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    two_changes(&fixture);
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    view.update_in(cx, |view, window, cx| {
+        view.focus_pane(Pane::ChangeSet, window, cx)
+    });
+    draw(cx);
+    // The cursor starts on the first change, not on the heading above it.
+    assert_eq!(
+        view.read_with(cx, |v, _| v.cursor()),
+        Some((ItemEntity::Obligation, fixture.offline_obligation))
+    );
+
+    cx.dispatch_action(ConversationToggleSelect);
+    draw(cx);
+    assert_eq!(view.read_with(cx, |v, _| v.changes.marked_count()), 1);
+
+    // R reverses the marked change and nothing else, and clears the marks.
+    cx.dispatch_action(ConversationReverse);
+    draw(cx);
+    let changes = self::changes(&view, cx);
+    let op = |id: Uuid| changes.iter().find(|c| c.id == id).map(|c| c.op);
+    assert_eq!(op(fixture.offline_obligation), Some(NetOp::Reversed));
+    assert_eq!(op(fixture.steps[0]), Some(NetOp::Edited));
+    assert_eq!(view.read_with(cx, |v, _| v.changes.marked_count()), 0);
+}
+
+#[gpui::test]
+fn a_change_set_group_collapses_from_the_keyboard(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    two_changes(&fixture);
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    view.update_in(cx, |view, window, cx| {
+        view.focus_pane(Pane::ChangeSet, window, cx)
+    });
+    draw(cx);
+    let rows = |cx: &mut VisualTestContext| view.read_with(cx, |v, _| v.changes.len());
+    let all = rows(cx);
+    assert!(all > 2, "the node heading, the plan heading and two changes");
+
+    // Up onto the node's heading, which Left collapses and Right opens.
+    cx.dispatch_action(ConversationUp);
+    draw(cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| v.changes.cursor_group().copied()),
+        Some(ChangeGroup::Node(fixture.node_id))
+    );
+    cx.simulate_keystrokes("left");
+    draw(cx);
+    assert_eq!(rows(cx), 1);
+    assert_eq!(view.read_with(cx, |v, _| v.pane), Pane::ChangeSet);
+    cx.simulate_keystrokes("right");
+    draw(cx);
+    assert_eq!(rows(cx), all);
 }
 
 #[gpui::test]
@@ -973,10 +1045,25 @@ mod context {
             })
         );
 
-        // Moving the highlight moves the panel, tab included.
+        // Moving the highlight moves the panel, tab included. The plan is a
+        // group of its own, so its heading is a stop on the way — a heading is
+        // not a change, and the panel stays on the last one.
         cx.dispatch_action(ConversationDown);
         draw(cx);
-        assert_eq!(view.read_with(cx, |v, _| v.cursor), Some(step));
+        view.read_with(cx, |v, _| {
+            assert_eq!(v.cursor(), None);
+            assert_eq!(
+                v.changes.cursor_group(),
+                Some(&ChangeGroup::Plan(fixture.node_id))
+            );
+        });
+        assert_eq!(
+            target(&view, cx),
+            Some(item(n, ContextTab::Obligations, fixture.offline_obligation))
+        );
+        cx.dispatch_action(ConversationDown);
+        draw(cx);
+        assert_eq!(view.read_with(cx, |v, _| v.cursor()), Some(step));
         assert_eq!(
             target(&view, cx),
             Some(item(n, ContextTab::Plan, fixture.steps[1]))
@@ -1018,6 +1105,9 @@ mod context {
         cx.simulate_keystrokes("ctrl-i");
         draw(cx);
         assert!(!view.read_with(cx, |v, _| v.context.open));
+        // Back past the plan's heading to the obligation.
+        cx.dispatch_action(ConversationUp);
+        draw(cx);
         cx.dispatch_action(ConversationUp);
         draw(cx);
         cx.dispatch_action(ConversationToggleContext);
@@ -1421,7 +1511,7 @@ fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
     cx.dispatch_action(ItemListUp);
     assert_eq!(at(cx), Some(fixture.steps[steps - 2]));
     // The change set's own cursor is untouched.
-    assert_eq!(view.read_with(cx, |v, _| v.cursor), None);
+    assert_eq!(view.read_with(cx, |v, _| v.cursor()), None);
 }
 
 #[gpui::test]

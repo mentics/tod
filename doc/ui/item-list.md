@@ -23,7 +23,7 @@ Every list feature the app needs exists somewhere, and no list has all of them.
 | Obligations panel (`views/obligations/`) | 3 levels | full | single | inline | — | — |
 | Conversation side pane, obligations (`conversation/side_pane.rs:605`) | — | — | — | — | — | — |
 | Review findings, conversation side pane (`views/rows/finding_row.rs`) | — | cursor | — | status only | — | — |
-| Change set (`conversation/change_set.rs`) | 1 level | cursor | multi | inline | — | — |
+| Change set (`conversation/change_set.rs`) | 2 levels | full | multi | inline | — | — |
 | Plan steps, panel and conversation side pane (`views/plan_steps/`) | — | full | single | inline | — | — |
 | Command history, agent transcripts, database | — | up/down | single | — | — | — |
 
@@ -215,9 +215,20 @@ the component, so no view sets a heading's colour, weight or indent itself.
    wherever it is shown, and the pane's hand-rolled `side_cursor` is gone. The
    conversation view keeps its own Up/Down/Enter dispatch and drives the list
    with it, since the pane is one of several the view routes between; the list
-   is the state and the rows, not the key set. Next the change set, which
-   brings multi-select and row buttons in.
-5. Move over command history, agent transcripts, and the database view.
+   is the state and the rows, not the key set.
+5. **Done.** Move the change set onto the component. It is the first list to
+   use `with_marking()`: Space and the row checkbox mark, and "Reverse
+   selected" works on `ItemList::selection`, which falls back to the cursor so
+   R reverses "this one" without a marking step. Its node headings became real
+   group headings, and the "Plan" label a group nested inside one, so both
+   collapse — which also makes them cursor stops, as they are in every other
+   list. The change set declares **no columns**: its rows are nodes,
+   obligations, plan steps and capability changes, and the one thing they all
+   have is the operation, which is a leading icon rather than a value to line
+   up. A row's own disclosure — showing a change in full with its
+   field-by-field detail — stays the view's, since it is about the row's
+   content, not its place in the list.
+6. Move over command history, agent transcripts, and the database view.
 
 Each step is complete on its own; the list of views above is the checklist.
 

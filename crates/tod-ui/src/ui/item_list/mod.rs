@@ -381,7 +381,9 @@ impl<T, G> ItemList<T, G> {
 
     /// Replace the rows, keeping the cursor on the same *key* rather than the
     /// same index, so a change that reorders rows does not move it. Falls back
-    /// to the first row. Selection drops keys that are gone.
+    /// to the first row. Marks are held by key too and survive the swap: a row
+    /// that is gone counts for nothing (see [`Self::marked_count`]), and one
+    /// that a collapsed group merely hid is marked again when it comes back.
     pub fn set_rows(&mut self, rows: Vec<ItemListRow<T, G>>) {
         let previous = self.cursor;
         let ix = self
@@ -400,8 +402,6 @@ impl<T, G> ItemList<T, G> {
                 self.cursor_key = None;
             }
         }
-        self.marked
-            .retain(|key| self.rows.iter().any(|row| row.key() == key.as_str()));
         if let Some(ix) = self.cursor {
             if previous != Some(ix) {
                 self.scroll.scroll_to_item(ix);
@@ -539,8 +539,20 @@ impl<T, G> ItemList<T, G> {
         }
     }
 
+    /// How many of the rows *present* are marked. A mark is held by key, so a
+    /// row a collapsed group hides keeps its mark and gets it back when the
+    /// group opens; while it is hidden it counts for nothing, and neither does
+    /// a mark on a row that is gone for good.
     pub fn marked_count(&self) -> usize {
-        self.marked.len()
+        self.marked_rows().count()
+    }
+
+    fn marked_rows(&self) -> impl Iterator<Item = &str> {
+        self.rows
+            .iter()
+            .filter(|row| row.as_item().is_some())
+            .map(ItemListRow::key)
+            .filter(|key| self.marked.contains(*key))
     }
 
     pub fn is_marked(&self, key: &str) -> bool {
@@ -552,19 +564,14 @@ impl<T, G> ItemList<T, G> {
     /// "this one" without a marking step. Empty when the cursor is on a group
     /// heading and nothing is marked.
     pub fn selection(&self) -> Vec<&str> {
-        if self.marked.is_empty() {
-            return self
-                .cursor_row()
-                .filter(|row| row.as_item().is_some())
-                .map(ItemListRow::key)
-                .into_iter()
-                .collect();
+        let marked: Vec<&str> = self.marked_rows().collect();
+        if !marked.is_empty() {
+            return marked;
         }
-        self.rows
-            .iter()
+        self.cursor_row()
             .filter(|row| row.as_item().is_some())
             .map(ItemListRow::key)
-            .filter(|key| self.marked.contains(*key))
+            .into_iter()
             .collect()
     }
 
@@ -1026,8 +1033,34 @@ mod tests {
         list.move_cursor(3);
         list.toggle_mark();
         list.set_rows(vec![ItemListRow::item("b", "Syncs later")]);
-        assert!(!list.is_marked("a"));
+        assert_eq!(list.marked_count(), 0);
         assert_eq!(list.selection(), vec!["b"]);
+    }
+
+    #[test]
+    fn a_mark_survives_the_row_being_hidden_and_shown_again() {
+        let rows = || {
+            vec![
+                ItemListRow::heading(GroupSpec::new("section", 0, "Offline").count(2)),
+                ItemListRow::item("a", "Works offline"),
+                ItemListRow::item("b", "Syncs later"),
+            ]
+        };
+        let mut list: ItemList<&'static str> = ItemList::new();
+        list.set_rows(rows());
+        list.move_cursor(1);
+        list.toggle_mark();
+        assert_eq!(list.selection(), vec!["a"]);
+
+        // What a collapsed group does: its items are not passed in this time.
+        list.set_rows(vec![ItemListRow::heading(
+            GroupSpec::new("section", 0, "Offline").count(2),
+        )]);
+        assert_eq!(list.marked_count(), 0);
+
+        list.set_rows(rows());
+        assert_eq!(list.marked_count(), 1);
+        assert_eq!(list.selection(), vec!["a"]);
     }
 
     #[test]

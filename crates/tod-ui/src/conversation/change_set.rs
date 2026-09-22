@@ -1,6 +1,7 @@
 //! The change-set pane: everything the conversation changed, grouped by node,
 //! with reversal, inline edits, and unsure flags.
 
+use crate::ui::item_list::{GroupSpec, ItemListRow, ItemRowState};
 use crate::ui::status_filter::{StatusFilter, render_status_filter};
 use super::context_panel::link_label;
 use super::{ChangeAction, ConversationView, Pane};
@@ -12,13 +13,11 @@ use crate::views::rows::{
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Context, ElementId, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, Context, ElementId, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
 };
 use gpui_component::RopeExt;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::scroll::Scrollbar;
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
@@ -105,22 +104,58 @@ pub(crate) fn change_counts(changes: &[NetChange]) -> Vec<(String, usize)> {
     ]
 }
 
-/// One line of the change-set list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DisplayRow {
-    /// A node group's heading.
-    Node(Uuid),
-    /// The "Plan" label before a group's plan steps.
-    PlanLabel(Uuid),
-    /// `changes[ix]`.
-    Change(usize),
+/// One change in the item list. A change carries everything its row shows
+/// except where it sits in the snapshot, which its reference links need.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeItem {
+    pub change: NetChange,
+    /// Its index in `Snapshot::changes`, for [`ChangeAction::OpenLink`].
+    pub ix: usize,
 }
 
-/// The changes `filter` lets through, grouped by node, in the order
-/// `net_changes` gives.
-pub(crate) fn display_rows(changes: &[NetChange], filter: &StatusFilter) -> Vec<DisplayRow> {
+/// What a group heading in the change set stands for: the node a run of
+/// changes is about, and that node's plan within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChangeGroup {
+    Node(Uuid),
+    Plan(Uuid),
+}
+
+pub(crate) type ChangeRow = ItemListRow<ChangeItem, ChangeGroup>;
+
+/// A change's key in the item list, which tracks the cursor and the marks by
+/// key rather than by index.
+pub(crate) fn row_key(key: ChangeKey) -> String {
+    let entity = match key.0 {
+        ItemEntity::Node => "node",
+        ItemEntity::Obligation => "obligation",
+        ItemEntity::PlanStep => "step",
+        ItemEntity::Capabilities => "capabilities",
+    };
+    format!("{entity}:{}", key.1)
+}
+
+pub(crate) fn node_group_key(node: Uuid) -> String {
+    format!("group-node:{node}")
+}
+
+pub(crate) fn plan_group_key(node: Uuid) -> String {
+    format!("group-plan:{node}")
+}
+
+/// The changes `filter` lets through, grouped by node and, within a node, by
+/// its plan, in the order `net_changes` gives. `collapsed` answers whether a
+/// group heading's run is hidden.
+pub(crate) fn change_rows(
+    changes: &[NetChange],
+    titles: &HashMap<Uuid, String>,
+    filter: &StatusFilter,
+    collapsed: impl Fn(&str) -> bool,
+) -> Vec<ChangeRow> {
     let mut rows = Vec::new();
     let mut group: Option<Option<Uuid>> = None;
+    let mut node_hidden = false;
+    let mut plan_hidden = false;
     let mut plan_labelled = false;
     for (ix, change) in changes.iter().enumerate() {
         if !change_shows(filter, change) {
@@ -130,17 +165,44 @@ pub(crate) fn display_rows(changes: &[NetChange], filter: &StatusFilter) -> Vec<
         if group != Some(node) {
             group = Some(node);
             plan_labelled = false;
+            plan_hidden = false;
+            node_hidden = false;
             if let Some(node) = node {
-                rows.push(DisplayRow::Node(node));
+                let key = node_group_key(node);
+                node_hidden = collapsed(&key);
+                let title = titles.get(&node).cloned().unwrap_or_default();
+                rows.push(ItemListRow::group(
+                    GroupSpec::new(key, 0, title).collapsed(node_hidden),
+                    ChangeGroup::Node(node),
+                ));
             }
         }
-        if change.entity == ItemEntity::PlanStep && !plan_labelled {
-            plan_labelled = true;
-            if let Some(node) = node {
-                rows.push(DisplayRow::PlanLabel(node));
+        if node_hidden {
+            continue;
+        }
+        if change.entity == ItemEntity::PlanStep {
+            if !plan_labelled {
+                plan_labelled = true;
+                if let Some(node) = node {
+                    let key = plan_group_key(node);
+                    plan_hidden = collapsed(&key);
+                    rows.push(ItemListRow::group(
+                        GroupSpec::new(key, 1, "Plan").collapsed(plan_hidden),
+                        ChangeGroup::Plan(node),
+                    ));
+                }
+            }
+            if plan_hidden {
+                continue;
             }
         }
-        rows.push(DisplayRow::Change(ix));
+        rows.push(ItemListRow::item(
+            row_key(key_of(change)),
+            ChangeItem {
+                change: change.clone(),
+                ix,
+            },
+        ));
     }
     rows
 }
@@ -335,30 +397,30 @@ impl ConversationView {
             }
         }
         self.pane = Pane::ChangeSet;
-        self.clamp_cursor();
-        self.scroll_to_cursor = true;
         cx.notify();
     }
 
-    pub(super) fn toggle_selected(&mut self, key: ChangeKey, cx: &mut Context<Self>) {
-        if !self.selected.remove(&key) {
-            self.selected.insert(key);
-        }
-        cx.notify();
+    /// The changes an action works on: the marked ones, or else the
+    /// highlighted one. The list decides which ([`ItemList::selection`]); this
+    /// turns its keys back into changes.
+    pub(super) fn marked_changes(&self) -> Vec<ChangeKey> {
+        let marked: std::collections::HashSet<&str> =
+            self.changes.selection().into_iter().collect();
+        self.changes
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                ItemListRow::Item { key, item } if marked.contains(key.as_str()) => {
+                    Some(key_of(&item.change))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// R: the selection, or else the highlighted change.
     pub(super) fn reverse_selection(&mut self, cx: &mut Context<Self>) {
-        let keys: Vec<ChangeKey> = if self.selected.is_empty() {
-            self.cursor.into_iter().collect()
-        } else {
-            self.data
-                .changes
-                .iter()
-                .map(key_of)
-                .filter(|k| self.selected.contains(k))
-                .collect()
-        };
+        let keys = self.marked_changes();
         self.reverse_keys(keys, cx);
     }
 
@@ -411,7 +473,7 @@ impl ConversationView {
         match serde_json::from_value::<ReverseOutcome>(value) {
             Ok(ReverseOutcome::Applied { new_action_ids }) => {
                 self.confirm = None;
-                self.selected.clear();
+                self.changes.clear_marks();
                 let n = new_action_ids.len();
                 self.status_line =
                     format!("Reversed {n} action{}", if n == 1 { "" } else { "s" }).into();
@@ -463,7 +525,7 @@ impl ConversationView {
 
     /// E: edit the highlighted change's text in place.
     pub(super) fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(key) = self.cursor else {
+        let Some(key) = self.cursor() else {
             return;
         };
         let Some(text) = self
@@ -544,65 +606,50 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let active = self.pane == Pane::ChangeSet;
-        let rows = display_rows(&self.data.changes, &self.change_filter);
-        if std::mem::take(&mut self.scroll_to_cursor)
-            && let Some(cursor) = self.cursor
-            && let Some(ix) = rows.iter().position(|r| {
-                matches!(r, DisplayRow::Change(ix)
-                    if self.data.changes.get(*ix).map(key_of) == Some(cursor))
-            })
-        {
-            self.change_scroll.scroll_to_item(ix);
+        let rows = change_rows(
+            &self.data.changes,
+            &self.data.node_titles,
+            &self.change_filter,
+            |key| self.changes.is_collapsed(key),
+        );
+        // The list keeps the cursor on its key; when that row is gone (a
+        // filter, a reversal) it falls back to the first row, which for the
+        // change set means the first change rather than a group heading.
+        let kept = self
+            .changes
+            .cursor_key()
+            .is_some_and(|key| rows.iter().any(|row| row.key() == key));
+        let empty = rows.is_empty();
+        self.changes.set_rows(rows);
+        if !kept {
+            self.cursor_to_first_change();
+            // Only when the cursor was carried elsewhere: the panel may be
+            // showing a link's target, which the cursor's own item must not
+            // overwrite.
+            self.follow_cursor();
+        }
+        if self.link.is_some_and(|n| n >= self.cursor_links()) {
+            self.link = None;
         }
 
-        let mut list: Vec<AnyElement> = Vec::new();
-        for row in &rows {
-            list.push(match *row {
-                DisplayRow::Node(node) => {
-                    let title = self
-                        .data
-                        .node_titles
-                        .get(&node)
-                        .cloned()
-                        .unwrap_or_default();
-                    style::text_dense_muted(h_flex())
-                        .pt(style::space::RELATED)
-                        .px(style::space::RELATED)
-                        .gap(style::space::INLINE)
-                        .child(Icon::new(IconName::Folder).xsmall())
-                        .child(
-                            selectable_text(
-                                ElementId::Name(format!("change-group-{node}").into()),
-                                title,
-                                window,
-                                cx,
-                            )
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .overflow_hidden(),
-                        )
-                        .into_any_element()
-                }
-                DisplayRow::PlanLabel(_) => style::text_dense_muted(div())
-                    .px(style::space::RELATED)
-                    .pt(style::space::INLINE)
-                    .child("Plan")
-                    .into_any_element(),
-                DisplayRow::Change(ix) => self.render_change_row(ix, window, cx),
-            });
-        }
-        if list.is_empty() {
-            list.push(
-                style::empty_message(div())
-                    .p(style::space::INSET)
-                    .child(if self.data.changes.is_empty() {
-                        "No changes yet"
-                    } else {
-                        "No changes in the chosen filters"
-                    })
-                    .into_any_element(),
-            );
-        }
+        let list = if empty {
+            style::empty_message(div())
+                .p(style::space::INSET)
+                .child(if self.data.changes.is_empty() {
+                    "No changes yet"
+                } else {
+                    "No changes in the chosen filters"
+                })
+                .into_any_element()
+        } else {
+            self.changes.render(
+                "change-set-list",
+                &self.host,
+                |item, state, window, cx| self.render_change_item(item, state, window, cx),
+                window,
+                cx,
+            )
+        };
 
         let filter = render_status_filter(
             "change-set",
@@ -612,12 +659,12 @@ impl ConversationView {
             cx,
         );
 
-        let selected = self.selected.len();
+        let selected = self.changes.marked_count();
         let can_reverse_all = self.data.changes.iter().any(|c| c.op != NetOp::Reversed);
         let hint: SharedString = if selected > 0 {
-            format!("{selected} selected").into()
+            format!("{selected} selected · R reverses them · Space deselects").into()
         } else {
-            "Enter show all · Space select · R reverse · E edit · F clear flag · → links · Ctrl+I context · Ctrl+J talk about it"
+            "Enter show all · Space select · R reverse · E edit · F clear flag · ←/→ groups, links · Ctrl+I context · Ctrl+J talk about it"
                 .into()
         };
 
@@ -639,34 +686,7 @@ impl ConversationView {
                     ),
             )
             .children(filter)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        v_flex()
-                            .id("change-set-list")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.change_scroll)
-                            .px(style::space::RELATED)
-                            .pb(style::space::RELATED)
-                            .children(list),
-                    )
-                    .child(
-                        // A narrow strip, so the scrollbar's click handler
-                        // does not cover the rows.
-                        div()
-                            .occlude()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(gpui::px(16.))
-                            .child(Scrollbar::vertical(&self.change_scroll)),
-                    ),
-            )
+            .child(list)
             .child(
                 style::panel_footer(h_flex())
                     .items_center()
@@ -698,24 +718,21 @@ impl ConversationView {
             .into_any_element()
     }
 
-    fn render_change_row(
-        &mut self,
-        ix: usize,
+    /// One change, for the item list. The list owns the row's selection
+    /// checkbox, its highlight and its place; this is what the change *is*.
+    fn render_change_item(
+        &self,
+        item: &ChangeItem,
+        state: ItemRowState<'_>,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
-        let change = self.data.changes[ix].clone();
-        let key = key_of(&change);
-        let highlighted = self.cursor == Some(key);
+        let change = &item.change;
+        let key = key_of(change);
+        let ix = state.row_ix;
+        let highlighted = state.highlighted;
         let host = self.host.clone();
 
-        let checkbox = Checkbox::new(("change-select", ix))
-            .checked(self.selected.contains(&key))
-            .tab_stop(false)
-            .on_click({
-                let host = host.clone();
-                move |_, _, cx| host.push(ChangeAction::Toggle(key), cx)
-            });
         let expanded = self.expanded.contains(&key);
         let disclosure = style::text_muted(div())
             .id(("change-expand", ix))
@@ -735,7 +752,7 @@ impl ConversationView {
             .on_mouse_down(MouseButton::Left, {
                 let host = host.clone();
                 move |_, _, cx| {
-                    host.push(ChangeAction::Select(ix), cx);
+                    host.push(ChangeAction::SelectRow { row_ix: ix }, cx);
                     host.push(ChangeAction::Expand(key), cx);
                     cx.stop_propagation();
                 }
@@ -745,7 +762,6 @@ impl ConversationView {
             .items_center()
             .gap(style::space::INLINE)
             .child(disclosure)
-            .child(checkbox)
             .child(op_icon(("change-op", ix), change.op))
             .into_any_element();
 
@@ -814,7 +830,7 @@ impl ConversationView {
             compact: true,
             wrap: expanded,
             leading: Some(leading),
-            trailing_context: self.render_context_refs(ix, &change, window, cx),
+            trailing_context: self.render_context_refs(item, ix, highlighted, window, cx),
             actions,
             detail: None,
             struck: matches!(change.op, NetOp::Deleted | NetOp::Reversed),
@@ -823,7 +839,7 @@ impl ConversationView {
         let editor = (self.editing == Some(key)).then_some(&self.edit_input);
         let row = match change.entity {
             ItemEntity::Node => {
-                let title = snapshot_of(&change).map(|s| s.text()).unwrap_or_default();
+                let title = snapshot_of(change).map(|s| s.text()).unwrap_or_default();
                 node_row(
                     NodeRowProps {
                         node_id: change.id,
@@ -840,7 +856,7 @@ impl ConversationView {
                 )
             }
             ItemEntity::Capabilities => {
-                let title = capabilities_title(&change);
+                let title = capabilities_title(change);
                 node_row(
                     NodeRowProps {
                         node_id: change.id,
@@ -856,7 +872,7 @@ impl ConversationView {
                     cx,
                 )
             }
-            ItemEntity::Obligation => match obligation_of(&change) {
+            ItemEntity::Obligation => match obligation_of(change) {
                 Some(obligation) => obligation_row(
                     ObligationRowProps {
                         obligation: &obligation,
@@ -871,7 +887,7 @@ impl ConversationView {
                 ),
                 None => div().into_any_element(),
             },
-            ItemEntity::PlanStep => match plan_step_of(&change) {
+            ItemEntity::PlanStep => match plan_step_of(change) {
                 Some(step) => plan_step_row(
                     PlanStepRowProps {
                         // The compact change-set line is one line, not a table.
@@ -895,7 +911,7 @@ impl ConversationView {
             },
         };
         match expanded
-            .then(|| self.render_detail(ix, &change, window, cx))
+            .then(|| self.render_detail(item, window, cx))
             .flatten()
         {
             Some(detail) => v_flex()
@@ -912,15 +928,20 @@ impl ConversationView {
     /// highlighted link (`self.link`) is drawn highlighted.
     fn render_context_refs(
         &self,
-        ix: usize,
-        change: &NetChange,
+        item: &ChangeItem,
+        row_ix: usize,
+        highlighted_row: bool,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<AnyElement> {
+        let change = &item.change;
         if change.context.is_empty() {
             return None;
         }
-        let highlighted = (self.pane == Pane::ChangeSet && self.cursor == Some(key_of(change)))
+        // A link addresses its change by where it sits in the snapshot, which
+        // is not where its row sits in the list.
+        let change_ix = item.ix;
+        let highlighted = (self.pane == Pane::ChangeSet && highlighted_row)
             .then_some(self.link)
             .flatten();
         let mut el = h_flex().items_center().gap(style::space::INLINE);
@@ -928,21 +949,27 @@ impl ConversationView {
             let label = link_label(&reference.target).to_string();
             let host = self.host.clone();
             let link = div()
-                .id(ElementId::Name(format!("change-link-{ix}-{n}").into()))
+                .id(ElementId::Name(format!("change-link-{row_ix}-{n}").into()))
                 .flex_shrink_0()
                 .px(style::space::HAIRLINE)
                 .cursor_pointer()
                 // Before the row's own mouse-down selects it, so the link
                 // wins over the row's item in the context panel.
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    host.push(ChangeAction::Select(ix), cx);
-                    host.push(ChangeAction::OpenLink { ix, link: n }, cx);
+                    host.push(ChangeAction::SelectRow { row_ix }, cx);
+                    host.push(
+                        ChangeAction::OpenLink {
+                            ix: change_ix,
+                            link: n,
+                        },
+                        cx,
+                    );
                     cx.stop_propagation();
                 })
                 .when(highlighted == Some(n), style::highlighted)
                 .child(style::text_link(
                     selectable_text(
-                        ElementId::Name(format!("change-ref-{ix}-{n}").into()),
+                        ElementId::Name(format!("change-ref-{row_ix}-{n}").into()),
                         label,
                         window,
                         cx,
@@ -960,11 +987,12 @@ impl ConversationView {
     /// there is neither.
     fn render_detail(
         &self,
-        ix: usize,
-        change: &NetChange,
+        item: &ChangeItem,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<AnyElement> {
+        let change = &item.change;
+        let ix = item.ix;
         let diffs = field_diffs(
             change.before.as_ref(),
             change.current.as_ref(),
