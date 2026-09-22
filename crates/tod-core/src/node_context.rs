@@ -21,11 +21,10 @@ use rusqlite::Connection;
 use std::fmt::Write as _;
 use std::path::Path;
 use tod_store::interview::short_id;
-use tod_store::outline::references::referenced_node_ids;
-use tod_store::outline::repos::{NodeRepo, ObligationRepo, PlanStepRepo};
+use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::{
     Capability, KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, PlanStep, ancestor_chain,
-    phase_visible, resolve_obligations,
+    resolve_obligations,
 };
 use uuid::Uuid;
 
@@ -177,15 +176,9 @@ pub fn obligation_line(o: &NodeObligation) -> String {
 /// ancestor's scope a descendant gets: its details and requirements are never
 /// listed, since a deep tree would otherwise put hundreds of unrelated rows
 /// into every context. An ancestor still without a summary gets a pointer to
-/// `tod-cli` instead.
-///
-/// Then each component the node's obligations reference with `[[slug]]`
-/// (the `node_references` edges), rendered the same way: a user of a
-/// component builds on its constraints as it does on an ancestor's, and a
-/// change to either reaches it as an incoming change
-/// (`doc/conversation/incoming-changes.md` §2, §3). A component that is also an
-/// ancestor is shown once, as an ancestor. This never includes anything of
-/// `node_id`'s own — callers show that separately.
+/// `tod-cli` instead. Components the node references with `[[slug]]` are not
+/// inherited: an agent looks one up when it needs it. This never includes
+/// anything of `node_id`'s own — callers show that separately.
 pub fn render_inherited_context(
     conn: &Connection,
     nodes: &NodeRepo<'_>,
@@ -200,56 +193,28 @@ pub fn render_inherited_context(
             .or_default()
             .push(item.obligation);
     }
-    let chain = ancestor_chain(conn, node_id)?;
     let mut ancestors = String::new();
-    for source_id in chain.iter().copied().filter(|id| *id != node_id) {
+    for source_id in ancestor_chain(conn, node_id)?
+        .into_iter()
+        .filter(|id| *id != node_id)
+    {
         let items = groups.remove(&source_id).unwrap_or_default();
         write_inherited_source(&mut ancestors, nodes, source_id, &items)?;
     }
 
-    let mut components: Vec<(String, Uuid)> = referenced_node_ids(conn, node_id)?
-        .into_iter()
-        .filter(|id| !chain.contains(id))
-        .map(|id| (node_title(nodes, id), id))
-        .collect();
-    components.sort();
-    let mut referenced = String::new();
-    for (_, source_id) in components {
-        let items: Vec<NodeObligation> = ObligationRepo::new(conn)
-            .list_for_node(source_id)?
-            .into_iter()
-            .filter(|o| max_phase.is_none_or(|m| phase_visible(&o.phase, m)))
-            .collect();
-        write_inherited_source(&mut referenced, nodes, source_id, &items)?;
+    if ancestors.is_empty() {
+        return Ok(String::new());
     }
 
     let mut out = String::new();
-    if !ancestors.is_empty() {
-        out.push_str(
-            "
-## Inherited context (ancestors)
-
-",
-        );
-        out.push_str(
-            "Each ancestor below is summarized, not fully restated — its scope              is settled and out of bounds here. Only decide what belongs to              *this* node; a gap in an ancestor's own scope belongs on that              ancestor, not as a question or obligation on this node.
-",
-        );
-        out.push_str(&ancestors);
-    }
-    if !referenced.is_empty() {
-        out.push_str(
-            "
-## Referenced components
-
-",
-        );
-        out.push_str(
-            "This node's obligations reference the components below with              `[[slug]]`. Each is summarized with its constraints, which hold              wherever it is used; a gap in a component belongs on that              component, not on this node.
-",
-        );
-        out.push_str(&referenced);
-    }
+    out.push_str("\n## Inherited context (ancestors)\n\n");
+    out.push_str(
+        "Each ancestor below is summarized, not fully restated — its scope \
+         is settled and out of bounds here. Only decide what belongs to \
+         *this* node; a gap in an ancestor's own scope belongs on that \
+         ancestor, not as a question or obligation on this node.\n",
+    );
+    out.push_str(&ancestors);
     Ok(out)
 }
 
@@ -270,11 +235,7 @@ fn write_inherited_source(
         return Ok(());
     }
     let title = node_title(nodes, source_id);
-    writeln!(
-        out,
-        "
-### From \"{title}\""
-    )?;
+    writeln!(out, "\n### From \"{title}\"")?;
     let constraints: Vec<&NodeObligation> =
         items.iter().filter(|o| o.kind == KIND_CONSTRAINT).collect();
     match summary {
@@ -286,11 +247,7 @@ fn write_inherited_source(
         None => {}
     }
     if !constraints.is_empty() {
-        out.push_str(
-            "
-Constraints:
-",
-        );
+        out.push_str("\nConstraints:\n");
         for o in constraints {
             writeln!(out, "- {}", obligation_line(o))?;
         }
@@ -564,7 +521,7 @@ mod tests {
             node_id: node,
             ..obligation(7, KIND_REQUIREMENT, None)
         };
-        ObligationRepo::new(&conn).insert(&ob).unwrap();
+        tod_store::outline::repos::ObligationRepo::new(&conn).insert(&ob).unwrap();
         let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
 
         // Pass one: a failure, then learn → done.
@@ -652,69 +609,6 @@ mod tests {
         assert!(text.contains("### From \"Interview node\""), "{text}");
         assert!(text.contains("Covers the parent."), "{text}");
         assert!(!text.contains("Long freeform"), "{text}");
-    }
-
-    /// A component the node references with `[[slug]]` is inherited like an
-    /// ancestor: its title, summary, and constraints, never its requirements.
-    #[test]
-    fn a_referenced_component_is_inherited_like_an_ancestor() {
-        use tod_store::outline::{CreatePosition, OutlineMutation};
-        let fx = crate::interview::test_support::fixture();
-        let comp = Uuid::new_v4();
-        fx.outline(OutlineMutation::CreateNode {
-            node_id: Some(comp),
-            list_id: fx.fleet.list_outline_lists().unwrap()[0].id,
-            parent_id: None,
-            anchor_id: None,
-            position: CreatePosition::Below,
-            title: "Dynamic form".into(),
-        });
-        fx.outline(OutlineMutation::EnableCapabilities {
-            node_id: comp,
-            capabilities: vec![Capability::Spec],
-        });
-        fx.fleet.writer().flush().unwrap();
-        for (kind, body) in [
-            (KIND_CONSTRAINT, "Labels sit above fields"),
-            (KIND_REQUIREMENT, "Renders a schema as fields"),
-        ] {
-            fx.outline(OutlineMutation::CreateObligation {
-                obligation_id: None,
-                node_id: comp,
-                kind: kind.into(),
-                after_id: None,
-                before: false,
-                section: None,
-                body: body.into(),
-                phase: "requirements".into(),
-            });
-        }
-        fx.outline(OutlineMutation::SetExtraContent {
-            node_id: comp,
-            content_type: "summary".into(),
-            body: "A form built from a schema.".into(),
-        });
-        fx.fleet.writer().flush().unwrap();
-        let inherited = || {
-            fx.fleet
-                .read(|conn| render_inherited_context(conn, &NodeRepo::new(conn), fx.node, None))
-                .unwrap()
-        };
-        assert_eq!(inherited(), "", "nothing referenced yet");
-
-        let slug = fx
-            .fleet
-            .read(|conn| Ok(NodeRepo::new(conn).get(comp)?.unwrap().slug))
-            .unwrap();
-        fx.obligation(&format!("Settings render as a [[{slug}]]"));
-        fx.fleet.writer().flush().unwrap();
-        let text = inherited();
-        assert!(text.contains("## Referenced components"), "{text}");
-        assert!(!text.contains("## Inherited context (ancestors)"), "{text}");
-        assert!(text.contains("### From \"Dynamic form\""), "{text}");
-        assert!(text.contains("A form built from a schema."), "{text}");
-        assert!(text.contains("Labels sit above fields"), "{text}");
-        assert!(!text.contains("Renders a schema"), "{text}");
     }
 
     fn render(items: &[NodeObligation]) -> String {

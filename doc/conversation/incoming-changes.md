@@ -50,8 +50,13 @@ entries that point at it cancel the same way a conversation reversal does.
 
 ## 2. What fans out
 
-Fan-out covers only what reaches a descendant's context. If it isn't inherited,
-it doesn't propagate.
+For ancestors, fan-out covers only what reaches a descendant's context: if it
+isn't inherited, it doesn't propagate. A component reference is a different
+path, not inheritance. The component's obligations are not put into its
+users' context; an agent looks a referenced node up through `tod-cli` when it
+needs it, most often while planning. Because a user can depend on any of a
+component's obligations, requirements included, any obligation change on a
+component fans out to its users.
 
 | Change | Fans out to |
 |---|---|
