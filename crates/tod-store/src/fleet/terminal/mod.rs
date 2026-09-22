@@ -114,6 +114,16 @@ fn spawn_custom(
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        // Terminal.app and iTerm take no command-line program to run, so
+        // settings like `open -a Terminal` or `iTerm` are driven through
+        // AppleScript, the same as the default.
+        if let Some(backend) = macos_terminal_backend(program) {
+            return spawn_macos_terminal(cwd, shell_id, assets, backend, startup_command);
+        }
+    }
+
     #[cfg(unix)]
     {
         let cmd = posix_launch_command(
@@ -124,8 +134,12 @@ fn spawn_custom(
             "posix",
             startup_command,
         );
-        return Command::new(program)
+        // The setting may carry its own arguments (`kitty --single-instance`).
+        let mut words = program.split_whitespace();
+        let exe = words.next().unwrap_or(program);
+        return Command::new(exe)
             .current_dir(cwd)
+            .args(words)
             .args(["-e", "bash", "-lc", &cmd])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -445,6 +459,27 @@ fn spawn_macos_default(
         return spawn_macos_terminal(cwd, shell_id, assets, "iterm", startup_command);
     }
     spawn_macos_terminal(cwd, shell_id, assets, "macos_terminal", startup_command)
+}
+
+/// The AppleScript backend for a terminal setting naming Terminal.app or
+/// iTerm, in any of the forms a user types: `Terminal`, `Terminal.app`,
+/// `open -a Terminal`, `/Applications/iTerm.app`, `open -a iTerm2`.
+#[cfg(any(target_os = "macos", test))]
+fn macos_terminal_backend(program: &str) -> Option<&'static str> {
+    let mut words: Vec<&str> = program.split_whitespace().collect();
+    if words.first() == Some(&"open") {
+        words.retain(|w| !w.starts_with('-') && *w != "open");
+    }
+    let [app] = words.as_slice() else {
+        return None;
+    };
+    let name = app.trim_end_matches('/').rsplit('/').next().unwrap_or(app);
+    let name = name.trim_end_matches(".app").to_ascii_lowercase();
+    match name.as_str() {
+        "terminal" => Some("macos_terminal"),
+        "iterm" | "iterm2" => Some("iterm"),
+        _ => None,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -892,6 +927,24 @@ mod tests {
         assert!(is_windows_terminal(
             r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\wt.exe"
         ));
+    }
+
+    #[test]
+    fn macos_terminal_backend_recognizes_app_forms() {
+        for s in [
+            "open -a Terminal",
+            "Terminal",
+            "Terminal.app",
+            "/System/Applications/Utilities/Terminal.app",
+        ] {
+            assert_eq!(macos_terminal_backend(s), Some("macos_terminal"), "{s}");
+        }
+        for s in ["open -a iTerm", "iTerm2", "/Applications/iTerm.app/"] {
+            assert_eq!(macos_terminal_backend(s), Some("iterm"), "{s}");
+        }
+        for s in ["kitty", "alacritty --option x", "open -a Kitty"] {
+            assert_eq!(macos_terminal_backend(s), None, "{s}");
+        }
     }
 
     #[test]
