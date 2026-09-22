@@ -608,7 +608,10 @@ impl OutlineMutation {
                 create_plan_step(conn, *step_id, *node_id, *after_id, *before, body)?;
             }
             OutlineMutation::UpdatePlanStepBody { step_id, body } => {
-                PlanStepRepo::new(conn).update_body(*step_id, body)?;
+                let repo = PlanStepRepo::new(conn);
+                let step = repo.get(*step_id)?.context("plan step not found")?;
+                reject_duplicate_plan_step(&repo, step.node_id, Some(*step_id), body)?;
+                repo.update_body(*step_id, body)?;
             }
             OutlineMutation::UpdatePlanStepStatus {
                 step_id,
@@ -1085,8 +1088,41 @@ fn create_plan_step(
         }
     };
     let id = step_id.unwrap_or_else(Uuid::new_v4);
+    reject_duplicate_plan_step(&repo, node_id, None, body)?;
     repo.insert_at(id, node_id, index, body)?;
     Ok(id)
+}
+
+/// Whitespace-insensitive form of a plan step body, for duplicate detection.
+fn plan_step_key(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A node's plan may not hold the same step twice: an agent retrying a
+/// `plan add` whose first attempt landed would otherwise leave two identical
+/// steps. Blank bodies are exempt (the UI creates a step before it is typed).
+/// `except` is the step being edited, which may keep its own text.
+fn reject_duplicate_plan_step(
+    repo: &PlanStepRepo<'_>,
+    node_id: Uuid,
+    except: Option<Uuid>,
+    body: &str,
+) -> Result<()> {
+    let key = plan_step_key(body);
+    if key.is_empty() {
+        return Ok(());
+    }
+    if let Some(existing) = repo
+        .list_for_node(node_id)?
+        .into_iter()
+        .find(|s| Some(s.id) != except && plan_step_key(&s.body) == key)
+    {
+        anyhow::bail!(
+            "the plan already has this step ({}); it was not added again",
+            existing.id
+        );
+    }
+    Ok(())
 }
 
 fn require_spec(conn: &Connection, node_id: Uuid) -> Result<()> {

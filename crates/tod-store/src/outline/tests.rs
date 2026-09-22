@@ -986,6 +986,35 @@ fn plan_step_dependency_graph_and_obligation_links() {
         })
         .unwrap();
 
+    // The same step cannot be added twice, nor can an edit make one a copy
+    // of another; whitespace differences don't disguise a duplicate.
+    let dup = store.enqueue_outline(OutlineMutation::CreatePlanStep {
+        step_id: None,
+        node_id,
+        after_id: None,
+        before: false,
+        body: "  Step   A\n".into(),
+    });
+    assert!(dup.is_err() || store.writer().flush().is_err());
+    let rename = store.enqueue_outline(OutlineMutation::UpdatePlanStepBody {
+        step_id: step_b,
+        body: "Step A".into(),
+    });
+    assert!(rename.is_err() || store.writer().flush().is_err());
+    store
+        .enqueue_outline(OutlineMutation::UpdatePlanStepBody {
+            step_id: step_a,
+            body: "Step A".into(),
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+    store
+        .read(|conn| {
+            assert_eq!(PlanStepRepo::new(conn).list_ids_for_node(node_id).unwrap().len(), 2);
+            Ok(())
+        })
+        .unwrap();
+
     store
         .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
             step_id: step_a,

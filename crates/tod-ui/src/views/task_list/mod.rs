@@ -2385,7 +2385,27 @@ impl TaskListView {
             );
             return;
         }
-        self.remove_outline_node(&task.id, window, cx);
+        // If deleting a generator node with children, show confirmation.
+        // A generator node has managed_count.is_some().
+        let is_generator = task.managed_count.is_some();
+        if is_generator && task.has_children {
+            let task_id = task.id.clone();
+            let view = cx.entity().downgrade();
+            crate::ui::toast::confirm_toast(
+                window,
+                cx,
+                "Delete Generator?",
+                "Deleting this generator node will permanently delete all managed child nodes under it.",
+                move |window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.remove_outline_node(&task_id, window, cx);
+                    });
+                },
+                |_window, _cx| {},
+            );
+        } else {
+            self.remove_outline_node(&task.id, window, cx);
+        }
     }
 
     fn on_delete(&mut self, _: &TaskListDelete, window: &mut Window, cx: &mut Context<Self>) {

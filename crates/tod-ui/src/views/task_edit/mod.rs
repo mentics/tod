@@ -11,7 +11,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px, rems,
 };
 use gpui_base::input::{InputBaseState, InputModeKind};
 use gpui_component::button::{Button, ButtonVariants};
@@ -304,7 +304,6 @@ enum LinearFilterStop {
 }
 
 const LINEAR_FILTER_FIELDS_HINT: &str = "linear_filter_fields";
-const LINEAR_COMMON_FILTER_FIELDS: [&str; 5] = ["team", "state", "priority", "assignee", "labels"];
 const LINEAR_TEXT_COMPARATORS: [&str; 2] = ["contains", "containsIgnoreCase"];
 
 /// The empty form value for an `IssueFilter` field, or `None` for a field
@@ -566,6 +565,15 @@ pub struct TaskEditView {
     linear_preset_name_input: Entity<InputState>,
     linear_preset_action: Option<LinearPresetAction>,
     linear_filter_values: HashMap<String, LinearFilterValue>,
+    /// Filters explicitly added to the form by the user (managed-filter-list pattern).
+    /// Only these filters are shown in the UI.
+    linear_added_filters: Vec<String>,
+    /// Search query for the "Add filter" dropdown.
+    linear_filter_search_query: String,
+    /// Input state for the filter search field.
+    linear_filter_search_input: Entity<InputState>,
+    /// Whether the "Add filter" dropdown is open.
+    linear_add_filter_dropdown_open: bool,
     /// Stored filters the form has no exact control for (or all of them,
     /// while there is no cached schema). Saved back untouched unless the form
     /// sets the same field.
@@ -626,6 +634,8 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
+        let linear_filter_search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search filters…"));
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -730,6 +740,10 @@ impl TaskEditView {
             linear_preset_name_input,
             linear_preset_action: None,
             linear_filter_values: HashMap::new(),
+            linear_added_filters: Vec::new(),
+            linear_filter_search_query: String::new(),
+            linear_filter_search_input,
+            linear_add_filter_dropdown_open: false,
             linear_filter_passthrough: serde_json::Map::new(),
             linear_filter_stops: Vec::new(),
             linear_filter_inputs: LinearFilterInputs::default(),
@@ -1941,25 +1955,40 @@ impl TaskEditView {
 
     /// Filter fields the form has a control for, in render order: the common
     /// ones first, then the rest by name.
-    fn linear_filter_field_groups(&self) -> (Vec<String>, Vec<String>) {
+    /// Returns the list of filter fields that have been explicitly added by the user,
+    /// in the order they were added. This is the managed-filter-list pattern.
+    fn linear_added_filter_names(&self) -> Vec<String> {
         let Some(cache) = self.linear_introspection_cache.as_ref() else {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         };
-        let shown = |name: &str| self.linear_filter_values.contains_key(name);
-        let common = LINEAR_COMMON_FILTER_FIELDS
+        // Return only the filters that are in our added list and exist in the schema
+        self.linear_added_filters
             .iter()
-            .filter(|name| cache.filter_fields.iter().any(|f| f.name == **name) && shown(name))
-            .map(|name| name.to_string())
+            .filter(|name| cache.filter_fields.iter().any(|f| &f.name == *name))
+            .cloned()
+            .collect()
+    }
+
+    /// Rebuild the keyboard stops list based on the currently added filters.
+    fn rebuild_linear_filter_stops(&mut self) {
+        let added_filters = self.linear_added_filter_names();
+        self.linear_filter_stops = added_filters
+            .into_iter()
+            .flat_map(|name| match &self.linear_filter_values[&name] {
+                LinearFilterValue::Text { .. } => vec![LinearFilterStop::Text(name)],
+                LinearFilterValue::DateRange { .. } => vec![
+                    LinearFilterStop::DateAfter(name.clone()),
+                    LinearFilterStop::DateBefore(name),
+                ],
+                LinearFilterValue::Enum { .. } | LinearFilterValue::Nullable { .. } => {
+                    vec![LinearFilterStop::Cycle(name)]
+                }
+                LinearFilterValue::MultiSelect { options, .. } => options
+                    .iter()
+                    .map(|option| LinearFilterStop::Option(name.clone(), option.clone()))
+                    .collect(),
+            })
             .collect();
-        let mut additional: Vec<String> = cache
-            .filter_fields
-            .iter()
-            .map(|f| f.name.clone())
-            .filter(|name| !LINEAR_COMMON_FILTER_FIELDS.contains(&name.as_str()) && shown(name))
-            .collect();
-        additional.sort();
-        additional.dedup();
-        (common, additional)
     }
 
     /// Rebuild the filter form from `stored` — a config's filter keys, or a
@@ -1973,6 +2002,7 @@ impl TaskEditView {
         stored.retain(|_, value| !value.is_null());
 
         self.linear_filter_values.clear();
+        self.linear_added_filters.clear();
         // Inputs are re-created, seeded from the new values, on next render.
         self.linear_filter_inputs = LinearFilterInputs::default();
         if matches!(self.editing, Some(TaskEditField::LinearFilter(_))) {
@@ -1989,6 +2019,8 @@ impl TaskEditView {
                     .and_then(|json| linear_filter_value_from_json(&field.name, &empty, json));
                 if loaded.is_some() {
                     stored.remove(&field.name);
+                    // Only add to linear_added_filters if it has a non-empty value
+                    self.linear_added_filters.push(field.name.clone());
                 }
                 self.linear_filter_values
                     .insert(field.name.clone(), loaded.unwrap_or(empty));
@@ -1996,25 +2028,7 @@ impl TaskEditView {
         }
         self.linear_filter_passthrough = stored;
 
-        let (common, additional) = self.linear_filter_field_groups();
-        self.linear_filter_stops = common
-            .into_iter()
-            .chain(additional)
-            .flat_map(|name| match &self.linear_filter_values[&name] {
-                LinearFilterValue::Text { .. } => vec![LinearFilterStop::Text(name)],
-                LinearFilterValue::DateRange { .. } => vec![
-                    LinearFilterStop::DateAfter(name.clone()),
-                    LinearFilterStop::DateBefore(name),
-                ],
-                LinearFilterValue::Enum { .. } | LinearFilterValue::Nullable { .. } => {
-                    vec![LinearFilterStop::Cycle(name)]
-                }
-                LinearFilterValue::MultiSelect { options, .. } => options
-                    .iter()
-                    .map(|option| LinearFilterStop::Option(name.clone(), option.clone()))
-                    .collect(),
-            })
-            .collect();
+        self.rebuild_linear_filter_stops();
     }
 
     /// Ensure all Input entities exist for filter fields that need them.
@@ -2128,6 +2142,71 @@ impl TaskEditView {
             }
             cx.notify();
         }
+    }
+
+    fn add_linear_filter(&mut self, field_name: String, cx: &mut Context<Self>) {
+        // Don't add if already added
+        if self.linear_added_filters.contains(&field_name) {
+            return;
+        }
+
+        // Add the filter to the list of added filters
+        self.linear_added_filters.push(field_name.clone());
+
+        // Get the cache to create the empty value
+        let Some(cache) = self.linear_introspection_cache.clone() else {
+            return;
+        };
+
+        // Find the field metadata
+        let Some(field) = cache.filter_fields.iter().find(|f| f.name == field_name) else {
+            return;
+        };
+
+        // Create empty value if it doesn't already exist
+        if !self.linear_filter_values.contains_key(&field_name) {
+            if let Some(empty_value) = empty_linear_filter_value(field, &cache) {
+                self.linear_filter_values.insert(field_name.clone(), empty_value);
+            }
+        }
+
+        // Rebuild stops after adding
+        self.rebuild_linear_filter_stops();
+
+        // Close the dropdown and clear search
+        self.linear_add_filter_dropdown_open = false;
+        self.linear_filter_search_query.clear();
+
+        cx.notify();
+    }
+
+    fn remove_linear_filter(&mut self, field_name: &str, cx: &mut Context<Self>) {
+        // Remove from added filters list
+        if let Some(pos) = self.linear_added_filters.iter().position(|f| f == field_name) {
+            self.linear_added_filters.remove(pos);
+        }
+
+        // Clear the value (don't remove from the map entirely, as we might want to keep it
+        // for passthrough if it was in the original config)
+        if let Some(field) = self.linear_introspection_cache.as_ref()
+            .and_then(|cache| cache.filter_fields.iter().find(|f| f.name == field_name))
+        {
+            if let Some(cache) = self.linear_introspection_cache.as_ref() {
+                if let Some(empty_value) = empty_linear_filter_value(field, cache) {
+                    self.linear_filter_values.insert(field_name.to_string(), empty_value);
+                }
+            }
+        }
+
+        // Rebuild stops
+        self.rebuild_linear_filter_stops();
+
+        cx.notify();
+    }
+
+    fn toggle_add_filter_dropdown(&mut self, cx: &mut Context<Self>) {
+        self.linear_add_filter_dropdown_open = !self.linear_add_filter_dropdown_open;
+        cx.notify();
     }
 
     fn confirm_linear_preset_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2581,6 +2660,27 @@ impl TaskEditView {
                     Err(err) => {
                         self.pending_toast =
                             Some(format!("Failed to check {}: {err}", cap.label()));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        }
+        // For Generator capability, only show confirmation if the node has children.
+        if cap == Capability::Generator {
+            if let Some(node_id) = self.node_uuid() {
+                match self.fleet.node_has_children(node_id) {
+                    Ok(false) => {
+                        // No children, disable directly without confirmation.
+                        self.disable_capability(cap, window, cx);
+                        return;
+                    }
+                    Ok(true) => {
+                        // Has children, show confirmation toast below.
+                    }
+                    Err(err) => {
+                        self.pending_toast =
+                            Some(format!("Failed to check children: {err}"));
                         cx.notify();
                         return;
                     }
@@ -4416,19 +4516,16 @@ impl TaskEditView {
         let Some(cache) = self.linear_introspection_cache.clone() else {
             return v_flex().into_any_element();
         };
-        let (common, additional) = self.linear_filter_field_groups();
-        let mut render_group = |names: Vec<String>| -> Vec<gpui::AnyElement> {
-            names
-                .iter()
-                .filter_map(|name| cache.filter_fields.iter().find(|f| &f.name == name))
-                .map(|field| {
-                    self.render_linear_filter_field(field, muted, window, cx)
-                        .into_any_element()
-                })
-                .collect()
-        };
-        let common_elements = render_group(common);
-        let additional_elements = render_group(additional);
+
+        let added_filters = self.linear_added_filter_names();
+        let filter_elements: Vec<gpui::AnyElement> = added_filters
+            .iter()
+            .filter_map(|name| cache.filter_fields.iter().find(|f| &f.name == name))
+            .map(|field| {
+                self.render_linear_filter_field_with_remove(field, muted, window, cx)
+                    .into_any_element()
+            })
+            .collect();
 
         // Stored filters the form has no control for: shown, so it is clear
         // what a save keeps.
@@ -4443,18 +4540,143 @@ impl TaskEditView {
 
         v_flex()
             .gap_2()
-            .when(!common_elements.is_empty(), |el| {
-                el.child(div().text_xs().text_color(muted).child("Common filters"))
-                    .child(v_flex().gap_1().children(common_elements))
-            })
-            .when(!additional_elements.is_empty(), |el| {
-                el.child(div().text_xs().text_color(muted).child("Additional filters"))
-                    .child(v_flex().gap_1().children(additional_elements))
+            .child(self.render_add_filter_button(window, cx))
+            .when(!filter_elements.is_empty(), |el| {
+                el.child(v_flex().gap_1().children(filter_elements))
             })
             .when(!carried.is_empty(), |el| {
                 el.child(self.render_linear_carried_filters(carried, muted, window, cx))
             })
             .into_any_element()
+    }
+
+    fn render_add_filter_button(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_open = self.linear_add_filter_dropdown_open;
+        let button_label = if is_open { "Add filter..." } else { "Add filter" };
+
+        let entity = cx.entity().clone();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                Button::new("task-edit-add-linear-filter")
+                    .label(button_label)
+                    .on_click(move |_event, window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.toggle_add_filter_dropdown(cx);
+                        });
+                    })
+            )
+            .when(is_open, |el| {
+                el.child(self.render_add_filter_dropdown(cx))
+            })
+    }
+
+    fn render_add_filter_dropdown(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(cache) = self.linear_introspection_cache.as_ref() else {
+            return div().into_any_element();
+        };
+
+        let search_query = self.linear_filter_search_query.to_lowercase();
+        let already_added = &self.linear_added_filters;
+
+        // Get available filters (not already added) that match the search query
+        let available_filters: Vec<&tod_integration::FilterFieldMetadata> = cache
+            .filter_fields
+            .iter()
+            .filter(|field| !already_added.contains(&field.name))
+            .filter(|field| {
+                if search_query.is_empty() {
+                    true
+                } else {
+                    field.name.to_lowercase().contains(&search_query)
+                        || field.description.as_ref()
+                            .map(|d| d.to_lowercase().contains(&search_query))
+                            .unwrap_or(false)
+                }
+            })
+            .collect();
+
+        let entity = cx.entity().clone();
+
+        v_flex()
+            .gap_1()
+            .p_2()
+            .bg(cx.theme().list_active)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_md()
+            .child(
+                Input::new(&self.linear_filter_search_input)
+            )
+            .children(available_filters.iter().map(|field| {
+                        let field_name = field.name.clone();
+                        let entity = entity.clone();
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .hover(|el| el.bg(cx.theme().list_hover))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                let field_name = field_name.clone();
+                                entity.update(cx, |this, cx| {
+                                    this.add_linear_filter(field_name, cx);
+                                });
+                            })
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(field.name.clone())
+                            )
+                            .when_some(field.description.as_ref(), |el, desc| {
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(desc.clone())
+                                )
+                            })
+                    }))
+            .into_any_element()
+    }
+
+    fn render_linear_filter_field_with_remove(
+        &self,
+        field: &tod_integration::FilterFieldMetadata,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let field_name = field.name.clone();
+        let entity = cx.entity().clone();
+
+        h_flex()
+            .gap_2()
+            .items_start()
+            .child(
+                div()
+                    .flex_1()
+                    .child(self.render_linear_filter_field(field, muted, window, cx))
+            )
+            .child(
+                Button::new(format!("task-edit-remove-linear-filter-{}", field_name))
+                    .label("Remove")
+                    .on_click(move |_event, _window, cx| {
+                        let field_name = field_name.clone();
+                        entity.update(cx, |this, cx| {
+                            this.remove_linear_filter(&field_name, cx);
+                        });
+                    })
+            )
     }
 
     fn render_linear_carried_filters(
