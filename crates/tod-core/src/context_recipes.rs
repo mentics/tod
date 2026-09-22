@@ -486,8 +486,8 @@ mod tests {
         out
     }
 
-    /// A typo in a recipe is silently skipped by `load_static_context`, so the
-    /// only thing that catches it is this test.
+    /// A typo in a recipe fails `load_static_context` at launch; this
+    /// test catches it before it ships.
     #[test]
     fn every_referenced_fragment_exists() {
         let Some(root) = context_root() else { return };
@@ -506,6 +506,8 @@ mod tests {
     /// Catches fragments orphaned by a split or rename. A `cli/` fragment
     /// need not be in any prompt: it is also a noun's reference, which
     /// `tod_cli::doc_sync` pins to the binary and agents reach through help.
+    /// `workspace/codebase` is compiled in by `codebase_rules` and attached
+    /// by working directory, not by recipe.
     #[test]
     fn every_fragment_is_used_by_some_recipe() {
         let Some(root) = context_root() else { return };
@@ -513,6 +515,7 @@ mod tests {
             .iter()
             .flat_map(|r| r.layers.iter().copied())
             .chain(SITUATIONAL_CLI.iter().copied())
+            .chain(["workspace/codebase"])
             .collect();
         for key in all_fragments(&root).into_iter().filter(|k| !k.starts_with("cli/")) {
             assert!(

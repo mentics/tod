@@ -361,7 +361,11 @@ impl InteractiveAgentView {
     fn opening(&self) -> Option<SessionOpening> {
         let first_message = self.conversation.is_empty() && self.agent_session_id.is_none();
         first_message.then(|| SessionOpening {
-            context: self.context_prefix.clone(),
+            context: Some(tod_core::codebase_rules::with_codebase_rules(
+                self.context_prefix.clone().unwrap_or_default(),
+                &self.workspace_cwd,
+            ))
+            .filter(|context| !context.is_empty()),
         })
     }
 

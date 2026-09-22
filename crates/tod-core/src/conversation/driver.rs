@@ -598,13 +598,6 @@ impl ConversationDriver {
             Some(name) => name.clone(),
             None => self.session_title(fleet)?,
         };
-        let opening = context.as_ref().map(|context| SessionOpening {
-            context: Some(context.clone()),
-        });
-        let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
-        self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
-        let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
-        let cold_resume = resume.is_some();
         check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
@@ -617,6 +610,16 @@ impl ConversationDriver {
             )
         };
         self.progress_before = progress;
+        // Whatever the protocol, an agent running in a codebase gets its rules.
+        let context =
+            context.map(|context| crate::codebase_rules::with_codebase_rules(context, &cwd));
+        let opening = context.as_ref().map(|context| SessionOpening {
+            context: Some(context.clone()),
+        });
+        let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
+        self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
+        let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
+        let cold_resume = resume.is_some();
         let handle = agent.send_session_turn(SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
