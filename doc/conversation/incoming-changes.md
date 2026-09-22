@@ -1,6 +1,6 @@
 # Incoming changes: re-evaluating nodes when what they inherit changes
 
-Status: design, not implemented.
+Status: implemented.
 
 ## Problem
 
