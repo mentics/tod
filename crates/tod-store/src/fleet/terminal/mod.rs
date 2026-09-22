@@ -455,9 +455,6 @@ fn spawn_macos_default(
     assets: &ShellInitAssets,
     startup_command: Option<&str>,
 ) -> Result<()> {
-    if command_available("iTerm.app") || Path::new("/Applications/iTerm.app").exists() {
-        return spawn_macos_terminal(cwd, shell_id, assets, "iterm", startup_command);
-    }
     spawn_macos_terminal(cwd, shell_id, assets, "macos_terminal", startup_command)
 }
 
@@ -588,7 +585,7 @@ fn spawn_linux_default(
     bail!("no terminal emulator found on PATH; set terminal.program in tod.yml")
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn command_available(name: &str) -> bool {
     Command::new("sh")
         .arg("-c")
@@ -605,7 +602,7 @@ pub fn default_terminal_hint() -> &'static str {
     }
     #[cfg(target_os = "macos")]
     {
-        "Auto: iTerm if installed, else Terminal.app"
+        "Auto: Terminal.app. Set to iTerm for iTerm instead."
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
