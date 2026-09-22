@@ -623,7 +623,10 @@ fn collect_linked_copy_updates(
             .map_err(|err| err.to_string())?;
         for link in links {
             let dirty = |field: &str| link.user_modified_fields.iter().any(|f| f == field);
-            let title = (!dirty("title")).then(|| item.title.clone());
+            // A copy is an ordinary node, so nothing shows the id beside
+            // it: its title carries it, as when it was copied out.
+            let title =
+                (!dirty("title")).then(|| format!("{}: {}", item.external_id, item.title));
             let tags = (!dirty("tags")).then(|| item.tags.clone());
             let body = (!dirty("body")).then(|| item.body.clone());
             if title.is_some() || tags.is_some() || body.is_some() {
@@ -874,11 +877,9 @@ mod tests {
     }
 
     fn item(external_id: &str, title: &str, children: Vec<DataSourceItem>) -> DataSourceItem {
-        // Mirror Linear adapter behavior: title includes identifier prefix
-        let prefixed_title = format!("{}: {}", external_id, title);
         DataSourceItem {
             external_id: external_id.into(),
-            title: prefixed_title,
+            title: title.into(),
             tags: vec![],
             body: String::new(),
             metadata: None,
@@ -898,7 +899,7 @@ mod tests {
 
         let children = managed_children(&fleet, list_id, node_id);
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].1, "EXT-1: First");
+        assert_eq!(children[0].1, "First");
 
         let config = read_config(&root, node_id).unwrap();
         assert_eq!(config.last_refresh_status.as_deref(), Some(REFRESH_SUCCESS));
@@ -925,7 +926,7 @@ mod tests {
         assert_eq!(top.len(), 1);
         let sub = managed_children(&fleet, list_id, top[0].0);
         assert_eq!(sub.len(), 1);
-        assert_eq!(sub[0].1, "EXT-2: Child");
+        assert_eq!(sub[0].1, "Child");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -948,7 +949,7 @@ mod tests {
 
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, first[0].0, "same node reused across refreshes");
-        assert_eq!(second[0].1, "EXT-1: New title");
+        assert_eq!(second[0].1, "New title");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -991,7 +992,7 @@ mod tests {
 
         let children = managed_children(&fleet, list_id, node_id);
         assert_eq!(
-            children[0].1, "EXT-1: Original",
+            children[0].1, "Original",
             "user-edited title must survive refresh"
         );
 

@@ -998,12 +998,10 @@ fn build_tree(flat: Vec<FlatIssue>, workspace_slug: &str) -> Vec<DataSourceItem>
 
         let metadata = Some(serde_json::Value::Object(meta));
 
-        // Title includes identifier prefix (e.g., "TOD-142: Fix bug")
-        let prefixed_title = format!("{}: {}", issue.identifier, issue.title);
-
+        // The bare title: the outline shows `external_id` beside it already.
         DataSourceItem {
             external_id: issue.identifier.clone(),
-            title: prefixed_title,
+            title: issue.title.clone(),
             tags: issue.labels.clone(),
             body: issue.description.clone().unwrap_or_default(),
             metadata,
@@ -1461,7 +1459,7 @@ mod tests {
         }];
         let tree = build_tree(flat, "test-workspace");
         assert_eq!(tree.len(), 1);
-        assert_eq!(tree[0].title, "TOD-142: Fix bug");
+        assert_eq!(tree[0].title, "Fix bug");
     }
 
     #[test]

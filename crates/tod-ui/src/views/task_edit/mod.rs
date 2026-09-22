@@ -19,6 +19,7 @@ use gpui_component::input::{
     AnyInputState, Input, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_component::scroll::Scrollbar;
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::{HashMap, HashSet};
@@ -544,6 +545,10 @@ pub struct TaskEditView {
     /// The config as last persisted, in the same shape the form produces, so
     /// "unsaved changes" is an exact comparison.
     generator_saved_config: Option<serde_json::Value>,
+    /// The config an autosave is scheduled (or was last attempted) for, and
+    /// its debounce task. A failed save is not retried until the form changes.
+    generator_autosave_pending: Option<serde_json::Value>,
+    _generator_autosave_task: Option<gpui::Task<()>>,
     generator_invalid_fields: HashSet<usize>,
     /// Label of the background save/refresh in flight, if any.
     generator_busy: Option<String>,
@@ -568,12 +573,12 @@ pub struct TaskEditView {
     /// Filters explicitly added to the form by the user (managed-filter-list pattern).
     /// Only these filters are shown in the UI.
     linear_added_filters: Vec<String>,
-    /// Search query for the "Add filter" dropdown.
-    linear_filter_search_query: String,
-    /// Input state for the filter search field.
-    linear_filter_search_input: Entity<InputState>,
-    /// Whether the "Add filter" dropdown is open.
-    linear_add_filter_dropdown_open: bool,
+    /// The "Add filter" combo box, listing the filters not yet added.
+    linear_add_filter_select: Entity<SelectState<SearchableVec<String>>>,
+    /// The items last given to `linear_add_filter_select`, so render only
+    /// resets them when the available filters change.
+    linear_add_filter_items: std::cell::RefCell<Vec<String>>,
+    _linear_add_filter_subscription: Subscription,
     /// Stored filters the form has no exact control for (or all of them,
     /// while there is no cached schema). Saved back untouched unless the form
     /// sets the same field.
@@ -634,8 +639,19 @@ impl TaskEditView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
-        let linear_filter_search_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search filters…"));
+        let linear_add_filter_select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::<String>::new()), None, window, cx).searchable(true)
+        });
+        let _linear_add_filter_subscription = cx.subscribe_in(
+            &linear_add_filter_select,
+            window,
+            |this: &mut TaskEditView, select, event: &SelectEvent<SearchableVec<String>>, window, cx| {
+                if let SelectEvent::Confirm(Some(name)) = event {
+                    this.add_linear_filter(name.clone(), cx);
+                    select.update(cx, |select, cx| select.set_selected_index(None, window, cx));
+                }
+            },
+        );
         let body_scroll_handle = ScrollHandle::new();
 
         let poll_entity = cx.weak_entity();
@@ -722,6 +738,8 @@ impl TaskEditView {
             generator_fields: Vec::new(),
             generator_extra_config: serde_json::Map::new(),
             generator_saved_config: None,
+            generator_autosave_pending: None,
+            _generator_autosave_task: None,
             generator_invalid_fields: HashSet::new(),
             generator_busy: None,
             generator_data_source_type: None,
@@ -741,9 +759,9 @@ impl TaskEditView {
             linear_preset_action: None,
             linear_filter_values: HashMap::new(),
             linear_added_filters: Vec::new(),
-            linear_filter_search_query: String::new(),
-            linear_filter_search_input,
-            linear_add_filter_dropdown_open: false,
+            linear_add_filter_select,
+            linear_add_filter_items: Default::default(),
+            _linear_add_filter_subscription,
             linear_filter_passthrough: serde_json::Map::new(),
             linear_filter_stops: Vec::new(),
             linear_filter_inputs: LinearFilterInputs::default(),
@@ -911,7 +929,9 @@ impl TaskEditView {
                         );
                     }
                 }
-                stops.push(TaskEditField::GeneratorSave);
+                if self.generator_data_source_type.is_none() {
+                    stops.push(TaskEditField::GeneratorSave);
+                }
             }
             if self.generator_data_source_type.is_some() {
                 stops.push(TaskEditField::GeneratorRefresh);
@@ -1767,6 +1787,30 @@ impl TaskEditView {
         }
     }
 
+    /// Once a generator is configured, edits save themselves after a short
+    /// pause; only the first configuration needs an explicit Save.
+    fn schedule_generator_autosave(&mut self, cx: &mut Context<Self>) {
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+        if self.generator_data_source_type.is_none() || !self.generator_dirty(cx) {
+            self.generator_autosave_pending = None;
+            self._generator_autosave_task = None;
+            return;
+        }
+        if self.generator_busy.is_some() {
+            return;
+        }
+        let value = self.generator_config_value(cx);
+        if self.generator_autosave_pending.as_ref() == Some(&value) {
+            return;
+        }
+        self.generator_autosave_pending = Some(value);
+        // Replacing the task drops (cancels) the previous debounce.
+        self._generator_autosave_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.save_generator_config(cx));
+        }));
+    }
+
     fn load_generator_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.generator_pending_source_type = None;
         self.generator_config_error = None;
@@ -1974,16 +2018,17 @@ impl TaskEditView {
         let added_filters = self.linear_added_filter_names();
         self.linear_filter_stops = added_filters
             .into_iter()
-            .flat_map(|name| match &self.linear_filter_values[&name] {
-                LinearFilterValue::Text { .. } => vec![LinearFilterStop::Text(name)],
-                LinearFilterValue::DateRange { .. } => vec![
+            .flat_map(|name| match self.linear_filter_values.get(&name) {
+                None => Vec::new(),
+                Some(LinearFilterValue::Text { .. }) => vec![LinearFilterStop::Text(name)],
+                Some(LinearFilterValue::DateRange { .. }) => vec![
                     LinearFilterStop::DateAfter(name.clone()),
                     LinearFilterStop::DateBefore(name),
                 ],
-                LinearFilterValue::Enum { .. } | LinearFilterValue::Nullable { .. } => {
+                Some(LinearFilterValue::Enum { .. } | LinearFilterValue::Nullable { .. }) => {
                     vec![LinearFilterStop::Cycle(name)]
                 }
-                LinearFilterValue::MultiSelect { options, .. } => options
+                Some(LinearFilterValue::MultiSelect { options, .. }) => options
                     .iter()
                     .map(|option| LinearFilterStop::Option(name.clone(), option.clone()))
                     .collect(),
@@ -2150,32 +2195,25 @@ impl TaskEditView {
             return;
         }
 
-        // Add the filter to the list of added filters
-        self.linear_added_filters.push(field_name.clone());
-
-        // Get the cache to create the empty value
         let Some(cache) = self.linear_introspection_cache.clone() else {
             return;
         };
-
-        // Find the field metadata
         let Some(field) = cache.filter_fields.iter().find(|f| f.name == field_name) else {
             return;
         };
 
-        // Create empty value if it doesn't already exist
+        // A field the form has no control for can't be added.
         if !self.linear_filter_values.contains_key(&field_name) {
-            if let Some(empty_value) = empty_linear_filter_value(field, &cache) {
-                self.linear_filter_values.insert(field_name.clone(), empty_value);
-            }
+            let Some(empty_value) = empty_linear_filter_value(field, &cache) else {
+                return;
+            };
+            self.linear_filter_values.insert(field_name.clone(), empty_value);
         }
+
+        self.linear_added_filters.push(field_name.clone());
 
         // Rebuild stops after adding
         self.rebuild_linear_filter_stops();
-
-        // Close the dropdown and clear search
-        self.linear_add_filter_dropdown_open = false;
-        self.linear_filter_search_query.clear();
 
         cx.notify();
     }
@@ -2201,11 +2239,6 @@ impl TaskEditView {
         // Rebuild stops
         self.rebuild_linear_filter_stops();
 
-        cx.notify();
-    }
-
-    fn toggle_add_filter_dropdown(&mut self, cx: &mut Context<Self>) {
-        self.linear_add_filter_dropdown_open = !self.linear_add_filter_dropdown_open;
         cx.notify();
     }
 
@@ -2414,8 +2447,8 @@ impl TaskEditView {
         cx.notify();
     }
 
-    /// Persist the form. Validation runs here — on an explicit save — never on
-    /// blur, and the store write plus any initial refresh run on the
+    /// Persist the form: the first Save, or a debounced autosave. Validation
+    /// runs here, and the store write plus any initial refresh run on the
     /// background executor so the UI stays responsive throughout.
     fn save_generator_config(&mut self, cx: &mut Context<Self>) {
         if self.generator_busy.is_some() {
@@ -4552,101 +4585,32 @@ impl TaskEditView {
 
     fn render_add_filter_button(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_open = self.linear_add_filter_dropdown_open;
-        let button_label = if is_open { "Add filter..." } else { "Add filter" };
-
-        let entity = cx.entity().clone();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                Button::new("task-edit-add-linear-filter")
-                    .label(button_label)
-                    .on_click(move |_event, window, cx| {
-                        entity.update(cx, |this, cx| {
-                            this.toggle_add_filter_dropdown(cx);
-                        });
-                    })
-            )
-            .when(is_open, |el| {
-                el.child(self.render_add_filter_dropdown(cx))
+        let available: Vec<String> = self
+            .linear_introspection_cache
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .filter_fields
+                    .iter()
+                    .filter(|field| !self.linear_added_filters.contains(&field.name))
+                    .filter(|field| empty_linear_filter_value(field, cache).is_some())
+                    .map(|field| field.name.clone())
+                    .collect()
             })
-    }
+            .unwrap_or_default();
+        if *self.linear_add_filter_items.borrow() != available {
+            self.linear_add_filter_select.update(cx, |select, cx| {
+                select.set_items(SearchableVec::new(available.clone()), window, cx);
+            });
+            *self.linear_add_filter_items.borrow_mut() = available;
+        }
 
-    fn render_add_filter_dropdown(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let Some(cache) = self.linear_introspection_cache.as_ref() else {
-            return div().into_any_element();
-        };
-
-        let search_query = self.linear_filter_search_query.to_lowercase();
-        let already_added = &self.linear_added_filters;
-
-        // Get available filters (not already added) that match the search query
-        let available_filters: Vec<&tod_integration::FilterFieldMetadata> = cache
-            .filter_fields
-            .iter()
-            .filter(|field| !already_added.contains(&field.name))
-            .filter(|field| {
-                if search_query.is_empty() {
-                    true
-                } else {
-                    field.name.to_lowercase().contains(&search_query)
-                        || field.description.as_ref()
-                            .map(|d| d.to_lowercase().contains(&search_query))
-                            .unwrap_or(false)
-                }
-            })
-            .collect();
-
-        let entity = cx.entity().clone();
-
-        v_flex()
-            .gap_1()
-            .p_2()
-            .bg(cx.theme().list_active)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded_md()
-            .child(
-                Input::new(&self.linear_filter_search_input)
-            )
-            .children(available_filters.iter().map(|field| {
-                        let field_name = field.name.clone();
-                        let entity = entity.clone();
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .hover(|el| el.bg(cx.theme().list_hover))
-                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                let field_name = field_name.clone();
-                                entity.update(cx, |this, cx| {
-                                    this.add_linear_filter(field_name, cx);
-                                });
-                            })
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child(field.name.clone())
-                            )
-                            .when_some(field.description.as_ref(), |el, desc| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(desc.clone())
-                                )
-                            })
-                    }))
-            .into_any_element()
+        Select::new(&self.linear_add_filter_select)
+            .placeholder("Add filter")
+            .menu_width(px(280.))
     }
 
     fn render_linear_filter_field_with_remove(
@@ -4865,8 +4829,7 @@ impl TaskEditView {
             .into_any_element()
     }
 
-    /// Save / Refresh. Nothing in this section is ever written on blur — the
-    /// config only reaches the store from here.
+    /// Save (first configuration only; after that edits autosave) / Refresh.
     fn render_generator_actions(
         &self,
         muted: gpui::Hsla,
@@ -4883,10 +4846,10 @@ impl TaskEditView {
         let save_label = match (busy.as_deref(), configured) {
             (Some(label), _) => label.to_string(),
             (None, false) => "Save configuration".to_string(),
-            (None, true) => "Save changes".to_string(),
+            (None, true) => String::new(),
         };
 
-        let mut row = h_flex().gap_2().items_center().flex_wrap().child(
+        let mut row = h_flex().gap_2().items_center().flex_wrap().when(!configured, |row| row.child(
             self.apply_focus_scroll_anchor(
                 TaskEditField::GeneratorSave,
                 div()
@@ -4906,7 +4869,7 @@ impl TaskEditView {
                             })),
                     ),
             ),
-        );
+        ));
 
         if configured {
             row = row.child(
@@ -4938,7 +4901,10 @@ impl TaskEditView {
 
         let hint = match (&busy, dirty, configured) {
             (Some(label), _, _) => label.clone(),
-            (None, true, true) => "Unsaved changes".to_string(),
+            (None, true, true) if self.generator_config_error.is_some() => {
+                "Unsaved changes".to_string()
+            }
+            (None, true, true) => "Saving…".to_string(),
             (None, false, _) => "Saved".to_string(),
             (None, true, false) => String::new(),
         };
@@ -5446,6 +5412,7 @@ impl Focusable for TaskEditView {
 impl Render for TaskEditView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_pending(window, cx);
+        self.schedule_generator_autosave(cx);
 
         // Pre-create all Input entities for Linear filter fields before rendering
         self.ensure_linear_filter_inputs_created(window, cx);
