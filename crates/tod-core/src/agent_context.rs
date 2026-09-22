@@ -169,6 +169,7 @@ mod tests {
     /// that shows a node's obligations as a whole.
     const NODE_CHAT: &ContextRecipe = &ContextRecipe {
         name: "test node chat",
+        situational: false,
         layers: &[],
         blocks: &[
             DynamicBlock::DataRoot,

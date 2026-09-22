@@ -10,8 +10,8 @@
 
 mod args;
 mod capabilities;
+mod help;
 mod changeset;
-#[cfg(test)]
 mod doc_sync;
 mod incoming;
 mod learn;
@@ -49,7 +49,7 @@ NOUNS:
     memory                 Interview memory notes for a node
     interview              Interview session state
     visual-design          the UI mockup associated with one obligation
-    capabilities           A node's capabilities and their settings
+    capabilities           Enable, disable, configure a node's capabilities (spec, lifecycle, agent, ...)
     changeset              This conversation's net changes and unsure flags
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
@@ -58,7 +58,9 @@ NOUNS:
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
 
-Run `tod-cli <NOUN> --help` for that noun's commands.
+Run `tod-cli <NOUN> --help` for that noun's commands, or
+`tod-cli help <WORDS>` to find the commands that mention them
+(e.g. `tod-cli help lifecycle`).
 ";
 
 fn main() -> ExitCode {
@@ -125,6 +127,11 @@ fn run(args: &[String]) -> anyhow::Result<String> {
 
     if rest.is_empty() {
         return Ok(USAGE.trim_end().to_string());
+    }
+    match rest[0].as_str() {
+        "help" => return Ok(help::run(&rest[1..], USAGE)),
+        "--build-stamp" => return Ok(tod_core::CLI_BUILD_STAMP.to_string()),
+        _ => {}
     }
 
     let data_root = data_root.ok_or_else(|| {

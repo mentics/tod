@@ -1,5 +1,5 @@
 use super::context::{
-    DELTA_HEADING, RESUME_HEADING, ReportedStale, delta, focus_selection, opening,
+    DELTA_HEADING, RESUME_HEADING, ReportedStale, delta, focus_selection, opening, situational_cli,
 };
 use super::driver::*;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun};
@@ -1157,4 +1157,35 @@ fn the_session_id_is_stored_while_the_first_turn_runs() {
         conversation.session_name.as_deref(),
         Some(agent.last().title.as_str())
     );
+}
+
+#[test]
+fn the_cli_docs_follow_the_focus() {
+    let fx = fixture();
+    let obligation = fx.obligation("Every request is logged.");
+    let picks = |focus| fx.fleet.read(|conn| situational_cli(conn, focus)).unwrap();
+    assert!(picks(Focus::Project).is_empty());
+    assert_eq!(picks(Focus::Node(fx.node)), ["cli/obligations", "cli/content"]);
+    assert_eq!(
+        picks(Focus::Obligation { node: fx.node, id: obligation }),
+        ["cli/obligations"]
+    );
+
+    // The recipe itself carries only what every conversation needs.
+    let media = media();
+    let id = Uuid::new_v4();
+    fx.user(InterviewCommand::CreateConversation {
+        id,
+        focus: Focus::Project,
+        protocol: ProtocolKind::Outline,
+        platform: None,
+        model: None,
+        effort: None,
+    });
+    let text = fx
+        .fleet
+        .read(|conn| opening(conn, &media, &fx.root, id))
+        .unwrap();
+    assert!(text.contains("tod-cli help"), "{text}");
+    assert!(!text.contains("obligations add"), "{text}");
 }

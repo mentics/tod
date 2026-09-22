@@ -23,7 +23,15 @@ pub struct ContextRecipe {
     pub layers: &'static [&'static str],
     /// Dynamic blocks to render after them, in order.
     pub blocks: &'static [DynamicBlock],
+    /// Whether the caller adds the `cli/` nouns the situation calls for
+    /// ([`SITUATIONAL_CLI`]) to `layers`, rather than `layers` naming them all.
+    pub situational: bool,
 }
+
+/// The `cli/` nouns a situational recipe may add, when its focus makes them
+/// likely (`conversation::context::situational_cli` picks). Every other noun
+/// is found through `tod-cli help`, which `cli/intro` always explains.
+pub const SITUATIONAL_CLI: &[&str] = &["cli/obligations", "cli/content", "cli/plan"];
 
 /// Assemble a first-turn message: static fragments, the process-bundle role
 /// doc when the surface has one, the dynamic blocks, then any surface-specific
@@ -39,7 +47,31 @@ pub fn build_message(
     ctx: &DynamicContext<'_>,
     tail: &str,
 ) -> Result<String> {
-    let mut out = load_static_context(paths, recipe.layers)?;
+    build_message_with(paths, recipe, &[], role_doc, ctx, tail)
+}
+
+/// [`build_message`] with `extra_cli` fragments added after the recipe's own
+/// `cli/` ones, for a [`ContextRecipe::situational`] recipe.
+pub fn build_message_with(
+    paths: &MediaPaths,
+    recipe: &ContextRecipe,
+    extra_cli: &[&str],
+    role_doc: Option<&str>,
+    ctx: &DynamicContext<'_>,
+    tail: &str,
+) -> Result<String> {
+    let mut layers: Vec<&str> = recipe.layers.to_vec();
+    let at = layers
+        .iter()
+        .position(|l| l.starts_with("surface/"))
+        .unwrap_or(layers.len());
+    let extra: Vec<&str> = extra_cli
+        .iter()
+        .copied()
+        .filter(|e| !layers.contains(e))
+        .collect();
+    layers.splice(at..at, extra);
+    let mut out = load_static_context(paths, &layers)?;
 
     if let Some(doc) = role_doc.map(str::trim).filter(|d| !d.is_empty()) {
         out.push_str("\n\n---\n\n");
@@ -68,6 +100,7 @@ const OWN_OBLIGATIONS_NOTE: &str = "This node's own. They define what is in scop
 /// selected here (the chat is scoped to one), hence no fallback.
 pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
     name: "visual-design chat",
+    situational: false,
     layers: &[
         "stance/interactive-chat",
         "domain/outline",
@@ -94,6 +127,7 @@ pub const VISUAL_DESIGN_CHAT: ContextRecipe = ContextRecipe {
 /// the reply is a sentence or two at most.
 pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
     name: "implementation session",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -127,6 +161,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
 /// verdicts and says how the reply works.
 pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
     name: "verification session",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -151,6 +186,7 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
 /// noun — no fixes, no approval, no gate — and says how the reply works.
 pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     name: "code review session",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -173,6 +209,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
 /// reply works.
 pub const FIX_SESSION: ContextRecipe = ContextRecipe {
     name: "review fix session",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -207,6 +244,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
 /// routinely turn on which capabilities a node has.
 pub const GATE_CHECK: ContextRecipe = ContextRecipe {
     name: "gate check",
+    situational: false,
     layers: &[
         "stance/one-shot",
         "domain/outline",
@@ -236,6 +274,7 @@ pub const GATE_CHECK: ContextRecipe = ContextRecipe {
 /// the app stores it per pass (`doc/conversation/incoming-changes.md` §9).
 pub const LEARN_GATE_CHECK: ContextRecipe = ContextRecipe {
     name: "learn gate check",
+    situational: false,
     layers: &[
         "stance/one-shot",
         "domain/outline",
@@ -256,6 +295,7 @@ pub const LEARN_GATE_CHECK: ContextRecipe = ContextRecipe {
 /// it loads the CLI nouns it writes through.
 pub const ON_ENTRY: ContextRecipe = ContextRecipe {
     name: "on-entry",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -277,6 +317,7 @@ pub const ON_ENTRY: ContextRecipe = ContextRecipe {
 ///
 pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
     name: "fleet autonomous run",
+    situational: false,
     layers: &[
         "stance/autonomous-session",
         "domain/outline",
@@ -301,6 +342,7 @@ pub const FLEET_AUTONOMOUS: ContextRecipe = ContextRecipe {
 /// `doc/agent-context-map.md`.
 pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
     name: "interview agent",
+    situational: false,
     layers: &[
         "stance/agent-to-agent",
         "domain/outline",
@@ -323,6 +365,7 @@ pub const INTERVIEW_AGENT: ContextRecipe = ContextRecipe {
 /// only where the conversation starts.
 pub const CONVERSATION: ContextRecipe = ContextRecipe {
     name: "conversation",
+    situational: true,
     layers: &[
         "stance/interactive-chat",
         "domain/outline",
@@ -332,10 +375,6 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
         "domain/capabilities",
         "cli/intro",
         "cli/node",
-        "cli/obligations",
-        "cli/plan",
-        "cli/content",
-        "cli/capabilities",
         "cli/changeset",
         "surface/conversation",
     ],
@@ -348,6 +387,7 @@ pub const CONVERSATION: ContextRecipe = ContextRecipe {
 /// it different: the user sets the job, not the surface.
 pub const CHAT: ContextRecipe = ContextRecipe {
     name: "chat",
+    situational: true,
     layers: &[
         "stance/interactive-chat",
         "domain/outline",
@@ -357,10 +397,6 @@ pub const CHAT: ContextRecipe = ContextRecipe {
         "domain/capabilities",
         "cli/intro",
         "cli/node",
-        "cli/obligations",
-        "cli/plan",
-        "cli/content",
-        "cli/capabilities",
         "cli/changeset",
         "surface/chat",
     ],
@@ -375,6 +411,7 @@ pub const CHAT: ContextRecipe = ContextRecipe {
 /// states: the verdict is recorded through the `incoming` noun.
 pub const INCOMING_CHANGES: ContextRecipe = ContextRecipe {
     name: "incoming-changes check",
+    situational: false,
     layers: &[
         "stance/one-shot",
         "domain/obligations",
@@ -464,15 +501,18 @@ mod tests {
         }
     }
 
-    /// Catches fragments orphaned by a split or rename.
+    /// Catches fragments orphaned by a split or rename. A `cli/` fragment
+    /// need not be in any prompt: it is also a noun's reference, which
+    /// `tod_cli::doc_sync` pins to the binary and agents reach through help.
     #[test]
     fn every_fragment_is_used_by_some_recipe() {
         let Some(root) = context_root() else { return };
         let used: BTreeSet<&str> = ALL_RECIPES
             .iter()
             .flat_map(|r| r.layers.iter().copied())
+            .chain(SITUATIONAL_CLI.iter().copied())
             .collect();
-        for key in all_fragments(&root) {
+        for key in all_fragments(&root).into_iter().filter(|k| !k.starts_with("cli/")) {
             assert!(
                 used.contains(key.as_str()),
                 "fragment {key:?} is not used by any recipe"

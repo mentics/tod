@@ -19,7 +19,18 @@ Any text flag (`--body`, `--why`, `--detail`) takes `-` to read its text from
 stdin, for long or multi-line text passed with a heredoc. Only one flag per
 command can read stdin.
 
-The sections that follow document the nouns you need for this particular job.
-`tod-cli` has others. Run `tod-cli --help` or `tod-cli <noun> --help` to see
-what the installed version actually supports — prefer that over assuming a
-command exists.
+## Finding a command
+
+The sections that follow document only the commands you are most likely to
+need here. `tod-cli` does much more: nodes' capabilities and their settings,
+notes, review findings, verdicts, and so on. To find one:
+
+```
+tod-cli help <WORDS>        # every command that mentions the words, e.g. `tod-cli help lifecycle`
+tod-cli <noun> --help       # a noun's full syntax and rules
+tod-cli --help              # every noun
+```
+
+Search before concluding something cannot be done, and before asking the user
+to do it in the app. An option a command does not know is ignored with a
+warning on stderr, not applied, so heed that warning.
