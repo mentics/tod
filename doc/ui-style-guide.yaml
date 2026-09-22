@@ -26,6 +26,10 @@ styles:
   text-dense-muted:
     extends: text-dense
     color: text-muted
+  # A dense label over the text it introduces (a finding's response).
+  text-dense-label:
+    extends: text-dense-muted
+    font-weight: semibold
   text-title:
     extends: text
     font: title

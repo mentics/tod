@@ -10,18 +10,20 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4.5.
 
-use super::{ConversationView, Pane};
+use super::{ChangeAction, ConversationView, Pane};
 use crate::ui::agent_conversation::{NoticeTone, PanelNotice};
+use crate::ui::item_list::{ItemListRow, ItemRowState};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status_filter::{render_status_filter, status_counts};
 use crate::ui::style;
 use crate::views::plan_steps::MutationRouter;
-use crate::views::rows::{StatusMenu, StatusMenuHandlers, status_chip};
+use crate::views::rows::{
+    FindingRowProps, RowHost, RowOptions, STATUS_COLUMN_WIDTH, StatusMenu, finding_row,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
-    relative,
+    AnyElement, App, Context, ElementId, InteractiveElement, IntoElement, ParentElement,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, relative,
 };
 use gpui_component::button::Button;
 use gpui_component::{Disableable, Sizable, h_flex, v_flex};
@@ -39,11 +41,41 @@ use tod_store::verification::{
     ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
 };
 use tod_store::review::{
-    FINDING_DECLINED, FINDING_FIXED, FINDING_OPEN, FINDING_OUT_OF_SCOPE, FINDING_REJECTED,
-    FINDING_STATUSES,
-    ReviewFinding, USER_FINDING_STATUSES,
+    FINDING_REJECTED, FINDING_STATUSES, ReviewFinding, USER_FINDING_STATUSES,
 };
 use uuid::Uuid;
+
+/// One review finding in the side pane's list. A finding carries everything
+/// its row shows, so there is nothing to hang beside it.
+#[derive(Debug, Clone)]
+pub(super) struct FindingItem {
+    pub finding: ReviewFinding,
+}
+
+/// Findings are a flat run in the order they were recorded: a review's
+/// sequence, not a hierarchy, so there is nothing to group by.
+pub(super) type FindingRow = ItemListRow<FindingItem>;
+
+/// Render one finding for the item list. `menu` is the open status dropdown,
+/// whichever finding it is on, and `active` whether the pane has the
+/// keyboard — the highlight only shows while it does.
+pub(super) fn render_finding(
+    item: &FindingItem,
+    state: ItemRowState<'_>,
+    menu: Option<StatusMenu>,
+    active: bool,
+    host: &RowHost<ChangeAction>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let props = FindingRowProps {
+        finding: &item.finding,
+        row_ix: state.row_ix,
+        highlighted: state.highlighted && active,
+        status_menu: menu,
+    };
+    finding_row(props, host, RowOptions::default(), window, cx)
+}
 
 /// What the side pane lists; see [`ConversationView::side_list`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,53 +441,6 @@ impl ConversationView {
         Some(col.into_any_element())
     }
 
-    /// A review finding's status chip: click it for the dropdown of the
-    /// answers it can be given.
-    fn render_status_badge(
-        &mut self,
-        item: Uuid,
-        status: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let menu = self.status_menu.filter(|m| m.is_on(item));
-        let view = cx.weak_entity();
-        let toggle = {
-            let view = view.clone();
-            Rc::new(move |_: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| {
-                    if !this.status_menu.take().is_some_and(|m| m.is_on(item)) {
-                        this.open_status_menu(item, cx);
-                    }
-                    cx.notify();
-                });
-            })
-        };
-        let choose = {
-            let view = view.clone();
-            Rc::new(move |status: &'static str, _: &mut Window, cx: &mut App| {
-                let _ = view.update(cx, |this, cx| this.choose_status(item, status, cx));
-            })
-        };
-        let dismiss = Rc::new(move |_: &mut Window, cx: &mut App| {
-            let _ = view.update(cx, |this, cx| {
-                this.status_menu = None;
-                cx.notify();
-            });
-        });
-        status_chip(
-            format!("finding-status-{item}"),
-            status,
-            finding_tone(status),
-            menu,
-            StatusMenuHandlers {
-                toggle,
-                choose,
-                dismiss,
-            },
-            cx,
-        )
-    }
-
     /// The side pane for whichever protocol runs the open conversation: the
     /// list it works on top and, once the node has a gate check verdict, that
     /// verdict beneath it.
@@ -589,19 +574,10 @@ impl ConversationView {
     /// every row shows.
     pub(super) fn toggle_status_filter(&mut self, status: &str, cx: &mut Context<Self>) {
         self.status_filter.toggle(status);
-        // The rows under the highlight have changed; start it over.
-        self.side_cursor = None;
+        // The list keeps its cursor on the finding it was on when that row
+        // still shows, and falls back to the first one when it does not.
         self.status_menu = None;
         cx.notify();
-    }
-
-    /// Rows Up/Down move among in the review pane. The plan pane hosts a
-    /// list with its own cursor.
-    fn side_row_count(&self) -> usize {
-        match self.side_list() {
-            SideList::Findings => self.shown_findings().len(),
-            _ => 0,
-        }
     }
 
     /// One toggle per status the review pane has a finding in, with its
@@ -620,7 +596,6 @@ impl ConversationView {
                 Some(status) => this.toggle_status_filter(status, cx),
                 None => {
                     if this.status_filter.clear() {
-                        this.side_cursor = None;
                         cx.notify();
                     }
                 }
@@ -657,22 +632,16 @@ impl ConversationView {
         )
     }
 
-    /// Move the review pane's highlight; entering an unhighlighted
-    /// pane lands on its first row.
+    /// Move the review pane's highlight, which the findings list owns.
     pub(super) fn move_side_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let count = self.side_row_count();
-        if count == 0 {
-            return;
-        }
-        let next = match self.side_cursor {
-            None => 0,
-            Some(ix) => (ix as isize + delta).clamp(0, count as isize - 1) as usize,
-        };
-        if self.side_cursor != Some(next) {
-            self.side_cursor = Some(next);
-            self.side_scroll_pending = true;
+        if self.findings.move_cursor(delta as i32) {
             cx.notify();
         }
+    }
+
+    /// The finding under the review pane's highlight.
+    pub(super) fn highlighted_finding(&self) -> Option<Uuid> {
+        self.findings.cursor_item().map(|item| item.finding.id)
     }
 
     /// The plan the conversation is working: the real plan-steps panel,
@@ -868,13 +837,6 @@ impl ConversationView {
         let active = self.pane == Pane::ChangeSet;
         let total = self.data.findings.len();
         let open = self.data.findings.iter().filter(|f| f.is_open()).count();
-        let findings = self.shown_findings();
-        let cursor = self.side_cursor.filter(|ix| *ix < findings.len());
-        if std::mem::take(&mut self.side_scroll_pending) {
-            if let Some(row) = cursor {
-                self.side_scroll.scroll_to_item(row);
-            }
-        }
         // A menu left open on a finding that has since gone closes.
         if self
             .status_menu
@@ -882,92 +844,36 @@ impl ConversationView {
         {
             self.status_menu = None;
         }
+        let rows: Vec<FindingRow> = self
+            .shown_findings()
+            .into_iter()
+            .map(|finding| ItemListRow::item(finding.id.to_string(), FindingItem { finding }))
+            .collect();
+        let empty = rows.is_empty();
+        self.findings.set_rows(rows);
 
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (n, finding) in findings.into_iter().enumerate() {
-            let id = finding.id;
-            let badge = self.render_status_badge(id, &finding.status, cx);
-            let severity = style::badge(div())
-                .flex_shrink_0()
-                .child(finding.severity.clone());
-            let severity = if finding.severity == "high" {
-                style::text_error(severity)
-            } else {
-                severity
-            };
-            let mut col = v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap(style::space::HAIRLINE)
-                .child(selectable_text(
-                    format!("review-finding-{id}"),
-                    finding.summary.clone(),
-                    window,
-                    cx,
-                ));
-            if let Some(location) = finding.location() {
-                col = col.child(style::text_dense_muted(div()).child(selectable_text(
-                    format!("review-finding-location-{id}"),
-                    location,
-                    window,
-                    cx,
-                )));
-            }
-            if let Some(detail) = &finding.detail {
-                col = col.child(style::text_dense_muted(div()).child(selectable_text(
-                    format!("review-finding-detail-{id}"),
-                    detail.clone(),
-                    window,
-                    cx,
-                )));
-            }
-            if let Some(response) = &finding.response {
-                col = col.child(
-                    v_flex()
-                        .pt(style::space::HAIRLINE)
-                        .child(
-                            style::text_dense_muted(div())
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(response_label(&finding.status)),
-                        )
-                        .child(style::text_dense(div()).child(selectable_text(
-                            format!("review-finding-response-{id}"),
-                            response.clone(),
-                            window,
-                            cx,
-                        ))),
-                );
-            }
-            rows.push(
-                h_flex()
-                    .when(active && cursor == Some(n), style::highlighted)
-                    .gap(style::space::INLINE)
-                    .px(style::space::RELATED)
-                    .py(style::space::INLINE)
-                    .items_start()
-                    .child(
-                        div()
-                            .w(SEVERITY_COLUMN_WIDTH)
-                            .flex_shrink_0()
-                            .child(severity),
-                    )
-                    .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
-                    .child(col)
-                    .into_any_element(),
-            );
-        }
-        if rows.is_empty() {
-            rows.push(
-                style::empty_message(div())
-                    .p(style::space::INSET)
-                    .child(if total == 0 {
-                        "No findings recorded."
-                    } else {
-                        "No findings in the chosen statuses."
-                    })
-                    .into_any_element(),
-            );
-        }
+        let list = if empty {
+            style::empty_message(div())
+                .p(style::space::INSET)
+                .child(if total == 0 {
+                    "No findings recorded."
+                } else {
+                    "No findings in the chosen statuses."
+                })
+                .into_any_element()
+        } else {
+            let menu = self.status_menu;
+            let row_host = self.host.clone();
+            self.findings.render(
+                "review-pane",
+                &self.host,
+                move |item, state, window, cx| {
+                    render_finding(item, state, menu, active, &row_host, window, cx)
+                },
+                window,
+                cx,
+            )
+        };
 
         v_flex()
             .size_full()
@@ -1004,16 +910,7 @@ impl ConversationView {
                     }),
             )
             .children(self.render_status_filter(cx))
-            .child(
-                v_flex()
-                    .id("review-pane")
-                    .track_scroll(&self.side_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .pb(style::space::RELATED)
-                    .children(rows),
-            )
+            .child(list)
             .into_any_element()
     }
 
@@ -1103,30 +1000,3 @@ impl ConversationView {
     }
 }
 
-/// What a finding's response is, by the answer it came with.
-/// Fixed widths for the leading columns of the plan and findings tables, so
-/// the text column starts at the same x on every row.
-const SEVERITY_COLUMN_WIDTH: Pixels = px(64.);
-const STATUS_COLUMN_WIDTH: Pixels = px(120.);
-
-fn response_label(status: &str) -> &'static str {
-    match status {
-        FINDING_FIXED => "Fixed",
-        FINDING_REJECTED => "Rejected — why it is not a problem",
-        FINDING_OUT_OF_SCOPE => "Out of scope",
-        FINDING_DECLINED => "Declined",
-        _ => "Note",
-    }
-}
-
-/// What a review finding's status says at a glance. An open finding is still
-/// asking for an answer, so it reads as blocking; a rejected one is the
-/// user's answer standing against the agent's, so it is neither.
-fn finding_tone(status: &str) -> style::StatusTone {
-    match status {
-        FINDING_OPEN => style::StatusTone::Blocked,
-        FINDING_FIXED => style::StatusTone::Done,
-        FINDING_REJECTED => style::StatusTone::Active,
-        _ => style::StatusTone::Idle,
-    }
-}

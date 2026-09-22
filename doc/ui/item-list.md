@@ -22,7 +22,7 @@ Every list feature the app needs exists somewhere, and no list has all of them.
 |---|---|---|---|---|---|---|
 | Obligations panel (`views/obligations/`) | 3 levels | full | single | inline | — | — |
 | Conversation side pane, obligations (`conversation/side_pane.rs:605`) | — | — | — | — | — | — |
-| Conversation side pane, findings (`side_pane.rs`) | — | cursor | — | status only | — | — |
+| Review findings, conversation side pane (`views/rows/finding_row.rs`) | — | cursor | — | status only | — | — |
 | Change set (`conversation/change_set.rs`) | 1 level | cursor | multi | inline | — | — |
 | Plan steps, panel and conversation side pane (`views/plan_steps/`) | — | full | single | inline | — | — |
 | Command history, agent transcripts, database | — | up/down | single | — | — | — |
@@ -187,9 +187,15 @@ the component, so no view sets a heading's colour, weight or indent itself.
    from the keyboard where the panel used to cycle status blindly. What only a
    conversation knows about a step — a handoff's answers, what verification
    found — reaches the row through a host hook rather than moving into the
-   shared row. Next the findings list, then the change set, which brings
-   multi-select and row buttons in.
-4. Move over command history, agent transcripts, and the database view.
+   shared row.
+4. **Done.** Move the review findings onto the component. A finding is now a
+   shared row (`views/rows/finding_row.rs`), so it looks and answers the same
+   wherever it is shown, and the pane's hand-rolled `side_cursor` is gone. The
+   conversation view keeps its own Up/Down/Enter dispatch and drives the list
+   with it, since the pane is one of several the view routes between; the list
+   is the state and the rows, not the key set. Next the change set, which
+   brings multi-select and row buttons in.
+5. Move over command history, agent transcripts, and the database view.
 
 Each step is complete on its own; the list of views above is the checklist.
 

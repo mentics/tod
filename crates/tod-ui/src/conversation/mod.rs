@@ -60,6 +60,7 @@ use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
+use crate::ui::item_list::{ItemList, ItemListEvent};
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
 use crate::ui::status::{self, StatusSource};
@@ -69,8 +70,11 @@ use crate::views::incoming_check::IncomingCheck;
 use crate::views::obligations::ObligationsView;
 use crate::views::plan_steps::PlanStepsView;
 use crate::views::lifecycle_control::LifecycleController;
-use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
+use crate::views::rows::{
+    FindingRowEvent, NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost,
+};
 use change_set::{ChangeKey, PendingReverse};
+use side_pane::FindingItem;
 use context_panel::{ContextPanel, ContextTab};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -215,7 +219,48 @@ pub(crate) enum ChangeAction {
         ix: usize,
         link: usize,
     },
+    /// Clicked the review pane's row at `row_ix`.
+    SelectFinding {
+        row_ix: usize,
+    },
+    /// Clicked a finding's status chip.
+    ToggleFindingStatusMenu {
+        finding_id: Uuid,
+    },
+    /// Answered a finding from its open dropdown.
+    ChooseFindingStatus {
+        finding_id: Uuid,
+        status: &'static str,
+    },
+    /// Clicked away from the open dropdown.
+    DismissStatusMenu,
     Ignore,
+}
+
+impl From<FindingRowEvent> for ChangeAction {
+    fn from(event: FindingRowEvent) -> Self {
+        match event {
+            FindingRowEvent::Select { row_ix } => Self::SelectFinding { row_ix },
+            FindingRowEvent::ToggleStatusMenu { finding_id } => {
+                Self::ToggleFindingStatusMenu { finding_id }
+            }
+            FindingRowEvent::ChooseStatus { finding_id, status } => {
+                Self::ChooseFindingStatus { finding_id, status }
+            }
+            FindingRowEvent::DismissStatusMenu => Self::DismissStatusMenu,
+        }
+    }
+}
+
+impl From<ItemListEvent> for ChangeAction {
+    fn from(event: ItemListEvent) -> Self {
+        match event {
+            ItemListEvent::Select { row_ix } => Self::SelectFinding { row_ix },
+            // The findings list is flat and single-select, so it has neither
+            // a group heading to collapse nor a checkbox to tick.
+            ItemListEvent::ToggleGroup { .. } | ItemListEvent::ToggleMark { .. } => Self::Ignore,
+        }
+    }
 }
 
 impl From<ObligationRowEvent> for ChangeAction {
@@ -368,8 +413,9 @@ pub struct ConversationView {
     /// Nodes whose gate check just finished a turn: the criteria rows it
     /// recorded are re-read on the next poll, so Advance appears on a pass.
     pending_gate_reloads: Vec<Uuid>,
-    /// The highlighted row of the review pane.
-    side_cursor: Option<usize>,
+    /// The review pane's findings, on the shared item list: it owns the
+    /// cursor, the scrolling, and the rows.
+    findings: ItemList<FindingItem>,
     /// The review finding status dropdown, while open.
     status_menu: Option<crate::views::rows::StatusMenu>,
     /// The statuses the review pane shows; empty shows every row.
@@ -377,8 +423,6 @@ pub struct ConversationView {
     /// The statuses the obligations pane, or the plan pane's requirements,
     /// shows; empty shows every obligation.
     obligation_filter: StatusFilter,
-    side_scroll: ScrollHandle,
-    side_scroll_pending: bool,
 
     change_filter: StatusFilter,
     cursor: Option<ChangeKey>,
@@ -548,12 +592,10 @@ impl ConversationView {
             edit_input,
             confirm: None,
             change_scroll: ScrollHandle::new(),
-            side_cursor: None,
+            findings: ItemList::new(),
             status_menu: None,
             status_filter: StatusFilter::default(),
             obligation_filter: StatusFilter::default(),
-            side_scroll: ScrollHandle::new(),
-            side_scroll_pending: false,
             scroll_to_cursor: false,
             context,
             side_obligations,
@@ -706,7 +748,7 @@ impl ConversationView {
         if switching {
             self.data = Snapshot::default();
             self.cursor = None;
-            self.side_cursor = None;
+            self.findings.set_cursor_key(None);
             self.status_menu = None;
             self.status_filter.clear();
             self.obligation_filter.clear();
@@ -1365,10 +1407,7 @@ impl ConversationView {
             Pane::Context => {}
             Pane::ChangeSet if self.side_list() == side_pane::SideList::Findings => {
                 // A highlighted finding's Enter opens its status dropdown.
-                let finding = self
-                    .side_cursor
-                    .and_then(|ix| self.shown_findings().get(ix).map(|f| f.id));
-                if let Some(finding) = finding {
+                if let Some(finding) = self.highlighted_finding() {
                     self.open_status_menu(finding, cx);
                 }
             }
@@ -1545,6 +1584,32 @@ impl ConversationView {
                 ChangeAction::OpenLink { ix, link } => {
                     self.link = Some(link);
                     self.open_link(ix, link, cx);
+                }
+                ChangeAction::SelectFinding { row_ix } => {
+                    self.pane = Pane::ChangeSet;
+                    self.picker = None;
+                    self.findings.set_cursor(row_ix);
+                    if !self.text_editing() {
+                        self.focus_handle.focus(window, cx);
+                    }
+                    cx.notify();
+                }
+                ChangeAction::ToggleFindingStatusMenu { finding_id } => {
+                    if !self
+                        .status_menu
+                        .take()
+                        .is_some_and(|menu| menu.is_on(finding_id))
+                    {
+                        self.open_status_menu(finding_id, cx);
+                    }
+                    cx.notify();
+                }
+                ChangeAction::ChooseFindingStatus { finding_id, status } => {
+                    self.choose_status(finding_id, status, cx);
+                }
+                ChangeAction::DismissStatusMenu => {
+                    self.status_menu = None;
+                    cx.notify();
                 }
                 ChangeAction::Ignore => {}
             }

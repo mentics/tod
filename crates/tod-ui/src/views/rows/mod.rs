@@ -1,4 +1,5 @@
-//! Obligation, plan-step, and node rows that any view can host.
+//! Obligation, plan-step, node, and review-finding rows that any view can
+//! host.
 //!
 //! The obligations list, the plan list, and the conversation change set all
 //! render the same rows. A row reports what the user did through a
@@ -6,6 +7,7 @@
 //! [`RowOptions`] adapts it to where it is shown (a compact change-set line,
 //! an op icon, hover actions, strike-through, an unsure flag).
 
+pub mod finding_row;
 pub mod node_row;
 pub mod obligation_row;
 pub mod plan_step_row;
@@ -25,10 +27,11 @@ use gpui_component::{Icon, Sizable as _, h_flex};
 use gpui_kit_assets::IconName;
 use tod_store::conversation::NetOp;
 
+pub use finding_row::{FindingRowEvent, FindingRowProps, STATUS_COLUMN_WIDTH, finding_row};
 pub use node_row::{NodeRowEvent, NodeRowProps, node_row};
 pub use obligation_row::{ObligationRowEvent, ObligationRowProps, obligation_row};
 pub use plan_step_row::{PlanStepRowEvent, PlanStepRowProps, plan_step_row};
-pub use status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
+pub use status_menu::StatusMenu;
 
 /// Where a row sends what the user did: an action queue plus a callback
 /// that makes the owner drain it.

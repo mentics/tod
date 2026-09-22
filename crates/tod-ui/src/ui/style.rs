@@ -229,6 +229,11 @@ pub fn text_dense_muted<E: Styled>(el: E) -> E {
     text_dense(el).text_color(color::text_muted())
 }
 
+/// `styles.text-dense-label`: a dense label over the text it introduces.
+pub fn text_dense_label<E: Styled>(el: E) -> E {
+    text_dense_muted(el).font_weight(FontWeight::SEMIBOLD)
+}
+
 /// `styles.text-error`.
 pub fn text_error<E: Styled>(el: E) -> E {
     text_dense(el).text_color(color::danger())
