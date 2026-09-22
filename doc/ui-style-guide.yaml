@@ -174,6 +174,36 @@ styles:
     hover: hover-menu
     highlighted: hover-menu
 
+  # Lists: one flat run of item rows under headings that group them. `row`
+  # above is the item; these are the list around it. Grouping goes as many
+  # levels as a list needs, each level one step lighter and one step further
+  # in than the one above it.
+  list-group:
+    font: title
+    height: group-row
+    padding-x: related
+    gap: inline
+    border-bottom: divider-strong
+    overflow: truncate-end
+    hover: hover-row
+    highlighted: highlighted
+  # The outermost level reads as a band across the whole list.
+  list-group-outer:
+    extends: list-group
+    font: title-bold
+    background: group-band
+  # Every level below the second.
+  list-group-inner:
+    extends: list-group
+    font: title-medium
+  # The count of items under a heading, appended to its label as "(n)".
+  list-group-count:
+    extends: text-muted
+  # The chevron that collapses a group, in the heading's leading gutter.
+  list-group-chevron:
+    extends: text-dense-muted
+    width: control-xsmall
+
   # Chunks: a block of content under a header that expands and collapses
   chunk:
     border: divider
@@ -295,10 +325,11 @@ properties:
   padding: space token, all sides
   padding-x: space token
   padding-y: space token
-  padding-left: space token
+  padding-left: "space token; a list heading adds size.group-indent per level"
   padding-bottom: space token
   gap: space token
   height: size token
+  width: size token
   min-width: size token
   max-width: size token
   align: "left | center | right"
@@ -350,6 +381,9 @@ tokens:
     badge-fill: "#262626"
     badge-edge: "#a3a3a38c"
     highlight: "#1e40af33"
+    # A group heading's rule, and the band behind an outermost heading.
+    divider-strong: "#a3a3a380"
+    group-band: "#26262680"
     highlight-edge: "#1d4ed8"
     toggle-on-fill: "#1d4ed8"
     toggle-on-edge: "#93c5fd"
@@ -363,6 +397,8 @@ tokens:
     dense: 12px, regular
     dense-medium: 12px, medium
     title: 14px, semibold
+    title-bold: 14px, bold
+    title-medium: 14px, medium
     page-title: 18px, semibold
   space:
     hairline: 2px
@@ -380,6 +416,8 @@ tokens:
     control-small: 24px
     control-xsmall: 20px
     pane-min: 320px
+    group-row: 28px
+    group-indent: 16px
     # Tallest a summary card's list grows before it scrolls.
     summary-list-max: 240px
     toast-min: 240px

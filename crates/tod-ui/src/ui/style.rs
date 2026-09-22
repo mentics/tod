@@ -84,6 +84,12 @@ pub mod color {
     pub fn incoming_text() -> Hsla {
         hex(0xfacc15ff)
     }
+    pub fn divider_strong() -> Hsla {
+        hex(0xa3a3a380)
+    }
+    pub fn group_band() -> Hsla {
+        hex(0x26262680)
+    }
 }
 
 /// `tokens.font` sizes (weights are applied by the styles that use them).
@@ -112,6 +118,9 @@ pub mod size {
 
     pub const BORDER: Pixels = px(1.);
     pub const PANE_MIN: Pixels = px(320.);
+    pub const CONTROL_XSMALL: Pixels = px(20.);
+    pub const GROUP_ROW: Pixels = px(28.);
+    pub const GROUP_INDENT: Pixels = px(16.);
     pub const SUMMARY_LIST_MAX: Pixels = px(240.);
 }
 
@@ -197,6 +206,32 @@ pub fn badge<E: Styled>(el: E) -> E {
         .py(space::HAIRLINE)
         .whitespace_nowrap()
         .flex_shrink_0()
+}
+
+/// `styles.list-group`: a heading over a run of item rows. `depth` is the
+/// grouping level, outermost 0: the outermost reads as a band across the
+/// list, the ones inside it as progressively lighter headings, each indented
+/// one step further than the one above.
+pub fn list_group<E: Styled>(el: E, depth: usize) -> E {
+    let el = el
+        .h(size::GROUP_ROW)
+        .px(space::RELATED)
+        .pl(space::RELATED + size::GROUP_INDENT * depth as f32)
+        .gap(space::INLINE)
+        .text_size(font::BODY)
+        .border_b(size::BORDER)
+        .border_color(color::divider_strong());
+    match depth {
+        0 => el.font_weight(FontWeight::BOLD).bg(color::group_band()),
+        1 => el.font_weight(FontWeight::SEMIBOLD),
+        _ => el.font_weight(FontWeight::MEDIUM),
+    }
+}
+
+/// `styles.list-group-chevron`: the collapse toggle in a heading's leading
+/// gutter.
+pub fn list_group_chevron<E: Styled>(el: E) -> E {
+    text_dense_muted(el).w(size::CONTROL_XSMALL).flex_shrink_0()
 }
 
 /// `styles.panel`.

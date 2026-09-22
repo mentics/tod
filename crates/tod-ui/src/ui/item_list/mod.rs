@@ -35,15 +35,12 @@ use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::Scrollbar;
-use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
+use gpui_component::{Sizable as _, h_flex};
 
 pub use keyboard::{ItemListKeys, bind_item_list_keys, bind_single_line_commit};
 
 /// Height of a group heading, and the unit page/viewport maths goes by.
 pub const GROUP_ROW_HEIGHT: gpui::Pixels = px(28.);
-
-/// How far each grouping level indents.
-const INDENT: gpui::Pixels = px(16.);
 
 /// What the user did to the list itself. A host's action type converts from
 /// it, so a view keeps one action queue for rows and list alike.
@@ -612,7 +609,7 @@ impl<T, G> ItemList<T, G> {
             let highlighted = self.cursor == Some(row_ix);
             let content = match row {
                 ItemListRow::Group { spec, .. } => {
-                    self.render_group(spec, row_ix, highlighted, host, cx)
+                    self.render_group(spec, row_ix, highlighted, host)
                 }
                 ItemListRow::Item { key, item } => {
                     let marked = self.marked.contains(key);
@@ -707,26 +704,14 @@ impl<T, G> ItemList<T, G> {
         row_ix: usize,
         highlighted: bool,
         host: &RowHost<A>,
-        cx: &mut App,
     ) -> AnyElement
     where
         A: From<ItemListEvent> + 'static,
     {
-        let theme = cx.theme();
-        let border = theme.muted_foreground.opacity(0.5);
         let select_host = host.clone();
-        let mut header = h_flex()
-            .h(GROUP_ROW_HEIGHT)
+        let mut header = style::list_group(h_flex(), group.depth)
             .flex_shrink_0()
             .items_center()
-            .gap_1()
-            .px_2()
-            .pl(px(8.) + INDENT * group.depth as f32)
-            .border_b_1()
-            .border_color(border)
-            // The outermost level of grouping reads as a band, the inner ones
-            // as headings within it.
-            .when(group.depth == 0, |el| el.bg(theme.secondary.opacity(0.5)))
             .when(highlighted, style::highlighted)
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
@@ -738,11 +723,7 @@ impl<T, G> ItemList<T, G> {
             let key = group.key.clone();
             let collapsed = group.collapsed;
             header = header.child(
-                div()
-                    .w(px(16.))
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                style::list_group_chevron(div())
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                         toggle_host.push(
@@ -775,11 +756,6 @@ impl<T, G> ItemList<T, G> {
             None => group.label.to_string(),
         };
         let mut text = div().flex_1().min_w_0().child(label);
-        text = match group.depth {
-            0 => text.text_sm().font_bold(),
-            1 => text.text_sm().font_semibold(),
-            _ => text.text_sm().font_medium(),
-        };
         if let Some(on_rename) = group.on_rename.clone() {
             // Renaming from the heading follows the cursor, as double-click to
             // edit does on an item row.
