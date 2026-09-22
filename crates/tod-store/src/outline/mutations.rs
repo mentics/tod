@@ -1614,7 +1614,7 @@ fn copy_managed_node_recursive(
         .get_extra_content(source_node_id, EXTRA_CONTENT_DETAILS)?
         .unwrap_or_default();
 
-    let title = format!("{}: {}", link.external_id, source.title);
+    let title = link.copy_title(&source.title);
     let new_id = Uuid::new_v4();
     let base = crate::outline::slug::derive_node_slug(&title, None);
     let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(new_id))?;
@@ -1637,6 +1637,11 @@ fn copy_managed_node_recursive(
     }
     if !tags.is_empty() {
         write_managed_tags(&node_repo, new_node.id, &tags)?;
+    }
+    if link.is_ticket() {
+        node_repo.enable_capability(new_node.id, Capability::Ticket)?;
+        crate::fleet::repos::task::TaskRepo::new(conn)
+            .update_linked_issues(&new_node.id.to_string(), &[link.external_id.clone()])?;
     }
 
     gen_repo.set_link(
