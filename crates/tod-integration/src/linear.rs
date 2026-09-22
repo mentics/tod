@@ -301,10 +301,11 @@ pub fn migrate_legacy_filter_keys(config: &mut serde_json::Map<String, serde_jso
 /// The `IssueFilter` fields that filter by a related entity, and how a list
 /// of picked values is expressed for each: the path of object keys down to
 /// the string comparator that takes `{ "in": [...] }`.
-const RELATION_FILTER_PATHS: [(&str, &[&str]); 4] = [
+const RELATION_FILTER_PATHS: [(&str, &[&str]); 5] = [
     ("team", &["key"]),
     ("state", &["name"]),
     ("assignee", &["displayName"]),
+    ("creator", &["displayName"]),
     ("labels", &["some", "name"]),
 ];
 
@@ -645,6 +646,7 @@ fn relation_options_from_response(data: &serde_json::Value) -> HashMap<String, V
         ("team", "teams", "key"),
         ("state", "workflowStates", "name"),
         ("assignee", "users", "displayName"),
+        ("creator", "users", "displayName"),
         ("labels", "issueLabels", "name"),
     ];
     let mut options = HashMap::new();
@@ -1383,6 +1385,7 @@ mod tests {
         assert_eq!(options["team"], vec!["OPS", "TOD"]);
         assert_eq!(options["state"], vec!["Done", "Todo"]);
         assert_eq!(options["assignee"], vec!["sam"]);
+        assert_eq!(options["creator"], vec!["sam"]);
         assert!(options["labels"].is_empty());
     }
 
