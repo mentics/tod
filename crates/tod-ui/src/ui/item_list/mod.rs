@@ -14,6 +14,10 @@
 //! The same item affords the same actions wherever it is shown, so a list
 //! leaves a capability out only where the data cannot take it.
 
+// The component's surface is written for every list in `doc/ui/item-list.md`'s
+// migration, not only the one migrated so far.
+#![allow(dead_code)]
+
 pub mod keyboard;
 pub mod search;
 
@@ -28,6 +32,7 @@ use gpui::{
     px,
 };
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputState};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, Sizable as _, StyledExt, h_flex};
@@ -48,6 +53,8 @@ pub enum ItemListEvent {
     Select { row_ix: usize },
     /// Clicked a group heading's chevron.
     ToggleGroup { key: String },
+    /// Clicked an item's selection checkbox.
+    ToggleMark { row_ix: usize },
 }
 
 /// A group heading: a label over a run of items, never an item itself.
@@ -117,13 +124,15 @@ impl GroupSpec {
     }
 }
 
-/// One row: a group heading, or an item carrying the caller's payload.
-pub enum ItemListRow<T> {
-    Group(GroupSpec),
+/// One row: a group heading, or an item. Both carry the caller's own payload —
+/// `T` for an item, `G` for a group — so a view reads a row's meaning off the
+/// row instead of parsing its key back.
+pub enum ItemListRow<T, G = ()> {
+    Group { spec: GroupSpec, group: G },
     Item { key: String, item: T },
 }
 
-impl<T> ItemListRow<T> {
+impl<T, G> ItemListRow<T, G> {
     pub fn item(key: impl Into<String>, item: T) -> Self {
         Self::Item {
             key: key.into(),
@@ -131,9 +140,13 @@ impl<T> ItemListRow<T> {
         }
     }
 
+    pub fn group(spec: GroupSpec, group: G) -> Self {
+        Self::Group { spec, group }
+    }
+
     pub fn key(&self) -> &str {
         match self {
-            Self::Group(group) => &group.key,
+            Self::Group { spec, .. } => &spec.key,
             Self::Item { key, .. } => key,
         }
     }
@@ -141,19 +154,34 @@ impl<T> ItemListRow<T> {
     pub fn as_item(&self) -> Option<&T> {
         match self {
             Self::Item { item, .. } => Some(item),
-            Self::Group(_) => None,
+            Self::Group { .. } => None,
         }
     }
 
     pub fn as_group(&self) -> Option<&GroupSpec> {
         match self {
-            Self::Group(group) => Some(group),
+            Self::Group { spec, .. } => Some(spec),
+            Self::Item { .. } => None,
+        }
+    }
+
+    /// The caller's payload for a group heading.
+    pub fn group_payload(&self) -> Option<&G> {
+        match self {
+            Self::Group { group, .. } => Some(group),
             Self::Item { .. } => None,
         }
     }
 
     fn depth(&self) -> Option<usize> {
         self.as_group().map(|group| group.depth)
+    }
+}
+
+impl<T> ItemListRow<T, ()> {
+    /// A group heading with no payload, for a list that groups by one thing.
+    pub fn heading(spec: GroupSpec) -> Self {
+        Self::Group { spec, group: () }
     }
 }
 
@@ -182,8 +210,8 @@ pub enum CollapseStep {
 }
 
 /// The list's own state: rows, cursor, selection, collapsed groups, scroll.
-pub struct ItemList<T> {
-    rows: Vec<ItemListRow<T>>,
+pub struct ItemList<T, G = ()> {
+    rows: Vec<ItemListRow<T, G>>,
     cursor: Option<usize>,
     cursor_key: Option<String>,
     marked: HashSet<String>,
@@ -194,17 +222,19 @@ pub struct ItemList<T> {
     group_editor: Option<gpui::Entity<InputState>>,
     group_edit_tag: Option<&'static str>,
     scroll: ScrollHandle,
+    /// Items carry a selection checkbox and answer Space.
+    marking: bool,
     drag: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
     context_menu: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
 }
 
-impl<T> Default for ItemList<T> {
+impl<T, G> Default for ItemList<T, G> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> ItemList<T> {
+impl<T, G> ItemList<T, G> {
     pub fn new() -> Self {
         Self {
             rows: Vec::new(),
@@ -216,6 +246,7 @@ impl<T> ItemList<T> {
             group_editor: None,
             group_edit_tag: None,
             scroll: ScrollHandle::new(),
+            marking: false,
             drag: None,
             context_menu: None,
         }
@@ -230,6 +261,13 @@ impl<T> ItemList<T> {
     ) -> Self {
         self.group_editor = Some(editor);
         self.group_edit_tag = Some(tag);
+        self
+    }
+
+    /// Let the user select several items: each row carries a checkbox, and
+    /// Space marks the row under the cursor.
+    pub fn with_marking(mut self) -> Self {
+        self.marking = true;
         self
     }
 
@@ -258,7 +296,7 @@ impl<T> ItemList<T> {
     /// Replace the rows, keeping the cursor on the same *key* rather than the
     /// same index, so a change that reorders rows does not move it. Falls back
     /// to the first row. Selection drops keys that are gone.
-    pub fn set_rows(&mut self, rows: Vec<ItemListRow<T>>) {
+    pub fn set_rows(&mut self, rows: Vec<ItemListRow<T, G>>) {
         let previous = self.cursor;
         let ix = self
             .cursor_key
@@ -285,7 +323,7 @@ impl<T> ItemList<T> {
         }
     }
 
-    pub fn rows(&self) -> &[ItemListRow<T>] {
+    pub fn rows(&self) -> &[ItemListRow<T, G>] {
         &self.rows
     }
 
@@ -312,7 +350,7 @@ impl<T> ItemList<T> {
         self.cursor_key.as_deref()
     }
 
-    pub fn cursor_row(&self) -> Option<&ItemListRow<T>> {
+    pub fn cursor_row(&self) -> Option<&ItemListRow<T, G>> {
         self.cursor.and_then(|ix| self.rows.get(ix))
     }
 
@@ -320,6 +358,11 @@ impl<T> ItemList<T> {
     /// group heading.
     pub fn cursor_item(&self) -> Option<&T> {
         self.cursor_row().and_then(ItemListRow::as_item)
+    }
+
+    /// The group heading under the cursor, with the caller's payload.
+    pub fn cursor_group(&self) -> Option<&G> {
+        self.cursor_row().and_then(ItemListRow::group_payload)
     }
 
     /// Put the cursor on `key` when the next [`set_rows`](Self::set_rows)
@@ -386,28 +429,54 @@ impl<T> ItemList<T> {
 
     // -- selection -------------------------------------------------------
 
-    /// Add or remove the row under the cursor from the selection.
+    /// Add or remove the row under the cursor from the selection. Only items
+    /// are selectable: a group heading is a label over a run, not a row an
+    /// action can work on.
     pub fn toggle_mark(&mut self) {
-        let Some(key) = self.cursor_key.clone() else {
+        let Some(ix) = self.cursor else {
             return;
         };
+        self.toggle_mark_at(ix);
+    }
+
+    /// The same for the row at `row_ix` (its checkbox).
+    pub fn toggle_mark_at(&mut self, row_ix: usize) {
+        let Some(row) = self.rows.get(row_ix) else {
+            return;
+        };
+        if row.as_item().is_none() {
+            return;
+        }
+        let key = row.key().to_string();
         if !self.marked.remove(&key) {
             self.marked.insert(key);
         }
+    }
+
+    pub fn marked_count(&self) -> usize {
+        self.marked.len()
     }
 
     pub fn is_marked(&self, key: &str) -> bool {
         self.marked.contains(key)
     }
 
-    /// The selection, in row order; the row under the cursor when nothing is
-    /// marked, so an action works on "this one" without a marking step.
+    /// The items an action works on, in row order: the marked ones, or the
+    /// item under the cursor when nothing is marked, so an action works on
+    /// "this one" without a marking step. Empty when the cursor is on a group
+    /// heading and nothing is marked.
     pub fn selection(&self) -> Vec<&str> {
         if self.marked.is_empty() {
-            return self.cursor_key.as_deref().into_iter().collect();
+            return self
+                .cursor_row()
+                .filter(|row| row.as_item().is_some())
+                .map(ItemListRow::key)
+                .into_iter()
+                .collect();
         }
         self.rows
             .iter()
+            .filter(|row| row.as_item().is_some())
             .map(ItemListRow::key)
             .filter(|key| self.marked.contains(*key))
             .collect()
@@ -456,8 +525,8 @@ impl<T> ItemList<T> {
             return CollapseStep::Nothing;
         };
         match self.rows.get(ix) {
-            Some(ItemListRow::Group(group)) if !self.collapsed.contains(&group.key) => {
-                let key = group.key.clone();
+            Some(ItemListRow::Group { spec, .. }) if !self.collapsed.contains(&spec.key) => {
+                let key = spec.key.clone();
                 self.collapsed.insert(key);
                 CollapseStep::Collapsed
             }
@@ -475,10 +544,11 @@ impl<T> ItemList<T> {
     /// Right: expand the collapsed group under the cursor. `true` when
     /// something changed and the rows need rebuilding.
     pub fn expand_step(&mut self) -> bool {
-        let Some(ItemListRow::Group(group)) = self.cursor.and_then(|ix| self.rows.get(ix)) else {
+        let Some(ItemListRow::Group { spec, .. }) = self.cursor.and_then(|ix| self.rows.get(ix))
+        else {
             return false;
         };
-        self.collapsed.remove(&group.key)
+        self.collapsed.remove(&spec.key)
     }
 
     /// The group that encloses row `ix`: the nearest heading above it that is
@@ -541,18 +611,24 @@ impl<T> ItemList<T> {
         for (row_ix, row) in self.rows.iter().enumerate() {
             let highlighted = self.cursor == Some(row_ix);
             let content = match row {
-                ItemListRow::Group(group) => {
-                    self.render_group(group, row_ix, highlighted, host, cx)
+                ItemListRow::Group { spec, .. } => {
+                    self.render_group(spec, row_ix, highlighted, host, cx)
                 }
                 ItemListRow::Item { key, item } => {
+                    let marked = self.marked.contains(key);
                     let state = ItemRowState {
                         row_ix,
                         key,
                         highlighted,
-                        marked: self.marked.contains(key),
+                        marked,
                         editing: self.editing_key.as_deref() == Some(key.as_str()),
                     };
-                    render_item(item, state, window, cx)
+                    let row = render_item(item, state, window, cx);
+                    if self.marking {
+                        self.with_checkbox(row, row_ix, marked, host)
+                    } else {
+                        row
+                    }
                 }
             };
             let mut wrapper = div().id(("item-list-row", row_ix)).w_full().child(content);
@@ -593,6 +669,35 @@ impl<T> ItemList<T> {
                     .w(px(16.))
                     .child(Scrollbar::vertical(&self.scroll)),
             )
+            .into_any_element()
+    }
+
+    /// The selection checkbox, ahead of the caller's row.
+    fn with_checkbox<A>(
+        &self,
+        row: AnyElement,
+        row_ix: usize,
+        marked: bool,
+        host: &RowHost<A>,
+    ) -> AnyElement
+    where
+        A: From<ItemListEvent> + 'static,
+    {
+        let host = host.clone();
+        h_flex()
+            .w_full()
+            .items_start()
+            .child(
+                div().flex_shrink_0().pt(px(6.)).pl(px(4.)).child(
+                    Checkbox::new(("item-list-mark", row_ix))
+                        .checked(marked)
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            host.push(ItemListEvent::ToggleMark { row_ix }.into(), cx);
+                        }),
+                ),
+            )
+            .child(div().flex_1().min_w_0().child(row))
             .into_any_element()
     }
 
@@ -719,9 +824,9 @@ mod tests {
     fn fixture() -> ItemList<&'static str> {
         let mut list = ItemList::new();
         list.set_rows(vec![
-            ItemListRow::Group(GroupSpec::new("phase", 0, "Requirements phase").count(2)),
-            ItemListRow::Group(GroupSpec::new("kind", 1, "Requirements").count(2)),
-            ItemListRow::Group(GroupSpec::new("section", 2, "Offline").count(2)),
+            ItemListRow::heading(GroupSpec::new("phase", 0, "Requirements phase").count(2)),
+            ItemListRow::heading(GroupSpec::new("kind", 1, "Requirements").count(2)),
+            ItemListRow::heading(GroupSpec::new("section", 2, "Offline").count(2)),
             ItemListRow::item("a", "Works offline"),
             ItemListRow::item("b", "Syncs later"),
         ]);
@@ -745,8 +850,8 @@ mod tests {
         assert_eq!(list.cursor_key(), Some("b"));
         // "b" moved above "a" and a group was added above them both.
         list.set_rows(vec![
-            ItemListRow::Group(GroupSpec::new("phase", 0, "Requirements phase")),
-            ItemListRow::Group(GroupSpec::new("kind", 1, "Requirements")),
+            ItemListRow::heading(GroupSpec::new("phase", 0, "Requirements phase")),
+            ItemListRow::heading(GroupSpec::new("kind", 1, "Requirements")),
             ItemListRow::item("b", "Syncs later"),
             ItemListRow::item("a", "Works offline"),
         ]);
@@ -812,6 +917,17 @@ mod tests {
         assert_eq!(list.selection(), vec!["a"]);
         list.clear_marks();
         assert_eq!(list.selection(), vec!["b"]);
+    }
+
+    #[test]
+    fn a_group_heading_is_not_selectable() {
+        let mut list = fixture();
+        // The cursor starts on the outermost heading.
+        list.toggle_mark();
+        assert_eq!(list.marked_count(), 0);
+        assert!(list.selection().is_empty());
+        list.toggle_mark_at(2);
+        assert_eq!(list.marked_count(), 0);
     }
 
     #[test]

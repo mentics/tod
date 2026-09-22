@@ -1,29 +1,37 @@
 //! Obligations panel — edit direct requirements/constraints for a Spec node.
 
-mod delegate;
+mod rows;
 
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::OpenAgentChat;
-use crate::ui::key_context;
-use crate::ui::list::{
-    ListArrowDown, ListArrowUp, ListEnd, ListHome, ListPageDown, ListPageUp, viewport_row_count,
+use crate::ui::item_list::keyboard::{
+    ItemListActivate, ItemListAddGroup, ItemListCollapse, ItemListCommitEdit, ItemListCreateAbove,
+    ItemListCreateBelow, ItemListCreateChild, ItemListDelete, ItemListDown, ItemListEdit,
+    ItemListEnd, ItemListExpand, ItemListFocusSearch, ItemListHome, ItemListMoveDown,
+    ItemListMoveUp, ItemListPageDown, ItemListPageUp, ItemListSearchSpace, ItemListToggleMark,
+    ItemListUp,
 };
+use crate::ui::item_list::{
+    CollapseStep, GroupSpec, ItemList, ItemListKeys, ItemListRow, bind_item_list_keys,
+    bind_single_line_commit, search,
+};
+use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
-use crate::views::rows::RowHost;
-use delegate::{
-    ListAction, NO_SECTION, ObligationListDelegate, ObligationRow, SECTION_EDIT_TAG, group_row_key,
-    new_section_row_key, obligation_section, phase_row_key, section_row_key,
+use crate::views::rows::{RowAction, RowHost};
+use rows::{
+    ListAction, NO_SECTION, ObGroup, ObRow, ObligationItem, SECTION_EDIT_TAG, group_row_key,
+    kind_label, new_section_row_key, obligation_section, phase_label, phase_row_key,
+    section_row_key, static_kind,
 };
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div, px,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, actions, div,
+    px,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
-use gpui_component::scroll::Scrollbar;
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -40,79 +48,16 @@ use uuid::Uuid;
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
 const INLINE_EDIT_ROWS: usize = 2;
 
-actions!(
-    obligations,
-    [
-        ObligationsClose,
-        ObligationsEnter,
-        ObligationsCreateBelow,
-        ObligationsCreateAbove,
-        ObligationsCreateChild,
-        ObligationsMoveUp,
-        ObligationsMoveDown,
-        ObligationsEdit,
-        ObligationsCommitEdit,
-        ObligationsCollapse,
-        ObligationsExpand,
-        ObligationsDelete,
-        ObligationsAddSection,
-        ObligationsFocusSearch,
-        ObligationsSearchSpace,
-    ]
-);
+actions!(obligations, [ObligationsClose]);
 
 pub fn register_obligations_keyboard_bindings(cx: &mut App) {
-    let context = Some(key_context::excluding_input(OBLIGATIONS_CONTEXT));
-    cx.bind_keys([
-        KeyBinding::new("up", ListArrowUp, context),
-        KeyBinding::new("down", ListArrowDown, context),
-        KeyBinding::new("pageup", ListPageUp, context),
-        KeyBinding::new("pagedown", ListPageDown, context),
-        KeyBinding::new("home", ListHome, context),
-        KeyBinding::new("end", ListEnd, context),
-        KeyBinding::new("enter", ObligationsEnter, context),
-        KeyBinding::new("n", ObligationsCreateBelow, context),
-        KeyBinding::new("f2", ObligationsEdit, context),
-        KeyBinding::new("left", ObligationsCollapse, context),
-        KeyBinding::new("right", ObligationsExpand, context),
-        KeyBinding::new("shift-enter", ObligationsCreateChild, context),
-        KeyBinding::new(
-            "shift-enter",
-            ObligationsCreateChild,
-            Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
-        ),
-        KeyBinding::new("alt-enter", ObligationsCreateAbove, context),
-        KeyBinding::new("secondary-up", ObligationsMoveUp, context),
-        KeyBinding::new("secondary-down", ObligationsMoveDown, context),
-        KeyBinding::new("backspace", ObligationsDelete, context),
-        KeyBinding::new("delete", ObligationsDelete, context),
-        KeyBinding::new("s", ObligationsAddSection, context),
-        KeyBinding::new("ctrl-f", ObligationsFocusSearch, context),
-        // Space must type a literal space in the search field rather than being
-        // swallowed as a shortcut — bind it explicitly while the field is focused.
-        KeyBinding::new(
-            "space",
-            ObligationsSearchSpace,
-            Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
-        ),
-        // Inline edit is a multi-line text area: arrows move the cursor as usual,
-        // Escape abandons the edit, and Ctrl+Enter commits it.
-        KeyBinding::new(
-            "ctrl-enter",
-            ObligationsCommitEdit,
-            Some(key_context::including_input(OBLIGATIONS_CONTEXT)),
-        ),
-        // The section-name field is single-line, so plain Enter commits it.
-        KeyBinding::new(
-            "enter",
-            ObligationsCommitEdit,
-            Some(key_context::including_tag(
-                OBLIGATIONS_CONTEXT,
-                SECTION_EDIT_TAG,
-            )),
-        ),
-    ]);
-    // Left/Right collapse/expand rows here, so crossing back to the tree uses Ctrl+arrows.
+    // The panel is an item list: navigation, editing, creation, reordering,
+    // marking, grouping and search all come from the one key set.
+    bind_item_list_keys(cx, OBLIGATIONS_CONTEXT, ItemListKeys::all());
+    // A section's name is a single-line field, so plain Enter commits it.
+    bind_single_line_commit(cx, OBLIGATIONS_CONTEXT, SECTION_EDIT_TAG);
+    // Left/Right collapse/expand groups here, so crossing back to the tree
+    // uses Ctrl+arrows.
     bind_modified_pane_nav(cx, OBLIGATIONS_CONTEXT);
     key_context::bind_panel_escape(cx, ObligationsClose, OBLIGATIONS_CONTEXT);
 }
@@ -139,6 +84,13 @@ pub enum ObligationsEvent {
     },
 }
 
+/// What the cursor is on, cloned out of the list so the panel can act on it.
+#[derive(Debug, Clone)]
+enum CursorRow {
+    Group(ObGroup),
+    Item(ObligationItem),
+}
+
 pub struct ObligationsView {
     fleet: Arc<FleetStore>,
     node_id: Option<Uuid>,
@@ -152,15 +104,10 @@ pub struct ObligationsView {
     /// interview (the standalone Obligations panel), where every phase starts
     /// expanded as before.
     active_phase: Option<String>,
-    phase_collapsed: HashSet<String>,
-    /// Keyed by `group_row_key(phase, kind)` — a kind's collapse state is
-    /// per-phase now that phase is the outermost grouping.
-    kind_collapsed: HashSet<String>,
-    section_collapsed: HashSet<String>,
     focus_handle: FocusHandle,
-    delegate: ObligationListDelegate,
-    scroll_handle: ScrollHandle,
-    selected_index: Option<usize>,
+    /// The rows, the cursor, the selection, the collapsed groups and the
+    /// scrolling: everything every list in the app shares.
+    list: ItemList<ObligationItem, ObGroup>,
     host: RowHost<ListAction>,
     /// Hosted inside another view (the conversation view's context panel):
     /// no Close or chat button, and Escape / Ctrl+Left go to the host.
@@ -169,6 +116,10 @@ pub struct ObligationsView {
     /// through (the conversation's deleted items). Merged into `items` on
     /// every reload and never editable.
     removed: Vec<NodeObligation>,
+    /// Which of `items` are those removed ones.
+    struck: HashSet<Uuid>,
+    /// Change-set operations by obligation id, shown as a leading op icon.
+    change_markers: HashMap<Uuid, NetOp>,
     /// Each obligation's standing — its verdict, else whether a plan step
     /// satisfies it — which the status filter goes by.
     standing: HashMap<Uuid, String>,
@@ -187,7 +138,6 @@ pub struct ObligationsView {
     section_edit_input: Entity<InputState>,
     pending_abandon_section_edit: bool,
     pending_live_refresh: bool,
-    selected_key: Option<String>,
     _inline_edit_subscription: Subscription,
     _section_edit_subscription: Subscription,
 }
@@ -219,8 +169,6 @@ impl ObligationsView {
 
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search obligations…"));
-
-        let delegate = ObligationListDelegate::new(Vec::new(), host.clone());
 
         let poll_entity = cx.weak_entity();
         let fleet_for_poll = fleet.clone();
@@ -254,16 +202,16 @@ impl ObligationsView {
             search_query: String::new(),
             search_input,
             active_phase: None,
-            phase_collapsed: HashSet::new(),
-            kind_collapsed: HashSet::new(),
-            section_collapsed: HashSet::new(),
             focus_handle: cx.focus_handle(),
-            delegate,
-            scroll_handle: ScrollHandle::new(),
-            selected_index: None,
+            list: ItemList::new()
+                .with_group_editor(section_edit_input.clone(), SECTION_EDIT_TAG)
+                .with_marking()
+                .with_drag(rows::draggable),
             host,
             embedded: false,
             removed: Vec::new(),
+            struck: HashSet::new(),
+            change_markers: HashMap::new(),
             standing: HashMap::new(),
             filter: StatusFilter::default(),
             editing_id: None,
@@ -276,7 +224,6 @@ impl ObligationsView {
             section_edit_input,
             pending_abandon_section_edit: false,
             pending_live_refresh: false,
-            selected_key: None,
             _inline_edit_subscription,
             _section_edit_subscription,
         }
@@ -306,10 +253,10 @@ impl ObligationsView {
             item.kind.clone(),
             obligation_section(item).to_string(),
         );
-        self.phase_collapsed.remove(&phase_row_key(&phase));
-        self.kind_collapsed.remove(&group_row_key(&phase, &kind));
-        self.section_collapsed
-            .remove(&section_row_key(&phase, &kind, &section));
+        self.list.set_collapsed(phase_row_key(&phase), false);
+        self.list.set_collapsed(group_row_key(&phase, &kind), false);
+        self.list
+            .set_collapsed(section_row_key(&phase, &kind, &section), false);
         let key = id.to_string();
         if !self.search_matches().iter().any(|o| o.id == id) {
             self.filter.clear();
@@ -318,27 +265,26 @@ impl ObligationsView {
                 input.set_value("", window, cx);
             });
         }
-        self.selected_key = Some(key);
+        self.list.set_cursor_key(Some(key));
         self.rebuild_visible(window, cx);
-        if let Some(ix) = self.selected_index {
-            self.scroll_handle.scroll_to_item(ix);
-        }
+        self.list.scroll_to_cursor();
     }
 
     /// Show a leading op icon on each obligation in `markers`.
     pub fn set_change_markers(&mut self, markers: HashMap<Uuid, NetOp>, cx: &mut Context<Self>) {
-        self.delegate.set_change_markers(markers);
+        self.change_markers = markers;
+        self.list.set_rows(self.flat_rows());
         cx.notify();
+    }
+
+    /// Whether `id` is shown as a removed (struck-through) row.
+    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
+        self.struck.contains(&id)
     }
 
     /// Also show `items`, which no longer exist, struck through at their old
     /// place. Ones that exist again (a reversed deletion) show as normal.
     /// Whether `id` is shown as a removed (struck-through) row.
-    #[cfg(test)]
-    pub(crate) fn is_struck(&self, id: Uuid) -> bool {
-        self.delegate.is_struck(id)
-    }
-
     pub fn set_removed_items(
         &mut self,
         items: Vec<NodeObligation>,
@@ -359,7 +305,7 @@ impl ObligationsView {
         Some(
             match self
                 .selected_obligation_id()
-                .filter(|id| !self.delegate.is_struck(*id))
+                .filter(|id| !self.is_struck(*id))
             {
                 Some(id) => Focus::Obligation { node, id },
                 None => Focus::Node(node),
@@ -378,8 +324,6 @@ impl ObligationsView {
         self.node_id = Some(node_id);
         self.title = title.to_string();
         self.active_phase = active_phase.map(str::to_string);
-        self.kind_collapsed.clear();
-        self.section_collapsed.clear();
         self.reset_phase_collapse();
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
@@ -411,8 +355,6 @@ impl ObligationsView {
         self.node_id = Some(node_id);
         self.title = title.to_string();
         self.active_phase = active_phase.map(str::to_string);
-        self.kind_collapsed.clear();
-        self.section_collapsed.clear();
         self.reset_phase_collapse();
         self.clear_inline_edit_state(window, cx);
         self.reload(window, cx);
@@ -425,11 +367,11 @@ impl ObligationsView {
     /// Collapse every phase except `active_phase`; expand everything when
     /// there is no active phase (outside an interview).
     fn reset_phase_collapse(&mut self) {
-        self.phase_collapsed.clear();
+        self.list.expand_all();
         if self.active_phase.is_some() {
             for phase in Self::phase_order() {
                 if Some(phase) != self.active_phase.as_deref() {
-                    self.phase_collapsed.insert(phase_row_key(phase));
+                    self.list.set_collapsed(phase_row_key(phase), true);
                 }
             }
         }
@@ -443,7 +385,8 @@ impl ObligationsView {
         self.node_id = None;
         self.title.clear();
         self.items.clear();
-        self.selected_key = None;
+        self.list.set_cursor_key(None);
+        self.list.clear_marks();
         self.search_query.clear();
         self.search_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
@@ -460,10 +403,7 @@ impl ObligationsView {
     /// Id of the selected obligation, when the selection is an item rather than
     /// a group or section header.
     fn selected_obligation_id(&self) -> Option<Uuid> {
-        match self.delegate.selected_row()? {
-            ObligationRow::Item { obligation } => Some(obligation.id),
-            _ => None,
-        }
+        Some(self.list.cursor_item()?.obligation.id)
     }
 
     fn open_agent_chat(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -510,7 +450,7 @@ impl ObligationsView {
                 .unwrap_or(self.items.len());
             self.items.insert(at, ghost.clone());
         }
-        self.delegate.set_struck(struck);
+        self.struck = struck;
         self.rebuild_visible(window, cx);
     }
 
@@ -550,32 +490,21 @@ impl ObligationsView {
     /// but every term must match for the item to be included. Empty query
     /// matches everything.
     fn search_matches(&self) -> Vec<&NodeObligation> {
-        let terms: Vec<String> = self
-            .search_query
-            .split_whitespace()
-            .map(|t| t.to_lowercase())
-            .collect();
-        let admitted = self
-            .items
+        self.items
             .iter()
-            .filter(|o| self.filter.admits(self.standing_of(o.id)));
-        if terms.is_empty() {
-            return admitted.collect();
-        }
-        admitted
+            .filter(|o| self.filter.admits(self.standing_of(o.id)))
             .filter(|o| {
-                let body = o.body.to_lowercase();
-                let section = o.section.as_deref().unwrap_or("").to_lowercase();
-                let words: Vec<&str> = body
-                    .split_whitespace()
-                    .chain(section.split_whitespace())
-                    .collect();
-                terms.iter().all(|term| fuzzy_term_matches(term, &words))
+                search::matches_query(
+                    &self.search_query,
+                    &[&o.body, o.section.as_deref().unwrap_or("")],
+                )
             })
             .collect()
     }
 
-    fn flat_rows(&self) -> Vec<ObligationRow> {
+    /// The rows the list shows: phase, then kind, then section, then the
+    /// obligations in that section.
+    fn flat_rows(&self) -> Vec<ObRow> {
         let mut rows = Vec::new();
         let matching = self.search_matches();
         for phase in Self::phase_order() {
@@ -587,75 +516,117 @@ impl ObligationsView {
             if phase_items.is_empty() {
                 continue;
             }
-            let phase_key = delegate::phase_row_key(phase);
-            let phase_collapsed = self.phase_collapsed.contains(&phase_key);
-            rows.push(ObligationRow::Phase {
-                phase: phase.to_string(),
-                collapsed: phase_collapsed,
-                count: phase_items.len(),
-            });
-            if phase_collapsed {
+            let key = phase_row_key(phase);
+            let collapsed = self.list.is_collapsed(&key);
+            rows.push(ItemListRow::group(
+                GroupSpec::new(key, 0, phase_label(phase))
+                    .count(phase_items.len())
+                    .collapsed(collapsed),
+                ObGroup::Phase {
+                    phase: phase.to_string(),
+                },
+            ));
+            if collapsed {
                 continue;
             }
-            let reqs: Vec<_> = phase_items
-                .iter()
-                .filter(|o| o.kind == KIND_REQUIREMENT)
-                .map(|o| (*o).clone())
-                .collect();
-            let cons: Vec<_> = phase_items
-                .iter()
-                .filter(|o| o.kind == KIND_CONSTRAINT)
-                .map(|o| (*o).clone())
-                .collect();
-            self.append_kind_group(&mut rows, phase, KIND_REQUIREMENT, reqs);
-            self.append_kind_group(&mut rows, phase, KIND_CONSTRAINT, cons);
+            for kind in [KIND_REQUIREMENT, KIND_CONSTRAINT] {
+                let items: Vec<NodeObligation> = phase_items
+                    .iter()
+                    .filter(|o| o.kind == kind)
+                    .map(|o| (*o).clone())
+                    .collect();
+                self.append_kind_group(&mut rows, phase, kind, items);
+            }
         }
         rows
     }
 
     fn append_kind_group(
         &self,
-        rows: &mut Vec<ObligationRow>,
+        rows: &mut Vec<ObRow>,
         phase: &str,
         kind: &'static str,
         items: Vec<NodeObligation>,
     ) {
         let kind_key = group_row_key(phase, kind);
-        let kind_collapsed = self.kind_collapsed.contains(&kind_key);
-        rows.push(ObligationRow::Group {
-            phase: phase.to_string(),
-            kind,
-            collapsed: kind_collapsed,
-            count: items.len(),
-        });
-        if kind_collapsed {
-            return;
-        }
-        if self.new_section_kind == Some((phase.to_string(), kind)) {
-            rows.push(ObligationRow::Section {
+        let collapsed = self.list.is_collapsed(&kind_key);
+        let add_host = self.host.clone();
+        let add_phase = phase.to_string();
+        rows.push(ItemListRow::group(
+            GroupSpec::new(kind_key, 1, kind_label(kind))
+                .count(items.len())
+                .collapsed(collapsed)
+                .action(RowAction::new("add-section", "+ Section", move |_, cx| {
+                    add_host.push(
+                        ListAction::AddSection {
+                            phase: add_phase.clone(),
+                            kind,
+                        },
+                        cx,
+                    );
+                })),
+            ObGroup::Kind {
                 phase: phase.to_string(),
                 kind,
-                section: String::new(),
-                collapsed: false,
-                count: 0,
-                is_new: true,
-            });
+            },
+        ));
+        if collapsed {
+            return;
+        }
+        if self.new_section_kind.as_ref() == Some(&(phase.to_string(), kind)) {
+            rows.push(ItemListRow::group(
+                GroupSpec::new(new_section_row_key(phase, kind), 2, "")
+                    .editing(true)
+                    .chevron(false),
+                ObGroup::Section {
+                    phase: phase.to_string(),
+                    kind,
+                    section: String::new(),
+                    is_new: true,
+                },
+            ));
         }
         for (section, section_items) in Self::group_by_section(items) {
             let key = section_row_key(phase, kind, &section);
-            let collapsed = self.section_collapsed.contains(&key);
-            rows.push(ObligationRow::Section {
-                phase: phase.to_string(),
-                kind,
-                section: section.clone(),
-                collapsed,
-                count: section_items.len(),
-                is_new: false,
-            });
-            if !collapsed {
-                for item in section_items {
-                    rows.push(ObligationRow::Item { obligation: item });
-                }
+            let collapsed = self.list.is_collapsed(&key);
+            let editing = self.list.editing_key() == Some(key.as_str());
+            let rename_host = self.host.clone();
+            let (rename_phase, rename_section) = (phase.to_string(), section.clone());
+            rows.push(ItemListRow::group(
+                GroupSpec::new(key, 2, section.clone())
+                    .count(section_items.len())
+                    .collapsed(collapsed)
+                    .editing(editing)
+                    .on_rename(move |_, cx| {
+                        rename_host.push(
+                            ListAction::StartSectionEdit {
+                                phase: rename_phase.clone(),
+                                kind,
+                                section: rename_section.clone(),
+                            },
+                            cx,
+                        );
+                    }),
+                ObGroup::Section {
+                    phase: phase.to_string(),
+                    kind,
+                    section: section.clone(),
+                    is_new: false,
+                },
+            ));
+            if collapsed {
+                continue;
+            }
+            for obligation in section_items {
+                let id = obligation.id;
+                rows.push(ItemListRow::item(
+                    id.to_string(),
+                    ObligationItem {
+                        struck: self.struck.contains(&id),
+                        marker: self.change_markers.get(&id).copied(),
+                        obligation,
+                    },
+                ));
             }
         }
     }
@@ -675,84 +646,26 @@ impl ObligationsView {
         sections
     }
 
+    /// Rebuild the rows from the store data, keeping the cursor on whatever it
+    /// was on.
     fn rebuild_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.flat_rows();
-        let selected = self.selected_key.clone();
-        let previous_index = self.selected_index;
-        let selected_ix = selected
-            .as_ref()
-            .and_then(|key| rows.iter().position(|r| r.key() == *key))
-            .or(Some(0).filter(|_| !rows.is_empty()));
-
-        if let Some(ix) = selected_ix {
-            self.selected_key = Some(rows[ix].key());
-            self.selected_index = Some(ix);
-        } else {
-            self.selected_key = None;
-            self.selected_index = None;
-        }
-
-        self.delegate.set_rows(rows);
-        self.delegate.set_selected_index(self.selected_index);
-        self.delegate.set_inline_edit(
-            self.delegate_editing_key(),
-            self.inline_edit_input.clone(),
-            self.section_edit_input.clone(),
-        );
-        if let Some(ix) = selected_ix {
-            if previous_index != selected_ix {
-                self.scroll_handle.scroll_to_item(ix);
-            }
-        }
+        self.list.set_editing_key(self.editing_key());
+        self.list.set_rows(self.flat_rows());
         cx.notify();
     }
 
     fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
-        let key = self.delegate.rows().get(row_ix).map(|r| r.key());
-        if self.selected_index != Some(row_ix) {
-            if self.editing_id.is_some() {
-                self.pending_abandon_edit = true;
-            }
-            if self.is_editing_section() {
-                self.pending_abandon_section_edit = true;
-            }
-            self.selected_index = Some(row_ix);
-            self.selected_key = key;
-            self.delegate.set_selected_index(self.selected_index);
-            self.scroll_handle.scroll_to_item(row_ix);
-            cx.notify();
+        if self.list.cursor() == Some(row_ix) {
+            return;
         }
-    }
-
-    fn select_parent_phase(&mut self, phase: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_key = Some(phase_row_key(phase));
-        self.rebuild_visible(window, cx);
-        self.focus_list(window, cx);
-    }
-
-    fn select_parent_group(
-        &mut self,
-        phase: &str,
-        kind: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.selected_key = Some(group_row_key(phase, kind));
-        self.rebuild_visible(window, cx);
-        self.focus_list(window, cx);
-    }
-
-    fn select_parent_section(
-        &mut self,
-        phase: &str,
-        kind: &str,
-        section: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.selected_key = Some(section_row_key(phase, kind, section));
-        self.rebuild_visible(window, cx);
-        self.focus_list(window, cx);
+        if self.editing_id.is_some() {
+            self.pending_abandon_edit = true;
+        }
+        if self.is_editing_section() {
+            self.pending_abandon_section_edit = true;
+        }
+        self.list.set_cursor(row_ix);
+        cx.notify();
     }
 
     fn first_item_in_scope(&self, phase: &str, kind: &str, section: Option<&str>) -> Option<Uuid> {
@@ -779,15 +692,12 @@ impl ObligationsView {
             .map(|o| o.id)
     }
 
-    fn selected_row(&self) -> Option<ObligationRow> {
-        self.delegate.selected_row().cloned().or_else(|| {
-            let key = self.selected_key.as_ref()?;
-            self.delegate
-                .rows()
-                .iter()
-                .find(|r| r.key() == *key)
-                .cloned()
-        })
+    /// What the cursor is on, cloned out of the list so the view can act on it.
+    fn cursor_row(&self) -> Option<CursorRow> {
+        match self.list.cursor_row()? {
+            ItemListRow::Group { group, .. } => Some(CursorRow::Group(group.clone())),
+            ItemListRow::Item { item, .. } => Some(CursorRow::Item(item.clone())),
+        }
     }
 
     fn clear_inline_edit_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -802,21 +712,13 @@ impl ObligationsView {
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.sync_delegate_editing(cx);
-    }
-
-    fn sync_delegate_editing(&mut self, cx: &mut Context<Self>) {
-        self.delegate.set_inline_edit(
-            self.delegate_editing_key(),
-            self.inline_edit_input.clone(),
-            self.section_edit_input.clone(),
-        );
+        self.list.set_editing_key(self.editing_key());
         cx.notify();
     }
 
     /// The row key currently in edit mode, for either an obligation body or a
     /// section name (mutually exclusive).
-    fn delegate_editing_key(&self) -> Option<String> {
+    fn editing_key(&self) -> Option<String> {
         self.editing_id.map(|id| id.to_string()).or_else(|| {
             if let Some((phase, kind)) = &self.new_section_kind {
                 Some(new_section_row_key(phase, kind))
@@ -853,7 +755,7 @@ impl ObligationsView {
     }
 
     fn start_inline_edit(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        if self.delegate.is_struck(id) {
+        if self.is_struck(id) {
             return;
         }
         let body = self
@@ -864,7 +766,7 @@ impl ObligationsView {
             .unwrap_or_default();
         self.editing_id = Some(id);
         self.edit_original_body = Some(body.clone());
-        self.selected_key = Some(id.to_string());
+        self.list.set_cursor_key(Some(id.to_string()));
         self.inline_edit_input.update(cx, |input, cx| {
             input.set_value(&body, window, cx);
             input.focus(window, cx);
@@ -955,7 +857,7 @@ impl ObligationsView {
         }
         self.draft_id = None;
         self.clear_inline_edit_state(window, cx);
-        self.selected_key = Some(editing_id.to_string());
+        self.list.set_cursor_key(Some(editing_id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
         true
@@ -981,7 +883,7 @@ impl ObligationsView {
             section.to_string()
         };
         self.section_edit_target = Some((phase.to_string(), kind, section.to_string()));
-        self.selected_key = Some(section_row_key(phase, kind, section));
+        self.list.set_cursor_key(Some(section_row_key(phase, kind, section)));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value(&initial, window, cx);
             input.focus(window, cx);
@@ -1002,9 +904,10 @@ impl ObligationsView {
         if self.section_edit_target.is_some() {
             self.abandon_section_edit(window, cx);
         }
-        self.kind_collapsed.remove(&group_row_key(phase, kind));
+        self.list
+            .set_collapsed(group_row_key(phase, kind), false);
         self.new_section_kind = Some((phase.to_string(), kind));
-        self.selected_key = Some(new_section_row_key(phase, kind));
+        self.list.set_cursor_key(Some(new_section_row_key(phase, kind)));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -1126,16 +1029,15 @@ impl ObligationsView {
             crate::ui::toast::error_toast(window, cx, format!("Rename failed: {err}"));
             return false;
         }
-        let old_key = section_row_key(&phase, kind, &old_section);
-        if self.section_collapsed.remove(&old_key) {
-            self.section_collapsed
-                .insert(section_row_key(&phase, kind, &new_name));
-        }
+        self.list.rekey_collapsed(
+            &section_row_key(&phase, kind, &old_section),
+            section_row_key(&phase, kind, &new_name),
+        );
         self.section_edit_target = None;
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.selected_key = Some(section_row_key(&phase, kind, &new_name));
+        self.list.set_cursor_key(Some(section_row_key(&phase, kind, &new_name)));
         self.reload(window, cx);
         self.focus_list(window, cx);
         true
@@ -1162,9 +1064,10 @@ impl ObligationsView {
         let Some(node_id) = self.node_id else {
             return;
         };
-        self.kind_collapsed.remove(&group_row_key(phase, kind));
-        self.section_collapsed
-            .remove(&section_row_key(phase, kind, NO_SECTION));
+        self.list
+            .set_collapsed(group_row_key(phase, kind), false);
+        self.list
+            .set_collapsed(section_row_key(phase, kind, NO_SECTION), false);
         let obligation_id = Uuid::new_v4();
         if let Err(err) = self
             .fleet
@@ -1192,8 +1095,8 @@ impl ObligationsView {
     }
 
     fn create_relative(&mut self, before: bool, window: &mut Window, cx: &mut Context<Self>) {
-        match self.selected_row() {
-            Some(ObligationRow::Group { phase, kind, .. }) => {
+        match self.cursor_row() {
+            Some(CursorRow::Group(ObGroup::Kind { phase, kind })) => {
                 if before {
                     self.create_in_kind(&phase, kind, None, true, window, cx);
                 } else {
@@ -1203,12 +1106,12 @@ impl ObligationsView {
                     }
                 }
             }
-            Some(ObligationRow::Section {
+            Some(CursorRow::Group(ObGroup::Section {
                 phase,
                 kind,
                 section,
                 ..
-            }) => {
+            })) => {
                 self.ensure_section_expanded(&phase, kind, &section, window, cx);
                 if before {
                     match self.first_item_in_scope(&phase, kind, Some(&section)) {
@@ -1222,13 +1125,13 @@ impl ObligationsView {
                     }
                 }
             }
-            Some(ObligationRow::Item { obligation }) => {
-                let phase = obligation.phase.clone();
+            Some(CursorRow::Item(item)) => {
+                let phase = item.obligation.phase.clone();
                 // A removed item is no anchor: add at the end of its kind.
-                let anchor = Some(obligation.id).filter(|id| !self.delegate.is_struck(*id));
-                self.create_in_kind(&phase, &obligation.kind, anchor, before, window, cx);
+                let anchor = Some(item.obligation.id).filter(|_| !item.struck);
+                self.create_in_kind(&phase, &item.obligation.kind, anchor, before, window, cx);
             }
-            Some(ObligationRow::Phase { phase, .. }) => {
+            Some(CursorRow::Group(ObGroup::Phase { phase })) => {
                 self.create_in_kind(&phase, KIND_REQUIREMENT, None, false, window, cx);
             }
             None => {
@@ -1245,118 +1148,34 @@ impl ObligationsView {
                 return;
             }
             if let Some(id) = saved {
-                self.selected_key = Some(id.to_string());
+                self.list.set_cursor_key(Some(id.to_string()));
                 self.create_relative(false, window, cx);
             }
             return;
         }
-        match self.selected_row() {
-            Some(ObligationRow::Item { obligation }) => {
-                self.start_inline_edit(obligation.id, window, cx);
+        match self.cursor_row() {
+            Some(CursorRow::Item(item)) => {
+                self.start_inline_edit(item.obligation.id, window, cx);
             }
-            Some(ObligationRow::Phase { .. })
-            | Some(ObligationRow::Group { .. })
-            | Some(ObligationRow::Section { .. })
-            | None => {
+            Some(CursorRow::Group(_)) | None => {
                 self.create_relative(false, window, cx);
             }
         }
     }
 
-    fn toggle_phase(&mut self, phase: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let key = phase_row_key(phase);
-        if self.phase_collapsed.contains(&key) {
-            self.phase_collapsed.remove(&key);
-        } else {
-            self.phase_collapsed.insert(key);
-        }
-        self.rebuild_visible(window, cx);
-    }
-
-    fn set_phase_collapsed(
-        &mut self,
-        phase: &str,
-        collapsed: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = phase_row_key(phase);
-        if collapsed {
-            self.phase_collapsed.insert(key);
-        } else {
-            self.phase_collapsed.remove(&key);
-        }
-        self.rebuild_visible(window, cx);
-    }
-
-    fn toggle_group(
-        &mut self,
-        phase: &str,
-        kind: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = group_row_key(phase, kind);
-        if self.kind_collapsed.contains(&key) {
-            self.kind_collapsed.remove(&key);
-        } else {
-            self.kind_collapsed.insert(key);
-        }
-        self.rebuild_visible(window, cx);
-    }
-
-    fn toggle_section(
-        &mut self,
-        phase: &str,
-        kind: &str,
-        section: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = section_row_key(phase, kind, section);
-        if self.section_collapsed.contains(&key) {
-            self.section_collapsed.remove(&key);
-        } else {
-            self.section_collapsed.insert(key);
-        }
-        self.rebuild_visible(window, cx);
-    }
-
+    /// Collapse or expand the group with `key`, then rebuild the rows.
     fn set_group_collapsed(
         &mut self,
-        phase: &str,
-        kind: &str,
+        key: String,
         collapsed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let key = group_row_key(phase, kind);
-        if collapsed {
-            self.kind_collapsed.insert(key);
-        } else {
-            self.kind_collapsed.remove(&key);
-        }
+        self.list.set_collapsed(key, collapsed);
         self.rebuild_visible(window, cx);
     }
 
-    fn set_section_collapsed(
-        &mut self,
-        phase: &str,
-        kind: &str,
-        section: &str,
-        collapsed: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = section_row_key(phase, kind, section);
-        if collapsed {
-            self.section_collapsed.insert(key);
-        } else {
-            self.section_collapsed.remove(&key);
-        }
-        self.rebuild_visible(window, cx);
-    }
-
+    /// Expand a section and everything above it, so a row created there shows.
     fn ensure_section_expanded(
         &mut self,
         phase: &str,
@@ -1365,54 +1184,76 @@ impl ObligationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_phase_collapsed(phase, false, window, cx);
-        self.set_group_collapsed(phase, kind, false, window, cx);
-        self.set_section_collapsed(phase, kind, section, false, window, cx);
+        self.list.set_collapsed(phase_row_key(phase), false);
+        self.list.set_collapsed(group_row_key(phase, kind), false);
+        self.list
+            .set_collapsed(section_row_key(phase, kind, section), false);
+        self.rebuild_visible(window, cx);
+    }
+
+    /// The obligations an action works on: the marked ones, or the one under
+    /// the cursor when none is marked. Group headings are not obligations and
+    /// drop out here, as do removed rows.
+    fn selected_obligations(&self) -> Vec<Uuid> {
+        self.list
+            .selection()
+            .iter()
+            .filter_map(|key| Uuid::parse_str(key).ok())
+            .filter(|id| !self.is_struck(*id))
+            .collect()
     }
 
     fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ObligationRow::Item { obligation }) = self.selected_row() else {
-            return;
-        };
-        if self.delegate.is_struck(obligation.id) {
+        let ids = self.selected_obligations();
+        if ids.is_empty() {
             return;
         }
-        let id = obligation.id;
-        let phase = obligation.phase.clone();
-        let kind = obligation.kind.clone();
-        let section = obligation_section(&obligation).to_string();
-        let next_key = self
+        let next_key = self.key_after_deleting(&ids);
+        for id in &ids {
+            if let Err(err) = self
+                .fleet
+                .enqueue_outline(OutlineMutation::DeleteObligation {
+                    obligation_id: *id,
+                })
+            {
+                crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
+                return;
+            }
+        }
+        let _ = self.fleet.writer().flush();
+        self.list.clear_marks();
+        self.list.set_cursor_key(next_key);
+        self.reload(window, cx);
+        self.focus_list(window, cx);
+    }
+
+    /// Where the cursor lands once `ids` are gone: the next obligation in the
+    /// last one's section, else the last one left there, else the section
+    /// heading itself.
+    fn key_after_deleting(&self, ids: &[Uuid]) -> Option<String> {
+        let last = ids.last()?;
+        let gone = self.items.iter().find(|o| o.id == *last)?;
+        let (phase, kind, section) = (
+            gone.phase.clone(),
+            gone.kind.clone(),
+            obligation_section(gone).to_string(),
+        );
+        let siblings: Vec<&NodeObligation> = self
             .items
             .iter()
             .filter(|o| {
-                o.phase == phase && o.kind == kind && obligation_section(o) == section && o.id != id
+                o.phase == phase
+                    && o.kind == kind
+                    && obligation_section(o) == section
+                    && !ids.contains(&o.id)
             })
-            .find(|o| o.ordinal > obligation.ordinal)
+            .collect();
+        siblings
+            .iter()
+            .find(|o| o.ordinal > gone.ordinal)
+            .or(siblings.last())
             .map(|o| o.id.to_string())
-            .or_else(|| {
-                self.items
-                    .iter()
-                    .filter(|o| {
-                        o.phase == phase
-                            && o.kind == kind
-                            && obligation_section(o) == section
-                            && o.id != id
-                    })
-                    .last()
-                    .map(|o| o.id.to_string())
-            })
-            .or_else(|| Some(section_row_key(&phase, &kind, &section)));
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::DeleteObligation { obligation_id: id })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
-            return;
-        }
-        let _ = self.fleet.writer().flush();
-        self.selected_key = next_key;
-        self.reload(window, cx);
-        self.focus_list(window, cx);
+            .or_else(|| Some(section_row_key(&phase, &kind, &section)))
     }
 
     fn move_selected(
@@ -1421,13 +1262,13 @@ impl ObligationsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ObligationRow::Item { obligation }) = self.selected_row() else {
+        let Some(CursorRow::Item(item)) = self.cursor_row() else {
             return;
         };
-        if self.delegate.is_struck(obligation.id) {
+        if item.struck {
             return;
         }
-        let id = obligation.id;
+        let id = item.obligation.id;
         if let Err(err) = self
             .fleet
             .enqueue_outline(OutlineMutation::ReorderObligation {
@@ -1439,40 +1280,38 @@ impl ObligationsView {
             return;
         }
         let _ = self.fleet.writer().flush();
-        self.selected_key = Some(id.to_string());
+        self.list.set_cursor_key(Some(id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
 
     fn move_selection(&mut self, delta: i32, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
+        if self.list.is_empty() {
             return;
         }
-        let current = self.selected_index.unwrap_or(0);
+        let current = self.list.cursor().unwrap_or(0);
         let next = if delta < 0 {
             current.saturating_sub((-delta) as usize)
         } else {
-            (current + delta as usize).min(count.saturating_sub(1))
+            (current + delta as usize).min(self.list.len() - 1)
         };
         self.select_row(next, cx);
     }
 
+    /// Apply what the rows and the list reported, in order.
     fn drain_row_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for action in self.host.drain() {
             match action {
-                ListAction::TogglePhase { phase } => {
-                    self.toggle_phase(&phase, window, cx);
+                ListAction::Select { row_ix } => {
+                    self.select_row(row_ix, cx);
                 }
-                ListAction::ToggleGroup { phase, kind } => {
-                    self.toggle_group(&phase, &kind, window, cx);
+                ListAction::ToggleGroup { key } => {
+                    self.list.toggle_collapsed(&key);
+                    self.rebuild_visible(window, cx);
                 }
-                ListAction::ToggleSection {
-                    phase,
-                    kind,
-                    section,
-                } => {
-                    self.toggle_section(&phase, &kind, &section, window, cx);
+                ListAction::ToggleMark { row_ix } => {
+                    self.list.toggle_mark_at(row_ix);
+                    cx.notify();
                 }
                 ListAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
@@ -1482,23 +1321,10 @@ impl ObligationsView {
                     kind,
                     section,
                 } => {
-                    let kind = if kind == KIND_REQUIREMENT {
-                        KIND_REQUIREMENT
-                    } else {
-                        KIND_CONSTRAINT
-                    };
                     self.start_section_edit(&phase, kind, &section, window, cx);
                 }
                 ListAction::AddSection { phase, kind } => {
-                    let kind = if kind == KIND_REQUIREMENT {
-                        KIND_REQUIREMENT
-                    } else {
-                        KIND_CONSTRAINT
-                    };
                     self.add_section(&phase, kind, window, cx);
-                }
-                ListAction::Select { row_ix } => {
-                    self.select_row(row_ix, cx);
                 }
                 ListAction::OpenVisualDesign { obligation_id } => {
                     if let Some(node_id) = self.node_id {
@@ -1528,13 +1354,13 @@ impl ObligationsView {
         self.close(window, cx);
     }
 
-    fn on_enter(&mut self, _: &ObligationsEnter, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_enter(&mut self, _: &ItemListActivate, window: &mut Window, cx: &mut Context<Self>) {
         self.on_smart_enter(window, cx);
     }
 
     fn on_create_below(
         &mut self,
-        _: &ObligationsCreateBelow,
+        _: &ItemListCreateBelow,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1546,7 +1372,7 @@ impl ObligationsView {
 
     fn on_create_above(
         &mut self,
-        _: &ObligationsCreateAbove,
+        _: &ItemListCreateAbove,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1558,24 +1384,24 @@ impl ObligationsView {
 
     fn on_create_child(
         &mut self,
-        _: &ObligationsCreateChild,
+        _: &ItemListCreateChild,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.is_editing() {
             let _ = self.commit_inline_edit(window, cx);
         }
-        match self.selected_row() {
-            Some(ObligationRow::Group { phase, kind, .. }) => {
-                self.set_group_collapsed(&phase, kind, false, window, cx);
+        match self.cursor_row() {
+            Some(CursorRow::Group(ObGroup::Kind { phase, kind })) => {
+                self.set_group_collapsed(group_row_key(&phase, kind), false, window, cx);
                 self.create_in_kind(&phase, kind, None, false, window, cx);
             }
-            Some(ObligationRow::Section {
+            Some(CursorRow::Group(ObGroup::Section {
                 phase,
                 kind,
                 section,
                 ..
-            }) => {
+            })) => {
                 self.ensure_section_expanded(&phase, kind, &section, window, cx);
                 match self.last_item_in_scope(&phase, kind, Some(&section)) {
                     Some(id) => self.create_in_kind(&phase, kind, Some(id), false, window, cx),
@@ -1586,28 +1412,23 @@ impl ObligationsView {
         }
     }
 
-    fn on_move_up(&mut self, _: &ObligationsMoveUp, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_move_up(&mut self, _: &ItemListMoveUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selected(ReorderDirection::Up, window, cx);
     }
 
-    fn on_move_down(
-        &mut self,
-        _: &ObligationsMoveDown,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_move_down(&mut self, _: &ItemListMoveDown, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selected(ReorderDirection::Down, window, cx);
     }
 
-    fn on_edit(&mut self, _: &ObligationsEdit, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ObligationRow::Item { obligation }) = self.selected_row() {
-            self.start_inline_edit(obligation.id, window, cx);
+    fn on_edit(&mut self, _: &ItemListEdit, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(CursorRow::Item(item)) = self.cursor_row() {
+            self.start_inline_edit(item.obligation.id, window, cx);
         }
     }
 
     fn on_commit_edit(
         &mut self,
-        _: &ObligationsCommitEdit,
+        _: &ItemListCommitEdit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1621,112 +1442,58 @@ impl ObligationsView {
         let _ = self.commit_inline_edit(window, cx);
     }
 
-    fn on_collapse(
+    /// Left: collapse the group under the cursor, else step out to the group
+    /// that encloses it. The list decides; the panel only rebuilds its rows.
+    fn on_collapse(&mut self, _: &ItemListCollapse, window: &mut Window, cx: &mut Context<Self>) {
+        match self.list.collapse_step() {
+            CollapseStep::Collapsed => self.rebuild_visible(window, cx),
+            CollapseStep::MovedToParent => cx.notify(),
+            CollapseStep::Nothing => {}
+        }
+    }
+
+    fn on_expand(&mut self, _: &ItemListExpand, window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.expand_step() {
+            self.rebuild_visible(window, cx);
+        }
+    }
+
+    fn on_toggle_mark(
         &mut self,
-        _: &ObligationsCollapse,
-        window: &mut Window,
+        _: &ItemListToggleMark,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.selected_row() {
-            Some(ObligationRow::Phase {
-                phase, collapsed, ..
-            }) if !collapsed => {
-                self.set_phase_collapsed(&phase, true, window, cx);
-            }
-            Some(ObligationRow::Group {
-                phase,
-                kind,
-                collapsed,
-                ..
-            }) if !collapsed => {
-                self.set_group_collapsed(&phase, kind, true, window, cx);
-            }
-            Some(ObligationRow::Group { phase, .. }) => {
-                self.select_parent_phase(&phase, window, cx);
-            }
-            Some(ObligationRow::Section {
-                phase,
-                kind,
-                section,
-                collapsed,
-                ..
-            }) if !collapsed => {
-                self.set_section_collapsed(&phase, kind, &section, true, window, cx);
-            }
-            Some(ObligationRow::Section { phase, kind, .. }) => {
-                self.select_parent_group(&phase, kind, window, cx);
-            }
-            Some(ObligationRow::Item { obligation }) => {
-                self.select_parent_section(
-                    &obligation.phase,
-                    &obligation.kind,
-                    obligation_section(&obligation),
-                    window,
-                    cx,
-                );
-            }
-            _ => {}
+        if self.is_editing() || self.is_editing_section() {
+            return;
         }
+        self.list.toggle_mark();
+        cx.notify();
     }
 
-    fn on_expand(&mut self, _: &ObligationsExpand, window: &mut Window, cx: &mut Context<Self>) {
-        match self.selected_row() {
-            Some(ObligationRow::Phase {
-                phase, collapsed, ..
-            }) if collapsed => {
-                self.set_phase_collapsed(&phase, false, window, cx);
-            }
-            Some(ObligationRow::Group {
-                phase,
-                kind,
-                collapsed,
-                ..
-            }) if collapsed => {
-                self.set_group_collapsed(&phase, kind, false, window, cx);
-            }
-            Some(ObligationRow::Section {
-                phase,
-                kind,
-                section,
-                collapsed,
-                ..
-            }) if collapsed => {
-                self.set_section_collapsed(&phase, kind, &section, false, window, cx);
-            }
-            _ => {}
-        }
-    }
-
-    fn on_delete(&mut self, _: &ObligationsDelete, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete(&mut self, _: &ItemListDelete, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() {
             return;
         }
-        if matches!(self.selected_row(), Some(ObligationRow::Item { .. })) {
-            self.delete_selected(window, cx);
-        } else {
+        if self.selected_obligations().is_empty() {
             cx.emit(ObligationsEvent::DeleteSelectedTask);
+            return;
         }
+        self.delete_selected(window, cx);
     }
 
-    fn on_add_section(
-        &mut self,
-        _: &ObligationsAddSection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_add_section(&mut self, _: &ItemListAddGroup, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editing() {
             return;
         }
-        let (phase, kind) = match self.selected_row() {
-            Some(ObligationRow::Group { phase, kind, .. }) => (phase, kind),
-            Some(ObligationRow::Section { phase, kind, .. }) => (phase, kind),
-            Some(ObligationRow::Item { obligation }) if obligation.kind == KIND_CONSTRAINT => {
-                (obligation.phase.clone(), KIND_CONSTRAINT)
-            }
-            Some(ObligationRow::Item { obligation }) => {
-                (obligation.phase.clone(), KIND_REQUIREMENT)
-            }
-            Some(ObligationRow::Phase { phase, .. }) => (phase, KIND_REQUIREMENT),
+        let (phase, kind) = match self.cursor_row() {
+            Some(CursorRow::Group(ObGroup::Kind { phase, kind })) => (phase, kind),
+            Some(CursorRow::Group(ObGroup::Section { phase, kind, .. })) => (phase, kind),
+            Some(CursorRow::Item(item)) => (
+                item.obligation.phase.clone(),
+                static_kind(&item.obligation.kind),
+            ),
+            Some(CursorRow::Group(ObGroup::Phase { phase })) => (phase, KIND_REQUIREMENT),
             None => (self.default_creation_phase(), KIND_REQUIREMENT),
         };
         self.add_section(&phase, kind, window, cx);
@@ -1742,7 +1509,7 @@ impl ObligationsView {
 
     fn on_focus_search(
         &mut self,
-        _: &ObligationsFocusSearch,
+        _: &ItemListFocusSearch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1753,7 +1520,7 @@ impl ObligationsView {
 
     fn on_search_space(
         &mut self,
-        _: &ObligationsSearchSpace,
+        _: &ItemListSearchSpace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1762,124 +1529,35 @@ impl ObligationsView {
         });
     }
 
-    fn on_arrow_up(&mut self, _: &ListArrowUp, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_arrow_up(&mut self, _: &ItemListUp, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(-1, window, cx);
     }
 
-    fn on_arrow_down(&mut self, _: &ListArrowDown, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_arrow_down(&mut self, _: &ItemListDown, window: &mut Window, cx: &mut Context<Self>) {
         self.move_selection(1, window, cx);
     }
 
-    fn on_page_up(&mut self, _: &ListPageUp, window: &mut Window, cx: &mut Context<Self>) {
-        let page = viewport_row_count(window.viewport_size().height).max(1);
+    fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<ObligationItem, ObGroup>::page_rows(window.viewport_size().height);
         self.move_selection(-(page as i32), window, cx);
     }
 
-    fn on_page_down(&mut self, _: &ListPageDown, window: &mut Window, cx: &mut Context<Self>) {
-        let page = viewport_row_count(window.viewport_size().height).max(1);
+    fn on_page_down(&mut self, _: &ItemListPageDown, window: &mut Window, cx: &mut Context<Self>) {
+        let page = ItemList::<ObligationItem, ObGroup>::page_rows(window.viewport_size().height);
         self.move_selection(page as i32, window, cx);
     }
 
-    fn on_home(&mut self, _: &ListHome, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
-            return;
-        }
-        self.select_row(0, cx);
-        self.scroll_handle.scroll_to_top_of_item(0);
-    }
-
-    fn on_end(&mut self, _: &ListEnd, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.delegate.rows().len();
-        if count == 0 {
-            return;
-        }
-        let last = count - 1;
-        self.select_row(last, cx);
-        self.scroll_handle.scroll_to_top_of_item(last);
-    }
-}
-
-/// True if `term` fuzzily matches any word in `words` (typo-tolerant).
-fn fuzzy_term_matches(term: &str, words: &[&str]) -> bool {
-    if term.is_empty() {
-        return true;
-    }
-    words.iter().any(|word| fuzzy_word_match(term, word))
-}
-
-/// A term matches a word if it's a substring, or within a small edit-distance
-/// budget that grows with the term's length (so short terms require an exact
-/// substring match, avoiding false positives).
-fn fuzzy_word_match(term: &str, word: &str) -> bool {
-    if word.contains(term) {
-        return true;
-    }
-    let max_dist = match term.chars().count() {
-        0..=3 => 0,
-        4..=6 => 1,
-        _ => 2,
-    };
-    if max_dist == 0 {
-        return false;
-    }
-    bounded_edit_distance_substring(term, word, max_dist)
-}
-
-/// True if some contiguous run of words in `word` (a single word here, but
-/// kept general) is within `max_dist` edits of `term` — checked by sliding a
-/// window sized close to `term`'s length across `word` and taking the best
-/// Levenshtein distance among windows, so a typo'd word of similar length
-/// still matches without requiring the lengths to be identical.
-fn bounded_edit_distance_substring(term: &str, word: &str, max_dist: usize) -> bool {
-    let term_len = term.chars().count();
-    let word_len = word.chars().count();
-    if word_len == 0 {
-        return false;
-    }
-    // Whole-word compare is enough for our use case (single tokens, not
-    // phrases): try the full word plus a couple of length-adjusted windows.
-    if levenshtein_within(term, word, max_dist) {
-        return true;
-    }
-    if word_len <= term_len {
-        return false;
-    }
-    let word_chars: Vec<char> = word.chars().collect();
-    for start in 0..=(word_len - term_len) {
-        let end = (start + term_len + max_dist).min(word_len);
-        let window: String = word_chars[start..end].iter().collect();
-        if levenshtein_within(term, &window, max_dist) {
-            return true;
+    fn on_home(&mut self, _: &ItemListHome, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_home() {
+            cx.notify();
         }
     }
-    false
-}
 
-/// Levenshtein distance between `a` and `b`, short-circuiting once it's
-/// certain the distance exceeds `max_dist`.
-fn levenshtein_within(a: &str, b: &str, max_dist: usize) -> bool {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    if a.len().abs_diff(b.len()) > max_dist {
-        return false;
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0usize; b.len() + 1];
-    for i in 1..=a.len() {
-        curr[0] = i;
-        let mut row_min = curr[0];
-        for j in 1..=b.len() {
-            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
-            row_min = row_min.min(curr[j]);
+    fn on_end(&mut self, _: &ItemListEnd, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.list.cursor_end() {
+            cx.notify();
         }
-        if row_min > max_dist {
-            return false;
-        }
-        std::mem::swap(&mut prev, &mut curr);
     }
-    prev[b.len()] <= max_dist
 }
 
 impl EventEmitter<ObligationsEvent> for ObligationsView {}
@@ -1953,6 +1631,7 @@ impl Render for ObligationsView {
             .on_action(cx.listener(Self::on_commit_edit))
             .on_action(cx.listener(Self::on_collapse))
             .on_action(cx.listener(Self::on_expand))
+            .on_action(cx.listener(Self::on_toggle_mark))
             .on_action(cx.listener(Self::on_delete))
             .on_action(cx.listener(Self::on_add_section))
             .on_action(cx.listener(Self::on_focus_search))
@@ -2015,7 +1694,7 @@ impl Render for ObligationsView {
                             .flex_shrink_0();
                         if let Some(pill) = render_shortcut_pill(
                             window,
-                            &ObligationsFocusSearch,
+                            &ItemListFocusSearch,
                             OBLIGATIONS_CONTEXT,
                             cx,
                         ) {
@@ -2050,39 +1729,17 @@ impl Render for ObligationsView {
                 cx,
             ))
             .child({
-                let row_count = self.delegate.rows().len();
-                let mut rows = Vec::with_capacity(row_count);
-                for ix in 0..row_count {
-                    if let Some(row) = self.delegate.render_row(ix, window, cx) {
-                        rows.push(row);
-                    }
-                }
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        div()
-                            .id("obligations-scroll")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .children(rows),
-                    )
-                    .child(
-                        // Narrow right-edge strip, not the full row area: the
-                        // Scrollbar element installs a click-to-jump handler
-                        // across its entire bounds, which would otherwise
-                        // swallow every mouse click meant for the rows below.
-                        div()
-                            .occlude()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .bottom_0()
-                            .w(px(16.))
-                            .child(Scrollbar::vertical(&self.scroll_handle)),
-                    )
+                let editor = self.inline_edit_input.clone();
+                let row_host = self.host.clone();
+                self.list.render(
+                    "obligations-scroll",
+                    &self.host,
+                    move |item, state, window, cx| {
+                        rows::render_obligation(item, state, &editor, &row_host, window, cx)
+                    },
+                    window,
+                    cx,
+                )
             })
             .child(
                 div()
@@ -2092,7 +1749,10 @@ impl Render for ObligationsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · S adds section · Del deletes · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J talks about it · Esc closes"),
+                    .child(match self.list.marked_count() {
+                        0 => SharedString::from("↑/↓ navigate · Enter edits · N adds · S adds section · Space selects · Del deletes · Cmd/Ctrl+↑/↓ reorders · ←/→ collapse/expand · Ctrl+J talks about it · Esc closes"),
+                        n => SharedString::from(format!("{n} selected · Del deletes them · Space deselects")),
+                    }),
             )
             .into_any_element()
     }
@@ -2155,13 +1815,7 @@ mod tests {
         let fixture = Fixture::new();
         let (view, _, cx) = open_view(&fixture, true, cx);
         let items = |view: &Entity<ObligationsView>, cx: &mut VisualTestContext| {
-            view.read_with(cx, |v, _| {
-                v.delegate
-                    .rows()
-                    .iter()
-                    .filter(|r| matches!(r, ObligationRow::Item { .. }))
-                    .count()
-            })
+            view.read_with(cx, |v, _| v.list.items().count())
         };
         assert_eq!(items(&view, cx), 3);
         view.update_in(cx, |v, window, cx| v.set_filter(Some("planned"), window, cx));
@@ -2179,21 +1833,20 @@ mod tests {
         let (view, _, cx) = open_view(&fixture, true, cx);
         let target = fixture.offline_obligation;
         view.update_in(cx, |view, window, cx| {
-            view.phase_collapsed
-                .insert(phase_row_key(PHASE_REQUIREMENTS));
-            view.kind_collapsed
-                .insert(group_row_key(PHASE_REQUIREMENTS, KIND_REQUIREMENT));
-            view.section_collapsed.insert(section_row_key(
-                PHASE_REQUIREMENTS,
-                KIND_REQUIREMENT,
-                "Offline",
-            ));
+            view.list
+                .set_collapsed(phase_row_key(PHASE_REQUIREMENTS), true);
+            view.list
+                .set_collapsed(group_row_key(PHASE_REQUIREMENTS, KIND_REQUIREMENT), true);
+            view.list.set_collapsed(
+                section_row_key(PHASE_REQUIREMENTS, KIND_REQUIREMENT, "Offline"),
+                true,
+            );
             view.search_input.update(cx, |input, cx| {
                 input.set_value("nothing matches this", window, cx);
             });
             view.sync_search_from_input(window, cx);
             assert!(
-                view.delegate
+                view.list
                     .rows()
                     .iter()
                     .all(|row| row.key() != target.to_string())
@@ -2293,14 +1946,11 @@ mod tests {
         // the one selected on open.
         let (host, target_ix, target) = view.read_with(cx, |view, _| {
             let (ix, id) = view
-                .delegate
+                .list
                 .rows()
                 .iter()
                 .enumerate()
-                .find_map(|(ix, row)| match row {
-                    ObligationRow::Item { obligation } => Some((ix, obligation.id)),
-                    _ => None,
-                })
+                .find_map(|(ix, row)| Some((ix, row.as_item()?.obligation.id)))
                 .unwrap();
             (view.host.clone(), ix, id)
         });
