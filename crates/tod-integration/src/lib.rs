@@ -6,6 +6,7 @@
 
 mod data_source;
 pub mod linear;
+pub mod linear_query;
 pub mod mock;
 pub mod preset;
 

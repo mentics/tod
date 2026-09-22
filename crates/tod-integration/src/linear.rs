@@ -129,14 +129,14 @@ impl DataSource for LinearDataSource {
     }
 
     fn configuration_schema(&self) -> ConfigSchema {
-        // Basic schema with result_cap and a placeholder for Linear filter fields.
-        // The UI will use introspection_metadata() to render the actual filter form.
+        // Basic schema with result_cap and a placeholder the UI renders the
+        // filter query editor under (see `linear_query`).
         ConfigSchema {
             fields: vec![
                 ConfigField {
                     name: "_linear_filters".into(),
                     label: "Filter criteria".into(),
-                    help: "Configure Linear issue filters (requires introspection)".into(),
+                    help: "A query such as team IS ANY OF (TOD) AND (assignee IS EMPTY OR priority <= high). Pick each part from the dropdown, or type it.".into(),
                     field_type: ConfigFieldType::Custom {
                         type_hint: "linear_filter_fields".into(),
                         metadata: serde_json::json!({}),
@@ -276,7 +276,10 @@ impl DataSource for LinearDataSource {
 /// opposed to a setting (`result_cap`, `workspace_slug`) or a schema
 /// placeholder (`_linear_filters`).
 pub fn is_filter_key(key: &str) -> bool {
-    key != "result_cap" && key != "workspace_slug" && !key.starts_with('_')
+    key != "result_cap"
+        && key != "workspace_slug"
+        && key != crate::linear_query::QUERY_KEY
+        && !key.starts_with('_')
 }
 
 /// Rewrite the first schema's `team_key` / `query` strings as the `team` /
@@ -381,7 +384,9 @@ fn result_cap_from_config(config: &serde_json::Value) -> Result<Option<u64>, Dat
     }
 }
 
-/// Build a Linear GraphQL filter object from config JSON.
+/// Build a Linear GraphQL filter object from config JSON: the compiled
+/// `filter_query`, and-ed with any `IssueFilter` keys stored beside it
+/// (configs written before the query existed, or filters it cannot write).
 fn build_filter_from_config(
     config: &serde_json::Value,
 ) -> Result<serde_json::Value, DataSourceError> {
@@ -393,14 +398,25 @@ fn build_filter_from_config(
     let mut obj = obj.clone();
     migrate_legacy_filter_keys(&mut obj);
 
-    // Everything that is not a setting is passed through as-is: the UI is
-    // responsible for building the correct GraphQL filter structure.
-    let filter: serde_json::Map<String, serde_json::Value> = obj
-        .into_iter()
+    let stored: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
         .filter(|(key, value)| is_filter_key(key) && !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    let query = obj
+        .get(crate::linear_query::QUERY_KEY)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let fields = crate::linear_query::fields(None);
+    let compiled = crate::linear_query::compile(query, &fields)
+        .map_err(|e| DataSourceError::InvalidConfig(format!("Filter query: {e}")))?;
 
-    Ok(serde_json::Value::Object(filter))
+    let compiled_empty = compiled.as_object().is_none_or(|o| o.is_empty());
+    Ok(match (compiled_empty, stored.is_empty()) {
+        (true, _) => serde_json::Value::Object(stored),
+        (false, true) => compiled,
+        (false, false) => serde_json::json!({ "and": [compiled, serde_json::Value::Object(stored)] }),
+    })
 }
 
 /// The browser URL of a Linear issue: `https://linear.app/<workspace>/issue/<identifier>`.
@@ -617,6 +633,7 @@ fn fetch_relation_options(
             workflowStates(first: 250) { nodes { name } }
             users(first: 250) { nodes { displayName } }
             issueLabels(first: 250) { nodes { name } }
+            projects(first: 250) { nodes { name } }
         }
     "#;
 
@@ -646,6 +663,7 @@ fn relation_options_from_response(data: &serde_json::Value) -> HashMap<String, V
         ("state", "workflowStates", "name"),
         ("assignee", "users", "displayName"),
         ("labels", "issueLabels", "name"),
+        ("project", "projects", "name"),
     ];
     let mut options = HashMap::new();
     for (field, connection, property) in connections {

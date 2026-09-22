@@ -113,11 +113,14 @@ pub fn refresh_introspection_metadata(
 /// [`DataSource::validate_config`] or test query validation (when credentials available)
 /// without enqueuing anything.
 ///
-/// Returns `true` when this was the node's first config, meaning an initial
-/// refresh is due. Saving is local and fast; refreshing reaches the network,
-/// so the two are separate calls and the caller decides where the refresh
-/// runs — a UI caller must run [`refresh_generator`] off its main thread.
-/// See [`set_generator_config`] for the combined, fully blocking version.
+/// Returns `true` when a refresh is due: the node's first config, or one
+/// that differs from what was stored, since the children reflect the old
+/// config until they are fetched again. Re-saving an unchanged config
+/// (the panel's autosave does) is not a reason to reach the network.
+/// Saving is local and fast; refreshing reaches the network, so the two are
+/// separate calls and the caller decides where the refresh runs — a UI
+/// caller must run [`refresh_generator`] off its main thread. See
+/// [`set_generator_config`] for the combined, fully blocking version.
 pub fn save_generator_config(
     fleet: &FleetStore,
     node_id: Uuid,
@@ -147,9 +150,16 @@ pub fn save_generator_config(
             .map_err(|err| err.to_string())?;
     }
 
-    let had_existing_config = fleet
-        .read(move |conn| Ok(GeneratorRepo::new(conn).get_config(node_id)?.is_some()))
-        .map_err(|err| err.to_string())?;
+    // Compared as JSON so a re-serialisation with the same content does
+    // not count as a change.
+    let unchanged = fleet
+        .read(move |conn| Ok(GeneratorRepo::new(conn).get_config(node_id)?))
+        .map_err(|err| err.to_string())?
+        .is_some_and(|existing| {
+            existing.data_source_type == data_source_type
+                && serde_json::from_str::<serde_json::Value>(&existing.config_json)
+                    .is_ok_and(|stored| stored == config)
+        });
 
     fleet
         .enqueue_outline(OutlineMutation::SetGeneratorConfig {
@@ -160,17 +170,16 @@ pub fn save_generator_config(
         .map_err(|err| err.to_string())?;
     fleet.writer().flush().map_err(|err| err.to_string())?;
 
-    Ok(!had_existing_config)
+    Ok(!unchanged)
 }
 
-/// [`save_generator_config`] plus the initial refresh it reports as due, run
-/// inline. Blocks on the network for that first save, so only callers that
+/// [`save_generator_config`] plus the refresh it reports as due, run
+/// inline. Blocks on the network for a changed config, so only callers that
 /// are already off a UI thread (tests, the CLI) should use it.
 ///
-/// The very first successful save for a generator node (i.e. one with no
-/// prior config) triggers an automatic initial refresh. Every save after
-/// that only persists the config — refreshing again is always a separate,
-/// user-triggered call to [`refresh_generator`].
+/// A save that changes the config refreshes the children to match; the
+/// data changing on the source's side is still the user's call to
+/// [`refresh_generator`].
 pub fn set_generator_config(
     fleet: &FleetStore,
     node_id: Uuid,
@@ -178,7 +187,7 @@ pub fn set_generator_config(
     config_json: &str,
 ) -> Result<(), String> {
     if save_generator_config(fleet, node_id, data_source_type, config_json)? {
-        // The config save itself has already succeeded; a failed initial
+        // The config save itself has already succeeded; a failed
         // refresh (e.g. blocked on a missing credential) is recorded on the
         // generator's refresh status by `refresh_generator` itself and does
         // not undo or fail the save.
@@ -833,7 +842,11 @@ mod tests {
             .unwrap();
         fleet.writer().flush().unwrap();
 
-        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query": "new"}"#).unwrap();
+        // The save lands while the refresh is still running; the refresh it
+        // reports as due is the caller's to run once that one finishes.
+        let refresh_due =
+            save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query": "new"}"#).unwrap();
+        assert!(refresh_due);
 
         let config = read_config(&root, node_id).unwrap();
         assert_eq!(config.config_json, r#"{"query": "new"}"#);
@@ -1435,7 +1448,11 @@ mod tests {
 
         let refresh_due =
             save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query":"x"}"#).unwrap();
-        assert!(!refresh_due, "only the very first save is owed a refresh");
+        assert!(refresh_due, "a changed config is owed a refresh");
+
+        let refresh_due =
+            save_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{ "query" : "x" }"#).unwrap();
+        assert!(!refresh_due, "re-saving the same config is not");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
@@ -1459,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn subsequent_config_save_does_not_trigger_refresh() {
+    fn changed_config_save_refreshes_but_an_unchanged_one_does_not() {
         let (root, fleet) = setup();
         let list_id = fleet.list_outline_lists().unwrap()[0].id;
         let node_id = create_generator_node(&fleet, list_id);
@@ -1470,12 +1487,16 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query":"changed"}"#).unwrap();
-
         let after_second = read_config(&root, node_id).unwrap().last_refresh_at;
-        assert_eq!(
-            after_first, after_second,
-            "subsequent saves must not auto-refresh"
+        assert!(
+            after_second > after_first,
+            "a changed config refreshes the children to match it"
         );
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_generator_config(&fleet, node_id, DATA_SOURCE_MOCK, r#"{"query":"changed"}"#).unwrap();
+        let after_third = read_config(&root, node_id).unwrap().last_refresh_at;
+        assert_eq!(after_second, after_third, "an unchanged re-save does not");
 
         drop(fleet);
         let _ = fs::remove_dir_all(root);
