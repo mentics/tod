@@ -238,6 +238,9 @@ impl GateCheckProtocol {
         let mut agent_criteria = Vec::new();
         let mut derived_rows = Vec::new();
         for (criterion, eval) in fleet.gate_criteria_for_transition(node, from, to)? {
+            if criterion.slug == tod_store::outline::READY_ACTIVE_ACTION_CONFIG_SLUG {
+                crate::gate::derived::generate_missing_branch(fleet, node)?;
+            }
             match fleet.read(|conn| evaluate_derived_criterion(conn, node, &criterion))? {
                 Some(derived) => derived_rows.push((
                     criterion.id,

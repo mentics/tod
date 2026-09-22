@@ -492,9 +492,13 @@ pub(super) fn worktree_fingerprint(cwd: &std::path::Path) -> String {
 /// Commit whatever the agent left in the worktree, at the end of a run.
 ///
 /// Does nothing outside a repository or when the tree is clean. A detached
-/// HEAD has no branch to commit to, so one named `branch` is created first.
-/// Returns whether a commit was made.
-pub(super) fn commit_worktree(cwd: &std::path::Path, branch: &str, message: &str) -> Result<bool> {
+/// HEAD has no branch to commit to, so one named `branch` is created first
+/// (an error when there is none). Returns whether a commit was made.
+pub(super) fn commit_worktree(
+    cwd: &std::path::Path,
+    branch: Option<&str>,
+    message: &str,
+) -> Result<bool> {
     fn git(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
         Command::new("git")
             .args(args)
@@ -512,6 +516,8 @@ pub(super) fn commit_worktree(cwd: &std::path::Path, branch: &str, message: &str
     }
     // `symbolic-ref` fails on a detached HEAD.
     if !git(cwd, &["symbolic-ref", "-q", "HEAD"])?.status.success() {
+        let branch =
+            branch.context("HEAD is detached and Files has no branch to commit the run to")?;
         let out = git(cwd, &["checkout", "-b", branch])?;
         anyhow::ensure!(
             out.status.success(),
@@ -623,14 +629,24 @@ pub(super) fn commit_run(
         Ok(node) => node,
         Err(err) => return vec![RunNotice::Error(format!("{err:#}"))],
     };
-    let branch = format!("tod/{}", short_id(node));
-    if let Err(err) = commit_worktree(cwd, &branch, &commit_message(env, node, what)) {
+    let branch = run_branch(env, node);
+    if let Err(err) = commit_worktree(cwd, branch.as_deref().ok(), &commit_message(env, node, what)) {
         notices.push(RunNotice::Error(format!(
             "Committing the run failed: {err:#}"
         )));
     }
     notices.extend(sync_branch(env, node, cwd));
     notices
+}
+
+/// The branch a run on a detached HEAD commits to: the Files branch, which
+/// the `ready` → `active` gate check fills in when it is blank.
+fn run_branch(env: &ProtocolEnv<'_>, node: Uuid) -> Result<String> {
+    env.fleet.reload_if_stale().ok();
+    env.fleet
+        .resolve_files_for_node(&node.to_string())?
+        .and_then(|files| files.branch().map(str::to_string))
+        .context("Files has no branch to commit the run to")
 }
 
 /// Record the checked-out branch on the Files capability when it has none;
@@ -725,12 +741,12 @@ mod commit_tests {
         git(&dir, &["checkout", "-q", "--detach"]);
 
         // A clean tree makes no commit and creates no branch.
-        assert!(!commit_worktree(&dir, "tod/x", "nothing").unwrap());
+        assert!(!commit_worktree(&dir, Some("task/x"), "nothing").unwrap());
         assert_eq!(current_branch(&dir), None);
 
         std::fs::write(dir.join("b.txt"), "b").unwrap();
-        assert!(commit_worktree(&dir, "tod/x", "second").unwrap());
-        assert_eq!(current_branch(&dir).as_deref(), Some("tod/x"));
+        assert!(commit_worktree(&dir, Some("task/x"), "second").unwrap());
+        assert_eq!(current_branch(&dir).as_deref(), Some("task/x"));
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "second");
         let _ = std::fs::remove_dir_all(&dir);
     }
