@@ -1,8 +1,7 @@
 use crate::app::transcript_window::TranscriptWindowControl;
-use crate::ui::actionable::{
-    chrome_control_with_shortcut, render_label_badge, render_shortcut_pill,
-};
+use crate::ui::actionable::{render_label_badge, render_shortcut_pill};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::style;
 use crate::ui::transcript_list::{
     self, ChunkId, Entry, EntryKind, StartState, TranscriptList, TranscriptListEvent,
 };
@@ -13,10 +12,10 @@ use gpui::{
     KeyBinding, MouseButton, ParentElement, Pixels, Render, SharedString, Styled, Subscription,
     Window, actions, div, px,
 };
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
-use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, StyledExt, TitleBar, h_flex, v_flex};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tod_agent::{FormatProblem, Transcript, TranscriptTurn};
@@ -659,6 +658,49 @@ impl Focusable for AgentTranscriptsView {
     }
 }
 
+impl AgentTranscriptsView {
+    /// The window is opened with `TitleBar::title_bar_options()`, which leaves
+    /// it without a system caption — the view has to draw one, or the window
+    /// cannot be dragged, minimized, or closed by its own chrome.
+    fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        TitleBar::new().child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(style::space::RELATED)
+                .child("Agent transcripts")
+                .child(div().flex_1())
+                // The pill sits beside the button, not under it as
+                // `chrome_control_with_shortcut` puts it: a title bar has no
+                // room below, and the pill lands on top of the label.
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(style::space::INLINE)
+                        .child(
+                            Button::new("close-transcripts")
+                                .label("Close")
+                                .ghost()
+                                .compact()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close(window, cx);
+                                })),
+                        )
+                        .when_some(
+                            render_shortcut_pill(
+                                window,
+                                &AgentTranscriptsClose,
+                                AGENT_TRANSCRIPTS_CONTEXT,
+                                cx,
+                            ),
+                            |el, pill| el.child(pill),
+                        ),
+                ),
+        )
+    }
+}
+
 impl Render for AgentTranscriptsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().border;
@@ -668,7 +710,7 @@ impl Render for AgentTranscriptsView {
         let accent = cx.theme().primary;
         let pick_badges = self.agent_pick_badges();
 
-        h_flex()
+        v_flex()
             .key_context(AGENT_TRANSCRIPTS_CONTEXT)
             .size_full()
             .track_focus(&self.focus_handle)
@@ -711,6 +753,7 @@ impl Render for AgentTranscriptsView {
             .on_action(cx.listener(|this, _: &AgentTranscriptsPick9, _, cx| {
                 this.pick_by_index(8, cx);
             }))
+            .child(self.render_title_bar(window, cx))
             .child(
                 h_resizable("agent-transcripts-columns")
                     .child(
@@ -761,9 +804,18 @@ impl Render for AgentTranscriptsView {
                                                     ),
                                             )
                                             .child(
+                                                // Pills beside their buttons,
+                                                // not under them: this header
+                                                // is one row tall, and a
+                                                // stacked pill lands on top of
+                                                // the label. Close lives in the
+                                                // title bar, with the window's
+                                                // own controls.
                                                 h_flex()
-                                                    .gap_1()
-                                                    .child(chrome_control_with_shortcut(
+                                                    .flex_shrink_0()
+                                                    .items_center()
+                                                    .gap(style::space::INLINE)
+                                                    .child(
                                                         Button::new("refresh-transcripts")
                                                             .label("Refresh")
                                                             .outline()
@@ -773,26 +825,16 @@ impl Render for AgentTranscriptsView {
                                                                     this.refresh(cx);
                                                                 },
                                                             )),
-                                                        window,
-                                                        &AgentTranscriptsRefresh,
-                                                        AGENT_TRANSCRIPTS_CONTEXT,
-                                                        cx,
-                                                    ))
-                                                    .child(chrome_control_with_shortcut(
-                                                        Button::new("close-transcripts")
-                                                            .label("Close")
-                                                            .outline()
-                                                            .compact()
-                                                            .on_click(cx.listener(
-                                                                |this, _, window, cx| {
-                                                                    this.close(window, cx);
-                                                                },
-                                                            )),
-                                                        window,
-                                                        &AgentTranscriptsClose,
-                                                        AGENT_TRANSCRIPTS_CONTEXT,
-                                                        cx,
-                                                    )),
+                                                    )
+                                                    .when_some(
+                                                        render_shortcut_pill(
+                                                            window,
+                                                            &AgentTranscriptsRefresh,
+                                                            AGENT_TRANSCRIPTS_CONTEXT,
+                                                            cx,
+                                                        ),
+                                                        |el, pill| el.child(pill),
+                                                    ),
                                             ),
                                     )
                                     .child(
@@ -836,10 +878,18 @@ impl Render for AgentTranscriptsView {
                             .size_range(px(TRANSCRIPT_PANEL_MIN)..Pixels::MAX)
                             .child(
                                 v_flex()
-                                    .h_full()
+                                    // `size_full`, not `h_full`: this panel has
+                                    // no fixed width, so without it the column
+                                    // shrinks to its content and the header
+                                    // divider stops short of the panel edge.
+                                    .size_full()
                                     .min_w_0()
                                     .child(
                                         h_flex()
+                                            // Without this the header shrinks
+                                            // to its content and its divider
+                                            // stops short of the panel edge.
+                                            .w_full()
                                             .px_4()
                                             .py_2()
                                             .border_b_1()
