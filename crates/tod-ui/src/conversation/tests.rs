@@ -1386,8 +1386,11 @@ fn the_picker_offers_verification_on_a_verifying_planned_node(cx: &mut TestAppCo
     });
 }
 
+/// The plan pane hosts the real plan list, so Up/Down there move that
+/// list's cursor — the same one the Tasks-view panel moves.
 #[gpui::test]
 fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
+    use crate::ui::item_list::keyboard::{ItemListDown, ItemListUp};
     let fixture = Fixture::new();
     let node = Focus::Node(fixture.node_id);
     let (view, _, cx) = open_view(&fixture, node, cx);
@@ -1400,23 +1403,31 @@ fn up_and_down_move_through_the_implementation_pane(cx: &mut TestAppContext) {
     view.update_in(cx, |view, window, cx| {
         view.focus_pane(Pane::ChangeSet, window, cx)
     });
+    draw(cx);
+    let at =
+        |cx: &mut VisualTestContext| view.read_with(cx, |v, cx| v.side_plan.read(cx).selected_id());
 
-    cx.dispatch_action(ConversationDown);
-    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(0));
-    cx.dispatch_action(ConversationDown);
-    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(1));
+    assert_eq!(
+        at(cx),
+        Some(fixture.steps[0]),
+        "entering lands on the first step"
+    );
+    cx.dispatch_action(ItemListDown);
+    assert_eq!(at(cx), Some(fixture.steps[1]));
     for _ in 0..steps + 3 {
-        cx.dispatch_action(ConversationDown);
+        cx.dispatch_action(ItemListDown);
     }
-    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(steps - 1));
-    cx.dispatch_action(ConversationUp);
-    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(steps - 2));
+    assert_eq!(at(cx), Some(fixture.steps[steps - 1]));
+    cx.dispatch_action(ItemListUp);
+    assert_eq!(at(cx), Some(fixture.steps[steps - 2]));
     // The change set's own cursor is untouched.
     assert_eq!(view.read_with(cx, |v, _| v.cursor), None);
 }
 
 #[gpui::test]
 fn the_status_filter_narrows_the_plan_pane(cx: &mut TestAppContext) {
+    use crate::ui::item_list::keyboard::ItemListHome;
+    use crate::views::plan_steps::{PlanStepsClose, PlanStepsStatusMenu};
     use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_FAILED};
     let fixture = Fixture::new();
     let node = Focus::Node(fixture.node_id);
@@ -1432,40 +1443,48 @@ fn the_status_filter_narrows_the_plan_pane(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| {
         v.choose_status(fixture.steps[1], STATUS_BLOCKED, cx)
     });
+    draw(cx);
+    let shown =
+        |cx: &mut VisualTestContext| view.read_with(cx, |v, cx| v.side_plan.read(cx).shown_steps());
+    let filter = |cx: &mut VisualTestContext, status: Option<&str>| {
+        view.update_in(cx, |v, window, cx| {
+            v.side_plan
+                .update(cx, |list, cx| list.toggle_filter(status, window, cx));
+        });
+        draw(cx);
+    };
 
     // Nothing toggled: every step shows.
-    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), steps);
+    assert_eq!(shown(cx).len(), steps);
 
-    // Toggling `blocked` on shows only that step, and Enter on the first
-    // shown row opens its dropdown.
-    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_BLOCKED, cx));
-    draw(cx);
-    view.read_with(cx, |v, _| {
-        let shown: Vec<_> = v.shown_plan().iter().map(|s| s.id).collect();
-        assert_eq!(shown, vec![fixture.steps[1]]);
-    });
-    cx.dispatch_action(ConversationDown);
-    cx.dispatch_action(ConversationDown);
-    assert_eq!(view.read_with(cx, |v, _| v.side_cursor), Some(0));
-    cx.dispatch_action(ConversationActivate);
+    // Toggling `blocked` on shows only that step, and `t` on the shown row
+    // opens its dropdown.
+    filter(cx, Some(STATUS_BLOCKED));
+    assert_eq!(shown(cx), vec![fixture.steps[1]]);
+    cx.dispatch_action(ItemListHome);
+    cx.dispatch_action(PlanStepsStatusMenu);
     assert_eq!(
-        view.read_with(cx, |v, _| v.status_menu.map(|m| m.step)),
+        view.read_with(cx, |v, cx| v.side_plan.read(cx).open_menu().map(|m| m.item)),
         Some(fixture.steps[1])
     );
-    cx.dispatch_action(ConversationEscape);
+    cx.dispatch_action(PlanStepsClose);
+    assert!(view.read_with(cx, |v, cx| v.side_plan.read(cx).open_menu().is_none()));
 
     // A status with no steps shows none; toggling both off shows them all.
-    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_FAILED, cx));
-    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), 1);
-    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_BLOCKED, cx));
-    draw(cx);
-    assert!(view.read_with(cx, |v, _| v.shown_plan().is_empty()));
-    view.update(cx, |v, cx| v.toggle_status_filter(STATUS_FAILED, cx));
-    assert_eq!(view.read_with(cx, |v, _| v.shown_plan().len()), steps);
+    filter(cx, Some(STATUS_FAILED));
+    assert_eq!(shown(cx).len(), 1);
+    filter(cx, Some(STATUS_BLOCKED));
+    assert!(shown(cx).is_empty());
+    filter(cx, Some(STATUS_FAILED));
+    assert_eq!(shown(cx).len(), steps);
 }
 
+/// `t` on a highlighted step opens the dropdown, Up/Down move it, Enter
+/// chooses and Escape closes — the hosted plan list's keys, in the pane.
 #[gpui::test]
 fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
+    use crate::ui::item_list::keyboard::{ItemListActivate, ItemListDown, ItemListUp};
+    use crate::views::plan_steps::{PlanStepsClose, PlanStepsStatusMenu};
     use tod_store::outline::repos::plan_steps::{PLAN_STEP_STATUSES, STATUS_BLOCKED, STATUS_READY};
     let fixture = Fixture::new();
     let node = Focus::Node(fixture.node_id);
@@ -1477,38 +1496,40 @@ fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
             .unwrap()
     };
     let (view, _, cx) = open_view(&fixture, node, cx);
+    let menu =
+        |cx: &mut VisualTestContext| view.read_with(cx, |v, cx| v.side_plan.read(cx).open_menu());
 
-    // Unsaved: Enter on the highlighted step opens the dropdown on its
-    // current status; the last entry is `blocked`.
+    // Unsaved: `t` on the highlighted step opens the dropdown on its current
+    // status; the last entry is `blocked`.
     view.update_in(cx, |view, window, cx| {
         view.open_with(node, ProtocolKind::Implementation, false, window, cx);
         view.focus_pane(Pane::ChangeSet, window, cx);
     });
     draw(cx);
-    cx.dispatch_action(ConversationDown);
-    cx.dispatch_action(ConversationActivate);
+    cx.dispatch_action(PlanStepsStatusMenu);
     let before = status_of(&fixture);
-    view.read_with(cx, |v, _| {
-        let menu = v.status_menu.expect("Enter opens the dropdown");
-        assert_eq!(menu.step, step);
-        assert_eq!(PLAN_STEP_STATUSES[menu.highlighted], before);
-    });
+    let open = menu(cx).expect("t opens the dropdown");
+    assert_eq!(open.item, step);
+    assert_eq!(PLAN_STEP_STATUSES[open.highlighted], before);
     draw(cx);
     for _ in 0..PLAN_STEP_STATUSES.len() {
-        cx.dispatch_action(ConversationDown);
+        cx.dispatch_action(ItemListDown);
     }
-    cx.dispatch_action(ConversationActivate);
+    cx.dispatch_action(ItemListActivate);
+    draw(cx);
     assert_eq!(status_of(&fixture), STATUS_BLOCKED);
-    view.read_with(cx, |v, _| {
-        assert!(v.status_menu.is_none());
+    assert!(menu(cx).is_none());
+    // The pane's own counts come from the conversation's next reload.
+    view.update(cx, |v, _| {
+        v.reload();
         assert_eq!(v.data.plan[0].status, STATUS_BLOCKED);
     });
 
     // Escape closes it without a change.
-    cx.dispatch_action(ConversationActivate);
-    cx.dispatch_action(ConversationUp);
-    cx.dispatch_action(ConversationEscape);
-    assert!(view.read_with(cx, |v, _| v.status_menu.is_none()));
+    cx.dispatch_action(PlanStepsStatusMenu);
+    cx.dispatch_action(ItemListUp);
+    cx.dispatch_action(PlanStepsClose);
+    assert!(menu(cx).is_none());
     assert_eq!(status_of(&fixture), STATUS_BLOCKED);
 
     // In a saved conversation the choice is the user's recorded edit, so it
@@ -1528,10 +1549,24 @@ fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
             },
         )
         .unwrap();
-    view.update(cx, |view, cx| {
+    view.update_in(cx, |view, window, cx| {
         view.show(node, Some(id), false, cx);
-        view.choose_status(step, STATUS_READY, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
     });
+    // The pane hands the list the conversation to record edits against.
+    draw(cx);
+    cx.dispatch_action(PlanStepsStatusMenu);
+    let open = menu(cx).expect("t opens the dropdown");
+    let ready = PLAN_STEP_STATUSES
+        .iter()
+        .position(|s| *s == STATUS_READY)
+        .unwrap();
+    assert!(ready < open.highlighted, "blocked sorts after ready");
+    for _ in 0..(open.highlighted - ready) {
+        cx.dispatch_action(ItemListUp);
+    }
+    cx.dispatch_action(ItemListActivate);
+    draw(cx);
     assert_eq!(status_of(&fixture), STATUS_READY);
     let changed = changes(&view, cx);
     assert!(
@@ -1540,6 +1575,30 @@ fn a_plan_steps_status_is_chosen_from_its_dropdown(cx: &mut TestAppContext) {
             .any(|c| change_set::key_of(c) == (ItemEntity::PlanStep, step)),
         "the status change is in the change set: {changed:?}"
     );
+}
+
+/// The plan side pane is the real plan panel, hosted: the same editing,
+/// creation, reordering and deletion as on the node tree, and an edit made
+/// there is the user's own action on the conversation.
+#[gpui::test]
+fn conversation_plan_pane_hosts_the_plan_list(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    view.update_in(cx, |view, window, cx| {
+        view.open_with(node, ProtocolKind::Implementation, false, window, cx);
+        view.focus_pane(Pane::ChangeSet, window, cx);
+    });
+    draw(cx);
+    view.read_with(cx, |v, cx| {
+        assert_eq!(v.side_list(), side_pane::SideList::Plan);
+        let list = v.side_plan.read(cx);
+        assert!(list.is_open(), "the hosted panel is targeted at the node");
+        assert_eq!(list.shown_steps(), fixture.steps);
+    });
+    // Entering the pane puts the keyboard in the hosted list.
+    let focused = view.read_with(cx, |v, cx| v.side_plan.read(cx).focus_handle(cx));
+    assert!(cx.update(|window, _| focused.is_focused(window)));
 }
 
 /// A step the agent handed back loads with its reason and renders its
@@ -1674,7 +1733,7 @@ fn a_review_lists_the_nodes_findings_and_answers_them(cx: &mut TestAppContext) {
     cx.dispatch_action(ConversationActivate);
     view.read_with(cx, |v, _| {
         let menu = v.status_menu.expect("Enter opens the dropdown");
-        assert_eq!(menu.step, second);
+        assert_eq!(menu.item, second);
         assert_eq!(menu.options, &USER_FINDING_STATUSES);
         assert_eq!(menu.highlighted, 0);
     });
@@ -2033,7 +2092,7 @@ fn a_fix_conversation_lists_the_findings_under_a_status_filter(cx: &mut TestAppC
     // leaves it out, since the menu cannot give the note it needs.
     view.read_with(cx, |v, _| {
         let menu = v.status_menu.expect("Enter opens the dropdown");
-        assert_eq!(menu.step, ids[1]);
+        assert_eq!(menu.item, ids[1]);
         assert_eq!(menu.options, &FINDING_STATUSES);
         assert_eq!(menu.options[menu.highlighted], FINDING_REJECTED);
     });

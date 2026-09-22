@@ -90,6 +90,57 @@ pub mod color {
     pub fn group_band() -> Hsla {
         hex(0x26262680)
     }
+    pub fn status_done() -> Hsla {
+        hex(0x4ade80ff)
+    }
+    pub fn status_active() -> Hsla {
+        hex(0xfbbf24ff)
+    }
+    pub fn status_blocked() -> Hsla {
+        hex(0xf87171ff)
+    }
+    pub fn status_ready() -> Hsla {
+        hex(0xfafafaff)
+    }
+    pub fn status_idle() -> Hsla {
+        hex(0xa3a3a3ff)
+    }
+}
+
+/// What a status says at a glance (`tokens.color.status-*`). A status with
+/// nothing to say — not started, not applicable — is [`StatusTone::Idle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusTone {
+    Done,
+    Active,
+    Blocked,
+    Ready,
+    Idle,
+}
+
+impl StatusTone {
+    fn color(self) -> Hsla {
+        match self {
+            Self::Done => color::status_done(),
+            Self::Active => color::status_active(),
+            Self::Blocked => color::status_blocked(),
+            Self::Ready => color::status_ready(),
+            Self::Idle => color::status_idle(),
+        }
+    }
+}
+
+/// `styles.status-chip`: an item's status, tinted by what it says.
+pub fn status_chip<E: Styled>(el: E, tone: StatusTone) -> E {
+    let color = tone.color();
+    el.text_size(font::DENSE)
+        .text_color(color)
+        .bg(color.opacity(0.15))
+        .rounded(radius::BADGE)
+        .px(space::SNUG)
+        .py(space::HAIRLINE)
+        .whitespace_nowrap()
+        .flex_shrink_0()
 }
 
 /// `tokens.font` sizes (weights are applied by the styles that use them).

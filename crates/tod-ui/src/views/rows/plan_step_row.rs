@@ -1,6 +1,7 @@
 //! One plan step, as a row.
 
 use super::obligation_row::one_line;
+use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
@@ -10,8 +11,10 @@ use gpui::{
 };
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
+use std::rc::Rc;
 use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
+use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_FAILED};
 use uuid::Uuid;
 
 /// What the user did on a plan-step row. A host's action type converts
@@ -22,6 +25,13 @@ pub enum PlanStepRowEvent {
     Select { row_ix: usize },
     /// Double-clicked the highlighted row's text.
     StartEdit { step_id: Uuid },
+    /// Clicked the status chip: open the dropdown on this step, or close it
+    /// when it is already open there.
+    ToggleStatusMenu { step_id: Uuid },
+    /// Picked a status from the open dropdown.
+    ChooseStatus { step_id: Uuid, status: &'static str },
+    /// Clicked away from the open dropdown.
+    DismissStatusMenu,
 }
 
 pub struct PlanStepRowProps<'a> {
@@ -36,6 +46,8 @@ pub struct PlanStepRowProps<'a> {
     pub highlighted: bool,
     /// The inline editor, when this row is being edited.
     pub editor: Option<&'a Entity<TextareaState>>,
+    /// The status dropdown, when it is open on this step.
+    pub status_menu: Option<StatusMenu>,
 }
 
 /// Render one plan step. The default [`RowOptions`] give the row the plan
@@ -55,6 +67,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         row_ix,
         highlighted,
         editor,
+        status_menu,
     } = props;
     let id = step.id;
     let key = id.to_string();
@@ -159,16 +172,41 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
                 .text_color(muted)
                 .child(format!("{}.", step.ordinal)),
         )
-        .child(
-            div()
-                .text_xs()
-                .px_1p5()
-                .py_0p5()
-                .rounded_sm()
-                .bg(status_color.opacity(0.15))
-                .text_color(status_color)
-                .child(step.status.clone()),
-        )
+        .child(status_chip(
+            format!("plan-status-{key}"),
+            &step.status,
+            status_tone(&step.status),
+            status_menu,
+            StatusMenuHandlers {
+                toggle: {
+                    let host = host.clone();
+                    Rc::new(move |_, cx| {
+                        host.push(
+                            PlanStepRowEvent::ToggleStatusMenu { step_id: id }.into(),
+                            cx,
+                        )
+                    })
+                },
+                choose: {
+                    let host = host.clone();
+                    Rc::new(move |status, _, cx| {
+                        host.push(
+                            PlanStepRowEvent::ChooseStatus {
+                                step_id: id,
+                                status,
+                            }
+                            .into(),
+                            cx,
+                        )
+                    })
+                },
+                dismiss: {
+                    let host = host.clone();
+                    Rc::new(move |_, cx| host.push(PlanStepRowEvent::DismissStatusMenu.into(), cx))
+                },
+            },
+            cx,
+        ))
         .child(div().flex_1())
         .children(row_tail(&key, &group, highlighted, &mut opts));
 
@@ -220,11 +258,23 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         .child(header)
         .children(editor)
         .children(body)
+        .children(opts.detail.take())
         .children(reason)
         .children(note)
         .children(links("depends on", depends_on))
         .children(links("satisfies", satisfies))
         .into_any_element()
+}
+
+/// What a plan step's status says at a glance.
+fn status_tone(status: &str) -> style::StatusTone {
+    match status {
+        "verified" | "implemented" => style::StatusTone::Done,
+        "in_progress" | "partial" => style::StatusTone::Active,
+        STATUS_BLOCKED | STATUS_FAILED => style::StatusTone::Blocked,
+        "ready" => style::StatusTone::Ready,
+        _ => style::StatusTone::Idle,
+    }
 }
 
 fn status_color(status: &str, theme: &gpui_component::Theme) -> gpui::Hsla {

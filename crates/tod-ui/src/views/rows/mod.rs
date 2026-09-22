@@ -9,6 +9,7 @@
 pub mod node_row;
 pub mod obligation_row;
 pub mod plan_step_row;
+pub mod status_menu;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -27,6 +28,7 @@ use tod_store::conversation::NetOp;
 pub use node_row::{NodeRowEvent, NodeRowProps, node_row};
 pub use obligation_row::{ObligationRowEvent, ObligationRowProps, obligation_row};
 pub use plan_step_row::{PlanStepRowEvent, PlanStepRowProps, plan_step_row};
+pub use status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 
 /// Where a row sends what the user did: an action queue plus a callback
 /// that makes the owner drain it.
@@ -129,6 +131,10 @@ pub struct RowOptions {
     /// Shown while the row is hovered or highlighted, beside the trailing
     /// context and never on top of it.
     pub actions: Vec<RowAction>,
+    /// Shown under the row's body: whatever the host has to say about this
+    /// item that the item itself does not carry (a conversation's handoff
+    /// answers, what verification found).
+    pub detail: Option<AnyElement>,
     /// The text is struck through (deleted or reversed items).
     pub struck: bool,
     /// An unsure dot, with this reason as its tooltip.

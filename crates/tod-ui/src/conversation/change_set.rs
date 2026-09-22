@@ -816,6 +816,7 @@ impl ConversationView {
             leading: Some(leading),
             trailing_context: self.render_context_refs(ix, &change, window, cx),
             actions,
+            detail: None,
             struck: matches!(change.op, NetOp::Deleted | NetOp::Reversed),
             flag: change.flag.clone(),
         };
@@ -879,6 +880,9 @@ impl ConversationView {
                         row_ix: ix,
                         highlighted,
                         editor,
+                        // A change-set row is one compact line: the status
+                        // dropdown belongs to the lists that work the plan.
+                        status_menu: None,
                     },
                     &host,
                     opts,

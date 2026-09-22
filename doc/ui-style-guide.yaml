@@ -109,6 +109,17 @@ styles:
     padding-x: snug
     padding-y: hairline
     overflow: single-line
+  # An item's own status, as a chip that opens the dropdown of the others.
+  # The tone is what the status says at a glance; a status with nothing to
+  # say — not started, not applicable — is `idle`.
+  status-chip:
+    font: dense
+    radius: badge
+    padding-x: snug
+    padding-y: hairline
+    overflow: single-line
+    color: "status-<tone>"
+    background: "status-<tone> at 15%"
   shortcut-badge:
     extends: badge
     anchor: bottom-right of target
@@ -380,6 +391,12 @@ tokens:
     notice-text: "#000000"
     badge-fill: "#262626"
     badge-edge: "#a3a3a38c"
+    # status-chip tones.
+    status-done: "#4ade80"
+    status-active: "#fbbf24"
+    status-blocked: "#f87171"
+    status-ready: "#fafafa"
+    status-idle: "#a3a3a3"
     highlight: "#1e40af33"
     # A group heading's rule, and the band behind an outermost heading.
     divider-strong: "#a3a3a380"

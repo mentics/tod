@@ -15,27 +15,41 @@ use crate::ui::item_list::{ItemList, ItemListKeys, ItemListRow, bind_item_list_k
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
-use crate::views::rows::RowHost;
+use crate::views::rows::{RowHost, StatusMenu};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, Styled, Subscription, Window, actions, div,
+    AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Styled, Subscription,
+    Window, actions, div,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{InputEvent, TextareaState};
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
 use rows::{ListAction, PlanRow, PlanStepItem};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 use tod_store::conversation::{Focus, NetOp};
 use tod_store::fleet::FleetStore;
+use tod_store::interview::{ACTOR_USER, InterviewCommand};
+use tod_store::outline::repos::plan_steps::needs_user;
 use tod_store::outline::{OutlineMutation, PLAN_STEP_STATUSES, PlanStep, ReorderDirection};
 use uuid::Uuid;
 
 const PLAN_STEPS_CONTEXT: &str = "PlanSteps";
 const INLINE_EDIT_ROWS: usize = 2;
 
-actions!(plan_steps, [PlanStepsClose, PlanStepsCycleStatus]);
+actions!(plan_steps, [PlanStepsClose, PlanStepsStatusMenu]);
+
+/// What the host shows under a step's body — a conversation's answers to a
+/// step handed back, what verification found — which the step itself does
+/// not carry. Unset on the standalone panel.
+pub type RowDetail = Rc<dyn Fn(&PlanStep, &mut Window, &mut App) -> Option<AnyElement>>;
+
+/// How the host runs a mutation the list makes. Inside a conversation the
+/// edit is recorded as the user's own action, so it joins the change set and
+/// can be reversed; without one the mutation runs plain.
+pub type MutationRouter = Rc<dyn Fn(OutlineMutation) -> InterviewCommand>;
 
 pub fn register_plan_steps_keyboard_bindings(cx: &mut App) {
     // The panel is an item list: navigation, editing, creation and reordering
@@ -50,11 +64,12 @@ pub fn register_plan_steps_keyboard_bindings(cx: &mut App) {
     // Ctrl+arrows, same as Obligations.
     bind_modified_pane_nav(cx, PLAN_STEPS_CONTEXT);
     key_context::bind_panel_escape(cx, PlanStepsClose, PLAN_STEPS_CONTEXT);
-    // Cycling a step's status is about what a plan step is, not about what a
-    // list does, so it stays the panel's own key.
+    // A step's status is about what a plan step is, not about what a list
+    // does, so it stays the panel's own key. Enter means "edit this item"
+    // here as everywhere else.
     cx.bind_keys([KeyBinding::new(
         "t",
-        PlanStepsCycleStatus,
+        PlanStepsStatusMenu,
         Some(key_context::excluding_input(PLAN_STEPS_CONTEXT)),
     )]);
 }
@@ -91,6 +106,13 @@ pub struct PlanStepsView {
     change_markers: HashMap<Uuid, NetOp>,
     /// The statuses the list shows; empty shows every step.
     filter: StatusFilter,
+    /// The status dropdown, while open on one step.
+    status_menu: Option<StatusMenu>,
+    /// What the host adds under a step's body, when it has anything.
+    row_detail: Option<RowDetail>,
+    /// How the host runs the list's mutations; plain outline writes when
+    /// unset.
+    router: Option<MutationRouter>,
     editing_id: Option<Uuid>,
     draft_id: Option<Uuid>,
     edit_original_body: Option<String>,
@@ -152,6 +174,9 @@ impl PlanStepsView {
             struck: HashSet::new(),
             change_markers: HashMap::new(),
             filter: StatusFilter::default(),
+            status_menu: None,
+            row_detail: None,
+            router: None,
             editing_id: None,
             draft_id: None,
             edit_original_body: None,
@@ -172,6 +197,65 @@ impl PlanStepsView {
     pub fn set_embedded(&mut self, embedded: bool, cx: &mut Context<Self>) {
         self.embedded = embedded;
         cx.notify();
+    }
+
+    /// What the host shows under each step's body. The standalone panel
+    /// leaves it unset; a conversation uses it for the blocks only a
+    /// conversation has — a step handed back to the user, and what
+    /// verification found.
+    pub fn set_row_detail(&mut self, detail: Option<RowDetail>) {
+        self.row_detail = detail;
+    }
+
+    /// How the host runs what the list changes. Set inside a conversation so
+    /// every edit, creation, reorder and deletion is recorded as the user's
+    /// own action there.
+    pub fn set_mutation_router(&mut self, router: Option<MutationRouter>) {
+        self.router = router;
+    }
+
+    /// Run `mutation` the way the host asked for.
+    fn apply(&self, mutation: OutlineMutation) -> Result<(), String> {
+        match &self.router {
+            Some(route) => self
+                .fleet
+                .interview(ACTOR_USER, route(mutation))
+                .map(|_| ())
+                .map_err(|err| format!("{err}")),
+            None => self
+                .fleet
+                .enqueue_outline(mutation)
+                .map_err(|err| format!("{err}"))
+                .and_then(|_| self.fleet.writer().flush().map_err(|err| format!("{err}"))),
+        }
+    }
+
+    /// The steps the list is showing, in order.
+    #[cfg(test)]
+    pub(crate) fn shown_steps(&self) -> Vec<Uuid> {
+        self.list.items().map(|item| item.step.id).collect()
+    }
+
+    /// The step under the cursor.
+    #[cfg(test)]
+    pub(crate) fn selected_id(&self) -> Option<Uuid> {
+        self.selected_step().map(|step| step.id)
+    }
+
+    /// The status dropdown, while open.
+    #[cfg(test)]
+    pub(crate) fn open_menu(&self) -> Option<StatusMenu> {
+        self.status_menu
+    }
+
+    #[cfg(test)]
+    pub(crate) fn toggle_filter(
+        &mut self,
+        status: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_filter(status, window, cx);
     }
 
     /// Scroll to plan step `id` and highlight it. Does nothing if the step is
@@ -331,6 +415,13 @@ impl PlanStepsView {
     /// Rebuild the rows from the store data, keeping the cursor on whatever it
     /// was on.
     fn rebuild_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // A dropdown left open on a step that has since gone closes.
+        if self
+            .status_menu
+            .is_some_and(|m| !self.items.iter().any(|s| s.id == m.item))
+        {
+            self.status_menu = None;
+        }
         self.list
             .set_editing_key(self.editing_id.map(|id| id.to_string()));
         self.list.set_rows(self.flat_rows());
@@ -352,6 +443,7 @@ impl PlanStepsView {
         if self.list.cursor() == Some(row_ix) {
             return;
         }
+        self.status_menu = None;
         if self.editing_id.is_some() {
             self.pending_abandon_edit = true;
         }
@@ -467,10 +559,9 @@ impl PlanStepsView {
 
         if is_draft && (force_delete_draft || body.is_empty()) {
             self.clear_inline_edit_state(window, cx);
-            let _ = self.fleet.enqueue_outline(OutlineMutation::DeletePlanStep {
+            let _ = self.apply(OutlineMutation::DeletePlanStep {
                 step_id: editing_id,
             });
-            let _ = self.fleet.writer().flush();
             self.reload(window, cx);
             self.focus_list(window, cx);
             return;
@@ -499,10 +590,9 @@ impl PlanStepsView {
         if body.is_empty() {
             if self.is_draft_edit() {
                 self.clear_inline_edit_state(window, cx);
-                let _ = self.fleet.enqueue_outline(OutlineMutation::DeletePlanStep {
+                let _ = self.apply(OutlineMutation::DeletePlanStep {
                     step_id: editing_id,
                 });
-                let _ = self.fleet.writer().flush();
                 self.reload(window, cx);
                 self.focus_list(window, cx);
                 return true;
@@ -513,17 +603,10 @@ impl PlanStepsView {
             });
             return false;
         }
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::UpdatePlanStepBody {
-                step_id: editing_id,
-                body: body.clone(),
-            })
-        {
-            crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
-            return false;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
+        if let Err(err) = self.apply(OutlineMutation::UpdatePlanStepBody {
+            step_id: editing_id,
+            body: body.clone(),
+        }) {
             crate::ui::toast::error_toast(window, cx, format!("Save failed: {err}"));
             return false;
         }
@@ -549,17 +632,13 @@ impl PlanStepsView {
             return;
         };
         let step_id = Uuid::new_v4();
-        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::CreatePlanStep {
+        if let Err(err) = self.apply(OutlineMutation::CreatePlanStep {
             step_id: Some(step_id),
             node_id,
             after_id: after,
             before,
             body: String::new(),
         }) {
-            crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
-            return;
-        }
-        if let Err(err) = self.fleet.writer().flush() {
             crate::ui::toast::error_toast(window, cx, format!("Create failed: {err}"));
             return;
         }
@@ -604,14 +683,10 @@ impl PlanStepsView {
                     .last()
                     .map(|s| s.id.to_string())
             });
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::DeletePlanStep { step_id: id })
-        {
+        if let Err(err) = self.apply(OutlineMutation::DeletePlanStep { step_id: id }) {
             crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
             return;
         }
-        let _ = self.fleet.writer().flush();
         self.list.set_cursor_key(next_key);
         self.reload(window, cx);
         self.focus_list(window, cx);
@@ -627,45 +702,65 @@ impl PlanStepsView {
             return;
         };
         let id = step.id;
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::ReorderPlanStep {
-                step_id: id,
-                direction,
-            })
-        {
+        if let Err(err) = self.apply(OutlineMutation::ReorderPlanStep {
+            step_id: id,
+            direction,
+        }) {
             crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
             return;
         }
-        let _ = self.fleet.writer().flush();
         self.list.set_cursor_key(Some(id.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
 
-    fn cycle_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(step) = self.selected_live_step() else {
+    /// Open the status dropdown on `step`, highlighting the status it has.
+    fn open_status_menu(&mut self, step: Uuid, cx: &mut Context<Self>) {
+        let Some(current) = self.items.iter().find(|s| s.id == step) else {
             return;
         };
-        let current_ix = PLAN_STEP_STATUSES
-            .iter()
-            .position(|s| *s == step.status)
-            .unwrap_or(0);
-        let next = PLAN_STEP_STATUSES[(current_ix + 1) % PLAN_STEP_STATUSES.len()];
-        if let Err(err) = self
-            .fleet
-            .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
-                step_id: step.id,
-                status: next.to_string(),
-                note: None,
-                reason: None,
-            })
-        {
+        self.status_menu = Some(StatusMenu::open(step, &PLAN_STEP_STATUSES, &current.status));
+        cx.notify();
+    }
+
+    fn close_status_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let closed = self.status_menu.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
+    /// Set `step`'s status to the one chosen from the dropdown.
+    fn choose_status(
+        &mut self,
+        step: Uuid,
+        status: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_menu = None;
+        let Some(current) = self.items.iter().find(|s| s.id == step).cloned() else {
+            cx.notify();
+            return;
+        };
+        if current.status == status {
+            cx.notify();
+            return;
+        }
+        // A step left for the user keeps the note and reason saying why; any
+        // other status has none.
+        let kept = needs_user(status).then_some(&current);
+        if let Err(err) = self.apply(OutlineMutation::UpdatePlanStepStatus {
+            step_id: step,
+            status: status.to_string(),
+            note: kept.and_then(|s| s.note.clone()),
+            reason: kept.and_then(|s| s.reason.clone()),
+        }) {
             crate::ui::toast::error_toast(window, cx, format!("Status update failed: {err}"));
             return;
         }
-        let _ = self.fleet.writer().flush();
-        self.list.set_cursor_key(Some(step.id.to_string()));
+        self.list.set_cursor_key(Some(step.to_string()));
         self.reload(window, cx);
         self.focus_list(window, cx);
     }
@@ -692,12 +787,27 @@ impl PlanStepsView {
                 ListAction::Select { row_ix } => {
                     self.select_row(row_ix, cx);
                 }
+                ListAction::ToggleStatusMenu { step_id } => {
+                    if !self.status_menu.take().is_some_and(|m| m.is_on(step_id)) {
+                        self.open_status_menu(step_id, cx);
+                    }
+                    cx.notify();
+                }
+                ListAction::ChooseStatus { step_id, status } => {
+                    self.choose_status(step_id, status, window, cx);
+                }
+                ListAction::DismissStatusMenu => {
+                    self.close_status_menu(cx);
+                }
                 ListAction::Ignored => {}
             }
         }
     }
 
     fn on_close(&mut self, _: &PlanStepsClose, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_status_menu(cx) {
+            return;
+        }
         if self.is_editing() {
             self.abandon_inline_edit(window, cx, true);
             return;
@@ -710,6 +820,12 @@ impl PlanStepsView {
     }
 
     fn on_enter(&mut self, _: &ItemListActivate, window: &mut Window, cx: &mut Context<Self>) {
+        // With the dropdown open Enter picks the highlighted status;
+        // otherwise it means "edit this item", as in every other list.
+        if let Some(menu) = self.status_menu {
+            self.choose_status(menu.item, menu.choice(), window, cx);
+            return;
+        }
         self.on_smart_enter(window, cx);
     }
 
@@ -776,24 +892,45 @@ impl PlanStepsView {
         }
     }
 
-    fn on_cycle_status(
+    fn on_status_menu(
         &mut self,
-        _: &PlanStepsCycleStatus,
-        window: &mut Window,
+        _: &PlanStepsStatusMenu,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.is_editing() {
             return;
         }
-        self.cycle_status(window, cx);
+        if self.close_status_menu(cx) {
+            return;
+        }
+        if let Some(step) = self.selected_live_step() {
+            self.open_status_menu(step.id, cx);
+        }
     }
 
     fn on_arrow_up(&mut self, _: &ItemListUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.move_status_menu(-1, cx) {
+            return;
+        }
         self.move_selection(-1, window, cx);
     }
 
     fn on_arrow_down(&mut self, _: &ItemListDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.move_status_menu(1, cx) {
+            return;
+        }
         self.move_selection(1, window, cx);
+    }
+
+    /// Move the open dropdown's highlight; `false` when none is open.
+    fn move_status_menu(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.status_menu.as_mut() else {
+            return false;
+        };
+        menu.move_highlight(delta);
+        cx.notify();
+        true
     }
 
     fn on_page_up(&mut self, _: &ItemListPageUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -874,7 +1011,7 @@ impl Render for PlanStepsView {
             .on_action(cx.listener(Self::on_edit))
             .on_action(cx.listener(Self::on_commit_edit))
             .on_action(cx.listener(Self::on_delete))
-            .on_action(cx.listener(Self::on_cycle_status))
+            .on_action(cx.listener(Self::on_status_menu))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))
@@ -951,11 +1088,18 @@ impl Render for PlanStepsView {
             .child({
                 let editor = self.inline_edit_input.clone();
                 let row_host = self.host.clone();
+                let menu = self.status_menu;
+                let detail = self.row_detail.clone();
                 self.list.render(
                     "plan-steps-scroll",
                     &self.host,
                     move |item, state, window, cx| {
-                        rows::render_plan_step(item, state, &editor, &row_host, window, cx)
+                        let extra = detail
+                            .as_ref()
+                            .and_then(|detail| detail(&item.step, window, cx));
+                        rows::render_plan_step(
+                            item, state, &editor, menu, extra, &row_host, window, cx,
+                        )
                     },
                     window,
                     cx,
@@ -969,7 +1113,7 @@ impl Render for PlanStepsView {
                     .border_color(border)
                     .text_xs()
                     .text_color(muted)
-                    .child("↑/↓ navigate · Enter edits · N adds · T cycles status · Cmd/Ctrl+↑/↓ reorders · Esc closes"),
+                    .child("↑/↓ navigate · Enter edits · N adds · T sets status · Cmd/Ctrl+↑/↓ reorders · Esc closes"),
             )
             .into_any_element()
     }

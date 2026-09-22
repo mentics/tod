@@ -67,6 +67,7 @@ use crate::ui::status_filter::StatusFilter;
 use crate::ui::style;
 use crate::views::incoming_check::IncomingCheck;
 use crate::views::obligations::ObligationsView;
+use crate::views::plan_steps::PlanStepsView;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost};
 use change_set::{ChangeKey, PendingReverse};
@@ -234,6 +235,10 @@ impl From<PlanStepRowEvent> for ChangeAction {
         match event {
             PlanStepRowEvent::Select { row_ix } => Self::Select(row_ix),
             PlanStepRowEvent::StartEdit { step_id } => Self::Edit((ItemEntity::PlanStep, step_id)),
+            // The change set shows compact rows, which carry no status chip.
+            PlanStepRowEvent::ToggleStatusMenu { .. }
+            | PlanStepRowEvent::ChooseStatus { .. }
+            | PlanStepRowEvent::DismissStatusMenu => Self::Ignore,
         }
     }
 }
@@ -363,13 +368,11 @@ pub struct ConversationView {
     /// Nodes whose gate check just finished a turn: the criteria rows it
     /// recorded are re-read on the next poll, so Advance appears on a pass.
     pending_gate_reloads: Vec<Uuid>,
-    /// The highlighted row of a side pane other than the change set: plan
-    /// steps first, then changed files.
+    /// The highlighted row of the review pane.
     side_cursor: Option<usize>,
-    /// The plan-step status dropdown, while open.
-    status_menu: Option<side_pane::StatusMenu>,
-    /// The statuses the plan pane, or the review pane, shows; empty shows
-    /// every row.
+    /// The review finding status dropdown, while open.
+    status_menu: Option<crate::views::rows::StatusMenu>,
+    /// The statuses the review pane shows; empty shows every row.
     status_filter: StatusFilter,
     /// The statuses the obligations pane, or the plan pane's requirements,
     /// shows; empty shows every obligation.
@@ -396,6 +399,10 @@ pub struct ConversationView {
     /// embedded, so it edits, reorders and groups exactly as it does on the
     /// node tree.
     side_obligations: Entity<ObligationsView>,
+    /// The side pane's plan list: the real [`PlanStepsView`], hosted
+    /// embedded, so a step affords the same actions here as it does on the
+    /// node tree.
+    side_plan: Entity<PlanStepsView>,
 
     /// Runs gate checks and lifecycle moves; shared with the lifecycle panel.
     lifecycle: Entity<LifecycleController>,
@@ -502,6 +509,11 @@ impl ConversationView {
             view.set_embedded(true, cx);
             view
         });
+        let side_plan = cx.new(|cx| {
+            let mut view = PlanStepsView::new(window, cx, fleet.clone());
+            view.set_embedded(true, cx);
+            view
+        });
         Self {
             host: RowHost::for_entity(cx.weak_entity()),
             fleet,
@@ -545,6 +557,7 @@ impl ConversationView {
             scroll_to_cursor: false,
             context,
             side_obligations,
+            side_plan,
             lifecycle,
             _lifecycle_changes: lifecycle_changes,
             incoming_check: None,
@@ -1300,12 +1313,7 @@ impl ConversationView {
                 cx.notify();
             }
             Pane::Context => {}
-            Pane::ChangeSet
-                if matches!(
-                    self.side_list(),
-                    side_pane::SideList::Plan | side_pane::SideList::Findings
-                ) =>
-            {
+            Pane::ChangeSet if self.side_list() == side_pane::SideList::Findings => {
                 self.move_side_cursor(delta, cx);
             }
             Pane::ChangeSet => {
@@ -1337,7 +1345,7 @@ impl ConversationView {
             return;
         }
         if let Some(menu) = self.status_menu {
-            self.choose_status(menu.step, menu.options[menu.highlighted], cx);
+            self.choose_status(menu.item, menu.choice(), cx);
             return;
         }
         match self.pane {
@@ -1355,15 +1363,8 @@ impl ConversationView {
                 }
             },
             Pane::Context => {}
-            Pane::ChangeSet if self.side_list() == side_pane::SideList::Plan => {
-                // A highlighted plan step's Enter opens its status dropdown.
-                let shown = self.shown_plan();
-                if let Some(step) = self.side_cursor.and_then(|ix| shown.get(ix)) {
-                    self.open_status_menu(step.id, cx);
-                }
-            }
             Pane::ChangeSet if self.side_list() == side_pane::SideList::Findings => {
-                // So does a highlighted finding's.
+                // A highlighted finding's Enter opens its status dropdown.
                 let finding = self
                     .side_cursor
                     .and_then(|ix| self.shown_findings().get(ix).map(|f| f.id));
@@ -1430,16 +1431,21 @@ impl ConversationView {
         }
         match pane {
             Pane::ChangeSet => {
-                // The obligations pane is a hosted list with its own keys; the
-                // rest of the side pane is this view's own.
-                if self.side_list() == side_pane::SideList::Obligations {
-                    self.side_obligations
+                // The obligations and plan panes are hosted lists with their
+                // own keys; the rest of the side pane is this view's own.
+                match self.side_list() {
+                    side_pane::SideList::Obligations => self
+                        .side_obligations
                         .read(cx)
                         .focus_handle(cx)
-                        .focus(window, cx);
-                } else {
-                    self.clamp_cursor();
-                    self.focus_handle.focus(window, cx);
+                        .focus(window, cx),
+                    side_pane::SideList::Plan => {
+                        self.side_plan.read(cx).focus_handle(cx).focus(window, cx)
+                    }
+                    _ => {
+                        self.clamp_cursor();
+                        self.focus_handle.focus(window, cx);
+                    }
                 }
             }
             Pane::Context => {
@@ -1482,12 +1488,20 @@ impl ConversationView {
         }
         match self.pane {
             Pane::ChangeSet => {
-                if self.side_list() == side_pane::SideList::Obligations {
-                    if let Some(focus) = self.side_obligations.read(cx).conversation_focus() {
-                        self.open(focus, true, window, cx);
+                let hosted = match self.side_list() {
+                    side_pane::SideList::Obligations => {
+                        self.side_obligations.read(cx).conversation_focus()
                     }
-                } else if let Some(key) = self.cursor {
-                    self.talk_about(key, window, cx);
+                    side_pane::SideList::Plan => self.side_plan.read(cx).conversation_focus(),
+                    _ => None,
+                };
+                match hosted {
+                    Some(focus) => self.open(focus, true, window, cx),
+                    None => {
+                        if let Some(key) = self.cursor {
+                            self.talk_about(key, window, cx);
+                        }
+                    }
                 }
             }
             Pane::Context => {

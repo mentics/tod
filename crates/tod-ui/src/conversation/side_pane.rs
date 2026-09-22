@@ -15,28 +15,32 @@ use crate::ui::agent_conversation::{NoticeTone, PanelNotice};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status_filter::{render_status_filter, status_counts};
 use crate::ui::style;
+use crate::views::plan_steps::MutationRouter;
+use crate::views::rows::{StatusMenu, StatusMenuHandlers, status_chip};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Anchor, AnyElement, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, anchored,
-    deferred, div, px, relative,
+    AnyElement, App, Context, ElementId, FontWeight, InteractiveElement, IntoElement,
+    ParentElement, Pixels, StatefulInteractiveElement, Styled, WeakEntity, Window, div, px,
+    relative,
 };
 use gpui_component::button::Button;
-use gpui_component::{Disableable, Icon, Sizable, h_flex, v_flex};
-use gpui_kit_assets::IconName;
+use gpui_component::{Disableable, Sizable, h_flex, v_flex};
+use std::collections::HashMap;
+use std::rc::Rc;
 use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_message};
 use tod_store::conversation::ProtocolKind;
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, PLAN_STEP_STATUSES, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_IN_PROGRESS,
-    STATUS_VERIFIED, needs_user,
+    HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_IN_PROGRESS, STATUS_VERIFIED,
+    needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
 use tod_store::verification::{
     ObligationStanding, VERDICT_FAILED, VERDICT_REOPENED, VERDICT_VERIFIED,
 };
 use tod_store::review::{
-    FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, FINDING_REJECTED, FINDING_STATUSES,
+    FINDING_DECLINED, FINDING_FIXED, FINDING_OPEN, FINDING_OUT_OF_SCOPE, FINDING_REJECTED,
+    FINDING_STATUSES,
     ReviewFinding, USER_FINDING_STATUSES,
 };
 use uuid::Uuid;
@@ -53,43 +57,23 @@ pub(super) enum SideList {
     Empty(&'static str, &'static str),
 }
 
-/// The status dropdown open on one plan step or review finding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StatusMenu {
-    /// The plan step or finding.
-    pub step: Uuid,
-    /// The statuses it lists: [`PLAN_STEP_STATUSES`], or for a finding
-    /// [`USER_FINDING_STATUSES`] ([`FINDING_STATUSES`] once it is rejected).
-    pub options: &'static [&'static str],
-    /// Index into `options`.
-    pub highlighted: usize,
-}
-
 impl ConversationView {
-    /// Open the status dropdown on `step` (a plan step or a finding),
-    /// highlighting its current status.
-    pub(super) fn open_status_menu(&mut self, step: Uuid, cx: &mut Context<Self>) {
-        let (current, options): (&str, &'static [&'static str]) =
-            if let Some(s) = self.data.plan.iter().find(|s| s.id == step) {
-                (&s.status, &PLAN_STEP_STATUSES)
-            } else if let Some(f) = self.data.findings.iter().find(|f| f.id == step) {
-                let options: &'static [&'static str] = if f.status == FINDING_REJECTED {
-                    &FINDING_STATUSES
-                } else {
-                    &USER_FINDING_STATUSES
-                };
-                (&f.status, options)
-            } else {
-                return;
-            };
-        let highlighted = options.iter().position(|s| *s == current).unwrap_or(0);
+    /// Open the status dropdown on review finding `finding`, highlighting the
+    /// status it has. A plan step's dropdown belongs to the plan list the
+    /// pane hosts, which owns its own.
+    pub(super) fn open_status_menu(&mut self, finding: Uuid, cx: &mut Context<Self>) {
+        let Some(f) = self.data.findings.iter().find(|f| f.id == finding) else {
+            return;
+        };
+        let options: &'static [&'static str] = if f.status == FINDING_REJECTED {
+            &FINDING_STATUSES
+        } else {
+            &USER_FINDING_STATUSES
+        };
+        let menu = StatusMenu::open(finding, options, &f.status);
         self.pane = Pane::ChangeSet;
         self.picker = None;
-        self.status_menu = Some(StatusMenu {
-            step,
-            options,
-            highlighted,
-        });
+        self.status_menu = Some(menu);
         cx.notify();
     }
 
@@ -98,8 +82,7 @@ impl ConversationView {
         let Some(menu) = self.status_menu.as_mut() else {
             return false;
         };
-        let last = menu.options.len() as isize - 1;
-        menu.highlighted = (menu.highlighted as isize + delta).clamp(0, last) as usize;
+        menu.move_highlight(delta);
         cx.notify();
         true
     }
@@ -188,12 +171,7 @@ impl ConversationView {
 
     /// Under a step that failed verification: what verification found. The
     /// agent works it again from this note once implementation runs.
-    fn render_failure(
-        &self,
-        step: &PlanStep,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_failure(step: &PlanStep, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         if step.status != STATUS_FAILED {
             return None;
         }
@@ -320,25 +298,28 @@ impl ConversationView {
     /// for each reason — keep one of the conflicting obligations, choose an
     /// option, or retry once the access or outside thing is in place.
     fn render_handoff(
-        &self,
+        view: &WeakEntity<Self>,
+        cited: &HashMap<Uuid, String>,
         step: &PlanStep,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<AnyElement> {
         if !needs_user(&step.status) {
             return None;
         }
         let id = step.id;
-        let answer_button =
-            |key: String, label: &'static str, answer: HandoffAnswer, cx: &mut Context<Self>| {
-                Button::new(ElementId::Name(key.into()))
-                    .label(label)
-                    .small()
-                    .flex_shrink_0()
-                    .on_click(cx.listener(move |this, _, _, cx| {
+        let answer_button = |key: String, label: &'static str, answer: HandoffAnswer| {
+            let view = view.clone();
+            Button::new(ElementId::Name(key.into()))
+                .label(label)
+                .small()
+                .flex_shrink_0()
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| {
                         this.answer_handoff(id, answer.clone(), cx);
-                    }))
-            };
+                    });
+                })
+        };
         let mut col = v_flex()
             .gap(style::space::HAIRLINE)
             .pt(style::space::HAIRLINE);
@@ -356,7 +337,7 @@ impl ConversationView {
         match &step.reason {
             Some(HandoffReason::Conflict { obligations }) => {
                 for obligation in obligations {
-                    let text = match self.data.cited.get(obligation) {
+                    let text = match cited.get(obligation) {
                         Some(body) => format!("[{}] {body}", short_id(*obligation)),
                         None => format!("[{}] (no longer exists)", short_id(*obligation)),
                     };
@@ -374,7 +355,6 @@ impl ConversationView {
                                 format!("plan-step-keep-{id}-{obligation}"),
                                 "Keep",
                                 HandoffAnswer::Keep(*obligation),
-                                cx,
                             )),
                     );
                 }
@@ -395,7 +375,6 @@ impl ConversationView {
                                 format!("plan-step-choose-{id}-{ix}"),
                                 "Choose",
                                 HandoffAnswer::Choose(ix),
-                                cx,
                             )),
                     );
                 }
@@ -421,7 +400,6 @@ impl ConversationView {
                     format!("plan-step-retry-{id}"),
                     "Retry",
                     HandoffAnswer::Retry,
-                    cx,
                 )));
             }
             // Handed back before reasons existed: the note is all there is,
@@ -431,101 +409,51 @@ impl ConversationView {
         Some(col.into_any_element())
     }
 
-    /// A plan step's status badge: click it for the dropdown of the others.
+    /// A review finding's status chip: click it for the dropdown of the
+    /// answers it can be given.
     fn render_status_badge(
         &mut self,
-        step: Uuid,
+        item: Uuid,
         status: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let menu = self
-            .status_menu
-            .filter(|m| m.step == step)
-            .map(|m| self.render_status_menu(m, status, cx));
-        div()
-            .id(ElementId::Name(format!("plan-status-{step}").into()))
-            .relative()
-            .flex_shrink_0()
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    if this.status_menu.take().is_none_or(|m| m.step != step) {
-                        this.open_status_menu(step, cx);
+        let menu = self.status_menu.filter(|m| m.is_on(item));
+        let view = cx.weak_entity();
+        let toggle = {
+            let view = view.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| {
+                    if !this.status_menu.take().is_some_and(|m| m.is_on(item)) {
+                        this.open_status_menu(item, cx);
                     }
                     cx.notify();
-                }),
-            )
-            .child({
-                let badge = style::badge(h_flex())
-                    .items_center()
-                    .gap(style::space::HAIRLINE)
-                    .child(status.to_string())
-                    .child(Icon::new(IconName::ChevronDown).xsmall());
-                if status == STATUS_FAILED {
-                    style::text_error(badge)
-                } else {
-                    badge
-                }
+                });
             })
-            .when_some(menu, |el, menu| {
-                el.child(
-                    deferred(
-                        anchored()
-                            .anchor(Anchor::TopLeft)
-                            .snap_to_window_with_margin(px(8.))
-                            .child(div().occlude().mt_1().child(menu)),
-                    )
-                    .with_priority(1),
-                )
+        };
+        let choose = {
+            let view = view.clone();
+            Rc::new(move |status: &'static str, _: &mut Window, cx: &mut App| {
+                let _ = view.update(cx, |this, cx| this.choose_status(item, status, cx));
             })
-            .into_any_element()
-    }
-
-    fn render_status_menu(
-        &self,
-        menu: StatusMenu,
-        current: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let step = menu.step;
-        let mut list = style::floating_panel(v_flex())
-            .id("plan-status-menu")
-            .min_w(px(160.))
-            .gap(style::space::HAIRLINE)
-            .px(style::space::INLINE)
-            .py(style::space::INLINE)
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+        };
+        let dismiss = Rc::new(move |_: &mut Window, cx: &mut App| {
+            let _ = view.update(cx, |this, cx| {
                 this.status_menu = None;
                 cx.notify();
-            }));
-        for (ix, status) in menu.options.iter().copied().enumerate() {
-            list = list.child(
-                style::menu_item(h_flex(), ix == menu.highlighted)
-                    .id(ElementId::Name(format!("plan-status-{status}").into()))
-                    .w_full()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.choose_status(step, status, cx);
-                        }),
-                    )
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .flex_shrink_0()
-                            .when(status == current, |el| {
-                                el.child(Icon::new(IconName::Check).xsmall())
-                            }),
-                    )
-                    .child(div().flex_1().child(status)),
-            );
-        }
-        list.into_any_element()
+            });
+        });
+        status_chip(
+            format!("finding-status-{item}"),
+            status,
+            finding_tone(status),
+            menu,
+            StatusMenuHandlers {
+                toggle,
+                choose,
+                dismiss,
+            },
+            cx,
+        )
     }
 
     /// The side pane for whichever protocol runs the open conversation: the
@@ -646,16 +574,6 @@ impl ConversationView {
             .into_any_element()
     }
 
-    /// The plan steps the status filter lets through, in plan order.
-    pub(super) fn shown_plan(&self) -> Vec<PlanStep> {
-        self.data
-            .plan
-            .iter()
-            .filter(|step| self.status_filter.admits(&step.status))
-            .cloned()
-            .collect()
-    }
-
     /// The review findings the status filter lets through, in the order they
     /// were recorded.
     pub(super) fn shown_findings(&self) -> Vec<ReviewFinding> {
@@ -667,8 +585,8 @@ impl ConversationView {
             .collect()
     }
 
-    /// Show or hide plan steps, or findings, in `status`. With no status
-    /// toggled on, every row shows.
+    /// Show or hide review findings in `status`. With no status toggled on,
+    /// every row shows.
     pub(super) fn toggle_status_filter(&mut self, status: &str, cx: &mut Context<Self>) {
         self.status_filter.toggle(status);
         // The rows under the highlight have changed; start it over.
@@ -677,37 +595,25 @@ impl ConversationView {
         cx.notify();
     }
 
-    /// Rows Up/Down move among in the plan pane, or the review pane.
+    /// Rows Up/Down move among in the review pane. The plan pane hosts a
+    /// list with its own cursor.
     fn side_row_count(&self) -> usize {
         match self.side_list() {
             SideList::Findings => self.shown_findings().len(),
-            SideList::Plan => self.shown_plan().len() + self.side_files.len(),
             _ => 0,
         }
     }
 
-    /// One toggle per status the pane has a row in — a plan step, or a
-    /// review finding — with its count, plus "All" to clear them.
+    /// One toggle per status the review pane has a finding in, with its
+    /// count, plus "All" to clear them. The plan pane's own filter belongs to
+    /// the list it hosts.
     fn render_status_filter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (id, counts) = if self.side_list() == SideList::Findings {
-            (
-                "finding",
-                status_counts(
-                    &FINDING_STATUSES,
-                    self.data.findings.iter().map(|f| f.status.as_str()),
-                ),
-            )
-        } else {
-            (
-                "plan",
-                status_counts(
-                    &PLAN_STEP_STATUSES,
-                    self.data.plan.iter().map(|s| s.status.as_str()),
-                ),
-            )
-        };
+        let counts = status_counts(
+            &FINDING_STATUSES,
+            self.data.findings.iter().map(|f| f.status.as_str()),
+        );
         render_status_filter(
-            id,
+            "finding",
             &counts,
             &self.status_filter,
             |this: &mut Self, status, _, cx| match status {
@@ -751,7 +657,7 @@ impl ConversationView {
         )
     }
 
-    /// Move the plan pane's highlight; entering an unhighlighted
+    /// Move the review pane's highlight; entering an unhighlighted
     /// pane lands on its first row.
     pub(super) fn move_side_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
         let count = self.side_row_count();
@@ -769,11 +675,19 @@ impl ConversationView {
         }
     }
 
-    /// Plan steps first — the same state the protocol's done-check reads — then
-    /// the worktree's changed files. Verification shows the same rows, counted
-    /// by verdict; the steps it fails go back to implementation, not to the
-    /// user, so it offers no answers to a step left for the user.
+    /// The plan the conversation is working: the real plan-steps panel,
+    /// hosted here, so a step affords the same editing, creation, reordering
+    /// and deletion as it does on the node tree, and its status chip opens
+    /// the same dropdown. Around it sit what only a conversation knows — the
+    /// test run its agent recorded, what verification ruled on the node's
+    /// obligations, and the files its worktree has changed. Verification
+    /// fails steps back to implementation, not to the user, so it offers no
+    /// answers to a step left for the user.
     fn render_plan_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(node) = self.data.focus_node else {
+            return self
+                .render_empty_pane("Implementation", "This conversation is not about a node.");
+        };
         let active = self.pane == Pane::ChangeSet;
         // Nothing until the agent records a run: before that there is no
         // test status to show.
@@ -786,8 +700,6 @@ impl ConversationView {
             .filter(|step| step.status == STATUS_IMPLEMENTED || step.status == STATUS_VERIFIED)
             .count();
         let total = self.data.plan.len();
-        let shown_steps = self.shown_plan();
-        let shown = shown_steps.len();
         let waiting = self
             .data
             .plan
@@ -807,105 +719,38 @@ impl ConversationView {
             .iter()
             .filter(|step| step.status == STATUS_VERIFIED)
             .count();
-        let count = self.side_row_count();
-        let cursor = self.side_cursor.filter(|ix| *ix < count);
-        let lit = |row: usize| active && cursor == Some(row);
-
-        // The scroll container's children, as `scroll_to_item` counts them:
-        // plan rows (or the one "no plan steps" line), then the "Changed
-        // files" heading, then file rows.
-        let child_of = |row: usize, plan: usize| {
-            if row < plan {
-                row
-            } else {
-                plan.max(1) + 1 + (row - plan)
-            }
-        };
-        if std::mem::take(&mut self.side_scroll_pending) {
-            if let Some(row) = cursor {
-                self.side_scroll.scroll_to_item(child_of(row, shown));
-            }
-        }
-
-        // A menu left open on a step that has since gone closes.
-        if self
-            .status_menu
-            .is_some_and(|m| !self.data.plan.iter().any(|s| s.id == m.step))
-        {
-            self.status_menu = None;
-        }
 
         let requirements = self.render_requirements(verifying, window, cx);
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (n, step) in shown_steps.into_iter().enumerate() {
-            let id = step.id;
-            let badge = self.render_status_badge(id, &step.status, cx);
-            let handoff = if verifying {
-                self.render_failure(&step, window, cx)
-            } else {
-                self.render_handoff(&step, window, cx)
-                    .or_else(|| self.render_failure(&step, window, cx))
-            };
-            rows.push(
-                h_flex()
-                    .when(lit(n), style::highlighted)
-                    .gap(style::space::INLINE)
-                    .px(style::space::RELATED)
-                    .py(style::space::INLINE)
-                    .items_start()
-                    .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(badge))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(selectable_text(
-                                format!("plan-step-{id}"),
-                                step.body,
-                                window,
-                                cx,
-                            ))
-                            .children(handoff),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if rows.is_empty() {
-            rows.push(
-                style::empty_message(div())
-                    .p(style::space::INSET)
-                    .child(if total == 0 {
-                        "This node has no plan steps."
-                    } else {
-                        "No plan steps in the chosen statuses."
-                    })
-                    .into_any_element(),
-            );
-        }
+        let files = self.render_changed_files(window, cx);
 
-        if !self.side_files.is_empty() {
-            rows.push(
-                style::text_dense_muted(div())
-                    .px(style::space::RELATED)
-                    .pt(style::space::RELATED)
-                    .child("Changed files")
-                    .into_any_element(),
-            );
-            for (i, line) in self.side_files.iter().enumerate() {
-                rows.push(
-                    div()
-                        .when(lit(shown + i), style::highlighted)
-                        .px(style::space::RELATED)
-                        .py(style::space::INLINE)
-                        .child(selectable_text(
-                            format!("worktree-{line}"),
-                            line.clone(),
-                            window,
-                            cx,
-                        ))
-                        .into_any_element(),
-                );
-            }
-        }
+        // A user edit here is the user's own action on the conversation, so
+        // it joins the change set and can be reversed; before the first
+        // message there is no conversation to record it in.
+        let router: MutationRouter = match self.conversation_id {
+            Some(conversation_id) => Rc::new(move |mutation| InterviewCommand::ConversationEdit {
+                conversation_id,
+                mutation,
+            }),
+            None => Rc::new(|mutation| InterviewCommand::Outline {
+                mutation,
+                target: None,
+            }),
+        };
+        let view = cx.weak_entity();
+        let cited = self.data.cited.clone();
+        let title = self.data.title.clone();
+        self.side_plan.update(cx, |list, cx| {
+            list.set_mutation_router(Some(router));
+            list.set_row_detail(Some(Rc::new(move |step, window, cx| {
+                if verifying {
+                    Self::render_failure(step, window, cx)
+                } else {
+                    Self::render_handoff(&view, &cited, step, window, cx)
+                        .or_else(|| Self::render_failure(step, window, cx))
+                }
+            })));
+            list.retarget(node, &title, false, window, cx);
+        });
 
         v_flex()
             .size_full()
@@ -961,18 +806,57 @@ impl ConversationView {
                     }),
             )
             .children(requirements)
-            .children(self.render_status_filter(cx))
-            .child(
-                v_flex()
-                    .id("plan-pane")
-                    .track_scroll(&self.side_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .pb(style::space::RELATED)
-                    .children(rows),
-            )
+            .child(div().flex_1().min_h_0().child(self.side_plan.clone()))
+            .children(files)
             .into_any_element()
+    }
+
+    /// The files the conversation's worktree has changed: its own section
+    /// under the plan, since they are about the run, not about a step.
+    fn render_changed_files(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.side_files.is_empty() {
+            return None;
+        }
+        let rows = self.side_files.iter().map(|line| {
+            div()
+                .px(style::space::RELATED)
+                .py(style::space::INLINE)
+                .child(selectable_text(
+                    format!("worktree-{line}"),
+                    line.clone(),
+                    window,
+                    cx,
+                ))
+                .into_any_element()
+        });
+        let rows: Vec<AnyElement> = rows.collect();
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .max_h(relative(0.3))
+                .min_h_0()
+                .border_t_1()
+                .border_color(style::color::divider())
+                .child(
+                    style::text_dense_muted(div())
+                        .px(style::space::RELATED)
+                        .pt(style::space::RELATED)
+                        .child("Changed files"),
+                )
+                .child(
+                    v_flex()
+                        .id("changed-files")
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .pb(style::space::RELATED)
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The node's review findings in the order they were recorded — the
@@ -994,7 +878,7 @@ impl ConversationView {
         // A menu left open on a finding that has since gone closes.
         if self
             .status_menu
-            .is_some_and(|m| !self.data.findings.iter().any(|f| f.id == m.step))
+            .is_some_and(|m| !self.data.findings.iter().any(|f| f.id == m.item))
         {
             self.status_menu = None;
         }
@@ -1232,5 +1116,17 @@ fn response_label(status: &str) -> &'static str {
         FINDING_OUT_OF_SCOPE => "Out of scope",
         FINDING_DECLINED => "Declined",
         _ => "Note",
+    }
+}
+
+/// What a review finding's status says at a glance. An open finding is still
+/// asking for an answer, so it reads as blocking; a rejected one is the
+/// user's answer standing against the agent's, so it is neither.
+fn finding_tone(status: &str) -> style::StatusTone {
+    match status {
+        FINDING_OPEN => style::StatusTone::Blocked,
+        FINDING_FIXED => style::StatusTone::Done,
+        FINDING_REJECTED => style::StatusTone::Active,
+        _ => style::StatusTone::Idle,
     }
 }

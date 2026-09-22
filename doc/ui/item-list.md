@@ -22,9 +22,9 @@ Every list feature the app needs exists somewhere, and no list has all of them.
 |---|---|---|---|---|---|---|
 | Obligations panel (`views/obligations/`) | 3 levels | full | single | inline | — | — |
 | Conversation side pane, obligations (`conversation/side_pane.rs:605`) | — | — | — | — | — | — |
-| Conversation side pane, plan / findings (`side_pane.rs:832`, `:1039`) | — | cursor | — | status only | — | — |
+| Conversation side pane, findings (`side_pane.rs`) | — | cursor | — | status only | — | — |
 | Change set (`conversation/change_set.rs`) | 1 level | cursor | multi | inline | — | — |
-| Plan steps (`views/plan_steps/`) | — | full | single | inline | — | — |
+| Plan steps, panel and conversation side pane (`views/plan_steps/`) | — | full | single | inline | — | — |
 | Command history, agent transcripts, database | — | up/down | single | — | — | — |
 
 The same obligation therefore looks and behaves differently depending on which
@@ -181,10 +181,14 @@ the component, so no view sets a heading's colour, weight or indent itself.
    this is the inconsistency that started this, and step 2 is where **The
    rule** is first actually true of something. The standing each side-pane row
    carried moved onto the shared obligation row, so the node tree shows it too.
-3. Move plan steps onto the component, then have the side pane's plan list
-   host that view (the status dropdown becomes a row action), then the
-   findings list, then the change set, which brings multi-select and row
-   buttons in.
+3. **Done.** Move plan steps onto the component, and have the side pane's
+   plan list host that view. The status dropdown became a row action — the
+   chip on the shared plan-step row opens it, in both lists, and `t` opens it
+   from the keyboard where the panel used to cycle status blindly. What only a
+   conversation knows about a step — a handoff's answers, what verification
+   found — reaches the row through a host hook rather than moving into the
+   shared row. Next the findings list, then the change set, which brings
+   multi-select and row buttons in.
 4. Move over command history, agent transcripts, and the database view.
 
 Each step is complete on its own; the list of views above is the checklist.

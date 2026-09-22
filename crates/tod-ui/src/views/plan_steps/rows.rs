@@ -6,7 +6,7 @@
 
 use crate::ui::item_list::{ItemListEvent, ItemListRow, ItemRowState};
 use crate::views::rows::{
-    PlanStepRowEvent, PlanStepRowProps, RowHost, RowOptions, op_icon, plan_step_row,
+    PlanStepRowEvent, PlanStepRowProps, RowHost, RowOptions, StatusMenu, op_icon, plan_step_row,
 };
 use gpui::{AnyElement, App, Entity, Window};
 use gpui_component::input::TextareaState;
@@ -41,6 +41,14 @@ pub enum ListAction {
     StartEdit {
         step_id: Uuid,
     },
+    ToggleStatusMenu {
+        step_id: Uuid,
+    },
+    ChooseStatus {
+        step_id: Uuid,
+        status: &'static str,
+    },
+    DismissStatusMenu,
     /// Something the list can report but this one never does.
     Ignored,
 }
@@ -50,6 +58,11 @@ impl From<PlanStepRowEvent> for ListAction {
         match event {
             PlanStepRowEvent::Select { row_ix } => Self::Select { row_ix },
             PlanStepRowEvent::StartEdit { step_id } => Self::StartEdit { step_id },
+            PlanStepRowEvent::ToggleStatusMenu { step_id } => Self::ToggleStatusMenu { step_id },
+            PlanStepRowEvent::ChooseStatus { step_id, status } => {
+                Self::ChooseStatus { step_id, status }
+            }
+            PlanStepRowEvent::DismissStatusMenu => Self::DismissStatusMenu,
         }
     }
 }
@@ -65,11 +78,15 @@ impl From<ItemListEvent> for ListAction {
     }
 }
 
-/// Render one plan step for the item list.
+/// Render one plan step for the item list. `menu` is the open status
+/// dropdown, whichever step it is on, and `detail` what the host has to add
+/// under this step's body.
 pub fn render_plan_step(
     item: &PlanStepItem,
     state: ItemRowState<'_>,
     editor: &Entity<TextareaState>,
+    menu: Option<StatusMenu>,
+    detail: Option<AnyElement>,
     host: &RowHost<ListAction>,
     window: &mut Window,
     cx: &mut App,
@@ -78,6 +95,7 @@ pub fn render_plan_step(
         leading: item
             .marker
             .map(|op| op_icon(("plan-step-op", state.row_ix), op)),
+        detail,
         struck: item.struck,
         ..RowOptions::default()
     };
@@ -88,6 +106,7 @@ pub fn render_plan_step(
         row_ix: state.row_ix,
         highlighted: state.highlighted,
         editor: Some(editor).filter(|_| state.editing),
+        status_menu: menu.filter(|m| m.is_on(item.step.id)),
     };
     plan_step_row(props, host, opts, window, cx)
 }
