@@ -50,13 +50,14 @@ actions!(
 pub struct ItemListKeys {
     /// Enter, F2, Ctrl+Enter.
     pub editing: bool,
-    /// `n`, Alt+Enter, Shift+Enter, Backspace/Delete.
+    /// `n`, Alt+Enter, Backspace/Delete.
     pub creation: bool,
     /// Cmd/Ctrl+Up/Down.
     pub reordering: bool,
     /// Space.
     pub marking: bool,
-    /// `s`.
+    /// `s`, Shift+Enter. Creating *into* a group is grouping, not creation:
+    /// a list with no headings has nowhere to put the new item.
     pub grouping: bool,
     /// Ctrl+F, and Space inside the field.
     pub search: bool,
@@ -136,12 +137,7 @@ pub fn bind_item_list_keys(cx: &mut App, surface: &str, keys: ItemListKeys) {
         bindings.extend([
             KeyBinding::new("n", ItemListCreateBelow, context),
             KeyBinding::new("alt-enter", ItemListCreateAbove, context),
-            KeyBinding::new("shift-enter", ItemListCreateChild, context),
-            KeyBinding::new(
-                "shift-enter",
-                ItemListCreateChild,
-                Some(key_context::including_input(surface)),
-            ),
+
             KeyBinding::new("backspace", ItemListDelete, context),
             KeyBinding::new("delete", ItemListDelete, context),
         ]);
@@ -156,7 +152,17 @@ pub fn bind_item_list_keys(cx: &mut App, surface: &str, keys: ItemListKeys) {
         bindings.push(KeyBinding::new("space", ItemListToggleMark, context));
     }
     if keys.grouping {
-        bindings.push(KeyBinding::new("s", ItemListAddGroup, context));
+        bindings.extend([
+            KeyBinding::new("s", ItemListAddGroup, context),
+            KeyBinding::new("shift-enter", ItemListCreateChild, context),
+            // Shift+Enter also lands from inside the item editor, which
+            // commits and opens the next one in the same group.
+            KeyBinding::new(
+                "shift-enter",
+                ItemListCreateChild,
+                Some(key_context::including_input(surface)),
+            ),
+        ]);
     }
     if keys.search {
         bindings.extend([
