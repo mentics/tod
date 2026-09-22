@@ -32,9 +32,7 @@ pub use finding_row::{
 };
 pub use node_row::{NodeRowEvent, NodeRowProps, node_row};
 pub use obligation_row::{ObligationRowEvent, ObligationRowProps, obligation_row};
-pub use plan_step_row::{
-    PlanStepRowEvent, PlanStepRowProps, plan_step_columns, plan_step_row,
-};
+pub use plan_step_row::{PlanStepRowEvent, PlanStepRowProps, plan_step_columns, plan_step_row};
 pub use status_menu::StatusMenu;
 
 /// Where a row sends what the user did: an action queue plus a callback
@@ -316,12 +314,9 @@ fn row_tail(
             reason,
         ));
     }
-    if let Some(buttons) = row_action_buttons(
-        key,
-        group,
-        highlighted,
-        std::mem::take(&mut opts.actions),
-    ) {
+    if let Some(buttons) =
+        row_action_buttons(key, group, highlighted, std::mem::take(&mut opts.actions))
+    {
         tail.push(buttons);
     }
     if let Some(context) = opts.trailing_context.take() {

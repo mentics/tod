@@ -2,6 +2,8 @@
 
 mod rows;
 
+pub use rows::DRAG_LIST;
+
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::item_list::keyboard::{
@@ -12,18 +14,13 @@ use crate::ui::item_list::keyboard::{
     ItemListUp,
 };
 use crate::ui::item_list::{
-    CollapseStep, GroupSpec, ItemList, ItemListKeys, ItemListRow, bind_item_list_keys,
+    CollapseStep, GroupSpec, ItemDropped, ItemList, ItemListKeys, ItemListRow, bind_item_list_keys,
     bind_single_line_commit, search,
 };
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::views::rows::{RowAction, RowHost};
-use rows::{
-    ListAction, NO_SECTION, ObGroup, ObRow, ObligationItem, SECTION_EDIT_TAG, group_row_key,
-    kind_label, new_section_row_key, obligation_section, phase_label, phase_row_key,
-    section_row_key, static_kind,
-};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -33,17 +30,70 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use gpui_component::{ActiveTheme, StyledExt, h_flex, v_flex};
+use rows::{
+    ListAction, NO_SECTION, ObGroup, ObRow, ObligationItem, SECTION_EDIT_TAG, group_row_key,
+    kind_label, new_section_row_key, obligation_section, phase_label, phase_row_key,
+    section_row_key, static_kind,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tod_store::conversation::{Focus, NetOp};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{OBLIGATION_PHASES, PHASE_REQUIREMENTS, PHASE_UNKNOWN};
+use tod_store::outline::repos::PlanStepRepo;
 use tod_store::outline::{
     KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation, OutlineMutation, ReorderDirection,
 };
-use tod_store::outline::repos::PlanStepRepo;
 use tod_store::verification::{LISTING_STATUSES, STANDING_NOT_PLANNED, VerdictRepo};
 use uuid::Uuid;
+
+/// Which of the places a dragged obligation could land the panel allows.
+///
+/// An obligation moves freely within its kind — to another section, or to
+/// another place in the order — but never into a different kind or phase. Its
+/// kind is what the obligation *is* (a requirement is not a constraint), and
+/// there is no mutation that changes one; its phase is where the lifecycle put
+/// it. Dragging says where a thing sits, not what it is.
+fn drop_allowed(dropped: &ItemDropped) -> bool {
+    // The outer two headings are the phase and the kind; the section is the
+    // third, and crossing that is the move this allows.
+    let outer = |chain: &[String]| chain.iter().take(2).cloned().collect::<Vec<_>>();
+    outer(&dropped.from.group) == outer(&dropped.group)
+}
+
+/// Where a dragged obligation lands in its kind's order, counting from 0 with
+/// the obligation itself already taken out — which is what
+/// [`OutlineMutation::PlaceObligation`] counts in, one higher.
+///
+/// The list reports the row a drop landed ahead of rather than an index,
+/// because the order runs across the whole kind while the rows are grouped by
+/// section inside it — an index counted off the rows would be an index into
+/// the wrong list. `before` of `None` is the end of the *target section*, which
+/// is the place just past its last obligation, not the end of the kind.
+fn landing_index(
+    items: &[NodeObligation],
+    moved: &NodeObligation,
+    kind: &str,
+    section: &str,
+    before: Option<&str>,
+) -> usize {
+    let order: Vec<&NodeObligation> = items
+        .iter()
+        .filter(|item| item.kind == kind && item.id != moved.id)
+        .collect();
+    if let Some(before) = before.and_then(|key| Uuid::parse_str(key).ok()) {
+        if let Some(at) = order.iter().position(|item| item.id == before) {
+            return at;
+        }
+    }
+    // Past the section's last obligation. A section with none left, or one
+    // that never had any, puts the row at the end of the kind: the only place
+    // there is nothing to measure against.
+    order
+        .iter()
+        .rposition(|item| obligation_section(item) == section)
+        .map_or(order.len(), |at| at + 1)
+}
 
 const OBLIGATIONS_CONTEXT: &str = "Obligations";
 const INLINE_EDIT_ROWS: usize = 2;
@@ -206,7 +256,8 @@ impl ObligationsView {
             list: ItemList::new()
                 .with_group_editor(section_edit_input.clone(), SECTION_EDIT_TAG)
                 .with_marking()
-                .with_drag(rows::draggable)
+                .with_reorder(DRAG_LIST)
+                .with_drop_filter(drop_allowed)
                 .with_row_actions({
                     let host = host.clone();
                     move |item| rows::obligation_actions(item, &host)
@@ -898,7 +949,8 @@ impl ObligationsView {
             section.to_string()
         };
         self.section_edit_target = Some((phase.to_string(), kind, section.to_string()));
-        self.list.set_cursor_key(Some(section_row_key(phase, kind, section)));
+        self.list
+            .set_cursor_key(Some(section_row_key(phase, kind, section)));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value(&initial, window, cx);
             input.focus(window, cx);
@@ -919,10 +971,10 @@ impl ObligationsView {
         if self.section_edit_target.is_some() {
             self.abandon_section_edit(window, cx);
         }
-        self.list
-            .set_collapsed(group_row_key(phase, kind), false);
+        self.list.set_collapsed(group_row_key(phase, kind), false);
         self.new_section_kind = Some((phase.to_string(), kind));
-        self.list.set_cursor_key(Some(new_section_row_key(phase, kind)));
+        self.list
+            .set_cursor_key(Some(new_section_row_key(phase, kind)));
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -1052,7 +1104,8 @@ impl ObligationsView {
         self.section_edit_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
         });
-        self.list.set_cursor_key(Some(section_row_key(&phase, kind, &new_name)));
+        self.list
+            .set_cursor_key(Some(section_row_key(&phase, kind, &new_name)));
         self.reload(window, cx);
         self.focus_list(window, cx);
         true
@@ -1079,8 +1132,7 @@ impl ObligationsView {
         let Some(node_id) = self.node_id else {
             return;
         };
-        self.list
-            .set_collapsed(group_row_key(phase, kind), false);
+        self.list.set_collapsed(group_row_key(phase, kind), false);
         self.list
             .set_collapsed(section_row_key(phase, kind, NO_SECTION), false);
         let obligation_id = Uuid::new_v4();
@@ -1227,9 +1279,7 @@ impl ObligationsView {
         for id in &ids {
             if let Err(err) = self
                 .fleet
-                .enqueue_outline(OutlineMutation::DeleteObligation {
-                    obligation_id: *id,
-                })
+                .enqueue_outline(OutlineMutation::DeleteObligation { obligation_id: *id })
             {
                 crate::ui::toast::error_toast(window, cx, format!("Delete failed: {err}"));
                 return;
@@ -1269,6 +1319,59 @@ impl ObligationsView {
             .or(siblings.last())
             .map(|o| o.id.to_string())
             .or_else(|| Some(section_row_key(&phase, &kind, &section)))
+    }
+
+    /// Carry out a dragged row: the obligation lands ahead of the one it was
+    /// dropped on, in the section it was dropped into.
+    ///
+    /// Two mutations at most, and the section one first: an obligation's order
+    /// is kept across the whole of its kind, so where it lands depends on
+    /// which section it is in by then.
+    fn drop_row(&mut self, dropped: ItemDropped, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(id) = Uuid::parse_str(&dropped.from.key) else {
+            return;
+        };
+        let Some(ObGroup::Section { kind, section, .. }) = dropped
+            .group
+            .last()
+            .and_then(|key| self.list.group_payload_for(key))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(moved) = self.items.iter().find(|item| item.id == id).cloned() else {
+            return;
+        };
+        let index = landing_index(
+            &self.items,
+            &moved,
+            kind,
+            &section,
+            dropped.before.as_deref(),
+        );
+        let mut mutations = Vec::new();
+        if obligation_section(&moved) != section {
+            mutations.push(OutlineMutation::UpdateObligationSection {
+                obligation_id: id,
+                section: (section != NO_SECTION).then(|| section.clone()),
+            });
+        }
+        mutations.push(OutlineMutation::PlaceObligation {
+            id,
+            node_id: moved.node_id,
+            // `PlaceObligation` counts from 1; the landing index from 0.
+            ordinal: index as i32 + 1,
+        });
+        for mutation in mutations {
+            if let Err(err) = self.fleet.enqueue_outline(mutation) {
+                crate::ui::toast::error_toast(window, cx, format!("Move failed: {err}"));
+                return;
+            }
+        }
+        let _ = self.fleet.writer().flush();
+        self.list.set_cursor_key(Some(id.to_string()));
+        self.reload(window, cx);
+        self.focus_list(window, cx);
     }
 
     fn move_selected(
@@ -1327,6 +1430,9 @@ impl ObligationsView {
                 ListAction::ToggleMark { row_ix } => {
                     self.list.toggle_mark_at(row_ix);
                     cx.notify();
+                }
+                ListAction::Drop(dropped) => {
+                    self.drop_row(dropped, window, cx);
                 }
                 ListAction::StartEdit { obligation_id } => {
                     self.start_inline_edit(obligation_id, window, cx);
@@ -1503,7 +1609,12 @@ impl ObligationsView {
         self.delete_selected(window, cx);
     }
 
-    fn on_add_section(&mut self, _: &ItemListAddGroup, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_add_section(
+        &mut self,
+        _: &ItemListAddGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_editing() {
             return;
         }
@@ -1782,6 +1893,7 @@ impl Render for ObligationsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::item_list::ItemDrag;
     use crate::views::rows::fixture::Fixture;
     use gpui::{TestAppContext, VisualTestContext};
     use gpui_component::Root;
@@ -1789,6 +1901,129 @@ mod tests {
     use std::rc::Rc;
 
     type Events = Rc<RefCell<Vec<ObligationsEvent>>>;
+
+    /// Two sections of one kind, in the order their ordinals put them.
+    fn kind_items() -> Vec<NodeObligation> {
+        let node_id = Uuid::new_v4();
+        ["Offline", "Offline", "Sync"]
+            .into_iter()
+            .enumerate()
+            .map(|(ix, section)| NodeObligation {
+                id: Uuid::new_v4(),
+                node_id,
+                kind: KIND_REQUIREMENT.to_string(),
+                ordinal: ix as i32 + 1,
+                section: Some(section.to_string()),
+                body: format!("ob {ix}"),
+                phase: "requirements".to_string(),
+                visual_design_path: None,
+            })
+            .collect()
+    }
+
+    fn drag_from(group: &[&str], key: &str) -> ItemDrag {
+        ItemDrag {
+            list: DRAG_LIST.into(),
+            key: key.to_string(),
+            group: group.iter().map(|part| part.to_string()).collect(),
+            label: "".into(),
+        }
+    }
+
+    #[test]
+    fn an_obligation_drags_between_sections_but_not_between_kinds() {
+        let from = ["phase:requirements", "group:requirements:requirement"];
+        let same_kind = |section: &str| ItemDropped {
+            from: drag_from(&from, "id"),
+            group: vec![
+                from[0].to_string(),
+                from[1].to_string(),
+                section.to_string(),
+            ],
+            before: None,
+        };
+        assert!(drop_allowed(&same_kind(
+            "section:requirements:requirement:Sync"
+        )));
+
+        // The kind heading differs: a requirement is not a constraint, and
+        // there is no mutation that would make it one.
+        let other_kind = ItemDropped {
+            from: drag_from(&from, "id"),
+            group: vec![
+                from[0].to_string(),
+                "group:requirements:constraint".to_string(),
+            ],
+            before: None,
+        };
+        assert!(!drop_allowed(&other_kind));
+
+        // So does the phase heading.
+        let other_phase = ItemDropped {
+            from: drag_from(&from, "id"),
+            group: vec!["phase:design".to_string(), from[1].to_string()],
+            before: None,
+        };
+        assert!(!drop_allowed(&other_phase));
+    }
+
+    #[test]
+    fn a_row_lands_where_the_one_it_was_dropped_on_is() {
+        let items = kind_items();
+        let moved = items[2].clone();
+        // Dropped on the first row: it takes that place.
+        assert_eq!(
+            landing_index(
+                &items,
+                &moved,
+                KIND_REQUIREMENT,
+                "Offline",
+                Some(&items[0].id.to_string())
+            ),
+            0
+        );
+        // Dropped on the second: one past the first, with itself already out
+        // of the order.
+        assert_eq!(
+            landing_index(
+                &items,
+                &moved,
+                KIND_REQUIREMENT,
+                "Offline",
+                Some(&items[1].id.to_string())
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_section_is_past_that_sections_last_row_not_the_kinds() {
+        let items = kind_items();
+        // The Sync row moved to the end of Offline: past Offline's last, which
+        // is index 2 of the kind, not the end of the kind.
+        let moved = items[2].clone();
+        assert_eq!(
+            landing_index(&items, &moved, KIND_REQUIREMENT, "Offline", None),
+            2
+        );
+        // An Offline row moved to the end of Sync: past Sync's last. With the
+        // moved row out of the order, Sync's only row sits at index 1.
+        let moved = items[0].clone();
+        assert_eq!(
+            landing_index(&items, &moved, KIND_REQUIREMENT, "Sync", None),
+            2
+        );
+    }
+
+    #[test]
+    fn a_section_with_nothing_in_it_puts_the_row_at_the_end_of_the_kind() {
+        let items = kind_items();
+        let moved = items[0].clone();
+        assert_eq!(
+            landing_index(&items, &moved, KIND_REQUIREMENT, "Brand new", None),
+            2
+        );
+    }
 
     fn open_view<'a>(
         fixture: &Fixture,
@@ -1839,10 +2074,14 @@ mod tests {
             view.read_with(cx, |v, _| v.list.items().count())
         };
         assert_eq!(items(&view, cx), 3);
-        view.update_in(cx, |v, window, cx| v.set_filter(Some("planned"), window, cx));
+        view.update_in(cx, |v, window, cx| {
+            v.set_filter(Some("planned"), window, cx)
+        });
         draw(cx);
         assert_eq!(items(&view, cx), 0);
-        view.update_in(cx, |v, window, cx| v.set_filter(Some("not planned"), window, cx));
+        view.update_in(cx, |v, window, cx| {
+            v.set_filter(Some("not planned"), window, cx)
+        });
         assert_eq!(items(&view, cx), 3);
         view.update_in(cx, |v, window, cx| v.set_filter(None, window, cx));
         assert_eq!(items(&view, cx), 3);

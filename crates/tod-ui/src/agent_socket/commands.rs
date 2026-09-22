@@ -1,3 +1,4 @@
+use crate::agent_socket::capture::DragStep;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,17 @@ pub enum Command {
         y: f32,
         /// The right button, for a row's context menu (`rclick`).
         right: bool,
+    },
+    /// Press on one point, move to another, release: what reorders a list row.
+    Drag {
+        from: (f32, f32),
+        to: (f32, f32),
+    },
+    /// One step of a drag held open, for looking at the UI mid-gesture.
+    DragStep {
+        step: DragStep,
+        x: f32,
+        y: f32,
     },
     Shot {
         path: PathBuf,
@@ -69,12 +81,8 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
             })
         }
         "click" | "rclick" => {
-            let x = parts
-                .next()
-                .ok_or_else(|| format!("{verb} requires x y"))?;
-            let y = parts
-                .next()
-                .ok_or_else(|| format!("{verb} requires x y"))?;
+            let x = parts.next().ok_or_else(|| format!("{verb} requires x y"))?;
+            let y = parts.next().ok_or_else(|| format!("{verb} requires x y"))?;
             if parts.next().is_some() {
                 return Err(format!("{verb} takes exactly two numbers"));
             }
@@ -82,6 +90,37 @@ pub fn parse_line(line: &str) -> Result<Command, String> {
                 x: parse_coord(x, "x")?,
                 y: parse_coord(y, "y")?,
                 right: verb == "rclick",
+            })
+        }
+        "drag" => {
+            let mut coord = |name: &str| {
+                parts
+                    .next()
+                    .ok_or_else(|| "drag requires x1 y1 x2 y2".to_string())
+                    .and_then(|value| parse_coord(value, name))
+            };
+            let from = (coord("x1")?, coord("y1")?);
+            let to = (coord("x2")?, coord("y2")?);
+            if parts.next().is_some() {
+                return Err("drag takes exactly four numbers".into());
+            }
+            Ok(Command::Drag { from, to })
+        }
+        "press" | "moveto" | "release" => {
+            let x = parts.next().ok_or_else(|| format!("{verb} requires x y"))?;
+            let y = parts.next().ok_or_else(|| format!("{verb} requires x y"))?;
+            if parts.next().is_some() {
+                return Err(format!("{verb} takes exactly two numbers"));
+            }
+            let step = match verb {
+                "press" => DragStep::Press,
+                "moveto" => DragStep::Move,
+                _ => DragStep::Release,
+            };
+            Ok(Command::DragStep {
+                step,
+                x: parse_coord(x, "x")?,
+                y: parse_coord(y, "y")?,
             })
         }
         "shot" => {
@@ -205,6 +244,16 @@ mod tests {
             _ => panic!(),
         }
         assert!(parse_line("rclick 10").is_err());
+        let c = parse_line("drag 10 20 30 44").unwrap();
+        match c {
+            Command::Drag { from, to } => {
+                assert_eq!(from, (10.0, 20.0));
+                assert_eq!(to, (30.0, 44.0));
+            }
+            _ => panic!(),
+        }
+        assert!(parse_line("drag 10 20 30").is_err());
+        assert!(parse_line("drag 10 20 30 44 50").is_err());
         let c = parse_line("shot out.png 0 80 640 400").unwrap();
         match c {
             Command::Shot { path, crop } => {

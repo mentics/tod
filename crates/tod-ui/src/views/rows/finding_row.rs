@@ -138,7 +138,8 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
         cx,
     );
 
-    let mut body = column_cell(columns, COLUMN_FINDING, v_flex()).gap(style::space::HAIRLINE)
+    let mut body = column_cell(columns, COLUMN_FINDING, v_flex())
+        .gap(style::space::HAIRLINE)
         .child(
             div()
                 .min_w_0()
@@ -194,7 +195,11 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             select_host.push(FindingRowEvent::Select { row_ix }.into(), cx);
         });
-    let row = if hoverable { style::hover_row(row) } else { row };
+    let row = if hoverable {
+        style::hover_row(row)
+    } else {
+        row
+    };
     row.when(highlighted, style::highlighted)
         .children(opts.leading.take())
         .child(column_cell(columns, COLUMN_SEVERITY, h_flex()).child(severity))

@@ -23,15 +23,15 @@ use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::tag::Tag;
 use gpui_component::{ActiveTheme, Disableable, Selectable, Sizable, StyledExt, h_flex, v_flex};
 use std::collections::HashSet;
-use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use std::sync::Arc;
 use tod_core::generator::ConfigFieldType;
+use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
 };
-use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::outline::types::EXTRA_CONTENT_METADATA;
+use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
 use tod_store::{
     AgentLaunchOptions, AgentPlatform, AgentRole, CredentialStore, efforts_for, models_for,
     parse_platform, platform_storage, resolve_linear_api_key,
@@ -226,11 +226,7 @@ impl GeneratorConfigField {
             tod_core::generator::ConfigFieldType::Text
             | tod_core::generator::ConfigFieldType::TextArea => {
                 let text = self.text_value(cx);
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(text)
-                }
+                if text.is_empty() { None } else { Some(text) }
             }
             tod_core::generator::ConfigFieldType::Boolean => Some(self.toggle.to_string()),
             tod_core::generator::ConfigFieldType::Select { .. } => self.choice.clone(),
@@ -529,9 +525,12 @@ impl TaskEditView {
                 this.commit_tag_draft(cx);
             }
         });
-        let _linear_preset_name_subscription = cx.subscribe(&linear_preset_name_input, |_this: &mut TaskEditView, _, _event: &InputEvent, _cx| {
-            // Preset name input is handled by explicit actions, not on blur/enter
-        });
+        let _linear_preset_name_subscription = cx.subscribe(
+            &linear_preset_name_input,
+            |_this: &mut TaskEditView, _, _event: &InputEvent, _cx| {
+                // Preset name input is handled by explicit actions, not on blur/enter
+            },
+        );
         Self {
             fleet,
             paths,
@@ -857,8 +856,15 @@ impl TaskEditView {
                 inputs.push((TaskEditField::GeneratorField(index), input));
             }
         }
-        if self.generator_fields.iter().any(GeneratorConfigField::is_linear_filters) {
-            inputs.push((TaskEditField::LinearQuery, self.linear_query_input.clone().into()));
+        if self
+            .generator_fields
+            .iter()
+            .any(GeneratorConfigField::is_linear_filters)
+        {
+            inputs.push((
+                TaskEditField::LinearQuery,
+                self.linear_query_input.clone().into(),
+            ));
         }
         inputs
     }
@@ -1697,8 +1703,8 @@ impl TaskEditView {
         }
 
         // Load presets
-        self.linear_presets = tod_integration::load_presets(data_root)
-            .unwrap_or_else(|_| Vec::new());
+        self.linear_presets =
+            tod_integration::load_presets(data_root).unwrap_or_else(|_| Vec::new());
 
         // Check credential status
         let store = CredentialStore::from_data_root(self.fleet.paths().root());
@@ -1735,20 +1741,23 @@ impl TaskEditView {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let result: Result<(), String> = cx.background_executor().spawn(async move {
-                let store = CredentialStore::from_data_root(fleet.paths().root());
-                let Some(api_key) = resolve_linear_api_key(&store) else {
-                    return Err("Linear API key not configured".to_string());
-                };
+            let result: Result<(), String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = CredentialStore::from_data_root(fleet.paths().root());
+                    let Some(api_key) = resolve_linear_api_key(&store) else {
+                        return Err("Linear API key not configured".to_string());
+                    };
 
-                use tod_integration::LinearDataSource;
-                let ds = LinearDataSource::with_data_root(data_root.clone());
+                    use tod_integration::LinearDataSource;
+                    let ds = LinearDataSource::with_data_root(data_root.clone());
 
-                // Fetch fresh introspection and update cache
-                ds.fetch_and_cache_introspection(&api_key)
-                    .map(|_| ())
-                    .map_err(|e| format!("Failed to fetch introspection: {}", e))
-            }).await;
+                    // Fetch fresh introspection and update cache
+                    ds.fetch_and_cache_introspection(&api_key)
+                        .map(|_| ())
+                        .map_err(|e| format!("Failed to fetch introspection: {}", e))
+                })
+                .await;
 
             let _ = this.update(cx, |this, cx| {
                 this.linear_introspection_fetching = false;
@@ -1772,7 +1781,8 @@ impl TaskEditView {
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
     }
 
     /// Copy a preset's filters into the form. The preset itself is left
@@ -1923,7 +1933,11 @@ impl TaskEditView {
 
     /// Why the query does not parse, if it does not.
     fn linear_query_error(&self, cx: &App) -> Option<linear_query::QueryError> {
-        if !self.generator_fields.iter().any(GeneratorConfigField::is_linear_filters) {
+        if !self
+            .generator_fields
+            .iter()
+            .any(GeneratorConfigField::is_linear_filters)
+        {
             return None;
         }
         let fields = linear_query::fields(self.linear_introspection_cache.as_ref());
@@ -2003,14 +2017,21 @@ impl TaskEditView {
         let column = head.rsplit('\n').next().unwrap_or_default().chars().count() as u32;
         self.linear_query_input.update(cx, |input, cx| {
             input.replace_all(query, window, cx);
-            input.set_cursor_position(gpui_component::input::Position::new(row, column), window, cx);
+            input.set_cursor_position(
+                gpui_component::input::Position::new(row, column),
+                window,
+                cx,
+            );
         });
         self.linear_query_dismissed = false;
         self.refresh_linear_query_completion(cx);
     }
 
     fn linear_query_accept(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.linear_query_chosen().filter(|_| self.linear_query_dropdown_open()) {
+        match self
+            .linear_query_chosen()
+            .filter(|_| self.linear_query_dropdown_open())
+        {
             Some(index) => self.accept_linear_query_suggestion(index, window, cx),
             None => self.exit_edit(window, cx),
         }
@@ -2050,7 +2071,10 @@ impl TaskEditView {
         match action {
             LinearPresetAction::SaveAs => {
                 // Check for overwrite
-                let exists = self.linear_presets.iter().any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
+                let exists = self
+                    .linear_presets
+                    .iter()
+                    .any(|p| p.name.to_lowercase() == preset_name.to_lowercase());
                 if exists {
                     // Show confirmation toast for overwrite
                     let view = cx.entity().downgrade();
@@ -2061,15 +2085,25 @@ impl TaskEditView {
                         window,
                         cx,
                         format!("Overwrite '{}'?", preset_name),
-                        format!("A preset named '{}' already exists. Overwrite it?", preset_name),
+                        format!(
+                            "A preset named '{}' already exists. Overwrite it?",
+                            preset_name
+                        ),
                         move |_window, cx| {
                             // User confirmed - save the preset
                             let _ = view.update(cx, |this, _cx| {
                                 let filters = this.linear_filter_config(_cx);
-                                if let Err(e) = tod_integration::save_preset(&data_root_clone, &preset_name_clone, &filters) {
-                                    this.generator_config_error = Some(format!("Failed to save preset: {}", e));
+                                if let Err(e) = tod_integration::save_preset(
+                                    &data_root_clone,
+                                    &preset_name_clone,
+                                    &filters,
+                                ) {
+                                    this.generator_config_error =
+                                        Some(format!("Failed to save preset: {}", e));
                                 } else {
-                                    this.linear_presets = tod_integration::load_presets(&data_root_clone).unwrap_or_default();
+                                    this.linear_presets =
+                                        tod_integration::load_presets(&data_root_clone)
+                                            .unwrap_or_default();
                                     this.linear_selected_preset = Some(preset_name_clone.clone());
                                     this.linear_preset_baseline = Some(filters);
                                 }
@@ -2092,7 +2126,8 @@ impl TaskEditView {
                 if let Err(e) = tod_integration::save_preset(&data_root, &preset_name, &filters) {
                     self.generator_config_error = Some(format!("Failed to save preset: {}", e));
                 } else {
-                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_presets =
+                        tod_integration::load_presets(&data_root).unwrap_or_default();
                     self.linear_selected_preset = Some(preset_name);
                     self.linear_preset_baseline = Some(filters);
                 }
@@ -2107,7 +2142,8 @@ impl TaskEditView {
                 if let Err(e) = tod_integration::rename_preset(&data_root, old_name, &preset_name) {
                     self.generator_config_error = Some(format!("Failed to rename preset: {}", e));
                 } else {
-                    self.linear_presets = tod_integration::load_presets(&data_root).unwrap_or_default();
+                    self.linear_presets =
+                        tod_integration::load_presets(&data_root).unwrap_or_default();
                     self.linear_selected_preset = Some(preset_name);
                 }
             }
@@ -2126,7 +2162,10 @@ impl TaskEditView {
         let mut filters = self.linear_filter_passthrough.clone();
         let query = self.linear_query_text(cx).trim().to_string();
         if !query.is_empty() {
-            filters.insert(linear_query::QUERY_KEY.to_string(), serde_json::Value::String(query));
+            filters.insert(
+                linear_query::QUERY_KEY.to_string(),
+                serde_json::Value::String(query),
+            );
         }
         filters
     }
@@ -2470,8 +2509,7 @@ impl TaskEditView {
                         // Has children, show confirmation toast below.
                     }
                     Err(err) => {
-                        self.pending_toast =
-                            Some(format!("Failed to check children: {err}"));
+                        self.pending_toast = Some(format!("Failed to check children: {err}"));
                         cx.notify();
                         return;
                     }
@@ -4140,18 +4178,13 @@ impl TaskEditView {
         h_flex()
             .gap_2()
             .items_center()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_text)
-            )
+            .child(div().text_xs().text_color(status_color).child(status_text))
             .when(show_link, |el| {
                 el.child(
                     Button::new("linear-cred-link")
                         .label("Settings")
                         .xsmall()
-                        .ghost()
+                        .ghost(),
                 )
             })
     }
@@ -4161,7 +4194,10 @@ impl TaskEditView {
         muted: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let age_text = self.linear_introspection_age.as_deref().unwrap_or("unknown age");
+        let age_text = self
+            .linear_introspection_age
+            .as_deref()
+            .unwrap_or("unknown age");
         let has_cache = self.linear_introspection_cache.is_some();
 
         h_flex()
@@ -4179,17 +4215,21 @@ impl TaskEditView {
                         format!("Schema cached ({})", age_text)
                     } else {
                         "No cached schema".to_string()
-                    })
+                    }),
             )
             .child(
                 Button::new("linear-refetch")
-                    .label(if self.linear_introspection_fetching { "Fetching..." } else { "Re-fetch schema" })
+                    .label(if self.linear_introspection_fetching {
+                        "Fetching..."
+                    } else {
+                        "Re-fetch schema"
+                    })
                     .xsmall()
                     .ghost()
                     .disabled(self.linear_introspection_fetching)
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.trigger_linear_introspection_fetch(cx);
-                    }))
+                    })),
             )
     }
 
@@ -4336,7 +4376,13 @@ impl TaskEditView {
         let error = linear_query::parse(&text, &fields).err();
         let (danger, list_active, list_hover, popover, border) = {
             let theme = cx.theme();
-            (theme.danger, theme.list_active, theme.list_hover, theme.popover, theme.border)
+            (
+                theme.danger,
+                theme.list_active,
+                theme.list_hover,
+                theme.popover,
+                theme.border,
+            )
         };
 
         let dropdown = self.linear_query_dropdown_open().then(|| {
@@ -4393,26 +4439,34 @@ impl TaskEditView {
             let below = window.viewport_size().height - bounds.bottom() - gap;
             let above = bounds.top() - gap;
             let (anchor, position, room) = if below < wanted.min(px(MIN_HEIGHT)) && above > below {
-                (gpui::Anchor::BottomLeft, gpui::point(bounds.left(), bounds.top() - gap), above)
+                (
+                    gpui::Anchor::BottomLeft,
+                    gpui::point(bounds.left(), bounds.top() - gap),
+                    above,
+                )
             } else {
-                (gpui::Anchor::TopLeft, gpui::point(bounds.left(), bounds.bottom() + gap), below)
+                (
+                    gpui::Anchor::TopLeft,
+                    gpui::point(bounds.left(), bounds.bottom() + gap),
+                    below,
+                )
             };
             deferred(
                 gpui::anchored().anchor(anchor).position(position).child(
-                div()
-                    .id("task-edit-linear-query-dropdown")
-                    .occlude()
-                    .min_w(px(280.))
-                    .max_h(wanted.min(room).max(px(60.)))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.linear_query_scroll)
-                    .p_1()
-                    .bg(popover)
-                    .border_1()
-                    .border_color(border)
-                    .rounded_md()
-                    .shadow_md()
-                    .children(rows),
+                    div()
+                        .id("task-edit-linear-query-dropdown")
+                        .occlude()
+                        .min_w(px(280.))
+                        .max_h(wanted.min(room).max(px(60.)))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.linear_query_scroll)
+                        .p_1()
+                        .bg(popover)
+                        .border_1()
+                        .border_color(border)
+                        .rounded_md()
+                        .shadow_md()
+                        .children(rows),
                 ),
             )
             .with_priority(1)
@@ -4485,12 +4539,9 @@ impl TaskEditView {
                     el.child(
                         v_flex()
                             .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child("Other stored filters, and-ed with the query (kept as they are)"),
-                            )
+                            .child(div().text_xs().text_color(muted).child(
+                                "Other stored filters, and-ed with the query (kept as they are)",
+                            ))
                             .child(div().text_xs().child(selectable_text(
                                 "task-edit-linear-carried-filters",
                                 carried.join("\n"),
@@ -4523,27 +4574,37 @@ impl TaskEditView {
             (None, true) => String::new(),
         };
 
-        let mut row = h_flex().gap_2().items_center().flex_wrap().when(!configured, |row| row.child(
-            self.apply_focus_scroll_anchor(
-                TaskEditField::GeneratorSave,
-                div()
-                    .id(field_anchor_id(TaskEditField::GeneratorSave))
-                    .rounded_md()
-                    .when(save_focused, |el| {
-                        el.bg(active).border_1().border_color(active_border)
-                    })
-                    .child(
-                        Button::new("task-edit-gen-save")
-                            .label(save_label)
-                            .primary()
-                            .compact()
-                            .disabled(busy.is_some() || !dirty)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.enter_field_edit(TaskEditField::GeneratorSave, window, cx);
-                            })),
+        let mut row = h_flex()
+            .gap_2()
+            .items_center()
+            .flex_wrap()
+            .when(!configured, |row| {
+                row.child(
+                    self.apply_focus_scroll_anchor(
+                        TaskEditField::GeneratorSave,
+                        div()
+                            .id(field_anchor_id(TaskEditField::GeneratorSave))
+                            .rounded_md()
+                            .when(save_focused, |el| {
+                                el.bg(active).border_1().border_color(active_border)
+                            })
+                            .child(
+                                Button::new("task-edit-gen-save")
+                                    .label(save_label)
+                                    .primary()
+                                    .compact()
+                                    .disabled(busy.is_some() || !dirty)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.enter_field_edit(
+                                            TaskEditField::GeneratorSave,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
                     ),
-            ),
-        ));
+                )
+            });
 
         if configured {
             row = row.child(
@@ -4926,17 +4987,12 @@ impl TaskEditView {
                             .text_color(danger)
                             .child("Error"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(danger)
-                            .child(selectable_text(
-                                "task-edit-generator-error-detail",
-                                error.clone(),
-                                window,
-                                cx,
-                            )),
-                    ),
+                    .child(div().text_xs().text_color(danger).child(selectable_text(
+                        "task-edit-generator-error-detail",
+                        error.clone(),
+                        window,
+                        cx,
+                    ))),
             );
         }
 
@@ -4999,12 +5055,7 @@ impl TaskEditView {
                     .border_b_1()
                     .border_color(border)
                     .bg(secondary)
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child("Generator Detail"),
-                    )
+                    .child(div().text_sm().font_semibold().child("Generator Detail"))
                     .child(div().flex_1())
                     .child(chrome_control_with_shortcut(
                         Button::new("task-edit-generator-close")
@@ -5335,7 +5386,10 @@ pub fn register_task_edit_keyboard_bindings(cx: &mut App) {
     ]);
     // The query editor's dropdown takes these keys while the query is being
     // edited. Bound after gpui-component's own, so they win at the same depth.
-    let query_context = Some(key_context::including_tag(LINEAR_QUERY_CONTEXT, key_context::INPUT));
+    let query_context = Some(key_context::including_tag(
+        LINEAR_QUERY_CONTEXT,
+        key_context::INPUT,
+    ));
     cx.bind_keys([
         KeyBinding::new("down", LinearQueryNext, query_context),
         KeyBinding::new("up", LinearQueryPrev, query_context),

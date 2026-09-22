@@ -5,25 +5,24 @@
 //! scrolling — is [`crate::ui::item_list`]. Only what an obligation *is* lives
 //! here.
 
-use crate::ui::drag_payload::ObligationDragPayload;
-use crate::ui::item_list::{ItemListEvent, ItemListRow, ItemRowState};
+use crate::ui::item_list::{ItemDropped, ItemListEvent, ItemListRow, ItemRowState};
 use crate::ui::style;
 use crate::views::rows::{
-    ObligationRowEvent, ObligationRowProps, RowAction, RowHost, RowOptions, obligation_row,
-    op_icon,
+    ObligationRowEvent, ObligationRowProps, RowAction, RowHost, RowOptions, obligation_row, op_icon,
 };
-use gpui::{
-    AnyElement, App, AppContext, Context, Div, Entity, IntoElement, ParentElement, Render,
-    Stateful, StatefulInteractiveElement, Styled, Window, div,
-};
+use gpui::{AnyElement, App, Entity, IntoElement, ParentElement, Window, div};
 use gpui_component::input::TextareaState;
-use gpui_component::ActiveTheme;
 use tod_store::conversation::NetOp;
 use tod_store::outline::{KIND_CONSTRAINT, KIND_REQUIREMENT, NodeObligation};
 use tod_store::verification::VERDICT_FAILED;
 use uuid::Uuid;
 
 pub const NO_SECTION: &str = "<no section>";
+
+/// This list's name in an [`crate::ui::item_list::ItemDrag`] payload, so a
+/// drop target elsewhere in the app — a node on the task tree — can tell an
+/// obligation being dragged from any other list's row.
+pub const DRAG_LIST: &str = "obligations";
 /// Tags the section-name text field so plain Enter commits it (unlike the
 /// multi-line obligation-body field, which reserves Enter for newlines).
 pub const SECTION_EDIT_TAG: &str = "ObligationsSectionEdit";
@@ -145,6 +144,8 @@ pub enum ListAction {
     OpenVisualDesign {
         obligation_id: Uuid,
     },
+    /// Dragged an obligation to a new place in the list.
+    Drop(ItemDropped),
     /// Add an obligation below the selected one (what `n` does).
     CreateBelow,
     /// Delete the selection (what Del does).
@@ -169,6 +170,7 @@ impl From<ItemListEvent> for ListAction {
             ItemListEvent::Select { row_ix } => Self::Select { row_ix },
             ItemListEvent::ToggleGroup { key } => Self::ToggleGroup { key },
             ItemListEvent::ToggleMark { row_ix } => Self::ToggleMark { row_ix },
+            ItemListEvent::Drop(dropped) => Self::Drop(dropped),
         }
     }
 }
@@ -234,38 +236,5 @@ fn standing_badge(standing: &str) -> AnyElement {
         style::text_error(badge).into_any_element()
     } else {
         badge.into_any_element()
-    }
-}
-
-/// Make an obligation row draggable, with the obligation's own payload.
-pub fn draggable(item: &ObligationItem, row: Stateful<Div>) -> Stateful<Div> {
-    let obligation_id = item.obligation.id;
-    row.on_drag(
-        ObligationDragPayload { obligation_id },
-        move |payload, _offset, _window, cx| {
-            let obligation_id = payload.obligation_id;
-            cx.new(|_| ObligationDragPreview { obligation_id })
-        },
-    )
-}
-
-struct ObligationDragPreview {
-    #[allow(dead_code)]
-    obligation_id: Uuid,
-}
-
-impl Render for ObligationDragPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .text_sm()
-            .text_color(theme.foreground)
-            .child("Obligation")
     }
 }

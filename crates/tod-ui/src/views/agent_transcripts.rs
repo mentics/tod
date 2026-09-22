@@ -197,7 +197,9 @@ impl From<ItemListEvent> for AgentListAction {
         match event {
             ItemListEvent::Select { row_ix } => Self::Select { row_ix },
             ItemListEvent::ToggleGroup { key } => Self::ToggleGroup { key },
-            ItemListEvent::ToggleMark { .. } => Self::Ignored,
+            // A session list is ordered by when each one last spoke, so
+            // there is nothing for a drag to rearrange.
+            ItemListEvent::ToggleMark { .. } | ItemListEvent::Drop(_) => Self::Ignored,
         }
     }
 }

@@ -195,40 +195,40 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
     // A flex cell so the chip hugs its text instead of stretching to
     // the column's width.
     let status = column_cell(columns, COLUMN_STATUS, h_flex()).child(status_chip(
-            format!("plan-status-{key}"),
-            &step.status,
-            status_tone(&step.status),
-            status_menu,
-            StatusMenuHandlers {
-                toggle: {
-                    let host = host.clone();
-                    Rc::new(move |_, cx| {
-                        host.push(
-                            PlanStepRowEvent::ToggleStatusMenu { step_id: id }.into(),
-                            cx,
-                        )
-                    })
-                },
-                choose: {
-                    let host = host.clone();
-                    Rc::new(move |status, _, cx| {
-                        host.push(
-                            PlanStepRowEvent::ChooseStatus {
-                                step_id: id,
-                                status,
-                            }
-                            .into(),
-                            cx,
-                        )
-                    })
-                },
-                dismiss: {
-                    let host = host.clone();
-                    Rc::new(move |_, cx| host.push(PlanStepRowEvent::DismissStatusMenu.into(), cx))
-                },
+        format!("plan-status-{key}"),
+        &step.status,
+        status_tone(&step.status),
+        status_menu,
+        StatusMenuHandlers {
+            toggle: {
+                let host = host.clone();
+                Rc::new(move |_, cx| {
+                    host.push(
+                        PlanStepRowEvent::ToggleStatusMenu { step_id: id }.into(),
+                        cx,
+                    )
+                })
             },
-            cx,
-        ));
+            choose: {
+                let host = host.clone();
+                Rc::new(move |status, _, cx| {
+                    host.push(
+                        PlanStepRowEvent::ChooseStatus {
+                            step_id: id,
+                            status,
+                        }
+                        .into(),
+                        cx,
+                    )
+                })
+            },
+            dismiss: {
+                let host = host.clone();
+                Rc::new(move |_, cx| host.push(PlanStepRowEvent::DismissStatusMenu.into(), cx))
+            },
+        },
+        cx,
+    ));
 
     let links = |label: &str, ids: &[Uuid]| {
         (!ids.is_empty()).then(|| {

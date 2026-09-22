@@ -35,7 +35,6 @@ use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
 use crate::ui::style;
 use crate::views::incoming_check::{IncomingCheck, outcome_line};
-use tod_core::incoming::NodeOutcome;
 use crate::views::lifecycle_control::{
     GateCheckState, LifecycleController, enters_with_agent, implement_directory,
 };
@@ -51,6 +50,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::gate::GateAction;
+use tod_core::incoming::NodeOutcome;
 use tod_core::lifecycle_validity::{Regression, regression};
 use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
@@ -415,7 +415,12 @@ impl LifecyclePanelView {
             .as_deref()
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
             .filter(|_| self.lifecycle_capable)
-            .and_then(|node| self.fleet.read(|conn| regression(conn, node)).ok().flatten());
+            .and_then(|node| {
+                self.fleet
+                    .read(|conn| regression(conn, node))
+                    .ok()
+                    .flatten()
+            });
         let changed = found != self.regression;
         self.regression = found;
         changed
@@ -670,15 +675,21 @@ impl LifecyclePanelView {
     /// only. Earlier passes' work history is summed up here, not re-shown.
     fn render_learnings(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
-        let mut section =
-            v_flex().gap_2().child(div().text_xs().font_semibold().child("Past learnings"));
+        let mut section = v_flex()
+            .gap_2()
+            .child(div().text_xs().font_semibold().child("Past learnings"));
         for (pass, content) in self.learnings.iter().rev() {
             let mut item = v_flex()
                 .gap_1()
                 .pl_2()
                 .border_l_2()
                 .border_color(cx.theme().border)
-                .child(div().text_xs().text_color(muted).child(format!("Pass {pass}")));
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Pass {pass}")),
+                );
             item = if content.is_empty() {
                 item.child(
                     div()
@@ -704,13 +715,13 @@ impl LifecyclePanelView {
     fn render_incoming(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = cx.theme().muted_foreground;
         let n = self.incoming.len();
-        let mut section = v_flex().gap_2().child(
-            div().text_xs().font_semibold().child(if n == 1 {
+        let mut section = v_flex()
+            .gap_2()
+            .child(div().text_xs().font_semibold().child(if n == 1 {
                 "1 incoming change".to_string()
             } else {
                 format!("{n} incoming changes")
-            }),
-        );
+            }));
         for (i, row) in self.incoming.iter().enumerate() {
             let mut item = v_flex()
                 .gap_1()
@@ -756,20 +767,19 @@ impl LifecyclePanelView {
                 "Another incoming-changes check is running ({done} of {total}); Check now is available when it finishes."
             )));
         } else {
-            if let Some(failed) = check.results().iter().find(|r| {
-                Some(r.node) == node && matches!(r.outcome, NodeOutcome::Failed(_))
-            }) {
-                section = section.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child(selectable_text(
-                            "lifecycle-panel-incoming-failed",
-                            outcome_line(failed),
-                            window,
-                            cx,
-                        )),
-                );
+            if let Some(failed) = check
+                .results()
+                .iter()
+                .find(|r| Some(r.node) == node && matches!(r.outcome, NodeOutcome::Failed(_)))
+            {
+                section = section.child(div().text_xs().text_color(cx.theme().danger).child(
+                    selectable_text(
+                        "lifecycle-panel-incoming-failed",
+                        outcome_line(failed),
+                        window,
+                        cx,
+                    ),
+                ));
             }
             let focused = self.is_focused(LifecyclePanelStop::CheckIncoming);
             let list_active_border = cx.theme().list_active_border;
@@ -819,8 +829,8 @@ impl LifecyclePanelView {
         let obligations_failed = standings.iter().filter(|s| s.is_failed()).count();
         // "Verify" until every obligation and step has a verdict, then
         // "Verify again".
-        let unchecked = steps.len() - verified - failed
-            + standings.iter().filter(|s| s.is_unchecked()).count();
+        let unchecked =
+            steps.len() - verified - failed + standings.iter().filter(|s| s.is_unchecked()).count();
         let status = self
             .task_id
             .as_ref()
@@ -1140,21 +1150,16 @@ impl Render for LifecyclePanelView {
         let list_active_border = theme.list_active_border;
 
         let next_state = next_lifecycle(&self.lifecycle);
-        let (
-            gate_status,
-            gate_error,
-            criteria_detail,
-            force_advance_armed,
-            revert_armed,
-        ) = self.current_state(cx, |s| {
-            (
-                s.gate_status.clone(),
-                s.gate_error.clone(),
-                s.criteria_detail.clone(),
-                s.force_advance_armed,
-                s.revert_armed,
-            )
-        });
+        let (gate_status, gate_error, criteria_detail, force_advance_armed, revert_armed) = self
+            .current_state(cx, |s| {
+                (
+                    s.gate_status.clone(),
+                    s.gate_error.clone(),
+                    s.criteria_detail.clone(),
+                    s.force_advance_armed,
+                    s.revert_armed,
+                )
+            });
 
         let mut body = v_flex()
             .id("lifecycle-panel-body")

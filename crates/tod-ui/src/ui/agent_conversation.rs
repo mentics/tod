@@ -728,12 +728,12 @@ impl Render for AgentConversationPanel {
             .when(has_lifecycle, |el| {
                 el.child(
                     style::panel_footer(v_flex())
-                        .child(style::text_dense_muted(div()).child(
-                            match &self.lifecycle_state {
+                        .child(
+                            style::text_dense_muted(div()).child(match &self.lifecycle_state {
                                 Some(state) => format!("Lifecycle: {state}"),
                                 None => "Lifecycle".to_string(),
-                            },
-                        ))
+                            }),
+                        )
                         .when(!self.notices.is_empty(), |el| el.child(notices))
                         .when(!actions.is_empty(), |el| {
                             el.child(

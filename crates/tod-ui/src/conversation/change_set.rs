@@ -1,11 +1,11 @@
 //! The change-set pane: everything the conversation changed, grouped by node,
 //! with reversal, inline edits, and unsure flags.
 
-use crate::ui::item_list::{GroupSpec, ItemListRow, ItemRowState};
-use crate::ui::status_filter::{StatusFilter, render_status_filter};
 use super::context_panel::link_label;
 use super::{ChangeAction, ConversationView, Pane};
+use crate::ui::item_list::{GroupSpec, ItemListRow, ItemRowState};
 use crate::ui::selectable_text::selectable_text;
+use crate::ui::status_filter::{StatusFilter, render_status_filter};
 use crate::ui::style;
 use crate::views::rows::{
     NodeRowProps, ObligationRowProps, PlanStepRowProps, RowAction, RowOptions, node_row,
@@ -673,17 +673,15 @@ impl ConversationView {
             .min_w_0()
             .overflow_hidden()
             .child(
-                style::panel_header(h_flex())
-                    .items_center()
-                    .child(
-                        if active {
-                            style::text_title(div())
-                        } else {
-                            style::text_muted(div())
-                        }
-                        .flex_shrink_0()
-                        .child("Changes"),
-                    ),
+                style::panel_header(h_flex()).items_center().child(
+                    if active {
+                        style::text_title(div())
+                    } else {
+                        style::text_muted(div())
+                    }
+                    .flex_shrink_0()
+                    .child("Changes"),
+                ),
             )
             .children(filter)
             .child(list)

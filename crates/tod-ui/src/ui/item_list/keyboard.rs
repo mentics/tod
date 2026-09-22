@@ -137,7 +137,6 @@ pub fn bind_item_list_keys(cx: &mut App, surface: &str, keys: ItemListKeys) {
         bindings.extend([
             KeyBinding::new("n", ItemListCreateBelow, context),
             KeyBinding::new("alt-enter", ItemListCreateAbove, context),
-
             KeyBinding::new("backspace", ItemListDelete, context),
             KeyBinding::new("delete", ItemListDelete, context),
         ]);

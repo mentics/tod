@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::ui::drag_payload::ObligationDragPayload;
+use crate::ui::item_list::ItemDrag;
+use crate::views::obligations::DRAG_LIST as OBLIGATION_DRAG_LIST;
 use gpui::{
     Context, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
     WeakEntity, Window, div, prelude::FluentBuilder, px,
@@ -620,22 +621,29 @@ impl ListDelegate for TaskListDelegate {
                 }),
             )
             .when(has_spec, |el| {
-                el.can_drop(|any, _, _| any.downcast_ref::<ObligationDragPayload>().is_some())
-                    .on_drop::<ObligationDragPayload>(cx.listener(
-                        move |_, payload: &ObligationDragPayload, _, cx| {
-                            drop_sink.borrow_mut().push(RowAction::DropObligation {
-                                task_id: drop_task_id.clone(),
-                                obligation_id: payload.obligation_id,
-                            });
-                            cx.notify();
-                        },
-                    ))
-                    .drag_over::<ObligationDragPayload>(move |style, _, _, _| {
-                        style.cursor_pointer().bg(primary.opacity(0.15))
-                    })
+                // An obligation dragged off the obligations panel: the same
+                // payload every item list drags, so the row it came from did
+                // not have to be built twice.
+                el.can_drop(|any, _, _| {
+                    any.downcast_ref::<ItemDrag>()
+                        .is_some_and(|drag| drag.list == OBLIGATION_DRAG_LIST)
+                })
+                .on_drop::<ItemDrag>(cx.listener(move |_, drag: &ItemDrag, _, cx| {
+                    let Ok(obligation_id) = uuid::Uuid::parse_str(&drag.key) else {
+                        return;
+                    };
+                    drop_sink.borrow_mut().push(RowAction::DropObligation {
+                        task_id: drop_task_id.clone(),
+                        obligation_id,
+                    });
+                    cx.notify();
+                }))
+                .drag_over::<ItemDrag>(move |style, _, _, _| {
+                    style.cursor_pointer().bg(primary.opacity(0.15))
+                })
             })
             .when(!has_spec, |el| {
-                el.drag_over::<ObligationDragPayload>(|style, _, _, _| style.cursor_not_allowed())
+                el.drag_over::<ItemDrag>(|style, _, _, _| style.cursor_not_allowed())
             })
             .child(title_line);
 

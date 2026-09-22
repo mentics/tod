@@ -158,6 +158,14 @@ fn handle_client(
                 capture::send_click(x, y, logical_width, logical_height, right)
                     .map(|()| "ok".to_string())
             }
+            Ok(Command::Drag { from, to }) => {
+                capture::send_drag(from, to, logical_width, logical_height)
+                    .map(|()| "ok".to_string())
+            }
+            Ok(Command::DragStep { step, x, y }) => {
+                capture::send_drag_step(step, x, y, logical_width, logical_height)
+                    .map(|()| "ok".to_string())
+            }
             Ok(Command::Sync) => dispatch_ui(&tx, UiRequest::Sync),
             Ok(Command::Transcripts(action)) => dispatch_ui(&tx, UiRequest::Transcripts(action)),
             Ok(Command::AgentPlatform(action)) => {

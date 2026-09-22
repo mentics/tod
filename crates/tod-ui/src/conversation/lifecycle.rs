@@ -348,7 +348,10 @@ impl ConversationView {
                 _ => false,
             };
         if !gate.gate_status.is_empty() && !gate_stale {
-            notices.push(PanelNotice::new(NoticeTone::Muted, gate.gate_status.clone()));
+            notices.push(PanelNotice::new(
+                NoticeTone::Muted,
+                gate.gate_status.clone(),
+            ));
         }
         if let Some(error) = &gate.gate_error {
             notices.push(PanelNotice::new(NoticeTone::Error, error.clone()));

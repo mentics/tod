@@ -698,9 +698,7 @@ impl TranscriptList {
                 };
                 let work = pieces
                     .iter()
-                    .filter(|(kind, _)| {
-                        !matches!(kind, PieceKind::Answer | PieceKind::Structured)
-                    })
+                    .filter(|(kind, _)| !matches!(kind, PieceKind::Answer | PieceKind::Structured))
                     .count();
                 let summary = match work {
                     0 => answer,

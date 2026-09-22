@@ -11,9 +11,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui::{
-    canvas, App, Bounds, ParentElement, Pixels, ScrollHandle, Styled, Window, point, px,
-};
+use gpui::{App, Bounds, ParentElement, Pixels, ScrollHandle, Styled, Window, canvas, point, px};
 
 #[derive(Clone)]
 pub struct ScrollReveal {
@@ -33,11 +31,14 @@ impl ScrollReveal {
     pub fn mark<E: ParentElement + Styled>(&self, el: E) -> E {
         let target = self.target.clone();
         el.child(
-            canvas(move |bounds, _, _| target.set(Some(bounds)), |_, _, _, _| {})
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
+            canvas(
+                move |bounds, _, _| target.set(Some(bounds)),
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full(),
         )
     }
 
@@ -60,7 +61,12 @@ impl ScrollReveal {
         };
         let viewport = self.handle.bounds();
         let offset = self.handle.offset();
-        let delta = reveal_delta(viewport.top(), viewport.bottom(), target.top(), target.bottom());
+        let delta = reveal_delta(
+            viewport.top(),
+            viewport.bottom(),
+            target.top(),
+            target.bottom(),
+        );
         if delta != px(0.) {
             let max = self.handle.max_offset().y;
             let y = (offset.y + delta).clamp(-max, px(0.));

@@ -104,9 +104,9 @@ pub fn render_status_filter<V: 'static>(
                 .label(format!("{status} {n}"))
                 .ghost()
                 .small()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    toggle(this, Some(&chosen), window, cx)
-                })),
+                .on_click(
+                    cx.listener(move |this, _, window, cx| toggle(this, Some(&chosen), window, cx)),
+                ),
             on,
         ));
     }
