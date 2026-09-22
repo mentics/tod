@@ -874,6 +874,8 @@ impl ConversationView {
             ItemEntity::PlanStep => match plan_step_of(&change) {
                 Some(step) => plan_step_row(
                     PlanStepRowProps {
+                        // The compact change-set line is one line, not a table.
+                        columns: &[],
                         step: &step,
                         depends_on: &[],
                         satisfies: &[],

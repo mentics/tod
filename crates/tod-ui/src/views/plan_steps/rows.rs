@@ -107,6 +107,7 @@ pub fn render_plan_step(
         highlighted: state.highlighted,
         editor: Some(editor).filter(|_| state.editing),
         status_menu: menu.filter(|m| m.is_on(item.step.id)),
+        columns: state.columns,
     };
     plan_step_row(props, host, opts, window, cx)
 }

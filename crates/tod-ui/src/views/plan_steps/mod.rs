@@ -15,7 +15,7 @@ use crate::ui::item_list::{ItemList, ItemListKeys, ItemListRow, bind_item_list_k
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
-use crate::views::rows::{RowHost, StatusMenu};
+use crate::views::rows::{RowHost, StatusMenu, plan_step_columns};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -167,7 +167,7 @@ impl PlanStepsView {
             title: String::new(),
             items: Vec::new(),
             focus_handle: cx.focus_handle(),
-            list: ItemList::new(),
+            list: ItemList::new().with_columns(plan_step_columns()),
             host,
             embedded: false,
             removed: Vec::new(),

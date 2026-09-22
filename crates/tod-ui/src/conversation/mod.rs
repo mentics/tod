@@ -71,7 +71,7 @@ use crate::views::obligations::ObligationsView;
 use crate::views::plan_steps::PlanStepsView;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::rows::{
-    FindingRowEvent, NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost,
+    FindingRowEvent, NodeRowEvent, ObligationRowEvent, PlanStepRowEvent, RowHost, finding_columns,
 };
 use change_set::{ChangeKey, PendingReverse};
 use side_pane::FindingItem;
@@ -592,7 +592,7 @@ impl ConversationView {
             edit_input,
             confirm: None,
             change_scroll: ScrollHandle::new(),
-            findings: ItemList::new(),
+            findings: ItemList::new().with_columns(finding_columns()),
             status_menu: None,
             status_filter: StatusFilter::default(),
             obligation_filter: StatusFilter::default(),

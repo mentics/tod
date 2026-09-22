@@ -88,8 +88,30 @@ enum ItemRow<K> {
   container — padding, hover, highlight, the `row` / `row-wrapped` styles — and
   the caller owns what is inside it.
 
-**Columns** are declared once per list (body, status badge, kind, trailing
-actions) so they align across every row, including across groups.
+## Columns
+
+A list that is a table declares its columns once, as `ColumnSpec`s, and the
+component does the rest. Nothing else sets a width, which is what keeps the
+columns aligned: a row asks for a column by key (`state.column("status", el)`)
+and gets a cell of the declared width.
+
+- **Fixed or content.** A fixed column holds the same width on every row.
+  Exactly one column — the content column — has no width and takes what the
+  fixed ones leave.
+- **A column is for a value every row has.** A plan step always has a status,
+  a finding always has a severity. Something only some rows carry (an
+  obligation's standing, which only exists during verification) stays inside
+  the content column as trailing context, where the empty case costs nothing.
+- **A grouping is never a column.** A group heading is a band over a run of
+  items, as it always was; its label starts where the content column does, so
+  it lines up with the text beneath it and the fixed columns stay empty
+  across it.
+- **A header names the columns** — above the rows, outside the scrolling area,
+  so it does not scroll away. A list that declares no columns has no header
+  and is a plain list, which is what the change set and command history want.
+
+Today: findings are `severity | answer | finding`, a plan is `# | status |
+step`. Obligations declare none.
 
 ## What the component owns
 

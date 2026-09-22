@@ -219,6 +219,23 @@ styles:
     extends: text-dense-muted
     width: control-xsmall
 
+  # Columns: a list that is a table declares them once, so every row and the
+  # header agree on where a value starts. A grouping is never a column — a
+  # heading's label lines up with the content column, past the fixed ones.
+  list-cell:
+    # A fixed column holds its width on every row; the content column, which
+    # has no width, takes what is left.
+    width: declared-or-fill
+  # The column names, above the rows and outside the scrolling area.
+  list-header:
+    extends: text-dense-muted
+    font-weight: semibold
+    text-case: upper
+    height: group-row
+    padding-x: related
+    gap: inline
+    border-bottom: divider-strong
+
   # Chunks: a block of content under a header that expands and collapses
   chunk:
     border: divider

@@ -2,11 +2,13 @@
 //!
 //! A review conversation's agent records the finding; the user answers it from
 //! the status chip, which opens the same dropdown a plan step's does. The
-//! severity and status columns are fixed widths, so the text starts at the
-//! same x on every row and lines up with the other tables beside it.
+//! The list declares the columns (see [`finding_columns`]); the row only
+//! says which one each value goes in, so severity, status and text line up
+//! down the list and under the header naming them.
 
 use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::{
@@ -21,11 +23,24 @@ use tod_store::review::{
 };
 use uuid::Uuid;
 
-/// Fixed widths for the leading columns of the findings table, which the
-/// requirements beside them share, so the text column starts at the same x on
-/// every row.
-pub const SEVERITY_COLUMN_WIDTH: Pixels = px(64.);
+/// The status column's width, which the requirements table beside the
+/// findings shares so the two line up. It goes once the requirements table is
+/// on the item list too.
 pub const STATUS_COLUMN_WIDTH: Pixels = px(120.);
+
+pub const COLUMN_SEVERITY: &str = "severity";
+pub const COLUMN_STATUS: &str = "status";
+pub const COLUMN_FINDING: &str = "finding";
+
+/// The columns a findings list is a table of. Every finding has all three,
+/// which is what makes them columns rather than trailing context.
+pub fn finding_columns() -> Vec<ColumnSpec> {
+    vec![
+        ColumnSpec::fixed(COLUMN_SEVERITY, COLUMN_SEVERITY, px(64.)),
+        ColumnSpec::fixed(COLUMN_STATUS, "answer", STATUS_COLUMN_WIDTH),
+        ColumnSpec::content(COLUMN_FINDING, COLUMN_FINDING),
+    ]
+}
 
 /// What the user did on a finding row. A host's action type converts from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +68,8 @@ pub struct FindingRowProps<'a> {
     /// The status dropdown, whichever finding it is open on; the row shows it
     /// only when it is open on this one.
     pub status_menu: Option<StatusMenu>,
+    /// The list's columns, so this row lines up with the others.
+    pub columns: &'a [ColumnSpec],
 }
 
 /// Render one review finding: how much it matters, the answer it has, and
@@ -69,6 +86,7 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
         row_ix,
         highlighted,
         status_menu,
+        columns,
     } = props;
     let id = finding.id;
     let key = id.to_string();
@@ -120,10 +138,7 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
         cx,
     );
 
-    let mut body = v_flex()
-        .flex_1()
-        .min_w_0()
-        .gap(style::space::HAIRLINE)
+    let mut body = column_cell(columns, COLUMN_FINDING, v_flex()).gap(style::space::HAIRLINE)
         .child(
             div()
                 .min_w_0()
@@ -182,13 +197,8 @@ pub fn finding_row<A: From<FindingRowEvent> + 'static>(
     let row = if hoverable { style::hover_row(row) } else { row };
     row.when(highlighted, style::highlighted)
         .children(opts.leading.take())
-        .child(
-            div()
-                .w(SEVERITY_COLUMN_WIDTH)
-                .flex_shrink_0()
-                .child(severity),
-        )
-        .child(div().w(STATUS_COLUMN_WIDTH).flex_shrink_0().child(chip))
+        .child(column_cell(columns, COLUMN_SEVERITY, h_flex()).child(severity))
+        .child(column_cell(columns, COLUMN_STATUS, h_flex()).child(chip))
         .child(body)
         .children(row_tail(&key, &group, highlighted, &mut opts))
         .into_any_element()

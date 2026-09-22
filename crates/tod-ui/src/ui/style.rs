@@ -268,11 +268,14 @@ pub fn badge<E: Styled>(el: E) -> E {
 /// grouping level, outermost 0: the outermost reads as a band across the
 /// list, the ones inside it as progressively lighter headings, each indented
 /// one step further than the one above.
-pub fn list_group<E: Styled>(el: E, depth: usize) -> E {
+/// `lead` is how wide the list's fixed columns are, so a heading's label
+/// starts where the content column does — a group is a heading over a run of
+/// items, never a value in a column of its own.
+pub fn list_group<E: Styled>(el: E, depth: usize, lead: Pixels) -> E {
     let el = el
         .h(size::GROUP_ROW)
         .px(space::RELATED)
-        .pl(space::RELATED + size::GROUP_INDENT * depth as f32)
+        .pl(space::RELATED + lead + size::GROUP_INDENT * depth as f32)
         .gap(space::INLINE)
         .text_size(font::BODY)
         .border_b(size::BORDER)
@@ -282,6 +285,30 @@ pub fn list_group<E: Styled>(el: E, depth: usize) -> E {
         1 => el.font_weight(FontWeight::SEMIBOLD),
         _ => el.font_weight(FontWeight::MEDIUM),
     }
+}
+
+/// `styles.list-cell`: one column's cell. A fixed column holds the same
+/// width on every row, so its contents line up down the list; the content
+/// column takes what is left.
+pub fn list_cell<E: Styled>(el: E, width: Option<Pixels>) -> E {
+    match width {
+        Some(width) => el.w(width).flex_shrink_0(),
+        None => el.flex_1().min_w_0(),
+    }
+}
+
+/// `styles.list-header`: the column names above a list that has columns. It
+/// sits outside the scrolling area, so it does not scroll away.
+pub fn list_header<E: Styled>(el: E) -> E {
+    el.h(size::GROUP_ROW)
+        .flex_shrink_0()
+        .px(space::RELATED)
+        .gap(space::INLINE)
+        .border_b(size::BORDER)
+        .border_color(color::divider_strong())
+        .text_size(font::DENSE)
+        .text_color(color::text_muted())
+        .font_weight(FontWeight::SEMIBOLD)
 }
 
 /// `styles.list-group-chevron`: the collapse toggle in a heading's leading

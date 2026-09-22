@@ -1,13 +1,19 @@
 //! One plan step, as a row.
+//!
+//! The plan list declares the columns (see [`plan_step_columns`]); this row
+//! only says which one each value goes in, so the ordinal, the status and the
+//! text line up down the list and under the header naming them. The compact
+//! row the change set shows is a single line and has no columns.
 
 use super::obligation_row::one_line;
 use super::status_menu::{StatusMenu, StatusMenuHandlers, status_chip};
 use super::{RowHost, RowOptions, row_group, row_tail};
+use crate::ui::item_list::{ColumnSpec, column_cell};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
 use gpui::{
     AnyElement, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, div, prelude::FluentBuilder,
+    SharedString, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::{ActiveTheme, h_flex, v_flex};
@@ -16,6 +22,20 @@ use tod_store::interview::short_id;
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::{STATUS_BLOCKED, STATUS_FAILED};
 use uuid::Uuid;
+
+pub const COLUMN_ORDINAL: &str = "ordinal";
+pub const COLUMN_STATUS: &str = "status";
+pub const COLUMN_STEP: &str = "step";
+
+/// The columns a plan is a table of. Every step has an ordinal and a status,
+/// which is what makes them columns rather than something inline.
+pub fn plan_step_columns() -> Vec<ColumnSpec> {
+    vec![
+        ColumnSpec::fixed(COLUMN_ORDINAL, "#", px(28.)),
+        ColumnSpec::fixed(COLUMN_STATUS, COLUMN_STATUS, px(120.)),
+        ColumnSpec::content(COLUMN_STEP, COLUMN_STEP),
+    ]
+}
 
 /// What the user did on a plan-step row. A host's action type converts
 /// from it.
@@ -48,6 +68,9 @@ pub struct PlanStepRowProps<'a> {
     pub editor: Option<&'a Entity<TextareaState>>,
     /// The status dropdown, when it is open on this step.
     pub status_menu: Option<StatusMenu>,
+    /// The list's columns, so this row lines up with the others. Empty for
+    /// the compact row, which is one line.
+    pub columns: &'a [ColumnSpec],
 }
 
 /// Render one plan step. The default [`RowOptions`] give the row the plan
@@ -68,6 +91,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         highlighted,
         editor,
         status_menu,
+        columns,
     } = props;
     let id = step.id;
     let key = id.to_string();
@@ -162,17 +186,13 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
             .into_any_element();
     }
 
-    let header = h_flex()
-        .items_center()
-        .gap_2()
-        .children(opts.leading.take())
-        .child(
-            div()
-                .text_xs()
-                .text_color(muted)
-                .child(format!("{}.", step.ordinal)),
-        )
-        .child(status_chip(
+    let ordinal = column_cell(columns, COLUMN_ORDINAL, div())
+        .text_xs()
+        .text_color(muted)
+        .child(format!("{}.", step.ordinal));
+    // A flex cell so the chip hugs its text instead of stretching to
+    // the column's width.
+    let status = column_cell(columns, COLUMN_STATUS, h_flex()).child(status_chip(
             format!("plan-status-{key}"),
             &step.status,
             status_tone(&step.status),
@@ -206,9 +226,7 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
                 },
             },
             cx,
-        ))
-        .child(div().flex_1())
-        .children(row_tail(&key, &group, highlighted, &mut opts));
+        ));
 
     let links = |label: &str, ids: &[Uuid]| {
         (!ids.is_empty()).then(|| {
@@ -220,15 +238,16 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
         })
     };
 
-    let row = v_flex()
+    let row = h_flex()
         .w_full()
         .flex_shrink_0()
-        .gap_0p5()
+        .items_start()
+        .gap(style::space::INLINE)
         .px_2()
         .py_1p5()
         .border_b_1()
         .border_color(divider)
-        .group(group)
+        .group(group.clone())
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, on_select);
     let row = if hoverable {
@@ -254,15 +273,25 @@ pub fn plan_step_row<A: From<PlanStepRowEvent> + 'static>(
                 cx,
             ))
     });
-    row.when(highlighted, style::highlighted)
-        .child(header)
+    // Everything the step *says* goes in the content column: its text, why it
+    // stopped, and what it is tied to. The two fixed columns hold only the
+    // values every step has.
+    let content = column_cell(columns, COLUMN_STEP, v_flex())
+        .gap_0p5()
         .children(editor)
         .children(body)
         .children(opts.detail.take())
         .children(reason)
         .children(note)
         .children(links("depends on", depends_on))
-        .children(links("satisfies", satisfies))
+        .children(links("satisfies", satisfies));
+
+    row.when(highlighted, style::highlighted)
+        .children(opts.leading.take())
+        .child(ordinal)
+        .child(status)
+        .child(content)
+        .children(row_tail(&key, &group, highlighted, &mut opts))
         .into_any_element()
 }
 

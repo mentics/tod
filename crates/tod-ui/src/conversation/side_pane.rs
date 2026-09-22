@@ -73,6 +73,7 @@ pub(super) fn render_finding(
         row_ix: state.row_ix,
         highlighted: state.highlighted && active,
         status_menu: menu,
+        columns: state.columns,
     };
     finding_row(props, host, RowOptions::default(), window, cx)
 }

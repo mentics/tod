@@ -54,6 +54,44 @@ pub enum ItemListEvent {
     ToggleMark { row_ix: usize },
 }
 
+/// One column of a list that is a table.
+///
+/// A list declares its columns once, so every row and the header above them
+/// agree on where a value starts without any row setting a width itself. A
+/// column is for something *every* row has — a plan step's status, a
+/// finding's severity. A value only some rows carry stays inside the content
+/// column, where empty space costs nothing.
+pub struct ColumnSpec {
+    /// How a row asks for this column: [`ItemRowState::column`].
+    pub key: &'static str,
+    /// Named in the header row, in capitals.
+    pub label: &'static str,
+    /// Fixed width, or `None` for the content column, which takes what the
+    /// fixed ones leave. Exactly one column has `None`, and it is the one a
+    /// group heading aligns to.
+    pub width: Option<gpui::Pixels>,
+}
+
+impl ColumnSpec {
+    /// A fixed-width column.
+    pub fn fixed(key: &'static str, label: &'static str, width: gpui::Pixels) -> Self {
+        Self {
+            key,
+            label,
+            width: Some(width),
+        }
+    }
+
+    /// The content column: what the row is actually about.
+    pub fn content(key: &'static str, label: &'static str) -> Self {
+        Self {
+            key,
+            label,
+            width: None,
+        }
+    }
+}
+
 /// A group heading: a label over a run of items, never an item itself.
 pub struct GroupSpec {
     pub key: String,
@@ -193,6 +231,26 @@ pub struct ItemRowState<'a> {
     pub marked: bool,
     /// Being edited.
     pub editing: bool,
+    /// The list's columns, empty when it is not a table.
+    pub columns: &'a [ColumnSpec],
+}
+
+impl ItemRowState<'_> {
+    /// Wrap `el` as the named column's cell, so it lines up with the same
+    /// column on every other row and with the header. A key the list does not
+    /// declare leaves the element as it is.
+    pub fn column<E: Styled>(&self, key: &str, el: E) -> E {
+        column_cell(self.columns, key, el)
+    }
+}
+
+/// [`ItemRowState::column`], for a row that was handed the columns rather
+/// than the whole state.
+pub fn column_cell<E: Styled>(columns: &[ColumnSpec], key: &str, el: E) -> E {
+    match columns.iter().find(|column| column.key == key) {
+        Some(column) => style::list_cell(el, column.width),
+        None => el,
+    }
 }
 
 /// What [`ItemList::collapse_step`] did, so the caller knows whether to
@@ -219,6 +277,8 @@ pub struct ItemList<T, G = ()> {
     group_editor: Option<gpui::Entity<InputState>>,
     group_edit_tag: Option<&'static str>,
     scroll: ScrollHandle,
+    /// The columns every row lines up in, empty when the list is not a table.
+    columns: Vec<ColumnSpec>,
     /// Items carry a selection checkbox and answer Space.
     marking: bool,
     drag: Option<Rc<dyn Fn(&T, Stateful<Div>) -> Stateful<Div>>>,
@@ -243,6 +303,7 @@ impl<T, G> ItemList<T, G> {
             group_editor: None,
             group_edit_tag: None,
             scroll: ScrollHandle::new(),
+            columns: Vec::new(),
             marking: false,
             drag: None,
             context_menu: None,
@@ -259,6 +320,34 @@ impl<T, G> ItemList<T, G> {
         self.group_editor = Some(editor);
         self.group_edit_tag = Some(tag);
         self
+    }
+
+    /// Make the list a table: its rows line up in these columns, and a header
+    /// naming them sits above the rows and does not scroll away. A row asks
+    /// for a column by key through [`ItemRowState::column`]; nothing else sets
+    /// a width, which is what keeps the columns aligned.
+    pub fn with_columns(mut self, columns: Vec<ColumnSpec>) -> Self {
+        debug_assert!(
+            columns.iter().filter(|c| c.width.is_none()).count() == 1,
+            "a list's columns need exactly one content column to take the rest"
+        );
+        self.columns = columns;
+        self
+    }
+
+    /// How wide the fixed columns ahead of the content column are — where a
+    /// group heading's label starts.
+    fn lead_width(&self) -> gpui::Pixels {
+        let gap = if self.columns.is_empty() {
+            px(0.)
+        } else {
+            style::space::INLINE
+        };
+        self.columns
+            .iter()
+            .take_while(|column| column.width.is_some())
+            .filter_map(|column| column.width)
+            .fold(px(0.), |total, width| total + width + gap)
     }
 
     /// Let the user select several items: each row carries a checkbox, and
@@ -619,6 +708,7 @@ impl<T, G> ItemList<T, G> {
                         highlighted,
                         marked,
                         editing: self.editing_key.as_deref() == Some(key.as_str()),
+                        columns: &self.columns,
                     };
                     let row = render_item(item, state, window, cx);
                     if self.marking {
@@ -643,11 +733,16 @@ impl<T, G> ItemList<T, G> {
         div()
             .flex_1()
             .min_h_0()
+            .flex()
+            .flex_col()
             .relative()
+            .children(self.render_header())
             .child(
                 div()
                     .id(id)
-                    .size_full()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
                     .children(elements),
@@ -660,13 +755,32 @@ impl<T, G> ItemList<T, G> {
                 div()
                     .occlude()
                     .absolute()
-                    .top_0()
+                    .top(if self.columns.is_empty() {
+                        px(0.)
+                    } else {
+                        style::size::GROUP_ROW
+                    })
                     .right_0()
                     .bottom_0()
                     .w(px(16.))
                     .child(Scrollbar::vertical(&self.scroll)),
             )
             .into_any_element()
+    }
+
+    /// The column names, above the rows and outside the scrolling area. A
+    /// list with no columns has no header.
+    fn render_header(&self) -> Option<AnyElement> {
+        if self.columns.is_empty() {
+            return None;
+        }
+        let mut header = style::list_header(h_flex()).w_full().items_center();
+        for column in &self.columns {
+            header = header.child(
+                style::list_cell(div(), column.width).child(column.label.to_uppercase()),
+            );
+        }
+        Some(header.into_any_element())
     }
 
     /// The selection checkbox, ahead of the caller's row.
@@ -709,7 +823,7 @@ impl<T, G> ItemList<T, G> {
         A: From<ItemListEvent> + 'static,
     {
         let select_host = host.clone();
-        let mut header = style::list_group(h_flex(), group.depth)
+        let mut header = style::list_group(h_flex(), group.depth, self.lead_width())
             .flex_shrink_0()
             .items_center()
             .when(highlighted, style::highlighted)
@@ -923,5 +1037,25 @@ mod tests {
         list.rekey_collapsed("section", "section:renamed");
         assert!(!list.is_collapsed("section"));
         assert!(list.is_collapsed("section:renamed"));
+    }
+
+    #[test]
+    fn a_group_heading_starts_where_the_content_column_does() {
+        // A grouping is not a column: the heading's label lines up with the
+        // content column, past the fixed ones.
+        let list: ItemList<&str, ()> = ItemList::new().with_columns(vec![
+            ColumnSpec::fixed("severity", "severity", px(64.)),
+            ColumnSpec::fixed("status", "answer", px(120.)),
+            ColumnSpec::content("finding", "finding"),
+        ]);
+        let gap = style::space::INLINE;
+        assert_eq!(list.lead_width(), px(64.) + gap + px(120.) + gap);
+    }
+
+    #[test]
+    fn a_list_with_no_columns_leads_with_nothing() {
+        let list: ItemList<&str, ()> = ItemList::new();
+        assert_eq!(list.lead_width(), px(0.));
+        assert!(list.render_header().is_none());
     }
 }
