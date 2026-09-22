@@ -189,8 +189,11 @@ impl Protocol for OutlineProtocol {
 
     /// An empty directory: the agent works on the project through `tod-cli`
     /// and needs nothing from a repository.
+    /// The focus node's working directory when it has one, so the agent
+    /// starts inside the workspace and loads its own agent docs (`CLAUDE.md`,
+    /// skills, rules); an empty directory otherwise.
     fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
-        scratch_dir(env.data_root, "conversation")
+        focus_cwd_or_scratch(env, "conversation")
     }
 
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
@@ -249,14 +252,7 @@ impl Protocol for ChatProtocol {
     /// The focus node's working directory when it has one, so "write this
     /// down" lands in the project's files; an empty directory otherwise.
     fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
-        if let Some(node) = env.focus.node_id() {
-            if let Ok(dir) =
-                tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string())
-            {
-                return Ok(dir);
-            }
-        }
-        scratch_dir(env.data_root, "chat")
+        focus_cwd_or_scratch(env, "chat")
     }
 
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
@@ -299,6 +295,21 @@ impl Protocol for ChatProtocol {
 }
 
 /// A conversation-owned directory under the data root.
+/// The focus node's Files directory (its own or inherited) when it resolves,
+/// else the scratch directory `name`. The agent CLI discovers the workspace's
+/// agent docs from its working directory, so this is what gives a
+/// conversation about a node the docs of the workspace that node lives in.
+fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<PathBuf> {
+    if let Some(node) = env.focus.node_id() {
+        if let Ok(dir) =
+            tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string())
+        {
+            return Ok(dir);
+        }
+    }
+    scratch_dir(env.data_root, name)
+}
+
 pub(super) fn scratch_dir(data_root: &Path, name: &str) -> Result<PathBuf> {
     use anyhow::Context;
     let dir = data_root.join("agent").join(name);

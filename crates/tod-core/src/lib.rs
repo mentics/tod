@@ -9,6 +9,7 @@
 pub const CLI_BUILD_STAMP: &str = env!("TOD_CLI_BUILD_STAMP");
 
 pub mod agent_context;
+pub mod codebase_rules;
 pub mod context_recipes;
 pub mod conversation;
 pub mod dynamic;

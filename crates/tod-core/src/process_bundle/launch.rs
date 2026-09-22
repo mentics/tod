@@ -142,6 +142,7 @@ pub fn build_fleet_agent_prompt(
          When you finish this slice of work, summarize what you did and any \
          blockers.\n",
     )
+    .map(|prompt| crate::codebase_rules::with_codebase_rules(prompt, cwd))
 }
 
 #[cfg(test)]

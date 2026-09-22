@@ -682,6 +682,13 @@ impl InterviewDriver {
             }
         };
 
+        let cwd = self.cwd()?;
+        // An agent running in a codebase gets its rules, whatever its role.
+        let opening = opening.map(|opening| SessionOpening {
+            context: opening
+                .context
+                .map(|context| crate::codebase_rules::with_codebase_rules(context, &cwd)),
+        });
         let key = session_key(session_id);
         let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let title = format!(
@@ -698,7 +705,7 @@ impl InterviewDriver {
             key: key.clone(),
             owner_id: self.config.node_id.to_string(),
             title,
-            cwd: self.cwd()?,
+            cwd,
             options: self.config.launch.clone(),
             resume_session_id: resume,
             opening,

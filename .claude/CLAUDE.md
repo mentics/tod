@@ -188,9 +188,15 @@ block renderers live in `tod_core::dynamic` and know nothing about which
 surface they are serving; anything surface-specific is a parameter on the block
 (e.g. `SelectedObligation { fallback }`).
 
-The tests in `context_recipes` enforce the rules above — missing fragments are
-skipped silently at load time, so an unregistered or misspelled recipe is
-caught only there.
+The tests in `context_recipes` enforce the rules above. A missing fragment is
+an error at load time (the agent is not launched), and the tests catch a
+misspelled recipe before it ever ships.
+
+One fragment is not in any recipe: `workspace/codebase` (no dev containers)
+is compiled into `tod_core::codebase_rules` and appended to the opening of
+**every** agent whose working directory is inside a git checkout, at each
+launch site (conversation driver, interview driver, fleet prompt, visual-design
+chat). A new launch site must call `with_codebase_rules` too.
 
 To add a surface: write a `surface/*.md`, add a `ContextRecipe` const, register
 it in `ALL_RECIPES`, and call `build_message`. `doc/agent-context-map.md` maps

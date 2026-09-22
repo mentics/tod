@@ -85,18 +85,22 @@ fn find_dev_media_root(start: &Path) -> Option<PathBuf> {
 /// `crate::gate::context` for the lists each surface uses), so a fragment
 /// like the interactive-chat behavior rules or the `tod-cli` command
 /// reference is included only where it actually applies, and each is
-/// authored once and shared by every caller that needs it. Missing fragments
-/// are skipped, so a caller can list a fragment that not every install
-/// ships.
+/// authored once and shared by every caller that needs it. A missing
+/// fragment is an error: every fragment ships in the same bundle, so one that
+/// is absent is a typo or a broken install, and an agent must never be
+/// launched without instructions it was meant to have.
 pub fn load_static_context(paths: &MediaPaths, keys: &[&str]) -> Result<String> {
     let root = paths.context_root();
 
     let mut out = String::new();
     for key in keys {
         let layer = root.join(format!("{key}.md"));
-        let Ok(text) = std::fs::read_to_string(&layer) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(&layer).with_context(|| {
+            format!(
+                "context fragment {key:?} is missing: could not read {}",
+                layer.display()
+            )
+        })?;
         if !out.is_empty() {
             out.push_str("\n\n---\n\n");
         }
@@ -150,10 +154,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_key_is_skipped_not_fatal() {
+    fn missing_key_is_an_error_naming_it() {
         let (_d, paths) = fixture();
-        let text = load_static_context(&paths, &["app", "nonexistent"]).unwrap();
-        assert_eq!(text, "APP");
+        let err = load_static_context(&paths, &["app", "nonexistent"]).unwrap_err();
+        assert!(format!("{err:#}").contains("\"nonexistent\""), "{err:#}");
     }
 
     #[test]
