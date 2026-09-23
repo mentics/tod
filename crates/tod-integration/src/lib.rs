@@ -8,6 +8,7 @@ mod data_source;
 pub mod linear;
 pub mod linear_query;
 pub mod mock;
+pub mod ntfy;
 pub mod preset;
 
 pub use data_source::{

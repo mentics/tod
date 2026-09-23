@@ -294,6 +294,26 @@ impl FleetStore {
         crate::journey_submissions::JourneySubmissionRepo::new(&conn).queued_milestones_for_node(node_id)
     }
 
+    /// Every `journey_submissions` entry with `status`
+    /// (`crate::journey_submissions::JourneySubmissionRepo::list_by_status`).
+    /// Used by the submission worker to find entries due to send or resend.
+    pub fn list_journey_submissions_by_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).list_by_status(status)
+    }
+
+    /// Looks up one `journey_submissions` entry by bundle id.
+    pub fn get_journey_submission(
+        &self,
+        bundle_id: uuid::Uuid,
+    ) -> Result<Option<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).get_by_bundle(bundle_id)
+    }
+
     /// Enqueue a fleet mutation for the async writer.
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
         if self.migration.is_some() {
