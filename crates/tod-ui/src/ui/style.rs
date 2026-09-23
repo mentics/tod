@@ -84,6 +84,15 @@ pub mod color {
     pub fn incoming_text() -> Hsla {
         hex(0xfacc15ff)
     }
+    pub fn callout_warning_fill() -> Hsla {
+        hex(0x7f1d1d33)
+    }
+    pub fn callout_warning_edge() -> Hsla {
+        hex(0xef4444ff)
+    }
+    pub fn callout_warning_text() -> Hsla {
+        hex(0xfca5a5ff)
+    }
     pub fn divider_strong() -> Hsla {
         hex(0xa3a3a380)
     }
@@ -380,6 +389,30 @@ pub fn callout_stale_title<E: Styled>(el: E) -> E {
     el.text_size(font::BODY)
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(color::stale_text())
+}
+
+/// `styles.callout-warning`: a stronger, red warning callout — distinct from
+/// `callout_stale`'s orange "this state may no longer hold" meaning. Used for
+/// the journeys-leave-this-computer warnings (spec §9.1).
+pub fn callout_warning<E: Styled>(el: E) -> E {
+    el.flex()
+        .flex_col()
+        .gap(space::RELATED)
+        .px(space::INSET)
+        .py(space::RELATED)
+        .rounded(radius::CONTROL)
+        .border(size::BORDER)
+        .border_color(color::callout_warning_edge())
+        .bg(color::callout_warning_fill())
+        .text_size(font::DENSE)
+        .text_color(color::callout_warning_text())
+}
+
+/// `styles.callout-warning-title`.
+pub fn callout_warning_title<E: Styled>(el: E) -> E {
+    el.text_size(font::BODY)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(color::callout_warning_text())
 }
 
 /// `styles.node-title-pending-changes`: a tree row title whose node has

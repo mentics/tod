@@ -333,6 +333,18 @@ styles:
     extends: callout-stale
     font: title
     text-case: sentence
+  callout-warning:
+    color: callout-warning-text
+    background: callout-warning-fill
+    border: callout-warning-edge
+    radius: control
+    padding-x: inset
+    padding-y: related
+    gap: related
+  callout-warning-title:
+    extends: callout-warning
+    font: title
+    text-case: sentence
     text-end: no-period
   node-title-pending-changes:
     # A tree row whose node has incoming changes it has not been checked
@@ -432,6 +444,9 @@ tokens:
     stale-fill: "#f9731626"
     stale-edge: "#f97316"
     stale-text: "#fdba74"
+    callout-warning-fill: "#7f1d1d33"
+    callout-warning-edge: "#ef4444"
+    callout-warning-text: "#fca5a5"
     incoming-text: "#facc15"
     notice-fill: "#ffff00"
     notice-text: "#000000"

@@ -6,6 +6,7 @@ use crate::interview::settings::{
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::list::{ListArrowDown, ListArrowUp};
+use crate::ui::style;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -17,12 +18,13 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme, IndexPath, Selectable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, IndexPath, Selectable, StyledExt, h_flex, v_flex};
 use std::path::PathBuf;
 use std::time::Duration;
 use tod_core::logging;
+use tod_journey::RelayCode;
 use tod_store::fleet::default_terminal_hint;
-use tod_store::settings::DEFAULT_TREEHOUSE_EXECUTABLE;
+use tod_store::settings::{DEFAULT_TREEHOUSE_EXECUTABLE, JourneySettings};
 use tod_store::{AgentRole, efforts_for, models_for, parse_platform};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -31,13 +33,20 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 5] = [
+const SECTIONS: [SettingsSection; 6] = [
     SettingsSection::Agents,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
     SettingsSection::Logging,
+    SettingsSection::Journeys,
 ];
+
+/// Spec §9.1's first warning callout, verbatim.
+const JOURNEYS_WARNING: &str = "Journeys leave this computer. They are encrypted so that only the receiving computer can read them, but they are delivered to a computer that is not managed by your employer. If this is a work computer, make sure your employer's policy allows it before turning this on. Transcripts are left out unless you include them below.";
+
+/// Spec §9.1's shorter warning, repeated beside Include transcripts.
+const JOURNEYS_TRANSCRIPTS_WARNING: &str = "Transcripts can contain anything you or the agent typed or read, including code and data from your work.";
 
 actions!(
     settings,
@@ -103,6 +112,7 @@ enum SettingsSection {
     AnswerProcessor,
     Workspaces,
     Logging,
+    Journeys,
 }
 
 impl SettingsSection {
@@ -113,6 +123,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
             Self::Logging => "Logging",
+            Self::Journeys => "Journeys",
         }
     }
 
@@ -123,6 +134,7 @@ impl SettingsSection {
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
             Self::Logging => "logging",
+            Self::Journeys => "journeys",
         }
     }
 
@@ -145,6 +157,14 @@ impl SettingsSection {
                 TerminalProgram,
             ],
             Self::Logging => &[LogLevel, LogMaxSize],
+            Self::Journeys => &[
+                JourneysSend,
+                JourneysIncludeTranscripts,
+                JourneysRelayCode,
+                JourneysSendTest,
+                JourneysMilestoneStates,
+                JourneysStorageCap,
+            ],
         }
     }
 }
@@ -165,6 +185,12 @@ enum SettingField {
     LogMaxSize,
     ChatLaunchMode,
     MaxParallelSessions,
+    JourneysSend,
+    JourneysIncludeTranscripts,
+    JourneysRelayCode,
+    JourneysSendTest,
+    JourneysMilestoneStates,
+    JourneysStorageCap,
 }
 
 impl SettingField {
@@ -185,6 +211,12 @@ impl SettingField {
             Self::LogMaxSize => "log-max-size",
             Self::ChatLaunchMode => "chat-launch-mode",
             Self::MaxParallelSessions => "max-parallel-sessions",
+            Self::JourneysSend => "journeys-send",
+            Self::JourneysIncludeTranscripts => "journeys-include-transcripts",
+            Self::JourneysRelayCode => "journeys-relay-code",
+            Self::JourneysSendTest => "journeys-send-test",
+            Self::JourneysMilestoneStates => "journeys-milestone-states",
+            Self::JourneysStorageCap => "journeys-storage-cap",
         }
     }
 }
@@ -286,6 +318,8 @@ pub struct SettingsView {
     terminal_program_input: Entity<InputState>,
     treehouse_worktrees_root_input: Entity<InputState>,
     treehouse_executable_input: Entity<InputState>,
+    relay_code_input: Entity<InputState>,
+    milestone_states_input: Entity<InputState>,
     agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
@@ -295,15 +329,22 @@ pub struct SettingsView {
     terminal_program_editing: bool,
     treehouse_worktrees_root_editing: bool,
     treehouse_executable_editing: bool,
+    relay_code_editing: bool,
+    milestone_states_editing: bool,
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
     /// Setting keys changed since the last flush, recorded to the app
     /// journey when the debounce actually writes them (spec §7, §8).
     pending_changed_keys: Vec<String>,
+    /// Result of the last "Send a test" click, if any (spec §9.1, §9.7).
+    journeys_test_status: Option<Result<SharedString, SharedString>>,
+    journeys_test_sending: bool,
     _terminal_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
     _treehouse_executable_subscription: Subscription,
+    _relay_code_subscription: Subscription,
+    _milestone_states_subscription: Subscription,
 }
 
 impl SettingsView {
@@ -383,6 +424,37 @@ impl SettingsView {
                 }
             });
 
+        let relay_code_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Paste a relay code (todj1:…)")
+                .default_value(settings.journeys.relay_code.clone().unwrap_or_default())
+        });
+        let _relay_code_subscription =
+            cx.subscribe(&relay_code_input, |this, input, event, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let text = input.read(cx).text().to_string();
+                    let trimmed = text.trim();
+                    let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                    if this.settings.journeys.relay_code != next {
+                        this.settings.journeys.relay_code = next;
+                        this.schedule_save("journeys.relay_code", cx);
+                    }
+                    cx.notify();
+                }
+            });
+        let milestone_states_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Comma-separated lifecycle states")
+                .default_value(settings.journeys.milestone_states.join(", "))
+        });
+        let _milestone_states_subscription =
+            cx.subscribe(&milestone_states_input, |this, input, event, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    let text = input.read(cx).text().to_string();
+                    this.apply_milestone_states_input(text, cx);
+                }
+            });
+
         let agent_selects = AgentRole::ALL
             .into_iter()
             .map(|role| AgentRoleSelects::new(role, &settings, window, cx))
@@ -395,6 +467,8 @@ impl SettingsView {
             terminal_program_input,
             treehouse_worktrees_root_input,
             treehouse_executable_input,
+            relay_code_input,
+            milestone_states_input,
             agent_selects,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
@@ -404,14 +478,58 @@ impl SettingsView {
             terminal_program_editing: false,
             treehouse_worktrees_root_editing: false,
             treehouse_executable_editing: false,
+            relay_code_editing: false,
+            milestone_states_editing: false,
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
             pending_changed_keys: Vec::new(),
+            journeys_test_status: None,
+            journeys_test_sending: false,
             _terminal_subscription,
             _treehouse_worktrees_root_subscription,
             _treehouse_executable_subscription,
+            _relay_code_subscription,
+            _milestone_states_subscription,
         }
+    }
+
+    /// Parses a comma-separated milestone-state list, validating each name
+    /// the same way `TodSettings::validate` does (via a probe
+    /// `JourneySettings`, since `tod-store`'s valid-states list is private).
+    fn apply_milestone_states_input(&mut self, raw: String, cx: &mut Context<Self>) {
+        let states: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !Self::milestone_states_valid(&states) {
+            tracing::warn!("invalid journeys milestone states: {raw}");
+            return;
+        }
+        if self.settings.journeys.milestone_states == states {
+            return;
+        }
+        self.settings.journeys.milestone_states = states;
+        self.schedule_save("journeys.milestone_states", cx);
+        cx.notify();
+    }
+
+    fn milestone_states_valid(states: &[String]) -> bool {
+        let probe = JourneySettings {
+            send: false,
+            milestone_states: states.to_vec(),
+            ..JourneySettings::default()
+        };
+        probe.validate().is_ok()
+    }
+
+    fn relay_code_valid(&self) -> bool {
+        self.settings
+            .journeys
+            .relay_code
+            .as_deref()
+            .is_some_and(|code| RelayCode::parse(code).is_ok())
     }
 
     fn apply_treehouse_worktrees_root_input(&mut self, raw: String, cx: &mut Context<Self>) {
@@ -439,6 +557,8 @@ impl SettingsView {
         self.terminal_program_editing
             || self.treehouse_worktrees_root_editing
             || self.treehouse_executable_editing
+            || self.relay_code_editing
+            || self.milestone_states_editing
     }
 
     fn exit_text_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -449,6 +569,8 @@ impl SettingsView {
             self.treehouse_worktrees_root_editing = false;
         }
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -462,6 +584,8 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
         self.active_section = section;
         self.selected_field_index = 0;
         self.selected_agent_column = 0;
@@ -521,6 +645,8 @@ impl SettingsView {
         self.terminal_program_editing = false;
         self.treehouse_worktrees_root_editing = false;
         self.treehouse_executable_editing = false;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = false;
         self.active_section = SECTIONS[next];
         self.selected_field_index = 0;
         self.focus_region = SettingsFocus::Sidebar;
@@ -595,6 +721,17 @@ impl SettingsView {
                 let step = if delta >= 0 { 1024 } else { -1024 };
                 self.step_log_max_size(step, cx);
             }
+            SettingField::JourneysSend => self.toggle_journeys_send(cx),
+            SettingField::JourneysIncludeTranscripts => {
+                self.toggle_journeys_include_transcripts(cx)
+            }
+            SettingField::JourneysStorageCap => {
+                let step = if delta >= 0 { 64 } else { -64 };
+                self.step_journeys_storage_cap(step, cx);
+            }
+            SettingField::JourneysRelayCode
+            | SettingField::JourneysSendTest
+            | SettingField::JourneysMilestoneStates => {}
         }
     }
 
@@ -613,6 +750,13 @@ impl SettingsView {
             }
             SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
+            SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
+            SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
+            SettingField::JourneysSendTest => self.send_journeys_test(cx),
+            SettingField::JourneysSend => self.toggle_journeys_send(cx),
+            SettingField::JourneysIncludeTranscripts => {
+                self.toggle_journeys_include_transcripts(cx)
+            }
             _ => {
                 // Cycle/step fields: Enter bumps forward like `=`.
                 self.adjust_selected(1, cx);
@@ -746,6 +890,115 @@ impl SettingsView {
                 input.focus(window, cx);
             });
         });
+    }
+
+    fn enter_relay_code_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysRelayCode) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.milestone_states_editing = false;
+        self.relay_code_editing = true;
+        cx.notify();
+        let input = self.relay_code_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    fn enter_milestone_states_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysMilestoneStates) {
+            return;
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.relay_code_editing = false;
+        self.milestone_states_editing = true;
+        cx.notify();
+        let input = self.milestone_states_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| {
+                input.focus(window, cx);
+            });
+        });
+    }
+
+    /// Toggles "Send journeys to development". Disabled (no-op) until the
+    /// relay code parses (spec §9.1: "Sending cannot be turned on until a
+    /// valid code is entered"). Turning it off also turns off "Include
+    /// transcripts", which is only meaningful while sending is on.
+    fn toggle_journeys_send(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.journeys.send && !self.relay_code_valid() {
+            return;
+        }
+        self.settings.journeys.send = !self.settings.journeys.send;
+        if !self.settings.journeys.send {
+            self.settings.journeys.include_transcripts = false;
+        }
+        self.schedule_save("journeys.send", cx);
+        cx.notify();
+    }
+
+    /// Toggles "Include transcripts". Disabled while sending is off.
+    fn toggle_journeys_include_transcripts(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.journeys.send {
+            return;
+        }
+        self.settings.journeys.include_transcripts = !self.settings.journeys.include_transcripts;
+        self.schedule_save("journeys.include_transcripts", cx);
+        cx.notify();
+    }
+
+    fn step_journeys_storage_cap(&mut self, delta_mb: i64, cx: &mut Context<Self>) {
+        let cap = &mut self.settings.journeys.storage_cap_mb;
+        *cap = if delta_mb >= 0 {
+            cap.saturating_add(delta_mb as u64)
+        } else {
+            cap.saturating_sub((-delta_mb) as u64).max(1)
+        };
+        self.schedule_save("journeys.storage_cap_mb", cx);
+        cx.notify();
+    }
+
+    /// "Send a test" (spec §9.1, §9.7): seals a tiny payload and `put`s it to
+    /// the configured relay on a background thread, then shows the result
+    /// inline next to the button.
+    fn send_journeys_test(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.selected_field(), SettingField::JourneysSendTest) {
+            return;
+        }
+        if self.journeys_test_sending {
+            return;
+        }
+        let Some(code) = self.settings.journeys.relay_code.clone() else {
+            self.journeys_test_status = Some(Err(SharedString::from("No relay code configured")));
+            cx.notify();
+            return;
+        };
+        self.journeys_test_sending = true;
+        self.journeys_test_status = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<()> = cx
+                .background_spawn(async move {
+                    use tod_core::journey::Relay;
+                    let relay = tod_core::journey::NtfyRelay::parse(&code)?;
+                    let payload = b"tod journeys test".to_vec();
+                    let sealed = tod_journey::seal::seal(relay.recipient(), &payload)?;
+                    relay.put("test.journey.age", &sealed)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.journeys_test_sending = false;
+                this.journeys_test_status = Some(match result {
+                    Ok(()) => Ok(SharedString::from("Test bundle accepted by the relay")),
+                    Err(err) => Err(SharedString::from(format!("Failed: {err:#}"))),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -993,13 +1246,30 @@ fn catalog_strings(items: &[&str]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::step_u32;
+    use super::{SettingsView, step_u32};
 
     #[test]
     fn step_increments_and_decrements() {
         assert_eq!(step_u32(8, 1), 9);
         assert_eq!(step_u32(8, -1), 7);
         assert_eq!(step_u32(0, -1), 0);
+    }
+
+    #[test]
+    fn milestone_states_valid_accepts_known_lifecycle_states() {
+        let states = vec!["active".to_string(), "review".to_string()];
+        assert!(SettingsView::milestone_states_valid(&states));
+    }
+
+    #[test]
+    fn milestone_states_valid_rejects_unknown_state() {
+        let states = vec!["active".to_string(), "not-a-real-state".to_string()];
+        assert!(!SettingsView::milestone_states_valid(&states));
+    }
+
+    #[test]
+    fn milestone_states_valid_accepts_empty_list() {
+        assert!(SettingsView::milestone_states_valid(&[]));
     }
 }
 
@@ -1046,6 +1316,30 @@ impl Render for SettingsView {
             self.treehouse_executable_editing,
             cx,
         );
+        key_context::set_input_tab_stop(&self.relay_code_input, self.relay_code_editing, cx);
+        key_context::set_input_tab_stop(
+            &self.milestone_states_input,
+            self.milestone_states_editing,
+            cx,
+        );
+        if !self.relay_code_editing
+            && self
+                .relay_code_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_relay_code_edit(window, cx);
+        }
+        if !self.milestone_states_editing
+            && self
+                .milestone_states_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        {
+            self.enter_milestone_states_edit(window, cx);
+        }
         if !self.treehouse_executable_editing
             && self
                 .treehouse_executable_input
@@ -1413,6 +1707,66 @@ impl SettingsView {
                     |this, _, cx| this.step_log_max_size(1024, cx),
                 ))
                 .into_any_element(),
+            SettingsSection::Journeys => {
+                let journeys = &self.settings.journeys;
+                let relay_valid = self.relay_code_valid();
+                let mut rows = v_flex()
+                    .gap_1()
+                    .child(journeys_warning_callout(JOURNEYS_WARNING, theme))
+                    .child(toggle_row(
+                        cx,
+                        self,
+                        SettingField::JourneysSend,
+                        journeys.send,
+                        !relay_valid,
+                        "Send journeys to development",
+                        "While off, reports and milestones are still recorded locally but nothing leaves this computer. Requires a valid relay code below.",
+                        theme,
+                        |this, cx| this.toggle_journeys_send(cx),
+                    ))
+                    .child(journeys_include_transcripts_row(cx, self, theme));
+                rows = rows
+                    .child(relay_code_row(
+                        cx,
+                        self,
+                        &self.relay_code_input,
+                        self.relay_code_editing,
+                        theme,
+                    ))
+                    .child(journeys_send_test_row(cx, self, theme))
+                    .child(text_input_row(
+                        cx,
+                        self,
+                        SettingField::JourneysMilestoneStates,
+                        "Milestone states",
+                        "Comma-separated lifecycle states that trigger a milestone bundle. Default: active, verifying, review, approved, done.",
+                        &self.milestone_states_input,
+                        self.milestone_states_editing,
+                        theme,
+                    ))
+                    .child(stepper_row(
+                        cx,
+                        self,
+                        SettingField::JourneysStorageCap,
+                        format!("{} MB", journeys.storage_cap_mb),
+                        "Journey storage cap",
+                        "Total on-disk cap across every journey before the oldest are pruned. Default 1024 MB.",
+                        theme,
+                        |this, _, cx| this.step_journeys_storage_cap(-64, cx),
+                        |this, _, cx| this.step_journeys_storage_cap(64, cx),
+                    ));
+                if let Some(err) = tod_core::journey::worker_last_error() {
+                    rows = rows.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .whitespace_normal()
+                            .child(format!("Last delivery error: {err}")),
+                    );
+                }
+                rows.into_any_element()
+            }
         }
     }
 }
@@ -1706,6 +2060,227 @@ fn text_input_row(
                 .focus_bordered(editing)
                 .w_full(),
         )
+}
+
+/// An On/Off row (spec §9.1, implementation plan step 8d): unlike
+/// `cycle_row`/`stepper_row` (which step through an ordered list with
+/// `-`/`=`), this has exactly two states and is flipped by Enter, Space, or a
+/// click on the pill — `-`/`=` also flip it, via `adjust_selected`, so the
+/// keyboard story matches every other row. `disabled` greys the row out and
+/// makes the toggle a no-op (the caller's `on_toggle` is expected to already
+/// guard the transition, e.g. `toggle_journeys_send`; this only affects
+/// rendering and the mouse click here).
+#[allow(clippy::too_many_arguments)]
+fn toggle_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    field: SettingField,
+    value: bool,
+    disabled: bool,
+    label: impl Into<SharedString>,
+    help: impl Into<SharedString>,
+    theme: &gpui_component::Theme,
+    on_toggle: impl Fn(&mut SettingsView, &mut Context<SettingsView>) + 'static,
+) -> impl IntoElement {
+    let selected = view.field_selected(field);
+    let id = field.id();
+    let label = label.into();
+    let help = help.into();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_start()
+        .when(disabled, |el| el.opacity(0.5))
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_semibold()
+                        .text_color(theme.foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .whitespace_normal()
+                        .child(help),
+                ),
+        )
+        .child(
+            Button::new(SharedString::from(format!("{id}-toggle")))
+                .label(if value { "On" } else { "Off" })
+                .selected(value)
+                .disabled(disabled)
+                .tab_stop(false)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    on_toggle(this, cx);
+                })),
+        )
+}
+
+fn journeys_warning_callout(text: &str, theme: &gpui_component::Theme) -> impl IntoElement {
+    let _ = theme;
+    style::callout_warning(v_flex().w_full()).child(
+        style::callout_warning_title(div()).child(SharedString::from(text.to_string())),
+    )
+}
+
+fn journeys_include_transcripts_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let send_on = view.settings.journeys.send;
+    let on = view.settings.journeys.include_transcripts;
+    v_flex()
+        .w_full()
+        .gap_2()
+        .child(toggle_row(
+            cx,
+            view,
+            SettingField::JourneysIncludeTranscripts,
+            on,
+            !send_on,
+            "Include transcripts",
+            "Off by default. What the user typed, what the agent read and wrote, and its prompts are the most likely place for sensitive data.",
+            theme,
+            |this, cx| this.toggle_journeys_include_transcripts(cx),
+        ))
+        .when(on, |el| {
+            el.child(
+                div()
+                    .px_3()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .whitespace_normal()
+                    .child(JOURNEYS_TRANSCRIPTS_WARNING),
+            )
+        })
+}
+
+fn relay_code_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    input: &Entity<InputState>,
+    editing: bool,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let code = view.settings.journeys.relay_code.clone();
+    let error = code.as_deref().and_then(|c| {
+        if c.trim().is_empty() {
+            None
+        } else {
+            RelayCode::parse(c).err().map(|e| format!("{e:#}"))
+        }
+    });
+    v_flex()
+        .w_full()
+        .gap_1()
+        .child(text_input_row(
+            cx,
+            view,
+            SettingField::JourneysRelayCode,
+            "Relay code",
+            "One pasted string holding the recipient's public key, the relay server, and the two topics. Sending cannot be turned on until this parses.",
+            input,
+            editing,
+            theme,
+        ))
+        .when_some(error, |el, err| {
+            el.child(
+                div()
+                    .px_3()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .whitespace_normal()
+                    .child(format!("Invalid relay code: {err}")),
+            )
+        })
+}
+
+fn journeys_send_test_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let field = SettingField::JourneysSendTest;
+    let selected = view.field_selected(field);
+    let sending = view.journeys_test_sending;
+    let disabled = view.settings.journeys.relay_code.is_none() || sending;
+    let status = view.journeys_test_status.clone();
+
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_center()
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            v_flex().flex_1().min_w_0().gap_1().child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child("Send a test"),
+            ),
+        )
+        .child(
+            Button::new("journeys-send-test-button")
+                .label(if sending { "Sending…" } else { "Send a test" })
+                .disabled(disabled)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.focus_region = SettingsFocus::Panel;
+                    this.focus_handle.focus(window, cx);
+                    this.send_journeys_test(cx);
+                })),
+        )
+        .when_some(status, |el, status| match status {
+            Ok(msg) => el.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .whitespace_normal()
+                    .child(msg),
+            ),
+            Err(msg) => el.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.danger)
+                    .whitespace_normal()
+                    .child(msg),
+            ),
+        })
 }
 
 fn read_only_row(
