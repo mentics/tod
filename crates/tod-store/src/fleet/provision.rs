@@ -35,13 +35,15 @@ pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<Workdir> 
 
 /// Set up (or reuse) the worktree for the node owning `node_id`'s Files capability,
 /// using git or Treehouse per settings, and record it on that node. For a
-/// repository inside a dev container, git or Treehouse runs there.
+/// repository inside a dev container, git or Treehouse runs there. Returns
+/// the worktree and what set up only partly (a submodule left off the
+/// branch), for the user.
 pub fn setup_worktree_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
     node_id: &str,
-) -> Result<Workdir> {
+) -> Result<(Workdir, Vec<String>)> {
     let files = resolve_files(fleet, node_id)?;
     if !files.use_worktree {
         bail!("Turn on the worktree flag (Files) before setting up a worktree");
@@ -51,7 +53,7 @@ pub fn setup_worktree_for_node(
     }
     if let Some(dir) = files.worktree_dir() {
         if dir.is_dir() {
-            return Ok(dir);
+            return Ok((dir, Vec::new()));
         }
     }
     let repo = files
@@ -63,21 +65,23 @@ pub fn setup_worktree_for_node(
     let lease_holder = format!("tod-{owner}");
     let data_root = settings.resolve_fleet_storage_root(paths)?;
 
-    let handle: WorktreeHandle = {
-        let projection = fleet.projection();
-        let guard = projection.lock().expect("fleet projection mutex");
-        let conn = guard.connection();
-        worktree::ensure_worktree(
-            &conn,
-            settings.worktree_backend,
-            settings,
-            paths,
-            &data_root,
-            &repo_path,
-            &branch,
-            &lease_holder,
-        )?
-    };
+    // No store lock is held while git, Docker, or Treehouse run: the UI reads
+    // the store on every frame.
+    let handle: WorktreeHandle = worktree::ensure_worktree(
+        &|repo, branch| {
+            fleet.read(|conn| {
+                crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
+                    .resolve_shared_worktree_path(repo, branch)
+            })
+        },
+        settings.worktree_backend,
+        settings,
+        paths,
+        &data_root,
+        &repo_path,
+        &branch,
+        &lease_holder,
+    )?;
 
     fleet.enqueue(FleetMutation::UpdateNodeWorktree {
         node_id: owner,
@@ -91,7 +95,7 @@ pub fn setup_worktree_for_node(
     if !handle.path.is_dir() {
         bail!("set-up worktree missing at {}", handle.path);
     }
-    Ok(handle.path)
+    Ok((handle.path, handle.warnings))
 }
 
 /// Change the branch of the node owning `node_id`'s Files capability while its

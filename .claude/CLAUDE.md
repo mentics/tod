@@ -327,7 +327,11 @@ Nothing starts or builds a container; tod only uses a running one.
   `TREEHOUSE_NO_UPDATE_CHECK=1`; none of tod's Treehouse settings apply.
   Wherever it runs, a lease asks for `--submodules` when the repository has
   a `.gitmodules`, and a new git worktree runs `git submodule update --init
-  --recursive`.
+  --recursive`. Either way `ensure_worktree` then initializes any submodule
+  still left out and puts every submodule on the node's branch; what it
+  could not do comes back as `WorktreeHandle::warnings` and is shown in the
+  Files section. It runs with no store lock held (the shared-worktree lookup
+  is a short `fleet.read`), so the UI never waits on git or Docker.
 - **Mounted** (`container_repo_on_host`): the repository is on this machine,
   git runs here, and only launches go into the container. The directory there
   is mapped through the container's mounts.

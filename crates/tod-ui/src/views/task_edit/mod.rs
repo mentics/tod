@@ -1453,8 +1453,16 @@ impl TaskEditView {
                 .background_spawn(async move {
                     let settings = TodSettings::load(&paths).unwrap_or_default();
                     if setup {
-                        setup_worktree_for_node(&fleet, &paths, &settings, &task_id)
-                            .map(|path| format!("Worktree ready at {path}"))
+                        setup_worktree_for_node(&fleet, &paths, &settings, &task_id).map(
+                            |(path, warnings)| {
+                                let mut message = format!("Worktree ready at {path}");
+                                for warning in warnings {
+                                    message.push_str(&format!("
+{warning}"));
+                                }
+                                message
+                            },
+                        )
                     } else {
                         release_worktree_for_node(&fleet, &paths, &settings, &task_id)
                             .map(|()| "Worktree released".to_string())
