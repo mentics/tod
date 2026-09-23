@@ -368,6 +368,23 @@ pub struct Manifest {
 pub struct Blob {
     #[serde(default)]
     pub mime: String,
-    #[serde(default)]
+    #[serde(default, with = "serde_bytes")]
     pub bytes: Vec<u8>,
+}
+
+#[cfg(test)]
+mod blob_tests {
+    use super::Blob;
+
+    #[test]
+    fn blob_bytes_encode_as_a_cbor_byte_string() {
+        let blob = Blob { mime: "image/png".into(), bytes: vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3] };
+        let mut out = Vec::new();
+        ciborium::into_writer(&blob, &mut out).unwrap();
+        // Byte string header (major type 2, length 8) immediately before the payload.
+        let needle = [0x48, 0x89, b'P', b'N', b'G', 0, 1, 2, 3];
+        assert!(out.windows(needle.len()).any(|w| w == needle), "not a byte string: {out:02x?}");
+        let back: Blob = ciborium::from_reader(out.as_slice()).unwrap();
+        assert_eq!(back, blob);
+    }
 }
