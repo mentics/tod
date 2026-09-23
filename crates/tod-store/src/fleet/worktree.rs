@@ -2,9 +2,10 @@
 //!
 //! Every function works on a [`Workdir`]: git runs on this machine for a
 //! repository here, and inside the dev container (via `docker exec`) for one
-//! that lives there.
+//! that lives there. So does Treehouse: in a container it is the `treehouse`
+//! on the container's `PATH`, with the container's own configuration.
 
-use crate::fleet::treehouse::TreehouseInvocation;
+use crate::fleet::treehouse::{TREEHOUSE_NO_UPDATE_CHECK_ENV, TreehouseInvocation};
 use crate::fleet::workdir::{Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
@@ -375,23 +376,55 @@ struct TreehouseLeaseJson {
     lease_holder: String,
 }
 
+/// Whether Treehouse can serve `repo`: the configured executable here, or a
+/// `treehouse` in the repository's dev container.
+fn treehouse_available_for(repo: &Workdir, settings: &TodSettings) -> bool {
+    match repo {
+        Workdir::Host(_) => treehouse_available(settings),
+        Workdir::Container { container, .. } => {
+            matches!(container_treehouse(container), Ok(Some(_)))
+        }
+    }
+}
+
+/// The `treehouse` in `container`: the one on its `PATH`, which sets up its
+/// own environment there. Tod's settings for Treehouse name paths on this
+/// machine, so none of them apply.
+fn container_treehouse(container: &str) -> Result<Option<String>> {
+    tod_agent::devcontainer::ContainerExec::connect(container)?.find_program("treehouse")
+}
+
+/// Run Treehouse with `args` in `dir`, which is in a dev container.
+fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process::Output> {
+    let container = dir.container_name().context("not a container directory")?;
+    let program = container_treehouse(container)?.with_context(|| {
+        format!("No `treehouse` on the PATH in dev container {container}: install it there")
+    })?;
+    let no_update_check = format!("{TREEHOUSE_NO_UPDATE_CHECK_ENV}=1");
+    let mut all = vec![no_update_check.as_str(), program.as_str()];
+    all.extend_from_slice(args);
+    dir.output("env", &all)
+}
+
 fn treehouse_get_lease(
-    repo: &Path,
+    repo: &Workdir,
     holder: &str,
     settings: &TodSettings,
     paths: &TodPaths,
 ) -> Result<WorktreeHandle> {
-    let invocation = TreehouseInvocation::resolve(settings, paths)?;
-    let mut command = invocation.command();
-    let output = command
-        .current_dir(repo)
-        .arg("get")
-        .arg("--lease")
-        .arg("--lease-holder")
-        .arg(holder)
-        .arg("--json")
-        .output()
-        .context("spawn treehouse get --lease")?;
+    let args = ["get", "--lease", "--lease-holder", holder, "--json"];
+    let output = match repo {
+        Workdir::Host(repo) => {
+            let invocation = TreehouseInvocation::resolve(settings, paths)?;
+            invocation
+                .command()
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .context("spawn treehouse get --lease")?
+        }
+        Workdir::Container { .. } => run_container_treehouse(repo, &args)?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("treehouse get --lease failed: {}", stderr.trim());
@@ -399,7 +432,7 @@ fn treehouse_get_lease(
     let parsed: TreehouseLeaseJson =
         serde_json::from_slice(&output.stdout).context("parse treehouse get --json stdout")?;
     Ok(WorktreeHandle {
-        path: Workdir::host(parsed.path),
+        path: repo.at(&parsed.path),
         lease: Some(TreehouseLease {
             lease_id: parsed.lease_id,
             lease_holder: parsed.lease_holder,
@@ -441,9 +474,8 @@ fn git_worktree(data_root: &Path, repo: &Workdir, branch: &str) -> Result<Worktr
     Ok(WorktreeHandle { path, lease: None })
 }
 
-/// Set up (or reuse) a worktree of `repo` for `branch`. Treehouse only
-/// manages repositories on this machine; one in a dev container always gets
-/// a git worktree.
+/// Set up (or reuse) a worktree of `repo` for `branch`, with Treehouse or
+/// git per `backend`, wherever the repository is.
 pub fn ensure_worktree(
     conn: &Connection,
     backend: WorktreeBackend,
@@ -478,16 +510,14 @@ pub fn ensure_worktree(
             return Ok(WorktreeHandle { path, lease: None });
         }
 
-        let handle = match (backend, repo) {
-            (_, Workdir::Container { .. }) | (WorktreeBackend::GitOnly, _) => {
-                git_worktree(data_root, repo, &branch_key)?
+        let handle = match backend {
+            WorktreeBackend::GitOnly => git_worktree(data_root, repo, &branch_key)?,
+            WorktreeBackend::TreehouseRequired => {
+                treehouse_get_lease(repo, lease_holder, settings, paths)?
             }
-            (WorktreeBackend::TreehouseRequired, Workdir::Host(host)) => {
-                treehouse_get_lease(host, lease_holder, settings, paths)?
-            }
-            (WorktreeBackend::TreehouseWithGitFallback, Workdir::Host(host)) => {
-                if treehouse_available(settings) {
-                    match treehouse_get_lease(host, lease_holder, settings, paths) {
+            WorktreeBackend::TreehouseWithGitFallback => {
+                if treehouse_available_for(repo, settings) {
+                    match treehouse_get_lease(repo, lease_holder, settings, paths) {
                         Ok(h) => h,
                         Err(err) => {
                             tracing::warn!(
@@ -577,20 +607,28 @@ fn comparable_path(path: &Workdir) -> String {
 
 /// Return a Treehouse lease so the worktree goes back to the pool.
 pub fn treehouse_return(
-    worktree: &Path,
+    worktree: &Workdir,
     lease_id: &str,
     settings: &TodSettings,
     paths: &TodPaths,
 ) -> Result<()> {
-    let invocation = TreehouseInvocation::resolve(settings, paths)?;
-    let mut command = invocation.command();
-    let output = command
-        .arg("return")
-        .arg(worktree)
-        .arg("--if-lease-id")
-        .arg(lease_id)
-        .output()
-        .context("spawn treehouse return")?;
+    let output = match worktree {
+        Workdir::Host(path) => {
+            let invocation = TreehouseInvocation::resolve(settings, paths)?;
+            invocation
+                .command()
+                .arg("return")
+                .arg(path)
+                .arg("--if-lease-id")
+                .arg(lease_id)
+                .output()
+                .context("spawn treehouse return")?
+        }
+        Workdir::Container { path, .. } => run_container_treehouse(
+            &worktree.at("/"),
+            &["return", path, "--if-lease-id", lease_id],
+        )?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("treehouse return failed: {}", stderr.trim());
@@ -813,6 +851,49 @@ mod tests {
         remove_git_worktree(&repo, &handle.path).unwrap();
         assert!(!handle.path.is_dir());
         let _ = scratch.output("rm", &["-rf", &dir]);
+    }
+
+    /// Needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE`: a running container with
+    /// git and a `treehouse` on its `PATH`.
+    #[test]
+    fn a_repository_in_a_dev_container_leases_from_its_treehouse() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER_TREEHOUSE") else {
+            eprintln!("skipping: TOD_TEST_DEV_CONTAINER_TREEHOUSE is not set");
+            return;
+        };
+        let dir = format!("/tmp/tod-th-{}", uuid::Uuid::new_v4());
+        let scratch = Workdir::container(&container, "/tmp");
+        let out = scratch
+            .output(
+                "sh",
+                &[
+                    "-c",
+                    "git init -q -b main \"$1\" && cd \"$1\" && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init",
+                    "sh",
+                    &dir,
+                ],
+            )
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        use crate::paths::{clear_data_root_override, set_data_root};
+        let repo = Workdir::container(&container, &dir);
+        let data_root = std::env::temp_dir().join(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
+        set_data_root(data_root.clone());
+        let paths = TodPaths::discover().unwrap();
+        clear_data_root_override();
+        let settings = TodSettings::default();
+        assert!(treehouse_available_for(&repo, &settings));
+
+        let handle = treehouse_get_lease(&repo, "tod-test", &settings, &paths).unwrap();
+        assert_eq!(handle.path.container_name(), Some(container.as_str()));
+        assert!(handle.path.is_dir());
+        let lease = handle.lease.expect("a lease");
+        assert_eq!(lease.lease_holder, "tod-test");
+
+        treehouse_return(&handle.path, &lease.lease_id, &settings, &paths).unwrap();
+        let _ = scratch.output("rm", &["-rf", &dir]);
+        let _ = fs::remove_dir_all(&data_root);
     }
 
     #[test]

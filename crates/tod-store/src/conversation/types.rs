@@ -257,12 +257,10 @@ pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting
         None => "this machine".into(),
         Some(dev) => {
             let container = dev.container().unwrap_or("(none chosen)");
-            match (dev.repo_on_host, dev.directory()) {
-                (false, _) => format!("dev container {container}"),
-                (true, Some(dir)) => {
-                    format!("dev container {container}, mounted at {dir}")
-                }
-                (true, None) => format!("dev container {container}, mounted"),
+            if dev.repo_on_host {
+                format!("dev container {container}, mounted")
+            } else {
+                format!("dev container {container}")
             }
         }
     }

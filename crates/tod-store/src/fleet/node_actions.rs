@@ -574,7 +574,6 @@ mod tests {
         );
         files.dev_container = Some(DevContainerSetting {
             container: Some("dev".into()),
-            directory: None,
             repo_on_host: true,
         });
         assert_eq!(files.directory(), FilesDirectory::Ready(host));

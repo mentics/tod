@@ -8,7 +8,7 @@ use crate::fleet::cli_relay;
 use crate::fleet::node_actions::ResolvedFiles;
 use crate::fleet::workdir::Workdir;
 use anyhow::Result;
-use std::path::{Component, Path};
+use std::path::Path;
 use tod_agent::AgentEnvironment;
 use tod_agent::devcontainer::{ContainerFile, DevContainerLaunch};
 
@@ -45,11 +45,11 @@ pub fn launch_for(
             let Some(Workdir::Host(root)) = files.ready_directory() else {
                 return Ok(None);
             };
-            let Ok(rest) = host_cwd.strip_prefix(&root) else {
+            if !host_cwd.starts_with(&root) {
                 return Ok(None);
-            };
-            let directory = dev.directory().map(|dir| join_posix(dir, rest));
-            (container.to_string(), host_cwd.clone(), directory)
+            }
+            // The directory inside follows from the container's mounts.
+            (container.to_string(), host_cwd.clone(), None)
         }
     };
     let relay = cli_relay::ensure_started(data_root)?;
@@ -77,17 +77,6 @@ pub fn environment_for(
         Some(launch) => AgentEnvironment::DevContainer(launch),
         None => AgentEnvironment::Host,
     })
-}
-
-fn join_posix(dir: &str, rest: &Path) -> String {
-    let mut out = dir.trim_end_matches('/').to_string();
-    for part in rest.components() {
-        if let Component::Normal(part) = part {
-            out.push('/');
-            out.push_str(&part.to_string_lossy());
-        }
-    }
-    if out.is_empty() { "/".into() } else { out }
 }
 
 #[cfg(test)]
@@ -118,7 +107,6 @@ mod tests {
         let data_root = PathBuf::from("/data");
         let dev = DevContainerSetting {
             container: Some("my-dev".into()),
-            directory: Some("/workspaces/p/".into()),
             repo_on_host: true,
         };
         let on_host = files(&dir, None);
@@ -134,7 +122,7 @@ mod tests {
             .unwrap()
             .expect("container launch");
         assert_eq!(launch.container, "my-dev");
-        assert_eq!(launch.directory.as_deref(), Some("/workspaces/p"));
+        assert_eq!(launch.directory, None);
         assert!(launch.env.iter().any(|(k, _)| k == cli_relay::PORT_ENV));
         assert_eq!(launch.files[0].path, shim_path());
 
@@ -155,12 +143,5 @@ mod tests {
             Some("/workspaces/app/.worktrees/x")
         );
         assert_eq!(launch.host_dir, data_root);
-    }
-
-    #[test]
-    fn subdirectories_follow_an_explicit_container_directory() {
-        assert_eq!(join_posix("/w/p", Path::new("a/b")), "/w/p/a/b");
-        assert_eq!(join_posix("/w/p/", Path::new("")), "/w/p");
-        assert_eq!(join_posix("/", Path::new("")), "/");
     }
 }

@@ -35,7 +35,7 @@ pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<Workdir> 
 
 /// Set up (or reuse) the worktree for the node owning `node_id`'s Files capability,
 /// using git or Treehouse per settings, and record it on that node. For a
-/// repository inside a dev container, git runs there.
+/// repository inside a dev container, git or Treehouse runs there.
 pub fn setup_worktree_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
@@ -179,8 +179,8 @@ pub fn release_worktree_for_node(
     }
     if exists {
         let lease_id = files.worktree_lease_id.as_deref().filter(|s| !s.is_empty());
-        if let (Some(lease_id), Workdir::Host(host)) = (lease_id, &path) {
-            worktree::treehouse_return(host, lease_id, settings, paths)?;
+        if let Some(lease_id) = lease_id {
+            worktree::treehouse_return(&path, lease_id, settings, paths)?;
         } else {
             let shared = fleet.read(|conn| {
                 crate::fleet::repos::node_files::NodeFilesRepo::new(conn)

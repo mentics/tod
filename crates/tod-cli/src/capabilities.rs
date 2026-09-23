@@ -24,7 +24,7 @@ COMMANDS:
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
     set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
-                         [--container <NAME|ID>] [--mounted on|off] [--container-dir <PATH>]
+                         [--container <NAME|ID>] [--mounted on|off]
     set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
@@ -44,8 +44,7 @@ dev container (`--container ''` runs them on this machine again). The
 repository lives in the container: `--dir` is its path there, and worktrees
 are made there. `--mounted on` is for a repository on this machine mounted
 into the container: `--dir` stays the host path, git runs here, and the
-directory inside the container follows from its mounts unless
-`--container-dir` names it.
+directory inside the container follows from its mounts.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -77,8 +76,7 @@ fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
     })
 }
 
-/// `--container` / `--mounted` / `--container-dir` over the node's current
-/// dev container.
+/// `--container` / `--mounted` over the node's current dev container.
 fn files_dev_container(
     args: &Args,
     current: Option<tod_store::fleet::DevContainerSetting>,
@@ -104,19 +102,6 @@ fn files_dev_container(
             "off" => false,
             other => anyhow::bail!("--mounted must be on or off, not `{other}`"),
         };
-    }
-    if let Some(dir) = args.get("--container-dir").map(str::trim) {
-        let dev = dev.as_mut().ok_or_else(|| needs_container("--container-dir"))?;
-        if !dev.repo_on_host {
-            anyhow::bail!(
-                "--container-dir is for a repository mounted from this machine (--mounted on); \
-                 otherwise --dir is the path in the container"
-            );
-        }
-        if !dir.is_empty() && !dir.starts_with('/') {
-            anyhow::bail!("--container-dir must be an absolute path in the container");
-        }
-        dev.directory = (!dir.is_empty()).then(|| dir.to_string());
     }
     Ok(dev)
 }
