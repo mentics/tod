@@ -150,6 +150,167 @@ pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Initialized submodules of `repo`, recursively, parents before children.
+/// Empty for a repository without submodules.
+pub fn submodule_dirs(repo: &Path) -> Result<Vec<PathBuf>> {
+    let output = run_git(repo, &["submodule", "status", "--recursive"])?;
+    Ok(output
+        .lines()
+        .filter_map(|line| parse_submodule_status(line))
+        .map(|rel| repo.join(rel))
+        .collect())
+}
+
+/// The path from one `git submodule status` line, or `None` for a submodule
+/// that is not initialized (`-`). A line is `<flag><sha> <path>[ (<describe>)]`.
+fn parse_submodule_status(line: &str) -> Option<&str> {
+    let mut chars = line.chars();
+    let flag = chars.next()?;
+    if flag == '-' {
+        return None;
+    }
+    let (_sha, rest) = chars.as_str().split_once(' ')?;
+    let path = match rest.rsplit_once(" (") {
+        Some((path, describe)) if describe.ends_with(')') => path,
+        _ => rest,
+    };
+    Some(path).filter(|p| !p.is_empty())
+}
+
+/// The branch checked out in `repo`, or `None` on a detached HEAD.
+pub fn current_branch(repo: &Path) -> Option<String> {
+    run_git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
+        .ok()
+        .filter(|b| !b.is_empty())
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    run_git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .is_ok()
+}
+
+/// Where a branch this app created in a submodule started, kept in the
+/// submodule's own config so [`prune_submodule_branches`] can tell a branch
+/// that was never used. `git branch -m` / `-D` carry and drop it with the branch.
+fn start_key(branch: &str) -> String {
+    format!("branch.{branch}.todstart")
+}
+
+/// Check `branch` out in every initialized submodule of `worktree`, creating
+/// it at the submodule's current commit where it does not exist yet, so an
+/// agent's commits inside a submodule land on a branch rather than a detached
+/// HEAD. Idempotent. Returns one warning per submodule it could not switch.
+pub fn branch_submodules(worktree: &Path, branch: &str) -> Result<Vec<String>> {
+    if branch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut warnings = Vec::new();
+    for dir in submodule_dirs(worktree)? {
+        if current_branch(&dir).as_deref() == Some(branch) {
+            continue;
+        }
+        let switched = if branch_exists(&dir, branch) {
+            run_git(&dir, &["switch", branch]).map(|_| ())
+        } else {
+            run_git(&dir, &["rev-parse", "HEAD"]).and_then(|head| {
+                run_git(&dir, &["switch", "-c", branch])?;
+                run_git(&dir, &["config", &start_key(branch), &head]).map(|_| ())
+            })
+        };
+        if let Err(err) = switched {
+            warnings.push(format!(
+                "Submodule {} is not on \"{branch}\": {err:#}",
+                dir.display()
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
+/// Undo [`branch_submodules`] where it was not needed: a submodule still on
+/// the `branch` this app created, at the commit it started from, with nothing
+/// uncommitted, goes back to a detached HEAD and the branch is deleted.
+pub fn prune_submodule_branches(worktree: &Path, branch: &str) -> Result<()> {
+    if branch.is_empty() {
+        return Ok(());
+    }
+    // Children first, so a parent's status no longer sees them as changed.
+    for dir in submodule_dirs(worktree)?.into_iter().rev() {
+        if current_branch(&dir).as_deref() != Some(branch) {
+            continue;
+        }
+        let Ok(start) = run_git(&dir, &["config", "--get", &start_key(branch)]) else {
+            continue;
+        };
+        let unused = run_git(&dir, &["rev-parse", "HEAD"]).is_ok_and(|head| head == start)
+            && run_git(&dir, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty());
+        if unused {
+            run_git(&dir, &["switch", "--detach", "-q"])?;
+            run_git(&dir, &["branch", "-D", branch])?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename `old` to `new` in `worktree` and in every submodule that has it.
+///
+/// Commits and uncommitted changes come along; the worktree stays where it is.
+/// Refused when `new` already exists in any of those repositories. Submodules
+/// are renamed before the superproject, and a failure part-way renames the
+/// ones already done back. Returns a warning per repository whose `old` had
+/// an upstream: the remote branch (and any pull request) keeps the old name.
+pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<Vec<String>> {
+    if old.is_empty() || new.is_empty() {
+        bail!("A branch name cannot be empty");
+    }
+    if old == new {
+        return Ok(Vec::new());
+    }
+    run_git(worktree, &["check-ref-format", "--branch", new])
+        .with_context(|| format!("\"{new}\" is not a valid branch name"))?;
+    let mut repos = submodule_dirs(worktree)?;
+    repos.reverse();
+    repos.push(worktree.to_path_buf());
+    let holders: Vec<PathBuf> = repos
+        .into_iter()
+        .filter(|repo| branch_exists(repo, old))
+        .collect();
+    for repo in &holders {
+        if branch_exists(repo, new) {
+            bail!("Branch \"{new}\" already exists in {}", repo.display());
+        }
+    }
+    let mut warnings = Vec::new();
+    for repo in &holders {
+        if let Ok(upstream) = run_git(
+            repo,
+            &["rev-parse", "--abbrev-ref", &format!("{old}@{{upstream}}")],
+        ) {
+            warnings.push(format!(
+                "{}: \"{old}\" was pushed as {upstream}; the remote keeps the old name",
+                repo.display()
+            ));
+        }
+    }
+    for (done, repo) in holders.iter().enumerate() {
+        if let Err(err) = run_git(repo, &["branch", "-m", old, new]) {
+            for renamed in &holders[..done] {
+                let _ = run_git(renamed, &["branch", "-m", new, old]);
+            }
+            return Err(err);
+        }
+    }
+    Ok(warnings)
+}
+
 fn git_worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<PathBuf> {
     if dest.exists() {
         return Ok(dest.to_path_buf());
@@ -336,7 +497,12 @@ pub fn ensure_worktree(
         // worktree (Treehouse's, typically detached) as-is rather than fail here.
         match worktree_holding_branch(repo, &branch_key)? {
             Some(holder) if !paths_refer_to_same_location(&holder, &handle.path) => {}
-            _ => checkout_branch(&handle.path, &branch_key)?,
+            _ => {
+                checkout_branch(&handle.path, &branch_key)?;
+                for warning in branch_submodules(&handle.path, &branch_key)? {
+                    tracing::warn!("{warning}");
+                }
+            }
         }
         Ok(handle)
     })
@@ -464,6 +630,97 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = StdCommand::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A superproject on `main` with two submodules, `a` and `b`, both detached.
+    fn repo_with_submodules() -> PathBuf {
+        let sub = init_temp_repo();
+        let top = init_temp_repo();
+        let sub_url = sub.to_string_lossy().replace('\\', "/");
+        git_in(&top, &["submodule", "add", "-q", &sub_url, "a"]);
+        git_in(&top, &["submodule", "add", "-q", &sub_url, "b"]);
+        git_in(&top, &["commit", "-q", "-m", "subs"]);
+        git_in(&top, &["submodule", "update", "-q", "--checkout"]);
+        top
+    }
+
+    #[test]
+    fn parses_submodule_status_lines() {
+        assert_eq!(
+            parse_submodule_status(" abc123 lib/a (heads/main)"),
+            Some("lib/a")
+        );
+        assert_eq!(
+            parse_submodule_status("+abc123 has space/x"),
+            Some("has space/x")
+        );
+        assert_eq!(parse_submodule_status("-abc123 uninit"), None);
+    }
+
+    #[test]
+    fn submodules_get_the_branch_and_unused_ones_are_pruned() {
+        let top = repo_with_submodules();
+        git_in(&top, &["switch", "-q", "-c", "tod/x"]);
+        assert!(branch_submodules(&top, "tod/x").unwrap().is_empty());
+        let (a, b) = (top.join("a"), top.join("b"));
+        assert_eq!(current_branch(&a).as_deref(), Some("tod/x"));
+        assert_eq!(current_branch(&b).as_deref(), Some("tod/x"));
+
+        git_in(&a, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        prune_submodule_branches(&top, "tod/x").unwrap();
+        assert_eq!(current_branch(&a).as_deref(), Some("tod/x"), "used: kept");
+        assert_eq!(current_branch(&b), None, "unused: detached again");
+        assert!(!branch_exists(&b, "tod/x"));
+    }
+
+    #[test]
+    fn rename_moves_the_branch_in_the_superproject_and_submodules() {
+        let top = repo_with_submodules();
+        git_in(&top, &["switch", "-q", "-c", "tod/x"]);
+        branch_submodules(&top, "tod/x").unwrap();
+        git_in(
+            &top.join("a"),
+            &["commit", "-q", "--allow-empty", "-m", "work"],
+        );
+
+        assert!(
+            rename_branch(&top, "tod/x", "renamed/y")
+                .unwrap()
+                .is_empty()
+        );
+        for repo in [top.clone(), top.join("a"), top.join("b")] {
+            assert_eq!(current_branch(&repo).as_deref(), Some("renamed/y"));
+            assert!(!branch_exists(&repo, "tod/x"));
+        }
+        // The start mark moved with the branch, so pruning still recognizes `b`.
+        prune_submodule_branches(&top, "renamed/y").unwrap();
+        assert_eq!(current_branch(&top.join("b")), None);
+    }
+
+    #[test]
+    fn rename_refuses_a_name_taken_in_a_submodule_and_changes_nothing() {
+        let top = repo_with_submodules();
+        git_in(&top, &["switch", "-q", "-c", "tod/x"]);
+        branch_submodules(&top, "tod/x").unwrap();
+        git_in(&top.join("b"), &["branch", "taken"]);
+
+        let err = rename_branch(&top, "tod/x", "taken").unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+        for repo in [top.clone(), top.join("a"), top.join("b")] {
+            assert_eq!(current_branch(&repo).as_deref(), Some("tod/x"));
+        }
     }
 
     #[test]
