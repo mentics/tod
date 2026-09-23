@@ -29,7 +29,7 @@ use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, rename_branch_for_node, setup_worktree_for_node,
-    validate_interview_workspace,
+    terminal::open_shell_for_node, validate_interview_workspace,
 };
 use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
@@ -83,6 +83,7 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::AgentEffort => "task-edit-field-agent-effort",
         TaskEditField::UseWorktree => "task-edit-field-use-worktree",
         TaskEditField::WorktreeAction => "task-edit-field-worktree-action",
+        TaskEditField::LaunchShell => "task-edit-field-launch-shell",
         TaskEditField::RunsIn => "task-edit-field-runs-in",
         TaskEditField::RepoLocation => "task-edit-field-repo-location",
         TaskEditField::ContainerName => "task-edit-field-container",
@@ -143,6 +144,8 @@ enum TaskEditField {
     UseWorktree,
     /// Files capability "Set up worktree" / "Release worktree" button.
     WorktreeAction,
+    /// Files capability: open a shell/terminal at the resolved directory.
+    LaunchShell,
     /// Files capability: this machine or a dev container (Enter cycles).
     RunsIn,
     /// Dev container: the repository is inside it, or mounted from this
@@ -191,6 +194,7 @@ impl TaskEditField {
                 | Self::AgentEffort
                 | Self::UseWorktree
                 | Self::WorktreeAction
+                | Self::LaunchShell
                 | Self::RunsIn
                 | Self::RepoLocation
                 | Self::ContainerRefresh
@@ -434,6 +438,7 @@ pub struct TaskEditView {
     resolved_files: Option<ResolvedFiles>,
     worktree_busy: bool,
     worktree_status: Option<String>,
+    shell_busy: bool,
     /// Files: where launches run (this machine or a dev container).
     dev: dev_container::DevContainerPanel,
     _title_subscription: Subscription,
@@ -648,6 +653,7 @@ impl TaskEditView {
             resolved_files: None,
             worktree_busy: false,
             worktree_status: None,
+            shell_busy: false,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -793,6 +799,12 @@ impl TaskEditView {
             if self.worktree_action().is_some() {
                 stops.push(TaskEditField::WorktreeAction);
             }
+            if matches!(
+                self.own_files().map(|files| files.directory()),
+                Some(FilesDirectory::Ready(_))
+            ) {
+                stops.push(TaskEditField::LaunchShell);
+            }
         }
         if self.capability_enabled(Capability::Ticket) {
             stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
@@ -920,6 +932,7 @@ impl TaskEditView {
             | TaskEditField::AgentEffort
             | TaskEditField::UseWorktree
             | TaskEditField::WorktreeAction
+            | TaskEditField::LaunchShell
             | TaskEditField::GeneratorSource
             | TaskEditField::GeneratorSave
             | TaskEditField::GeneratorRefresh
@@ -1028,6 +1041,10 @@ impl TaskEditView {
             }
             TaskEditField::WorktreeAction => {
                 self.run_worktree_action(cx);
+                return;
+            }
+            TaskEditField::LaunchShell => {
+                self.launch_shell_for_task(cx);
                 return;
             }
             TaskEditField::RunsIn => {
@@ -1456,6 +1473,42 @@ impl TaskEditView {
                 let _ = this.fleet.reload_if_stale();
                 this.load_action_capabilities();
                 this.clamp_focus_index();
+                this.notify_changed(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Open a shell/terminal at the node's resolved directory, off the UI thread.
+    fn launch_shell_for_task(&mut self, cx: &mut Context<Self>) {
+        if self.shell_busy {
+            return;
+        }
+        let Some(task_id) = self.task_id() else {
+            return;
+        };
+        self.shell_busy = true;
+        self.worktree_status = Some("Opening terminal…".into());
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<String> = cx
+                .background_spawn(async move {
+                    let settings = TodSettings::load(&paths).unwrap_or_default();
+                    open_shell_for_node(&fleet, &paths, &settings, &task_id, None)
+                        .map(|(_, cwd)| format!("Opened terminal in {cwd}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.shell_busy = false;
+                match result {
+                    Ok(message) => this.worktree_status = Some(message),
+                    Err(err) => {
+                        this.worktree_status = None;
+                        this.pending_toast = Some(format!("{err:#}"));
+                    }
+                }
                 this.notify_changed(cx);
             });
         })
@@ -3669,6 +3722,35 @@ impl TaskEditView {
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.enter_field_edit(
                                         TaskEditField::WorktreeAction,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                ),
+            );
+        }
+        if matches!(directory, Some(FilesDirectory::Ready(_))) {
+            let shell_busy = self.shell_busy;
+            let shell_focused = self.field_nav_focused(TaskEditField::LaunchShell);
+            directory_row = directory_row.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::LaunchShell,
+                    div()
+                        .id(field_anchor_id(TaskEditField::LaunchShell))
+                        .rounded_md()
+                        .when(shell_focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .child(
+                            Button::new("task-edit-launch-shell")
+                                .label(if shell_busy { "Opening…" } else { "Open shell" })
+                                .outline()
+                                .compact()
+                                .disabled(shell_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_field_edit(
+                                        TaskEditField::LaunchShell,
                                         window,
                                         cx,
                                     );
