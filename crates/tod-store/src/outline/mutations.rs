@@ -88,6 +88,9 @@ pub enum OutlineMutation {
         repo: Option<String>,
         branch: Option<String>,
         use_worktree: bool,
+        /// `Some` runs the node's launches in a dev container.
+        #[serde(default)]
+        dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
     },
     /// The Ticket capability's linked issues and pull requests.
     SetNodeTicket {
@@ -530,14 +533,21 @@ impl OutlineMutation {
                 repo,
                 branch,
                 use_worktree,
+                dev_container,
             } => {
                 require_capability(conn, *node_id, Capability::Files)?;
                 let id = node_id.to_string();
                 let tasks = crate::fleet::repos::task::TaskRepo::new(conn);
                 tasks.update_repo(&id, repo.as_deref())?;
                 tasks.update_branch(&id, branch.as_deref())?;
-                crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
-                    .set_use_worktree(&id, *use_worktree)?;
+                if let Some(container) =
+                    dev_container.as_ref().and_then(|dev| dev.container())
+                {
+                    tod_agent::devcontainer::validate_container_ref(container)?;
+                }
+                let files = crate::fleet::repos::node_files::NodeFilesRepo::new(conn);
+                files.set_use_worktree(&id, *use_worktree)?;
+                files.set_dev_container(&id, dev_container.as_ref())?;
             }
             OutlineMutation::SetNodeTicket {
                 node_id,

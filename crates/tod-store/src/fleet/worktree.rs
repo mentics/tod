@@ -1,33 +1,18 @@
 //! Git worktree and Treehouse provisioning for agent workspaces.
+//!
+//! Every function works on a [`Workdir`]: git runs on this machine for a
+//! repository here, and inside the dev container (via `docker exec`) for one
+//! that lives there.
 
 use crate::fleet::treehouse::TreehouseInvocation;
+use crate::fleet::workdir::{Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
-
-/// Strip Win32 `\\?\` extended-length prefix so git and error messages see normal paths.
-fn path_for_git(path: &Path) -> PathBuf {
-    let raw = path.as_os_str().to_string_lossy();
-    #[cfg(windows)]
-    {
-        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-            return PathBuf::from(stripped);
-        }
-    }
-    path.to_path_buf()
-}
-
-fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct TreehouseLease {
@@ -37,7 +22,7 @@ pub struct TreehouseLease {
 
 #[derive(Debug, Clone)]
 pub struct WorktreeHandle {
-    pub path: PathBuf,
+    pub path: Workdir,
     pub lease: Option<TreehouseLease>,
 }
 
@@ -69,6 +54,8 @@ fn branch_slug(branch: &str) -> String {
     }
 }
 
+/// Where the worktree for `repo` + `branch` goes on this machine: under the
+/// data root, keyed by the repository.
 pub fn worktree_dest(data_root: &Path, repo: &Path, branch: &str) -> Result<PathBuf> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -82,34 +69,50 @@ pub fn worktree_dest(data_root: &Path, repo: &Path, branch: &str) -> Result<Path
         .join(branch_slug(branch)))
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
-    let git_repo = path_for_git(repo);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&git_repo)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawn git -C {} {:?}", git_repo.display(), args))?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+/// Worktrees of a repository inside a dev container live in the repository,
+/// under this directory, which is kept out of `git status` through the
+/// repository's `info/exclude`. The data root is on this machine, and a
+/// directory beside the repository may not outlive the container.
+pub const CONTAINER_WORKTREES_DIR: &str = ".worktrees";
+
+/// Where the worktree for `branch` of `repo` goes: see [`worktree_dest`] and
+/// [`CONTAINER_WORKTREES_DIR`].
+pub fn worktree_dest_for(data_root: &Path, repo: &Workdir, branch: &str) -> Result<Workdir> {
+    match repo {
+        Workdir::Host(path) => Ok(Workdir::Host(worktree_dest(data_root, path, branch)?)),
+        Workdir::Container { .. } => Ok(repo
+            .join(CONTAINER_WORKTREES_DIR)
+            .join(&branch_slug(branch))),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!(
-        "git -C {} {} failed: {}",
-        git_repo.display(),
-        args.join(" "),
-        stderr.trim()
-    );
 }
 
-/// Returns the worktree path where `branch` is checked out, if any.
-fn worktree_holding_branch(repo: &Path, branch: &str) -> Result<Option<PathBuf>> {
+/// Keep [`CONTAINER_WORKTREES_DIR`] out of `repo`'s `git status`.
+fn exclude_container_worktrees(repo: &Workdir) -> Result<()> {
+    let exclude = repo.git(&["rev-parse", "--git-path", "info/exclude"])?;
+    let entry = format!("/{CONTAINER_WORKTREES_DIR}/");
+    let script = r#"grep -qxF "$2" "$1" 2>/dev/null || { mkdir -p "$(dirname "$1")" && printf '%s\n' "$2" >> "$1"; }"#;
+    let out = repo.output("sh", &["-c", script, "sh", &exclude, &entry])?;
+    if !out.status.success() {
+        bail!(
+            "add {entry} to {exclude}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn run_git(repo: &Workdir, args: &[&str]) -> Result<String> {
+    repo.git(args)
+}
+
+/// Returns the worktree where `branch` is checked out, if any.
+fn worktree_holding_branch(repo: &Workdir, branch: &str) -> Result<Option<Workdir>> {
     let output = run_git(repo, &["worktree", "list", "--porcelain"])?;
     let branch_ref = format!("refs/heads/{branch}");
-    let mut current_worktree: Option<PathBuf> = None;
+    let mut current_worktree: Option<Workdir> = None;
     for line in output.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            current_worktree = Some(PathBuf::from(path));
+            current_worktree = Some(repo.at(path));
         } else if let Some(b) = line.strip_prefix("branch ") {
             if b == branch_ref {
                 return Ok(current_worktree);
@@ -119,7 +122,7 @@ fn worktree_holding_branch(repo: &Path, branch: &str) -> Result<Option<PathBuf>>
     Ok(None)
 }
 
-pub fn resolve_default_branch(repo: &Path) -> Result<String> {
+pub fn resolve_default_branch(repo: &Workdir) -> Result<String> {
     if let Ok(name) = run_git(
         repo,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -138,7 +141,7 @@ pub fn resolve_default_branch(repo: &Path) -> Result<String> {
     run_git(repo, &["branch", "--show-current"]).or_else(|_| Ok("main".into()))
 }
 
-pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<()> {
+pub fn checkout_branch(worktree: &Workdir, branch: &str) -> Result<()> {
     if branch.is_empty() {
         return Ok(());
     }
@@ -152,7 +155,7 @@ pub fn checkout_branch(worktree: &Path, branch: &str) -> Result<()> {
 
 /// Initialized submodules of `repo`, recursively, parents before children.
 /// Empty for a repository without submodules.
-pub fn submodule_dirs(repo: &Path) -> Result<Vec<PathBuf>> {
+pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
     let output = run_git(repo, &["submodule", "status", "--recursive"])?;
     Ok(output
         .lines()
@@ -178,13 +181,13 @@ fn parse_submodule_status(line: &str) -> Option<&str> {
 }
 
 /// The branch checked out in `repo`, or `None` on a detached HEAD.
-pub fn current_branch(repo: &Path) -> Option<String> {
+pub fn current_branch(repo: &Workdir) -> Option<String> {
     run_git(repo, &["symbolic-ref", "--short", "-q", "HEAD"])
         .ok()
         .filter(|b| !b.is_empty())
 }
 
-fn branch_exists(repo: &Path, branch: &str) -> bool {
+fn branch_exists(repo: &Workdir, branch: &str) -> bool {
     run_git(
         repo,
         &[
@@ -208,7 +211,7 @@ fn start_key(branch: &str) -> String {
 /// it at the submodule's current commit where it does not exist yet, so an
 /// agent's commits inside a submodule land on a branch rather than a detached
 /// HEAD. Idempotent. Returns one warning per submodule it could not switch.
-pub fn branch_submodules(worktree: &Path, branch: &str) -> Result<Vec<String>> {
+pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>> {
     if branch.is_empty() {
         return Ok(Vec::new());
     }
@@ -226,10 +229,7 @@ pub fn branch_submodules(worktree: &Path, branch: &str) -> Result<Vec<String>> {
             })
         };
         if let Err(err) = switched {
-            warnings.push(format!(
-                "Submodule {} is not on \"{branch}\": {err:#}",
-                dir.display()
-            ));
+            warnings.push(format!("Submodule {dir} is not on \"{branch}\": {err:#}"));
         }
     }
     Ok(warnings)
@@ -238,7 +238,7 @@ pub fn branch_submodules(worktree: &Path, branch: &str) -> Result<Vec<String>> {
 /// Undo [`branch_submodules`] where it was not needed: a submodule still on
 /// the `branch` this app created, at the commit it started from, with nothing
 /// uncommitted, goes back to a detached HEAD and the branch is deleted.
-pub fn prune_submodule_branches(worktree: &Path, branch: &str) -> Result<()> {
+pub fn prune_submodule_branches(worktree: &Workdir, branch: &str) -> Result<()> {
     if branch.is_empty() {
         return Ok(());
     }
@@ -267,7 +267,7 @@ pub fn prune_submodule_branches(worktree: &Path, branch: &str) -> Result<()> {
 /// are renamed before the superproject, and a failure part-way renames the
 /// ones already done back. Returns a warning per repository whose `old` had
 /// an upstream: the remote branch (and any pull request) keeps the old name.
-pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<Vec<String>> {
+pub fn rename_branch(worktree: &Workdir, old: &str, new: &str) -> Result<Vec<String>> {
     if old.is_empty() || new.is_empty() {
         bail!("A branch name cannot be empty");
     }
@@ -278,14 +278,14 @@ pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<Vec<String
         .with_context(|| format!("\"{new}\" is not a valid branch name"))?;
     let mut repos = submodule_dirs(worktree)?;
     repos.reverse();
-    repos.push(worktree.to_path_buf());
-    let holders: Vec<PathBuf> = repos
+    repos.push(worktree.clone());
+    let holders: Vec<Workdir> = repos
         .into_iter()
         .filter(|repo| branch_exists(repo, old))
         .collect();
     for repo in &holders {
         if branch_exists(repo, new) {
-            bail!("Branch \"{new}\" already exists in {}", repo.display());
+            bail!("Branch \"{new}\" already exists in {repo}");
         }
     }
     let mut warnings = Vec::new();
@@ -295,8 +295,7 @@ pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<Vec<String
             &["rev-parse", "--abbrev-ref", &format!("{old}@{{upstream}}")],
         ) {
             warnings.push(format!(
-                "{}: \"{old}\" was pushed as {upstream}; the remote keeps the old name",
-                repo.display()
+                "{repo}: \"{old}\" was pushed as {upstream}; the remote keeps the old name"
             ));
         }
     }
@@ -311,9 +310,20 @@ pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<Vec<String
     Ok(warnings)
 }
 
-fn git_worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<PathBuf> {
-    if dest.exists() {
-        return Ok(dest.to_path_buf());
+/// The path git is given for `dir`.
+fn git_path_arg(dir: &Workdir) -> Result<String> {
+    Ok(match dir {
+        Workdir::Host(path) => strip_verbatim(path)
+            .to_str()
+            .context("worktree path utf8")?
+            .to_string(),
+        Workdir::Container { path, .. } => path.clone(),
+    })
+}
+
+fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Workdir> {
+    if dest.is_dir() {
+        return Ok(dest.clone());
     }
     let branch_ref = if branch.is_empty() {
         resolve_default_branch(repo)?
@@ -327,24 +337,25 @@ fn git_worktree_add(repo: &Path, dest: &Path, branch: &str) -> Result<PathBuf> {
     }
 
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create worktree parent {}", parent.display()))?;
+        parent
+            .create_dir_all()
+            .with_context(|| format!("create worktree parent {parent}"))?;
     }
-    let dest_str = path_for_git(dest)
-        .to_str()
-        .context("worktree dest utf8")?
-        .to_string();
+    if matches!(repo, Workdir::Container { .. }) {
+        exclude_container_worktrees(repo)?;
+    }
+    let dest_str = git_path_arg(dest)?;
     if run_git(repo, &["rev-parse", "--verify", &branch_ref]).is_ok() {
         run_git(repo, &["worktree", "add", &dest_str, &branch_ref])?;
     } else {
         run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])?;
     }
-    Ok(dest.to_path_buf())
+    Ok(dest.clone())
 }
 
 /// Validate that an interview workspace can be provisioned for `repo` + `branch`.
 pub fn validate_interview_workspace(repo: &Path, branch: &str) -> Result<()> {
-    let canonical = validate_git_repo(repo)?;
+    let canonical = validate_git_repo(&Workdir::host(repo))?;
     let branch_key = if branch.is_empty() {
         resolve_default_branch(&canonical)?
     } else {
@@ -388,7 +399,7 @@ fn treehouse_get_lease(
     let parsed: TreehouseLeaseJson =
         serde_json::from_slice(&output.stdout).context("parse treehouse get --json stdout")?;
     Ok(WorktreeHandle {
-        path: PathBuf::from(parsed.path),
+        path: Workdir::host(parsed.path),
         lease: Some(TreehouseLease {
             lease_id: parsed.lease_id,
             lease_holder: parsed.lease_holder,
@@ -423,71 +434,71 @@ fn with_creation_lock<T>(data_root: &Path, f: impl FnOnce() -> Result<T>) -> Res
     }
 }
 
+/// A git worktree of `repo` for `branch` at [`worktree_dest_for`].
+fn git_worktree(data_root: &Path, repo: &Workdir, branch: &str) -> Result<WorktreeHandle> {
+    let dest = worktree_dest_for(data_root, repo, branch)?;
+    let path = git_worktree_add(repo, &dest, branch)?;
+    Ok(WorktreeHandle { path, lease: None })
+}
+
+/// Set up (or reuse) a worktree of `repo` for `branch`. Treehouse only
+/// manages repositories on this machine; one in a dev container always gets
+/// a git worktree.
 pub fn ensure_worktree(
     conn: &Connection,
     backend: WorktreeBackend,
     settings: &TodSettings,
     paths: &TodPaths,
     data_root: &Path,
-    repo: &Path,
+    repo: &Workdir,
     branch: &str,
     lease_holder: &str,
 ) -> Result<WorktreeHandle> {
     use crate::fleet::repos::node_files::NodeFilesRepo;
 
-    let repo_str = repo.to_string_lossy();
+    let repo_str = repo.storage();
     let branch_key = if branch.is_empty() {
         resolve_default_branch(repo)?
     } else {
         branch.to_string()
     };
 
-    if let Some(shared) =
-        NodeFilesRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
-    {
-        let path = PathBuf::from(shared);
-        if path.is_dir() {
-            return Ok(WorktreeHandle { path, lease: None });
-        }
+    let shared = |conn: &Connection| -> Result<Option<Workdir>> {
+        Ok(NodeFilesRepo::new(conn)
+            .resolve_shared_worktree_path(&repo_str, &branch_key)?
+            .map(|path| repo.at(&path))
+            .filter(Workdir::is_dir))
+    };
+    if let Some(path) = shared(conn)? {
+        return Ok(WorktreeHandle { path, lease: None });
     }
 
     with_creation_lock(data_root, || {
-        if let Some(shared) =
-            NodeFilesRepo::new(conn).resolve_shared_worktree_path(&repo_str, &branch_key)?
-        {
-            let path = PathBuf::from(shared);
-            if path.is_dir() {
-                return Ok(WorktreeHandle { path, lease: None });
-            }
+        if let Some(path) = shared(conn)? {
+            return Ok(WorktreeHandle { path, lease: None });
         }
 
-        let handle = match backend {
-            WorktreeBackend::GitOnly => {
-                let dest = worktree_dest(data_root, repo, &branch_key)?;
-                let path = git_worktree_add(repo, &dest, &branch_key)?;
-                WorktreeHandle { path, lease: None }
+        let handle = match (backend, repo) {
+            (_, Workdir::Container { .. }) | (WorktreeBackend::GitOnly, _) => {
+                git_worktree(data_root, repo, &branch_key)?
             }
-            WorktreeBackend::TreehouseRequired => {
-                treehouse_get_lease(repo, lease_holder, settings, paths)?
+            (WorktreeBackend::TreehouseRequired, Workdir::Host(host)) => {
+                treehouse_get_lease(host, lease_holder, settings, paths)?
             }
-            WorktreeBackend::TreehouseWithGitFallback => {
+            (WorktreeBackend::TreehouseWithGitFallback, Workdir::Host(host)) => {
                 if treehouse_available(settings) {
-                    match treehouse_get_lease(repo, lease_holder, settings, paths) {
+                    match treehouse_get_lease(host, lease_holder, settings, paths) {
                         Ok(h) => h,
                         Err(err) => {
                             tracing::warn!(
                                 "treehouse unavailable ({err:#}); falling back to git worktree"
                             );
-                            let dest = worktree_dest(data_root, repo, &branch_key)?;
-                            let path = git_worktree_add(repo, &dest, &branch_key)?;
-                            WorktreeHandle { path, lease: None }
+                            git_worktree(data_root, repo, &branch_key)?
                         }
                     }
                 } else {
                     tracing::warn!("treehouse not on PATH; falling back to git worktree");
-                    let dest = worktree_dest(data_root, repo, &branch_key)?;
-                    let path = git_worktree_add(repo, &dest, &branch_key)?;
-                    WorktreeHandle { path, lease: None }
+                    git_worktree(data_root, repo, &branch_key)?
                 }
             }
         };
@@ -496,7 +507,7 @@ pub fn ensure_worktree(
         // already held elsewhere (e.g. the primary repo), leave a freshly provisioned
         // worktree (Treehouse's, typically detached) as-is rather than fail here.
         match worktree_holding_branch(repo, &branch_key)? {
-            Some(holder) if !paths_refer_to_same_location(&holder, &handle.path) => {}
+            Some(holder) if !holder.same_location(&handle.path) => {}
             _ => {
                 checkout_branch(&handle.path, &branch_key)?;
                 for warning in branch_submodules(&handle.path, &branch_key)? {
@@ -510,58 +521,57 @@ pub fn ensure_worktree(
 
 /// Remove a git worktree previously added for `repo`. Refuses to touch the
 /// primary checkout, and never forces: uncommitted changes make git refuse.
-pub fn remove_git_worktree(repo: &Path, worktree: &Path) -> Result<()> {
-    if paths_refer_to_same_location(repo, worktree) {
+pub fn remove_git_worktree(repo: &Workdir, worktree: &Workdir) -> Result<()> {
+    if repo.same_location(worktree) {
         return Ok(());
     }
-    let worktree = path_for_git(worktree);
-    if !is_registered_worktree(repo, &worktree)? {
+    if !is_registered_worktree(repo, worktree)? {
         // Already unregistered — e.g. an earlier removal deleted the files but a
         // process with the folder open kept it on disk. Clean up what's left.
-        let _ = std::fs::remove_dir(&worktree);
+        worktree.remove_empty_dir();
         return Ok(());
     }
-    let worktree_str = worktree.to_str().context("worktree path utf8")?.to_string();
+    let worktree_str = git_path_arg(worktree)?;
     if let Err(err) = run_git(repo, &["worktree", "remove", &worktree_str]) {
         // git unregisters the worktree before deleting its folder; when only the
         // folder delete failed, the worktree is already gone as far as git knows.
-        if is_registered_worktree(repo, &worktree)? {
+        if is_registered_worktree(repo, worktree)? {
             return Err(err);
         }
-        tracing::warn!(
-            "git removed worktree {} but left its folder: {err:#}",
-            worktree.display()
-        );
+        tracing::warn!("git removed worktree {worktree} but left its folder: {err:#}");
     }
     Ok(())
 }
 
 /// Forget worktrees of `repo` whose folders no longer exist.
-pub fn prune_git_worktrees(repo: &Path) -> Result<()> {
+pub fn prune_git_worktrees(repo: &Workdir) -> Result<()> {
     run_git(repo, &["worktree", "prune"]).map(|_| ())
 }
 
 /// Whether git still lists `worktree` among `repo`'s worktrees.
-fn is_registered_worktree(repo: &Path, worktree: &Path) -> Result<bool> {
+fn is_registered_worktree(repo: &Workdir, worktree: &Workdir) -> Result<bool> {
     let output = run_git(repo, &["worktree", "list", "--porcelain"])?;
     let target = comparable_path(worktree);
     Ok(output
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
-        .map(Path::new)
-        .any(|listed| {
-            comparable_path(listed) == target || paths_refer_to_same_location(listed, worktree)
-        }))
+        .map(|listed| repo.at(listed))
+        .any(|listed| comparable_path(&listed) == target || listed.same_location(worktree)))
 }
 
 /// Path text normalized for comparing git's output with stored paths.
-fn comparable_path(path: &Path) -> String {
-    let text = path_for_git(path).to_string_lossy().replace('\\', "/");
-    let text = text.trim_end_matches('/');
-    if cfg!(windows) {
-        text.to_lowercase()
-    } else {
-        text.to_string()
+fn comparable_path(path: &Workdir) -> String {
+    match path {
+        Workdir::Host(path) => {
+            let text = strip_verbatim(path).to_string_lossy().replace('\\', "/");
+            let text = text.trim_end_matches('/');
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text.to_string()
+            }
+        }
+        Workdir::Container { path, .. } => path.trim_end_matches('/').to_string(),
     }
 }
 
@@ -588,12 +598,18 @@ pub fn treehouse_return(
     Ok(())
 }
 
-pub fn validate_git_repo(repo: &Path) -> Result<PathBuf> {
-    let canonical = repo
-        .canonicalize()
-        .with_context(|| format!("repo path {}", repo.display()))?;
-    run_git(&canonical, &["rev-parse", "--git-dir"])?;
-    Ok(canonical)
+/// `repo` checked to be a git repository: canonicalized on this machine;
+/// inside a container, as given.
+pub fn validate_git_repo(repo: &Workdir) -> Result<Workdir> {
+    let checked = match repo {
+        Workdir::Host(path) => Workdir::Host(
+            path.canonicalize()
+                .with_context(|| format!("repo path {}", path.display()))?,
+        ),
+        Workdir::Container { .. } => repo.clone(),
+    };
+    run_git(&checked, &["rev-parse", "--git-dir"])?;
+    Ok(checked)
 }
 
 #[cfg(test)]
@@ -632,22 +648,25 @@ mod tests {
         dir
     }
 
-    fn git_in(dir: &Path, args: &[&str]) -> String {
-        let out = StdCommand::new("git")
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(["-c", "protocol.file.allow=always"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap();
+    fn git_in(dir: &Workdir, args: &[&str]) -> String {
+        let mut all = vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "protocol.file.allow=always",
+        ];
+        all.extend_from_slice(args);
+        let out = dir.git_output(&all).unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
     /// A superproject on `main` with two submodules, `a` and `b`, both detached.
-    fn repo_with_submodules() -> PathBuf {
+    fn repo_with_submodules() -> Workdir {
         let sub = init_temp_repo();
-        let top = init_temp_repo();
+        let top = Workdir::host(init_temp_repo());
         let sub_url = sub.to_string_lossy().replace('\\', "/");
         git_in(&top, &["submodule", "add", "-q", &sub_url, "a"]);
         git_in(&top, &["submodule", "add", "-q", &sub_url, "b"]);
@@ -725,81 +744,126 @@ mod tests {
 
     #[test]
     fn git_worktree_reuses_existing_checkout() {
-        let repo = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
-        let dest = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let first = git_worktree_add(&repo, &dest, "feature").unwrap();
         checkout_branch(&first, "feature").unwrap();
 
-        let dest2 = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let dest2 = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let second = git_worktree_add(&repo, &dest2, "feature").unwrap();
-        assert!(paths_refer_to_same_location(&first, &second));
+        assert!(first.same_location(&second));
 
-        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
     }
 
     #[test]
     fn git_worktree_reuses_primary_repo_when_branch_checked_out() {
-        let repo = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
-        let dest = worktree_dest(&data_root, &repo, "main").unwrap();
+        let dest = worktree_dest_for(&data_root, &repo, "main").unwrap();
         let path = git_worktree_add(&repo, &dest, "main").unwrap();
-        assert!(paths_refer_to_same_location(&path, &repo));
-        assert!(!dest.exists());
-        let _ = fs::remove_dir_all(&repo);
+        assert!(path.same_location(&repo));
+        assert!(!dest.is_dir());
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
+    }
+
+    /// A repository inside a dev container gets its worktree there, under
+    /// `.worktrees/`, kept out of its `git status`. Needs a running container
+    /// with git: `TOD_TEST_DEV_CONTAINER=<name>`.
+    #[test]
+    fn a_repository_in_a_dev_container_gets_its_worktree_there() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            eprintln!("skipping: TOD_TEST_DEV_CONTAINER is not set");
+            return;
+        };
+        let dir = format!("/tmp/tod-wt-{}", uuid::Uuid::new_v4());
+        let scratch = Workdir::container(&container, "/tmp");
+        let out = scratch
+            .output(
+                "sh",
+                &[
+                    "-c",
+                    "git init -q -b main \"$1\" && cd \"$1\" && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init",
+                    "sh",
+                    &dir,
+                ],
+            )
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        let repo = validate_git_repo(&Workdir::container(&container, &dir)).unwrap();
+        let data_root = std::env::temp_dir();
+        let handle = git_worktree(&data_root, &repo, "task/in-container").unwrap();
+        assert_eq!(handle.path.container_name(), Some(container.as_str()));
+        assert_eq!(handle.path.path_text(), format!("{dir}/.worktrees/task_in-container"));
+        assert!(handle.path.is_dir());
+        assert_eq!(
+            run_git(&handle.path, &["branch", "--show-current"]).unwrap(),
+            "task/in-container"
+        );
+        assert_eq!(run_git(&repo, &["status", "--porcelain"]).unwrap(), "");
+
+        // Asking again reuses it.
+        let again = git_worktree(&data_root, &repo, "task/in-container").unwrap();
+        assert!(again.path.same_location(&handle.path));
+
+        remove_git_worktree(&repo, &handle.path).unwrap();
+        assert!(!handle.path.is_dir());
+        let _ = scratch.output("rm", &["-rf", &dir]);
     }
 
     #[test]
     fn validate_interview_workspace_accepts_existing_worktree() {
-        let repo = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
-        let dest = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let _ = git_worktree_add(&repo, &dest, "feature").unwrap();
-        validate_interview_workspace(&repo, "feature").unwrap();
-        let _ = fs::remove_dir_all(&repo);
+        validate_interview_workspace(repo.host_path().unwrap(), "feature").unwrap();
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
     }
 
     #[test]
     fn validate_interview_workspace_accepts_primary_checkout() {
-        let repo = init_temp_repo();
-        validate_interview_workspace(&repo, "main").unwrap();
-        let _ = fs::remove_dir_all(&repo);
+        let repo = Workdir::host(init_temp_repo());
+        validate_interview_workspace(repo.host_path().unwrap(), "main").unwrap();
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
     }
 
     #[test]
     fn git_worktree_add_and_checkout() {
-        let repo = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
-        let dest = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let path = git_worktree_add(&repo, &dest, "feature").unwrap();
         checkout_branch(&path, "feature").unwrap();
         let branch = run_git(&path, &["branch", "--show-current"]).unwrap();
         assert_eq!(branch, "feature");
-        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
     }
 
     #[test]
     fn remove_git_worktree_finishes_a_half_removed_worktree() {
-        let repo = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
-        let dest = worktree_dest(&data_root, &repo, "feature").unwrap();
+        let dest = worktree_dest_for(&data_root, &repo, "feature").unwrap();
         let path = git_worktree_add(&repo, &dest, "feature").unwrap();
         assert!(is_registered_worktree(&repo, &path).unwrap());
 
         // Simulate git unregistering the worktree but failing to delete its folder.
-        let path_str = path_for_git(&path).to_string_lossy().into_owned();
+        let path_str = path.path_text();
         run_git(&repo, &["worktree", "remove", &path_str]).unwrap();
-        fs::create_dir_all(&path).unwrap();
+        path.create_dir_all().unwrap();
         assert!(!is_registered_worktree(&repo, &path).unwrap());
 
         remove_git_worktree(&repo, &path).unwrap();
-        assert!(!path.exists());
+        assert!(!path.is_dir());
 
-        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
     }
 
@@ -813,8 +877,8 @@ mod tests {
         use crate::settings::WorktreeBackend;
         use uuid::Uuid;
 
-        let git_repo = init_temp_repo();
-        let repo_str = git_repo.to_string_lossy().into_owned();
+        let git_repo = Workdir::host(init_temp_repo());
+        let repo_str = git_repo.storage();
         let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
         set_data_root(data_root.clone());
         let paths = TodPaths::discover().unwrap();
@@ -869,7 +933,7 @@ mod tests {
         NodeFilesRepo::new(&conn)
             .update_worktree(
                 &node_main,
-                Some(main_handle.path.to_string_lossy().as_ref()),
+                Some(main_handle.path.storage().as_str()),
                 None,
                 None,
             )
@@ -890,12 +954,12 @@ mod tests {
         assert!(reused.lease.is_none());
 
         remove_git_worktree(&git_repo, &main_handle.path).unwrap();
-        assert!(!main_handle.path.exists());
+        assert!(!main_handle.path.is_dir());
         // The primary checkout is never removed.
         remove_git_worktree(&git_repo, &git_repo).unwrap();
-        assert!(git_repo.exists());
+        assert!(git_repo.is_dir());
 
-        let _ = fs::remove_dir_all(&git_repo);
+        let _ = fs::remove_dir_all(git_repo.host_path().unwrap());
         let _ = fs::remove_dir_all(&data_root);
         cleanup_test_dir(&db_dir);
         clear_data_root_override();

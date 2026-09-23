@@ -233,9 +233,14 @@ impl SessionsView {
             return Ok(driver.clone());
         }
         let settings = TodSettings::load(&self.paths).unwrap_or_default();
+        // The interview agents run on this machine: a repository inside a
+        // dev container leaves them in the data root.
         let repo_cwd = self
             .fleet
-            .files_dir_or_data_root(&session.node_id.to_string());
+            .files_dir_or_data_root(&session.node_id.to_string())
+            .host_path()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.fleet.paths().root().to_path_buf());
         let install = TodInstallPaths::discover().map_err(|e| format!("Process bundle: {e}"))?;
         let manifest =
             ProcessManifest::load(&install).map_err(|e| format!("Process bundle: {e}"))?;

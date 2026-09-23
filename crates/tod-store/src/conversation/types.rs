@@ -232,6 +232,9 @@ pub struct CapabilitySettings {
     pub branch: Option<String>,
     #[serde(default)]
     pub use_worktree: bool,
+    /// `Some` when the node's launches run in a dev container.
+    #[serde(default)]
+    pub dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
     #[serde(default)]
     pub linked_issues: Vec<String>,
     #[serde(default)]
@@ -245,6 +248,23 @@ pub struct CapabilitySettings {
     pub obligations: usize,
     #[serde(default)]
     pub managed_nodes: usize,
+}
+
+/// Where a Files capability's launches run, for the change set.
+pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting>) -> String {
+    match dev {
+        None => "this machine".into(),
+        Some(dev) => {
+            let container = dev.container().unwrap_or("(none chosen)");
+            match (dev.repo_on_host, dev.directory()) {
+                (false, _) => format!("dev container {container}"),
+                (true, Some(dir)) => {
+                    format!("dev container {container}, mounted at {dir}")
+                }
+                (true, None) => format!("dev container {container}, mounted"),
+            }
+        }
+    }
 }
 
 /// What changed between two states of a node's capabilities, one phrase per
@@ -326,6 +346,11 @@ pub fn capabilities_changes(
             "worktree",
             if old.use_worktree { "on" } else { "off" }.into(),
             if new.use_worktree { "on" } else { "off" }.into(),
+        );
+        setting(
+            "runs in",
+            runs_in(&old.dev_container),
+            runs_in(&new.dev_container),
         );
     }
     if both(Capability::Ticket) {

@@ -65,9 +65,10 @@ impl AgentProvider for RoutingAgentProvider {
         prompt: String,
         options: AgentLaunchOptions,
         session_title: String,
+        environment: crate::AgentEnvironment,
     ) -> Result<AgentRunHandle> {
         self.for_platform(options.platform)
-            .start_fleet_agent(owner_id, cwd, prompt, options, session_title)
+            .start_fleet_agent(owner_id, cwd, prompt, options, session_title, environment)
     }
 
     fn send_session_turn(&mut self, turn: SessionTurn) -> Result<AgentRunHandle> {

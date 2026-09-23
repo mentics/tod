@@ -41,7 +41,12 @@ pub fn open_code_editor_for_node(
     editor: &dyn CodeEditor,
     node_id: &str,
 ) -> Result<PathBuf> {
-    let cwd = resolve_launch_cwd(fleet, node_id)?;
+    let cwd = match resolve_launch_cwd(fleet, node_id)? {
+        crate::fleet::Workdir::Host(cwd) => cwd,
+        crate::fleet::Workdir::Container { container, path } => anyhow::bail!(
+            "{path} is inside dev container {container}; open it from an editor attached to the container"
+        ),
+    };
     editor
         .open(&cwd)
         .with_context(|| format!("open {} in {}", cwd.display(), editor.label()))?;

@@ -14,6 +14,7 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4d.
 
+use tod_store::fleet::Workdir;
 use super::context::ReportedStale;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
@@ -85,7 +86,7 @@ impl Protocol for FixProtocol {
     }
 
     /// The node's worktree — the change the findings are about.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         let node = node_id(env)?;
         resolve_launch_cwd(env.fleet, &node.to_string())
     }
@@ -111,7 +112,7 @@ impl Protocol for FixProtocol {
                 )
             })
             .unwrap_or_default();
-        let working_dir = self.cwd(env)?;
+        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_fix_message(
             env.media,
             &ImplementRequest {

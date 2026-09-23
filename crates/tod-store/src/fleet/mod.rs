@@ -1,7 +1,9 @@
 //! Fleet persistence — durable on-machine storage for tasks, agents, and related entities.
 
+pub mod cli_relay;
 pub mod code_editor;
 pub mod command_log;
+pub mod dev_container;
 pub mod explore;
 pub mod launch;
 pub mod lock;
@@ -21,6 +23,7 @@ pub mod store;
 pub mod terminal;
 pub mod treehouse;
 pub mod undo;
+pub mod workdir;
 pub mod worktree;
 pub mod writer;
 
@@ -45,7 +48,7 @@ pub use reattach::ReattachReport;
 pub use repos::agent_run::AgentRun;
 pub use repos::agent_session::{AgentSession, NewAgentSession};
 pub use repos::node_agent::NodeAgent;
-pub use repos::node_files::NodeFiles;
+pub use repos::node_files::{DevContainerSetting, NodeFiles};
 pub use repos::notification::FleetNotification;
 pub use repos::shell::ShellSession;
 pub use repos::task::{FleetTask, NoteItem};
@@ -61,5 +64,6 @@ pub use treehouse::{
     TreehouseInvocation, resolve_worktrees_parent, sync_user_config, treehouse_available,
     treehouse_config_path, treehouse_home,
 };
+pub use workdir::Workdir;
 pub use worktree::{validate_git_repo, validate_interview_workspace};
 pub use writer::{FleetMutation, FleetWriter};

@@ -182,6 +182,7 @@ impl AgentProvider for MockAgentProvider {
         prompt: String,
         options: AgentLaunchOptions,
         session_title: String,
+        _environment: crate::AgentEnvironment,
     ) -> Result<AgentRunHandle> {
         self.last_fleet_options = Some(options);
         self.last_fleet_session_title = Some(session_title.clone());
@@ -469,6 +470,7 @@ mod tests {
             message: message.into(),
             purpose,
             env: vec![("TOD_INTERVIEW_ACTOR".into(), "actor-1".into())],
+            environment: crate::AgentEnvironment::Host,
         }
     }
 
@@ -526,6 +528,7 @@ mod tests {
                 "go".into(),
                 AgentLaunchOptions::for_platform(AgentPlatform::Claude),
                 "Fleet · Fix login".into(),
+                crate::AgentEnvironment::Host,
             )
             .unwrap();
         poll_run(&mut mock, run.id);

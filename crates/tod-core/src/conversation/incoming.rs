@@ -6,11 +6,11 @@
 //! recorded, never the reply. A turn that ends without one is reported, and
 //! the node's changes stay pending.
 
+use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id};
 use super::protocol::{Protocol, ProtocolEnv, RunNotice, scratch_dir};
 use crate::incoming::{INCOMING_ACTIONS_ENV, STARTER, opening_message};
 use anyhow::Result;
-use std::path::PathBuf;
 use tod_store::conversation::ProtocolKind;
 use tod_store::incoming::{AFFECTS, AFFECTS_NONE, IncomingRepo};
 use tod_store::interview::InterviewCommand;
@@ -33,8 +33,8 @@ impl Protocol for IncomingProtocol {
 
     /// An empty directory: the judgement is on the node's obligations and
     /// plan, which the context carries in full.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
-        scratch_dir(env.data_root, "incoming")
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
+        scratch_dir(env.data_root, "incoming").map(Workdir::Host)
     }
 
     /// The node and conversation (so `tod-cli incoming resolve` files the

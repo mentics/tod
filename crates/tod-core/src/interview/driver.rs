@@ -716,6 +716,7 @@ impl InterviewDriver {
                 Role::Drafter => SessionPurpose::Drafter,
             },
             env: vec![(ACTOR_ENV.to_string(), session_id.to_string())],
+            environment: Default::default(),
         })?;
         self.turns.push(Turn {
             run: handle.id,
@@ -773,6 +774,7 @@ mod tests {
             _: String,
             _: AgentLaunchOptions,
             _: String,
+            _: tod_agent::AgentEnvironment,
         ) -> anyhow::Result<AgentRunHandle> {
             anyhow::bail!("not used")
         }

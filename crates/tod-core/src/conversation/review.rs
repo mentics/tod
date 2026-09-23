@@ -11,6 +11,7 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4c.
 
+use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, plan_steps};
 use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message};
@@ -84,7 +85,7 @@ impl Protocol for ReviewProtocol {
     }
 
     /// The node's worktree — the change being reviewed.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         let node = node_id(env)?;
         resolve_launch_cwd(env.fleet, &node.to_string())
     }
@@ -112,7 +113,7 @@ impl Protocol for ReviewProtocol {
             .unwrap_or_default();
         let manifest = ProcessManifest::load(&TodInstallPaths::discover()?)?;
         let role_doc = state_role_doc(&manifest, REVIEW)?;
-        let working_dir = self.cwd(env)?;
+        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_review_message(
             env.media,
             &ImplementRequest {

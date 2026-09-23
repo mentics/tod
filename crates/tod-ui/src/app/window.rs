@@ -719,34 +719,42 @@ impl Shell {
         shell_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let settings = TodSettings::load(&self.paths).unwrap_or_default();
-        let result: anyhow::Result<String> = (|| {
-            if let Some(shell_id) = shell_id {
-                let shell = self
-                    .fleet
-                    .get_shell(&shell_id)?
-                    .ok_or_else(|| anyhow::anyhow!("shell session not found"))?;
-                let cwd = focus_shell_session(&self.fleet, &self.paths, &settings, &shell)?;
-                return Ok(format!("Focused shell in {}", cwd.display()));
-            }
-            let (_, cwd) =
-                open_shell_for_node(&self.fleet, &self.paths, &settings, &task_id, None)?;
-            Ok(format!("Opened terminal in {}", cwd.display()))
-        })();
-
-        match result {
-            Ok(msg) => {
-                let _ = self.fleet.reload_if_stale();
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(msg, cx);
-                    list.request_live_refresh(cx);
-                });
-            }
-            Err(err) => {
-                self.queue_error_toast(format!("Shell failed: {err:#}"), cx);
-            }
-        }
-        cx.notify();
+        // Off the UI thread: opening waits for the terminal's shell to start,
+        // and for Docker when the node runs in a dev container.
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<String> = cx
+                .background_spawn(async move {
+                    let settings = TodSettings::load(&paths).unwrap_or_default();
+                    if let Some(shell_id) = shell_id {
+                        let shell = fleet
+                            .get_shell(&shell_id)?
+                            .ok_or_else(|| anyhow::anyhow!("shell session not found"))?;
+                        let cwd = focus_shell_session(&fleet, &paths, &settings, &shell)?;
+                        return Ok(format!("Focused shell in {cwd}"));
+                    }
+                    let (_, cwd) = open_shell_for_node(&fleet, &paths, &settings, &task_id, None)?;
+                    Ok(format!("Opened terminal in {cwd}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(msg) => {
+                        let _ = this.fleet.reload_if_stale();
+                        this.task_list.update(cx, |list, cx| {
+                            list.set_status_message(msg, cx);
+                            list.request_live_refresh(cx);
+                        });
+                    }
+                    Err(err) => {
+                        this.queue_error_toast(format!("Shell failed: {err:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A — open the node's most recent chat session, or start a new one.

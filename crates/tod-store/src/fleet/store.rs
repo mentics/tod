@@ -335,14 +335,27 @@ impl FleetStore {
             .map_err(Into::into)
     }
 
+    /// Where an agent or terminal from `node_id` that runs in `cwd` runs: in
+    /// the dev container when `cwd` is inside one, or when the node's
+    /// repository is mounted into one and `cwd` is its directory; else this
+    /// machine. Starts the `tod-cli` relay for a container.
+    pub fn agent_environment(
+        &self,
+        node_id: &str,
+        cwd: &crate::fleet::Workdir,
+    ) -> Result<tod_agent::AgentEnvironment> {
+        let files = self.resolve_files_for_node(node_id)?;
+        crate::fleet::dev_container::environment_for(files.as_ref(), cwd, self.paths().root())
+    }
+
     /// The node's ready Files directory, else the data root — where agent
     /// turns that don't need a workspace (chat, interview, gate checks) run.
-    pub fn files_dir_or_data_root(&self, node_id: &str) -> std::path::PathBuf {
+    pub fn files_dir_or_data_root(&self, node_id: &str) -> crate::fleet::Workdir {
         self.resolve_files_for_node(node_id)
             .ok()
             .flatten()
             .and_then(|files| files.ready_directory())
-            .unwrap_or_else(|| self.paths().root().to_path_buf())
+            .unwrap_or_else(|| crate::fleet::Workdir::host(self.paths().root()))
     }
 
     /// Checks whether it is safe to disable `cap` on `node_id`. Returns

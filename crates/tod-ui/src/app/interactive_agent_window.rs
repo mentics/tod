@@ -57,6 +57,7 @@ pub fn chat_launch_for_node(
         .ok()
         .flatten()
         .and_then(|files| files.ready_directory())
+        .and_then(|dir| dir.host_path().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| paths.data_root().to_path_buf());
     let launch = fleet
         .resolve_agent_for_node(node_id)

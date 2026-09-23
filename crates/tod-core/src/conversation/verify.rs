@@ -18,6 +18,7 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4b.
 
+use tod_store::fleet::Workdir;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, node_id, plan_steps,
 };
@@ -72,7 +73,7 @@ impl Protocol for VerificationProtocol {
     }
 
     /// The node's worktree — the code being verified.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         let node = node_id(env)?;
         resolve_launch_cwd(env.fleet, &node.to_string())
     }
@@ -100,7 +101,7 @@ impl Protocol for VerificationProtocol {
             .unwrap_or_default();
         let manifest = ProcessManifest::load(&TodInstallPaths::discover()?)?;
         let role_doc = state_working_doc(&manifest, VERIFYING)?;
-        let working_dir = self.cwd(env)?;
+        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_verify_message(
             env.media,
             &ImplementRequest {

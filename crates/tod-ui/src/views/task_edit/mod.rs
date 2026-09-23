@@ -38,6 +38,8 @@ use tod_store::{
     parse_platform, platform_storage, resolve_linear_api_key,
 };
 
+mod dev_container;
+
 const TASK_EDIT_CONTEXT: &str = "TaskEdit";
 const TITLE_MAX_LEN: usize = 120;
 const MAX_TAGS: usize = 10;
@@ -81,6 +83,12 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::AgentEffort => "task-edit-field-agent-effort",
         TaskEditField::UseWorktree => "task-edit-field-use-worktree",
         TaskEditField::WorktreeAction => "task-edit-field-worktree-action",
+        TaskEditField::RunsIn => "task-edit-field-runs-in",
+        TaskEditField::RepoLocation => "task-edit-field-repo-location",
+        TaskEditField::ContainerName => "task-edit-field-container",
+        TaskEditField::ContainerDir => "task-edit-field-container-dir",
+        TaskEditField::ContainerRefresh => "task-edit-field-container-refresh",
+        TaskEditField::ContainerChoice(_) => "task-edit-field-container-choice",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
         TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
@@ -133,6 +141,20 @@ enum TaskEditField {
     UseWorktree,
     /// Files capability "Set up worktree" / "Release worktree" button.
     WorktreeAction,
+    /// Files capability: this machine or a dev container (Enter cycles).
+    RunsIn,
+    /// Dev container: the repository is inside it, or mounted from this
+    /// machine (Enter cycles).
+    RepoLocation,
+    /// Dev container name or id.
+    ContainerName,
+    /// For a mounted repository, the directory inside the dev container
+    /// when its mounts do not say.
+    ContainerDir,
+    /// Re-list the running containers.
+    ContainerRefresh,
+    /// One listed running container, by index; Enter chooses it.
+    ContainerChoice(usize),
     /// Generator capability: pick the data source (only until one is saved).
     GeneratorSource,
     /// One field of the generator's configuration form, by index into
@@ -162,6 +184,10 @@ impl TaskEditField {
                 | Self::AgentEffort
                 | Self::UseWorktree
                 | Self::WorktreeAction
+                | Self::RunsIn
+                | Self::RepoLocation
+                | Self::ContainerRefresh
+                | Self::ContainerChoice(_)
                 | Self::GeneratorSource
                 | Self::GeneratorSave
                 | Self::GeneratorRefresh
@@ -387,6 +413,8 @@ pub struct TaskEditView {
     resolved_files: Option<ResolvedFiles>,
     worktree_busy: bool,
     worktree_status: Option<String>,
+    /// Files: where launches run (this machine or a dev container).
+    dev: dev_container::DevContainerPanel,
     _title_subscription: Subscription,
     _linear_subscription: Subscription,
     _github_subscription: Subscription,
@@ -532,9 +560,11 @@ impl TaskEditView {
                 // Preset name input is handled by explicit actions, not on blur/enter
             },
         );
+        let dev = dev_container::DevContainerPanel::new(window, cx);
         Self {
             fleet,
             paths,
+            dev,
             task_id: None,
             focus_handle: cx.focus_handle(),
             title_input,
@@ -721,6 +751,17 @@ impl TaskEditView {
             if self.worktree_action().is_some() {
                 stops.push(TaskEditField::WorktreeAction);
             }
+            if self.own_files().is_some() {
+                stops.push(TaskEditField::RunsIn);
+            }
+            if let Some(dev) = self.own_dev_container() {
+                stops.extend([TaskEditField::RepoLocation, TaskEditField::ContainerName]);
+                if dev.repo_on_host {
+                    stops.push(TaskEditField::ContainerDir);
+                }
+                stops.push(TaskEditField::ContainerRefresh);
+                stops.extend((0..self.dev.container_count()).map(TaskEditField::ContainerChoice));
+            }
         }
         if self.capability_enabled(Capability::Ticket) {
             stops.extend([TaskEditField::LinearLink, TaskEditField::GithubPr]);
@@ -827,7 +868,13 @@ impl TaskEditView {
             TaskEditField::Repo => self.repo_input.clone().into(),
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
+            TaskEditField::ContainerName => self.dev.container_input.clone().into(),
+            TaskEditField::ContainerDir => self.dev.dir_input.clone().into(),
             TaskEditField::Obligations
+            | TaskEditField::RunsIn
+            | TaskEditField::RepoLocation
+            | TaskEditField::ContainerRefresh
+            | TaskEditField::ContainerChoice(_)
             | TaskEditField::AgentPlatform
             | TaskEditField::AgentModel
             | TaskEditField::AgentEffort
@@ -851,6 +898,11 @@ impl TaskEditView {
             (TaskEditField::Repo, self.repo_input.clone().into()),
             (TaskEditField::Branch, self.branch_input.clone().into()),
             (TaskEditField::Details, self.details_input.clone().into()),
+            (
+                TaskEditField::ContainerName,
+                self.dev.container_input.clone().into(),
+            ),
+            (TaskEditField::ContainerDir, self.dev.dir_input.clone().into()),
         ];
         for (index, field) in self.generator_fields.iter().enumerate() {
             if let Some(input) = field.input.clone() {
@@ -923,6 +975,22 @@ impl TaskEditView {
             }
             TaskEditField::WorktreeAction => {
                 self.run_worktree_action(cx);
+                return;
+            }
+            TaskEditField::RunsIn => {
+                self.toggle_dev_container(cx);
+                return;
+            }
+            TaskEditField::RepoLocation => {
+                self.toggle_repo_location(cx);
+                return;
+            }
+            TaskEditField::ContainerRefresh => {
+                self.refresh_containers(cx);
+                return;
+            }
+            TaskEditField::ContainerChoice(index) => {
+                self.choose_container(index, window, cx);
                 return;
             }
             _ => {
@@ -1102,6 +1170,7 @@ impl TaskEditView {
             .unwrap_or_default()
             .launch_options_for(AgentRole::Default);
         self.load_action_capabilities();
+        self.load_dev_container(window, cx);
         self.load_obligation_counts(&task_id);
         self.load_generator_config(window, cx);
         self.load_managed_link();
@@ -1315,7 +1384,7 @@ impl TaskEditView {
                     let settings = TodSettings::load(&paths).unwrap_or_default();
                     if setup {
                         setup_worktree_for_node(&fleet, &paths, &settings, &task_id)
-                            .map(|path| format!("Worktree ready at {}", path.display()))
+                            .map(|path| format!("Worktree ready at {path}"))
                     } else {
                         release_worktree_for_node(&fleet, &paths, &settings, &task_id)
                             .map(|()| "Worktree released".to_string())
@@ -2800,7 +2869,18 @@ impl TaskEditView {
         if value == self.loaded_repo {
             return;
         }
-        if !value.is_empty() {
+        if !value.is_empty() && self.repo_in_container() {
+            if !value.starts_with('/') {
+                self.pending_toast = Some(
+                    "The repository is inside the dev container: give its path there, \
+                     like /workspaces/app"
+                        .into(),
+                );
+                self.pending_repo_revert = true;
+                cx.notify();
+                return;
+            }
+        } else if !value.is_empty() {
             if let Err(err) =
                 validate_interview_workspace(std::path::Path::new(&value), &self.loaded_branch)
             {
@@ -2829,6 +2909,9 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.load_action_capabilities();
         self.clamp_focus_index();
+        if self.repo_in_container() {
+            self.check_dev_container(cx);
+        }
         cx.notify();
     }
 
@@ -2844,7 +2927,7 @@ impl TaskEditView {
             self.rename_worktree_branch(id, value, cx);
             return;
         }
-        if !self.loaded_repo.is_empty() {
+        if !self.loaded_repo.is_empty() && !self.repo_in_container() {
             if let Err(err) =
                 validate_interview_workspace(std::path::Path::new(&self.loaded_repo), &value)
             {
@@ -3396,7 +3479,7 @@ impl TaskEditView {
         let action_focused = self.field_nav_focused(TaskEditField::WorktreeAction);
 
         let directory_text = match &directory {
-            Some(FilesDirectory::Ready(path)) => Some(path.display().to_string()),
+            Some(FilesDirectory::Ready(path)) => Some(path.to_string()),
             Some(FilesDirectory::Missing(reason)) => Some(reason.clone()),
             Some(FilesDirectory::NeedsWorktreeSetup) | None => None,
         };
@@ -3457,7 +3540,14 @@ impl TaskEditView {
                                 .gap_1()
                                 .w(px(280.))
                                 .flex_shrink_0()
-                                .child(Self::render_field_label("Workspace directory", cx))
+                                .child(Self::render_field_label(
+                                    if self.repo_in_container() {
+                                        "Repository in the container"
+                                    } else {
+                                        "Workspace directory"
+                                    },
+                                    cx,
+                                ))
                                 .child(self.render_nav_input(
                                     TaskEditField::Repo,
                                     self.repo_input.clone(),
@@ -3522,6 +3612,9 @@ impl TaskEditView {
                     .child(Self::render_field_label("Resolved directory", cx))
                     .child(directory_row),
             )
+            .when(self.own_files().is_some(), |el| {
+                el.child(self.render_dev_container(muted, window, cx))
+            })
             .when_some(self.worktree_status.clone(), |el, status| {
                 el.child(div().text_xs().text_color(muted).child(selectable_text(
                     "task-edit-worktree-status",
@@ -3601,11 +3694,19 @@ impl TaskEditView {
             }
             Capability::Files => {
                 let resolved = self.resolved_files.as_ref().filter(|f| f.inherited)?;
-                let summary = match resolved.directory() {
-                    FilesDirectory::Ready(path) => path.display().to_string(),
+                let mut summary = match resolved.directory() {
+                    FilesDirectory::Ready(path) => path.to_string(),
                     FilesDirectory::NeedsWorktreeSetup => "worktree not set up".to_string(),
                     FilesDirectory::Missing(reason) => reason,
                 };
+                if let Some(container) = resolved
+                    .dev_container
+                    .as_ref()
+                    .filter(|dev| dev.repo_on_host)
+                    .and_then(|dev| dev.container())
+                {
+                    summary = format!("{summary} · in dev container {container}");
+                }
                 (resolved.source_title.clone(), summary)
             }
             _ => return None,

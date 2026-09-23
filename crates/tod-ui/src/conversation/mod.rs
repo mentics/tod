@@ -87,7 +87,6 @@ use keyboard::*;
 use nav::NavMenu;
 use side_pane::FindingItem;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tod_core::conversation::context::focus_selection;
@@ -927,7 +926,7 @@ impl ConversationView {
     /// Advance the drivers, and reload when the store changed. Returns
     /// whether anything visible changed, and the worktree to re-read the
     /// changed files from (the caller does that off the main thread).
-    fn poll(&mut self, committed: bool) -> (bool, Option<PathBuf>) {
+    fn poll(&mut self, committed: bool) -> (bool, Option<tod_store::fleet::Workdir>) {
         let mut finished = false;
         let mut current_error = None;
         let mut loop_turns = None;
@@ -1005,7 +1004,7 @@ impl ConversationView {
 
     /// The worktree an implementation conversation is running in, when that
     /// is what is open.
-    fn implementation_worktree(&self) -> Option<PathBuf> {
+    fn implementation_worktree(&self) -> Option<tod_store::fleet::Workdir> {
         if self.data.protocol != ProtocolKind::Implementation {
             return None;
         }
@@ -1938,11 +1937,8 @@ impl Render for ConversationView {
 /// The worktree's changed files, one `git status --porcelain` line each.
 /// Empty when it is not a repository, or git is not on the path — the pane
 /// simply shows nothing rather than an error.
-fn worktree_files(cwd: &std::path::Path) -> Vec<String> {
-    std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()
+fn worktree_files(cwd: &tod_store::fleet::Workdir) -> Vec<String> {
+    cwd.git_output(&["status", "--porcelain"])
         .ok()
         .filter(|out| out.status.success())
         .map(|out| {

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 56;
+pub const CURRENT_USER_VERSION: i32 = 57;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -365,6 +365,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v55_to_v56(conn)?;
         conn.pragma_update(None, "user_version", 56)?;
     }
+    if version < 57 {
+        migrate_v56_to_v57(conn)?;
+        conn.pragma_update(None, "user_version", 57)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -677,6 +681,24 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// The Files capability can run a node's launches in a dev container.
+fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("dev_container", "INTEGER NOT NULL DEFAULT 0"),
+        ("container", "TEXT"),
+        ("container_dir", "TEXT"),
+        ("container_repo_on_host", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('node_files') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!("ALTER TABLE node_files ADD COLUMN {column} {ddl};"))?;
+        }
+    }
     Ok(())
 }
 

@@ -302,6 +302,7 @@ fn every_mutation() -> Vec<(M, Option<ActionKind>)> {
                 repo: None,
                 branch: None,
                 use_worktree: false,
+                dev_container: None,
             },
             Some(Edit),
         ),

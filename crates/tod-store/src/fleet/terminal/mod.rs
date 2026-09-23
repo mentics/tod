@@ -9,7 +9,7 @@ use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::reconnect_identity::{self};
 use crate::fleet::repos::agent_run::{AgentRun, RUNTIME_STATUS_ACTIVE};
 use crate::fleet::repos::shell::ShellSession;
-use crate::fleet::{FleetMutation, FleetStore, resolve_launch_cwd};
+use crate::fleet::{FleetMutation, FleetStore, Workdir, resolve_launch_cwd};
 use crate::paths::TodPaths;
 use crate::settings::{TerminalSettings, TodSettings};
 use anyhow::{Context, Result, bail};
@@ -752,12 +752,21 @@ pub fn open_shell_for_node(
     settings: &TodSettings,
     node_id: &str,
     startup_command: Option<&str>,
-) -> Result<(String, PathBuf)> {
+) -> Result<(String, Workdir)> {
     let cwd = resolve_launch_cwd(fleet, node_id)?;
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
     let shell_id = uuid::Uuid::new_v4().to_string();
-    launch_shell_terminal(&cwd, &terminal, &shell_id, &assets, startup_command)?;
+    let in_container =
+        container_startup(fleet, node_id, &cwd, &shell_id, startup_command, &terminal)?;
+    let startup_command = in_container.as_deref().or(startup_command);
+    launch_shell_terminal(
+        &host_terminal_dir(fleet, &cwd),
+        &terminal,
+        &shell_id,
+        &assets,
+        startup_command,
+    )?;
     let state_dir = normalize_launch_path(&assets.state_dir);
     let state = wait_for_shell_state(&state_dir, &shell_id)?;
     let reconnect = reconnect_identity::record(state.pid);
@@ -770,6 +779,111 @@ pub fn open_shell_for_node(
     Ok((shell_id, cwd))
 }
 
+/// Where the terminal window itself starts on this machine: `cwd`, or the
+/// data root when `cwd` is inside a dev container (the shell in the window
+/// then `docker exec`s into it).
+fn host_terminal_dir(fleet: &FleetStore, cwd: &Workdir) -> PathBuf {
+    cwd.host_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| fleet.paths().root().to_path_buf())
+}
+
+/// When the node's Files run in a dev container: the host command that opens
+/// the terminal's shell there (in the container's directory, as its user,
+/// with `tod-cli` relayed), running `inner` first if given. `None` runs the
+/// terminal on this machine. Talks to Docker.
+fn container_startup(
+    fleet: &FleetStore,
+    node_id: &str,
+    cwd: &Workdir,
+    session_id: &str,
+    inner: Option<&str>,
+    terminal: &TerminalSettings,
+) -> Result<Option<String>> {
+    use tod_agent::devcontainer::{self, ContainerFile, sh_quote};
+    let tod_agent::AgentEnvironment::DevContainer(launch) = fleet.agent_environment(node_id, cwd)?
+    else {
+        return Ok(None);
+    };
+    let container = devcontainer::prepare(&launch)?;
+    let mut script = format!(
+        "cd {} || exit 1\nexport PATH={}\n",
+        sh_quote(&container.cwd),
+        sh_quote(&container.path)
+    );
+    for (key, value) in &container.env {
+        script.push_str(&format!("export {key}={}\n", sh_quote(value)));
+    }
+    // Not a login shell: a login profile resets `PATH`, and with it `tod-cli`.
+    script.push_str("shell=bash; command -v bash >/dev/null 2>&1 || shell=sh\n");
+    match inner.map(str::trim).filter(|c| !c.is_empty()) {
+        // The shell stays after the CLI exits, as on this machine.
+        Some(inner) => script.push_str(&format!(
+            "exec \"$shell\" -c {}\n",
+            sh_quote(&format!("{inner}; exec \"${{0}}\""))
+        )),
+        None => script.push_str("exec \"$shell\"\n"),
+    }
+    let script_path = format!(
+        "{}/launch-{session_id}.sh",
+        crate::fleet::cli_relay::SHIM_DIR
+    );
+    devcontainer::write_file(
+        &container.id,
+        &ContainerFile {
+            path: script_path.clone(),
+            contents: script,
+            executable: false,
+        },
+    )?;
+    // The script sets the environment, so none of it (the relay token) goes
+    // on the command line.
+    let mut exec = vec!["exec".to_string(), "-it".to_string()];
+    if let Some(user) = &container.user {
+        exec.extend(["-u".to_string(), user.clone()]);
+    }
+    exec.extend([container.id.clone(), "sh".to_string(), script_path]);
+    Ok(Some(format!(
+        "{} {}",
+        docker_invocation(terminal),
+        exec.join(" ")
+    )))
+}
+
+/// How the terminal's shell runs `docker`: bare when it is on `PATH`, else
+/// its full path, quoted the way the shell needs.
+fn docker_invocation(terminal: &TerminalSettings) -> String {
+    let bin = tod_agent::devcontainer::docker_bin();
+    let on_path = std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| bin.parent() == Some(dir.as_path()))
+    });
+    if on_path || bin.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return "docker".into();
+    }
+    let path = bin.to_string_lossy().into_owned();
+    if !path.contains(' ') {
+        return path.replace('\\', "/");
+    }
+    #[cfg(windows)]
+    {
+        let powershell = terminal
+            .program
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .is_none_or(is_powershell);
+        if powershell {
+            return format!("& '{path}'");
+        }
+        return format!("\"{}\"", path.replace('\\', "/"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = terminal;
+        tod_agent::devcontainer::sh_quote(&path)
+    }
+}
+
 /// Launch the agent CLI in an OS terminal, tracked as a `terminal` agent run (not a shell).
 ///
 /// Uses the agent run id as the terminal state-file key for PID focus/liveness.
@@ -780,7 +894,7 @@ pub fn open_terminal_agent_for_node(
     node_id: &str,
     startup_command: &str,
     launch: Option<AgentLaunchOptions>,
-) -> Result<(String, PathBuf)> {
+) -> Result<(String, Workdir)> {
     let cwd = resolve_launch_cwd(fleet, node_id)?;
 
     fleet.enqueue(FleetMutation::CreateAgentRun {
@@ -804,9 +918,25 @@ pub fn open_terminal_agent_for_node(
 
     let terminal = fresh_terminal_settings(paths, &settings.terminal);
     let assets = ensure_shell_init_assets(paths)?;
-    if let Err(err) =
-        launch_shell_terminal(&cwd, &terminal, &run_id, &assets, Some(startup_command))
-    {
+    let launched = container_startup(
+        fleet,
+        node_id,
+        &cwd,
+        &run_id,
+        Some(startup_command),
+        &terminal,
+    )
+    .and_then(|in_container| {
+        let startup_command = in_container.as_deref().unwrap_or(startup_command);
+        launch_shell_terminal(
+            &host_terminal_dir(fleet, &cwd),
+            &terminal,
+            &run_id,
+            &assets,
+            Some(startup_command),
+        )
+    });
+    if let Err(err) = launched {
         let _ = fleet.enqueue(FleetMutation::DeleteAgentRun {
             run_id: run_id.clone(),
         });
@@ -851,7 +981,7 @@ pub fn focus_terminal_agent_run(
     settings: &TodSettings,
     run: &AgentRun,
     startup_command: &str,
-) -> Result<PathBuf> {
+) -> Result<Workdir> {
     let cwd = resolve_launch_cwd(fleet, &run.node_id)?;
 
     if terminal_agent_is_alive(paths, run) {
@@ -887,7 +1017,7 @@ pub fn focus_shell_session(
     paths: &TodPaths,
     settings: &TodSettings,
     shell: &ShellSession,
-) -> Result<PathBuf> {
+) -> Result<Workdir> {
     let cwd = resolve_launch_cwd(fleet, &shell.node_id)?;
 
     if shell_is_alive(paths, shell) {
@@ -1286,7 +1416,7 @@ mod tests {
         let settings = TodSettings::default();
         let (shell_id, resolved) =
             open_shell_for_node(&store, &paths, &settings, &node_id, None).unwrap();
-        assert_eq!(resolved, cwd);
+        assert_eq!(resolved, Workdir::host(&cwd));
 
         let (alive, pid) = verify_shell_session(&paths, &shell_id).unwrap();
         assert!(alive, "shell process should be alive after launch");
