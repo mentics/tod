@@ -188,6 +188,8 @@ pub fn classify(mutation: &OutlineMutation) -> Option<(ActionKind, Entity, Uuid)
         | M::ClearStaleCopyLinks { .. }
         | M::RefreshLinkedCopy { .. }
         | M::PasteManagedNodeCopy { .. }
+        | M::SetGeneratorAcceptConfig { .. }
+        | M::AcceptGeneratedTicket { .. }
         | M::SetRefreshStatus { .. } => return None,
     })
 }
