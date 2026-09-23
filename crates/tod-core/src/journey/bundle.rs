@@ -202,17 +202,11 @@ pub fn build_bundle(
     }
     for key in &row_order {
         let state = row_state.get(key).expect("row_order and row_state stay in sync");
-        resolve_row(&mut writer, key, state)?;
+        resolve_row(&mut writer, store, key, state, include_transcripts)?;
     }
 
-    // TODO(journeys step 6e): gate evaluations/reports are not resolved as
-    // `Resolved` records. `Event::GateResult` already carries its full
-    // `GateReport`/`CriterionResult`s inline (see `record.rs`), and nothing
-    // in the current record shapes gives a gate evaluation a stable id that
-    // something else could reference — so there is nothing to "resolve" yet
-    // that isn't already in the streamed records above. Wiring this in for
-    // real would mean giving gate evaluations an id and having some other
-    // event reference it, which is a data-model change beyond this step.
+    // Note: gate results are also carried inline by `Event::GateResult`
+    // (full report and criterion results) in the streamed records above.
 
     writer.finish().context("finishing bundle")
 }
@@ -407,7 +401,13 @@ fn resolve_conversation(
     Ok(())
 }
 
-fn resolve_row(writer: &mut BundleWriter, key: &(String, String), state: &RowRefState) -> Result<()> {
+fn resolve_row(
+    writer: &mut BundleWriter,
+    store: &FleetStore,
+    key: &(String, String),
+    state: &RowRefState,
+    include_transcripts: bool,
+) -> Result<()> {
     let (table, row_id) = key;
     let reference = Reference {
         kind: "row".to_string(),
@@ -415,19 +415,21 @@ fn resolve_row(writer: &mut BundleWriter, key: &(String, String), state: &RowRef
         from_seq: None,
         to_seq: None,
     };
-    // The journey's own recorded history is the only "current state" source
-    // available here without a generic per-table live lookup (no such
-    // registry exists in `tod-store` today — see the module doc comment).
-    // A deleted row (or one whose last known state carries no `new_state`)
-    // resolves as missing; anything else resolves to the last state the
-    // journey itself recorded for it, up to the bundle's cutoff seq.
-    let content = if state.op == "delete" || state.new_state.is_none() {
-        Resolution::Missing
+    // Spec §5.3: resolve the row's current content from the database
+    // (`Missing` if gone). Only if the lookup errors do we fall back to the
+    // last state the journey itself recorded for the row.
+    let content = if tod_store::journey_rows::is_transcript_table(table) && !include_transcripts {
+        withheld_placeholder()
     } else {
-        Resolution::Found {
-            data: tod_journey::Blob {
-                mime: "application/json".to_string(),
-                bytes: state.new_state.clone().unwrap_or_default().into_bytes(),
+        match store.read(|conn| tod_store::journey_rows::fetch_row(conn, table, row_id)) {
+            Ok(Some(value)) => found_json(&value)?,
+            Ok(None) => Resolution::Missing,
+            Err(_) if state.op == "delete" || state.new_state.is_none() => Resolution::Missing,
+            Err(_) => Resolution::Found {
+                data: tod_journey::Blob {
+                    mime: "application/json".to_string(),
+                    bytes: state.new_state.clone().unwrap_or_default().into_bytes(),
+                },
             },
         }
     };
@@ -530,6 +532,31 @@ mod tests {
         // something concrete.
         let obligation_id = fx.obligation("Passwords are hashed.");
 
+        // A gate evaluation and an interview transcript row, inserted
+        // directly (the triggers still fire).
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+        let transcript_id = Uuid::new_v4();
+        let gate_row_id = {
+            let conn = rusqlite::Connection::open(fx.fleet.paths().db()).unwrap();
+            let criterion: Vec<u8> = conn
+                .query_row("SELECT id FROM gate_criteria LIMIT 1", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO node_gate_evaluations (node_id, criterion_id, outcome, detail, source, evaluated_at)
+                 VALUES (?1, ?2, 'pass', 'live-gate-detail', 'agent', 1)",
+                rusqlite::params![fx.node.as_bytes().to_vec(), criterion],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO interview_transcripts (id, node_id, phase, display_name, body, created_at, updated_at)
+                 VALUES (?1, ?2, 'requirements', 'T', 'secret transcript body', 1, 1)",
+                rusqlite::params![transcript_id.as_bytes().to_vec(), fx.node.as_bytes().to_vec()],
+            )
+            .unwrap();
+            format!("{}:{}", hex(fx.node.as_bytes()), hex(&criterion))
+        };
+        fx.fleet.reload_if_stale().unwrap();
+
         // Hand-write a small node journey: an AgentTurn referencing the
         // conversation's two turns, and DataChanged for the obligation.
         {
@@ -562,6 +589,27 @@ mod tests {
                         old_state: None,
                         new_state: Some(format!("{{\"id\":\"{obligation_id}\"}}")),
                     }],
+                },
+            );
+            writer.append(
+                Actor::App,
+                Event::DataChanged {
+                    rows: vec![
+                        RowRef {
+                            table: "node_gate_evaluations".into(),
+                            row_id: gate_row_id.clone(),
+                            op: "insert".into(),
+                            old_state: None,
+                            new_state: None,
+                        },
+                        RowRef {
+                            table: "interview_transcripts".into(),
+                            row_id: hex(transcript_id.as_bytes()),
+                            op: "insert".into(),
+                            old_state: None,
+                            new_state: None,
+                        },
+                    ],
                 },
             );
             // A row that gets deleted before the cutoff: resolves as missing.
@@ -694,5 +742,30 @@ mod tests {
             row_res.iter().any(|(_, c)| matches!(c, Resolution::Missing)),
             "the deleted row resolves as missing"
         );
+
+        let text_of = |c: &Resolution| match c {
+            Resolution::Found { data } => Some(String::from_utf8_lossy(&data.bytes).into_owned()),
+            _ => None,
+        };
+        let gate = row_res
+            .iter()
+            .find(|(r, _)| r.id.starts_with("node_gate_evaluations:"))
+            .expect("gate evaluation reference");
+        let gate_text = text_of(&gate.1).expect("gate evaluation found");
+        assert!(gate_text.contains("live-gate-detail"), "{gate_text}");
+        let obligation = row_res
+            .iter()
+            .find(|(r, c)| r.id.starts_with("node_obligations:") && text_of(c).is_some())
+            .expect("live obligation row");
+        assert!(text_of(&obligation.1).unwrap().contains("Passwords are hashed."));
+        let transcript = row_res
+            .iter()
+            .find(|(r, _)| r.id.starts_with("interview_transcripts:"))
+            .expect("transcript row reference");
+        if include_transcripts {
+            assert!(text_of(&transcript.1).unwrap().contains("secret transcript body"));
+        } else {
+            assert!(matches!(transcript.1, Resolution::Withheld { .. }));
+        }
     }
 }

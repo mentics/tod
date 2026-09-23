@@ -7,6 +7,7 @@ pub mod incoming;
 pub mod install;
 pub mod interview;
 pub mod journey_changes;
+pub mod journey_rows;
 pub mod journey_submissions;
 pub mod learn;
 pub mod lifecycle_baseline;
