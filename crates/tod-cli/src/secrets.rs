@@ -98,13 +98,19 @@ fn set(rest: &[String], store: &CredentialStore) -> anyhow::Result<String> {
     let value = match rest.get(1) {
         Some(value) if value != "-" => value.clone(),
         _ => {
+            // A single line, not the whole stream: reading to EOF instead
+            // is at the mercy of how the terminal signals it — on Windows
+            // git-bash, a literal Ctrl+D keystroke lands in the buffer as a
+            // control byte rather than closing stdin.
             let mut buf = String::new();
             std::io::stdin()
-                .read_to_string(&mut buf)
+                .lock()
+                .read_line(&mut buf)
                 .map_err(|err| anyhow::anyhow!("could not read {} from stdin: {err}", kind.name()))?;
             buf
         }
     };
+    let value: String = value.chars().filter(|c| !c.is_control()).collect();
     let backend = store.set(kind, &value).map_err(|err| anyhow::anyhow!("{err}"))?;
     Ok(format!("ok {} stored ({backend:?})", kind.name()))
 }

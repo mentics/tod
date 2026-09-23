@@ -114,15 +114,33 @@ fn open(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
     let title = args.require("--title")?.to_string();
     let body = args.get("--body").unwrap_or_default().to_string();
     let token = token(inv)?;
-    let pr = github::create_pr(&token, &owner, &repo, &head, &base, &title, &body)
-        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?;
-    inv.client().interview(InterviewCommand::RecordNodePr {
-        node_id: node,
-        owner,
-        repo,
-        pr_number: pr.number,
-        url: pr.url.clone(),
-    })?;
+    // GitHub itself is the source of truth for whether one already exists —
+    // not just the local record checked above — so a retry after the local
+    // write below failed (the PR now orphaned from tod's perspective) finds
+    // the existing PR instead of opening a duplicate.
+    let pr = match github::find_open_pr(&token, &owner, &repo, &head)
+        .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?
+    {
+        Some(pr) => pr,
+        None => github::create_pr(&token, &owner, &repo, &head, &base, &title, &body)
+            .map_err(|err| anyhow::anyhow!("GitHub: {err}"))?,
+    };
+    inv.client()
+        .interview(InterviewCommand::RecordNodePr {
+            node_id: node,
+            owner,
+            repo,
+            pr_number: pr.number,
+            url: pr.url.clone(),
+        })
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "{} is open on GitHub but could not be recorded on the node: {err}. \
+                 Re-run `pr open` once fixed — it will find this PR rather than opening \
+                 a duplicate.",
+                pr.url
+            )
+        })?;
     Ok(format!("ok {}", pr.url))
 }
 

@@ -55,7 +55,6 @@ NOUNS:
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
     pr                     Opening and driving a node's pull request
-    pr                     Opening and driving a node's pull request
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass

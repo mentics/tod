@@ -66,7 +66,40 @@ fn request_error(err: ureq::Error) -> GithubError {
     GithubError::Http(err.to_string())
 }
 
-/// Open a pull request `head` -> `base` in `owner/repo`.
+/// Find an already-open pull request from `head` into `owner/repo`, if any.
+/// `create_pr` checks this first — GitHub itself is the source of truth for
+/// whether one exists, not just the local `node_pr` record, so a lost local
+/// record (e.g. the DB write after creation failed) can't lead to a
+/// duplicate PR on retry.
+pub fn find_open_pr(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+) -> Result<Option<PullRequest>, GithubError> {
+    let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?head={owner}:{head}&state=open");
+    let mut response = ureq::get(&url)
+        .header("Authorization", &auth_header(token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "tod")
+        .call()
+        .map_err(request_error)?;
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        return Err(api_error(status.as_u16(), &mut response));
+    }
+    let raw: Vec<PrRaw> = response
+        .body_mut()
+        .read_json()
+        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
+    Ok(raw.into_iter().next().map(|pr| PullRequest {
+        number: pr.number,
+        url: pr.html_url,
+    }))
+}
+
+/// Open a pull request `head` -> `base` in `owner/repo`. Callers should check
+/// `find_open_pr` first — this always creates a new one.
 pub fn create_pr(
     token: &str,
     owner: &str,
