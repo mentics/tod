@@ -5,10 +5,12 @@
 //! events. See `doc/journeys/spec.md` and
 //! `doc/journeys/implementation-plan.md` step 2.
 
+pub mod bundle;
 pub mod changes;
 pub mod recorder;
 pub mod snapshot;
 
+pub use bundle::build_bundle;
 pub use recorder::{Recorder, install, record, record_and_get_seq};
 pub use snapshot::{ResolvedAgentSettings, SettingsSnapshot, settings_snapshot};
 

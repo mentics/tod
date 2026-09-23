@@ -3,8 +3,9 @@
 //! an in-memory buffer. Reading a bundle reuses [`crate::reader::JourneyReader::from_reader`]
 //! over the decompressed bytes.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
+use crate::reader::JourneyReader;
 use crate::record::{Actor, Event, Record};
 
 /// Writes a bundle: a zstd-compressed CBOR sequence of records, held
@@ -57,4 +58,11 @@ impl Default for BundleWriter {
     fn default() -> Self {
         Self::new().expect("in-memory zstd encoder never fails to construct")
     }
+}
+
+/// Reads a bundle built by [`BundleWriter`]: strips the zstd framing and
+/// hands the plain CBOR record stream to [`JourneyReader::from_reader`].
+pub fn read_bundle(bytes: impl Read) -> io::Result<JourneyReader> {
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    Ok(JourneyReader::from_reader(decoder))
 }
