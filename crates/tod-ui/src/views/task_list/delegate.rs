@@ -74,6 +74,12 @@ pub enum RowAction {
     ToggleGeneratorFilter {
         task_id: String,
     },
+    /// The row's Accept chip (or Space). A no-op if the row's generator has
+    /// no quick-accept destination configured — the handler checks
+    /// `accept_ready` itself.
+    AcceptTicket {
+        task_id: String,
+    },
 }
 
 pub struct TaskListDelegate {
@@ -271,6 +277,42 @@ impl ListDelegate for TaskListDelegate {
                     }
                 },
             ));
+        }
+        if managed && item.external_id.is_some() {
+            let task_id_accept = item.id.clone();
+            let ready = item.accept_ready;
+            let sink = sink.clone();
+            let label = if selected {
+                "Accept (Space)".to_string()
+            } else {
+                "Accept".to_string()
+            };
+            chips = chips.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .when(ready, |el| el.cursor_pointer())
+                    .border_1()
+                    .border_color(border)
+                    .bg(background)
+                    .text_color(if ready { foreground } else { muted_foreground })
+                    .opacity(if ready { 1.0 } else { 0.5 })
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            if ready {
+                                sink.borrow_mut().push(RowAction::AcceptTicket {
+                                    task_id: task_id_accept.clone(),
+                                });
+                                cx.notify();
+                            }
+                        }),
+                    ),
+            );
         }
         if item.has_spec {
             let mut obl_label = format!(

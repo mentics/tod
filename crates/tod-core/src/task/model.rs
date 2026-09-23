@@ -54,6 +54,9 @@ pub struct TaskItem {
     pub generator_status: Option<String>,
     /// `last_refresh_error`, for generator nodes whose last refresh failed.
     pub generator_error: Option<String>,
+    /// True for a managed ticket whose generator has a quick-accept
+    /// destination configured — the Accept action is inert otherwise.
+    pub accept_ready: bool,
 }
 
 impl TaskItem {
@@ -586,6 +589,7 @@ mod tests {
             managed_count: None,
             generator_status: None,
             generator_error: None,
+            accept_ready: false,
         }
     }
 

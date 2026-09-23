@@ -85,6 +85,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 managed_count: row.managed_count,
                 generator_status: row.generator_status,
                 generator_error: row.generator_error,
+                accept_ready: row.accept_ready,
             }
         })
         .collect()
@@ -131,6 +132,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             managed_count: None,
             generator_status: None,
             generator_error: None,
+            accept_ready: false,
         })
         .collect()
 }

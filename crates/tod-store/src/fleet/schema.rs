@@ -692,6 +692,27 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Quick-accept for generator ticket nodes: the destination node accepted
+/// copies are created under, and the capabilities to auto-enable on them.
+/// Both start unset — accept is inert until the user configures a
+/// destination.
+fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("accept_destination_node_id", "BLOB"),
+        ("accept_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+    ] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('node_generator_config') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE node_generator_config ADD COLUMN {column} {ddl};"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 /// The Files capability can run a node's launches in a dev container.
 fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
@@ -713,9 +734,6 @@ fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
 /// The `pr` lifecycle state's PR reference: one row per node once its pull
 /// request has been opened (`tod-cli pr open`), read by the `pr -> approved`
 /// and `approved -> merged` gates and shown in the side pane.
-/// The node's pull request reference, once `tod-cli pr open` creates one —
-/// what the `pr` lifecycle protocol and the `pr` -> `approved` / `approved`
-/// -> `merged` gates read live status against.
 fn migrate_v58_to_v59(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS node_pr (
@@ -727,20 +745,6 @@ fn migrate_v58_to_v59(conn: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL,
             FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
         );",
-    )?;
-    Ok(())
-}
-
-fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS node_pr (
-             node_id BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-             owner TEXT NOT NULL,
-             repo TEXT NOT NULL,
-             pr_number INTEGER NOT NULL,
-             url TEXT NOT NULL,
-             created_at INTEGER NOT NULL
-         );",
     )?;
     Ok(())
 }

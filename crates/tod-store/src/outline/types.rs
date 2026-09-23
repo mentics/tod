@@ -180,4 +180,7 @@ pub struct FlatNodeRow {
     pub generator_status: Option<String>,
     /// `last_refresh_error`, for generator nodes whose last refresh failed.
     pub generator_error: Option<String>,
+    /// True for a managed node whose generator has a quick-accept
+    /// destination configured — accept is a no-op otherwise.
+    pub accept_ready: bool,
 }
