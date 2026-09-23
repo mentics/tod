@@ -12,6 +12,7 @@ gpui_kit_assets::icon_assets!(
         Pencil,
         CircleDot,
         MessagesSquare,
+        Flag,
         FlagOff,
         Layers,
         ListChecks,
@@ -43,4 +44,14 @@ impl AssetSource for AppAssets {
 #[cfg(test)]
 pub fn serves(path: &str) -> bool {
     matches!(AppAssets.load(path), Ok(Some(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serves;
+
+    #[test]
+    fn title_bar_report_icon_is_bundled() {
+        assert!(serves("icons/flag.svg"));
+    }
 }

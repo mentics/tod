@@ -87,8 +87,17 @@ pub fn process_message(
         ordered.push(std::fs::read(parts_dir.join(i.to_string()))?);
     }
     let sealed = tod_journey::seal::join(ordered);
-    let compressed = tod_journey::seal::open(identity, &sealed)?;
-    let plain = tod_journey::bundle::decompress(&compressed)?;
+    let opened = tod_journey::seal::open(identity, &sealed)
+        .and_then(|compressed| Ok(tod_journey::bundle::decompress(&compressed)?));
+    let plain = match opened {
+        Ok(plain) => plain,
+        Err(e) => {
+            // A bundle that cannot be opened will never become openable, and
+            // `last_seen` moves past it, so drop its buffered parts.
+            let _ = std::fs::remove_dir_all(&parts_dir);
+            return Err(e);
+        }
+    };
 
     std::fs::create_dir_all(config::received_dir(home))?;
     std::fs::write(&dest, &plain)?;
@@ -265,5 +274,16 @@ mod tests {
         let m = Message { id: "id-1".to_string(), time: 0, message: "got 42".to_string(), attachment: None };
         let outcome = process_message(&home, "unused", &m, |_| Ok(Vec::new()), |_| Ok(())).unwrap();
         assert_eq!(outcome, Outcome::Ignored);
+    }
+
+    #[test]
+    fn an_unopenable_bundle_leaves_no_buffered_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let (identity, _recipient) = tod_journey::seal::generate_test_identity();
+        let m = msg("id-1", "junk.journey.age", "part://1");
+        let err = process_message(&home, &identity, &m, |_| Ok(b"not sealed".to_vec()), |_| Ok(()));
+        assert!(err.is_err());
+        assert!(!config::parts_dir(&home).join("junk").exists());
     }
 }

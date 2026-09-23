@@ -431,7 +431,13 @@ impl SettingsView {
         });
         let _relay_code_subscription =
             cx.subscribe(&relay_code_input, |this, input, event, cx| {
-                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                // Applied on every change as well as on blur/Enter: the code is
+                // pasted whole, and the toggles below depend on whether it parses,
+                // so they must not wait for a blur that may never come.
+                if matches!(
+                    event,
+                    InputEvent::Change | InputEvent::Blur | InputEvent::PressEnter { .. }
+                ) {
                     let text = input.read(cx).text().to_string();
                     let trimmed = text.trim();
                     let next = (!trimmed.is_empty()).then(|| trimmed.to_string());
@@ -984,9 +990,12 @@ impl SettingsView {
                 .background_spawn(async move {
                     use tod_core::journey::Relay;
                     let relay = tod_core::journey::NtfyRelay::parse(&code)?;
-                    let payload = b"tod journeys test".to_vec();
+                    // An empty but well-formed bundle, so `tod-journeys pull`
+                    // opens, files, and acknowledges it like a real one.
+                    let payload = tod_journey::bundle::BundleWriter::new()?.finish()?;
                     let sealed = tod_journey::seal::seal(relay.recipient(), &payload)?;
-                    relay.put("test.journey.age", &sealed)
+                    let name = format!("test-{}.journey.age", uuid::Uuid::new_v4().simple());
+                    relay.put(&name, &sealed)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
