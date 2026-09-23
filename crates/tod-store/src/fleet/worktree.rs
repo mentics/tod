@@ -228,6 +228,11 @@ fn switch_to_branch(repo: &Workdir, branch: &str) -> Result<bool> {
 /// Initialized submodules of `repo`, recursively, parents before children.
 /// Empty for a repository without submodules.
 pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
+    // `git submodule status --recursive` takes most of a second even with
+    // nothing to report, and every run start and commit asks.
+    if !has_gitmodules(repo) {
+        return Ok(Vec::new());
+    }
     let output = run_git(repo, &["submodule", "status", "--recursive"])?;
     Ok(output
         .lines()

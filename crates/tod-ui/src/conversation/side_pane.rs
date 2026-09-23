@@ -33,7 +33,7 @@ use tod_core::conversation::implement::{HandoffAnswer, TestRun, handoff_answer_m
 use tod_store::conversation::ProtocolKind;
 use tod_store::interview::{InterviewCommand, short_id};
 use tod_store::outline::repos::plan_steps::{
-    HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_IN_PROGRESS, STATUS_VERIFIED,
+    HandoffReason, STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED,
     needs_user,
 };
 use tod_store::outline::{OutlineMutation, PlanStep};
@@ -195,9 +195,11 @@ impl ConversationView {
         let Some(step) = self.data.plan.iter().find(|s| s.id == step).cloned() else {
             return;
         };
-        if self.deliver(&handoff_answer_message(&step, &answer), cx) {
-            self.choose_status(step.id, STATUS_IN_PROGRESS, cx);
-        }
+        self.deliver(
+            &handoff_answer_message(&step, &answer),
+            super::AfterSend::Handoff(step.id),
+            cx,
+        );
     }
 
     /// Under a step that failed verification: what verification found. The
