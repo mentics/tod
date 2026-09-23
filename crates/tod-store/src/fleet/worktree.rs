@@ -6,7 +6,7 @@
 //! on the container's `PATH`, with the container's own configuration.
 
 use crate::fleet::treehouse::{TREEHOUSE_NO_UPDATE_CHECK_ENV, TreehouseInvocation};
-use crate::fleet::workdir::{Workdir, strip_verbatim};
+use crate::fleet::workdir::{CONTAINER_GIT_CONFIG_ENV, Workdir, strip_verbatim};
 use crate::paths::TodPaths;
 use crate::settings::{TodSettings, WorktreeBackend};
 use anyhow::{Context, Result, bail};
@@ -521,9 +521,18 @@ fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process:
         format!("No `treehouse` on the PATH in dev container {container}: install it there")
     })?;
     let no_update_check = format!("{TREEHOUSE_NO_UPDATE_CHECK_ENV}=1");
-    let mut all = vec![no_update_check.as_str(), program.as_str()];
+    // Treehouse runs git itself (in submodules too), which needs the same
+    // ownership exception as tod's own git there.
+    let mut all = vec![
+        "-c",
+        CONTAINER_GIT_CONFIG_ENV,
+        "sh",
+        "env",
+        no_update_check.as_str(),
+        program.as_str(),
+    ];
     all.extend_from_slice(args);
-    dir.output("env", &all)
+    dir.output("sh", &all)
 }
 
 /// Whether `repo` declares submodules. Talks to Docker for a container.
@@ -1119,6 +1128,30 @@ mod tests {
 
         let repo = Workdir::container(&container, &dir);
         assert_eq!(run_git(&repo, &["branch", "--show-current"]).unwrap(), "main");
+
+        // So does git a program run there starts itself (Treehouse), and git
+        // config the container already puts in the environment still applies.
+        let out = scratch
+            .output(
+                "env",
+                &[
+                    "GIT_CONFIG_COUNT=1",
+                    "GIT_CONFIG_KEY_0=tod.test",
+                    "GIT_CONFIG_VALUE_0=kept",
+                    "sh",
+                    "-c",
+                    CONTAINER_GIT_CONFIG_ENV,
+                    "sh",
+                    "sh",
+                    "-c",
+                    "git -C \"$1\" rev-parse --abbrev-ref HEAD && git config tod.test",
+                    "sh",
+                    &dir,
+                ],
+            )
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "main\nkept");
         as_root("rm -rf \"$1\"");
     }
 
