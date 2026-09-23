@@ -31,6 +31,7 @@ use tod_store::conversation::{
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
+use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use uuid::Uuid;
 
 /// The body of the transcript entry that marks a fresh agent session.
@@ -195,6 +196,15 @@ impl ConversationDriver {
         format!("conversation-{conversation_id}")
     }
 
+    /// Which journey this conversation's events are recorded to: the focus
+    /// node's, or the project journey when it has none.
+    fn journey_key(&self) -> JourneyKey {
+        self.focus
+            .node_id()
+            .map(JourneyKey::Node)
+            .unwrap_or(JourneyKey::Project)
+    }
+
     /// Stop the turn in flight. Its user turn stays in the transcript with an
     /// error turn after it.
     pub fn cancel(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
@@ -208,6 +218,14 @@ impl ConversationDriver {
             .conversation_id
             .context("a run without a conversation")?;
         self.append(fleet, id, TurnRole::Error, "Stopped")?;
+        crate::journey::record(
+            self.journey_key(),
+            Actor::Agent { conversation: id },
+            Event::AgentTurn {
+                conversation: id,
+                phase: TurnPhase::Stopped,
+            },
+        );
         Ok(())
     }
 
@@ -286,7 +304,8 @@ impl ConversationDriver {
             );
         }
         if has_history {
-            return self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text);
+            let reason = if !resumable { "not resumable" } else { "over budget" };
+            return self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text, reason);
         }
         // The first turn: the opening context, then the message.
         let context = self.protocol.opening(&self.env(fleet, id))?;
@@ -389,7 +408,15 @@ impl ConversationDriver {
                 } else {
                     reply_answer(&parts)
                 };
-                self.land_reply(fleet, agent, id, &body, parts, run.user_seq, events)?;
+                let seq = self.land_reply(fleet, agent, id, &body, parts, run.user_seq, events)?;
+                crate::journey::record(
+                    self.journey_key(),
+                    Actor::Agent { conversation: id },
+                    Event::AgentTurn {
+                        conversation: id,
+                        phase: TurnPhase::Replied { seq: seq as u64 },
+                    },
+                );
             }
             Err(message) if run.cold_resume => {
                 // The recorded session could not be resumed: start fresh and
@@ -408,11 +435,30 @@ impl ConversationDriver {
                 tracing::warn!(conversation = %id, "resume failed, rotating: {message}");
                 // The corrections were already in the failed prompt; a fresh
                 // session gets the current state in its snapshot.
-                self.rotate_and_start(fleet, agent, &conversation, run.user_seq, "", &text)?;
+                self.rotate_and_start(
+                    fleet,
+                    agent,
+                    &conversation,
+                    run.user_seq,
+                    "",
+                    &text,
+                    "cold resume failed",
+                )?;
                 events.push(ConversationEvent::Rotated);
             }
             Err(message) => {
-                self.append(fleet, id, TurnRole::Error, &message)?;
+                let seq = self.append(fleet, id, TurnRole::Error, &message)?;
+                crate::journey::record(
+                    self.journey_key(),
+                    Actor::Agent { conversation: id },
+                    Event::AgentTurn {
+                        conversation: id,
+                        phase: TurnPhase::Failed {
+                            seq: seq as u64,
+                            error: message.clone(),
+                        },
+                    },
+                );
                 self.last_error = Some(message.clone());
                 events.push(ConversationEvent::TurnFinished {
                     error: Some(message),
@@ -424,7 +470,7 @@ impl ConversationDriver {
 
     /// Record a finished reply, and decide from what the agent recorded
     /// during the turn whether the exchange is over or another turn goes out
-    /// without the user.
+    /// without the user. Returns the agent turn's own seq.
     #[allow(clippy::too_many_arguments)]
     fn land_reply(
         &mut self,
@@ -435,8 +481,8 @@ impl ConversationDriver {
         parts: Vec<ReplyPart>,
         turn_seq: i64,
         events: &mut Vec<ConversationEvent>,
-    ) -> Result<()> {
-        self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
+    ) -> Result<i64> {
+        let reply_seq = self.append_with_parts(fleet, id, TurnRole::Agent, body, parts)?;
         for notice in self.protocol.on_reply(&self.env(fleet, id), body) {
             events.push(ConversationEvent::Notice(notice));
         }
@@ -456,22 +502,48 @@ impl ConversationDriver {
                 progressed,
             })?
         };
+        let decision = match &next {
+            Next::Done(stop) => Decision::Stop {
+                stop: match stop {
+                    super::protocol::Stop::Complete => "complete".to_string(),
+                    super::protocol::Stop::HandBack(_) => "hand_back".to_string(),
+                    super::protocol::Stop::ContinuationCap => "continuation_cap".to_string(),
+                    super::protocol::Stop::NoProgress => "no_progress".to_string(),
+                },
+                reason: match stop {
+                    super::protocol::Stop::HandBack(reason) => reason.clone(),
+                    _ => String::new(),
+                },
+            },
+            Next::Continue { reason, .. } => Decision::Continue {
+                reason: reason.clone(),
+            },
+        };
+        crate::journey::record(
+            self.journey_key(),
+            Actor::App,
+            Event::ProtocolDecision {
+                conversation: id,
+                protocol: self.protocol.kind().as_str().to_string(),
+                decision,
+            },
+        );
         match next {
-            Next::Done => {
+            Next::Done(_) => {
                 self.continuations = 0;
                 for notice in self.protocol.finish(&self.env(fleet, id)) {
                     events.push(ConversationEvent::Notice(notice));
                 }
                 events.push(ConversationEvent::TurnFinished { error: None });
             }
-            Next::Continue { message } => {
+            Next::Continue { message, .. } => {
                 self.continuations += 1;
                 self.append(fleet, id, TurnRole::Continuation, &message)?;
                 self.resend(fleet, agent, id, message)?;
                 events.push(ConversationEvent::Continued);
             }
         }
-        Ok(())
+        Ok(reply_seq)
     }
 
     /// Send another turn on the conversation's own session, without a user
@@ -566,7 +638,9 @@ impl ConversationDriver {
     }
 
     /// Mark the rotation, forget the old session, and send `text` to a fresh
-    /// one that gets the conversation's snapshot.
+    /// one that gets the conversation's snapshot. `reason` is recorded to the
+    /// journey ("over budget" | "not resumable" | "cold resume failed").
+    #[allow(clippy::too_many_arguments)]
     fn rotate_and_start(
         &mut self,
         fleet: &FleetStore,
@@ -575,10 +649,19 @@ impl ConversationDriver {
         user_seq: i64,
         changes: &str,
         text: &str,
+        reason: &str,
     ) -> Result<()> {
         let id = conversation.id;
         agent.close_session(&Self::session_key(id));
         self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
+        crate::journey::record(
+            self.journey_key(),
+            Actor::App,
+            Event::SessionRotated {
+                conversation: id,
+                reason: reason.to_string(),
+            },
+        );
         fleet.interview(
             ACTOR_USER,
             InterviewCommand::SetConversationSession {
@@ -693,6 +776,16 @@ impl ConversationDriver {
             title,
             session_saved: false,
         });
+        crate::journey::record(
+            self.journey_key(),
+            Actor::Agent { conversation: id },
+            Event::AgentTurn {
+                conversation: id,
+                phase: TurnPhase::Started {
+                    user_seq: user_seq as u64,
+                },
+            },
+        );
         Ok(())
     }
 

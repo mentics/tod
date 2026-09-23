@@ -13,7 +13,7 @@
 
 use tod_store::fleet::Workdir;
 use super::implement::{IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, node_id, plan_steps};
-use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_review_message};
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_role_doc};
 use anyhow::{Context, Result};
@@ -176,13 +176,14 @@ impl Protocol for ReviewProtocol {
     /// turn goes out, until the cap or a turn that recorded nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
         if turn.report.is_some_and(is_done_report) {
-            return Ok(Next::Done);
+            return Ok(Next::Done(Stop::Complete));
         }
-        if turn.continuations >= super::protocol::CONTINUATION_CAP || !turn.progressed {
-            return Ok(Next::Done);
+        if let Some(done) = cap_or_stall(turn) {
+            return Ok(done);
         }
         Ok(Next::Continue {
             message: continuation_message(),
+            reason: "review not recorded done".to_string(),
         })
     }
 }
@@ -269,18 +270,19 @@ mod tests {
 
     #[test]
     fn a_review_recorded_done_hands_back() {
-        assert!(matches!(decide(Some(done_report()), 0, true), Next::Done));
+        assert!(matches!(decide(Some(done_report()), 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn a_review_not_recorded_done_keeps_the_loop_going() {
-        let Next::Continue { message } = decide(None, 0, true) else {
+        let Next::Continue { message, reason } = decide(None, 0, true) else {
             panic!("an unfinished review should continue");
         };
         assert!(
             message.starts_with("The review is not recorded as finished"),
             "{message}"
         );
+        assert_eq!(reason, "review not recorded done");
         // A test run is not a finished review.
         let run = json!({ "command": "cargo test", "passed": 1, "failed": 0, "errors": 0 });
         assert!(matches!(decide(Some(run), 0, true), Next::Continue { .. }));
@@ -288,7 +290,7 @@ mod tests {
 
     #[test]
     fn the_cap_or_a_turn_that_changed_nothing_stops_the_loop() {
-        assert!(matches!(decide(None, CONTINUATION_CAP, true), Next::Done));
-        assert!(matches!(decide(None, 1, false), Next::Done));
+        assert!(matches!(decide(None, CONTINUATION_CAP, true), Next::Done(Stop::ContinuationCap)));
+        assert!(matches!(decide(None, 1, false), Next::Done(Stop::NoProgress)));
     }
 }

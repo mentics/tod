@@ -22,7 +22,7 @@ use tod_store::fleet::Workdir;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, node_id, plan_steps,
 };
-use super::protocol::{Next, Protocol, ProtocolEnv, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_verify_message};
 use crate::gate::PlanStepWithLinks;
 use crate::process_bundle::{ProcessManifest, TodInstallPaths, state_working_doc};
@@ -194,13 +194,14 @@ impl Protocol for VerificationProtocol {
             tests_recorded: turn.report.and_then(TestRun::from_report).is_some(),
         };
         if owed.nothing() {
-            return Ok(Next::Done);
+            return Ok(Next::Done(Stop::Complete));
         }
-        if turn.continuations >= super::protocol::CONTINUATION_CAP || !turn.progressed {
-            return Ok(Next::Done);
+        if let Some(done) = cap_or_stall(turn) {
+            return Ok(done);
         }
         Ok(Next::Continue {
             message: owed.message(),
+            reason: owed.reason(),
         })
     }
 }
@@ -257,6 +258,24 @@ impl Owed<'_> {
             && self.stranded.is_empty()
             && self.steps.is_empty()
             && self.tests_recorded
+    }
+
+    /// A short account of why the loop is continuing, for the journey.
+    fn reason(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.obligations.is_empty() {
+            parts.push(format!("{} obligation(s) with no verdict", self.obligations.len()));
+        }
+        if !self.stranded.is_empty() {
+            parts.push(format!("{} stranded failure(s)", self.stranded.len()));
+        }
+        if !self.steps.is_empty() {
+            parts.push(format!("{} step(s) with no verdict", self.steps.len()));
+        }
+        if !self.tests_recorded {
+            parts.push("no test run recorded".to_string());
+        }
+        parts.join(", ")
     }
 
     /// What the loop sends. Its first sentence is what the collapsed
@@ -474,12 +493,13 @@ mod tests {
     #[test]
     fn a_step_without_a_verdict_keeps_the_loop_going() {
         let fx = planned(&[STATUS_VERIFIED, STATUS_IMPLEMENTED]);
-        let Next::Continue { message } = decide(&fx, true, 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, true, 0, true) else {
             panic!("an unchecked step should continue");
         };
         assert!(message.contains("1 plan step with no verdict"), "{message}");
         assert!(message.contains("(implemented): Step 1"), "{message}");
         assert!(!message.contains("Step 0"), "{message}");
+        assert_eq!(reason, "1 step(s) with no verdict");
     }
 
     /// A failed step is a verdict: verification is done with it, whatever
@@ -487,17 +507,18 @@ mod tests {
     #[test]
     fn every_step_ruled_on_and_a_test_run_hands_back() {
         let fx = planned(&[STATUS_VERIFIED, STATUS_FAILED]);
-        assert!(matches!(decide(&fx, true, 0, true), Next::Done));
+        assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
     fn no_recorded_test_run_keeps_the_loop_going() {
         let fx = planned(&[STATUS_VERIFIED, STATUS_VERIFIED]);
-        let Next::Continue { message } = decide(&fx, false, 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, false, 0, true) else {
             panic!("an unrecorded test run should continue");
         };
         assert!(!message.contains("plan step"), "{message}");
         assert!(message.contains("No test run was recorded"), "{message}");
+        assert_eq!(reason, "no test run recorded");
     }
 
     /// An obligation `fx.node` owns, satisfied by the plan steps in `by`.
@@ -558,13 +579,14 @@ mod tests {
     fn an_obligation_without_a_verdict_keeps_the_loop_going() {
         let fx = planned(&[STATUS_VERIFIED]);
         let syncs = requirement(&fx, "Tickets sync from Linear", &step_ids(&fx));
-        let Next::Continue { message } = decide(&fx, true, 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, true, 0, true) else {
             panic!("an unchecked obligation should continue");
         };
         assert!(message.contains("1 obligation with no verdict"), "{message}");
         assert!(message.contains("Tickets sync from Linear"), "{message}");
+        assert_eq!(reason, "1 obligation(s) with no verdict");
         rule(&fx, syncs, "verified");
-        assert!(matches!(decide(&fx, true, 0, true), Next::Done));
+        assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
     }
 
     /// Implementation works from failed steps, so a failed obligation has to
@@ -575,10 +597,11 @@ mod tests {
         let steps = step_ids(&fx);
         let syncs = requirement(&fx, "Tickets sync from Linear", &steps);
         rule(&fx, syncs, "failed");
-        let Next::Continue { message } = decide(&fx, true, 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, true, 0, true) else {
             panic!("a stranded failure should continue");
         };
         assert!(message.contains("no failed plan step satisfies it"), "{message}");
+        assert!(reason.contains("stranded failure"), "{reason}");
         fx.fleet
             .enqueue_outline(OutlineMutation::UpdatePlanStepStatus {
                 step_id: steps[0],
@@ -588,7 +611,7 @@ mod tests {
             })
             .unwrap();
         fx.fleet.writer().flush().unwrap();
-        assert!(matches!(decide(&fx, true, 0, true), Next::Done));
+        assert!(matches!(decide(&fx, true, 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
@@ -596,8 +619,8 @@ mod tests {
         let fx = planned(&[STATUS_IMPLEMENTED]);
         assert!(matches!(
             decide(&fx, false, CONTINUATION_CAP, true),
-            Next::Done
+            Next::Done(Stop::ContinuationCap)
         ));
-        assert!(matches!(decide(&fx, false, 1, false), Next::Done));
+        assert!(matches!(decide(&fx, false, 1, false), Next::Done(Stop::NoProgress)));
     }
 }

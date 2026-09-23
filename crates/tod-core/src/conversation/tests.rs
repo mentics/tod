@@ -296,6 +296,58 @@ fn a_first_send_opens_the_session_and_records_actions_with_an_empty_reply() {
     );
 }
 
+/// With a journey recorder installed, a plain send-and-reply turn shows up in
+/// the node's journey as `AgentTurn::Started`, `AgentTurn::Replied`, and a
+/// `ProtocolDecision` recording the loop's stop.
+#[test]
+fn a_turn_is_recorded_to_the_node_journey() {
+    let fx = fixture();
+    let journeys_dir = fx.root.join("journeys");
+    let recorder = crate::journey::recorder::spawn(journeys_dir.clone(), 1024);
+    crate::journey::recorder::install(recorder);
+
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
+    say(&mut driver, &fx, &mut agent, "hello");
+
+    // The recorder's writer thread appends asynchronously; give it a moment.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let reader =
+        tod_journey::JourneyReader::open(&journeys_dir, tod_journey::JourneyKey::Node(fx.node))
+            .unwrap();
+    let records = reader.all();
+    assert!(
+        records.iter().any(|r| matches!(
+            &r.event,
+            tod_journey::Event::AgentTurn {
+                phase: tod_journey::TurnPhase::Started { .. },
+                ..
+            }
+        )),
+        "{records:?}"
+    );
+    assert!(
+        records.iter().any(|r| matches!(
+            &r.event,
+            tod_journey::Event::AgentTurn {
+                phase: tod_journey::TurnPhase::Replied { .. },
+                ..
+            }
+        )),
+        "{records:?}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(&r.event, tod_journey::Event::ProtocolDecision { .. })),
+        "{records:?}"
+    );
+}
+
 #[test]
 fn the_opening_context_is_recorded_as_sent() {
     let fx = fixture();

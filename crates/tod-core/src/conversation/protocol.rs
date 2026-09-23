@@ -38,12 +38,43 @@ pub struct ProtocolEnv<'a> {
 
 /// What the driver does once a reply has landed.
 pub enum Next {
-    /// Hand back to the user.
-    Done,
+    /// Hand back to the user, for the given reason.
+    Done(Stop),
     /// Send `message` as another turn, without the user. It is recorded
     /// verbatim as a [`TurnRole::Continuation`](tod_store::conversation::TurnRole)
-    /// turn, so the transcript shows exactly what the app sent.
-    Continue { message: String },
+    /// turn, so the transcript shows exactly what the app sent. `reason` is a
+    /// short, human-readable account of why the loop is continuing (e.g. "3
+    /// plan steps open"), recorded alongside the decision.
+    Continue { message: String, reason: String },
+}
+
+/// Why a protocol's loop stopped and handed back to the user. Recorded as
+/// part of `Event::ProtocolDecision` (`doc/journeys/spec.md` §3.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// The protocol's own definition of done holds.
+    Complete,
+    /// Handed back to the user for a specific reason (e.g. "step 5 is
+    /// blocked").
+    HandBack(String),
+    /// The loop sent as many continuations as it is allowed to for one user
+    /// message ([`CONTINUATION_CAP`]).
+    ContinuationCap,
+    /// A continuation changed nothing the protocol tracks as progress.
+    NoProgress,
+}
+
+/// Shared stop logic for the continuation cap and stalled progress, used by
+/// every looping protocol's `next` once its own "done" check has passed.
+/// Returns `None` when neither applies, so the loop should send another turn.
+pub fn cap_or_stall(turn: &TurnContext<'_>) -> Option<Next> {
+    if turn.continuations >= CONTINUATION_CAP {
+        return Some(Next::Done(Stop::ContinuationCap));
+    }
+    if !turn.progressed {
+        return Some(Next::Done(Stop::NoProgress));
+    }
+    None
 }
 
 /// Something the user should hear about when a run ends.
@@ -160,7 +191,7 @@ pub trait Protocol: Send + Sync {
 
     /// Whether to hand back to the user, or send another turn without them.
     fn next(&self, _turn: &TurnContext<'_>) -> Result<Next> {
-        Ok(Next::Done)
+        Ok(Next::Done(Stop::Complete))
     }
 }
 

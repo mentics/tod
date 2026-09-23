@@ -203,18 +203,30 @@ pub struct Regression {
     pub reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+/// A protocol loop's decision after a turn (spec §3.1). `stop`'s value is one
+/// of `complete | hand_back | continuation_cap | no_progress`, matching
+/// `tod_core::conversation::protocol::Stop`; `reason` is empty except for
+/// `hand_back`, whose message is a hand-back-specific detail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Decision {
-    #[default]
-    Continue,
-    ContinueWithReason {
+    Continue {
         #[serde(default)]
         reason: String,
     },
     Stop {
         #[serde(default)]
+        stop: String,
+        #[serde(default)]
         reason: String,
     },
+}
+
+impl Default for Decision {
+    fn default() -> Self {
+        Decision::Continue {
+            reason: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

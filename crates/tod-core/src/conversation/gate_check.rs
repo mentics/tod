@@ -30,6 +30,7 @@ use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::outline::repos::NodeRepo;
 use tod_store::outline::{EXTRA_CONTENT_DETAILS, OutlineMutation, SOURCE_AGENT, SOURCE_DERIVED};
+use tod_journey::{Actor, CriterionResult, Event, GateReport as JourneyGateReport, JourneyKey};
 use uuid::Uuid;
 
 /// The key a gate check's report is stored under in its conversation.
@@ -253,6 +254,15 @@ impl GateCheckProtocol {
         }
         let had_derived = !derived_rows.is_empty();
         if had_derived {
+            let criteria = derived_rows
+                .iter()
+                .map(|(id, outcome, detail, _action)| CriterionResult {
+                    id: id.to_string(),
+                    outcome: outcome.clone(),
+                    detail: detail.clone().unwrap_or_default(),
+                    source: SOURCE_DERIVED.to_string(),
+                })
+                .collect();
             fleet.enqueue_outline(OutlineMutation::ApplyGateResults {
                 node_id: node,
                 results: derived_rows,
@@ -260,6 +270,16 @@ impl GateCheckProtocol {
                 source: SOURCE_DERIVED.to_string(),
             })?;
             fleet.writer().flush()?;
+            crate::journey::record(
+                JourneyKey::Node(node),
+                Actor::App,
+                Event::GateResult {
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    criteria,
+                    report: None,
+                },
+            );
         }
         Ok((had_derived, agent_criteria))
     }
@@ -353,6 +373,35 @@ impl GateCheckProtocol {
                 body: record.to_value(),
             },
         )?;
+        crate::journey::record(
+            JourneyKey::Node(node),
+            Actor::Agent {
+                conversation: env.conversation_id,
+            },
+            Event::GateResult {
+                from,
+                to,
+                criteria: reply
+                    .gate_results
+                    .iter()
+                    .map(|row| CriterionResult {
+                        id: row.criterion_id.to_string(),
+                        outcome: row.outcome.clone(),
+                        detail: row.detail.clone().unwrap_or_default(),
+                        source: SOURCE_AGENT.to_string(),
+                    })
+                    .collect(),
+                report: Some(JourneyGateReport {
+                    result: record.result.clone(),
+                    summary: record.summary.clone(),
+                    blockers: record
+                        .blockers
+                        .iter()
+                        .map(|b| format!("{}: {}", b.reference, b.what))
+                        .collect(),
+                }),
+            },
+        );
         Ok(Vec::new())
     }
 }

@@ -20,7 +20,7 @@ use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
     prepare_submodules, worktree_fingerprint,
 };
-use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
+use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
 use crate::dynamic::review_finding_lines;
 use anyhow::{Context, Result};
@@ -199,14 +199,25 @@ impl Protocol for FixProtocol {
         let open = open_findings(turn.env.fleet, node_id(turn.env)?);
         let tests = turn.report.and_then(TestRun::from_report);
         if open.is_empty() && tests.as_ref().is_some_and(TestRun::green) {
-            return Ok(Next::Done);
+            return Ok(Next::Done(Stop::Complete));
         }
-        if turn.continuations >= super::protocol::CONTINUATION_CAP || !turn.progressed {
-            return Ok(Next::Done);
+        if let Some(done) = cap_or_stall(turn) {
+            return Ok(done);
         }
         Ok(Next::Continue {
             message: continuation_message(&open, tests.as_ref()),
+            reason: fix_continuation_reason(&open, tests.as_ref()),
         })
+    }
+}
+
+/// A short account of why the loop is continuing, for the journey.
+fn fix_continuation_reason(open: &[ReviewFinding], tests: Option<&TestRun>) -> String {
+    match (open.len(), tests) {
+        (0, None) => "no test run recorded".to_string(),
+        (0, Some(run)) => format!("tests not green ({})", run.label()),
+        (1, _) => "1 review finding open".to_string(),
+        (n, _) => format!("{n} review findings open"),
     }
 }
 
@@ -370,7 +381,7 @@ mod tests {
     #[test]
     fn an_open_finding_keeps_the_loop_going_however_green_the_tests() {
         let (fx, ids) = with_findings(2);
-        let Next::Continue { message } = decide(&fx, green(), 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, green(), 0, true) else {
             panic!("open findings should continue");
         };
         assert!(
@@ -380,6 +391,7 @@ mod tests {
         assert!(message.contains(&short_id(ids[1])), "{message}");
         assert!(message.contains("Finding 1"), "{message}");
         assert!(message.contains("`rejected` with a note"), "{message}");
+        assert_eq!(reason, "2 review findings open");
     }
 
     /// Fixed and rejected both close a finding; the loop still wants tests.
@@ -388,7 +400,7 @@ mod tests {
         let (fx, ids) = with_findings(2);
         respond(&fx, ids[0], FINDING_FIXED, "abc123");
         respond(&fx, ids[1], FINDING_REJECTED, "Validated upstream");
-        let Next::Continue { message } = decide(&fx, None, 0, true) else {
+        let Next::Continue { message, reason } = decide(&fx, None, 0, true) else {
             panic!("no test run should continue");
         };
         assert!(
@@ -396,7 +408,8 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("No test run was recorded"), "{message}");
-        assert!(matches!(decide(&fx, green(), 0, true), Next::Done));
+        assert_eq!(reason, "no test run recorded");
+        assert!(matches!(decide(&fx, green(), 0, true), Next::Done(Stop::Complete)));
     }
 
     #[test]
@@ -404,8 +417,8 @@ mod tests {
         let (fx, _) = with_findings(1);
         assert!(matches!(
             decide(&fx, None, CONTINUATION_CAP, true),
-            Next::Done
+            Next::Done(Stop::ContinuationCap)
         ));
-        assert!(matches!(decide(&fx, None, 1, false), Next::Done));
+        assert!(matches!(decide(&fx, None, 1, false), Next::Done(Stop::NoProgress)));
     }
 }
