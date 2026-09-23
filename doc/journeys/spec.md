@@ -293,7 +293,10 @@ Two settings, in their own section of the settings view:
   was presented, transitions, gate results, protocol decisions), the
   settings, and the user's report note, and every reference into a
   transcript is kept as its id, size, and time only. The screenshot is left
-  out too, since it can show a transcript.
+  out too, since it can show a transcript. Outline text (obligations, plan
+  steps, review findings, verdict evidence) is included either way: agents
+  write some of it, but it is unlikely to carry sensitive data. A separate
+  switch can be added if that proves wrong.
 
 Next to the first setting, a prominent warning (the style guide's warning
 callout, not a caption):
