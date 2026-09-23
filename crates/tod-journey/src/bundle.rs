@@ -36,11 +36,18 @@ impl BundleWriter {
     /// `Manifest`, `Settings`, and `Resolved` records synthesized only for
     /// the bundle).
     pub fn append(&mut self, actor: Actor, event: Event) -> io::Result<u64> {
+        self.append_at(chrono::Utc::now().timestamp_micros(), actor, event)
+    }
+
+    /// Like [`Self::append`] but keeps the given time (microseconds since
+    /// the epoch): a record copied from a journey gets a new seq, since the
+    /// bundle's own records come first, but keeps when it really happened.
+    pub fn append_at(&mut self, at: i64, actor: Actor, event: Event) -> io::Result<u64> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let record = Record {
             seq,
-            at: chrono::Utc::now().timestamp_micros(),
+            at,
             actor,
             event,
         };
@@ -75,4 +82,24 @@ pub fn decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     zstd::stream::copy_decode(bytes, &mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_at_keeps_the_time_and_renumbers() {
+        let mut writer = BundleWriter::new().unwrap();
+        writer
+            .append_at(1_000, Actor::User, Event::Settings { snapshot: "a".into() })
+            .unwrap();
+        writer
+            .append_at(2_000, Actor::App, Event::Settings { snapshot: "b".into() })
+            .unwrap();
+        let bytes = writer.finish().unwrap();
+        let records: Vec<Record> = read_bundle(bytes.as_slice()).unwrap().collect();
+        assert_eq!(records.iter().map(|r| r.at).collect::<Vec<_>>(), [1_000, 2_000]);
+        assert_eq!(records.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2]);
+    }
 }

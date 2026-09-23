@@ -187,12 +187,13 @@ pub fn build_bundle(
             _ => {}
         }
 
-        // Re-stamped with the bundle's own seq counter (`writer.append`, not
-        // `append_record`): the bundle is a fresh CBOR stream whose reader
+        // Re-numbered with the bundle's own seq counter (`writer.append_at`,
+        // not `append_record`): the bundle is a fresh CBOR stream whose reader
         // requires strictly increasing seqs, and the journey's own seqs
         // would collide with the Manifest/Settings records already written
-        // ahead of it.
-        writer.append(record.actor, record.event).context("writing journey record to bundle")?;
+        // ahead of it. The time is kept: it is what the timeline and stats
+        // are about.
+        writer.append_at(record.at, record.actor, record.event).context("writing journey record to bundle")?;
     }
 
     // Emit resolutions in first-referenced order: conversations first (each
