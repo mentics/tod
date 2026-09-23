@@ -77,10 +77,12 @@ impl ConversationView {
         match event {
             AgentConversationEvent::Send(text) => self.send(text, window, cx),
             AgentConversationEvent::Stop => self.stop_turn(cx),
-            AgentConversationEvent::Action(id) if id.as_ref() == COPY_CONTEXT => {
+            AgentConversationEvent::Action(id, _) if id.as_ref() == COPY_CONTEXT => {
                 self.copy_opening_context(cx)
             }
-            AgentConversationEvent::Action(id) => self.lifecycle_action(id, window, cx),
+            AgentConversationEvent::Action(id, source) => {
+                self.lifecycle_action(id, *source, window, cx)
+            }
             AgentConversationEvent::Activated => {
                 self.pane = Pane::Transcript;
                 self.stop = Stop::Transcript;

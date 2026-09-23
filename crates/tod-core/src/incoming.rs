@@ -394,7 +394,7 @@ impl IncomingRunner {
         let mut driver =
             ConversationDriver::new(self.config.clone(), Focus::Node(node), ProtocolKind::Incoming);
         match driver.send(fleet, agent, STARTER) {
-            Ok(()) => self.running.push((node, driver)),
+            Ok(_) => self.running.push((node, driver)),
             Err(err) => self.push(fleet, node, NodeOutcome::Failed(format!("{err:#}"))),
         }
     }

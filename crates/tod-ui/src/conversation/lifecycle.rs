@@ -13,8 +13,10 @@
 
 use super::ConversationView;
 use crate::ui::agent_conversation::{NoticeTone, PanelAction, PanelNotice};
+use crate::ui::journey::Source;
 use crate::views::lifecycle_control::{GateCheckState, enters_with_agent, implement_directory};
 use gpui::{App, Context, SharedString, Window};
+use tod_journey::{Presented, PresentedAction};
 use tod_core::conversation::gate_check::{
     GateReportRecord, latest_gate_report, settle_derived_criteria,
 };
@@ -378,16 +380,63 @@ impl ConversationView {
         notices
     }
 
-    /// A lifecycle button or Waive was pressed.
+    /// The [`Presented`] snapshot for the lifecycle buttons and notices right
+    /// now: every button on offer (id, label, primary, disabled), the
+    /// transcript panel's keyboard highlight (when it names one of those
+    /// buttons), and the notices showing above the input plus the gate
+    /// check's own (§3.1: "what separates a user mistake from the app
+    /// pointing the wrong way").
+    pub(super) fn presented_lifecycle_controls(&self, cx: &App) -> Presented {
+        use crate::ui::agent_conversation::PanelStop;
+
+        let (actions, notices) = self.lifecycle_controls(cx);
+        let gate_notices = self.gate_notices(cx);
+        let highlight = self.transcript.read(cx).highlight();
+        let focused = match highlight {
+            PanelStop::Action(ix) => actions.get(ix).map(|a| a.id.to_string()),
+            other => Some(format!("{other:?}")),
+        };
+        Presented {
+            actions: actions
+                .iter()
+                .map(|a| PresentedAction {
+                    id: a.id.to_string(),
+                    label: a.label.to_string(),
+                    primary: a.primary,
+                    disabled: a.disabled,
+                })
+                .collect(),
+            focused,
+            notices: notices
+                .iter()
+                .chain(gate_notices.iter())
+                .map(|n| n.text.to_string())
+                .collect(),
+        }
+    }
+
+    /// A lifecycle button or Waive was pressed. Records the `UserAction`
+    /// (what was on offer, and the source: click or keyboard) before doing
+    /// what the button does.
     pub(super) fn lifecycle_action(
         &mut self,
         id: &SharedString,
+        source: Source,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(snapshot) = self.data.lifecycle.clone() else {
             return;
         };
+        let presented = self.presented_lifecycle_controls(cx);
+        crate::ui::journey::record_action(
+            cx,
+            self.focus,
+            id.to_string(),
+            source,
+            "conversation",
+            presented,
+        );
         let node = snapshot.node;
         let task_id = node.to_string();
         let lifecycle = self.lifecycle.clone();

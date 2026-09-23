@@ -156,8 +156,9 @@ pub enum AgentConversationEvent {
     Activated,
     /// Writing started or stopped.
     EditingChanged(bool),
-    /// One of the host's buttons ([`PanelAction::id`]).
-    Action(SharedString),
+    /// One of the host's buttons ([`PanelAction::id`]), and whether it was
+    /// clicked or activated from the keyboard highlight.
+    Action(SharedString, crate::ui::journey::Source),
 }
 
 pub struct AgentConversationPanel {
@@ -456,17 +457,26 @@ impl AgentConversationPanel {
             PanelStop::Input => self.start_editing(window, cx),
             PanelStop::Action(ix) => {
                 if let Some(action) = self.actions.get(ix) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::NoticeAction(ix) => {
                 if let Some(action) = self.notices.get(ix).and_then(|n| n.action.as_ref()) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::HeaderAction(ix) => {
                 if let Some(action) = self.header_actions.get(ix) {
-                    cx.emit(AgentConversationEvent::Action(action.id.clone()));
+                    cx.emit(AgentConversationEvent::Action(
+                        action.id.clone(),
+                        crate::ui::journey::Source::Keyboard,
+                    ));
                 }
             }
             PanelStop::Stop => cx.emit(AgentConversationEvent::Stop),
@@ -489,7 +499,10 @@ impl AgentConversationPanel {
             .selected(self.active && self.highlight == stop)
             .on_click(cx.listener(move |_, _, _, cx| {
                 cx.emit(AgentConversationEvent::Activated);
-                cx.emit(AgentConversationEvent::Action(id.clone()));
+                cx.emit(AgentConversationEvent::Action(
+                    id.clone(),
+                    crate::ui::journey::Source::Click,
+                ));
             }));
         if action.primary {
             button.primary()

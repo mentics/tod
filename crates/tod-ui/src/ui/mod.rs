@@ -4,6 +4,7 @@ pub mod agent_conversation;
 pub mod agent_permission;
 pub mod app_nav;
 pub mod item_list;
+pub mod journey;
 pub mod key_context;
 pub mod list;
 pub mod pane_nav;

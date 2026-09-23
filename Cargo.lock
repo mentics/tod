@@ -9112,6 +9112,7 @@ dependencies = [
  "tod-agent",
  "tod-core",
  "tod-integration",
+ "tod-journey",
  "tod-store",
  "tokio",
  "toml 0.8.23",

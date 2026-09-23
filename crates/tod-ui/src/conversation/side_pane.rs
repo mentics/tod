@@ -964,7 +964,7 @@ impl ConversationView {
                     .flex_shrink_0()
                     .disabled(action.disabled)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.lifecycle_action(&id, window, cx);
+                        this.lifecycle_action(&id, crate::ui::journey::Source::Click, window, cx);
                     }))
             });
             rows = rows.child(

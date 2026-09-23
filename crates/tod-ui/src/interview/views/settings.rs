@@ -252,7 +252,7 @@ impl AgentRoleSelects {
                 move |this, _, event: &SelectEvent<Vec<String>>, cx| {
                     if let SelectEvent::Confirm(Some(value)) = event {
                         this.settings.set_model_for(role, value.clone());
-                        this.schedule_save(cx);
+                        this.schedule_save("model", cx);
                         cx.notify();
                     }
                 },
@@ -262,7 +262,7 @@ impl AgentRoleSelects {
                 move |this, _, event: &SelectEvent<Vec<String>>, cx| {
                     if let SelectEvent::Confirm(Some(value)) = event {
                         this.settings.set_effort_for(role, value.clone());
-                        this.schedule_save(cx);
+                        this.schedule_save("effort", cx);
                         cx.notify();
                     }
                 },
@@ -298,6 +298,9 @@ pub struct SettingsView {
     selected_agent_column: usize,
     pending_launch_select_sync: bool,
     save_generation: u64,
+    /// Setting keys changed since the last flush, recorded to the app
+    /// journey when the debounce actually writes them (spec §7, §8).
+    pending_changed_keys: Vec<String>,
     _terminal_subscription: Subscription,
     _treehouse_worktrees_root_subscription: Subscription,
     _treehouse_executable_subscription: Subscription,
@@ -345,7 +348,7 @@ impl SettingsView {
                     let next = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
                     if this.settings.treehouse_executable != next {
                         this.settings.treehouse_executable = next;
-                        this.schedule_save(cx);
+                        this.schedule_save("treehouse_executable", cx);
                     }
                 }
             });
@@ -366,7 +369,7 @@ impl SettingsView {
                     };
                     if this.settings.terminal.program != next {
                         this.settings.terminal.program = next;
-                        this.schedule_save(cx);
+                        this.schedule_save("terminal.program", cx);
                     }
                 }
             });
@@ -404,6 +407,7 @@ impl SettingsView {
             selected_agent_column: 0,
             pending_launch_select_sync: false,
             save_generation: 0,
+            pending_changed_keys: Vec::new(),
             _terminal_subscription,
             _treehouse_worktrees_root_subscription,
             _treehouse_executable_subscription,
@@ -427,7 +431,7 @@ impl SettingsView {
             return;
         }
         self.settings.treehouse_worktrees_root = next;
-        self.schedule_save(cx);
+        self.schedule_save("treehouse_worktrees_root", cx);
         cx.notify();
     }
 
@@ -755,7 +759,11 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+    /// Schedules a debounce-autosave (`doc/../explicit-save-not-on-blur.md`)
+    /// and notes `key` as changed, so the actual write — when the debounce
+    /// fires — can record every key that changed since the last one.
+    fn schedule_save(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.pending_changed_keys.push(key.to_string());
         self.save_generation = self.save_generation.wrapping_add(1);
         let generation = self.save_generation;
         let entity = cx.weak_entity();
@@ -780,13 +788,16 @@ impl SettingsView {
         }
         let _ = logging::reload_level(self.settings.log_level);
         let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        for key in std::mem::take(&mut self.pending_changed_keys) {
+            crate::ui::journey::record_settings_changed(cx, key, "");
+        }
         cx.notify();
     }
 
     fn step_replenish(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.question_maker.replenish_threshold =
             step_u32(self.settings.question_maker.replenish_threshold, delta);
-        self.schedule_save(cx);
+        self.schedule_save("question_maker.replenish_threshold", cx);
         cx.notify();
     }
 
@@ -797,7 +808,7 @@ impl SettingsView {
         } else {
             budget.saturating_sub(10_000).max(10_000)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.context_budget_tokens", cx);
         cx.notify();
     }
 
@@ -808,7 +819,7 @@ impl SettingsView {
         } else {
             minutes.saturating_sub(1).max(1)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.prompt_cache_idle_minutes", cx);
         cx.notify();
     }
 
@@ -819,7 +830,7 @@ impl SettingsView {
         } else {
             cap.saturating_sub(10).max(10)
         };
-        self.schedule_save(cx);
+        self.schedule_save("interview_context.answered_history_cap", cx);
         cx.notify();
     }
 
@@ -832,13 +843,13 @@ impl SettingsView {
             value.saturating_sub(1)
         }
         .clamp(min, max);
-        self.schedule_save(cx);
+        self.schedule_save("max_parallel_agent_sessions", cx);
         cx.notify();
     }
 
     fn step_log_level(&mut self, delta: i32, cx: &mut Context<Self>) {
         self.settings.log_level = self.settings.log_level.step(delta);
-        self.schedule_save(cx);
+        self.schedule_save("log_level", cx);
         cx.notify();
     }
 
@@ -851,7 +862,7 @@ impl SettingsView {
                 .saturating_sub((-delta) as u64)
         };
         self.settings.log_max_size_kb = TodSettings::clamp_log_max_size_kb(next);
-        self.schedule_save(cx);
+        self.schedule_save("log_max_size_kb", cx);
         cx.notify();
     }
 
@@ -879,7 +890,7 @@ impl SettingsView {
         if role == AgentRole::Interview {
             cx.emit(SettingsEvent::AgentPlatformChanged(platform));
         }
-        self.schedule_save(cx);
+        self.schedule_save("platform", cx);
         cx.notify();
     }
 
@@ -942,7 +953,7 @@ impl SettingsView {
         let len = ORDER.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
         self.settings.worktree_backend = ORDER[next];
-        self.schedule_save(cx);
+        self.schedule_save("worktree_backend", cx);
         cx.notify();
     }
 
@@ -963,7 +974,7 @@ impl SettingsView {
         let len = ORDER.len() as i32;
         let next = ((idx as i32 + delta).rem_euclid(len)) as usize;
         self.settings.chat_launch_mode = ORDER[next];
-        self.schedule_save(cx);
+        self.schedule_save("chat_launch_mode", cx);
         cx.notify();
     }
 }

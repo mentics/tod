@@ -1351,10 +1351,21 @@ impl ConversationView {
             Err(_) => Err("the agent is unavailable".to_string()),
         };
         let sent = match result {
-            Ok(()) => {
+            Ok(user_seq) => {
                 self.error = None;
                 self.conversation_id = self.drivers[ix].conversation_id();
                 self.status = self.drivers[ix].status();
+                crate::ui::journey::record_action(
+                    cx,
+                    self.focus,
+                    "send",
+                    crate::ui::journey::Source::Keyboard,
+                    "conversation",
+                    tod_journey::Presented {
+                        notices: vec![format!("seq={user_seq}"), format!("length={}", text.len())],
+                        ..Default::default()
+                    },
+                );
                 true
             }
             Err(err) => {

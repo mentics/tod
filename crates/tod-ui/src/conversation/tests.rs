@@ -2018,7 +2018,12 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     );
     for action in waive {
         view.update_in(cx, |view, window, cx| {
-            view.lifecycle_action(&action.id, window, cx)
+            view.lifecycle_action(
+                &action.id,
+                crate::ui::journey::Source::Click,
+                window,
+                cx,
+            )
         });
     }
     draw(cx);
@@ -2277,4 +2282,63 @@ fn conversation_obligations_pane_hosts_the_obligations_list(cx: &mut TestAppCont
 
 fn counts(changes: &[tod_store::conversation::NetChange]) -> Vec<usize> {
     change_counts(changes).into_iter().map(|(_, n)| n).collect()
+}
+
+// ----- journey: presented snapshot ---------------------------------------------
+
+/// `presented_lifecycle_controls` must describe exactly what `lifecycle_controls`
+/// renders — same ids/labels/primary/disabled — so the recorded journey
+/// snapshot never drifts from the UI (doc/journeys/spec.md §3.1).
+#[gpui::test]
+fn presented_lifecycle_controls_matches_the_rendered_buttons(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "design");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+
+    let presented = view.read_with(cx, |view, cx| view.presented_lifecycle_controls(cx));
+    let (actions, _) = view.read_with(cx, |view, cx| view.lifecycle_controls(cx));
+
+    assert_eq!(presented.actions.len(), actions.len());
+    for (p, a) in presented.actions.iter().zip(actions.iter()) {
+        assert_eq!(p.id, a.id.to_string());
+        assert_eq!(p.label, a.label.to_string());
+        assert_eq!(p.primary, a.primary);
+        assert_eq!(p.disabled, a.disabled);
+    }
+    // "Gate check → planning" is the primary action on a `design` node.
+    let primary = presented
+        .actions
+        .iter()
+        .find(|a| a.primary)
+        .expect("a design node has a primary action");
+    assert_eq!(primary.label, "Gate check → planning");
+}
+
+/// Pressing a lifecycle button records a `UserAction` to the app journey ring
+/// buffer with the `Presented` snapshot captured at press time.
+#[gpui::test]
+fn pressing_a_lifecycle_button_records_the_presented_snapshot(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "ready");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+
+    let before = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+    press_lifecycle(&view, "Gate check → active", cx);
+    let after = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).len());
+    assert!(after > before, "pressing a lifecycle button records an entry");
+
+    let last = cx.update(|_, cx| crate::ui::journey::hub(cx).read(cx).snapshot());
+    let last = last.last().expect("at least one entry recorded");
+    match &last.record.event {
+        tod_journey::Event::UserAction {
+            surface, presented, ..
+        } => {
+            assert_eq!(surface, "conversation");
+            assert!(
+                presented.actions.iter().any(|a| a.primary),
+                "the recorded snapshot includes the primary button"
+            );
+        }
+        other => panic!("expected a UserAction, got {other:?}"),
+    }
 }

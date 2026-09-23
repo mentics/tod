@@ -231,12 +231,16 @@ impl ConversationDriver {
 
     /// Append the user's message and start the agent's turn on it. Creates
     /// the conversation row on the first send.
+    /// Sends `text` as the user's turn. Returns the turn's seq — recorded by
+    /// the caller as the journey's `send` `UserAction` (spec §3.1), along
+    /// with the text's length rather than its content, which is already in
+    /// the transcript.
     pub fn send(
         &mut self,
         fleet: &FleetStore,
         agent: &mut dyn AgentProvider,
         text: &str,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         if self.run.is_some() {
             bail!("the agent is still working on the previous message");
         }
@@ -291,9 +295,9 @@ impl ConversationDriver {
         }
         let over_budget = self.session_tokens.is_some_and(|t| t > budget);
 
-        if resumable && !over_budget {
+        let started = if resumable && !over_budget {
             let message = join(&changes, text);
-            return self.start(
+            self.start(
                 fleet,
                 agent,
                 &conversation,
@@ -301,32 +305,33 @@ impl ConversationDriver {
                 None,
                 message,
                 conversation.agent_session_id.clone().filter(|_| !live),
-            );
-        }
-        if has_history {
+            )
+        } else if has_history {
             let reason = if !resumable { "not resumable" } else { "over budget" };
-            return self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text, reason);
-        }
-        // The first turn: the opening context, then the message.
-        let context = self.protocol.opening(&self.env(fleet, id))?;
-        // Kept so the user can read what the agent was given.
-        fleet.interview(
-            ACTOR_USER,
-            InterviewCommand::SetConversationOpeningContext {
-                conversation_id: id,
-                context: context.clone(),
-            },
-        )?;
-        self.session_tokens = Some(0);
-        self.start(
-            fleet,
-            agent,
-            &conversation,
-            user_seq,
-            Some(context),
-            join(&changes, text),
-            None,
-        )
+            self.rotate_and_start(fleet, agent, &conversation, user_seq, &changes, text, reason)
+        } else {
+            // The first turn: the opening context, then the message.
+            let context = self.protocol.opening(&self.env(fleet, id))?;
+            // Kept so the user can read what the agent was given.
+            fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::SetConversationOpeningContext {
+                    conversation_id: id,
+                    context: context.clone(),
+                },
+            )?;
+            self.session_tokens = Some(0);
+            self.start(
+                fleet,
+                agent,
+                &conversation,
+                user_seq,
+                Some(context),
+                join(&changes, text),
+                None,
+            )
+        };
+        started.map(|()| user_seq)
     }
 
     /// Collect a finished turn. Call on every poll.

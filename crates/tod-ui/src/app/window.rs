@@ -229,6 +229,12 @@ impl Shell {
             self.view_before_conversation = self.active_view;
         }
         self.active_view = view;
+        crate::ui::journey::record_nav(
+            cx,
+            tod_journey::NavEvent::ViewSelected {
+                view: format!("{view:?}"),
+            },
+        );
         match view {
             ShellView::Tasks => {
                 self.task_list.update(cx, |list, cx| {
@@ -272,6 +278,12 @@ impl Shell {
             self.queue_open_conversation(focus, cx);
             return;
         }
+        crate::ui::journey::record_nav(
+            cx,
+            tod_journey::NavEvent::DrawerOpened {
+                drawer: "interview".into(),
+            },
+        );
         self.active_view = ShellView::Interview;
         self.pending_open_interview = Some(PendingOpenInterview {
             task_id,
@@ -479,6 +491,29 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        match &request {
+            DrawerRequest::Close | DrawerRequest::Follow { task_id: None } => {
+                crate::ui::journey::record_nav(
+                    cx,
+                    tod_journey::NavEvent::DrawerClosed {
+                        drawer: "drawer".into(),
+                    },
+                );
+            }
+            DrawerRequest::Follow { task_id: Some(_) } | DrawerRequest::Focus => {}
+            other => {
+                crate::ui::journey::record_nav(
+                    cx,
+                    tod_journey::NavEvent::DrawerOpened {
+                        drawer: format!("{other:?}")
+                            .split(|c: char| c == ' ' || c == '{')
+                            .next()
+                            .unwrap_or("drawer")
+                            .to_string(),
+                    },
+                );
+            }
+        }
         match request {
             DrawerRequest::OpenTaskEdit { task_id } => {
                 self.drawer
@@ -594,6 +629,9 @@ impl Shell {
                 conversation.open_with(focus, protocol, true, window, cx);
             }
         });
+        if let Some(conversation_id) = self.conversation.read(cx).conversation_id() {
+            crate::ui::journey::record_conversation_opened(cx, conversation_id);
+        }
         cx.notify();
     }
 
