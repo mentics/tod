@@ -1530,6 +1530,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 fleet.paths().root().to_path_buf(),
                             );
                         }
+                        // The journey recorder and change-feed thread start with the
+                        // store (never for a data root that failed to open above),
+                        // and stop with the app: no explicit shutdown, matching the
+                        // other background threads started here.
+                        tod_core::journey::start(
+                            fleet.paths().root().join("journeys"),
+                            fleet.clone(),
+                            app_settings.journeys.clone(),
+                        );
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
                         let app_settings = TodSettings::load(&paths).unwrap_or_default();

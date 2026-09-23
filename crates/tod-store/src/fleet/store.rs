@@ -243,6 +243,16 @@ impl FleetStore {
             .subscribe()
     }
 
+    /// Deletes every `journey_changes` row through `through_id`
+    /// (`crate::journey_changes::prune_through`), once the journey
+    /// change-feed thread has recorded it. A plain maintenance write on its
+    /// own short-lived connection, like `backup_database` — it does not need
+    /// the debounced `FleetMutation` queue.
+    pub fn prune_journey_changes_through(&self, through_id: i64) -> Result<()> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_changes::prune_through(&conn, through_id)
+    }
+
     /// Enqueue a fleet mutation for the async writer.
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
         if self.migration.is_some() {

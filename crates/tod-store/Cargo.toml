@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 tod-agent = { path = "../tod-agent" }
+tod-journey = { path = "../tod-journey" }
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"

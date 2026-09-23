@@ -22,6 +22,7 @@ thiserror = "2.0"
 toml = "0.8"
 tod-agent = { path = "../tod-agent" }
 tod-integration = { path = "../tod-integration" }
+tod-journey = { path = "../tod-journey" }
 tod-store = { path = "../tod-store" }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"

@@ -11,6 +11,92 @@ const DEFAULT_ANSWERED_HISTORY_CAP: u32 = 100;
 pub const DEFAULT_LOG_MAX_SIZE_KB: u64 = 51_200;
 pub const MIN_LOG_MAX_SIZE_KB: u64 = 1;
 pub const MAX_LOG_MAX_SIZE_KB: u64 = 104_857_600;
+const DEFAULT_JOURNEY_STORAGE_CAP_MB: u64 = 1024;
+
+/// Every lifecycle state name a node can hold, mirroring the `CHECK`
+/// constraint on `node_lifecycle.state` (`outline/ddl.rs`). Kept here rather
+/// than importing `tod-core`'s `LIFECYCLE_STATES`: `tod-store` is the lower
+/// layer and never depends on `tod-core`.
+const VALID_LIFECYCLE_STATES: [&str; 12] = [
+    "proposed", "design", "planning", "ready", "active", "verifying", "review", "approved",
+    "merged", "released", "learn", "done",
+];
+
+fn default_journey_milestone_states() -> Vec<String> {
+    vec![
+        "active".to_string(),
+        "verifying".to_string(),
+        "review".to_string(),
+        "approved".to_string(),
+        "done".to_string(),
+    ]
+}
+
+fn default_journey_storage_cap_mb() -> u64 {
+    DEFAULT_JOURNEY_STORAGE_CAP_MB
+}
+
+/// Whether, and how, per-node/project journeys are recorded and can be sent
+/// for review (`doc/journeys/spec.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JourneySettings {
+    /// Whether recorded journeys may be sealed and sent to the configured
+    /// relay. Recording itself is unconditional; this gates submission.
+    #[serde(default)]
+    pub send: bool,
+    /// Whether a submitted bundle includes agent transcripts.
+    #[serde(default)]
+    pub include_transcripts: bool,
+    /// The pasted relay code (`tod_journey::relay_code::RelayCode`)
+    /// naming where a submission goes. Required when `send` is true.
+    #[serde(default)]
+    pub relay_code: Option<String>,
+    /// Lifecycle states that count as milestones: entering one triggers a
+    /// `Milestone` journey event and a compaction.
+    #[serde(default = "default_journey_milestone_states")]
+    pub milestone_states: Vec<String>,
+    /// Total on-disk cap, across every journey, before the oldest are pruned.
+    #[serde(default = "default_journey_storage_cap_mb")]
+    pub storage_cap_mb: u64,
+}
+
+impl Default for JourneySettings {
+    fn default() -> Self {
+        Self {
+            send: false,
+            include_transcripts: false,
+            relay_code: None,
+            milestone_states: default_journey_milestone_states(),
+            storage_cap_mb: default_journey_storage_cap_mb(),
+        }
+    }
+}
+
+impl JourneySettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.send {
+            let code = self
+                .relay_code
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("journeys.send is true but no relay_code is configured")
+                })?;
+            tod_journey::relay_code::RelayCode::parse(code)
+                .context("journeys.relay_code is not a valid relay code")?;
+        }
+        for state in &self.milestone_states {
+            if !VALID_LIFECYCLE_STATES.contains(&state.as_str()) {
+                bail!(
+                    "journeys.milestone_states has an unknown lifecycle state `{state}` \
+                     (expected one of {})",
+                    VALID_LIFECYCLE_STATES.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Agent platform lives in `tod-agent` (it describes the agent, not storage);
 /// re-exported here because it is persisted in `tod.yml` and agent config rows.
@@ -338,6 +424,9 @@ pub struct TodSettings {
     /// Last known main-window placement.
     #[serde(default)]
     pub window_geometry: Option<WindowGeometry>,
+    /// Per-node/project journey recording and submission (`doc/journeys/spec.md`).
+    #[serde(default)]
+    pub journeys: JourneySettings,
 }
 
 /// The Treehouse executable when none is configured: found on PATH.
@@ -365,6 +454,7 @@ impl Default for TodSettings {
             legacy_agent_effort: None,
             terminal: TerminalSettings::default(),
             window_geometry: None,
+            journeys: JourneySettings::default(),
         }
     }
 }
@@ -532,6 +622,7 @@ impl TodSettings {
         if let Some(geometry) = &self.window_geometry {
             geometry.validate()?;
         }
+        self.journeys.validate()?;
         Ok(())
     }
 
@@ -675,6 +766,7 @@ mod tests {
                 height: 900.0,
                 maximized: false,
             }),
+            journeys: JourneySettings::default(),
         };
         settings.save_to_path(&path).unwrap();
         let loaded = TodSettings::load_from_path(&path).unwrap();

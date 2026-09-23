@@ -6,6 +6,7 @@ pub mod fleet;
 pub mod incoming;
 pub mod install;
 pub mod interview;
+pub mod journey_changes;
 pub mod learn;
 pub mod lifecycle_baseline;
 pub mod linear;
@@ -42,7 +43,7 @@ pub use paths::{
 };
 pub use settings::{
     AgentLaunchByPlatform, AgentPlatform, AgentRole, AgentRoleSettings, ChatLaunchMode,
-    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, MAX_LOG_MAX_SIZE_KB, MIN_LOG_MAX_SIZE_KB,
-    PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings, TodSettings, WindowGeometry,
-    WorktreeBackend,
+    DEFAULT_LOG_MAX_SIZE_KB, InterviewContextSettings, JourneySettings, MAX_LOG_MAX_SIZE_KB,
+    MIN_LOG_MAX_SIZE_KB, PlatformLaunchSettings, QuestionMakerSettings, TerminalSettings,
+    TodSettings, WindowGeometry, WorktreeBackend,
 };
