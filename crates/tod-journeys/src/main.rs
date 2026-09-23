@@ -10,6 +10,7 @@ mod config;
 mod init;
 mod pull;
 mod show;
+mod stats;
 
 use std::path::PathBuf;
 
@@ -26,11 +27,12 @@ fn main() -> Result<()> {
         "init" => cmd_init(rest),
         "pull" => cmd_pull(rest),
         "show" => cmd_show(rest),
+        "stats" => cmd_stats(rest),
         "help" | "-h" | "--help" => {
             print_usage();
             Ok(())
         }
-        other => bail!("unknown command `{other}`; expected init, pull, or show"),
+        other => bail!("unknown command `{other}`; expected init, pull, show, or stats"),
     }
 }
 
@@ -41,7 +43,8 @@ fn print_usage() {
 USAGE:\n\
     tod-journeys init [--server URL] [--home DIR] [--force]\n\
     tod-journeys pull [--once] [--home DIR]\n\
-    tod-journeys show <file>\n"
+    tod-journeys show <file> [--full]\n\
+    tod-journeys stats <dir>\n"
     );
 }
 
@@ -85,6 +88,15 @@ fn cmd_pull(args: &[String]) -> Result<()> {
 }
 
 fn cmd_show(args: &[String]) -> Result<()> {
-    let path = args.first().context("usage: tod-journeys show <file>")?;
-    show::run(std::path::Path::new(path))
+    let full = has_flag(args, "--full");
+    let path = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .context("usage: tod-journeys show <file> [--full]")?;
+    show::run(std::path::Path::new(path), full)
+}
+
+fn cmd_stats(args: &[String]) -> Result<()> {
+    let dir = args.first().context("usage: tod-journeys stats <dir>")?;
+    stats::run(std::path::Path::new(dir))
 }
