@@ -629,6 +629,30 @@ impl ContainerExec {
     pub fn is_dir(&self, path: &str) -> Result<bool> {
         Ok(self.output("/", "test", &["-d", path])?.status.success())
     }
+
+    /// Where `program` is in the container: on its configured `PATH`, else
+    /// on the `PATH` a login shell sets up (`~/.local/bin` and the like).
+    pub fn find_program(&self, program: &str) -> Result<Option<String>> {
+        const FIND: &str = r#"command -v "$1""#;
+        for (shell, flag) in [("sh", "-c"), ("bash", "-lc")] {
+            let Ok(out) = self.output("/", shell, &[flag, FIND, shell, program]) else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            // A login shell may print its own lines first.
+            let found = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .rfind(|line| line.starts_with('/'))
+                .map(str::to_string);
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Single-quote `value` for a POSIX shell.

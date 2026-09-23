@@ -79,8 +79,6 @@ pub struct ArchivedNodeFiles {
     #[serde(default)]
     pub container: Option<String>,
     #[serde(default)]
-    pub container_dir: Option<String>,
-    #[serde(default)]
     pub container_repo_on_host: bool,
 }
 
@@ -298,7 +296,7 @@ fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFi
 fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedNodeFiles>> {
     conn.query_row(
         "SELECT use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_dir, container_repo_on_host
+                dev_container, container, container_repo_on_host
          FROM node_files WHERE node_id = ?1",
         params![uuid_to_blob(node_id)],
         |row| {
@@ -310,8 +308,7 @@ fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<Archiv
                 updated_at: row.get(4)?,
                 dev_container: row.get::<_, i64>(5)? != 0,
                 container: row.get(6)?,
-                container_dir: row.get(7)?,
-                container_repo_on_host: row.get::<_, i64>(8)? != 0,
+                container_repo_on_host: row.get::<_, i64>(7)? != 0,
             })
         },
     )
@@ -739,8 +736,8 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO node_files
                (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_dir, container_repo_on_host)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                dev_container, container, container_repo_on_host)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 blob,
                 i32::from(files.use_worktree),
@@ -750,7 +747,6 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 files.updated_at,
                 i32::from(files.dev_container),
                 files.container,
-                files.container_dir,
                 i32::from(files.container_repo_on_host),
             ],
         )?;

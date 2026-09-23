@@ -689,7 +689,6 @@ fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         ("dev_container", "INTEGER NOT NULL DEFAULT 0"),
         ("container", "TEXT"),
-        ("container_dir", "TEXT"),
         ("container_repo_on_host", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let present = conn
