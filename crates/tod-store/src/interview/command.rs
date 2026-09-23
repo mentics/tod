@@ -229,6 +229,9 @@ pub enum InterviewCommand {
         status: String,
         evidence: String,
     },
+    /// Withdraw what verification confirmed on a node whose code changed
+    /// since (`PlanStepRepo::reopen_verification`).
+    ReopenVerification { node_id: Uuid, why: String },
     /// Record an evaluation's verdict on a node's incoming changes and
     /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
     /// every pending entry when unset.
@@ -870,6 +873,11 @@ pub fn execute(
                 evidence,
             )?;
             Ok(json!({ "id": verdict.id, "status": verdict.status }))
+        }
+        InterviewCommand::ReopenVerification { node_id, why } => {
+            let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
+                .reopen_verification(*node_id, why)?;
+            Ok(json!({ "steps": steps, "verdicts": verdicts }))
         }
         InterviewCommand::ResolveIncoming {
             node_id,

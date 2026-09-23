@@ -351,7 +351,18 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
   changed no verdict, status, or note, like §4.4.
 - **Reopening.** Setting any of the node's steps `implemented` again
   withdraws its `verified` obligation verdicts (`reopened`): the code they
-  were earned against changed. Failed verdicts stay.
+  were earned against changed. Failed verdicts stay. A Fix or Implement turn
+  that lands while the node is in `verifying` (a gate check's finding fixed
+  there) goes further: every `verified` step goes back to `implemented` and
+  every `verified` verdict is reopened (`ReopenVerification`), so the node is
+  verified again before its gate can pass. In `review`, fixing findings is
+  the normal loop and reopens nothing.
+- **Next step.** `tod_core::lifecycle_next` picks the primary button in the
+  lifecycle panel and beside Send, from the stored statuses and verdicts:
+  Verify while anything is owed a verdict, Fix failed once verification
+  finished with failures, and the gate check only after that. A gate verdict
+  recorded before a reopen is replaced in the side pane by "Verify again
+  before the gate check", with a Verify button.
 - **Gate.** `verifying` → `review` has two app-answered criteria:
   `verifying-review.obligations-verified` (every own obligation `verified`)
   and `verifying-review.plan-steps-verified`.

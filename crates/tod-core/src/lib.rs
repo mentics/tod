@@ -19,6 +19,7 @@ pub mod incoming;
 pub mod generator;
 pub mod install;
 pub mod interview;
+pub mod lifecycle_next;
 pub mod lifecycle_validity;
 pub mod linear_import;
 pub mod logging;

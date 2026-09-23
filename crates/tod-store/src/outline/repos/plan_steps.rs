@@ -285,6 +285,27 @@ impl<'a> PlanStepRepo<'a> {
         Ok(())
     }
 
+    /// Withdraw everything verification confirmed on `node_id`, because its
+    /// code changed since: each `verified` step goes back to `implemented`
+    /// (its note stays), and each `verified` verdict is reopened with `why`.
+    /// Failed steps and verdicts stay: they are what the change was fixing.
+    /// Returns how many steps and verdicts were reopened.
+    pub fn reopen_verification(&self, node_id: Uuid, why: &str) -> Result<(usize, usize)> {
+        let steps = self.conn.execute(
+            "UPDATE node_plan_steps SET status = ?1, updated_at = ?2
+             WHERE node_id = ?3 AND status = ?4",
+            params![
+                STATUS_IMPLEMENTED,
+                now_ms(),
+                uuid_to_blob(node_id),
+                STATUS_VERIFIED
+            ],
+        )?;
+        let verdicts =
+            crate::verification::VerdictRepo::new(self.conn).reopen_verified(node_id, why)?;
+        Ok((steps, verdicts))
+    }
+
     /// Append `note` to `id`'s history, unless the step already has this
     /// note with this status — which is what reversing a status change, or
     /// repeating one, would otherwise add again.
