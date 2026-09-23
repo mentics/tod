@@ -66,3 +66,13 @@ pub fn read_bundle(bytes: impl Read) -> io::Result<JourneyReader> {
     let decoder = zstd::stream::read::Decoder::new(bytes)?;
     Ok(JourneyReader::from_reader(decoder))
 }
+
+/// Strips a bundle's zstd framing, returning the plain CBOR record stream as
+/// bytes rather than parsed records — used by `tod-journeys pull`, which
+/// files the decompressed stream as-is (`<bundle-id>.journey`) after opening
+/// the sealed bundle it received.
+pub fn decompress(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    zstd::stream::copy_decode(bytes, &mut out)?;
+    Ok(out)
+}

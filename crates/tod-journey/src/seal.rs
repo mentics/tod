@@ -58,12 +58,19 @@ pub fn join(parts: Vec<Vec<u8>>) -> Vec<u8> {
     parts.into_iter().flatten().collect()
 }
 
-/// Generates a fresh (identity, recipient) pair for tests that need to seal
-/// and open a bundle end-to-end without a real relay code. Not for
-/// production use — callers outside this crate only reach it from `#[cfg(test)]`.
-pub fn generate_test_identity() -> (String, String) {
+/// Generates a fresh age X25519 (identity, recipient) pair, as strings ready
+/// to write to `identity.txt` / embed in a [`crate::relay_code::RelayCode`].
+/// Used by `tod-journeys init` and by tests that need a real key pair.
+pub fn generate_identity() -> (String, String) {
     use age::secrecy::ExposeSecret;
     let identity = age::x25519::Identity::generate();
     let recipient = identity.to_public().to_string();
     (identity.to_string().expose_secret().to_string(), recipient)
+}
+
+/// Generates a fresh (identity, recipient) pair for tests that need to seal
+/// and open a bundle end-to-end without a real relay code. Not for
+/// production use — callers outside this crate only reach it from `#[cfg(test)]`.
+pub fn generate_test_identity() -> (String, String) {
+    generate_identity()
 }

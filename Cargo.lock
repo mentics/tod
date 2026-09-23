@@ -9058,6 +9058,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tod-journeys"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 6.0.0",
+ "rand 0.8.7",
+ "serde",
+ "tempfile",
+ "tod-integration",
+ "tod-journey",
+ "toml 0.8.23",
+]
+
+[[package]]
 name = "tod-store"
 version = "0.1.0"
 dependencies = [

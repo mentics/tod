@@ -20,4 +20,5 @@ pub use record::{
     PresentedAction, Record, Reference, Regression, Resolution, RowRef, TurnPhase,
 };
 pub use relay_code::RelayCode;
+pub use seal::generate_identity;
 pub use writer::JourneyWriter;
