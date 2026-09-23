@@ -171,6 +171,7 @@ pub fn protocol_for(kind: ProtocolKind) -> &'static dyn Protocol {
         ProtocolKind::Implementation => &super::implement::ImplementationProtocol,
         ProtocolKind::Verification => &super::verify::VerificationProtocol,
         ProtocolKind::Review => &super::review::ReviewProtocol,
+        ProtocolKind::Pr => &super::pr::PrProtocol,
         ProtocolKind::Fix => &super::fix::FixProtocol,
         ProtocolKind::GateCheck => &super::gate_check::GateCheckProtocol,
         ProtocolKind::OnEntry => &super::gate_check::OnEntryProtocol,
@@ -344,6 +345,7 @@ mod tests {
             ProtocolKind::GateCheck,
             ProtocolKind::OnEntry,
             ProtocolKind::Incoming,
+            ProtocolKind::Pr,
             ProtocolKind::Chat,
         ] {
             assert_eq!(protocol_for(kind).kind(), kind, "{kind:?}");

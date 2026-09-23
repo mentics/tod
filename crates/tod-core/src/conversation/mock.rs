@@ -67,6 +67,9 @@ pub fn plan_turn(access: &impl Access, node_id: Uuid, conversation_id: Uuid) -> 
         Some(tod_store::conversation::ProtocolKind::Fix) => {
             super::fix::mock_turn(access, node_id, conversation_id)
         }
+        Some(tod_store::conversation::ProtocolKind::Pr) => {
+            super::pr::mock_turn(access, node_id, conversation_id)
+        }
         _ => super::implement::mock_turn(access, node_id, conversation_id),
     }
 }

@@ -494,12 +494,12 @@ impl ConversationView {
             // conversation's, so it has a change set too.
             ProtocolKind::Outline | ProtocolKind::Chat => SideList::ChangeSet,
             ProtocolKind::Implementation | ProtocolKind::Verification => SideList::Plan,
-            ProtocolKind::Review | ProtocolKind::Fix => SideList::Findings,
+            ProtocolKind::Review | ProtocolKind::Fix | ProtocolKind::Pr => SideList::Findings,
             ProtocolKind::GateCheck | ProtocolKind::OnEntry => {
                 match self.data.lifecycle.as_ref().map(|s| s.lifecycle.as_str()) {
                     Some("proposed" | "design") => SideList::Obligations,
                     Some("planning" | "ready" | "active" | "verifying") => SideList::Plan,
-                    Some("review" | "approved") => SideList::Findings,
+                    Some("review" | "pr" | "approved") => SideList::Findings,
                     _ if self.data.protocol == ProtocolKind::GateCheck => SideList::Gate,
                     _ => SideList::Empty(
                         "On entry",

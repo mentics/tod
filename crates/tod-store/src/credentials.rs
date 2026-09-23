@@ -18,11 +18,12 @@ const FILE_MAGIC: &[u8; 7] = b"TODENC1";
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     LinearApiKey,
+    GithubToken,
 }
 
 impl CredentialKind {
     /// Every kind, in the order `tod-cli secrets list` shows them.
-    pub const ALL: [Self; 1] = [Self::LinearApiKey];
+    pub const ALL: [Self; 2] = [Self::LinearApiKey, Self::GithubToken];
 
     /// The name an agent uses for this secret (`tod-cli secrets`).
     pub fn name(self) -> &'static str {
@@ -36,24 +37,28 @@ impl CredentialKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::LinearApiKey => "Linear API key",
+            Self::GithubToken => "GitHub token",
         }
     }
 
     fn keyring_account(self) -> &'static str {
         match self {
             Self::LinearApiKey => "linear_api_key",
+            Self::GithubToken => "github_token",
         }
     }
 
     fn file_name(self) -> &'static str {
         match self {
             Self::LinearApiKey => "linear_api_key.enc",
+            Self::GithubToken => "github_token.enc",
         }
     }
 
     fn env_var(self) -> Option<&'static str> {
         match self {
             Self::LinearApiKey => Some("LINEAR_API_KEY"),
+            Self::GithubToken => Some("GITHUB_TOKEN"),
         }
     }
 }
@@ -452,6 +457,10 @@ fn machine_id() -> Option<String> {
 
 pub fn resolve_linear_api_key(store: &CredentialStore) -> Option<String> {
     store.get(CredentialKind::LinearApiKey)
+}
+
+pub fn resolve_github_token(store: &CredentialStore) -> Option<String> {
+    store.get(CredentialKind::GithubToken)
 }
 
 #[cfg(test)]

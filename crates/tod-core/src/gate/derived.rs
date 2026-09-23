@@ -16,12 +16,18 @@ use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
 use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_IMPLEMENTED, STATUS_VERIFIED};
 use tod_store::outline::repos::obligations::KIND_REQUIREMENT;
 use tod_store::outline::repos::ObligationRepo;
+use tod_store::github::NodePrRepo;
 use tod_store::outline::{
     ACTIVE_VERIFYING_PLAN_IMPLEMENTED_SLUG, GateCriterion, OUTCOME_FAIL, OUTCOME_PASS, PLANNING_READY_REQUIREMENTS_TRACEABLE_SLUG,
     READY_ACTIVE_ACTION_CONFIG_SLUG,
     REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG, REVIEW_APPROVED_REVIEW_DONE_SLUG,
     VERIFYING_REVIEW_OBLIGATIONS_VERIFIED_SLUG, VERIFYING_REVIEW_PLAN_VERIFIED_SLUG,
 };
+
+/// `pr → approved`: the PR is mergeable (checks green, reviews satisfied).
+pub const PR_APPROVED_MERGEABLE_SLUG: &str = "pr-approved.mergeable";
+/// `approved → merged`: the PR has actually been merged.
+pub const APPROVED_MERGED_PR_MERGED_SLUG: &str = "approved-merged.pr-merged";
 use tod_store::review::ReviewRepo;
 use tod_store::verification::{ObligationStanding, VerdictRepo};
 use uuid::Uuid;
@@ -55,6 +61,8 @@ pub fn evaluate_derived_criterion(
         REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG => {
             findings_answered_outcome(conn, node_id).map(Some)
         }
+        PR_APPROVED_MERGEABLE_SLUG => pr_mergeable_outcome(conn, node_id).map(Some),
+        APPROVED_MERGED_PR_MERGED_SLUG => pr_merged_outcome(conn, node_id).map(Some),
         _ => Ok(None),
     }
 }
@@ -328,6 +336,81 @@ fn findings_answered_outcome(conn: &Connection, node_id: Uuid) -> Result<Derived
         findings.len(),
         open.join("; ")
     )))
+}
+
+/// Resolve the GitHub token the same way `tod-cli pr` does — OS keyring or
+/// encrypted file first, `GITHUB_TOKEN` env var as a fallback
+/// (`CredentialStore::get`) — using the data root the open `Connection`
+/// itself lives under (`tod.db` sits directly at the data root, same as
+/// `FleetPaths::db()`), since `evaluate_derived_criterion` only has a
+/// `Connection` in scope, not a `CredentialStore`.
+fn resolve_github_token(conn: &Connection) -> Option<String> {
+    let db_path = conn.path()?;
+    let data_root = std::path::Path::new(db_path).parent()?;
+    let store = tod_store::credentials::CredentialStore::from_data_root(data_root);
+    tod_store::credentials::resolve_github_token(&store)
+}
+
+/// The PR is mergeable: GitHub's own `mergeable_state` is `"clean"` —
+/// meaning this repo's actual branch protection rules (required reviews,
+/// required checks) are satisfied and there's no conflict — and it hasn't
+/// already been merged. `None` when no PR is open yet is a fail — the `pr`
+/// state's agent hasn't finished its job.
+fn pr_mergeable_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let Some(pr) = NodePrRepo::new(conn).get(node_id)? else {
+        return Ok(fail(
+            "No pull request has been opened yet — `tod-cli pr open` from the `pr` state.",
+        ));
+    };
+    let Some(token) = resolve_github_token(conn) else {
+        return Ok(fail(
+            "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
+        ));
+    };
+    let status = match tod_store::github::get_pr_status(&token, &pr.owner, &pr.repo, pr.pr_number) {
+        Ok(status) => status,
+        Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
+    };
+    if status.merged {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("{} is already merged.", pr.url),
+        });
+    }
+    if status.mergeable_state.as_deref() == Some("clean") {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("{} is mergeable.", pr.url),
+        });
+    }
+    Ok(fail(format!(
+        "{} is not mergeable yet (state: {}).",
+        pr.url,
+        status.mergeable_state.as_deref().unwrap_or("unknown")
+    )))
+}
+
+/// The PR has actually been merged.
+fn pr_merged_outcome(conn: &Connection, node_id: Uuid) -> Result<DerivedOutcome> {
+    let Some(pr) = NodePrRepo::new(conn).get(node_id)? else {
+        return Ok(fail("No pull request on record for this node."));
+    };
+    let Some(token) = resolve_github_token(conn) else {
+        return Ok(fail(
+            "No GitHub token configured — see `tod-cli secrets` — cannot check PR status.",
+        ));
+    };
+    let status = match tod_store::github::get_pr_status(&token, &pr.owner, &pr.repo, pr.pr_number) {
+        Ok(status) => status,
+        Err(err) => return Ok(fail(format!("Could not read PR status: {err}"))),
+    };
+    if status.merged {
+        return Ok(DerivedOutcome {
+            outcome: OUTCOME_PASS,
+            detail: format!("{} is merged.", pr.url),
+        });
+    }
+    Ok(fail(format!("{} is not merged yet.", pr.url)))
 }
 
 #[cfg(test)]

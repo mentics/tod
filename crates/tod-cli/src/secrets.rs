@@ -18,9 +18,14 @@ tod-cli secrets — use stored secrets without seeing them
 
 COMMANDS:
     list
+    set       <NAME> [VALUE]
     run       --env <VAR>=<SECRET> [--env <VAR>=<SECRET> ...] -- <COMMAND> [ARGS...]
 
 `list` shows each secret's name and whether it is set, never its value.
+`set` stores NAME (e.g. `github_token`), preferring the OS keyring and
+falling back to an encrypted file under the data root. VALUE can be given as
+an argument, but reading it from stdin (no VALUE, pipe or type it, `-` also
+means stdin) keeps it out of shell history.
 `run` starts COMMAND with each named secret in environment variable VAR,
 prints its output with every secret value replaced by `***`, and exits with
 its exit code. A secret that is not set is an error saying how the user can
@@ -39,6 +44,7 @@ pub fn run(inv: Invocation) -> anyhow::Result<String> {
     let store = CredentialStore::from_data_root(&inv.data_root);
     match command.as_str() {
         "list" => Ok(list(&inv, &store)),
+        "set" => set(&rest, &store),
         "run" => {
             let code = run_with_secrets(&store, &rest)?;
             let _ = std::io::stdout().flush();
@@ -75,6 +81,34 @@ fn list(inv: &Invocation, store: &CredentialStore) -> String {
         .join("\n")
 }
 
+/// `set <NAME> [VALUE]` — VALUE from stdin (or `-`) when omitted, so it
+/// never has to sit in shell history.
+fn set(rest: &[String], store: &CredentialStore) -> anyhow::Result<String> {
+    let name = rest
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: secrets set <NAME> [VALUE]"))?;
+    let kind = CredentialKind::from_name(name).ok_or_else(|| {
+        let known: Vec<&str> = CredentialKind::ALL.iter().map(|kind| kind.name()).collect();
+        anyhow::anyhow!(
+            "no secret named `{name}` (tod stores: {}). Only the user can add a new kind \
+             of secret",
+            known.join(", ")
+        )
+    })?;
+    let value = match rest.get(1) {
+        Some(value) if value != "-" => value.clone(),
+        _ => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|err| anyhow::anyhow!("could not read {} from stdin: {err}", kind.name()))?;
+            buf
+        }
+    };
+    let backend = store.set(kind, &value).map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(format!("ok {} stored ({backend:?})", kind.name()))
+}
+
 /// How the user stores `kind`, for the error an agent passes on when it is
 /// missing.
 fn how_to_set(kind: CredentialKind) -> &'static str {
@@ -83,6 +117,10 @@ fn how_to_set(kind: CredentialKind) -> &'static str {
             "tod asks for it the first time you create a task from a Linear ticket \
              (paste a Linear ticket URL into the task list); or set LINEAR_API_KEY \
              in the environment tod is launched from"
+        }
+        CredentialKind::GithubToken => {
+            "set GITHUB_TOKEN in the environment tod is launched from, or store it with \
+             `tod-cli secrets set github_token <token>`"
         }
     }
 }
@@ -271,7 +309,7 @@ mod tests {
         assert!(parse_run(&strings(&["--", "python"])).is_err());
         assert!(parse_run(&strings(&["--env", "X=linear_api_key"])).is_err());
         assert!(parse_run(&strings(&["--env", "X=linear_api_key", "--"])).is_err());
-        let unknown = parse_run(&strings(&["--env", "X=github_token", "--", "sh"]))
+        let unknown = parse_run(&strings(&["--env", "X=bogus_credential", "--", "sh"]))
             .err()
             .unwrap()
             .to_string();

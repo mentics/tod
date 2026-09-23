@@ -330,12 +330,13 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
         label: "Node- or ancestor-defined gate extras (if any) done?",
         sort_order: 9,
     },
-    // review → approved — evaluated by the app, not an agent (`tod_core::gate::derived`).
-    // Approval itself is the user's Advance once both pass.
+    // review → pr — evaluated by the app, not an agent (`tod_core::gate::derived`).
+    // Advancing to `pr` opens the pull request; the checks below no longer
+    // gate approval itself (see `pr → approved` below).
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000001",
         from_state: "review",
-        to_state: "approved",
+        to_state: "pr",
         slug: crate::outline::repos::gate::REVIEW_APPROVED_REVIEW_DONE_SLUG,
         label: "Independent code review recorded as finished?",
         sort_order: 1,
@@ -343,10 +344,30 @@ pub const GATE_CRITERIA: &[GateCriterionSeed] = &[
     GateCriterionSeed {
         id_str: "a1000006-0006-4006-8006-000000000002",
         from_state: "review",
-        to_state: "approved",
+        to_state: "pr",
         slug: crate::outline::repos::gate::REVIEW_APPROVED_FINDINGS_ANSWERED_SLUG,
         label: "Every review finding answered (fixed, out of scope, declined, or rejected)?",
         sort_order: 2,
+    },
+    // pr → approved — app-checked: the PR is mergeable (checks green,
+    // required reviews satisfied). `tod_core::gate::pr_mergeable_outcome`.
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000003",
+        from_state: "pr",
+        to_state: "approved",
+        slug: "pr-approved.mergeable",
+        label: "PR approved and checks green?",
+        sort_order: 1,
+    },
+    // approved → merged — app-checked: the PR has actually been merged.
+    // `tod_core::gate::pr_merged_outcome`.
+    GateCriterionSeed {
+        id_str: "a1000006-0006-4006-8006-000000000004",
+        from_state: "approved",
+        to_state: "merged",
+        slug: "approved-merged.pr-merged",
+        label: "PR merged?",
+        sort_order: 1,
     },
 ];
 
@@ -410,6 +431,16 @@ pub fn seed_gate_criteria(conn: &Connection) -> Result<()> {
     }
     conn.execute(
         "UPDATE gate_criteria SET active = 0, updated_at = ?1 WHERE slug = 'planning-ready.human-lookover' AND active = 1",
+        params![now],
+    )?;
+    // The `pr` lifecycle state split `review → approved` into
+    // `review → pr` and new `pr → approved` / `approved → merged` gates.
+    // `INSERT OR IGNORE` above never updates an already-seeded row's
+    // `from_state`/`to_state`, so installs seeded before the split need this
+    // explicit backfill.
+    conn.execute(
+        "UPDATE gate_criteria SET to_state = 'pr', updated_at = ?1
+         WHERE from_state = 'review' AND to_state = 'approved'",
         params![now],
     )?;
     // design → planning requires `buildable` and the constraints check only.

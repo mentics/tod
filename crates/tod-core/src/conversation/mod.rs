@@ -15,6 +15,7 @@ pub mod gate_check;
 pub mod implement;
 pub mod incoming;
 pub mod mock;
+pub mod pr;
 pub mod protocol;
 pub mod review;
 pub mod verify;

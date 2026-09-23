@@ -137,6 +137,7 @@ str_enum!(
         GateCheck => "gate_check",
         OnEntry => "on_entry",
         Incoming => "incoming",
+        Pr => "pr",
     }
 );
 
@@ -150,7 +151,7 @@ impl ProtocolKind {
     /// Whether this kind works through a node's review findings — its side
     /// pane lists them, each answered from its status.
     pub fn works_the_findings(self) -> bool {
-        matches!(self, ProtocolKind::Review | ProtocolKind::Fix)
+        matches!(self, ProtocolKind::Review | ProtocolKind::Fix | ProtocolKind::Pr)
     }
 
     /// Whether this kind belongs to a lifecycle transition (or a state's

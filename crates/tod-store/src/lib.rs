@@ -8,6 +8,7 @@ pub mod install;
 pub mod interview;
 pub mod learn;
 pub mod lifecycle_baseline;
+pub mod github;
 pub mod linear;
 pub mod log_level;
 pub mod outline;
