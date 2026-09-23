@@ -23,6 +23,7 @@ use std::process::Command;
 use tod_agent::SessionPurpose;
 use tod_store::conversation::ProtocolKind;
 use tod_store::fleet::provision::resolve_launch_cwd;
+use tod_store::fleet::worktree::{self, current_branch};
 use tod_store::fleet::{FleetMutation, FleetStore};
 use tod_store::interview::short_id;
 use tod_store::outline::EXTRA_CONTENT_DETAILS;
@@ -108,6 +109,10 @@ impl Protocol for ImplementationProtocol {
             Ok(cwd) => commit_run(env, &cwd, "Implement"),
             Err(err) => vec![RunNotice::Error(format!("{err:#}"))],
         }
+    }
+
+    fn prepare(&self, env: &ProtocolEnv<'_>) -> Result<()> {
+        prepare_submodules(env, &self.cwd(env)?)
     }
 
     /// Its writes are not a reversible change set, so no conversation actor:
@@ -499,6 +504,22 @@ pub(super) fn commit_worktree(
     branch: Option<&str>,
     message: &str,
 ) -> Result<bool> {
+    // Submodules first, deepest first, so each parent commits the child's new
+    // commit; they go on the superproject's branch, like the rest of the work.
+    let branch = current_branch(cwd).or_else(|| branch.map(str::to_string));
+    let mut committed = false;
+    if let Some(branch) = branch.as_deref() {
+        let submodules = worktree::submodule_dirs(cwd).unwrap_or_default();
+        for dir in submodules.iter().rev() {
+            committed |= commit_repo(dir, Some(branch), message)?;
+        }
+        worktree::prune_submodule_branches(cwd, branch)?;
+    }
+    Ok(commit_repo(cwd, branch.as_deref(), message)? || committed)
+}
+
+/// Commit everything in the one repository at `cwd`; see [`commit_worktree`].
+fn commit_repo(cwd: &std::path::Path, branch: Option<&str>, message: &str) -> Result<bool> {
     fn git(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
         Command::new("git")
             .args(args)
@@ -539,18 +560,6 @@ pub(super) fn commit_worktree(
         String::from_utf8_lossy(&commit.stderr).trim()
     );
     Ok(true)
-}
-
-/// The branch checked out in `cwd`, or `None` when HEAD is detached or it
-/// cannot be read.
-fn current_branch(cwd: &std::path::Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["symbolic-ref", "--short", "-q", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|out| out.status.success())?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|b| !b.is_empty())
 }
 
 /// What tells one run's commit from another's: which run of the conversation
@@ -615,6 +624,25 @@ Conversation {}",
         short_id(env.conversation_id)
     ));
     message
+}
+
+/// Put every submodule of the worktree on the node's branch before a turn, so
+/// the agent's commits inside one land on a branch, not a detached HEAD.
+/// The branch is the Files branch, else the worktree's own.
+pub(super) fn prepare_submodules(env: &ProtocolEnv<'_>, cwd: &std::path::Path) -> Result<()> {
+    let node = node_id(env)?;
+    let recorded = env
+        .fleet
+        .resolve_files_for_node(&node.to_string())?
+        .and_then(|files| files.branch().map(str::to_string))
+        .filter(|b| !b.is_empty());
+    let Some(branch) = recorded.or_else(|| current_branch(cwd)) else {
+        return Ok(());
+    };
+    for warning in worktree::branch_submodules(cwd, &branch)? {
+        tracing::warn!("{warning}");
+    }
+    Ok(())
 }
 
 /// Commit at the end of an implementation or fix run (see [`Protocol::finish`]),

@@ -17,7 +17,7 @@
 use super::context::ReportedStale;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
-    worktree_fingerprint,
+    prepare_submodules, worktree_fingerprint,
 };
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
@@ -57,6 +57,10 @@ impl Protocol for FixProtocol {
 
     fn starter(&self) -> Option<&'static str> {
         Some("Resolve the open review findings.")
+    }
+
+    fn prepare(&self, env: &ProtocolEnv<'_>) -> Result<()> {
+        prepare_submodules(env, &self.cwd(env)?)
     }
 
     fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {

@@ -601,6 +601,9 @@ impl ConversationDriver {
         check_tod_cli()?;
         let (cwd, turn_env, progress) = {
             let env = self.env(fleet, id);
+            if let Err(err) = self.protocol.prepare(&env) {
+                tracing::warn!("preparing the working directory: {err:#}");
+            }
             let mut turn_env = self.protocol.turn_env(&env);
             turn_env.extend(tod_cli_path_env());
             (

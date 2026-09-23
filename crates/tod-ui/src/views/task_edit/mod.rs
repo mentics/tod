@@ -28,7 +28,8 @@ use tod_core::generator::ConfigFieldType;
 use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
-    release_worktree_for_node, setup_worktree_for_node, validate_interview_workspace,
+    release_worktree_for_node, rename_branch_for_node, setup_worktree_for_node,
+    validate_interview_workspace,
 };
 use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
@@ -2840,9 +2841,7 @@ impl TaskEditView {
             return;
         }
         if self.has_own_worktree() {
-            self.pending_toast = Some("Release the worktree before changing the branch".into());
-            self.pending_branch_revert = true;
-            cx.notify();
+            self.rename_worktree_branch(id, value, cx);
             return;
         }
         if !self.loaded_repo.is_empty() {
@@ -2874,6 +2873,50 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.load_action_capabilities();
         cx.notify();
+    }
+
+    /// With a worktree set up, a new branch name renames the branch in place
+    /// (superproject and submodules) instead of moving to another worktree.
+    fn rename_worktree_branch(&mut self, id: String, value: String, cx: &mut Context<Self>) {
+        if self.worktree_busy {
+            self.pending_branch_revert = true;
+            cx.notify();
+            return;
+        }
+        self.worktree_busy = true;
+        self.worktree_status = Some("Renaming branch…".into());
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let new = value.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { rename_branch_for_node(&fleet, &id, &new) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.worktree_busy = false;
+                match result {
+                    Ok(warnings) => {
+                        this.worktree_status = Some(format!("Branch renamed to {value}"));
+                        this.loaded_branch = value;
+                        if !warnings.is_empty() {
+                            this.pending_toast = Some(warnings.join(
+                                "
+",
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        this.worktree_status = None;
+                        this.pending_toast = Some(format!("Branch: {err:#}"));
+                        this.pending_branch_revert = true;
+                    }
+                }
+                let _ = this.fleet.reload_if_stale();
+                this.load_action_capabilities();
+                this.notify_changed(cx);
+            });
+        })
+        .detach();
     }
 
     fn persist_notes(&mut self, _cx: &mut Context<Self>) {

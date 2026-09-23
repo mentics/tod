@@ -90,6 +90,35 @@ pub fn setup_worktree_for_node(
     Ok(handle.path)
 }
 
+/// Change the branch of the node owning `node_id`'s Files capability while its
+/// worktree is set up: the worktree's branch is renamed in place, in the
+/// superproject and every submodule that has it (see [`worktree::rename_branch`]),
+/// then recorded. Returns warnings the user should see (a renamed branch that
+/// was already pushed).
+pub fn rename_branch_for_node(fleet: &FleetStore, node_id: &str, new: &str) -> Result<Vec<String>> {
+    let files = resolve_files(fleet, node_id)?;
+    let path = files
+        .worktree_path()
+        .map(PathBuf::from)
+        .context("No worktree is set up")?;
+    if new.is_empty() {
+        bail!("A worktree needs a branch; release it to clear the branch");
+    }
+    let old = match files.branch().filter(|b| !b.is_empty()) {
+        Some(branch) => branch.to_string(),
+        None => worktree::current_branch(&path)
+            .context("The worktree is on a detached HEAD; there is no branch to rename")?,
+    };
+    let warnings = worktree::rename_branch(&path, &old, new)?;
+    fleet.enqueue(FleetMutation::UpdateTaskBranch {
+        id: files.source_node_id.clone(),
+        branch: Some(new.to_string()),
+    })?;
+    fleet.writer().flush()?;
+    fleet.reload_if_stale()?;
+    Ok(warnings)
+}
+
 /// Release the worktree recorded for the node owning `node_id`'s Files capability.
 ///
 /// Drop shells and terminal agents whose processes have exited (closed outside

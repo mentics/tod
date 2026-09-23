@@ -95,6 +95,12 @@ pub trait Protocol: Send + Sync {
         None
     }
 
+    /// Runs before every turn is sent, to put the working directory in the
+    /// state the agent expects. A failure is logged, not fatal to the turn.
+    fn prepare(&self, _env: &ProtocolEnv<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// The first message's context.
     fn opening(&self, env: &ProtocolEnv<'_>) -> Result<String>;
 
