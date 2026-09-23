@@ -330,7 +330,10 @@ Nothing starts or builds a container; tod only uses a running one.
   --recursive`. Either way `ensure_worktree` then initializes any submodule
   still left out and puts every submodule on the node's branch; what it
   could not do comes back as `WorktreeHandle::warnings` and is shown in the
-  Files section. It runs with no store lock held (the shared-worktree lookup
+  Files section. In the superproject and each submodule, a branch that
+  `origin/<branch>` already has is created from it, and an existing one with
+  no upstream is linked to it (one `for-each-ref`, no fetch: it goes by the
+  last fetch). It runs with no store lock held (the shared-worktree lookup
   is a short `fleet.read`), so the UI never waits on git or Docker.
 - **Mounted** (`container_repo_on_host`): the repository is on this machine,
   git runs here, and only launches go into the container. The directory there

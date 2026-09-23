@@ -147,12 +147,82 @@ pub fn checkout_branch(worktree: &Workdir, branch: &str) -> Result<()> {
     if branch.is_empty() {
         return Ok(());
     }
-    if run_git(worktree, &["rev-parse", "--verify", branch]).is_ok() {
-        run_git(worktree, &["switch", branch])?;
-    } else {
-        run_git(worktree, &["switch", "-c", branch])?;
+    switch_to_branch(worktree, branch).map(|_| ())
+}
+
+/// The remote a branch of the same name is looked for on.
+const REMOTE: &str = "origin";
+
+/// What a repository has of `branch`, from one git call.
+#[derive(Debug, Default)]
+struct BranchState {
+    /// Checked out.
+    current: bool,
+    local: bool,
+    /// The local branch has an upstream.
+    upstream: bool,
+    /// `origin/<branch>` is known, as of the last fetch.
+    remote: bool,
+}
+
+fn branch_state(repo: &Workdir, branch: &str) -> Result<BranchState> {
+    let local = format!("refs/heads/{branch}");
+    let remote = format!("refs/remotes/{REMOTE}/{branch}");
+    // `%(HEAD)` last: it is a space when not checked out, and output is trimmed.
+    let out = run_git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%00%(upstream)%00%(HEAD)",
+            &local,
+            &remote,
+        ],
+    )?;
+    let mut state = BranchState::default();
+    for line in out.lines() {
+        let mut fields = line.split('\0');
+        let (name, upstream, head) = (
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        );
+        if name == local {
+            state.local = true;
+            state.upstream = !upstream.is_empty();
+            state.current = head.trim() == "*";
+        } else if name == remote {
+            state.remote = true;
+        }
     }
-    Ok(())
+    Ok(state)
+}
+
+/// Check `branch` out in `repo`. One that does not exist yet is created from
+/// `origin/<branch>` when there is one (work pushed before, a pull request),
+/// else at HEAD. A branch with no upstream is linked to `origin/<branch>`, so
+/// `git pull` and `git push` work. Nothing is fetched: this goes by what the
+/// last fetch saw. Returns whether the branch was created at HEAD.
+fn switch_to_branch(repo: &Workdir, branch: &str) -> Result<bool> {
+    let state = branch_state(repo, branch)?;
+    let tracking = format!("{REMOTE}/{branch}");
+    if !state.local {
+        if state.remote {
+            run_git(repo, &["switch", "--track", "-c", branch, &tracking])?;
+            return Ok(false);
+        }
+        run_git(repo, &["switch", "-c", branch])?;
+        return Ok(true);
+    }
+    if !state.current {
+        run_git(repo, &["switch", branch])?;
+    }
+    if state.remote && !state.upstream {
+        let upstream = format!("--set-upstream-to={tracking}");
+        if let Err(err) = run_git(repo, &["branch", &upstream, branch]) {
+            tracing::warn!("link {branch} in {repo} to {tracking}: {err:#}");
+        }
+    }
+    Ok(false)
 }
 
 /// Initialized submodules of `repo`, recursively, parents before children.
@@ -245,27 +315,24 @@ pub fn init_submodules(worktree: &Workdir) -> Result<()> {
     Ok(())
 }
 
-/// Check `branch` out in every initialized submodule of `worktree`, creating
-/// it at the submodule's current commit where it does not exist yet, so an
-/// agent's commits inside a submodule land on a branch rather than a detached
-/// HEAD. Idempotent. Returns one warning per submodule it could not switch.
+/// Check `branch` out in every initialized submodule of `worktree` (see
+/// [`switch_to_branch`]: from `origin/<branch>` if the submodule has one, else
+/// at its current commit), so an agent's commits inside a submodule land on a
+/// branch rather than a detached HEAD. Idempotent. Returns one warning per
+/// submodule it could not switch.
 pub fn branch_submodules(worktree: &Workdir, branch: &str) -> Result<Vec<String>> {
     if branch.is_empty() {
         return Ok(Vec::new());
     }
     let mut warnings = Vec::new();
     for dir in submodule_dirs(worktree)? {
-        if current_branch(&dir).as_deref() == Some(branch) {
-            continue;
-        }
-        let switched = if branch_exists(&dir, branch) {
-            run_git(&dir, &["switch", branch]).map(|_| ())
-        } else {
-            run_git(&dir, &["rev-parse", "HEAD"]).and_then(|head| {
-                run_git(&dir, &["switch", "-c", branch])?;
-                run_git(&dir, &["config", &start_key(branch), &head]).map(|_| ())
-            })
-        };
+        let switched = switch_to_branch(&dir, branch).and_then(|created_at_head| {
+            if created_at_head {
+                let head = run_git(&dir, &["rev-parse", "HEAD"])?;
+                run_git(&dir, &["config", &start_key(branch), &head])?;
+            }
+            Ok(())
+        });
         if let Err(err) = switched {
             warnings.push(format!("Submodule {dir} is not on \"{branch}\": {err:#}"));
         }
@@ -383,8 +450,15 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
         exclude_container_worktrees(repo)?;
     }
     let dest_str = git_path_arg(dest)?;
-    if run_git(repo, &["rev-parse", "--verify", &branch_ref]).is_ok() {
+    let state = branch_state(repo, &branch_ref)?;
+    if state.local {
         run_git(repo, &["worktree", "add", &dest_str, &branch_ref])?;
+    } else if state.remote {
+        let tracking = format!("{REMOTE}/{branch_ref}");
+        run_git(
+            repo,
+            &["worktree", "add", "--track", "-b", &branch_ref, &dest_str, &tracking],
+        )?;
     } else {
         run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])?;
     }
@@ -829,6 +903,83 @@ mod tests {
         assert_eq!(current_branch(&a).as_deref(), Some("tod/x"), "used: kept");
         assert_eq!(current_branch(&b), None, "unused: detached again");
         assert!(!branch_exists(&b, "tod/x"));
+    }
+
+    /// A clone of a repository whose `feature` has one commit more than `main`.
+    fn clone_with_remote_feature() -> (Workdir, String) {
+        let origin = Workdir::host(init_temp_repo());
+        git_in(&origin, &["switch", "-q", "feature"]);
+        git_in(&origin, &["commit", "-q", "--allow-empty", "-m", "pushed work"]);
+        let tip = git_in(&origin, &["rev-parse", "HEAD"]);
+        git_in(&origin, &["switch", "-q", "main"]);
+        let dir = std::env::temp_dir().join(format!("tod-wt-clone-{}", uuid::Uuid::new_v4()));
+        let out = StdCommand::new("git")
+            .args(["clone", "-q"])
+            .arg(origin.host_path().unwrap())
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        (Workdir::host(dir), tip)
+    }
+
+    fn upstream_of(repo: &Workdir, branch: &str) -> Option<String> {
+        run_git(repo, &["rev-parse", "--abbrev-ref", &format!("{branch}@{{upstream}}")]).ok()
+    }
+
+    #[test]
+    fn a_branch_on_origin_is_checked_out_from_it_and_linked() {
+        let (clone, tip) = clone_with_remote_feature();
+        checkout_branch(&clone, "feature").unwrap();
+        assert_eq!(current_branch(&clone).as_deref(), Some("feature"));
+        assert_eq!(run_git(&clone, &["rev-parse", "HEAD"]).unwrap(), tip);
+        assert_eq!(upstream_of(&clone, "feature").as_deref(), Some("origin/feature"));
+
+        // A branch only here gets no upstream.
+        checkout_branch(&clone, "local-only").unwrap();
+        assert_eq!(upstream_of(&clone, "local-only"), None);
+    }
+
+    #[test]
+    fn an_existing_branch_is_linked_to_origin_of_the_same_name() {
+        let (clone, _) = clone_with_remote_feature();
+        git_in(&clone, &["branch", "--no-track", "feature", "main"]);
+        assert_eq!(upstream_of(&clone, "feature"), None);
+        checkout_branch(&clone, "feature").unwrap();
+        assert_eq!(upstream_of(&clone, "feature").as_deref(), Some("origin/feature"));
+
+        // Already on it, still unlinked: linked, and nothing else changes.
+        git_in(&clone, &["branch", "--unset-upstream", "feature"]);
+        let head = run_git(&clone, &["rev-parse", "HEAD"]).unwrap();
+        checkout_branch(&clone, "feature").unwrap();
+        assert_eq!(upstream_of(&clone, "feature").as_deref(), Some("origin/feature"));
+        assert_eq!(run_git(&clone, &["rev-parse", "HEAD"]).unwrap(), head);
+    }
+
+    #[test]
+    fn a_new_git_worktree_of_a_branch_on_origin_tracks_it() {
+        let (clone, tip) = clone_with_remote_feature();
+        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let dest = worktree_dest_for(&data_root, &clone, "feature").unwrap();
+        let path = git_worktree_add(&clone, &dest, "feature").unwrap();
+        assert_eq!(run_git(&path, &["rev-parse", "HEAD"]).unwrap(), tip);
+        assert_eq!(upstream_of(&path, "feature").as_deref(), Some("origin/feature"));
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    #[test]
+    fn a_submodule_branch_on_origin_is_linked_and_never_pruned() {
+        // The submodules' origin has a `feature` branch.
+        let top = repo_with_submodules();
+        // Its own `feature` predates the submodules.
+        git_in(&top, &["branch", "-q", "-D", "feature"]);
+        git_in(&top, &["switch", "-q", "-c", "feature"]);
+        assert!(branch_submodules(&top, "feature").unwrap().is_empty());
+        let a = top.join("a");
+        assert_eq!(current_branch(&a).as_deref(), Some("feature"));
+        assert_eq!(upstream_of(&a, "feature").as_deref(), Some("origin/feature"));
+        prune_submodule_branches(&top, "feature").unwrap();
+        assert_eq!(current_branch(&a).as_deref(), Some("feature"));
     }
 
     #[test]
