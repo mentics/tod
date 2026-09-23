@@ -439,6 +439,8 @@ fn capture_outline_inverse(conn: &Connection, m: &OutlineMutation) -> Result<Opt
         | OutlineMutation::ClearStaleCopyLinks { .. }
         | OutlineMutation::RefreshLinkedCopy { .. }
         | OutlineMutation::PasteManagedNodeCopy { .. }
+        | OutlineMutation::SetGeneratorAcceptConfig { .. }
+        | OutlineMutation::AcceptGeneratedTicket { .. }
         | OutlineMutation::SetRefreshStatus { .. } => Ok(None),
     }
 }

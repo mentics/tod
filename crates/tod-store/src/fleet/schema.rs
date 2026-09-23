@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 57;
+pub const CURRENT_USER_VERSION: i32 = 58;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -369,6 +369,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v56_to_v57(conn)?;
         conn.pragma_update(None, "user_version", 57)?;
     }
+    if version < 58 {
+        migrate_v57_to_v58(conn)?;
+        conn.pragma_update(None, "user_version", 58)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -681,6 +685,27 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Quick-accept for generator ticket nodes: the destination node accepted
+/// copies are created under, and the capabilities to auto-enable on them.
+/// Both start unset — accept is inert until the user configures a
+/// destination.
+fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        ("accept_destination_node_id", "BLOB"),
+        ("accept_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+    ] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('node_generator_config') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE node_generator_config ADD COLUMN {column} {ddl};"
+            ))?;
+        }
+    }
     Ok(())
 }
 
