@@ -555,8 +555,9 @@ fn check_repo_in_container(container: &str, repo: Option<&str>) -> Result<String
             exec.name
         ));
     };
+    let [config, safe] = tod_store::fleet::workdir::CONTAINER_GIT_CONFIG;
     let out = exec
-        .output("/", "git", &["-C", repo, "rev-parse", "--show-toplevel"])
+        .output("/", "git", &[config, safe, "-C", repo, "rev-parse", "--show-toplevel"])
         .map_err(|err| format!("{err:#}"))?;
     if !out.status.success() {
         return Err(format!(
