@@ -244,39 +244,38 @@ impl<'a> ConversationRepo<'a> {
 
     pub fn turns(&self, conversation_id: Uuid) -> Result<Vec<Turn>> {
         let mut stmt = self.conn.prepare(
-            "SELECT seq, role, body, parts, created_at FROM conversation_turns
+            "SELECT seq, role, body, parts, sent_context, created_at FROM conversation_turns
              WHERE conversation_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt
-            .query_map(params![uuid_to_blob(conversation_id)], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })?
+            .query_map(params![uuid_to_blob(conversation_id)], read_turn_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(seq, role, body, parts, created_at)| {
-                // Parts are for display; a row that does not parse shows its body.
-                let parts = parts
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or_default();
-                Ok(Turn {
-                    seq,
-                    role: TurnRole::parse(&role)?,
-                    body,
-                    parts,
-                    created_at,
-                })
-            })
-            .collect()
+        rows.into_iter().map(parse_turn_row).collect()
+    }
+
+    /// Turns in `[from_seq, to_seq]`, inclusive — the range a bundle exporter
+    /// resolves a turn-range reference against.
+    pub fn turns_range(
+        &self,
+        conversation_id: Uuid,
+        from_seq: i64,
+        to_seq: i64,
+    ) -> Result<Vec<Turn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, role, body, parts, sent_context, created_at FROM conversation_turns
+             WHERE conversation_id = ?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![uuid_to_blob(conversation_id), from_seq, to_seq],
+                read_turn_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(parse_turn_row).collect()
     }
 
     pub fn append_turn(&self, conversation_id: Uuid, role: TurnRole, body: &str) -> Result<Turn> {
-        self.append_turn_with_parts(conversation_id, role, body, &[])
+        self.append_turn_with_parts_and_context(conversation_id, role, body, &[], None)
     }
 
     /// [`Self::append_turn`] for an agent reply that came with its parts.
@@ -287,6 +286,21 @@ impl<'a> ConversationRepo<'a> {
         body: &str,
         parts: &[ReplyPart],
     ) -> Result<Turn> {
+        self.append_turn_with_parts_and_context(conversation_id, role, body, parts, None)
+    }
+
+    /// [`Self::append_turn_with_parts`], also recording the part of what was
+    /// sent to the agent that is not the user's own text (the protocol delta
+    /// prepended to a user turn). `None` for a continuation turn, whose body
+    /// already equals what was sent, and for every non-user turn.
+    pub fn append_turn_with_parts_and_context(
+        &self,
+        conversation_id: Uuid,
+        role: TurnRole,
+        body: &str,
+        parts: &[ReplyPart],
+        sent_context: Option<&str>,
+    ) -> Result<Turn> {
         let now = now_ms();
         let seq: i64 = self.conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM conversation_turns WHERE conversation_id = ?1",
@@ -294,8 +308,9 @@ impl<'a> ConversationRepo<'a> {
             |row| row.get(0),
         )?;
         self.conn.execute(
-            "INSERT INTO conversation_turns (id, conversation_id, seq, role, body, parts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO conversation_turns
+                (id, conversation_id, seq, role, body, parts, sent_context, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 uuid_to_blob(Uuid::new_v4()),
                 uuid_to_blob(conversation_id),
@@ -305,6 +320,7 @@ impl<'a> ConversationRepo<'a> {
                 (!parts.is_empty())
                     .then(|| serde_json::to_string(parts))
                     .transpose()?,
+                sent_context,
                 now
             ],
         )?;
@@ -314,6 +330,7 @@ impl<'a> ConversationRepo<'a> {
             role,
             body: body.to_string(),
             parts: parts.to_vec(),
+            sent_context: sent_context.map(str::to_string),
             created_at: now,
         })
     }
@@ -461,6 +478,35 @@ impl<'a> ConversationRepo<'a> {
             .map(|(entity, id, reason)| Ok(((Entity::parse(&entity)?, id), reason)))
             .collect()
     }
+}
+
+type RawTurnRow = (i64, String, String, Option<String>, Option<String>, i64);
+
+fn read_turn_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawTurnRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<String>>(3)?,
+        row.get::<_, Option<String>>(4)?,
+        row.get::<_, i64>(5)?,
+    ))
+}
+
+fn parse_turn_row(row: RawTurnRow) -> Result<Turn> {
+    let (seq, role, body, parts, sent_context, created_at) = row;
+    // Parts are for display; a row that does not parse shows its body.
+    let parts = parts
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    Ok(Turn {
+        seq,
+        role: TurnRole::parse(&role)?,
+        body,
+        parts,
+        sent_context,
+        created_at,
+    })
 }
 
 /// `focus_node_id` is stored only for items that live on a node.

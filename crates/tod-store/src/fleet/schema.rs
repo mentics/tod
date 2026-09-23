@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 57;
+pub const CURRENT_USER_VERSION: i32 = 58;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -369,6 +369,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v56_to_v57(conn)?;
         conn.pragma_update(None, "user_version", 57)?;
     }
+    if version < 58 {
+        migrate_v57_to_v58(conn)?;
+        conn.pragma_update(None, "user_version", 58)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -685,6 +689,20 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
 }
 
 /// The Files capability can run a node's launches in a dev container.
+/// `conversation_turns.sent_context`: the part of what was sent to the agent
+/// on a user turn that is not the user's own text (the protocol delta
+/// prepended to it). Continuation turns leave this null: their body already
+/// equals what was sent. See `doc/journeys/spec.md` §3.2.
+fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'sent_context'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
+    }
+    Ok(())
+}
+
 fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         ("dev_container", "INTEGER NOT NULL DEFAULT 0"),
@@ -1207,6 +1225,7 @@ fn migrate_v35_to_v36(conn: &Connection) -> Result<()> {
             seq             INTEGER NOT NULL,
             role            TEXT NOT NULL CHECK (role IN ('user','agent','error','rotation')),
             body            TEXT NOT NULL DEFAULT '',
+            sent_context    TEXT,
             created_at      INTEGER NOT NULL,
             UNIQUE (conversation_id, seq)
         );

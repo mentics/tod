@@ -163,6 +163,11 @@ pub enum InterviewCommand {
         /// An agent reply's streamed parts, when the provider reported them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         parts: Vec<crate::conversation::ReplyPart>,
+        /// The part of what was sent to the agent that is not the user's own
+        /// text (the protocol delta prepended to a user turn). `None` for a
+        /// continuation turn, and for every non-user turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sent_context: Option<String>,
     },
     /// Close the turns left waiting on an agent when the app last stopped
     /// (at startup, before any turn is in flight); returns their
@@ -798,12 +803,19 @@ pub fn execute(
             role,
             body,
             parts,
+            sent_context,
         } => {
             let repo = crate::conversation::ConversationRepo::new(conn);
             if repo.get(*conversation_id)?.is_none() {
                 bail!("conversation {conversation_id} not found");
             }
-            let turn = repo.append_turn_with_parts(*conversation_id, *role, body, parts)?;
+            let turn = repo.append_turn_with_parts_and_context(
+                *conversation_id,
+                *role,
+                body,
+                parts,
+                sent_context.as_deref(),
+            )?;
             Ok(json!({ "seq": turn.seq }))
         }
         InterviewCommand::CloseInterruptedConversationTurns { body } => {

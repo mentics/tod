@@ -467,6 +467,11 @@ pub struct Turn {
     /// An agent turn as the agent streamed it: narration, thoughts, tool
     /// calls, and the answer. Empty when the provider reported none.
     pub parts: Vec<ReplyPart>,
+    /// For a user turn: the part of what was sent to the agent that is not
+    /// the user's own text (the protocol delta prepended to it). `None` for
+    /// a continuation turn (its body already equals what was sent) and for
+    /// every non-user turn.
+    pub sent_context: Option<String>,
     pub created_at: i64,
 }
 

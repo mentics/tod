@@ -410,6 +410,71 @@ fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
 }
 
 #[test]
+fn a_send_with_a_delta_stores_it_as_sent_context_on_the_user_turn() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
+    say(
+        &mut driver,
+        &fx,
+        &mut agent,
+        &format!("add obligation {}: Sessions expire.", slug(&fx)),
+    );
+    let id = driver.conversation_id().unwrap();
+
+    // The first (opening) turn carries no delta: nothing came before it.
+    let first = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).turns(id))
+        .unwrap()
+        .into_iter()
+        .find(|t| t.role == TurnRole::User)
+        .unwrap();
+    assert_eq!(first.sent_context, None);
+
+    let change = fx
+        .fleet
+        .read(|conn| net_changes(conn, id))
+        .unwrap()
+        .remove(0);
+    let outcome: ReverseOutcome =
+        serde_json::from_value(fx.user(InterviewCommand::ReverseConversationActions {
+            conversation_id: id,
+            action_ids: change.action_ids.clone(),
+            include_dependents: false,
+            force: false,
+        }))
+        .unwrap();
+    assert!(
+        matches!(outcome, ReverseOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+
+    say(&mut driver, &fx, &mut agent, "ask Why did that go?");
+    let sent = agent.last().message.clone();
+    // What the mock actually received is the delta plus the message, joined
+    // as `driver::join` does.
+    let (delta, _) = sent.split_once("\n\n# Message\n\n").unwrap();
+
+    let stored = fx
+        .fleet
+        .read(|conn| ConversationRepo::new(conn).turns(id))
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.role == TurnRole::User)
+        .next_back()
+        .unwrap();
+    assert_eq!(stored.body, "ask Why did that go?");
+    // `join` trims trailing whitespace off the delta before appending the
+    // message; the stored context is the untrimmed delta.
+    assert_eq!(stored.sent_context.as_deref().map(str::trim_end), Some(delta));
+}
+
+#[test]
 fn a_session_over_budget_rotates_to_a_snapshot() {
     let fx = fixture();
     let mut agent = FakeAgent::new(&fx.fleet);

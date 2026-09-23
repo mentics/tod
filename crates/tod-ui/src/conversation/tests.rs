@@ -528,6 +528,7 @@ fn append_turn(
                 role,
                 body: body.into(),
                 parts,
+                sent_context: None,
             },
         )
         .unwrap();

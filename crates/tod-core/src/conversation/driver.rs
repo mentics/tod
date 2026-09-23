@@ -253,7 +253,15 @@ impl ConversationDriver {
             }
             None => String::new(),
         };
-        let user_seq = self.append(fleet, id, TurnRole::User, text)?;
+        let sent_context = (!changes.is_empty()).then(|| changes.clone());
+        let user_seq = self.append_with_parts_and_context(
+            fleet,
+            id,
+            TurnRole::User,
+            text,
+            Vec::new(),
+            sent_context,
+        )?;
         // A user message ends whatever loop the previous one started.
         self.continuations = 0;
 
@@ -531,6 +539,19 @@ impl ConversationDriver {
         body: &str,
         parts: Vec<ReplyPart>,
     ) -> Result<i64> {
+        self.append_with_parts_and_context(fleet, id, role, body, parts, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_with_parts_and_context(
+        &self,
+        fleet: &FleetStore,
+        id: Uuid,
+        role: TurnRole,
+        body: &str,
+        parts: Vec<ReplyPart>,
+        sent_context: Option<String>,
+    ) -> Result<i64> {
         let value = fleet.interview(
             ACTOR_USER,
             InterviewCommand::AppendConversationTurn {
@@ -538,6 +559,7 @@ impl ConversationDriver {
                 role,
                 body: body.to_string(),
                 parts,
+                sent_context,
             },
         )?;
         value["seq"].as_i64().context("turn seq missing")

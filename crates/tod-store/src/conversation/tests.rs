@@ -1584,6 +1584,36 @@ fn conversations_are_listed_per_focus_and_keep_their_turns() {
 }
 
 #[test]
+fn turns_range_returns_the_inclusive_seq_range() {
+    let fx = setup();
+    let repo = ConversationRepo::new(&fx.conn);
+    // `setup` already appended seq 1.
+    repo.append_turn(fx.conv, TurnRole::Agent, "reply 1").unwrap();
+    repo.append_turn_with_parts_and_context(
+        fx.conv,
+        TurnRole::User,
+        "turn 3",
+        &[],
+        Some("delta before turn 3"),
+    )
+    .unwrap();
+    repo.append_turn(fx.conv, TurnRole::Agent, "reply 3").unwrap();
+    repo.append_turn(fx.conv, TurnRole::User, "turn 5").unwrap();
+
+    let range = repo.turns_range(fx.conv, 2, 4).unwrap();
+    assert_eq!(
+        range.iter().map(|t| t.seq).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    let turn3 = range.iter().find(|t| t.seq == 3).unwrap();
+    assert_eq!(turn3.sent_context.as_deref(), Some("delta before turn 3"));
+    assert_eq!(range[0].sent_context, None);
+
+    // Out-of-range bounds are simply empty, not an error.
+    assert!(repo.turns_range(fx.conv, 100, 200).unwrap().is_empty());
+}
+
+#[test]
 fn the_v33_to_v34_migration_runs_twice_cleanly() {
     let dir = std::env::temp_dir().join(format!("tod-conversation-mig-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
