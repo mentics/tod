@@ -17,4 +17,5 @@ pub mod status;
 pub mod status_filter;
 pub mod style;
 pub mod toast;
+pub mod token_usage;
 pub mod transcript_list;

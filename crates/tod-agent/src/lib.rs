@@ -18,6 +18,7 @@ mod reply;
 mod routing;
 pub mod run_state;
 mod transcript;
+mod usage;
 pub mod util;
 
 pub use agent_launch::{AgentLaunchOptions, effort_for_acp};
@@ -47,6 +48,7 @@ pub use transcript::{
     FormatProblem, Transcript, TranscriptRead, TranscriptTurn, read_transcript,
     transcript_fingerprint,
 };
+pub use usage::{Cost, TokenCounts, TokenUsage};
 
 use std::sync::{Arc, Mutex};
 

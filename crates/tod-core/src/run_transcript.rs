@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tod_agent::{
-    AgentPlatform, FormatProblem, Transcript, TranscriptRead, read_transcript,
+    AgentPlatform, FormatProblem, TokenUsage, Transcript, TranscriptRead, read_transcript,
     transcript_fingerprint,
 };
 use tod_store::fleet::{AgentRun, AgentSession, FleetMutation, FleetStore};
@@ -59,11 +59,12 @@ pub fn needs_capture(run: &AgentRun) -> bool {
     let Some(platform) = platform(run) else {
         return false;
     };
-    if stored(run).is_none() {
+    let Some(stored) = stored(run) else {
         return true;
-    }
-    transcript_fingerprint(platform, session_id)
-        .is_some_and(|now| run.transcript_fingerprint.as_deref() != Some(now.as_str()))
+    };
+    transcript_fingerprint(platform, session_id).is_some_and(|now| {
+        !stored.usage_read || run.transcript_fingerprint.as_deref() != Some(now.as_str())
+    })
 }
 
 /// The platform `run` was started on, when it recorded one.
@@ -117,14 +118,43 @@ pub fn session_needs_capture(session: &AgentSession) -> bool {
         .cached_transcript
         .as_deref()
         .and_then(Transcript::from_stored);
-    if stored.is_none() {
+    let Some(stored) = stored else {
         return true;
-    }
+    };
+    // One stored before usage was is read again while the platform still
+    // has the record to read it from.
     session_platforms(session).into_iter().any(|platform| {
         transcript_fingerprint(platform, &session.agent_session_id).is_some_and(|now| {
-            session.transcript_fingerprint.as_deref() != Some(now.as_str())
+            !stored.usage_read || session.transcript_fingerprint.as_deref() != Some(now.as_str())
         })
     })
+}
+
+/// What every agent session filed under `session_key` spent, as each
+/// platform's record says, oldest first: a conversation that rotated has
+/// several. `None` when no record says anything of usage. Reads the
+/// platforms' files and stores nothing, so run it off the UI thread.
+pub fn usage_for_key(fleet: &FleetStore, session_key: &str) -> Option<TokenUsage> {
+    let mut sessions: Vec<AgentSession> = fleet
+        .list_agent_sessions_without_transcripts()
+        .ok()?
+        .into_iter()
+        .filter(|session| session.session_key.as_deref() == Some(session_key))
+        .collect();
+    sessions.sort_by_key(|session| session.started_at);
+    let mut total: Option<TokenUsage> = None;
+    for session in &sessions {
+        let usage = session_platforms(session).into_iter().find_map(|platform| {
+            read_transcript(platform, &session.agent_session_id)
+                .ok()
+                .flatten()
+                .and_then(|read| read.transcript.usage)
+        });
+        if let Some(usage) = usage {
+            total.get_or_insert_with(TokenUsage::default).add(&usage);
+        }
+    }
+    total
 }
 
 /// Read `session`'s transcript from its platform's record and keep it.

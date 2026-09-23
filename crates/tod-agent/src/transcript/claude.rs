@@ -4,6 +4,7 @@
 //! file snapshots, attachments, modes) is bookkeeping and skipped, as are
 //! subagents' records and the ones Claude Code writes on the user's behalf.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -12,6 +13,10 @@ use serde_json::Value;
 
 use super::{Problems, a, Transcript, TranscriptRead, tool_title};
 use crate::run_state::find_claude_session_log;
+use crate::usage::{
+    ClaudeCostState, TokenCounts, TokenUsage, anthropic_counts, apply_cost_states,
+    claude_cost_state,
+};
 
 /// Record types that carry no part of the conversation.
 const BOOKKEEPING: &[&str] = &[
@@ -38,11 +43,38 @@ pub(super) fn read(config_dir: &Path, session_id: &str) -> anyhow::Result<Option
     let Some(path) = find_claude_session_log(config_dir, session_id) else {
         return Ok(None);
     };
-    let file =
-        std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = BufReader::new(file);
     let mut transcript = Transcript::default();
     let mut problems = Problems::default();
+    let mut tally = Tally::default();
+    for_each_record(&path, &mut problems, |record, problems| {
+        tally.note(record, false);
+        push_record(&mut transcript, problems, record);
+    })?;
+    // Subagents keep logs of their own beside the session's.
+    let subagents = path.with_extension("").join("subagents");
+    if let Ok(entries) = std::fs::read_dir(&subagents) {
+        for entry in entries.flatten() {
+            let log = entry.path();
+            if log.extension().is_some_and(|ext| ext == "jsonl") {
+                for_each_record(&log, &mut problems, |record, _| tally.note(record, true))?;
+            }
+        }
+    }
+    transcript.set_usage(tally.into_usage());
+    Ok(Some(TranscriptRead {
+        transcript,
+        problems: problems.into_vec(),
+    }))
+}
+
+/// Call `each` with every record in the log at `path`.
+fn for_each_record(
+    path: &Path,
+    problems: &mut Problems,
+    mut each: impl FnMut(&Value, &mut Problems),
+) -> anyhow::Result<()> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -58,16 +90,87 @@ pub(super) fn read(config_dir: &Path, session_id: &str) -> anyhow::Result<Option
             continue;
         }
         match serde_json::from_str::<Value>(&text) {
-            Ok(record) => push_record(&mut transcript, &mut problems, &record),
+            Ok(record) => each(&record, problems),
             // A last line without its newline is still being written.
             Err(_) if !complete => {}
             Err(_) => problems.note("a line that is not JSON"),
         }
     }
-    Ok(Some(TranscriptRead {
-        transcript,
-        problems: problems.into_vec(),
-    }))
+    Ok(())
+}
+
+/// The usage a log's records carry. Claude Code writes an API response as
+/// a record per content block, each carrying the response's usage, so a
+/// response is counted once, by its message id, as its latest record says.
+#[derive(Default)]
+struct Tally {
+    /// Message id → (model, counts, from a subagent), in first-seen order.
+    responses: Vec<(String, String, TokenCounts, bool)>,
+    index: HashMap<String, usize>,
+    /// The latest main-chain response's whole prompt.
+    context_tokens: Option<u64>,
+    cost_states: Vec<ClaudeCostState>,
+}
+
+impl Tally {
+    fn note(&mut self, record: &Value, subagent_log: bool) {
+        match record.get("type").and_then(Value::as_str) {
+            Some("assistant") => {}
+            Some("cost-state") if !subagent_log => {
+                self.cost_states.push(claude_cost_state(record));
+                return;
+            }
+            _ => return,
+        }
+        let (Some(usage), Some(id)) = (
+            record.pointer("/message/usage"),
+            record.pointer("/message/id").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let model = record
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        // Claude Code's own stand-in replies (an API error, an interrupt)
+        // never reached a model.
+        if model == "<synthetic>" {
+            return;
+        }
+        let sidechain = subagent_log
+            || record
+                .get("isSidechain")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        let counts = anthropic_counts(usage);
+        if !sidechain {
+            self.context_tokens = Some(counts.prompt());
+        }
+        let response = (id.to_string(), model.to_string(), counts, sidechain);
+        match self.index.get(id) {
+            Some(&at) => self.responses[at] = response,
+            None => {
+                self.index.insert(id.to_string(), self.responses.len());
+                self.responses.push(response);
+            }
+        }
+    }
+
+    fn into_usage(self) -> TokenUsage {
+        let mut usage = TokenUsage {
+            context_tokens: self.context_tokens,
+            ..TokenUsage::default()
+        };
+        for (_, model, counts, sidechain) in &self.responses {
+            usage.total.add(counts);
+            usage.by_model.entry(model.clone()).or_default().add(counts);
+            if *sidechain {
+                usage.subagents.add(counts);
+            }
+        }
+        apply_cost_states(&mut usage, self.cost_states);
+        usage
+    }
 }
 
 fn push_record(transcript: &mut Transcript, problems: &mut Problems, record: &Value) {
@@ -240,6 +343,59 @@ mod tests {
         );
         assert_eq!(read.transcript.turns.len(), 3, "the rest still reads");
         assert_eq!(read.transcript.turns[1].text(), "Hello.");
+    }
+
+    #[test]
+    fn usage_counts_each_response_once_with_its_subagents() {
+        let dir = std::env::temp_dir().join(format!("tod-claude-transcript-{}", uuid::Uuid::new_v4()));
+        let project = dir.join("projects").join("C--work-repo");
+        std::fs::create_dir_all(project.join("s1").join("subagents")).unwrap();
+        let usage = |input, output, read, write| {
+            format!(
+                r#"{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":{read},"cache_creation_input_tokens":{write},"cache_creation":{{"ephemeral_1h_input_tokens":{write}}},"output_tokens_details":{{"thinking_tokens":1}},"server_tool_use":{{"web_search_requests":1}}}}"#
+            )
+        };
+        let assistant = |id: &str, model: &str, usage: &str, block: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","model":"{model}","role":"assistant","usage":{usage},"content":[{block}]}}}}"#
+            )
+        };
+        let text = r#"{"type":"text","text":"x"}"#;
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"Hi."}}"#.to_string(),
+            // One response, written as a record per block.
+            assistant("m1", "opus", &usage(2, 5, 100, 10), r#"{"type":"thinking","thinking":"t"}"#),
+            assistant("m1", "opus", &usage(2, 9, 100, 10), text),
+            assistant("m2", "haiku", &usage(3, 4, 200, 0), text),
+            assistant("m3", "<synthetic>", &usage(0, 0, 0, 0), text),
+            r#"{"type":"cost-state","startTime":1,"totalCostUSD":0.5,"totalAPIDuration":900}"#
+                .to_string(),
+        ];
+        std::fs::write(project.join("s1.jsonl"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(
+            project.join("s1").join("subagents").join("agent-a.jsonl"),
+            assistant("m4", "haiku", &usage(1, 1, 0, 0), text) + "\n",
+        )
+        .unwrap();
+
+        let read = read(&dir, "s1").unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read.problems, vec![]);
+        let usage = read.transcript.usage.unwrap();
+        assert_eq!(usage.total.requests, 3);
+        assert_eq!(usage.total.input, 2 + 3 + 1);
+        assert_eq!(usage.total.output, 9 + 4 + 1);
+        assert_eq!(usage.total.cache_read, 300);
+        assert_eq!(usage.total.cache_write, 10);
+        assert_eq!(usage.total.cache_write_1h, 10);
+        assert_eq!(usage.total.thinking, 3);
+        assert_eq!(usage.total.web_searches, 3);
+        assert_eq!(usage.by_model["opus"].output, 9);
+        assert_eq!(usage.by_model["haiku"].requests, 2);
+        assert_eq!(usage.subagents.requests, 1);
+        assert_eq!(usage.context_tokens, Some(3 + 200));
+        assert_eq!(usage.cost.as_ref().map(crate::Cost::amount), Some(0.5));
+        assert_eq!(usage.api_duration_ms, Some(900));
     }
 
     #[test]
