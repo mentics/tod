@@ -9,7 +9,7 @@ pub mod changes;
 pub mod recorder;
 pub mod snapshot;
 
-pub use recorder::{Recorder, install, record};
+pub use recorder::{Recorder, install, record, record_and_get_seq};
 pub use snapshot::{ResolvedAgentSettings, SettingsSnapshot, settings_snapshot};
 
 use std::path::PathBuf;

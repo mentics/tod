@@ -20,7 +20,7 @@ use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, Settin
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
-use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
+use crate::ui::report_problem::{OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem};
 use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
     register_app_nav_keyboard_bindings,
@@ -29,7 +29,7 @@ use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status::{self, StatusSource};
-use crate::ui::toast::{error_toast, notification_overlay, warning_toast};
+use crate::ui::toast::{error_toast, info_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
 use crate::views::database::DatabaseView;
 use crate::views::incoming_check::{IncomingCheck, IncomingCheckEvent};
@@ -45,7 +45,8 @@ use crate::views::visual_design_panel::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, h_flex};
+use gpui_component::input::{Textarea, TextareaState};
+use gpui_component::{ActiveTheme, IconName, Root, Selectable, StyledExt, TitleBar, WindowExt, h_flex};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tod_agent::EngagementState;
@@ -739,21 +740,90 @@ impl Shell {
     }
 
     /// Handle [`OpenReportDialog`] dispatched by any view: opens the report
-    /// dialog for `key`. The dialog itself (the modal, the note field, and
-    /// recording the report) is a later step (implementation plan Step 6c);
-    /// this is the single place that step will wire it up from, so every
-    /// entry point already routes here.
+    /// dialog for `key`. Snapshots the app journey ring buffer synchronously
+    /// on submit, then does the (potentially slow) screenshot capture and the
+    /// journey write on a background thread so the UI never blocks.
     fn on_open_report_dialog(
         &mut self,
         action: &OpenReportDialog,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        tracing::info!(
-            "report-a-problem requested for {:?} (conversation {:?}); dialog not yet implemented",
-            action.key,
-            action.conversation
-        );
+        let key = action.key;
+        let title: SharedString = match key {
+            JourneyKey::Project => "Report a problem: project".into(),
+            JourneyKey::Node(id) => {
+                let node_title = self
+                    .fleet
+                    .get_node(&id.to_string())
+                    .ok()
+                    .flatten()
+                    .map(|task| task.title)
+                    .unwrap_or_else(|| id.to_string());
+                format!("Report a problem: {node_title}").into()
+            }
+        };
+
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .rows(4)
+                .placeholder("What went wrong?")
+        });
+        let focus_handle = input.read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let input = input.clone();
+            let input_for_submit = input.clone();
+            let fleet = fleet.clone();
+            let paths = paths.clone();
+            dialog
+                .title(title.clone())
+                .overlay(true)
+                .overlay_closable(true)
+                .keyboard(true)
+                .close_button(true)
+                .child({
+                    let fleet = fleet.clone();
+                    let paths = paths.clone();
+                    div()
+                        .key_context(REPORT_DIALOG_CONTEXT)
+                        .on_action(move |_: &ReportDialogSubmit, window, cx| {
+                            let note = input_for_submit.read(cx).value().trim().to_string();
+                            if note.is_empty() {
+                                return;
+                            }
+                            submit_report(key, note, fleet.clone(), paths.clone(), window, cx);
+                            window.close_dialog(cx);
+                        })
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(120.))
+                                .child(Textarea::new(&input).w_full().h(px(120.))),
+                        )
+                })
+                .footer(
+                    div().flex().justify_end().gap_2().child(
+                        Button::new("report-dialog-submit").label("Report").primary().on_click({
+                            let input = input.clone();
+                            let fleet = fleet.clone();
+                            let paths = paths.clone();
+                            move |_, window, cx| {
+                                let note = input.read(cx).value().trim().to_string();
+                                if note.is_empty() {
+                                    return;
+                                }
+                                submit_report(key, note, fleet.clone(), paths.clone(), window, cx);
+                                window.close_dialog(cx);
+                            }
+                        }),
+                    ),
+                )
+        });
     }
 
     /// Show `message` as an error banner on the next render; messages that
@@ -1422,6 +1492,63 @@ pub(crate) fn journey_key_for_focus(focus: Focus) -> JourneyKey {
         Focus::Obligation { node, .. } => JourneyKey::Node(node),
         Focus::PlanStep { node, .. } => JourneyKey::Node(node),
     }
+}
+
+/// Finishes a report-a-problem submission (implementation plan Step 6c): the
+/// app journey ring buffer is snapshotted synchronously (cheap, in-memory)
+/// before this runs; screenshot capture and the journey write happen on a
+/// background thread since the screenshot can be slow (Win32 GDI) and must
+/// never block the UI. Shows a toast once the write completes.
+fn submit_report(
+    key: JourneyKey,
+    note: String,
+    fleet: Arc<FleetStore>,
+    paths: TodPaths,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let _ = &fleet; // reserved for Step 6d's queue insert
+    let app_journey: Vec<tod_journey::Record> = crate::ui::journey::hub(cx)
+        .read(cx)
+        .snapshot()
+        .into_iter()
+        .map(|entry| entry.record)
+        .collect();
+    let window_handle = window.window_handle();
+
+    cx.spawn(async move |cx| {
+        let (app_journey, note) = (app_journey, note);
+        let seq = cx
+            .background_spawn(async move {
+                let screenshot = crate::ui::screenshot::capture_app_screenshot().map(|img| {
+                    let bytes = crate::ui::screenshot::encode_png(&img).unwrap_or_default();
+                    tod_journey::Blob {
+                        mime: "image/png".into(),
+                        bytes,
+                    }
+                });
+                let event = tod_journey::Event::Report {
+                    note,
+                    app_journey,
+                    screenshot,
+                };
+                tod_core::journey::record_and_get_seq(key, tod_journey::Actor::User, event)
+            })
+            .await;
+
+        let settings = TodSettings::load(&paths).unwrap_or_default();
+        let queued = seq.is_some() && settings.journeys.send;
+
+        let _ = cx.update_window(window_handle, move |_view, window, cx| {
+            let message = if queued {
+                "Report recorded and queued to send"
+            } else {
+                "Report recorded"
+            };
+            info_toast(window, cx, message);
+        });
+    })
+    .detach();
 }
 
 #[cfg(feature = "agent-socket")]

@@ -25,6 +25,7 @@ enum Msg {
         key: JourneyKey,
         actor: Actor,
         event: Event,
+        reply: Option<mpsc::Sender<u64>>,
     },
     Compact {
         key: JourneyKey,
@@ -56,11 +57,42 @@ pub fn record(key: JourneyKey, actor: Actor, event: Event) {
     }
 }
 
+/// Same as [`record`], but returns the seq the writer thread assigned to the
+/// event (blocking the calling thread until the writer replies). `None` when
+/// no recorder is installed, or the writer thread could not append it.
+pub fn record_and_get_seq(key: JourneyKey, actor: Actor, event: Event) -> Option<u64> {
+    RECORDER.get()?.record_and_get_seq(key, actor, event)
+}
+
 impl Recorder {
     /// Same as the free function [`record`], for callers that already hold
     /// a handle (e.g. the change-feed thread).
     pub fn record(&self, key: JourneyKey, actor: Actor, event: Event) {
-        let _ = self.tx.send(Msg::Append { key, actor, event });
+        let _ = self.tx.send(Msg::Append {
+            key,
+            actor,
+            event,
+            reply: None,
+        });
+    }
+
+    /// Same as [`Self::record`], but blocks (on the caller's own thread —
+    /// never the UI thread) until the writer thread has appended the event
+    /// and replies with the seq it was assigned. Used by callers that must
+    /// reference the just-recorded event afterward (e.g. queuing a
+    /// submission for a just-recorded report). Returns `None` if the writer
+    /// thread is gone or the record could not be opened.
+    pub fn record_and_get_seq(&self, key: JourneyKey, actor: Actor, event: Event) -> Option<u64> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Msg::Append {
+                key,
+                actor,
+                event,
+                reply: Some(reply_tx),
+            })
+            .ok()?;
+        reply_rx.recv().ok()
     }
 
     /// Asks the writer thread to compact `key`'s journey (tail -> `.zst`)
@@ -87,10 +119,13 @@ pub fn spawn(journeys_dir: PathBuf, storage_cap_mb: u64) -> Recorder {
 
             loop {
                 match rx.recv_timeout(IDLE_CHECK) {
-                    Ok(Msg::Append { key, actor, event }) => {
+                    Ok(Msg::Append { key, actor, event, reply }) => {
                         if let Some((writer, last_used)) = open_writer(&journeys_dir, &mut writers, key) {
-                            writer.append(actor, event);
+                            let seq = writer.append(actor, event);
                             *last_used = Instant::now();
+                            if let Some(reply) = reply {
+                                let _ = reply.send(seq);
+                            }
                         }
                     }
                     Ok(Msg::Compact { key }) => {
@@ -188,6 +223,55 @@ mod tests {
         // this binary already installed one, this still must not panic or
         // block).
         record(
+            JourneyKey::Project,
+            Actor::App,
+            Event::SettingsChanged {
+                key: "x".into(),
+                value: "y".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn record_and_get_seq_returns_the_writer_thread_s_assigned_seq() {
+        let dir = std::env::temp_dir().join(format!("tod-journey-recorder-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorder = spawn(dir.clone(), 100);
+
+        let key = JourneyKey::Node(uuid::Uuid::new_v4());
+        let first = recorder
+            .record_and_get_seq(
+                key,
+                Actor::User,
+                Event::Report {
+                    note: "first".into(),
+                    app_journey: Vec::new(),
+                    screenshot: None,
+                },
+            )
+            .expect("writer thread replied");
+        let second = recorder
+            .record_and_get_seq(
+                key,
+                Actor::User,
+                Event::Report {
+                    note: "second".into(),
+                    app_journey: Vec::new(),
+                    screenshot: None,
+                },
+            )
+            .expect("writer thread replied");
+        assert_eq!(second, first + 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_and_get_seq_with_no_recorder_installed_returns_none() {
+        // Uses the free function, which reads the process-wide `RECORDER`
+        // (possibly installed by another test in this binary) rather than a
+        // standalone handle; either way it must not panic or block.
+        let _ = record_and_get_seq(
             JourneyKey::Project,
             Actor::App,
             Event::SettingsChanged {

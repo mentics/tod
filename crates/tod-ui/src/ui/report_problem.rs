@@ -14,7 +14,13 @@ use gpui::{App, KeyBinding, actions};
 use tod_journey::JourneyKey;
 use uuid::Uuid;
 
+use crate::ui::key_context;
+
 actions!(report_problem, [ReportProblem]);
+
+/// Ctrl+Enter in the report-a-problem dialog's note field.
+pub const REPORT_DIALOG_CONTEXT: &str = "ReportDialog";
+actions!(report_problem, [ReportDialogSubmit]);
 
 /// Open the report-a-problem dialog against `key`. Dispatched by views,
 /// handled by the shell. Never bound to a key directly — `ReportProblem` is.
@@ -45,4 +51,6 @@ impl OpenReportDialog {
 
 pub fn register_report_problem_keyboard_bindings(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("ctrl-shift-r", ReportProblem, None)]);
+    let input = Some(key_context::including_input(REPORT_DIALOG_CONTEXT));
+    cx.bind_keys([KeyBinding::new("ctrl-enter", ReportDialogSubmit, input)]);
 }
