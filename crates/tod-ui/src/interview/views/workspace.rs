@@ -279,7 +279,8 @@ impl WorkspaceView {
                     });
                 }
                 ObligationsEvent::DeleteSelectedTask
-                | ObligationsEvent::OpenVisualDesign { .. } => {}
+                | ObligationsEvent::OpenVisualDesign { .. }
+                | ObligationsEvent::ReportProblem { .. } => {}
             },
         );
 

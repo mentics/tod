@@ -31,6 +31,7 @@ use gpui::{
     ListState, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
     div, list, px,
 };
+use gpui_component::button::ButtonVariants;
 use gpui_component::scroll::Scrollbar;
 use gpui_component::{Icon, Sizable, h_flex, v_flex};
 use gpui_kit_assets::IconName;
@@ -684,6 +685,23 @@ impl TranscriptList {
                             style::text(text).into_any_element()
                         },
                     ));
+                    if entry.kind == EntryKind::Error {
+                        chunk = chunk.child(
+                            gpui_component::button::Button::new((
+                                "transcript-entry-report-problem",
+                                entry_ix,
+                            ))
+                            .label("Report a problem")
+                            .ghost()
+                            .compact()
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(crate::ui::report_problem::ReportProblem),
+                                    cx,
+                                );
+                            }),
+                        );
+                    }
                 }
                 chunk.into_any_element()
             }

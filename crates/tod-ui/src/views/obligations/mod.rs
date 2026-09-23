@@ -6,6 +6,7 @@ pub use rows::DRAG_LIST;
 
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::report_problem::ReportProblem;
 use crate::ui::item_list::keyboard::{
     ItemListActivate, ItemListAddGroup, ItemListCollapse, ItemListCommitEdit, ItemListCreateAbove,
     ItemListCreateBelow, ItemListCreateChild, ItemListDelete, ItemListDown, ItemListEdit,
@@ -126,6 +127,9 @@ pub enum ObligationsEvent {
         /// The specific obligation selected, when one is.
         obligation_id: Option<Uuid>,
     },
+    /// Ctrl+Shift+R — report a problem against the node behind the selected
+    /// obligation.
+    ReportProblem { node_id: Uuid },
     /// Clicked the "Design"/"+ Design" affordance on a design-phase
     /// obligation row — create or open its associated visual-design mockup.
     OpenVisualDesign {
@@ -479,6 +483,13 @@ impl ObligationsView {
             node_id,
             obligation_id: self.selected_obligation_id(),
         });
+    }
+
+    fn report_problem(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.node_id else {
+            return;
+        };
+        cx.emit(ObligationsEvent::ReportProblem { node_id });
     }
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1749,6 +1760,14 @@ impl Render for ObligationsView {
                     return;
                 }
                 this.open_agent_chat(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &ReportProblem, _window, cx| {
+                if this.embedded {
+                    cx.propagate();
+                    return;
+                }
+                this.report_problem(cx);
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(Self::on_search_space))

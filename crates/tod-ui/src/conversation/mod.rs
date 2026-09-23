@@ -57,6 +57,7 @@ pub use keyboard::register_conversation_keyboard_bindings;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
@@ -1633,6 +1634,25 @@ impl ConversationView {
         }
     }
 
+    /// Ctrl+Shift+R inside the view: report a problem against this
+    /// conversation's own focus and conversation id.
+    fn on_report_problem(
+        &mut self,
+        _: &ReportProblem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let key = crate::app::window::journey_key_for_focus(self.focus);
+        window.dispatch_action(
+            Box::new(OpenReportDialog {
+                key,
+                conversation: self.conversation_id,
+            }),
+            cx,
+        );
+    }
+
     /// Nav-mode handlers yield while a text field is being edited.
     fn nav_guard(&self) -> bool {
         !self.text_editing()
@@ -1768,6 +1788,7 @@ impl Render for ConversationView {
             .flex_col()
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::on_report_problem))
             .on_action(
                 cx.listener(|this, _: &ConversationSubmit, window, cx| this.submit(window, cx)),
             )

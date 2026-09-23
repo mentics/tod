@@ -21,6 +21,7 @@ use std::sync::Arc;
 use crate::interview::TodPaths;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
 use crate::ui::key_context;
 use crate::ui::list::{
@@ -1508,6 +1509,21 @@ impl TaskListView {
             });
         cx.stop_propagation();
         window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
+    }
+
+    /// Ctrl+Shift+R: report a problem against the selected node, or the
+    /// whole project when nothing is selected.
+    fn on_report_problem(
+        &mut self,
+        _: &ReportProblem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self
+            .selected_node_id()
+            .map_or(tod_journey::JourneyKey::Project, tod_journey::JourneyKey::Node);
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(OpenReportDialog { key, conversation: None }), cx);
     }
 
     fn selected_task(&self, cx: &Context<Self>) -> Option<TaskItem> {
@@ -3118,6 +3134,7 @@ impl Render for TaskListView {
             .relative()
             .on_action(cx.listener(Self::on_focus_drawer))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))

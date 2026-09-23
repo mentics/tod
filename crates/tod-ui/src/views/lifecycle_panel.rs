@@ -1479,27 +1479,47 @@ impl Render for LifecyclePanelView {
                         cx,
                     ));
                 }
+                let node_id = self.node_id_for_stops();
                 body = body.child(
-                    callout.child(
-                        div()
-                            .w_full()
-                            .rounded_md()
-                            .when(focused, |el| el.border_1().border_color(list_active_border))
-                            .child(
-                                Button::new("lifecycle-panel-move-back")
-                                    .label(format!("Move back to {}", found.target))
-                                    .primary()
-                                    .w_full()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.perform(
-                                            LifecyclePanelStop::MoveBack,
-                                            Source::Click,
-                                            window,
+                    callout
+                        .child(
+                            div()
+                                .w_full()
+                                .rounded_md()
+                                .when(focused, |el| el.border_1().border_color(list_active_border))
+                                .child(
+                                    Button::new("lifecycle-panel-move-back")
+                                        .label(format!("Move back to {}", found.target))
+                                        .primary()
+                                        .w_full()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.perform(
+                                                LifecyclePanelStop::MoveBack,
+                                                Source::Click,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                        )
+                        .when_some(node_id, |el, node_id| {
+                            el.child(
+                                Button::new("lifecycle-panel-regression-report-problem")
+                                    .label("Report a problem")
+                                    .ghost()
+                                    .compact()
+                                    .on_click(move |_, window, cx| {
+                                        window.dispatch_action(
+                                            Box::new(
+                                                crate::ui::report_problem::OpenReportDialog::node(
+                                                    node_id,
+                                                ),
+                                            ),
                                             cx,
                                         );
-                                    })),
-                            ),
-                    ),
+                                    }),
+                            )
+                        }),
                 );
             }
 
@@ -1742,6 +1762,22 @@ impl Render for LifecyclePanelView {
                     window,
                     cx,
                 )));
+                if let Some(node_id) = self.node_id_for_stops() {
+                    body = body.child(
+                        Button::new("lifecycle-panel-gate-error-report-problem")
+                            .label("Report a problem")
+                            .ghost()
+                            .compact()
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(
+                                        crate::ui::report_problem::OpenReportDialog::node(node_id),
+                                    ),
+                                    cx,
+                                );
+                            }),
+                    );
+                }
             }
 
             if !criteria_detail.is_empty() {

@@ -12,6 +12,8 @@ use tod_store::conversation::{ConversationRepo, ProtocolKind, Turn, TurnRole};
 
 /// The transcript header's button that copies the opening context.
 const COPY_CONTEXT: &str = "transcript:copy-context";
+/// The transcript header's button that opens the report-a-problem dialog.
+const REPORT_PROBLEM: &str = "transcript:report-problem";
 
 pub(super) fn entry_of(turn: &Turn) -> Entry {
     // What the app sent on its own, shown as sent.
@@ -79,6 +81,9 @@ impl ConversationView {
             AgentConversationEvent::Stop => self.stop_turn(cx),
             AgentConversationEvent::Action(id, _) if id.as_ref() == COPY_CONTEXT => {
                 self.copy_opening_context(cx)
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == REPORT_PROBLEM => {
+                self.on_report_problem(&crate::ui::report_problem::ReportProblem, window, cx);
             }
             AgentConversationEvent::Action(id, source) => {
                 self.lifecycle_action(id, *source, window, cx)
@@ -182,11 +187,12 @@ impl ConversationView {
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
         let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
-        let header_actions = if self.data.has_opening_context {
+        let mut header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {
             Vec::new()
         };
+        header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);

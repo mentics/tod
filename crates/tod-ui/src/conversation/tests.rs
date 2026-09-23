@@ -303,7 +303,9 @@ fn picker_lists_only_this_focus_and_opens_the_chosen_one(cx: &mut TestAppContext
         assert_eq!(view.picker_label(), "2 of 2");
     });
 
-    // Input -> Picker, open it, move to the older one, open that.
+    // Input -> the transcript header's "Report a problem" action -> Picker,
+    // open it, move to the older one, open that.
+    cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationActivate);
     assert_eq!(view.read_with(cx, |v, _| v.picker), Some(0));
@@ -498,13 +500,15 @@ fn the_input_is_a_tab_stop_only_while_editing(cx: &mut TestAppContext) {
     assert!(!view.read_with(cx, |v, _| v.input_editing));
     assert!(!tab_stop(&view, cx));
 
-    // With no turns, stops run Back, Forward, Picker, then the transcript's
-    // input, and stop at the ends.
+    // With no turns, stops run Back, Forward, Picker, the transcript
+    // header's "Report a problem" action, then the transcript's input, and
+    // stop at the ends.
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     assert_eq!(view.read_with(cx, |v, _| v.stop), Stop::Back);
+    cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
     cx.dispatch_action(ConversationDown);
@@ -620,7 +624,9 @@ fn a_reply_shows_its_answer_with_the_work_collapsed(cx: &mut TestAppContext) {
         view.read_with(cx, |v, cx| v.transcript.read(cx).highlight()),
         PanelStop::Input
     );
-    // Above the first message is the picker, then Forward and Back.
+    // Above the first message is the transcript header's "Report a
+    // problem" action, then the picker, then Forward and Back.
+    cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
     cx.dispatch_action(ConversationUp);
@@ -1906,12 +1912,15 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
     let node = Focus::Node(fixture.node_id);
     let without = create_conversation(&fixture, node);
     let (view, _, cx) = open_view(&fixture, node, cx);
+    // "Report a problem" is always a header action, so its presence isn't a
+    // useful signal; "Copy context" only appears once there's context to
+    // copy, at which point it pushes "Report a problem" out to index 1.
     let header_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
         view.read_with(cx, |view, cx| {
             view.transcript
                 .read(cx)
                 .stops()
-                .contains(&PanelStop::HeaderAction(0))
+                .contains(&PanelStop::HeaderAction(1))
         })
     };
     // Nothing recorded, nothing to copy.

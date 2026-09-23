@@ -20,6 +20,7 @@ use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, Settin
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
     register_app_nav_keyboard_bindings,
@@ -54,6 +55,7 @@ use tod_core::run_transcript;
 use tod_store::agent_traffic::{
     AgentStatusGroups, SharedAgentTrafficLog, format_status_bar, shared_log,
 };
+use tod_journey::JourneyKey;
 use tod_store::conversation::{Focus, ProtocolKind};
 use tod_store::fleet::terminal::{focus_shell_session, open_shell_for_node};
 use tod_store::fleet::{FleetLaunchError, FleetStore, code_editor, open_code_editor_for_node};
@@ -121,6 +123,7 @@ pub struct Shell {
     pending_open_interview_for_task: Option<(String, String)>,
     /// A conversation to open once `window` is available (panel events have none).
     pending_open_conversation: Option<Focus>,
+    pending_report_dialog: Option<JourneyKey>,
     /// A node that just entered a state with on-entry work for its agent.
     pending_on_entry: Option<Uuid>,
     /// The conversation view asked to return to where the user came from.
@@ -642,9 +645,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// [`Self::on_open_report_dialog`] from an event handler, which has no
+    /// `window` and may run while nested entity leases are still on the
+    /// stack.
+    fn queue_open_report_dialog(&mut self, key: JourneyKey, cx: &mut Context<Self>) {
+        self.pending_report_dialog = Some(key);
+        cx.notify();
+    }
+
     fn drain_pending_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(focus) = self.pending_open_conversation.take() {
             self.open_conversation(focus, window, cx);
+        }
+        if let Some(key) = self.pending_report_dialog.take() {
+            self.on_open_report_dialog(
+                &OpenReportDialog { key, conversation: None },
+                window,
+                cx,
+            );
         }
         if let Some(node) = self.pending_on_entry.take() {
             self.open_conversation_with(Focus::Node(node), ProtocolKind::OnEntry, true, window, cx);
@@ -710,6 +728,32 @@ impl Shell {
     ) {
         let focus = fallback_focus(self.task_list.read(cx).selected_node_id());
         self.open_conversation(focus, window, cx);
+    }
+
+    /// Ctrl+Shift+R that no view handled: the task tree's selection, else
+    /// the whole project.
+    fn on_report_problem(&mut self, _: &ReportProblem, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = fallback_focus(self.task_list.read(cx).selected_node_id());
+        let key = journey_key_for_focus(focus);
+        self.on_open_report_dialog(&OpenReportDialog { key, conversation: None }, window, cx);
+    }
+
+    /// Handle [`OpenReportDialog`] dispatched by any view: opens the report
+    /// dialog for `key`. The dialog itself (the modal, the note field, and
+    /// recording the report) is a later step (implementation plan Step 6c);
+    /// this is the single place that step will wire it up from, so every
+    /// entry point already routes here.
+    fn on_open_report_dialog(
+        &mut self,
+        action: &OpenReportDialog,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        tracing::info!(
+            "report-a-problem requested for {:?} (conversation {:?}); dialog not yet implemented",
+            action.key,
+            action.conversation
+        );
     }
 
     /// Show `message` as an error banner on the next render; messages that
@@ -1006,6 +1050,24 @@ impl Shell {
                             &OpenAgentChat,
                             None,
                             cx,
+                        ))
+                        .child(
+                            Button::new("title-report-problem")
+                                .icon(gpui_component::Icon::new(
+                                    gpui_kit_assets::IconName::Flag,
+                                ))
+                                .label("Report a problem")
+                                .ghost()
+                                .compact()
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ReportProblem), cx);
+                                }),
+                        )
+                        .children(render_shortcut_pill_in_context(
+                            window,
+                            &ReportProblem,
+                            None,
+                            cx,
                         )),
                 )
                 .when(always_on_top::is_supported(), |bar| {
@@ -1056,6 +1118,8 @@ impl Render for Shell {
                 this.open_conversation(Focus::Project, window, cx);
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::on_report_problem))
+            .on_action(cx.listener(Self::on_open_report_dialog))
             .on_action(cx.listener(|this, action: &OpenConversation, window, cx| {
                 this.open_conversation_with(
                     action.focus,
@@ -1347,6 +1411,17 @@ fn obligation_focus(node_id: Uuid, obligation_id: Option<Uuid>) -> Focus {
 /// selected node, else the whole project.
 pub(crate) fn fallback_focus(selected_node: Option<Uuid>) -> Focus {
     selected_node.map_or(Focus::Project, Focus::Node)
+}
+
+/// The journey a conversation focus reports against: the node it's about,
+/// or the project journey when there is none.
+pub(crate) fn journey_key_for_focus(focus: Focus) -> JourneyKey {
+    match focus {
+        Focus::Project => JourneyKey::Project,
+        Focus::Node(id) => JourneyKey::Node(id),
+        Focus::Obligation { node, .. } => JourneyKey::Node(node),
+        Focus::PlanStep { node, .. } => JourneyKey::Node(node),
+    }
 }
 
 #[cfg(feature = "agent-socket")]
@@ -1798,6 +1873,12 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
+                                        ObligationsEvent::ReportProblem { node_id } => {
+                                            this.queue_open_report_dialog(
+                                                JourneyKey::Node(*node_id),
+                                                cx,
+                                            );
+                                        }
                                         ObligationsEvent::OpenVisualDesign {
                                             node_id,
                                             obligation_id,
@@ -1986,6 +2067,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 pending_open_interview: None,
                                 pending_open_interview_for_task: None,
                                 pending_open_conversation: None,
+                                pending_report_dialog: None,
                                 pending_on_entry: None,
                                 pending_go_to_tasks: None,
                                 pending_gate_check: None,

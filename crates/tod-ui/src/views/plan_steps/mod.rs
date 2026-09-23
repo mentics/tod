@@ -6,6 +6,7 @@
 mod rows;
 
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::item_list::keyboard::{
     ItemListActivate, ItemListCommitEdit, ItemListCreateAbove, ItemListCreateBelow, ItemListDelete,
     ItemListDown, ItemListEdit, ItemListEnd, ItemListHome, ItemListMoveDown, ItemListMoveUp,
@@ -472,6 +473,26 @@ impl PlanStepsView {
         };
         cx.stop_propagation();
         window.dispatch_action(Box::new(OpenConversation::outline(focus)), cx);
+    }
+
+    /// Ctrl+Shift+R: report a problem against the node behind the selected
+    /// step, or the whole project when there is none. Embedded, the host
+    /// decides.
+    fn on_report_problem(
+        &mut self,
+        _: &ReportProblem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.embedded {
+            cx.propagate();
+            return;
+        }
+        let key = self
+            .node_id
+            .map_or(tod_journey::JourneyKey::Project, tod_journey::JourneyKey::Node);
+        cx.stop_propagation();
+        window.dispatch_action(Box::new(OpenReportDialog { key, conversation: None }), cx);
     }
 
     /// The conversation Ctrl+J opens here: the selected step, or the node
@@ -1053,6 +1074,7 @@ impl Render for PlanStepsView {
                 cx.stop_propagation();
             }))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::on_report_problem))
             .on_action(cx.listener(Self::on_close))
             .on_action(cx.listener(Self::on_enter))
             .on_action(cx.listener(Self::on_create_below))
