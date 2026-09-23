@@ -77,6 +77,17 @@ struct MockSession {
     context_chars: u64,
     /// The latest turn's parts, when the handler gave any.
     reply_parts: Option<Vec<ReplyPart>>,
+    /// What the session "spent", reported the way an ACP agent reports it:
+    /// a token per four characters, the whole context sent each turn.
+    usage: crate::TokenUsage,
+}
+
+impl MockSession {
+    fn count_reply(&mut self, reply: &str) {
+        self.context_chars += reply.len() as u64;
+        self.usage.total.output += reply.len() as u64 / 4;
+        self.usage.context_tokens = Some(self.context_chars / 4);
+    }
 }
 
 impl MockAgentProvider {
@@ -155,6 +166,7 @@ impl MockAgentProvider {
                     self.log_traffic(kind, id, TrafficDirection::Response, &reply.text);
                     if let Some(session) = self.sessions.get_mut(&key) {
                         session.reply_parts = reply.parts;
+                        session.count_reply(&reply.text);
                     }
                     AgentRunState::Success(Some(reply.text))
                 }
@@ -222,16 +234,23 @@ impl AgentProvider for MockAgentProvider {
                 purpose: turn.purpose,
                 context_chars: 0,
                 reply_parts: None,
+                usage: crate::TokenUsage {
+                    context_window: Some(200_000),
+                    ..crate::TokenUsage::default()
+                },
             });
         session.messages += 1;
         session.reply_parts = None;
         session.context_chars += request.len() as u64;
+        session.usage.total.requests += 1;
+        session.usage.total.input += request.len() as u64 / 4;
+        session.usage.total.cache_read += (session.context_chars - request.len() as u64) / 4;
         let kind = turn.purpose.run_kind();
         let tag = TrafficTag::new(turn.key.clone(), &turn.title, kind.traffic_label());
 
         if turn.purpose == SessionPurpose::Chat {
             let reply = mock_session_reply(session.messages, &turn);
-            session.context_chars += reply.len() as u64;
+            session.count_reply(&reply);
             return Ok(self.finish(
                 kind,
                 tag,
@@ -304,6 +323,10 @@ impl AgentProvider for MockAgentProvider {
 
     fn session_context_chars(&self, key: &str) -> Option<u64> {
         self.sessions.get(key).map(|session| session.context_chars)
+    }
+
+    fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
+        self.sessions.get(key).map(|session| session.usage.clone())
     }
 
     fn session_reply_parts(&self, key: &str) -> Option<Vec<ReplyPart>> {

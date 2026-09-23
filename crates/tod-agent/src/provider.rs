@@ -237,6 +237,14 @@ pub trait AgentProvider {
         None
     }
 
+    /// The tokens conversation `key`'s agent reported spending while this
+    /// provider held it — each turn's totals, the context's size, the cost
+    /// — when it reports any. The platform's own record of the session
+    /// (`read_transcript`) says more, where it keeps usage at all.
+    fn session_token_usage(&self, _key: &str) -> Option<crate::TokenUsage> {
+        None
+    }
+
     /// Stop the live process behind conversation `key`. The agent-side session
     /// is left intact, so a later turn can resume it.
     fn close_session(&mut self, key: &str);

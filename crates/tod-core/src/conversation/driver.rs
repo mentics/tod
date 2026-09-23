@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
-    SessionTurn, SharedAgent,
+    SessionTurn, SharedAgent, TokenUsage,
 };
 use tod_store::conversation::{
     Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnRole, reply_answer,
@@ -96,6 +96,10 @@ pub struct ConversationStatus {
     pub permission: Option<PermissionRequest>,
     /// The last turn's failure, until the next send.
     pub last_error: Option<String>,
+    /// The tokens the agent reported spending while this app held its
+    /// session, when the provider reports any. The platform's record says
+    /// more (`run_transcript::usage_for_key`).
+    pub live_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +153,7 @@ pub struct ConversationDriver {
     activity: Option<String>,
     permission: Option<PermissionRequest>,
     last_error: Option<String>,
+    live_usage: Option<TokenUsage>,
 }
 
 impl ConversationDriver {
@@ -168,6 +173,7 @@ impl ConversationDriver {
             activity: None,
             permission: None,
             last_error: None,
+            live_usage: None,
         }
     }
 
@@ -226,6 +232,7 @@ impl ConversationDriver {
             activity: self.activity.clone(),
             permission: self.permission.clone(),
             last_error: self.last_error.clone(),
+            live_usage: self.live_usage.clone(),
         }
     }
 
@@ -379,10 +386,16 @@ impl ConversationDriver {
         agent: &mut A,
     ) -> Vec<ConversationEvent> {
         let mut events = Vec::new();
+        let key = self.run.as_ref().map(|run| run.key.clone());
         if let Err(err) = self.poll(fleet, agent, &mut events) {
             let error = format!("{err:#}");
             self.last_error = Some(error.clone());
             events.push(ConversationEvent::TurnFinished { error: Some(error) });
+        }
+        // Read after the poll: a turn that just ended has reported its
+        // totals by the time it reads as ended.
+        if let Some(usage) = key.and_then(|key| agent.with(|a| a.session_token_usage(&key))) {
+            self.live_usage = Some(usage);
         }
         events
     }

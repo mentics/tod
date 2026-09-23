@@ -19,6 +19,7 @@ use crate::ui::item_list::{
 };
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::style;
+use crate::ui::token_usage;
 use crate::ui::transcript_list::{
     self, ChunkId, Entry, EntryKind, StartState, TranscriptList, TranscriptListEvent,
 };
@@ -32,7 +33,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::{ActiveTheme, Disableable, StyledExt, TitleBar, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Sizable, StyledExt, TitleBar, h_flex, v_flex};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tod_agent::{FormatProblem, Transcript, TranscriptTurn};
@@ -240,6 +241,8 @@ pub struct AgentTranscriptsView {
     entries: Vec<Entry>,
     /// Chunks the user toggled away from how they start.
     toggled: HashMap<ChunkId, bool>,
+    /// Every usage figure is shown, not just the one-line summary.
+    usage_expanded: bool,
     _transcript_subscription: Subscription,
 }
 
@@ -283,6 +286,7 @@ impl AgentTranscriptsView {
             transcript,
             entries: Vec::new(),
             toggled: HashMap::new(),
+            usage_expanded: false,
             _transcript_subscription: subscription,
         };
         this.reload_agents();
@@ -848,6 +852,63 @@ impl Focusable for AgentTranscriptsView {
 }
 
 impl AgentTranscriptsView {
+    /// The selected session's token usage under the header: a line, and
+    /// every figure when expanded. Nothing for traffic with no session.
+    fn render_usage(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let history = self.history.as_ref()?;
+        let border = cx.theme().border;
+        let line = match (&history.usage, history.usage_read) {
+            (Some(usage), _) => token_usage::summary(usage),
+            (None, false) => "Tokens: not read yet — kept from before usage was".to_string(),
+            (None, true) => "Tokens: the platform's record of this session has none".to_string(),
+        };
+        let details = history
+            .usage
+            .as_ref()
+            .filter(|_| self.usage_expanded)
+            .map(token_usage::details);
+        Some(
+            v_flex()
+                .w_full()
+                .px_4()
+                .py_1()
+                .gap(style::space::HAIRLINE)
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(style::space::RELATED)
+                        .child(
+                            style::text_dense_muted(div()).flex_1().min_w_0().child(
+                                selectable_text("agent-transcript-usage", line, window, cx),
+                            ),
+                        )
+                        .when(history.usage.is_some(), |row| {
+                            row.child(
+                                Button::new("agent-transcript-usage-details")
+                                    .label(if self.usage_expanded { "Less" } else { "Details" })
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.usage_expanded = !this.usage_expanded;
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
+                .children(details.map(|details| {
+                    style::text_dense_muted(div()).child(selectable_text(
+                        "agent-transcript-usage-details-text",
+                        details,
+                        window,
+                        cx,
+                    ))
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// The window is opened with `TitleBar::title_bar_options()`, which leaves
     /// it without a system caption — the view has to draw one, or the window
     /// cannot be dragged, minimized, or closed by its own chrome.
@@ -1094,6 +1155,7 @@ impl Render for AgentTranscriptsView {
                                                     })),
                                             ),
                                     )
+                                    .children(self.render_usage(window, cx))
                                     .child(div().flex_1().min_h_0().child(self.transcript.clone())),
                             ),
                     ),
