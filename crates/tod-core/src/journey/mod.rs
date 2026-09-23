@@ -7,8 +7,10 @@
 
 pub mod changes;
 pub mod recorder;
+pub mod snapshot;
 
 pub use recorder::{Recorder, install, record};
+pub use snapshot::{ResolvedAgentSettings, SettingsSnapshot, settings_snapshot};
 
 use std::path::PathBuf;
 use std::sync::Arc;
