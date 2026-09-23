@@ -351,6 +351,15 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
     } else {
         run_git(repo, &["worktree", "add", "-b", &branch_ref, &dest_str])?;
     }
+    // Only a new worktree: in one already in use this would put every
+    // submodule back on a detached HEAD.
+    if has_gitmodules(dest)
+        && let Err(err) = run_git(dest, &["submodule", "update", "--init", "--recursive"])
+    {
+        // Leave nothing behind, so trying again starts clean.
+        let _ = remove_git_worktree(repo, dest);
+        return Err(err.context(format!("set up the submodules in {dest}")));
+    }
     Ok(dest.clone())
 }
 
@@ -406,20 +415,40 @@ fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process:
     dir.output("env", &all)
 }
 
+/// Whether `repo` declares submodules. Talks to Docker for a container.
+fn has_gitmodules(repo: &Workdir) -> bool {
+    match repo {
+        Workdir::Host(path) => path.join(".gitmodules").is_file(),
+        Workdir::Container { .. } => repo
+            .output("test", &["-f", ".gitmodules"])
+            .is_ok_and(|out| out.status.success()),
+    }
+}
+
+/// `treehouse get` for a lease, asking for the submodules to be set up too
+/// when the repository has any.
+fn lease_args(holder: &str, submodules: bool) -> Vec<&str> {
+    let mut args = vec!["get", "--lease", "--lease-holder", holder, "--json"];
+    if submodules {
+        args.push("--submodules");
+    }
+    args
+}
+
 fn treehouse_get_lease(
     repo: &Workdir,
     holder: &str,
     settings: &TodSettings,
     paths: &TodPaths,
 ) -> Result<WorktreeHandle> {
-    let args = ["get", "--lease", "--lease-holder", holder, "--json"];
+    let args = lease_args(holder, has_gitmodules(repo));
     let output = match repo {
         Workdir::Host(repo) => {
             let invocation = TreehouseInvocation::resolve(settings, paths)?;
             invocation
                 .command()
                 .current_dir(repo)
-                .args(args)
+                .args(&args)
                 .output()
                 .context("spawn treehouse get --lease")?
         }
@@ -853,6 +882,52 @@ mod tests {
         let _ = scratch.output("rm", &["-rf", &dir]);
     }
 
+    #[test]
+    fn a_lease_asks_for_submodules_only_when_the_repository_has_them() {
+        let repo = Workdir::host(init_temp_repo());
+        assert!(!has_gitmodules(&repo));
+        assert!(!lease_args("h", false).contains(&"--submodules"));
+        fs::write(repo.host_path().unwrap().join(".gitmodules"), "").unwrap();
+        assert!(has_gitmodules(&repo));
+        assert_eq!(
+            lease_args("h", true),
+            ["get", "--lease", "--lease-holder", "h", "--json", "--submodules"]
+        );
+        let _ = fs::remove_dir_all(repo.host_path().unwrap());
+    }
+
+    #[test]
+    fn a_new_git_worktree_has_its_submodules() {
+        let sub = init_temp_repo();
+        let repo = Workdir::host(init_temp_repo());
+        let host = repo.host_path().unwrap().to_path_buf();
+        // Submodules from a local path need the file protocol allowed, and a
+        // submodule clone reads no repository config, only the environment.
+        // SAFETY: every test that sets it sets the same values.
+        unsafe {
+            std::env::set_var("GIT_CONFIG_COUNT", "1");
+            std::env::set_var("GIT_CONFIG_KEY_0", "protocol.file.allow");
+            std::env::set_var("GIT_CONFIG_VALUE_0", "always");
+        }
+        let url = sub.to_string_lossy().replace('\\', "/");
+        run_git(&repo, &["submodule", "add", "-q", &url, "sub"]).unwrap();
+        run_git(
+            &repo,
+            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "add sub"],
+        )
+        .unwrap();
+
+        let data_root = std::env::temp_dir().join(format!("tod-wt-data-{}", uuid::Uuid::new_v4()));
+        let handle = git_worktree(&data_root, &repo, "with-sub").unwrap();
+        let subs = submodule_dirs(&handle.path).unwrap();
+        assert_eq!(subs.len(), 1, "submodule not initialized in {}", handle.path);
+        assert!(run_git(&subs[0], &["rev-parse", "HEAD"]).is_ok());
+
+        let _ = fs::remove_dir_all(&host);
+        let _ = fs::remove_dir_all(&sub);
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
     /// Needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE`: a running container with
     /// git and a `treehouse` on its `PATH`.
     #[test]
@@ -891,6 +966,44 @@ mod tests {
         let lease = handle.lease.expect("a lease");
         assert_eq!(lease.lease_holder, "tod-test");
 
+        treehouse_return(&handle.path, &lease.lease_id, &settings, &paths).unwrap();
+        let _ = scratch.output("rm", &["-rf", &dir]);
+        let _ = fs::remove_dir_all(&data_root);
+    }
+
+    /// Needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE`, as above.
+    #[test]
+    fn a_leased_worktree_in_a_dev_container_has_its_submodules() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER_TREEHOUSE") else {
+            eprintln!("skipping: TOD_TEST_DEV_CONTAINER_TREEHOUSE is not set");
+            return;
+        };
+        let dir = format!("/tmp/tod-th-sub-{}", uuid::Uuid::new_v4());
+        let scratch = Workdir::container(&container, "/tmp");
+        let script = r#"set -e
+mkdir -p "$1" && cd "$1"
+git init -q -b main sub && git -C sub -c user.name=t -c user.email=t@t commit -q --allow-empty -m sub
+git init -q -b main main && cd main
+git -c protocol.file.allow=always submodule add -q "$1/sub" sub
+git -c user.name=t -c user.email=t@t commit -q -m 'add sub'"#;
+        let out = scratch.output("sh", &["-c", script, "sh", &dir]).unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+        use crate::paths::{clear_data_root_override, set_data_root};
+        let repo = Workdir::container(&container, format!("{dir}/main"));
+        assert!(has_gitmodules(&repo));
+        let data_root = std::env::temp_dir().join(format!("tod-th-data-{}", uuid::Uuid::new_v4()));
+        set_data_root(data_root.clone());
+        let paths = TodPaths::discover().unwrap();
+        clear_data_root_override();
+        let settings = TodSettings::default();
+
+        let handle = treehouse_get_lease(&repo, "tod-test", &settings, &paths).unwrap();
+        let subs = submodule_dirs(&handle.path).unwrap();
+        assert_eq!(subs.len(), 1, "submodule not initialized in {}", handle.path);
+        assert!(run_git(&subs[0], &["rev-parse", "HEAD"]).is_ok());
+
+        let lease = handle.lease.expect("a lease");
         treehouse_return(&handle.path, &lease.lease_id, &settings, &paths).unwrap();
         let _ = scratch.output("rm", &["-rf", &dir]);
         let _ = fs::remove_dir_all(&data_root);

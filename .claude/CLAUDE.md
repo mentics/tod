@@ -323,6 +323,9 @@ Nothing starts or builds a container; tod only uses a running one.
   `info/exclude`. Treehouse runs there too: the `treehouse` on the
   container's `PATH` (else a login shell's), with its own configuration and
   `TREEHOUSE_NO_UPDATE_CHECK=1`; none of tod's Treehouse settings apply.
+  Wherever it runs, a lease asks for `--submodules` when the repository has
+  a `.gitmodules`, and a new git worktree runs `git submodule update --init
+  --recursive`.
 - **Mounted** (`container_repo_on_host`): the repository is on this machine,
   git runs here, and only launches go into the container. The directory there
   is mapped through the container's mounts.
