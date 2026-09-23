@@ -19,6 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::interview::TodPaths;
+use crate::ui::journey::Source;
 use crate::ui::actionable::{chrome_control_with_shortcut, render_shortcut_pill};
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
@@ -743,7 +744,7 @@ impl TaskListView {
                     .find(|t| t.id == task_id)
                     .is_some_and(|t| t.accept_ready);
                 if ready {
-                    self.accept_ticket(&task_id, window, cx);
+                    self.accept_ticket(&task_id, Source::Click, window, cx);
                 }
             }
         }
@@ -2565,7 +2566,7 @@ impl TaskListView {
             && task.external_id.is_some()
         {
             if task.accept_ready {
-                self.accept_ticket(&task_id, window, cx);
+                self.accept_ticket(&task_id, Source::Keyboard, window, cx);
             }
             return;
         }
@@ -2578,10 +2579,34 @@ impl TaskListView {
     /// still an accept-ready managed ticket — callers check `accept_ready`
     /// before calling this so the keystroke and chip are both silent
     /// no-ops otherwise, not an error toast.
-    fn accept_ticket(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn accept_ticket(
+        &mut self,
+        task_id: &str,
+        source: Source,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Ok(source_node_id) = uuid::Uuid::parse_str(task_id) else {
             return;
         };
+        // The ticket row offers exactly one action, so that is all that was presented.
+        crate::ui::journey::record_action(
+            cx,
+            tod_store::conversation::Focus::Node(source_node_id),
+            "accept-ticket",
+            source,
+            "task-list",
+            tod_journey::Presented {
+                actions: vec![tod_journey::PresentedAction {
+                    id: "accept-ticket".into(),
+                    label: "Accept".into(),
+                    primary: true,
+                    disabled: false,
+                }],
+                focused: Some("accept-ticket".into()),
+                notices: Vec::new(),
+            },
+        );
         let new_node_id = uuid::Uuid::new_v4();
         if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
             source_node_id,
