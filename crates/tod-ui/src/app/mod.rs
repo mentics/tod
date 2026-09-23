@@ -16,6 +16,7 @@ use crate::interview::views::{
 };
 use crate::ui::agent_chat::register_agent_chat_keyboard_bindings;
 use crate::ui::journey::register_app_journey_keystrokes;
+use crate::ui::report_problem::register_report_problem_keyboard_bindings;
 use crate::ui::list::register_list_keyboard_bindings;
 use crate::views::action_panel::register_action_panel_keyboard_bindings;
 use crate::views::agent_transcripts::register_agent_transcripts_keyboard_bindings;
@@ -37,6 +38,7 @@ pub use window::{open, open_data_root_setup};
 pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_list_keyboard_bindings(cx);
     register_agent_chat_keyboard_bindings(cx);
+    register_report_problem_keyboard_bindings(cx);
     register_task_list_keyboard_bindings(cx);
     register_command_history_keyboard_bindings(cx);
     register_task_edit_keyboard_bindings(cx);
