@@ -253,6 +253,35 @@ impl FleetStore {
         crate::journey_changes::prune_through(&conn, through_id)
     }
 
+    /// Queues a just-built bundle for submission (`crate::journey_submissions`).
+    /// A plain maintenance write on its own short-lived connection, like
+    /// `prune_journey_changes_through` — the queue is outside the
+    /// `OutlineMutation`/`FleetMutation` invariants, so it does not need the
+    /// debounced writer queue. The caller (e.g. `submit_report`) is
+    /// responsible for also recording the corresponding journey
+    /// `Event::Submission`, since `tod-store` cannot depend on `tod-core`.
+    pub fn queue_journey_submission(
+        &self,
+        bundle_id: uuid::Uuid,
+        node_id: Option<uuid::Uuid>,
+        seq: i64,
+        reason: &str,
+    ) -> Result<crate::journey_submissions::SubmissionEntry> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn)
+            .insert_queued(bundle_id, node_id, seq, reason)
+    }
+
+    /// Moves a queued submission's status (`crate::journey_submissions`).
+    pub fn set_journey_submission_status(
+        &self,
+        bundle_id: uuid::Uuid,
+        status: &str,
+    ) -> Result<()> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).set_status(bundle_id, status)
+    }
+
     /// Enqueue a fleet mutation for the async writer.
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
         if self.migration.is_some() {

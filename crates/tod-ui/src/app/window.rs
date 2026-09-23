@@ -1507,7 +1507,6 @@ fn submit_report(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let _ = &fleet; // reserved for Step 6d's queue insert
     let app_journey: Vec<tod_journey::Record> = crate::ui::journey::hub(cx)
         .read(cx)
         .snapshot()
@@ -1537,7 +1536,38 @@ fn submit_report(
             .await;
 
         let settings = TodSettings::load(&paths).unwrap_or_default();
-        let queued = seq.is_some() && settings.journeys.send;
+
+        // Step 6d: queue the report for submission when the setting is on
+        // and the report itself was actually recorded. The queue entry gets
+        // its own bundle id now (the bundle itself is built later, by the
+        // submission worker, Step 6e) so the journey's own `Submission`
+        // event can point at it.
+        let queued = if let (Some(seq), true) = (seq, settings.journeys.send) {
+            let node_id = match key {
+                JourneyKey::Project => None,
+                JourneyKey::Node(id) => Some(id),
+            };
+            let bundle_id = uuid::Uuid::new_v4();
+            match fleet.queue_journey_submission(bundle_id, node_id, seq as i64, "report") {
+                Ok(entry) => {
+                    tod_core::journey::record(
+                        key,
+                        tod_journey::Actor::App,
+                        tod_journey::Event::Submission {
+                            bundle: entry.bundle_id,
+                            status: "queued".to_string(),
+                        },
+                    );
+                    true
+                }
+                Err(err) => {
+                    tracing::warn!("journey: failed to queue report submission: {err}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         let _ = cx.update_window(window_handle, move |_view, window, cx| {
             let message = if queued {

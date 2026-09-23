@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 59;
+pub const CURRENT_USER_VERSION: i32 = 60;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -377,6 +377,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(crate::journey_changes::CREATE_JOURNEY_CHANGES)?;
         conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
         conn.pragma_update(None, "user_version", 59)?;
+    }
+    if version < 60 {
+        conn.execute_batch(crate::journey_submissions::CREATE_JOURNEY_SUBMISSIONS)?;
+        conn.pragma_update(None, "user_version", 60)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
