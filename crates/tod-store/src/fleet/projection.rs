@@ -56,6 +56,12 @@ impl FleetProjection {
         self.change_tx.subscribe()
     }
 
+    /// Announce a change made on a connection of its own (outside the writer
+    /// queue), so subscribers such as the journey submission worker wake.
+    pub fn notify_changed(&self) {
+        let _ = self.change_tx.send(());
+    }
+
     /// Compare `PRAGMA data_version` and metadata; reload when the on-disk store changed.
     pub fn reload_if_stale(&mut self) -> Result<bool> {
         let conn = schema::open_read_connection(&self.db_path)?;

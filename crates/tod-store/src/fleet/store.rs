@@ -268,8 +268,15 @@ impl FleetStore {
         reason: &str,
     ) -> Result<crate::journey_submissions::SubmissionEntry> {
         let conn = rusqlite::Connection::open(self.writer.db_path())?;
-        crate::journey_submissions::JourneySubmissionRepo::new(&conn)
-            .insert_queued(bundle_id, node_id, seq, reason)
+        let entry = crate::journey_submissions::JourneySubmissionRepo::new(&conn)
+            .insert_queued(bundle_id, node_id, seq, reason)?;
+        // This write bypasses the writer, so nothing else announces it; the
+        // submission worker would otherwise sleep until its fallback poll.
+        self.projection
+            .lock()
+            .expect("fleet projection mutex")
+            .notify_changed();
+        Ok(entry)
     }
 
     /// Moves a queued submission's status (`crate::journey_submissions`).
@@ -980,6 +987,21 @@ mod tests {
         drop(store);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(dest);
+    }
+
+    #[test]
+    fn queueing_a_journey_submission_notifies_subscribers() {
+        let root =
+            std::env::temp_dir().join(format!("tod-fleet-store-queue-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FleetStore::open(&root).unwrap();
+        let mut rx = store.subscribe_changes();
+        store
+            .queue_journey_submission(uuid::Uuid::new_v4(), None, 1, "report")
+            .unwrap();
+        assert!(rx.try_recv().is_ok());
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
