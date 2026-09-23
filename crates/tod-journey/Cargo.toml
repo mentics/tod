@@ -1,0 +1,27 @@
+[package]
+name = "tod-journey"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tod_journey"
+path = "src/lib.rs"
+
+# Deliberately a leaf crate: no `tod-*` dependencies. A future standalone
+# receiver binary needs this format, the writer/reader, retention, sealing,
+# and the relay code without pulling in GPUI or SQLite.
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+zstd = "0.13"
+age = "0.11"
+
+[dev-dependencies]
+tempfile = "3.10"
