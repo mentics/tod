@@ -56,10 +56,11 @@ impl FleetProjection {
         self.change_tx.subscribe()
     }
 
-    /// Announce a change made on a connection of its own (outside the writer
-    /// queue), so subscribers such as the journey submission worker wake.
-    pub fn notify_changed(&self) {
-        let _ = self.change_tx.send(());
+    /// The sender behind [`Self::subscribe`], for announcing a change made on
+    /// a connection of its own without taking the projection's lock (callers
+    /// such as the journey change feed already hold it).
+    pub fn change_sender(&self) -> broadcast::Sender<()> {
+        self.change_tx.clone()
     }
 
     /// Compare `PRAGMA data_version` and metadata; reload when the on-disk store changed.

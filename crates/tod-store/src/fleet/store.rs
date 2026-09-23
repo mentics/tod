@@ -47,6 +47,7 @@ pub struct FleetStore {
     writer: FleetWriter,
     command_log: Arc<Mutex<crate::fleet::command_log::CommandLog>>,
     projection: Arc<Mutex<FleetProjection>>,
+    change_tx: broadcast::Sender<()>,
     notices: FleetNoticeHooks,
     migration: Option<StorageMigration>,
     traffic_log: Option<SharedAgentTrafficLog>,
@@ -104,6 +105,7 @@ impl FleetStore {
         let projection = Arc::new(Mutex::new(
             FleetProjection::open(paths.db()).map_err(FleetLaunchError::Other)?,
         ));
+        let change_tx = projection.lock().expect("fleet projection mutex").change_sender();
         let background_shutdown = Arc::new(AtomicBool::new(false));
         crate::fleet::projection::spawn_commit_reloader(
             projection.clone(),
@@ -117,6 +119,7 @@ impl FleetStore {
             writer,
             command_log,
             projection,
+            change_tx,
             notices: FleetNoticeHooks::new(),
             migration: None,
             traffic_log: None,
@@ -272,10 +275,8 @@ impl FleetStore {
             .insert_queued(bundle_id, node_id, seq, reason)?;
         // This write bypasses the writer, so nothing else announces it; the
         // submission worker would otherwise sleep until its fallback poll.
-        self.projection
-            .lock()
-            .expect("fleet projection mutex")
-            .notify_changed();
+        // Not through the projection: callers may already hold its lock.
+        let _ = self.change_tx.send(());
         Ok(entry)
     }
 

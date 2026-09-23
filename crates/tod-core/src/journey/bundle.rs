@@ -100,7 +100,7 @@ pub fn build_bundle(
     let mut writer = BundleWriter::new().context("opening bundle writer")?;
 
     let manifest = Manifest {
-        bundle: Uuid::new_v4(),
+        bundle: entry.bundle_id,
         reason: entry.reason.clone(),
         node_id: entry.node_id,
         slug,
@@ -701,6 +701,7 @@ mod tests {
             })
             .expect("bundle has a manifest record");
         assert_eq!(manifest.node_id, Some(fx.node));
+        assert_eq!(manifest.bundle, entry.bundle_id, "manifest names the queued submission");
         assert_eq!(manifest.queued_seq, cutoff);
         assert_eq!(manifest.transcripts_included, include_transcripts);
         assert!(!manifest.cli_build_stamp.is_empty());
