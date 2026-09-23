@@ -44,13 +44,15 @@ struct TreeData {
     lifecycle: HashMap<Uuid, String>,
     tags: HashMap<Uuid, Vec<String>>,
     ticket_ids: HashMap<Uuid, String>,
-    /// Link on the node itself: (external id, source type).
-    links: HashMap<Uuid, (String, String)>,
+    /// Link on the node itself: (external id, source type, generator node id).
+    links: HashMap<Uuid, (String, String, Uuid)>,
     /// How many nodes each generator node owns. Not scoped to the list: a
     /// generator's count is of everything it produced.
     managed_counts: HashMap<Uuid, usize>,
     /// Generator node → (last refresh status, last refresh error).
     generator_status: HashMap<Uuid, (Option<String>, Option<String>)>,
+    /// Generator node → quick-accept destination, when configured.
+    accept_destinations: HashMap<Uuid, Uuid>,
 }
 
 impl TreeData {
@@ -150,14 +152,32 @@ impl TreeData {
 
         let mut links = HashMap::new();
         let mut stmt = conn.prepare(
-            "SELECT l.node_id, l.external_id, l.source_type
+            "SELECT l.node_id, l.external_id, l.source_type, l.generator_node_id
              FROM managed_node_links l JOIN outline_entries e ON e.node_id = l.node_id
              WHERE e.list_id = ?1",
         )?;
         let mut rows = stmt.query(params![list_blob])?;
         while let Some(row) = rows.next()? {
             let id_blob: Vec<u8> = row.get(0)?;
-            links.insert(blob_to_uuid_sql(&id_blob)?, (row.get(1)?, row.get(2)?));
+            let gen_blob: Vec<u8> = row.get(3)?;
+            links.insert(
+                blob_to_uuid_sql(&id_blob)?,
+                (row.get(1)?, row.get(2)?, blob_to_uuid_sql(&gen_blob)?),
+            );
+        }
+        drop(rows);
+        drop(stmt);
+
+        let mut accept_destinations = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT node_id, accept_destination_node_id FROM node_generator_config
+             WHERE accept_destination_node_id IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id_blob: Vec<u8> = row.get(0)?;
+            let dest_blob: Vec<u8> = row.get(1)?;
+            accept_destinations.insert(blob_to_uuid_sql(&id_blob)?, blob_to_uuid_sql(&dest_blob)?);
         }
         drop(rows);
         drop(stmt);
@@ -198,6 +218,7 @@ impl TreeData {
             links,
             managed_counts,
             generator_status,
+            accept_destinations,
         })
     }
 }
@@ -270,6 +291,9 @@ fn walk(
             } else {
                 (None, None, None)
             };
+        let accept_ready = link
+            .map(|(_, _, generator_node_id)| data.accept_destinations.contains_key(generator_node_id))
+            .unwrap_or(false);
         out.push(FlatNodeRow {
             node,
             depth,
@@ -282,11 +306,12 @@ fn walk(
             collapsed: entry.collapsed,
             has_children,
             managed,
-            external_id: link.map(|(external_id, _)| external_id.clone()),
-            source_type: link.map(|(_, source_type)| source_type.clone()),
+            external_id: link.map(|(external_id, _, _)| external_id.clone()),
+            source_type: link.map(|(_, source_type, _)| source_type.clone()),
             managed_count,
             generator_status,
             generator_error,
+            accept_ready,
         });
         if !entry.collapsed {
             walk(by_parent, data, Some(entry.node_id), depth + 1, out);

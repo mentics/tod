@@ -30,6 +30,9 @@ pub const VERIFY_SURFACE: &str = "verify";
 /// The surface label a code review session is named with.
 pub const REVIEW_SURFACE: &str = "review";
 
+/// The `pr` protocol's surface: opening and driving the pull request.
+pub const PR_SURFACE: &str = "pr";
+
 /// The surface label a review-fix session is named with.
 pub const FIX_SURFACE: &str = "fix";
 

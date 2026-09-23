@@ -87,6 +87,7 @@ pub(super) fn insert_draft_row(tasks: &mut Vec<TaskItem>, draft: &DraftRow) {
             managed_count: None,
             generator_status: None,
             generator_error: None,
+            accept_ready: false,
         },
     );
     for (ordinal, task) in tasks.iter_mut().enumerate() {

@@ -1,5 +1,6 @@
 //! Generator repository — generator config, managed nodes, data-source links.
 
+use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, now_ms, uuid_to_blob};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,6 +19,11 @@ pub struct GeneratorConfig {
     pub last_refresh_status: Option<String>,
     pub last_refresh_error: Option<String>,
     pub last_refresh_at: Option<i64>,
+    /// Quick-accept destination: the node newly-accepted tickets are copied
+    /// under. `None` until the user sets it — accept is inert until then.
+    pub accept_destination_node_id: Option<Uuid>,
+    /// Capabilities auto-enabled on a ticket's copy when it is accepted.
+    pub accept_capabilities: Vec<Capability>,
 }
 
 /// Data-source link on a managed or copied-out node.
@@ -63,20 +69,11 @@ impl<'a> GeneratorRepo<'a> {
         self.conn
             .query_row(
                 "SELECT node_id, data_source_type, config_json,
-                        last_refresh_status, last_refresh_error, last_refresh_at
+                        last_refresh_status, last_refresh_error, last_refresh_at,
+                        accept_destination_node_id, accept_capabilities
                  FROM node_generator_config WHERE node_id = ?1",
                 params![uuid_to_blob(node_id)],
-                |row| {
-                    let id_blob: Vec<u8> = row.get(0)?;
-                    Ok(GeneratorConfig {
-                        node_id: blob_to_uuid_sql(&id_blob)?,
-                        data_source_type: row.get(1)?,
-                        config_json: row.get(2)?,
-                        last_refresh_status: row.get(3)?,
-                        last_refresh_error: row.get(4)?,
-                        last_refresh_at: row.get(5)?,
-                    })
-                },
+                row_to_config,
             )
             .optional()
             .map_err(Into::into)
@@ -93,6 +90,28 @@ impl<'a> GeneratorRepo<'a> {
              VALUES (?1, ?2, ?3)
              ON CONFLICT(node_id) DO UPDATE SET config_json = excluded.config_json",
             params![uuid_to_blob(node_id), data_source_type, config_json],
+        )?;
+        Ok(())
+    }
+
+    /// Set the quick-accept destination node and capabilities for a
+    /// generator. Both are `None`/empty until explicitly set by the user.
+    pub fn set_accept_config(
+        &self,
+        node_id: Uuid,
+        destination_node_id: Option<Uuid>,
+        capabilities: &[Capability],
+    ) -> Result<()> {
+        let caps_json = serde_json::to_string(capabilities)?;
+        self.conn.execute(
+            "UPDATE node_generator_config
+             SET accept_destination_node_id = ?2, accept_capabilities = ?3
+             WHERE node_id = ?1",
+            params![
+                uuid_to_blob(node_id),
+                destination_node_id.map(uuid_to_blob),
+                caps_json,
+            ],
         )?;
         Ok(())
     }
@@ -448,6 +467,23 @@ impl<'a> GeneratorRepo<'a> {
         fields.push(field.to_string());
         self.update_user_modified_fields(node_id, &fields)
     }
+}
+
+fn row_to_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<GeneratorConfig> {
+    let id_blob: Vec<u8> = row.get(0)?;
+    let dest_blob: Option<Vec<u8>> = row.get(6)?;
+    let caps_json: String = row.get(7)?;
+    let accept_capabilities: Vec<Capability> = serde_json::from_str(&caps_json).unwrap_or_default();
+    Ok(GeneratorConfig {
+        node_id: blob_to_uuid_sql(&id_blob)?,
+        data_source_type: row.get(1)?,
+        config_json: row.get(2)?,
+        last_refresh_status: row.get(3)?,
+        last_refresh_error: row.get(4)?,
+        last_refresh_at: row.get(5)?,
+        accept_destination_node_id: dest_blob.map(|b| blob_to_uuid_sql(&b)).transpose()?,
+        accept_capabilities,
+    })
 }
 
 fn row_to_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedNodeLink> {

@@ -162,7 +162,6 @@ mod tests {
         let media = media_paths(media_dir.path());
         let dev_container = DevContainerSetting {
             container: Some("my-dev".into()),
-            directory: None,
             repo_on_host: false,
         };
 

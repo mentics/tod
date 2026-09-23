@@ -19,6 +19,7 @@ mod interview;
 mod node;
 mod obligations;
 mod plan;
+mod pr;
 mod review;
 mod secrets;
 mod test_runs;
@@ -53,6 +54,7 @@ NOUNS:
     changeset              This conversation's net changes and unsure flags
     tests                  Record a test run for this implementation
     review                 Code review findings on a node, and their responses
+    pr                     Opening and driving a node's pull request
     verdicts               What verification found for each obligation of a node
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
@@ -77,6 +79,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("changeset", crate::changeset::USAGE),
     ("tests", crate::test_runs::USAGE),
     ("review", crate::review::USAGE),
+    ("pr", crate::pr::USAGE),
     ("verdicts", crate::verdicts::USAGE),
     ("incoming", crate::incoming::USAGE),
     ("learn", crate::learn::USAGE),
@@ -195,12 +198,13 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "changeset" => changeset::run(invocation),
         "tests" => test_runs::run(invocation),
         "review" => review::run(invocation),
+        "pr" => pr::run(invocation),
         "verdicts" => verdicts::run(invocation),
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, verdicts, incoming, learn, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets)"
         ),
     }
 }

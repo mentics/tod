@@ -6,14 +6,18 @@ without ever seeing it. You never read a secret's value: you name it, and
 
 ```
 tod-cli --data-root <DATA_ROOT> secrets list
+tod-cli --data-root <DATA_ROOT> secrets set <NAME> [VALUE]
 tod-cli --data-root <DATA_ROOT> secrets run --env <VAR>=<SECRET> [--env <VAR>=<SECRET> ...] -- <COMMAND> [ARGS...]
 ```
 
 `list` shows each secret tod knows by name (e.g. `linear_api_key`) and whether
-it is set. `run` starts `<COMMAND>` with each named secret in environment
-variable `<VAR>`; the command's output comes back with every secret value
-replaced by `***`, and `run` exits with the command's exit code. For example,
-a script that calls Linear's API reads its key from `LINEAR_API_KEY`:
+it is set. `set` is how the user stores one (e.g. `github_token`) — not
+something you run on their behalf; VALUE from stdin when omitted, so it never
+sits in shell history. `run` starts `<COMMAND>` with each named secret in
+environment variable `<VAR>`; the command's output comes back with every
+secret value replaced by `***`, and `run` exits with the command's exit code.
+For example, a script that calls Linear's API reads its key from
+`LINEAR_API_KEY`:
 
 ```
 tod-cli --data-root <DATA_ROOT> secrets run --env LINEAR_API_KEY=linear_api_key -- python scripts/fetch_schema.py

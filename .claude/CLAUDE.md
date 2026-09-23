@@ -271,7 +271,9 @@ mirror for a `verifying` node (the lifecycle panel's Verify). What it
 verifies is the node's **obligations**, not only the plan: the agent
 exercises each one in the running work and records a verdict with evidence
 through `tod-cli verdicts` (`tod_store::verification`, an append-only
-history per obligation; reimplementing a step reopens the `verified` ones).
+history per obligation; reimplementing a step reopens the `verified` ones,
+and a Fix or Implement turn on a `verifying` node reopens every verified step
+and verdict, so `tod_core::lifecycle_next` recommends Verify, not the gate).
 It loops until every own obligation and every plan step is `verified` or
 `failed`, every failed obligation has a `failed` step to carry it back to
 implementation, and a test run is recorded; it replaces the old `verifying`
@@ -312,25 +314,40 @@ Tracks agents running against git worktrees: provisioning (`provision.rs`), laun
 
 The Files capability can run a node's work in a running dev container
 instead of on this machine (`node_files.dev_container` / `container` /
-`container_dir` / `container_repo_on_host`, schema v57; the task editor's
+`container_repo_on_host`, schema v57; `container_dir` is unused; the task editor's
 "Runs in" section, which lists `docker ps` in the background, or `tod-cli
 capabilities set <node> files --container <name|id> [--mounted on|off]`).
 Nothing starts or builds a container; tod only uses a running one.
 
 - **Repository in the container** (the default): the workspace directory is a
-  container path, and git runs there too. Worktrees go to
+  container path, and git runs there too. Git worktrees go to
   `<repo>/.worktrees/<branch>`, which is added to the repository's
-  `info/exclude`. Treehouse is host-only, so these always use git worktrees.
+  `info/exclude`. Treehouse runs there too: the `treehouse` on the
+  container's `PATH` (else a login shell's), with its own configuration and
+  `TREEHOUSE_NO_UPDATE_CHECK=1`; none of tod's Treehouse settings apply.
+  Wherever it runs, a lease asks for `--submodules` when the repository has
+  a `.gitmodules`, and a new git worktree runs `git submodule update --init
+  --recursive`. Either way `ensure_worktree` then initializes any submodule
+  still left out and puts every submodule on the node's branch; what it
+  could not do comes back as `WorktreeHandle::warnings` and is shown in the
+  Files section. In the superproject and each submodule, a branch that
+  `origin/<branch>` already has is created from it, and an existing one with
+  no upstream is linked to it (one `for-each-ref`, no fetch: it goes by the
+  last fetch). It runs with no store lock held (the shared-worktree lookup
+  is a short `fleet.read`), so the UI never waits on git or Docker.
 - **Mounted** (`container_repo_on_host`): the repository is on this machine,
   git runs here, and only launches go into the container. The directory there
-  is mapped through the container's mounts unless `container_dir` names it.
+  is mapped through the container's mounts.
 
 - `tod_store::fleet::Workdir` (`Host(path)` / `Container { container, path }`)
   is the directory type for every git and worktree operation and every launch
   cwd (`FilesDirectory::Ready`, `resolve_launch_cwd`, `Protocol::cwd`). Its
   `git`/`output` run on the host or through `docker exec`
   (`tod_agent::devcontainer::ContainerExec`, which caches `docker inspect` for
-  30s). A container directory is never checked from the UI thread.
+  30s). A container directory is never checked from the UI thread. Git in a
+  container runs with `-c safe.directory=*` (`workdir::CONTAINER_GIT_CONFIG`):
+  Docker Desktop bind mounts can briefly report a new directory as root's,
+  and git would refuse it as "dubious ownership".
 
 - `tod_agent::devcontainer` is the transport: `docker ps`/`inspect`, mount
   mapping, `prepare` (check the container is running, resolve directory, user
@@ -357,7 +374,9 @@ Nothing starts or builds a container; tod only uses a running one.
   a command line.
 - Tests that need a real container are skipped unless `TOD_TEST_DEV_CONTAINER`
   (a running container with git; some also need
-  `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set.
+  `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set; the
+  Treehouse one needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE` (a container with
+  `treehouse` on its `PATH`).
 
 ### `tod-store::outline` — task tree
 

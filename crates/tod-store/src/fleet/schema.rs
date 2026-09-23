@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 60;
+pub const CURRENT_USER_VERSION: i32 = 62;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -374,13 +374,21 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 58)?;
     }
     if version < 59 {
-        conn.execute_batch(crate::journey_changes::CREATE_JOURNEY_CHANGES)?;
-        conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+        migrate_v58_to_v59(conn)?;
         conn.pragma_update(None, "user_version", 59)?;
     }
     if version < 60 {
-        conn.execute_batch(crate::journey_submissions::CREATE_JOURNEY_SUBMISSIONS)?;
+        migrate_v59_to_v60(conn)?;
         conn.pragma_update(None, "user_version", 60)?;
+    }
+    if version < 61 {
+        conn.execute_batch(crate::journey_changes::CREATE_JOURNEY_CHANGES)?;
+        conn.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 61)?;
+    }
+    if version < 62 {
+        conn.execute_batch(crate::journey_submissions::CREATE_JOURNEY_SUBMISSIONS)?;
+        conn.pragma_update(None, "user_version", 62)?;
     }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
@@ -697,26 +705,32 @@ fn migrate_v36_to_v37(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The Files capability can run a node's launches in a dev container.
-/// `conversation_turns.sent_context`: the part of what was sent to the agent
-/// on a user turn that is not the user's own text (the protocol delta
-/// prepended to it). Continuation turns leave this null: their body already
-/// equals what was sent. See `doc/journeys/spec.md` §3.2.
+/// Quick-accept for generator ticket nodes: the destination node accepted
+/// copies are created under, and the capabilities to auto-enable on them.
+/// Both start unset — accept is inert until the user configures a
+/// destination.
 fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
-    let present = conn
-        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'sent_context'")?
-        .exists([])?;
-    if !present {
-        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
+    for (column, ddl) in [
+        ("accept_destination_node_id", "BLOB"),
+        ("accept_capabilities", "TEXT NOT NULL DEFAULT '[]'"),
+    ] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('node_generator_config') WHERE name = ?1")?
+            .exists([column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE node_generator_config ADD COLUMN {column} {ddl};"
+            ))?;
+        }
     }
     Ok(())
 }
 
+/// The Files capability can run a node's launches in a dev container.
 fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         ("dev_container", "INTEGER NOT NULL DEFAULT 0"),
         ("container", "TEXT"),
-        ("container_dir", "TEXT"),
         ("container_repo_on_host", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         let present = conn
@@ -725,6 +739,38 @@ fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
         if !present {
             conn.execute_batch(&format!("ALTER TABLE node_files ADD COLUMN {column} {ddl};"))?;
         }
+    }
+    Ok(())
+}
+
+/// The `pr` lifecycle state's PR reference: one row per node once its pull
+/// request has been opened (`tod-cli pr open`), read by the `pr -> approved`
+/// and `approved -> merged` gates and shown in the side pane.
+fn migrate_v58_to_v59(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS node_pr (
+            node_id BLOB PRIMARY KEY,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );",
+    )?;
+    Ok(())
+}
+
+/// `conversation_turns.sent_context`: the part of what was sent to the agent
+/// on a user turn that is not the user's own text (the protocol delta
+/// prepended to it). Continuation turns leave this null: their body already
+/// equals what was sent. See `doc/journeys/spec.md` §3.2.
+fn migrate_v59_to_v60(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('conversation_turns') WHERE name = 'sent_context'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE conversation_turns ADD COLUMN sent_context TEXT;")?;
     }
     Ok(())
 }

@@ -137,6 +137,7 @@ str_enum!(
         GateCheck => "gate_check",
         OnEntry => "on_entry",
         Incoming => "incoming",
+        Pr => "pr",
     }
 );
 
@@ -150,7 +151,7 @@ impl ProtocolKind {
     /// Whether this kind works through a node's review findings — its side
     /// pane lists them, each answered from its status.
     pub fn works_the_findings(self) -> bool {
-        matches!(self, ProtocolKind::Review | ProtocolKind::Fix)
+        matches!(self, ProtocolKind::Review | ProtocolKind::Fix | ProtocolKind::Pr)
     }
 
     /// Whether this kind belongs to a lifecycle transition (or a state's
@@ -256,12 +257,10 @@ pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting
         None => "this machine".into(),
         Some(dev) => {
             let container = dev.container().unwrap_or("(none chosen)");
-            match (dev.repo_on_host, dev.directory()) {
-                (false, _) => format!("dev container {container}"),
-                (true, Some(dir)) => {
-                    format!("dev container {container}, mounted at {dir}")
-                }
-                (true, None) => format!("dev container {container}, mounted"),
+            if dev.repo_on_host {
+                format!("dev container {container}, mounted")
+            } else {
+                format!("dev container {container}")
             }
         }
     }

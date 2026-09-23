@@ -874,15 +874,21 @@ fn gate_criteria_seed_on_migration() {
     assert_eq!(active_verifying.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
     assert_eq!(verifying_review.len(), 11);
-    let review_approved = repo.list_for_transition("review", "approved").unwrap();
-    assert_eq!(review_approved.len(), 2);
+    let review_pr = repo.list_for_transition("review", "pr").unwrap();
+    assert_eq!(review_pr.len(), 2);
+    let pr_approved = repo.list_for_transition("pr", "approved").unwrap();
+    assert_eq!(pr_approved.len(), 1);
+    let approved_merged = repo.list_for_transition("approved", "merged").unwrap();
+    assert_eq!(approved_merged.len(), 1);
     assert_eq!(
         design_planning.len()
             + planning_ready.len()
             + ready_active.len()
             + active_verifying.len()
             + verifying_review.len()
-            + review_approved.len(),
+            + review_pr.len()
+            + pr_approved.len()
+            + approved_merged.len(),
         GATE_CRITERIA.len() - superseded
     );
     let _ = fs::remove_dir_all(root);
@@ -2045,6 +2051,99 @@ fn paste_managed_node_copy_deep_copies_and_converts_to_normal() {
                     .as_deref(),
                 Some("child body")
             );
+
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn accept_generated_ticket_is_a_noop_without_a_configured_destination() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (_generator_id, managed_id, _managed_child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+
+    let new_node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
+            source_node_id: managed_id,
+            new_node_id,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+            assert!(
+                node_repo.get(new_node_id).unwrap().is_none(),
+                "no destination configured — accept must not create anything"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    drop(store);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn accept_generated_ticket_copies_to_destination_and_enables_capabilities() {
+    let (store, root, list_id) = setup_store_with_list();
+    let (generator_id, managed_id, managed_child_id) =
+        setup_generator_with_managed_tree(&store, list_id);
+    let destination = create_node_in(&store, list_id, None, "Accepted work");
+
+    store
+        .enqueue_outline(OutlineMutation::SetGeneratorAcceptConfig {
+            node_id: generator_id,
+            destination_node_id: Some(destination),
+            capabilities: vec![Capability::Tags, Capability::Spec],
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    let new_node_id = Uuid::new_v4();
+    store
+        .enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
+            source_node_id: managed_id,
+            new_node_id,
+        })
+        .unwrap();
+    store.writer().flush().unwrap();
+
+    store
+        .read(|conn| {
+            let node_repo = crate::outline::repos::NodeRepo::new(conn);
+            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
+            let outline = crate::outline::repos::OutlineRepo::new(conn);
+
+            let new_node = node_repo.get(new_node_id).unwrap().unwrap();
+            assert_eq!(new_node.title, "EXT-1: Fix the bug");
+            assert!(!gen_repo.is_managed(new_node_id).unwrap());
+
+            let entries = outline.list_for_list(list_id).unwrap();
+            let entry = entries
+                .iter()
+                .find(|e| e.node_id == new_node_id)
+                .expect("new node must be placed in the outline");
+            assert_eq!(entry.parent_id, Some(destination));
+
+            let caps = node_repo.list_capabilities(new_node_id).unwrap();
+            assert!(caps.contains(&Capability::Tags));
+            assert!(caps.contains(&Capability::Spec));
+
+            // The generator's managed original stays untouched.
+            assert!(gen_repo.is_managed(managed_id).unwrap());
+
+            let child_copy = entries
+                .iter()
+                .find(|e| e.parent_id == Some(new_node_id))
+                .expect("managed descendants must be deep-copied");
+            assert_ne!(child_copy.node_id, managed_child_id);
 
             Ok(())
         })

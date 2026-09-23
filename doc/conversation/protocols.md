@@ -74,6 +74,7 @@ context recipes — one list, one place, tests over it.
 | `verification` | Verifying-phase **Verify** | node worktree | no | plan steps with verdicts | yes |
 | `review` | Review-phase **Review** | node worktree | no | review findings | yes |
 | `fix` | Review-phase **Fix** | node worktree | no | review findings | yes |
+| `pr` | Pr-phase **Pr** | node worktree | no | PR comments/status | yes |
 | `chat` | action panel's **Chat**, the picker | node's directory, else scratch | yes, recorded | change set | no |
 | `visual_design` | design panel | scratch | yes (1 command) | designer | no |
 
@@ -351,7 +352,18 @@ turn, whose reply was a wall of narration in the lifecycle panel: entering
   changed no verdict, status, or note, like §4.4.
 - **Reopening.** Setting any of the node's steps `implemented` again
   withdraws its `verified` obligation verdicts (`reopened`): the code they
-  were earned against changed. Failed verdicts stay.
+  were earned against changed. Failed verdicts stay. A Fix or Implement turn
+  that lands while the node is in `verifying` (a gate check's finding fixed
+  there) goes further: every `verified` step goes back to `implemented` and
+  every `verified` verdict is reopened (`ReopenVerification`), so the node is
+  verified again before its gate can pass. In `review`, fixing findings is
+  the normal loop and reopens nothing.
+- **Next step.** `tod_core::lifecycle_next` picks the primary button in the
+  lifecycle panel and beside Send, from the stored statuses and verdicts:
+  Verify while anything is owed a verdict, Fix failed once verification
+  finished with failures, and the gate check only after that. A gate verdict
+  recorded before a reopen is replaced in the side pane by "Verify again
+  before the gate check", with a Verify button.
 - **Gate.** `verifying` → `review` has two app-answered criteria:
   `verifying-review.obligations-verified` (every own obligation `verified`)
   and `verifying-review.plan-steps-verified`.
@@ -443,6 +455,52 @@ stays in `review`: fixing is an answer to the review, not a phase of its own.
 - **Side pane.** The review pane (§4c), titled "Fix".
 - **Gate.** Unchanged: rejected counts as answered. The user reads each
   rejection's note, and reopens the finding if they disagree.
+
+## 4e. The pr protocol
+
+Opening and driving the node's pull request (`tod_core::conversation::pr`).
+The node moves to `pr` once `review → pr`'s two app-checked criteria pass
+(the renamed review-done / findings-answered gate, §4c); `pr` owns PR
+creation, CI/comment babysitting, and pushing fixes — not the `approved.md`
+role doc, which is now a thin holding state matching `ready`/`done`.
+
+- **Launch.** Beside Send, **Pr** sits where Review/Fix do once the node has
+  entered `pr`, and sends the starter, "Open and drive the pull request."
+  The picker offers "New pr" on a node in `pr`.
+- **Context.** Implementation's blocks (worktree, node, plan, obligations,
+  ancestors) under the `PR_SESSION` recipe, with the `pr` state agent's role
+  doc and `surface/pr`, which scopes it to opening/driving the PR to
+  mergeable — no approval, no merge, no gate evaluation — and sets the reply
+  rule.
+- **What the agent records.** If the node has no PR yet, it opens one with
+  `tod-cli pr open`, which records the reference
+  (`tod_store::github::NodePrRepo`, table `node_pr`, schema v58: owner,
+  repo, PR number, URL). Each turn it checks `tod-cli pr status` (mergeable
+  flag, combined check conclusion, review decision), pushes fixes for a
+  failing check or a requested change from the worktree, and replies to
+  comments with `tod-cli pr comment reply`. It records a conversation report
+  through `tod-cli pr mergeable` (`{"pr":"mergeable"}`) once GitHub reports
+  the PR ready, `tod-cli pr merged` if it was merged out of band, or
+  `tod-cli pr blocked --why <TEXT>` if it cannot make further progress
+  without the user. The reply is empty or a sentence or two.
+- **Done.** A turn recorded mergeable, merged, or blocked. Otherwise the
+  loop sends the agent back to keep watching and fixing, capped and stopped
+  by a turn that changed nothing since the last one (its progress
+  fingerprint is the PR's owner/repo/number — the closest live signal
+  available without a webhook), like §4.4. There is no polling loop inside a
+  turn: a turn that finds nothing new stops rather than sleeping and
+  re-checking, matching "never block on a timer."
+- **Side pane.** The node's PR comments, reusing the findings-list pattern
+  (`ProtocolKind::works_the_findings`) since both are a list of items to
+  answer.
+- **Gate.** `pr → approved` and `approved → merged` are both app-checked,
+  no agent turn: `tod_core::gate::pr_mergeable_outcome` and
+  `pr_merged_outcome` read the node's `node_pr` row and a live
+  `tod_store::github::get_pr_status` call (mergeable, checks green, and — for
+  the second — merged) rather than asking an agent to judge it. The agent's
+  job ends at mergeable, matching the role doc: approval and merging happen
+  outside this automation, driven by the user (and GitHub's own review
+  requirements).
 
 ## 5. View changes
 

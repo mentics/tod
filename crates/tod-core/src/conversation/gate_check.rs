@@ -119,6 +119,23 @@ pub fn latest_gate_report(
     if entered_at.is_some_and(|entered| conversation.created_at < entered) {
         return Ok(None);
     }
+    // ...nor one verification has ruled on the work since: a fix of its
+    // finding reopened verification, and the verdicts recorded after it are
+    // the current word on the work.
+    let verified_at: Option<i64> = conn.query_row(
+        "SELECT MAX(at) FROM (
+             SELECT MAX(created_at) AS at FROM obligation_verdicts
+             WHERE node_id = ?1 AND status IN ('verified', 'failed')
+             UNION ALL
+             SELECT MAX(updated_at) FROM node_plan_steps
+             WHERE node_id = ?1 AND status IN ('verified', 'failed')
+         )",
+        [node.as_bytes().to_vec()],
+        |row| row.get(0),
+    )?;
+    if verified_at.is_some_and(|verified| conversation.created_at < verified) {
+        return Ok(None);
+    }
     let record = repo
         .latest_report(conversation.id)?
         .and_then(|value| GateReportRecord::from_value(&value));
@@ -623,6 +640,46 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].pass, 1);
         assert!(outputs[0].content.starts_with("Mock retrospective"));
+    }
+
+    /// A gate check's verdict stops standing once verification rules on the
+    /// work again (after a fix of its finding reopened it): the side pane
+    /// must not keep pointing at a finding that was fixed and re-verified.
+    #[test]
+    fn a_gate_report_from_before_the_latest_verification_is_not_shown() {
+        use tod_store::outline::repos::{NodeRepo, PlanStepRepo};
+        use tod_store::outline::repos::plan_steps::STATUS_VERIFIED;
+
+        let fx = crate::interview::test_support::fixture();
+        let conn = tod_store::fleet::schema::open_writer_connection(fx.fleet.writer().db_path())
+            .unwrap();
+        NodeRepo::new(&conn).set_lifecycle(fx.node, "verifying").unwrap();
+        let step = Uuid::new_v4();
+        let steps = PlanStepRepo::new(&conn);
+        steps.insert_at(step, fx.node, 0, "Build it").unwrap();
+        steps.update_status(step, STATUS_VERIFIED, None, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let conversations = ConversationRepo::new(&conn);
+        let check = conversations
+            .create(Focus::Node(fx.node), ProtocolKind::GateCheck, None, None, None)
+            .unwrap();
+        conversations.set_transition(check.id, "verifying", "review").unwrap();
+        let record = GateReportRecord {
+            result: "blocked".into(),
+            summary: "One defect.".into(),
+            ..GateReportRecord::default()
+        };
+        conversations.record_report(check.id, &record.to_value()).unwrap();
+        let shown = latest_gate_report(&conn, fx.node, "verifying").unwrap();
+        assert_eq!(shown.map(|(_, r)| r), Some(record));
+
+        // A fix reopens verification; verification then rules again.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        steps.reopen_verification(fx.node, "Fixed since.").unwrap();
+        assert!(latest_gate_report(&conn, fx.node, "verifying").unwrap().is_some());
+        steps.update_status(step, STATUS_VERIFIED, None, None).unwrap();
+        assert_eq!(latest_gate_report(&conn, fx.node, "verifying").unwrap(), None);
     }
 
     #[test]

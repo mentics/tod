@@ -4,29 +4,22 @@
 
 ## On entry
 
-1. Read lifecycle state and approval evidence.
-2. If already merged to the integration branch → verify and proceed to exit.
+No agent runs on entry — `approved` is a thin holding state, like `ready`/`done`. The `pr` state already drove the PR to mergeable; this state just waits for the user to click merge.
 
 ## Responsibilities
 
-Drive merge to the **agreed integration branch**:
-
-- Open/update PR if needed; ensure CI passes.
-- Resolve merge conflicts; re-run verification if merge affects behavior.
-- Record merge commit/PR reference in evidence notes.
-
-Watch builds triggered by merge as applicable.
+None. Nothing here is agent work: the PR is already open, checks are green, and it is approved. The user merges it when ready.
 
 ## Forward gate rules (`approved` → `merged`)
 
-Apply these prose rules (no DB checklist items for this transition):
+The app checks this gate itself from GitHub's live status; no agent evaluates it:
 
-- Changes are merged to the agreed integration branch. That merge is the gate.
+- The PR has been merged.
 
 ## Exit
 
-When changes are on the integration branch, return `forward_lifecycle: merged`.
+The gate advances the node once GitHub reports the PR merged — no agent turn decides this.
 
 ## Blockers
 
-CI failure, merge conflict requiring human decision, or branch policy block → `blocked`.
+None — if the PR needs more work, the node moves back to `pr`, not forward from here.

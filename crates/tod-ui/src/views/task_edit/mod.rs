@@ -29,7 +29,7 @@ use tod_integration::linear_query::{self, Completion, SuggestionKind};
 use tod_store::fleet::{
     FilesDirectory, FleetMutation, FleetStore, NodeAgent, NoteItem, ResolvedAgent, ResolvedFiles,
     release_worktree_for_node, rename_branch_for_node, setup_worktree_for_node,
-    validate_interview_workspace,
+    terminal::open_shell_for_node, validate_interview_workspace,
 };
 use tod_store::outline::types::EXTRA_CONTENT_METADATA;
 use tod_store::outline::{Capability, EXTRA_CONTENT_DETAILS, NodeSummary, OutlineMutation};
@@ -83,10 +83,10 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::AgentEffort => "task-edit-field-agent-effort",
         TaskEditField::UseWorktree => "task-edit-field-use-worktree",
         TaskEditField::WorktreeAction => "task-edit-field-worktree-action",
+        TaskEditField::LaunchShell => "task-edit-field-launch-shell",
         TaskEditField::RunsIn => "task-edit-field-runs-in",
         TaskEditField::RepoLocation => "task-edit-field-repo-location",
         TaskEditField::ContainerName => "task-edit-field-container",
-        TaskEditField::ContainerDir => "task-edit-field-container-dir",
         TaskEditField::ContainerRefresh => "task-edit-field-container-refresh",
         TaskEditField::ContainerChoice(_) => "task-edit-field-container-choice",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
@@ -101,6 +101,9 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::LinearQuery => "task-edit-field-linear-query",
         TaskEditField::GeneratorSave => "task-edit-field-gen-save",
         TaskEditField::GeneratorRefresh => "task-edit-field-gen-refresh",
+        TaskEditField::GeneratorAcceptDestination => "task-edit-field-gen-accept-dest",
+        TaskEditField::GeneratorAcceptCapability(_) => "task-edit-field-gen-accept-cap",
+        TaskEditField::GeneratorAcceptSave => "task-edit-field-gen-accept-save",
     }
 }
 
@@ -141,6 +144,8 @@ enum TaskEditField {
     UseWorktree,
     /// Files capability "Set up worktree" / "Release worktree" button.
     WorktreeAction,
+    /// Files capability: open a shell/terminal at the resolved directory.
+    LaunchShell,
     /// Files capability: this machine or a dev container (Enter cycles).
     RunsIn,
     /// Dev container: the repository is inside it, or mounted from this
@@ -150,7 +155,6 @@ enum TaskEditField {
     ContainerName,
     /// For a mounted repository, the directory inside the dev container
     /// when its mounts do not say.
-    ContainerDir,
     /// Re-list the running containers.
     ContainerRefresh,
     /// One listed running container, by index; Enter chooses it.
@@ -168,6 +172,12 @@ enum TaskEditField {
     GeneratorSave,
     /// Generator "Refresh now" button.
     GeneratorRefresh,
+    /// Quick-accept destination node slug.
+    GeneratorAcceptDestination,
+    /// One quick-accept capability chip; Enter / click toggles it.
+    GeneratorAcceptCapability(Capability),
+    /// Quick-accept "Save" button.
+    GeneratorAcceptSave,
     Capability(Capability),
 }
 
@@ -184,6 +194,7 @@ impl TaskEditField {
                 | Self::AgentEffort
                 | Self::UseWorktree
                 | Self::WorktreeAction
+                | Self::LaunchShell
                 | Self::RunsIn
                 | Self::RepoLocation
                 | Self::ContainerRefresh
@@ -191,6 +202,8 @@ impl TaskEditField {
                 | Self::GeneratorSource
                 | Self::GeneratorSave
                 | Self::GeneratorRefresh
+                | Self::GeneratorAcceptCapability(_)
+                | Self::GeneratorAcceptSave
                 | Self::Capability(_)
         )
     }
@@ -367,6 +380,18 @@ pub struct TaskEditView {
     generator_config_error: Option<String>,
     /// When true, show the generator detail view instead of the edit form.
     generator_show_detail: bool,
+    /// Quick-accept destination slug, as typed. Not saved until
+    /// `GeneratorAcceptSave` is activated.
+    generator_accept_destination_input: Entity<InputState>,
+    /// The last-saved quick-accept destination, so "unsaved changes" compares
+    /// like with like.
+    generator_accept_destination_saved: Option<String>,
+    /// Capabilities currently checked in the quick-accept form.
+    generator_accept_capabilities: Vec<Capability>,
+    /// Capabilities as last persisted.
+    generator_accept_capabilities_saved: Vec<Capability>,
+    generator_accept_error: Option<String>,
+    generator_accept_busy: bool,
     /// Linear-specific state for filter configuration UI
     linear_introspection_cache: Option<tod_integration::IntrospectionCache>,
     linear_introspection_age: Option<String>,
@@ -413,6 +438,7 @@ pub struct TaskEditView {
     resolved_files: Option<ResolvedFiles>,
     worktree_busy: bool,
     worktree_status: Option<String>,
+    shell_busy: bool,
     /// Files: where launches run (this machine or a dev container).
     dev: dev_container::DevContainerPanel,
     _title_subscription: Subscription,
@@ -456,6 +482,9 @@ impl TaskEditView {
         });
         let tag_draft_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter to edit · Add tag…"));
+        let generator_accept_destination_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Enter to edit · Destination node slug")
+        });
         let linear_preset_name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Preset name…"));
         let linear_preset_select = cx.new(|cx| {
@@ -588,6 +617,12 @@ impl TaskEditView {
             generator_last_error: None,
             generator_config_error: None,
             generator_show_detail: false,
+            generator_accept_destination_input,
+            generator_accept_destination_saved: None,
+            generator_accept_capabilities: Vec::new(),
+            generator_accept_capabilities_saved: Vec::new(),
+            generator_accept_error: None,
+            generator_accept_busy: false,
             linear_introspection_cache: None,
             linear_introspection_age: None,
             linear_introspection_fetching: false,
@@ -618,6 +653,7 @@ impl TaskEditView {
             resolved_files: None,
             worktree_busy: false,
             worktree_status: None,
+            shell_busy: false,
             tags: Vec::new(),
             capabilities: HashSet::new(),
             loaded_title: String::new(),
@@ -743,6 +779,18 @@ impl TaskEditView {
             ]);
         }
         if self.capability_enabled(Capability::Files) {
+            // Where it runs first: it decides what the workspace directory is.
+            if self.own_files().is_some() {
+                stops.push(TaskEditField::RunsIn);
+            }
+            if self.own_dev_container().is_some() {
+                stops.extend([
+                    TaskEditField::RepoLocation,
+                    TaskEditField::ContainerName,
+                    TaskEditField::ContainerRefresh,
+                ]);
+                stops.extend((0..self.dev.container_count()).map(TaskEditField::ContainerChoice));
+            }
             stops.extend([
                 TaskEditField::Repo,
                 TaskEditField::Branch,
@@ -751,16 +799,11 @@ impl TaskEditView {
             if self.worktree_action().is_some() {
                 stops.push(TaskEditField::WorktreeAction);
             }
-            if self.own_files().is_some() {
-                stops.push(TaskEditField::RunsIn);
-            }
-            if let Some(dev) = self.own_dev_container() {
-                stops.extend([TaskEditField::RepoLocation, TaskEditField::ContainerName]);
-                if dev.repo_on_host {
-                    stops.push(TaskEditField::ContainerDir);
-                }
-                stops.push(TaskEditField::ContainerRefresh);
-                stops.extend((0..self.dev.container_count()).map(TaskEditField::ContainerChoice));
+            if matches!(
+                self.own_files().map(|files| files.directory()),
+                Some(FilesDirectory::Ready(_))
+            ) {
+                stops.push(TaskEditField::LaunchShell);
             }
         }
         if self.capability_enabled(Capability::Ticket) {
@@ -789,6 +832,13 @@ impl TaskEditView {
             }
             if self.generator_data_source_type.is_some() {
                 stops.push(TaskEditField::GeneratorRefresh);
+                // Quick-accept config lives on the same row as the data-source
+                // config, so it only exists once that has been saved once.
+                stops.push(TaskEditField::GeneratorAcceptDestination);
+                for cap in Capability::ALL {
+                    stops.push(TaskEditField::GeneratorAcceptCapability(cap));
+                }
+                stops.push(TaskEditField::GeneratorAcceptSave);
             }
         }
         for cap in Capability::ALL {
@@ -869,7 +919,9 @@ impl TaskEditView {
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::ContainerName => self.dev.container_input.clone().into(),
-            TaskEditField::ContainerDir => self.dev.dir_input.clone().into(),
+            TaskEditField::GeneratorAcceptDestination => {
+                self.generator_accept_destination_input.clone().into()
+            }
             TaskEditField::Obligations
             | TaskEditField::RunsIn
             | TaskEditField::RepoLocation
@@ -880,9 +932,12 @@ impl TaskEditView {
             | TaskEditField::AgentEffort
             | TaskEditField::UseWorktree
             | TaskEditField::WorktreeAction
+            | TaskEditField::LaunchShell
             | TaskEditField::GeneratorSource
             | TaskEditField::GeneratorSave
             | TaskEditField::GeneratorRefresh
+            | TaskEditField::GeneratorAcceptCapability(_)
+            | TaskEditField::GeneratorAcceptSave
             | TaskEditField::Capability(_) => return None,
         })
     }
@@ -902,7 +957,10 @@ impl TaskEditView {
                 TaskEditField::ContainerName,
                 self.dev.container_input.clone().into(),
             ),
-            (TaskEditField::ContainerDir, self.dev.dir_input.clone().into()),
+            (
+                TaskEditField::GeneratorAcceptDestination,
+                self.generator_accept_destination_input.clone().into(),
+            ),
         ];
         for (index, field) in self.generator_fields.iter().enumerate() {
             if let Some(input) = field.input.clone() {
@@ -957,6 +1015,14 @@ impl TaskEditView {
                 self.refresh_generator_now(cx);
                 return;
             }
+            TaskEditField::GeneratorAcceptCapability(cap) => {
+                self.toggle_accept_capability(cap, cx);
+                return;
+            }
+            TaskEditField::GeneratorAcceptSave => {
+                self.save_generator_accept_config(cx);
+                return;
+            }
             TaskEditField::Capability(cap) => {
                 self.toggle_capability(cap, window, cx);
                 self.clamp_focus_index();
@@ -975,6 +1041,10 @@ impl TaskEditView {
             }
             TaskEditField::WorktreeAction => {
                 self.run_worktree_action(cx);
+                return;
+            }
+            TaskEditField::LaunchShell => {
+                self.launch_shell_for_task(cx);
                 return;
             }
             TaskEditField::RunsIn => {
@@ -1383,8 +1453,16 @@ impl TaskEditView {
                 .background_spawn(async move {
                     let settings = TodSettings::load(&paths).unwrap_or_default();
                     if setup {
-                        setup_worktree_for_node(&fleet, &paths, &settings, &task_id)
-                            .map(|path| format!("Worktree ready at {path}"))
+                        setup_worktree_for_node(&fleet, &paths, &settings, &task_id).map(
+                            |(path, warnings)| {
+                                let mut message = format!("Worktree ready at {path}");
+                                for warning in warnings {
+                                    message.push_str(&format!("
+{warning}"));
+                                }
+                                message
+                            },
+                        )
                     } else {
                         release_worktree_for_node(&fleet, &paths, &settings, &task_id)
                             .map(|()| "Worktree released".to_string())
@@ -1403,6 +1481,42 @@ impl TaskEditView {
                 let _ = this.fleet.reload_if_stale();
                 this.load_action_capabilities();
                 this.clamp_focus_index();
+                this.notify_changed(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Open a shell/terminal at the node's resolved directory, off the UI thread.
+    fn launch_shell_for_task(&mut self, cx: &mut Context<Self>) {
+        if self.shell_busy {
+            return;
+        }
+        let Some(task_id) = self.task_id() else {
+            return;
+        };
+        self.shell_busy = true;
+        self.worktree_status = Some("Opening terminal…".into());
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let result: anyhow::Result<String> = cx
+                .background_spawn(async move {
+                    let settings = TodSettings::load(&paths).unwrap_or_default();
+                    open_shell_for_node(&fleet, &paths, &settings, &task_id, None)
+                        .map(|(_, cwd)| format!("Opened terminal in {cwd}"))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.shell_busy = false;
+                match result {
+                    Ok(message) => this.worktree_status = Some(message),
+                    Err(err) => {
+                        this.worktree_status = None;
+                        this.pending_toast = Some(format!("{err:#}"));
+                    }
+                }
                 this.notify_changed(cx);
             });
         })
@@ -1720,6 +1834,18 @@ impl TaskEditView {
                 // Compare against the form's own rendering of the stored
                 // config, so a round trip alone never reads as dirty.
                 self.generator_saved_config = Some(self.generator_config_value(cx));
+                let dest_text = config
+                    .accept_destination_node_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default();
+                self.generator_accept_destination_input.update(cx, |input, cx| {
+                    input.set_value(dest_text, window, cx);
+                });
+                self.generator_accept_destination_saved =
+                    config.accept_destination_node_id.map(|id| id.to_string());
+                self.generator_accept_capabilities = config.accept_capabilities.clone();
+                self.generator_accept_capabilities_saved = config.accept_capabilities;
+                self.generator_accept_error = None;
             }
             None => {
                 self.generator_data_source_type = None;
@@ -1729,6 +1855,13 @@ impl TaskEditView {
                 self.generator_extra_config.clear();
                 self.generator_invalid_fields.clear();
                 self.generator_saved_config = None;
+                self.generator_accept_destination_input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                });
+                self.generator_accept_destination_saved = None;
+                self.generator_accept_capabilities.clear();
+                self.generator_accept_capabilities_saved.clear();
+                self.generator_accept_error = None;
                 self.clear_linear_state();
             }
         }
@@ -2413,6 +2546,88 @@ impl TaskEditView {
             });
         })
         .detach();
+    }
+
+    fn toggle_accept_capability(&mut self, cap: Capability, cx: &mut Context<Self>) {
+        if let Some(pos) = self
+            .generator_accept_capabilities
+            .iter()
+            .position(|c| *c == cap)
+        {
+            self.generator_accept_capabilities.remove(pos);
+        } else {
+            self.generator_accept_capabilities.push(cap);
+        }
+        cx.notify();
+    }
+
+    /// Resolve a node slug (as the user types it) to its id, for the
+    /// quick-accept destination field. Trimmed; empty clears the
+    /// destination.
+    fn resolve_accept_destination(&self, cx: &App) -> Result<Option<uuid::Uuid>, String> {
+        let slug = input_text(&self.generator_accept_destination_input, cx)
+            .trim()
+            .to_string();
+        if slug.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(id) = uuid::Uuid::parse_str(&slug) {
+            return Ok(Some(id));
+        }
+        let found = self
+            .fleet
+            .read(|conn| tod_store::outline::repos::NodeRepo::new(conn).get_by_slug(&slug))
+            .map_err(|err| err.to_string())?;
+        match found {
+            Some(node) => Ok(Some(node.id)),
+            None => Err(format!("No node with slug \"{slug}\"")),
+        }
+    }
+
+    /// Save the quick-accept destination and capabilities. Both are optional
+    /// — clearing the destination field turns accept back off for this
+    /// generator.
+    fn save_generator_accept_config(&mut self, cx: &mut Context<Self>) {
+        if self.generator_accept_busy {
+            return;
+        }
+        let Some(node_id) = self.node_uuid() else {
+            return;
+        };
+        let destination_node_id = match self.resolve_accept_destination(cx) {
+            Ok(id) => id,
+            Err(err) => {
+                self.generator_accept_error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+        self.generator_accept_error = None;
+        self.generator_accept_busy = true;
+        cx.notify();
+
+        let capabilities = self.generator_accept_capabilities.clone();
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::SetGeneratorAcceptConfig {
+            node_id,
+            destination_node_id,
+            capabilities: capabilities.clone(),
+        }) {
+            self.generator_accept_busy = false;
+            self.generator_accept_error = Some(err.to_string());
+            cx.notify();
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.generator_accept_busy = false;
+            self.generator_accept_error = Some(err.to_string());
+            cx.notify();
+            return;
+        }
+        self.generator_accept_busy = false;
+        self.generator_accept_destination_saved =
+            destination_node_id.map(|id| id.to_string());
+        self.generator_accept_capabilities_saved = capabilities;
+        self.notify_changed(cx);
     }
 
     /// Fetch from the configured data source on the background executor. The
@@ -3481,7 +3696,8 @@ impl TaskEditView {
         let directory_text = match &directory {
             Some(FilesDirectory::Ready(path)) => Some(path.to_string()),
             Some(FilesDirectory::Missing(reason)) => Some(reason.clone()),
-            Some(FilesDirectory::NeedsWorktreeSetup) | None => None,
+            Some(FilesDirectory::NeedsWorktreeSetup) => Some("Not set up yet".to_string()),
+            None => None,
         };
         let mut directory_row = h_flex().gap_2().items_center().flex_wrap();
         if let Some(text) = directory_text {
@@ -3522,11 +3738,43 @@ impl TaskEditView {
                 ),
             );
         }
+        if matches!(directory, Some(FilesDirectory::Ready(_))) {
+            let shell_busy = self.shell_busy;
+            let shell_focused = self.field_nav_focused(TaskEditField::LaunchShell);
+            directory_row = directory_row.child(
+                self.apply_focus_scroll_anchor(
+                    TaskEditField::LaunchShell,
+                    div()
+                        .id(field_anchor_id(TaskEditField::LaunchShell))
+                        .rounded_md()
+                        .when(shell_focused, |el| {
+                            el.bg(active).border_1().border_color(active_border)
+                        })
+                        .child(
+                            Button::new("task-edit-launch-shell")
+                                .label(if shell_busy { "Opening…" } else { "Open shell" })
+                                .outline()
+                                .compact()
+                                .disabled(shell_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.enter_field_edit(
+                                        TaskEditField::LaunchShell,
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
+                ),
+            );
+        }
 
         v_flex()
             .gap_2()
             .px_3()
             .pb_3()
+            .when(self.own_files().is_some(), |el| {
+                el.child(self.render_dev_container(muted, window, cx))
+            })
             .child(
                 h_flex()
                     .gap_2()
@@ -3542,7 +3790,7 @@ impl TaskEditView {
                                 .flex_shrink_0()
                                 .child(Self::render_field_label(
                                     if self.repo_in_container() {
-                                        "Repository in the container"
+                                        "Workspace directory (in the container)"
                                     } else {
                                         "Workspace directory"
                                     },
@@ -3612,9 +3860,6 @@ impl TaskEditView {
                     .child(Self::render_field_label("Resolved directory", cx))
                     .child(directory_row),
             )
-            .when(self.own_files().is_some(), |el| {
-                el.child(self.render_dev_container(muted, window, cx))
-            })
             .when_some(self.worktree_status.clone(), |el, status| {
                 el.child(div().text_xs().text_color(muted).child(selectable_text(
                     "task-edit-worktree-status",
@@ -4107,6 +4352,118 @@ impl TaskEditView {
                 cx,
             )));
         }
+
+        col = col.child(self.render_generator_accept_section(muted, window, cx));
+
+        col
+    }
+
+    /// Quick-accept: the destination node a ticket copies to on Accept, and
+    /// the capabilities enabled on the copy. Both start unset — the Accept
+    /// action is a no-op until a destination is saved here.
+    fn render_generator_accept_section(
+        &self,
+        muted: gpui::Hsla,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let danger = cx.theme().danger;
+        let mut col = v_flex()
+            .gap_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_xs()
+                    .font_semibold()
+                    .text_color(muted)
+                    .child("Quick accept"),
+            );
+
+        col = col.child(
+            self.apply_focus_scroll_anchor(
+                TaskEditField::GeneratorAcceptDestination,
+                v_flex()
+                    .id(field_anchor_id(TaskEditField::GeneratorAcceptDestination))
+                    .gap_1()
+                    .w_full()
+                    .rounded_md()
+                    .when(
+                        self.field_nav_focused(TaskEditField::GeneratorAcceptDestination),
+                        |el| {
+                            el.bg(cx.theme().list_active)
+                                .border_1()
+                                .border_color(cx.theme().list_active_border)
+                        },
+                    )
+                    .child(Self::render_field_label("Destination node slug", cx))
+                    .child(
+                        Input::new(&self.generator_accept_destination_input)
+                            .w_full()
+                            .disabled(
+                                self.editing != Some(TaskEditField::GeneratorAcceptDestination),
+                            ),
+                    ),
+            ),
+        );
+
+        let mut chips = h_flex().gap_1().flex_wrap();
+        for cap in Capability::ALL {
+            let checked = self.generator_accept_capabilities.contains(&cap);
+            let focused = self.field_nav_focused(TaskEditField::GeneratorAcceptCapability(cap));
+            chips = chips.child(
+                div()
+                    .id(field_anchor_id(TaskEditField::GeneratorAcceptCapability(cap)))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if focused {
+                        cx.theme().list_active_border
+                    } else {
+                        cx.theme().border
+                    })
+                    .when(checked, |el| el.bg(cx.theme().list_active))
+                    .text_color(if checked { cx.theme().foreground } else { muted })
+                    .child(cap.label())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_accept_capability(cap, cx);
+                        }),
+                    ),
+            );
+        }
+        col = col.child(chips);
+
+        if let Some(err) = &self.generator_accept_error {
+            col = col.child(div().text_xs().text_color(danger).child(selectable_text(
+                "task-edit-gen-accept-error",
+                err.clone(),
+                window,
+                cx,
+            )));
+        }
+
+        col = col.child(
+            h_flex().justify_end().child(
+                Button::new("task-edit-gen-accept-save")
+                    .label(if self.generator_accept_busy {
+                        "Saving…"
+                    } else {
+                        "Save"
+                    })
+                    .compact()
+                    .selected(self.field_nav_focused(TaskEditField::GeneratorAcceptSave))
+                    .disabled(self.generator_accept_busy)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.save_generator_accept_config(cx);
+                    })),
+            ),
+        );
 
         col
     }

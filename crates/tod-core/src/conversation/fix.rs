@@ -18,7 +18,7 @@ use tod_store::fleet::Workdir;
 use super::context::ReportedStale;
 use super::implement::{
     IMPLEMENT_CONVERSATION_ENV, IMPLEMENT_NODE_ENV, TestRun, commit_run, node_id, plan_steps,
-    prepare_submodules, worktree_fingerprint,
+    prepare_submodules, reopen_verification_after_change, worktree_fingerprint,
 };
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, Stop, TurnContext, cap_or_stall};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_fix_message};
@@ -62,6 +62,12 @@ impl Protocol for FixProtocol {
 
     fn prepare(&self, env: &ProtocolEnv<'_>) -> Result<()> {
         prepare_submodules(env, &self.cwd(env)?)
+    }
+
+    /// A fix on a node still in `verifying` (a gate check's finding) changes
+    /// code verification already confirmed, so it has to be verified again.
+    fn on_reply(&self, env: &ProtocolEnv<'_>, _reply: &str) -> Vec<RunNotice> {
+        reopen_verification_after_change(env, "A fix")
     }
 
     fn finish(&self, env: &ProtocolEnv<'_>) -> Vec<RunNotice> {
@@ -420,5 +426,49 @@ mod tests {
             Next::Done(Stop::ContinuationCap)
         ));
         assert!(matches!(decide(&fx, None, 1, false), Next::Done(Stop::NoProgress)));
+    }
+
+    /// A fix on a node in `verifying` (a gate check's finding) withdraws
+    /// what verification confirmed, so Verify — not the gate check — is next.
+    /// In `review`, where fixing findings is the normal loop, it does not.
+    #[test]
+    fn a_fix_in_verifying_reopens_verification_but_not_in_review() {
+        use tod_store::outline::OutlineMutation;
+        use tod_store::outline::repos::PlanStepRepo;
+        use tod_store::outline::repos::plan_steps::{STATUS_IMPLEMENTED, STATUS_VERIFIED};
+
+        let fx = fixture();
+        let conn = tod_store::fleet::schema::open_writer_connection(fx.fleet.writer().db_path())
+            .unwrap();
+        let step = Uuid::new_v4();
+        let steps = PlanStepRepo::new(&conn);
+        steps.insert_at(step, fx.node, 0, "Build it").unwrap();
+        let media = MediaPaths::discover().expect("media paths");
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id: Uuid::new_v4(),
+            focus: Focus::Node(fx.node),
+        };
+        let status = || {
+            PlanStepRepo::new(&conn).list_for_node(fx.node).unwrap()[0]
+                .status
+                .clone()
+        };
+        let reply_in = |state: &str| {
+            fx.outline(OutlineMutation::SetLifecycle {
+                node_id: fx.node,
+                state: state.into(),
+            });
+            fx.fleet.writer().flush().unwrap();
+            steps.update_status(step, STATUS_VERIFIED, None, None).unwrap();
+            assert!(FixProtocol.on_reply(&env, "").is_empty());
+        };
+
+        reply_in("review");
+        assert_eq!(status(), STATUS_VERIFIED);
+        reply_in("verifying");
+        assert_eq!(status(), STATUS_IMPLEMENTED);
     }
 }

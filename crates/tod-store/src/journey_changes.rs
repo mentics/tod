@@ -24,7 +24,7 @@
 //! - `node_gate_evaluations`
 //! - `node_plan_steps`
 //! - `node_generator_config`, `managed_node_links`
-//! - `node_files`, `node_agent`
+//! - `node_files`, `node_agent`, `node_pr` (the pull request the `pr` state opened)
 //! - `obligation_verdicts` (`tod_store::verification`; insert-only, the
 //!   history is append-only)
 //! - `review_findings` (`tod_store::review`)
@@ -136,7 +136,7 @@ pub fn create_triggers_sql() -> String {
 
     // Tables whose primary key *is* node_id (one row per node): row_id is
     // just the node id.
-    for table in ["node_fields", "node_tags", "node_generator_config", "node_files", "node_agent"] {
+    for table in ["node_fields", "node_tags", "node_generator_config", "node_files", "node_agent", "node_pr"] {
         sql.push_str(&node_keyed_triggers(table));
     }
 

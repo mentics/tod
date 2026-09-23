@@ -216,6 +216,15 @@ pub enum InterviewCommand {
         conversation_id: Option<Uuid>,
         finding: crate::review::NewFinding,
     },
+    /// Record a node's pull request reference, once `tod-cli pr open` has
+    /// created it (`crate::github::NodePrRepo`).
+    RecordNodePr {
+        node_id: Uuid,
+        owner: String,
+        repo: String,
+        pr_number: i64,
+        url: String,
+    },
     /// Respond to a review finding: its status, and the fix or why not.
     RespondReviewFinding {
         finding_id: Uuid,
@@ -234,6 +243,9 @@ pub enum InterviewCommand {
         status: String,
         evidence: String,
     },
+    /// Withdraw what verification confirmed on a node whose code changed
+    /// since (`PlanStepRepo::reopen_verification`).
+    ReopenVerification { node_id: Uuid, why: String },
     /// Record an evaluation's verdict on a node's incoming changes and
     /// resolve the entries it covers (`crate::incoming`): `action_ids`, or
     /// every pending entry when unset.
@@ -859,6 +871,16 @@ pub fn execute(
                 crate::review::ReviewRepo::new(conn).add(*node_id, *conversation_id, finding)?;
             Ok(json!({ "id": finding.id.to_string(), "seq": finding.seq }))
         }
+        InterviewCommand::RecordNodePr {
+            node_id,
+            owner,
+            repo,
+            pr_number,
+            url,
+        } => {
+            crate::github::NodePrRepo::new(conn).set(*node_id, owner, repo, *pr_number, url)?;
+            Ok(json!({}))
+        }
         InterviewCommand::RespondReviewFinding {
             finding_id,
             status,
@@ -882,6 +904,11 @@ pub fn execute(
                 evidence,
             )?;
             Ok(json!({ "id": verdict.id, "status": verdict.status }))
+        }
+        InterviewCommand::ReopenVerification { node_id, why } => {
+            let (steps, verdicts) = crate::outline::repos::PlanStepRepo::new(conn)
+                .reopen_verification(*node_id, why)?;
+            Ok(json!({ "steps": steps, "verdicts": verdicts }))
         }
         InterviewCommand::ResolveIncoming {
             node_id,

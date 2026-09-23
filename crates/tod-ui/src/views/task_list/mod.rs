@@ -736,6 +736,16 @@ impl TaskListView {
             RowAction::ToggleGeneratorFilter { task_id } => {
                 self.toggle_generator_filter(&task_id, window, cx);
             }
+            RowAction::AcceptTicket { task_id } => {
+                let ready = self
+                    .all_tasks
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .is_some_and(|t| t.accept_ready);
+                if ready {
+                    self.accept_ticket(&task_id, window, cx);
+                }
+            }
         }
     }
 
@@ -2539,7 +2549,7 @@ impl TaskListView {
         cx.notify();
     }
 
-    fn on_toggle_mark(&mut self, _: &TaskListToggleMark, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_toggle_mark(&mut self, _: &TaskListToggleMark, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task_id) = self
             .working_set
             .selected_id
@@ -2548,7 +2558,44 @@ impl TaskListView {
         else {
             return;
         };
+        // On a ticket row whose generator has a quick-accept destination
+        // configured, Space accepts it instead of toggling the batch mark.
+        if let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id)
+            && task.managed
+            && task.external_id.is_some()
+        {
+            if task.accept_ready {
+                self.accept_ticket(&task_id, window, cx);
+            }
+            return;
+        }
         self.toggle_mark(&task_id, cx);
+    }
+
+    /// Quick-accept: copy a generator-managed ticket out to its generator's
+    /// configured destination, enable the configured capabilities on the
+    /// copy, and select it. A no-op (nothing enqueued) unless the row is
+    /// still an accept-ready managed ticket — callers check `accept_ready`
+    /// before calling this so the keystroke and chip are both silent
+    /// no-ops otherwise, not an error toast.
+    fn accept_ticket(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(source_node_id) = uuid::Uuid::parse_str(task_id) else {
+            return;
+        };
+        let new_node_id = uuid::Uuid::new_v4();
+        if let Err(err) = self.fleet.enqueue_outline(OutlineMutation::AcceptGeneratedTicket {
+            source_node_id,
+            new_node_id,
+        }) {
+            self.show_error(format!("Accept failed: {err}"), window, cx);
+            return;
+        }
+        if let Err(err) = self.fleet.writer().flush() {
+            self.show_error(format!("Accept failed: {err}"), window, cx);
+            return;
+        }
+        self.live_refresh(window, cx);
+        self.select_created_task(&new_node_id.to_string(), window, cx);
     }
 
     /// The nodes "Check incoming changes" acts on: the marked rows, else

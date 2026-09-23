@@ -303,6 +303,25 @@ pub enum OutlineMutation {
     DeleteGeneratorConfig {
         node_id: Uuid,
     },
+    /// Set a generator's quick-accept destination node and the capabilities
+    /// to auto-enable on an accepted ticket's copy. Both start unset.
+    SetGeneratorAcceptConfig {
+        node_id: Uuid,
+        destination_node_id: Option<Uuid>,
+        capabilities: Vec<Capability>,
+    },
+    /// Quick-accept a generator-managed ticket: copy it (and its managed
+    /// descendants) out to its generator's configured accept destination,
+    /// following the same copy-and-link path as [`OutlineMutation::PasteManagedNodeCopy`],
+    /// then enable the generator's configured accept capabilities on the
+    /// new root node. A no-op if the source has no data-source link or its
+    /// generator has no destination configured.
+    AcceptGeneratedTicket {
+        source_node_id: Uuid,
+        /// The UI assigns this up front so it can select the new node
+        /// reliably as soon as the mutation is flushed.
+        new_node_id: Uuid,
+    },
     /// Create a managed node under a generator parent with a data-source link.
     CreateManagedNode {
         node_id: Option<Uuid>,
@@ -425,6 +444,8 @@ impl OutlineMutation {
                 | OutlineMutation::ApplyGateResults { .. }
                 | OutlineMutation::SetGeneratorConfig { .. }
                 | OutlineMutation::DeleteGeneratorConfig { .. }
+                | OutlineMutation::SetGeneratorAcceptConfig { .. }
+                | OutlineMutation::AcceptGeneratedTicket { .. }
                 | OutlineMutation::CreateManagedNode { .. }
                 | OutlineMutation::UpdateManagedNode { .. }
                 | OutlineMutation::DeleteManagedNodes { .. }
@@ -815,6 +836,30 @@ impl OutlineMutation {
             }
             OutlineMutation::DeleteGeneratorConfig { node_id } => {
                 GeneratorRepo::new(conn).delete_config(*node_id)?;
+            }
+            OutlineMutation::SetGeneratorAcceptConfig {
+                node_id,
+                destination_node_id,
+                capabilities,
+            } => {
+                require_capability(conn, *node_id, Capability::Generator)?;
+                if let Some(dest) = destination_node_id {
+                    NodeRepo::new(conn)
+                        .get(*dest)
+                        .context("accept destination node not found")?;
+                }
+                GeneratorRepo::new(conn).set_accept_config(
+                    *node_id,
+                    *destination_node_id,
+                    capabilities,
+                )?;
+            }
+            OutlineMutation::AcceptGeneratedTicket {
+                source_node_id,
+                new_node_id,
+            } => {
+                let new_id = accept_generated_ticket(conn, *source_node_id, *new_node_id)?;
+                return Ok(new_id);
             }
             OutlineMutation::CreateManagedNode {
                 node_id,
@@ -1599,9 +1644,53 @@ fn paste_managed_node_copy(
         list_id,
         parent_id,
         Some(ordinal),
+        None,
     )?;
 
     Ok(new_root_id)
+}
+
+/// Quick-accept: copy a managed ticket node out to its generator's
+/// configured accept destination and enable the configured accept
+/// capabilities on it. `Ok(None)` if the source has no data-source link or
+/// its generator has no destination configured — the caller treats that as
+/// inert, not an error.
+fn accept_generated_ticket(
+    conn: &Connection,
+    source_node_id: Uuid,
+    new_node_id: Uuid,
+) -> Result<Option<Uuid>> {
+    let gen_repo = GeneratorRepo::new(conn);
+    let Some(link) = gen_repo.get_link(source_node_id)? else {
+        return Ok(None);
+    };
+    let Some(config) = gen_repo.get_config(link.generator_node_id)? else {
+        return Ok(None);
+    };
+    let Some(destination) = config.accept_destination_node_id else {
+        return Ok(None);
+    };
+
+    guard_not_in_generator_subtree(conn, Some(destination))?;
+    let list_id = outline_list_for_node(conn, destination)?;
+    let outline = OutlineRepo::new(conn);
+    let ordinal = outline.next_ordinal(list_id, Some(destination))?;
+
+    let new_id = copy_managed_node_recursive(
+        conn,
+        source_node_id,
+        &link,
+        list_id,
+        Some(destination),
+        Some(ordinal),
+        Some(new_node_id),
+    )?;
+
+    if !config.accept_capabilities.is_empty() {
+        NodeRepo::new(conn).enable_capabilities(new_id, &config.accept_capabilities)?;
+    }
+
+    Ok(Some(new_id))
 }
 
 fn copy_managed_node_recursive(
@@ -1611,6 +1700,7 @@ fn copy_managed_node_recursive(
     list_id: Uuid,
     parent_id: Option<Uuid>,
     ordinal: Option<i32>,
+    forced_id: Option<Uuid>,
 ) -> Result<Uuid> {
     let node_repo = NodeRepo::new(conn);
     let outline = OutlineRepo::new(conn);
@@ -1625,7 +1715,7 @@ fn copy_managed_node_recursive(
         .unwrap_or_default();
 
     let title = link.copy_title(&source.title);
-    let new_id = Uuid::new_v4();
+    let new_id = forced_id.unwrap_or_else(Uuid::new_v4);
     let base = crate::outline::slug::derive_node_slug(&title, None);
     let slug = crate::outline::slug::allocate_unique_slug(conn, &base, Some(new_id))?;
     let new_node = node_repo.create_with_id(new_id, &slug, &title)?;
@@ -1690,6 +1780,7 @@ fn copy_managed_node_recursive(
             &child_link,
             list_id,
             Some(new_node.id),
+            None,
             None,
         )?;
     }

@@ -3,11 +3,12 @@
 //!
 //! The repository usually lives in the container, and the workspace
 //! directory is its path there. "Repository" switches to one on this machine
-//! mounted into the container, which adds the directory in the container.
+//! mounted into the container; the directory in the container then follows
+//! from its mounts.
 //!
-//! Docker is only ever called off the UI thread. The container name and the
-//! directory in it autosave after a short pause in typing (Enter saves at
-//! once); choosing a listed container saves immediately.
+//! Docker is only ever called off the UI thread. The container name
+//! autosaves after a short pause in typing (Enter saves at once); choosing a
+//! listed container saves immediately.
 
 use super::{TaskEditField, TaskEditView, input_text};
 use crate::ui::selectable_text::selectable_text;
@@ -27,7 +28,6 @@ const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 pub(super) struct DevContainerPanel {
     pub(super) container_input: Entity<InputState>,
-    pub(super) dir_input: Entity<InputState>,
     /// Running containers from the last `docker ps`, dev containers first.
     containers: Vec<ContainerSummary>,
     listing: bool,
@@ -39,16 +39,13 @@ pub(super) struct DevContainerPanel {
     /// panel has left is dropped.
     generation: u64,
     _save_task: Option<Task<()>>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 1],
 }
 
 impl DevContainerPanel {
     pub(super) fn new(window: &mut Window, cx: &mut Context<TaskEditView>) -> Self {
         let container_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Enter to edit · Container name or ID")
-        });
-        let dir_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Enter to edit · From the container's mounts")
         });
         let subscribe = |input: &Entity<InputState>, cx: &mut Context<TaskEditView>| {
             cx.subscribe(input, |this: &mut TaskEditView, _, event: &InputEvent, cx| {
@@ -59,13 +56,9 @@ impl DevContainerPanel {
                 }
             })
         };
-        let _subscriptions = [
-            subscribe(&container_input, cx),
-            subscribe(&dir_input, cx),
-        ];
+        let _subscriptions = [subscribe(&container_input, cx)];
         Self {
             container_input,
-            dir_input,
             containers: Vec::new(),
             listing: false,
             list_error: None,
@@ -97,12 +90,8 @@ impl TaskEditView {
         self.dev.checking = false;
         let dev = self.own_dev_container().unwrap_or_default();
         let container = dev.container().unwrap_or_default().to_string();
-        let directory = dev.directory.clone().unwrap_or_default();
         self.dev.container_input.update(cx, |input, cx| {
             input.set_value(container, window, cx);
-        });
-        self.dev.dir_input.update(cx, |input, cx| {
-            input.set_value(directory, window, cx);
         });
         if self.own_dev_container().is_some() {
             if self.dev.containers.is_empty() && !self.dev.listing {
@@ -122,8 +111,6 @@ impl TaskEditView {
             None => Some(DevContainerSetting {
                 container: Some(input_text(&self.dev.container_input, cx))
                     .filter(|c| !c.trim().is_empty()),
-                directory: Some(input_text(&self.dev.dir_input, cx))
-                    .filter(|d| !d.trim().is_empty()),
                 repo_on_host: false,
             }),
         };
@@ -169,14 +156,6 @@ impl TaskEditView {
             return;
         }
         let container = input_text(&self.dev.container_input, cx).trim().to_string();
-        let directory = input_text(&self.dev.dir_input, cx).trim().to_string();
-        if !directory.is_empty() && !directory.starts_with('/') {
-            self.dev.check = Some(Err(
-                "The directory in the container must be an absolute path (/workspaces/…)".into(),
-            ));
-            cx.notify();
-            return;
-        }
         if !container.is_empty()
             && let Err(err) = devcontainer::validate_container_ref(&container)
         {
@@ -188,7 +167,6 @@ impl TaskEditView {
         self.save_dev_container(
             Some(DevContainerSetting {
                 container: (!container.is_empty()).then_some(container),
-                directory: (!directory.is_empty()).then_some(directory),
                 repo_on_host,
             }),
             cx,
@@ -232,12 +210,6 @@ impl TaskEditView {
         let normalize = |dev: Option<DevContainerSetting>| {
             dev.map(|dev| DevContainerSetting {
                 container: dev.container().map(str::to_string),
-                directory: dev
-                    .directory
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_string),
                 repo_on_host: dev.repo_on_host,
             })
         };
@@ -315,9 +287,8 @@ impl TaskEditView {
                 self.dev.checking = false;
                 return;
             };
-            let directory = dev.directory().map(str::to_string);
             Box::new(move || {
-                devcontainer::resolve_directory(&container, &host_dir, directory.as_deref())
+                devcontainer::resolve_directory(&container, &host_dir, None)
                     .map(|(info, dir)| match info.remote_user {
                         Some(user) => format!("Runs in {dir} in {} as {user}", info.name),
                         None => format!("Runs in {dir} in {}", info.name),
@@ -432,23 +403,7 @@ impl TaskEditView {
                         window,
                         cx,
                     )),
-            ))
-            .when(dev.repo_on_host, |el| el.child(self.apply_focus_scroll_anchor(
-                TaskEditField::ContainerDir,
-                v_flex()
-                    .id(super::field_anchor_id(TaskEditField::ContainerDir))
-                    .gap_1()
-                    .w(gpui::px(200.))
-                    .flex_shrink_0()
-                    .child(Self::render_field_label("Directory in the container", cx))
-                    .child(self.render_nav_input(
-                        TaskEditField::ContainerDir,
-                        self.dev.dir_input.clone(),
-                        None,
-                        window,
-                        cx,
-                    )),
-            )));
+            ));
 
         let refresh_focused = self.field_nav_focused(TaskEditField::ContainerRefresh);
         let list_header = h_flex()
@@ -600,8 +555,9 @@ fn check_repo_in_container(container: &str, repo: Option<&str>) -> Result<String
             exec.name
         ));
     };
+    let [config, safe] = tod_store::fleet::workdir::CONTAINER_GIT_CONFIG;
     let out = exec
-        .output("/", "git", &["-C", repo, "rev-parse", "--show-toplevel"])
+        .output("/", "git", &[config, safe, "-C", repo, "rev-parse", "--show-toplevel"])
         .map_err(|err| format!("{err:#}"))?;
     if !out.status.success() {
         return Err(format!(

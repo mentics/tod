@@ -22,10 +22,6 @@ pub struct DevContainerSetting {
     /// Container name or id; `None` until one is chosen.
     #[serde(default)]
     pub container: Option<String>,
-    /// With `repo_on_host`, the directory inside the container. `None` maps
-    /// the workspace directory (or worktree) through the container's mounts.
-    #[serde(default)]
-    pub directory: Option<String>,
     /// The repository is on this machine, mounted into the container.
     #[serde(default)]
     pub repo_on_host: bool,
@@ -34,15 +30,6 @@ pub struct DevContainerSetting {
 impl DevContainerSetting {
     pub fn container(&self) -> Option<&str> {
         self.container.as_deref().map(str::trim).filter(|c| !c.is_empty())
-    }
-
-    /// The directory inside the container for a repository on this machine;
-    /// `None` when it lives in the container (its path is the directory).
-    pub fn directory(&self) -> Option<&str> {
-        if !self.repo_on_host {
-            return None;
-        }
-        self.directory.as_deref().map(str::trim).filter(|d| !d.is_empty())
     }
 
     /// The container the repository lives in, when it lives in one.
@@ -89,7 +76,7 @@ impl<'a> NodeFilesRepo<'a> {
         self.conn
             .query_row(
                 "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
-                        dev_container, container, container_dir, container_repo_on_host
+                        dev_container, container, container_repo_on_host
                  FROM node_files WHERE node_id = ?1",
                 params![blob],
                 row_to_files,
@@ -116,31 +103,24 @@ impl<'a> NodeFilesRepo<'a> {
         dev_container: Option<&DevContainerSetting>,
     ) -> Result<()> {
         let blob = node_id_blob(node_id)?;
-        let (on, container, directory, on_host) = match dev_container {
+        let (on, container, on_host) = match dev_container {
             Some(setting) => (
                 1,
                 setting.container().map(str::to_string),
-                setting
-                    .directory
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty())
-                    .map(str::to_string),
                 i32::from(setting.repo_on_host),
             ),
-            None => (0, None, None, 0),
+            None => (0, None, 0),
         };
         self.conn.execute(
             "INSERT INTO node_files
-               (node_id, use_worktree, dev_container, container, container_dir, container_repo_on_host, updated_at)
-             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)
+               (node_id, use_worktree, dev_container, container, container_repo_on_host, updated_at)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5)
              ON CONFLICT(node_id) DO UPDATE SET
                dev_container = excluded.dev_container,
                container = excluded.container,
-               container_dir = excluded.container_dir,
                container_repo_on_host = excluded.container_repo_on_host,
                updated_at = excluded.updated_at",
-            params![blob, on, container, directory, on_host, now_ms()],
+            params![blob, on, container, on_host, now_ms()],
         )?;
         Ok(())
     }
@@ -178,7 +158,7 @@ impl<'a> NodeFilesRepo<'a> {
     pub fn list_with_worktree(&self) -> Result<Vec<NodeFiles>> {
         let mut stmt = self.conn.prepare(
             "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
-                    dev_container, container, container_dir, container_repo_on_host
+                    dev_container, container, container_repo_on_host
              FROM node_files WHERE worktree_path IS NOT NULL AND worktree_path != ''",
         )?;
         let rows = stmt
@@ -228,8 +208,7 @@ fn row_to_files(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeFiles> {
         dev_container: if row.get::<_, i64>(5)? != 0 {
             Some(DevContainerSetting {
                 container: row.get(6)?,
-                directory: row.get(7)?,
-                repo_on_host: row.get::<_, i64>(8)? != 0,
+                repo_on_host: row.get::<_, i64>(7)? != 0,
             })
         } else {
             None
@@ -284,7 +263,6 @@ mod tests {
 
         let setting = DevContainerSetting {
             container: Some(" my-dev ".into()),
-            directory: Some("".into()),
             repo_on_host: true,
         };
         repo.set_dev_container(&a, Some(&setting)).unwrap();
@@ -292,7 +270,6 @@ mod tests {
         assert_eq!(files.worktree_path(), Some("/wt/a"));
         let dev = files.dev_container.expect("dev container");
         assert_eq!(dev.container.as_deref(), Some("my-dev"));
-        assert_eq!(dev.directory, None);
         assert!(dev.repo_on_host);
         assert_eq!(dev.repo_container(), None);
 

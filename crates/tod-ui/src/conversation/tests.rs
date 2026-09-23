@@ -2098,6 +2098,89 @@ fn a_review_node_offers_review_and_holds_the_gate_for_open_findings(cx: &mut Tes
     );
 }
 
+/// In `verifying`, the gate check is the primary step only once everything
+/// is verified. A fix after that (here, the store's reopen, which a Fix or
+/// Implement turn on a `verifying` node does) makes Verify the primary step
+/// again and holds the gate check back.
+#[gpui::test]
+fn verifying_recommends_verify_again_after_a_fix_not_the_gate(cx: &mut TestAppContext) {
+    use tod_store::outline::repos::plan_steps::STATUS_VERIFIED;
+    use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
+    use tod_store::verification::VerdictRepo;
+
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "verifying");
+    let conn =
+        tod_store::fleet::schema::open_writer_connection(fixture.store.writer().db_path()).unwrap();
+    let obligation = Uuid::new_v4();
+    ObligationRepo::new(&conn)
+        .insert_at(
+            obligation,
+            fixture.node_id,
+            "requirement",
+            usize::MAX,
+            None,
+            "It works",
+            "requirements",
+        )
+        .unwrap();
+    let steps = PlanStepRepo::new(&conn);
+    steps
+        .insert_at(Uuid::new_v4(), fixture.node_id, 0, "Build it")
+        .unwrap();
+    for step in steps.list_for_node(fixture.node_id).unwrap() {
+        steps
+            .update_status(step.id, STATUS_VERIFIED, None, None)
+            .unwrap();
+    }
+    let verdicts = VerdictRepo::new(&conn);
+    for standing in verdicts.standings(fixture.node_id).unwrap() {
+        verdicts
+            .record(
+                fixture.node_id,
+                standing.obligation.id,
+                None,
+                "verified",
+                "Saw it work.",
+            )
+            .unwrap();
+    }
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    let primary = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.lifecycle_controls(cx)
+                .0
+                .iter()
+                .filter(|a| a.primary)
+                .map(|a| a.label.to_string())
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(primary(&view, cx), vec!["Gate check → review"]);
+    assert!(lifecycle_labels(&view, cx).contains(&"Verify again".to_string()));
+
+    fixture
+        .store
+        .interview(
+            ACTOR_USER,
+            InterviewCommand::ReopenVerification {
+                node_id: fixture.node_id,
+                why: "A fix changed the code after this was verified.".into(),
+            },
+        )
+        .unwrap();
+    view.update(cx, |view, _| view.reload());
+    draw(cx);
+    assert_eq!(primary(&view, cx), vec!["Verify"]);
+    assert!(
+        !lifecycle_labels(&view, cx)
+            .iter()
+            .any(|label| label.starts_with("Gate check")),
+        "{:?}",
+        lifecycle_labels(&view, cx)
+    );
+}
+
 /// A lifecycle run never reopens an earlier conversation: each gets a fresh
 /// agent, so the last run's context cannot skew it. Opening one still does.
 #[gpui::test]
