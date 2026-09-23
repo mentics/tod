@@ -15,6 +15,12 @@ use tod_agent::devcontainer::ContainerExec;
 /// The user's own git, here or in the container, keeps the check.
 pub const CONTAINER_GIT_CONFIG: [&str; 2] = ["-c", "safe.directory=*"];
 
+/// The same for every git a program tod starts in a dev container runs
+/// itself (Treehouse): `sh -c` with this script, then the program and its
+/// arguments. It adds `safe.directory=*` to git's environment config after
+/// any `GIT_CONFIG_COUNT` entries the container already sets.
+pub const CONTAINER_GIT_CONFIG_ENV: &str = r#"n=${GIT_CONFIG_COUNT:-0}; export "GIT_CONFIG_KEY_$n=safe.directory" "GIT_CONFIG_VALUE_$n=*" "GIT_CONFIG_COUNT=$((n + 1))"; exec "$@""#;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Workdir {
     /// A directory on this machine.

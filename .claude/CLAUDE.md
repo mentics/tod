@@ -347,7 +347,10 @@ Nothing starts or builds a container; tod only uses a running one.
   30s). A container directory is never checked from the UI thread. Git in a
   container runs with `-c safe.directory=*` (`workdir::CONTAINER_GIT_CONFIG`):
   Docker Desktop bind mounts can briefly report a new directory as root's,
-  and git would refuse it as "dubious ownership".
+  and git would refuse it as "dubious ownership". Treehouse in a container
+  is started through `workdir::CONTAINER_GIT_CONFIG_ENV`, which adds the same
+  setting to git's `GIT_CONFIG_COUNT` environment config (after any the
+  container sets), since it runs git itself.
 
 - `tod_agent::devcontainer` is the transport: `docker ps`/`inspect`, mount
   mapping, `prepare` (check the container is running, resolve directory, user
