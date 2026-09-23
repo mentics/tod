@@ -942,6 +942,35 @@ mod tests {
         let _ = scratch.output("rm", &["-rf", &dir]);
     }
 
+    /// Git in a dev container works on a repository some other user owns
+    /// (as a bind mount can briefly report), where it would otherwise stop
+    /// with "dubious ownership". Needs `TOD_TEST_DEV_CONTAINER`, as above.
+    #[test]
+    fn git_in_a_dev_container_ignores_who_owns_the_repository() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            eprintln!("skipping: TOD_TEST_DEV_CONTAINER is not set");
+            return;
+        };
+        let dir = format!("/tmp/tod-own-{}", uuid::Uuid::new_v4());
+        let as_root = |script: &str| {
+            StdCommand::new("docker")
+                .args(["exec", "-u", "root", &container, "sh", "-c", script, "sh", &dir])
+                .output()
+                .unwrap()
+        };
+        let out = as_root(
+            "git init -q -b main \"$1\" && cd \"$1\" && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init && chown -R 4321 \"$1\" && chmod -R a+rwX \"$1\"",
+        );
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let scratch = Workdir::container(&container, "/tmp");
+        let plain = scratch.output("git", &["-C", &dir, "rev-parse", "HEAD"]).unwrap();
+        assert!(!plain.status.success(), "the container's git should check ownership");
+
+        let repo = Workdir::container(&container, &dir);
+        assert_eq!(run_git(&repo, &["branch", "--show-current"]).unwrap(), "main");
+        as_root("rm -rf \"$1\"");
+    }
+
     #[test]
     fn a_lease_asks_for_submodules_only_when_the_repository_has_them() {
         let repo = Workdir::host(init_temp_repo());

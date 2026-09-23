@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tod_agent::devcontainer::ContainerExec;
 
+/// Put before the arguments of every git tod runs in a dev container: turns
+/// off git's "dubious ownership" check for that one command. Docker
+/// Desktop's bind mounts can briefly report a new directory (a worktree, a
+/// submodule) as owned by root, so git refuses a directory tod itself chose.
+/// The user's own git, here or in the container, keeps the check.
+pub const CONTAINER_GIT_CONFIG: [&str; 2] = ["-c", "safe.directory=*"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Workdir {
     /// A directory on this machine.
@@ -171,7 +178,8 @@ impl Workdir {
         ContainerExec::connect(container)?.output(dir, program, args)
     }
 
-    /// `git args…` in this directory.
+    /// `git args…` in this directory. In a container, git's ownership check
+    /// is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {
         match self {
             Self::Host(path) => {
@@ -183,7 +191,10 @@ impl Workdir {
                     .stdin(std::process::Stdio::null())
                     .output()?)
             }
-            Self::Container { .. } => self.output("git", args),
+            Self::Container { .. } => {
+                let args: Vec<&str> = CONTAINER_GIT_CONFIG.iter().chain(args).copied().collect();
+                self.output("git", &args)
+            }
         }
     }
 

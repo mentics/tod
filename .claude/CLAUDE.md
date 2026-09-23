@@ -341,7 +341,10 @@ Nothing starts or builds a container; tod only uses a running one.
   cwd (`FilesDirectory::Ready`, `resolve_launch_cwd`, `Protocol::cwd`). Its
   `git`/`output` run on the host or through `docker exec`
   (`tod_agent::devcontainer::ContainerExec`, which caches `docker inspect` for
-  30s). A container directory is never checked from the UI thread.
+  30s). A container directory is never checked from the UI thread. Git in a
+  container runs with `-c safe.directory=*` (`workdir::CONTAINER_GIT_CONFIG`):
+  Docker Desktop bind mounts can briefly report a new directory as root's,
+  and git would refuse it as "dubious ownership".
 
 - `tod_agent::devcontainer` is the transport: `docker ps`/`inspect`, mount
   mapping, `prepare` (check the container is running, resolve directory, user
