@@ -100,9 +100,10 @@ fn capabilities_snapshot(conn: &Connection, node_id: Uuid) -> Result<Option<Enti
         settings.linked_issues = task.linked_issues;
         settings.linked_prs = task.linked_prs;
     }
-    settings.use_worktree = NodeFilesRepo::new(conn)
-        .get(&id)?
-        .is_some_and(|f| f.use_worktree);
+    if let Some(files) = NodeFilesRepo::new(conn).get(&id)? {
+        settings.use_worktree = files.use_worktree;
+        settings.dev_container = files.dev_container;
+    }
     let generators = GeneratorRepo::new(conn);
     settings.generator = generators
         .get_config(node_id)?

@@ -1,9 +1,13 @@
-use super::acp_host::{AcpHost, is_standalone_acp_server, spawn_acp_process};
+use super::acp_host::{
+    AcpHost, container_agent_bin, is_standalone_acp_server, spawn_acp_in_container,
+    spawn_acp_process,
+};
 use super::provider::{
     AgentProvider, AgentRunHandle, AgentRunKind, AgentRunState, PermissionOption,
     PermissionRequest, RunId, SessionObserver, SessionPurpose, SessionStarted, SessionTurn,
 };
 use crate::agent_launch::{AgentLaunchOptions, effort_for_acp};
+use crate::devcontainer::AgentEnvironment;
 use crate::agent_traffic::{
     InterviewAgentCounts, SharedAgentTrafficLog, TrafficDirection, TrafficTag,
 };
@@ -104,6 +108,7 @@ struct ConversationSpec {
     purpose: SessionPurpose,
     tag: TrafficTag,
     session_observer: Option<SessionObserver>,
+    environment: AgentEnvironment,
 }
 
 /// A long-lived conversation: a worker thread owning at most one agent process.
@@ -279,6 +284,7 @@ impl ConversationWorker {
                 spec.tag.clone(),
                 spec.purpose.run_kind(),
                 &spec.env,
+                &spec.environment,
                 Some(self.context_chars.clone()),
                 Some(self.reply_parts.clone()),
             )?;
@@ -290,15 +296,15 @@ impl ConversationWorker {
                 &session.session_id,
                 &spec.tag.id,
                 title,
-                &spec.cwd,
+                &session.cwd,
             );
             *live = Some(session);
             created = start == SessionStart::New;
         }
-        let name = created.then_some((self.spec.host, title));
-        live.as_mut()
-            .expect("connected above")
-            .prompt_blocks(blocks, run_id, name)
+        let live = live.as_mut().expect("connected above");
+        // A container's session log is not on this machine to name.
+        let name = (created && !live.in_container).then_some((self.spec.host, title));
+        live.prompt_blocks(blocks, run_id, name)
     }
 }
 
@@ -387,6 +393,7 @@ impl CursorAcpProvider {
         model: String,
         effort: String,
         session_title: String,
+        environment: AgentEnvironment,
     ) -> Result<AgentRunHandle> {
         let id = RunId::new();
         let (tx, rx) = mpsc::channel();
@@ -444,6 +451,7 @@ impl CursorAcpProvider {
                 &write_roots,
                 &session_title,
                 session_observer.as_ref(),
+                &environment,
             );
             match &result {
                 Ok(text) => tracing::info!(
@@ -519,6 +527,7 @@ impl AgentProvider for CursorAcpProvider {
         prompt: String,
         options: AgentLaunchOptions,
         session_title: String,
+        environment: AgentEnvironment,
     ) -> Result<AgentRunHandle> {
         self.spawn_run(
             AgentRunKind::FleetAgent,
@@ -528,6 +537,7 @@ impl AgentProvider for CursorAcpProvider {
             options.model,
             options.effort,
             session_title,
+            environment,
         )
     }
 
@@ -541,6 +551,7 @@ impl AgentProvider for CursorAcpProvider {
             resume_session_id,
             purpose,
             env,
+            environment,
             ..
         } = turn;
         // Keyed by the session, not its owner: one owner can hold several.
@@ -557,6 +568,7 @@ impl AgentProvider for CursorAcpProvider {
             purpose,
             tag: tag.clone(),
             session_observer: self.session_observer.clone(),
+            environment,
         };
 
         let id = RunId::new();
@@ -961,8 +973,17 @@ fn run_acp_session(
     extra_write_roots: &[PathBuf],
     session_title: &str,
     session_observer: Option<&SessionObserver>,
+    environment: &AgentEnvironment,
 ) -> Result<String> {
-    let mut child = spawn_acp_process(host, agent_bin, &[])?;
+    let SpawnedAgent {
+        mut child,
+        agent_bin,
+        cwd,
+        write_roots,
+        in_container,
+    } = spawn_agent(host, agent_bin, cwd, environment, &[], extra_write_roots)?;
+    let agent_bin = agent_bin.as_path();
+    let cwd = cwd.as_path();
     let stdin = child.stdin.take().context("agent stdin unavailable")?;
     let stdout = child.stdout.take().context("agent stdout unavailable")?;
     let stderr = child.stderr.take().context("agent stderr unavailable")?;
@@ -985,7 +1006,7 @@ fn run_acp_session(
         tag,
         run_id,
         kind,
-        write_roots: acp_write_roots(cwd, extra_write_roots),
+        write_roots,
         activity,
         pending_permission,
         context_chars: None,
@@ -1073,7 +1094,9 @@ fn run_acp_session(
                 "prompt": [{ "type": "text", "text": prompt }]
             }),
         )?;
-        name_session_in_background(host, session_id.to_string(), session_title.to_string());
+        if !in_container {
+            name_session_in_background(host, session_id.to_string(), session_title.to_string());
+        }
         session.await_response(PROMPT_TIMEOUT)?;
         Ok(session.assistant_text)
     })();
@@ -1527,6 +1550,61 @@ fn respond(stdin: &mut std::process::ChildStdin, id: i64, result: Value) -> Resu
     Ok(())
 }
 
+/// An agent process as one connection starts it.
+struct SpawnedAgent {
+    child: AgentProcess,
+    /// The binary actually run: the container's own in a dev container.
+    agent_bin: PathBuf,
+    /// The session's working directory as the agent sees it.
+    cwd: PathBuf,
+    write_roots: Vec<PathBuf>,
+    in_container: bool,
+}
+
+/// Start the ACP agent where `environment` says. In a dev container the
+/// working directory and write roots are the container's paths, and the host's
+/// `extra_write_roots` (the data root) mean nothing there.
+fn spawn_agent(
+    host: AcpHost,
+    agent_bin: &Path,
+    cwd: &Path,
+    environment: &AgentEnvironment,
+    env: &[(String, String)],
+    extra_write_roots: &[PathBuf],
+) -> Result<SpawnedAgent> {
+    match environment {
+        AgentEnvironment::Host => Ok(SpawnedAgent {
+            child: spawn_acp_process(host, agent_bin, env)?,
+            agent_bin: agent_bin.to_path_buf(),
+            cwd: cwd.to_path_buf(),
+            write_roots: acp_write_roots(cwd, extra_write_roots),
+            in_container: false,
+        }),
+        AgentEnvironment::DevContainer(launch) => {
+            let container = crate::devcontainer::prepare(launch)?;
+            let bin = container_agent_bin(host, &container)?;
+            tracing::info!(
+                event = "agent",
+                action = "acp_spawn_container",
+                host = host.label(),
+                container = %container.name,
+                user = ?container.user,
+                cwd = %container.cwd,
+                agent_bin = %bin,
+                "starting ACP agent in dev container"
+            );
+            let child = spawn_acp_in_container(host, &container, &bin, env)?;
+            Ok(SpawnedAgent {
+                child,
+                agent_bin: PathBuf::from(bin),
+                cwd: PathBuf::from(&container.cwd),
+                write_roots: vec![PathBuf::from(&container.cwd)],
+                in_container: true,
+            })
+        }
+    }
+}
+
 fn acp_write_roots(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for candidate in extra {
@@ -1572,7 +1650,23 @@ fn tool_path_allowed(tool_title: &str, write_roots: &[PathBuf]) -> bool {
     let Some(path) = extract_tool_path(tool_title) else {
         return true;
     };
-    write_roots.iter().any(|root| path_is_under(root, &path))
+    write_roots
+        .iter()
+        .any(|root| path_is_under(root, &path) || posix_path_is_under(root, &path))
+}
+
+/// [`path_is_under`] for a dev container's paths, which are POSIX paths this
+/// machine may not be able to resolve (on Windows they are not even absolute).
+fn posix_path_is_under(root: &Path, path: &Path) -> bool {
+    let (root, path) = (root.to_string_lossy(), path.to_string_lossy());
+    if !root.starts_with('/') || !path.starts_with('/') {
+        return false;
+    }
+    if path.split('/').any(|part| part == "..") {
+        return false;
+    }
+    let root = root.trim_end_matches('/');
+    path == root || path.starts_with(&format!("{root}/")) || root.is_empty()
 }
 
 fn pick_allow_option_id(options: &[Value]) -> Option<&str> {
@@ -1713,6 +1807,9 @@ fn apply_session_config_options(
 struct PersistentAcpSession {
     client: AcpClient,
     session_id: String,
+    /// The session's working directory as the agent sees it.
+    cwd: PathBuf,
+    in_container: bool,
     _reader_handle: JoinHandle<()>,
 }
 
@@ -1733,10 +1830,18 @@ impl PersistentAcpSession {
         tag: TrafficTag,
         kind: AgentRunKind,
         env: &[(String, String)],
+        environment: &AgentEnvironment,
         context_chars: Option<Arc<AtomicU64>>,
         reply_parts: Option<SharedReplyParts>,
     ) -> Result<Self> {
-        let mut child = spawn_acp_process(host, agent_bin, env)?;
+        let SpawnedAgent {
+            mut child,
+            agent_bin,
+            cwd,
+            write_roots,
+            in_container,
+        } = spawn_agent(host, agent_bin, cwd, environment, env, extra_write_roots)?;
+        let agent_bin = agent_bin.as_path();
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
         let stderr = child.stderr.take().context("agent stderr unavailable")?;
@@ -1759,7 +1864,7 @@ impl PersistentAcpSession {
             tag,
             run_id: RunId::new(),
             kind,
-            write_roots: acp_write_roots(cwd, extra_write_roots),
+            write_roots,
             activity,
             pending_permission,
             context_chars,
@@ -1837,6 +1942,8 @@ impl PersistentAcpSession {
         Ok(Self {
             client,
             session_id,
+            cwd,
+            in_container,
             _reader_handle: reader_handle,
         })
     }
@@ -2049,6 +2156,7 @@ while True:
                 message: message.into(),
                 purpose: crate::provider::SessionPurpose::Chat,
                 env: Vec::new(),
+                environment: AgentEnvironment::Host,
             };
         let opening = SessionOpening {
             context: Some("CONTEXT".into()),
@@ -2108,6 +2216,107 @@ while True:
         assert_eq!(ids, ["run-1"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers every prompt with where it runs: its working directory, user,
+    /// and `TOD_PROBE` from its environment.
+    const CONTAINER_FAKE_ACP_AGENT: &str = r##"#!/usr/bin/env python3
+import json, os, sys, getpass
+
+def send(message):
+    print(json.dumps(message), flush=True)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    if method is None or "id" not in message:
+        continue
+    params = message.get("params", {})
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}
+    elif method == "session/new":
+        result = {"sessionId": "container-session", "cwdParam": params.get("cwd")}
+    elif method == "session/prompt":
+        text = "cwd=%s param=%s user=%s probe=%s" % (
+            os.getcwd(), CWD[0], getpass.getuser(), os.environ.get("TOD_PROBE"))
+        update = {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": params.get("sessionId"), "update": update}})
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    if method == "session/new":
+        CWD = [params.get("cwd")]
+    send({"jsonrpc": "2.0", "id": message["id"], "result": result})
+"##;
+
+    /// Runs an agent in a real dev container. Needs Docker and a running
+    /// container with python3 that mounts a host directory:
+    /// `TOD_TEST_DEV_CONTAINER=<name> TOD_TEST_DEV_CONTAINER_HOST_DIR=<mounted host dir>`.
+    #[test]
+    fn a_conversation_runs_in_a_dev_container() {
+        use crate::agent_launch::AgentLaunchOptions;
+        use crate::devcontainer::{ContainerFile, DevContainerLaunch};
+        use crate::platform::AgentPlatform;
+
+        let (Ok(container), Ok(host_dir)) = (
+            std::env::var("TOD_TEST_DEV_CONTAINER"),
+            std::env::var("TOD_TEST_DEV_CONTAINER_HOST_DIR"),
+        ) else {
+            eprintln!("skipping: TOD_TEST_DEV_CONTAINER is not set");
+            return;
+        };
+        let host_dir = PathBuf::from(host_dir);
+        let info = crate::devcontainer::inspect(&container).unwrap();
+        let expected_cwd = info.map_host_path(&host_dir).expect("host dir is mounted");
+        let launch = DevContainerLaunch {
+            container: container.clone(),
+            host_dir: host_dir.clone(),
+            directory: None,
+            env: vec![("TOD_PROBE".into(), "from-host".into())],
+            path_prepend: vec!["/tmp/tod-test-bin".into()],
+            files: vec![ContainerFile {
+                path: "/tmp/tod-test-bin/claude-code-acp".into(),
+                contents: CONTAINER_FAKE_ACP_AGENT.into(),
+                executable: true,
+            }],
+        };
+        // The host binary is never run: the container's own is found on its PATH.
+        let mut provider =
+            CursorAcpProvider::with_agent_bin(AcpHost::Claude, PathBuf::from("unused"));
+        let run = provider
+            .send_session_turn(SessionTurn {
+                key: "container-1".into(),
+                owner_id: "config".into(),
+                title: "named but not on this machine".into(),
+                cwd: host_dir,
+                options: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
+                resume_session_id: None,
+                opening: None,
+                message: "hi".into(),
+                purpose: crate::provider::SessionPurpose::Chat,
+                env: vec![("PATH".into(), r"C:\host\only".into())],
+                environment: AgentEnvironment::DevContainer(launch),
+            })
+            .unwrap();
+        let reply = wait_for_reply(&mut provider, run.id);
+        let user = info.remote_user.clone().unwrap_or_else(|| "root".into());
+        assert_eq!(
+            reply,
+            format!("cwd={expected_cwd} param={expected_cwd} user={user} probe=from-host")
+        );
+        assert_eq!(provider.session_id("container-1").as_deref(), Some("container-session"));
+    }
+
+    #[test]
+    fn container_paths_are_write_roots_on_any_host() {
+        let roots = [PathBuf::from("/workspaces/app")];
+        assert!(tool_path_allowed("Edit `/workspaces/app/src/main.rs`", &roots));
+        assert!(!tool_path_allowed("Edit `/workspaces/other/x`", &roots));
+        assert!(!tool_path_allowed("Edit `/workspaces/app/../other/x`", &roots));
+        assert!(!tool_path_allowed("Write /workspaces/application/x", &roots));
     }
 
     #[test]

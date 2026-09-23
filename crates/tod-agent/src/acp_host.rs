@@ -378,6 +378,68 @@ pub fn spawn_acp_process(
     })
 }
 
+/// The ACP agent inside a dev container: found on the container's `PATH`
+/// rather than on this machine, since the host's may be a Windows shim.
+pub fn container_agent_bin(
+    host: AcpHost,
+    container: &crate::devcontainer::PreparedContainer,
+) -> Result<String> {
+    let (candidates, install): (&[&str], &str) = match host {
+        AcpHost::Claude => (
+            &["claude-agent-acp", "claude-code-acp"],
+            "npm install -g @zed-industries/claude-code-acp (and sign in to `claude` there)",
+        ),
+        AcpHost::Cursor => (
+            &["cursor-agent", "agent"],
+            "curl https://cursor.com/install -fsS | bash (and sign in there)",
+        ),
+    };
+    container.find_program(candidates)?.with_context(|| {
+        format!(
+            "No {} ACP agent in dev container `{}` (looked for {}). Install it in the container: {install}",
+            host.label(),
+            container.name,
+            candidates.join(", "),
+        )
+    })
+}
+
+/// [`spawn_acp_process`] inside a dev container, through `docker exec -i`.
+/// ACP runs over the exec's stdio exactly as it does over a local child's.
+pub fn spawn_acp_in_container(
+    host: AcpHost,
+    container: &crate::devcontainer::PreparedContainer,
+    agent_bin: &str,
+    env: &[(String, String)],
+) -> Result<crate::process_tree::AgentProcess> {
+    use std::process::Stdio;
+
+    let args: Vec<String> = if host.uses_acp_subcommand(Path::new(agent_bin)) {
+        vec!["acp".to_string()]
+    } else {
+        Vec::new()
+    };
+    let mut container = container.clone();
+    // A host `PATH` means nothing in the container; its own was set up by
+    // `devcontainer::prepare`.
+    for (key, value) in env.iter().filter(|(key, _)| !key.eq_ignore_ascii_case("PATH")) {
+        container.env.retain(|(existing, _)| existing != key);
+        container.env.push((key.clone(), value.clone()));
+    }
+    let mut command = container.command(agent_bin, &args)?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::process_tree::spawn(&mut command).with_context(|| {
+        format!(
+            "failed to start {} ACP in dev container `{}`",
+            host.label(),
+            container.name
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -97,7 +97,9 @@ fn mark_run_not_running(writer: &FleetWriter, run_id: &str) -> Result<()> {
 }
 
 /// Clear recorded worktrees whose directory no longer exists, so the Files
-/// capability offers "Set up worktree" again.
+/// capability offers "Set up worktree" again. One inside a dev container is
+/// left alone: checking it needs Docker, and the container may not be
+/// running yet. Setting up the worktree again checks it there.
 pub fn clear_missing_worktrees(
     conn: &Connection,
     writer: &FleetWriter,
@@ -108,7 +110,11 @@ pub fn clear_missing_worktrees(
         let Some(path) = files.worktree_path() else {
             continue;
         };
-        if std::path::Path::new(path).exists() {
+        let in_container = files
+            .dev_container
+            .as_ref()
+            .is_some_and(|dev| dev.repo_container().is_some());
+        if in_container || std::path::Path::new(path).exists() {
             continue;
         }
         notices.on_worktree_missing(&files.node_id);
@@ -253,6 +259,37 @@ mod tests {
         assert!(files.worktree_path().is_none());
         assert!(files.use_worktree);
         assert_eq!(notices.worktree_missing_notices(), vec![node_id]);
+
+        writer.shutdown().unwrap();
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn a_worktree_in_a_dev_container_is_kept() {
+        let (dir, conn) = test_writer_conn();
+        let writer = open_writer(&dir);
+        let node_id = seed_node(&conn);
+        let files = NodeFilesRepo::new(&conn);
+        files
+            .set_dev_container(
+                &node_id,
+                Some(&crate::fleet::DevContainerSetting {
+                    container: Some("app".into()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        files
+            .update_worktree(&node_id, Some("/workspaces/app/.worktrees/x"), None, None)
+            .unwrap();
+        let notices = crate::fleet::notices::FleetNoticeHooks::new();
+
+        assert_eq!(
+            clear_missing_worktrees(&conn, &writer, &notices).unwrap(),
+            0
+        );
+        let files = files.get(&node_id).unwrap().unwrap();
+        assert_eq!(files.worktree_path(), Some("/workspaces/app/.worktrees/x"));
 
         writer.shutdown().unwrap();
         cleanup_test_dir(&dir);

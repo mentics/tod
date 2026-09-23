@@ -11,6 +11,7 @@
 //! per-criterion results, advances a prose-only gate that passed, and stores
 //! the report the conversation view shows.
 
+use tod_store::fleet::Workdir;
 use super::implement::node_id;
 use super::protocol::{Protocol, ProtocolEnv, RunNotice};
 use crate::gate::response::GateBlocker;
@@ -24,7 +25,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use tod_store::conversation::{Conversation, ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
@@ -211,7 +211,7 @@ fn role_doc(state: &str) -> Result<String> {
     state_role_doc(&manifest, state)
 }
 
-fn state_cwd(env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+fn state_cwd(env: &ProtocolEnv<'_>) -> Result<Workdir> {
     let node = node_id(env)?;
     Ok(env.fleet.files_dir_or_data_root(&node.to_string()))
 }
@@ -375,7 +375,7 @@ impl Protocol for GateCheckProtocol {
         Some((from, next?))
     }
 
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         state_cwd(env)
     }
 
@@ -490,7 +490,7 @@ impl Protocol for OnEntryProtocol {
         Some((state.clone(), state))
     }
 
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         state_cwd(env)
     }
 

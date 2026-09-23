@@ -43,6 +43,7 @@ impl AgentProvider for FakeAgent {
         _: String,
         _: AgentLaunchOptions,
         _: String,
+        _: tod_agent::AgentEnvironment,
     ) -> anyhow::Result<AgentRunHandle> {
         anyhow::bail!("not used")
     }

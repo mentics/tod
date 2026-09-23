@@ -1,5 +1,6 @@
 use crate::agent_launch::AgentLaunchOptions;
 use crate::agent_traffic::{AgentCategory, InterviewAgentCounts};
+use crate::devcontainer::AgentEnvironment;
 use crate::platform::AgentPlatform;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -166,6 +167,9 @@ pub struct SessionTurn {
     /// Extra environment for the agent process. Applied when the process for
     /// this key is started, so it must stay the same for the life of the key.
     pub env: Vec<(String, String)>,
+    /// Where the agent process runs. With a dev container, `cwd` is the host
+    /// directory it maps from; like `env`, it applies when the process starts.
+    pub environment: AgentEnvironment,
 }
 
 impl SessionTurn {
@@ -193,7 +197,8 @@ pub trait AgentProvider {
     /// [`SessionTurn::title`] does for chat turns — callers build both with
     /// the same naming convention so a session looks the same no matter how it
     /// was started; empty means don't name it. Platforms that expose no rename
-    /// mechanism (Cursor) ignore it.
+    /// mechanism (Cursor) ignore it. `environment` is where it runs, as for
+    /// [`SessionTurn::environment`].
     fn start_fleet_agent(
         &mut self,
         owner_id: &str,
@@ -201,6 +206,7 @@ pub trait AgentProvider {
         prompt: String,
         options: AgentLaunchOptions,
         session_title: String,
+        environment: AgentEnvironment,
     ) -> anyhow::Result<AgentRunHandle>;
 
     /// Send one message in the long-lived conversation `turn.key`, starting or
@@ -269,6 +275,7 @@ mod tests {
             message: "hello".into(),
             purpose: SessionPurpose::Chat,
             env: Vec::new(),
+            environment: AgentEnvironment::Host,
         }
     }
 

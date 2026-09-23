@@ -132,7 +132,7 @@ fn implementation_setup_outcome(conn: &Connection, node_id: Uuid) -> Result<Deri
             "Agent from \"{}\"; Files from \"{}\" in {}",
             agent.source_title,
             files.source_title,
-            directory.display()
+            directory
         ),
     })
 }

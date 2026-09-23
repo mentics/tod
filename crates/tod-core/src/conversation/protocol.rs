@@ -9,6 +9,7 @@
 //! calls through it. [`protocol_for`] is the registry: one match, every kind.
 //! Spec: `doc/conversation/protocols.md`.
 
+use tod_store::fleet::Workdir;
 use crate::context_recipes::CHAT;
 use crate::conversation::context::{
     ReportedStale, delta, opening, opening_with, resume_snapshot, resume_snapshot_with,
@@ -79,8 +80,9 @@ pub trait Protocol: Send + Sync {
         SessionPurpose::Conversation
     }
 
-    /// Where the agent runs.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf>;
+    /// Where the agent runs: on this machine, or inside the dev container
+    /// the node's repository lives in.
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir>;
 
     /// Environment for every turn. Only protocols whose outline writes are
     /// recorded set the actor.
@@ -198,7 +200,7 @@ impl Protocol for OutlineProtocol {
     /// The focus node's working directory when it has one, so the agent
     /// starts inside the workspace and loads its own agent docs (`CLAUDE.md`,
     /// skills, rules); an empty directory otherwise.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         focus_cwd_or_scratch(env, "conversation")
     }
 
@@ -257,7 +259,7 @@ impl Protocol for ChatProtocol {
 
     /// The focus node's working directory when it has one, so "write this
     /// down" lands in the project's files; an empty directory otherwise.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         focus_cwd_or_scratch(env, "chat")
     }
 
@@ -305,7 +307,7 @@ impl Protocol for ChatProtocol {
 /// else the scratch directory `name`. The agent CLI discovers the workspace's
 /// agent docs from its working directory, so this is what gives a
 /// conversation about a node the docs of the workspace that node lives in.
-fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<PathBuf> {
+fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<Workdir> {
     if let Some(node) = env.focus.node_id() {
         if let Ok(dir) =
             tod_store::fleet::provision::resolve_launch_cwd(env.fleet, &node.to_string())
@@ -313,7 +315,7 @@ fn focus_cwd_or_scratch(env: &ProtocolEnv<'_>, name: &str) -> Result<PathBuf> {
             return Ok(dir);
         }
     }
-    scratch_dir(env.data_root, name)
+    scratch_dir(env.data_root, name).map(Workdir::Host)
 }
 
 pub(super) fn scratch_dir(data_root: &Path, name: &str) -> Result<PathBuf> {

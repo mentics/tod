@@ -75,6 +75,11 @@ pub enum FleetMutation {
         node_id: String,
         use_worktree: bool,
     },
+    /// Run the node's launches in a dev container (`Some`), or on this machine.
+    SetNodeDevContainer {
+        node_id: String,
+        dev_container: Option<crate::fleet::repos::node_files::DevContainerSetting>,
+    },
     /// Record (or clear, with `None`s) the node's set-up worktree.
     UpdateNodeWorktree {
         node_id: String,
@@ -199,6 +204,7 @@ impl FleetMutation {
             self,
             FleetMutation::DeleteTask { .. }
                 | FleetMutation::SetNodeUseWorktree { .. }
+                | FleetMutation::SetNodeDevContainer { .. }
                 | FleetMutation::UpdateNodeWorktree { .. }
                 | FleetMutation::UpsertNodeAgent { .. }
                 | FleetMutation::UpdateAgentRunReconnect { .. }
@@ -272,6 +278,12 @@ impl FleetMutation {
                 use_worktree,
             } => {
                 NodeFilesRepo::new(conn).set_use_worktree(node_id, *use_worktree)?;
+            }
+            FleetMutation::SetNodeDevContainer {
+                node_id,
+                dev_container,
+            } => {
+                NodeFilesRepo::new(conn).set_dev_container(node_id, dev_container.as_ref())?;
             }
             FleetMutation::UpdateNodeWorktree {
                 node_id,

@@ -432,7 +432,7 @@ impl LifecycleController {
 pub fn implement_directory(
     fleet: &FleetStore,
     task_id: &str,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<tod_store::fleet::Workdir, String> {
     if fleet
         .resolve_agent_for_node(task_id)
         .ok()

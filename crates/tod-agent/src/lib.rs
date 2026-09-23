@@ -9,6 +9,7 @@ mod acp_host;
 pub mod agent_launch;
 pub mod agent_traffic;
 mod cursor_acp;
+pub mod devcontainer;
 mod mock;
 pub mod platform;
 mod process_tree;
@@ -20,6 +21,7 @@ mod transcript;
 pub mod util;
 
 pub use agent_launch::{AgentLaunchOptions, effort_for_acp};
+pub use devcontainer::AgentEnvironment;
 pub use platform::AgentPlatform;
 pub use run_state::{
     EngagementState, LivenessResult, RunHandle, RunLocation, RunLocationOps,

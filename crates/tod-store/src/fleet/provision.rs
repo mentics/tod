@@ -3,14 +3,13 @@
 use crate::fleet::FleetStore;
 use crate::fleet::node_actions::{FilesDirectory, ResolvedFiles};
 use crate::fleet::terminal::{prune_stale_shell_sessions, prune_stale_terminal_agent_runs};
+use crate::fleet::workdir::Workdir;
 use crate::fleet::worktree::{self, WorktreeHandle, validate_git_repo};
 use crate::fleet::writer::FleetMutation;
-use crate::path_util::path_for_storage;
 use crate::paths::TodPaths;
 use crate::settings::TodSettings;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 fn resolve_files(fleet: &FleetStore, node_id: &str) -> Result<ResolvedFiles> {
     fleet.reload_if_stale().ok();
@@ -19,12 +18,14 @@ fn resolve_files(fleet: &FleetStore, node_id: &str) -> Result<ResolvedFiles> {
         .context("Enable Files and set a workspace directory")
 }
 
-/// Directory that shells, editors, and coding agents launched from `node_id` run in.
+/// Directory that shells, editors, and coding agents launched from `node_id`
+/// run in: on this machine, or inside the dev container the repository
+/// lives in.
 ///
 /// Never provisions: a node whose worktree hasn't been set up is an error.
-pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> {
+pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<Workdir> {
     match resolve_files(fleet, node_id)?.directory() {
-        FilesDirectory::Ready(path) => Ok(path),
+        FilesDirectory::Ready(dir) => Ok(dir),
         FilesDirectory::NeedsWorktreeSetup => {
             bail!("Set up the worktree (Files) before launching")
         }
@@ -33,27 +34,30 @@ pub fn resolve_launch_cwd(fleet: &FleetStore, node_id: &str) -> Result<PathBuf> 
 }
 
 /// Set up (or reuse) the worktree for the node owning `node_id`'s Files capability,
-/// using git or Treehouse per settings, and record it on that node.
+/// using git or Treehouse per settings, and record it on that node. For a
+/// repository inside a dev container, git runs there.
 pub fn setup_worktree_for_node(
     fleet: &FleetStore,
     paths: &TodPaths,
     settings: &TodSettings,
     node_id: &str,
-) -> Result<PathBuf> {
+) -> Result<Workdir> {
     let files = resolve_files(fleet, node_id)?;
     if !files.use_worktree {
         bail!("Turn on the worktree flag (Files) before setting up a worktree");
     }
-    if let Some(path) = files.worktree_path() {
-        let path = PathBuf::from(path);
-        if path.is_dir() {
-            return Ok(path);
+    if let FilesDirectory::Missing(reason) = files.directory() {
+        bail!("{reason}");
+    }
+    if let Some(dir) = files.worktree_dir() {
+        if dir.is_dir() {
+            return Ok(dir);
         }
     }
     let repo = files
-        .repo()
+        .repo_dir()
         .context("Set a workspace directory before setting up a worktree")?;
-    let repo_path = validate_git_repo(Path::new(repo))?;
+    let repo_path = validate_git_repo(&repo)?;
     let branch = files.branch().unwrap_or_default().to_string();
     let owner = files.source_node_id.clone();
     let lease_holder = format!("tod-{owner}");
@@ -77,7 +81,7 @@ pub fn setup_worktree_for_node(
 
     fleet.enqueue(FleetMutation::UpdateNodeWorktree {
         node_id: owner,
-        worktree_path: Some(path_for_storage(&handle.path)),
+        worktree_path: Some(handle.path.storage()),
         worktree_lease_id: handle.lease.as_ref().map(|l| l.lease_id.clone()),
         worktree_lease_holder: handle.lease.as_ref().map(|l| l.lease_holder.clone()),
     })?;
@@ -85,7 +89,7 @@ pub fn setup_worktree_for_node(
     fleet.reload_if_stale()?;
 
     if !handle.path.is_dir() {
-        bail!("set-up worktree missing at {}", handle.path.display());
+        bail!("set-up worktree missing at {}", handle.path);
     }
     Ok(handle.path)
 }
@@ -97,10 +101,7 @@ pub fn setup_worktree_for_node(
 /// was already pushed).
 pub fn rename_branch_for_node(fleet: &FleetStore, node_id: &str, new: &str) -> Result<Vec<String>> {
     let files = resolve_files(fleet, node_id)?;
-    let path = files
-        .worktree_path()
-        .map(PathBuf::from)
-        .context("No worktree is set up")?;
+    let path = files.worktree_dir().context("No worktree is set up")?;
     if new.is_empty() {
         bail!("A worktree needs a branch; release it to clear the branch");
     }
@@ -158,7 +159,7 @@ pub fn release_worktree_for_node(
 ) -> Result<()> {
     let files = resolve_files(fleet, node_id)?;
     let owner = files.source_node_id.clone();
-    let Some(path) = files.worktree_path().map(PathBuf::from) else {
+    let Some(path) = files.worktree_dir() else {
         return Ok(());
     };
     prune_stale_sessions(fleet, paths);
@@ -169,23 +170,25 @@ pub fn release_worktree_for_node(
         .worktree_lease_id
         .as_deref()
         .is_some_and(|id| !id.is_empty());
-    if !path.is_dir() && !has_lease {
+    let exists = path.is_dir();
+    if !exists && !has_lease {
         // Folder already gone: just drop git's record of it.
-        if let Some(repo) = files.repo() {
-            let _ = worktree::prune_git_worktrees(Path::new(repo));
+        if let Some(repo) = files.repo_dir() {
+            let _ = worktree::prune_git_worktrees(&repo);
         }
     }
-    if path.is_dir() {
-        if let Some(lease_id) = files.worktree_lease_id.as_deref().filter(|s| !s.is_empty()) {
-            worktree::treehouse_return(&path, lease_id, settings, paths)?;
+    if exists {
+        let lease_id = files.worktree_lease_id.as_deref().filter(|s| !s.is_empty());
+        if let (Some(lease_id), Workdir::Host(host)) = (lease_id, &path) {
+            worktree::treehouse_return(host, lease_id, settings, paths)?;
         } else {
             let shared = fleet.read(|conn| {
                 crate::fleet::repos::node_files::NodeFilesRepo::new(conn)
-                    .other_nodes_using_worktree(&owner, &path_for_storage(&path))
+                    .other_nodes_using_worktree(&owner, &path.storage())
             })?;
             if shared.is_empty() {
-                if let Some(repo) = files.repo() {
-                    worktree::remove_git_worktree(Path::new(repo), &path)?;
+                if let Some(repo) = files.repo_dir() {
+                    worktree::remove_git_worktree(&repo, &path)?;
                 }
             }
         }

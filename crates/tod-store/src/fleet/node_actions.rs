@@ -5,7 +5,8 @@
 
 use crate::agent_launch::AgentLaunchOptions;
 use crate::fleet::repos::node_agent::{NodeAgent, NodeAgentRepo};
-use crate::fleet::repos::node_files::NodeFilesRepo;
+use crate::fleet::repos::node_files::{DevContainerSetting, NodeFilesRepo};
+use crate::fleet::workdir::Workdir;
 use crate::outline::repos::NodeRepo;
 use crate::outline::types::Capability;
 use crate::outline::uuid_blob::{blob_to_uuid_sql, uuid_to_blob};
@@ -30,12 +31,18 @@ pub struct ResolvedFiles {
     pub worktree_path: Option<String>,
     pub worktree_lease_id: Option<String>,
     pub worktree_lease_holder: Option<String>,
+    /// Set when launches run in a dev container. When the repository lives
+    /// in it, `repo` and `worktree_path` are container paths; when it is
+    /// mounted from this machine they stay host paths, and the container's
+    /// own is resolved against the running container at launch (see
+    /// [`crate::fleet::dev_container`]).
+    pub dev_container: Option<DevContainerSetting>,
 }
 
 /// Where launches from a node run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesDirectory {
-    Ready(PathBuf),
+    Ready(Workdir),
     /// Worktree flag on, but no worktree has been set up (or it's gone).
     NeedsWorktreeSetup,
     /// No usable directory; the reason is user-facing.
@@ -60,30 +67,81 @@ impl ResolvedFiles {
         non_empty(&self.worktree_path)
     }
 
-    /// The resolved directory: the worktree when enabled, else the workspace directory.
+    /// The dev container the repository lives in, when it lives in one.
+    pub fn repo_container(&self) -> Option<&str> {
+        self.dev_container
+            .as_ref()
+            .and_then(DevContainerSetting::repo_container)
+    }
+
+    /// `path` (the workspace directory or worktree) where it is: in the
+    /// repository's container, else on this machine.
+    pub fn workdir(&self, path: &str) -> Workdir {
+        match self.repo_container() {
+            Some(container) => Workdir::container(container, path),
+            None => Workdir::host(path),
+        }
+    }
+
+    /// The workspace directory, where it is.
+    pub fn repo_dir(&self) -> Option<Workdir> {
+        self.repo().map(|repo| self.workdir(repo))
+    }
+
+    /// The set-up worktree, where it is.
+    pub fn worktree_dir(&self) -> Option<Workdir> {
+        self.worktree_path().map(|path| self.workdir(path))
+    }
+
+    /// The resolved directory: the worktree when enabled, else the workspace
+    /// directory. With the repository mounted into a dev container, the host
+    /// side of it. One inside a container is not checked here (that takes
+    /// Docker); a launch into a missing one fails.
     pub fn directory(&self) -> FilesDirectory {
+        if self
+            .dev_container
+            .as_ref()
+            .is_some_and(|dev| dev.container().is_none())
+        {
+            return FilesDirectory::Missing("Choose a dev container".into());
+        }
         let Some(repo) = self.repo() else {
             return FilesDirectory::Missing("Set a workspace directory".into());
         };
+        if let Some(container) = self.repo_container() {
+            if !repo.starts_with('/') {
+                return FilesDirectory::Missing(format!(
+                    "The workspace directory is inside dev container {container}: \
+                     give its path there, like /workspaces/app"
+                ));
+            }
+            if self.use_worktree {
+                return match self.worktree_dir() {
+                    Some(dir) => FilesDirectory::Ready(dir),
+                    None => FilesDirectory::NeedsWorktreeSetup,
+                };
+            }
+            return FilesDirectory::Ready(self.workdir(repo));
+        }
         if self.use_worktree {
             return match self.worktree_path() {
                 Some(path) if Path::new(path).is_dir() => {
-                    FilesDirectory::Ready(PathBuf::from(path))
+                    FilesDirectory::Ready(Workdir::host(path))
                 }
                 _ => FilesDirectory::NeedsWorktreeSetup,
             };
         }
         let path = PathBuf::from(repo);
         if path.is_dir() {
-            FilesDirectory::Ready(path)
+            FilesDirectory::Ready(Workdir::Host(path))
         } else {
             FilesDirectory::Missing(format!("Workspace directory does not exist: {repo}"))
         }
     }
 
-    pub fn ready_directory(&self) -> Option<PathBuf> {
+    pub fn ready_directory(&self) -> Option<Workdir> {
         match self.directory() {
-            FilesDirectory::Ready(path) => Some(path),
+            FilesDirectory::Ready(dir) => Some(dir),
             _ => None,
         }
     }
@@ -151,6 +209,7 @@ pub fn resolve_files_for_node(conn: &Connection, node_id: &str) -> Result<Option
         worktree_path: files.as_ref().and_then(|f| f.worktree_path.clone()),
         worktree_lease_id: files.as_ref().and_then(|f| f.worktree_lease_id.clone()),
         worktree_lease_holder: files.as_ref().and_then(|f| f.worktree_lease_holder.clone()),
+        dev_container: files.and_then(|f| f.dev_container),
         source_node_id,
     }))
 }
@@ -496,13 +555,60 @@ mod tests {
             worktree_path: None,
             worktree_lease_id: None,
             worktree_lease_holder: None,
+            dev_container: None,
         };
+        let host = Workdir::host(&dir);
         assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
         files.repo = Some(dir.display().to_string());
-        assert_eq!(files.directory(), FilesDirectory::Ready(dir.clone()));
+        assert_eq!(files.directory(), FilesDirectory::Ready(host.clone()));
         files.use_worktree = true;
         assert_eq!(files.directory(), FilesDirectory::NeedsWorktreeSetup);
         files.worktree_path = Some(dir.display().to_string());
-        assert_eq!(files.directory(), FilesDirectory::Ready(dir));
+        assert_eq!(files.directory(), FilesDirectory::Ready(host.clone()));
+
+        // A dev container needs one chosen; mounted, the directory stays the host's.
+        files.dev_container = Some(DevContainerSetting::default());
+        assert_eq!(
+            files.directory(),
+            FilesDirectory::Missing("Choose a dev container".into())
+        );
+        files.dev_container = Some(DevContainerSetting {
+            container: Some("dev".into()),
+            directory: None,
+            repo_on_host: true,
+        });
+        assert_eq!(files.directory(), FilesDirectory::Ready(host));
+    }
+
+    #[test]
+    fn a_repository_in_a_dev_container_is_a_container_path() {
+        let mut files = ResolvedFiles {
+            source_node_id: Uuid::new_v4().to_string(),
+            source_title: "N".into(),
+            inherited: false,
+            repo: Some(r"C:\not\there".into()),
+            branch: None,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+            dev_container: Some(DevContainerSetting {
+                container: Some("dev".into()),
+                ..Default::default()
+            }),
+        };
+        assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
+        files.repo = Some("/workspaces/app".into());
+        assert_eq!(
+            files.directory(),
+            FilesDirectory::Ready(Workdir::container("dev", "/workspaces/app"))
+        );
+        files.use_worktree = true;
+        assert_eq!(files.directory(), FilesDirectory::NeedsWorktreeSetup);
+        files.worktree_path = Some("/workspaces/app/.worktrees/x".into());
+        assert_eq!(
+            files.directory(),
+            FilesDirectory::Ready(Workdir::container("dev", "/workspaces/app/.worktrees/x"))
+        );
     }
 }

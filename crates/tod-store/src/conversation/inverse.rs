@@ -234,6 +234,7 @@ fn capabilities_inverse(action: &ActionRow) -> Result<Vec<OutlineMutation>> {
             repo: s.repo,
             branch: s.branch,
             use_worktree: s.use_worktree,
+            dev_container: s.dev_container,
         }],
         M::SetNodeTicket { .. } => vec![M::SetNodeTicket {
             node_id,

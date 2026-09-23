@@ -41,6 +41,7 @@ use tod_store::fleet::{
     AgentRun, FilesDirectory, FleetMutation, FleetStore, ResolvedAgent, ResolvedFiles, code_editor,
     code_editors, open_code_editor_for_node, reconnect_identity,
 };
+use tod_store::fleet::Workdir;
 use tod_store::{AgentLaunchOptions, AgentPlatform, AgentRole};
 
 const ACTION_PANEL_CONTEXT: &str = "ActionPanel";
@@ -241,7 +242,7 @@ impl ActionPanelView {
     }
 
     /// The directory launches run in, when Files resolves to one.
-    fn ready_directory(&self) -> Option<PathBuf> {
+    fn ready_directory(&self) -> Option<Workdir> {
         self.files.as_ref().and_then(ResolvedFiles::ready_directory)
     }
 
@@ -423,7 +424,7 @@ impl ActionPanelView {
             &media,
             self.paths.data_root(),
             &task,
-            &cwd,
+            &PathBuf::from(cwd.path_text()),
         ) {
             Ok(prompt) => prompt,
             Err(err) => {
@@ -432,6 +433,22 @@ impl ActionPanelView {
             }
         };
         let options = self.agent_launch_options(AgentRole::Default);
+        let environment = match self.fleet.agent_environment(&task_id, &cwd) {
+            Ok(environment) => environment,
+            Err(err) => {
+                error_toast(window, cx, format!("Launch agent failed: {err:#}"));
+                return;
+            }
+        };
+        let where_ = match environment.dev_container() {
+            Some(dev) => format!("{cwd} in dev container {}", dev.container),
+            None => cwd.to_string(),
+        };
+        // An agent inside a dev container is started from the data root here.
+        let host_cwd = cwd
+            .host_path()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.paths.data_root().to_path_buf());
         if let Err(err) = self.fleet.enqueue(FleetMutation::CreateAgentRun {
             node_id: task_id.clone(),
             run_kind: Some("auto".into()),
@@ -472,7 +489,7 @@ impl ActionPanelView {
         let provider_run = {
             let title = session_name(Some("fleet"), &task.title, chrono::Local::now());
             let mut agent = self.agent.lock().expect("agent mutex");
-            agent.start_fleet_agent(&task_id, cwd.clone(), prompt, options, title)
+            agent.start_fleet_agent(&task_id, host_cwd, prompt, options, title, environment)
         };
         match provider_run {
             Ok(handle) => {
@@ -481,7 +498,7 @@ impl ActionPanelView {
                     fleet_run_id: fleet_run_id.clone(),
                     prompt: prompt_for_transcript,
                 });
-                self.changed(format!("Launched agent in {}", cwd.display()), cx);
+                self.changed(format!("Launched agent in {where_}"), cx);
             }
             Err(err) => {
                 let _ = self.fleet.enqueue(FleetMutation::EndAgentRun {
@@ -569,23 +586,57 @@ impl ActionPanelView {
         };
         let options = self.agent_launch_options(AgentRole::Default);
         let cli = agent_cli(options.platform);
-        match open_terminal_agent_for_node(
-            &self.fleet,
-            &self.paths,
-            &self.settings,
-            &task_id,
-            cli,
-            Some(options),
-        ) {
-            Ok((_, cwd)) => {
-                self.changed(format!("Terminal agent `{cli}` in {}", cwd.display()), cx)
-            }
-            Err(err) => error_toast(
-                window,
-                cx,
-                format!("Launch agent in terminal failed: {err:#}"),
-            ),
-        }
+        self.run_terminal_job(
+            "Opening terminal agent…",
+            "Launch agent in terminal failed",
+            move |fleet, paths, settings| {
+                let (_, cwd) = open_terminal_agent_for_node(
+                    fleet,
+                    paths,
+                    settings,
+                    &task_id,
+                    cli,
+                    Some(options),
+                )?;
+                Ok(format!("Terminal agent `{cli}` in {cwd}"))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Open or focus a terminal off the UI thread: it waits for the
+    /// terminal's shell to start, and for Docker when the node runs in a dev
+    /// container.
+    fn run_terminal_job(
+        &mut self,
+        busy: &str,
+        failure: &'static str,
+        job: impl FnOnce(&FleetStore, &TodPaths, &TodSettings) -> anyhow::Result<String>
+        + Send
+        + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status_message = busy.to_string();
+        cx.notify();
+        let fleet = self.fleet.clone();
+        let paths = self.paths.clone();
+        let settings = self.settings.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { job(&fleet, &paths, &settings) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(message) => this.changed(message, cx),
+                Err(err) => {
+                    this.changed(String::new(), cx);
+                    error_toast(window, cx, format!("{failure}: {err:#}"));
+                }
+            });
+        })
+        .detach();
     }
 
     fn focus_terminal_agent(&mut self, run_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -602,16 +653,17 @@ impl ActionPanelView {
             .launch_options()
             .map(|options| options.platform)
             .unwrap_or_else(|| self.agent_launch_options(AgentRole::Default).platform);
-        match focus_terminal_agent_run(
-            &self.fleet,
-            &self.paths,
-            &self.settings,
-            &run,
-            agent_cli(platform),
-        ) {
-            Ok(cwd) => self.changed(format!("Terminal agent in {}", cwd.display()), cx),
-            Err(err) => error_toast(window, cx, format!("Focus terminal agent failed: {err:#}")),
-        }
+        self.run_terminal_job(
+            "Focusing terminal agent…",
+            "Focus terminal agent failed",
+            move |fleet, paths, settings| {
+                let cwd =
+                    focus_terminal_agent_run(fleet, paths, settings, &run, agent_cli(platform))?;
+                Ok(format!("Terminal agent in {cwd}"))
+            },
+            window,
+            cx,
+        );
     }
 
     fn delete_terminal_agent(&mut self, run_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -639,10 +691,16 @@ impl ActionPanelView {
         let Some(task_id) = self.task_id.clone() else {
             return;
         };
-        match open_shell_for_node(&self.fleet, &self.paths, &self.settings, &task_id, None) {
-            Ok((_, cwd)) => self.changed(format!("Opened terminal in {}", cwd.display()), cx),
-            Err(err) => error_toast(window, cx, format!("Launch shell failed: {err:#}")),
-        }
+        self.run_terminal_job(
+            "Opening terminal…",
+            "Launch shell failed",
+            move |fleet, paths, settings| {
+                let (_, cwd) = open_shell_for_node(fleet, paths, settings, &task_id, None)?;
+                Ok(format!("Opened terminal in {cwd}"))
+            },
+            window,
+            cx,
+        );
     }
 
     fn focus_shell(&mut self, shell_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -650,10 +708,16 @@ impl ActionPanelView {
             error_toast(window, cx, "Shell session not found.");
             return;
         };
-        match focus_shell_session(&self.fleet, &self.paths, &self.settings, &shell) {
-            Ok(cwd) => self.changed(format!("Shell in {}", cwd.display()), cx),
-            Err(err) => error_toast(window, cx, format!("Focus shell failed: {err:#}")),
-        }
+        self.run_terminal_job(
+            "Focusing terminal…",
+            "Focus shell failed",
+            move |fleet, paths, settings| {
+                let cwd = focus_shell_session(fleet, paths, settings, &shell)?;
+                Ok(format!("Shell in {cwd}"))
+            },
+            window,
+            cx,
+        );
     }
 
     fn delete_shell(&mut self, shell_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -722,8 +786,19 @@ impl ActionPanelView {
 
     fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        // A repository mounted from this machine still runs its agents,
+        // shells, and terminal agents in the container.
+        let mounted_container = self
+            .files
+            .as_ref()
+            .and_then(|files| files.dev_container.as_ref())
+            .filter(|dev| dev.repo_on_host)
+            .and_then(|dev| dev.container());
         let directory = match self.files.as_ref().map(ResolvedFiles::directory) {
-            Some(FilesDirectory::Ready(path)) => path.display().to_string(),
+            Some(FilesDirectory::Ready(path)) => match mounted_container {
+                Some(container) => format!("{path} · runs in dev container {container}"),
+                None => path.to_string(),
+            },
             Some(FilesDirectory::NeedsWorktreeSetup) => "Worktree not set up".to_string(),
             Some(FilesDirectory::Missing(reason)) => reason,
             None => "Files not enabled — chat runs in the data root".to_string(),

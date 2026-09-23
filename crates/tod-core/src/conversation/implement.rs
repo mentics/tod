@@ -12,6 +12,7 @@
 //!
 //! Spec: `doc/conversation/protocols.md` §4.
 
+use tod_store::fleet::Workdir;
 use super::protocol::{Next, Protocol, ProtocolEnv, RunNotice, TurnContext};
 use crate::agent_context::{ImplementRequest, NodeSelection, build_implement_message};
 use crate::gate::PlanStepWithLinks;
@@ -19,7 +20,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-use std::process::Command;
 use tod_agent::SessionPurpose;
 use tod_store::conversation::ProtocolKind;
 use tod_store::fleet::provision::resolve_launch_cwd;
@@ -129,7 +129,7 @@ impl Protocol for ImplementationProtocol {
     }
 
     /// The node's worktree — this agent edits files, not just the outline.
-    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<PathBuf> {
+    fn cwd(&self, env: &ProtocolEnv<'_>) -> Result<Workdir> {
         let node = node_id(env)?;
         resolve_launch_cwd(env.fleet, &node.to_string())
     }
@@ -157,7 +157,7 @@ impl Protocol for ImplementationProtocol {
             })
             .unwrap_or_default();
         let lifecycle = Some(node.lifecycle.clone());
-        let working_dir = self.cwd(env)?;
+        let working_dir = PathBuf::from(self.cwd(env)?.path_text());
         build_implement_message(
             env.media,
             &ImplementRequest {
@@ -483,11 +483,8 @@ pub fn plan_steps(fleet: &FleetStore, node_id: Uuid) -> Vec<PlanStepWithLinks> {
 /// `git status --porcelain` in the worktree, or an empty mark when it cannot
 /// be read (a worktree that is not a repository still implements fine; it
 /// just contributes nothing to the progress check).
-pub(super) fn worktree_fingerprint(cwd: &std::path::Path) -> String {
-    Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(cwd)
-        .output()
+pub(super) fn worktree_fingerprint(cwd: &Workdir) -> String {
+    cwd.git_output(&["status", "--porcelain"])
         .ok()
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
@@ -500,7 +497,7 @@ pub(super) fn worktree_fingerprint(cwd: &std::path::Path) -> String {
 /// HEAD has no branch to commit to, so one named `branch` is created first
 /// (an error when there is none). Returns whether a commit was made.
 pub(super) fn commit_worktree(
-    cwd: &std::path::Path,
+    cwd: &Workdir,
     branch: Option<&str>,
     message: &str,
 ) -> Result<bool> {
@@ -519,12 +516,9 @@ pub(super) fn commit_worktree(
 }
 
 /// Commit everything in the one repository at `cwd`; see [`commit_worktree`].
-fn commit_repo(cwd: &std::path::Path, branch: Option<&str>, message: &str) -> Result<bool> {
-    fn git(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
-        Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
+fn commit_repo(cwd: &Workdir, branch: Option<&str>, message: &str) -> Result<bool> {
+    fn git(cwd: &Workdir, args: &[&str]) -> Result<std::process::Output> {
+        cwd.git_output(args)
             .with_context(|| format!("running git {}", args.join(" ")))
     }
     let inside = git(cwd, &["rev-parse", "--is-inside-work-tree"])?;
@@ -629,7 +623,7 @@ Conversation {}",
 /// Put every submodule of the worktree on the node's branch before a turn, so
 /// the agent's commits inside one land on a branch, not a detached HEAD.
 /// The branch is the Files branch, else the worktree's own.
-pub(super) fn prepare_submodules(env: &ProtocolEnv<'_>, cwd: &std::path::Path) -> Result<()> {
+pub(super) fn prepare_submodules(env: &ProtocolEnv<'_>, cwd: &Workdir) -> Result<()> {
     let node = node_id(env)?;
     let recorded = env
         .fleet
@@ -649,7 +643,7 @@ pub(super) fn prepare_submodules(env: &ProtocolEnv<'_>, cwd: &std::path::Path) -
 /// then make the node's Files branch agree with what is checked out.
 pub(super) fn commit_run(
     env: &ProtocolEnv<'_>,
-    cwd: &std::path::Path,
+    cwd: &Workdir,
     what: &str,
 ) -> Vec<RunNotice> {
     let mut notices = Vec::new();
@@ -679,7 +673,7 @@ fn run_branch(env: &ProtocolEnv<'_>, node: Uuid) -> Result<String> {
 
 /// Record the checked-out branch on the Files capability when it has none;
 /// warn when it has a different one.
-fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &std::path::Path) -> Option<RunNotice> {
+fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &Workdir) -> Option<RunNotice> {
     let actual = current_branch(cwd)?;
     env.fleet.reload_if_stale().ok();
     let files = env.fleet.resolve_files_for_node(&node.to_string()).ok()??;
@@ -746,6 +740,7 @@ pub fn mock_turn(
 #[cfg(test)]
 mod commit_tests {
     use super::*;
+    use std::process::Command;
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -769,12 +764,13 @@ mod commit_tests {
         git(&dir, &["checkout", "-q", "--detach"]);
 
         // A clean tree makes no commit and creates no branch.
-        assert!(!commit_worktree(&dir, Some("task/x"), "nothing").unwrap());
-        assert_eq!(current_branch(&dir), None);
+        let work = Workdir::host(&dir);
+        assert!(!commit_worktree(&work, Some("task/x"), "nothing").unwrap());
+        assert_eq!(current_branch(&work), None);
 
         std::fs::write(dir.join("b.txt"), "b").unwrap();
-        assert!(commit_worktree(&dir, Some("task/x"), "second").unwrap());
-        assert_eq!(current_branch(&dir).as_deref(), Some("task/x"));
+        assert!(commit_worktree(&work, Some("task/x"), "second").unwrap());
+        assert_eq!(current_branch(&work).as_deref(), Some("task/x"));
         assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "second");
         let _ = std::fs::remove_dir_all(&dir);
     }

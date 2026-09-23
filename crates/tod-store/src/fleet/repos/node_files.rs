@@ -1,4 +1,5 @@
-//! Files capability repository — worktree flag and set-up worktree per node.
+//! Files capability repository — worktree flag, set-up worktree, and dev
+//! container per node.
 //!
 //! The workspace directory and branch live on `node_fields.repo` / `branch`.
 
@@ -6,6 +7,52 @@ use crate::fleet::repos::{node_id_blob, node_id_column};
 use crate::outline::uuid_blob::now_ms;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+/// A node's launches run inside a running dev container rather than on this
+/// machine.
+///
+/// Usually the repository lives in the container: the workspace directory
+/// and worktree are container paths, and git runs there. With
+/// `repo_on_host`, the repository is on this machine and mounted into the
+/// container: the workspace directory stays a host path, git runs here, and
+/// only the launches go into the container.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevContainerSetting {
+    /// Container name or id; `None` until one is chosen.
+    #[serde(default)]
+    pub container: Option<String>,
+    /// With `repo_on_host`, the directory inside the container. `None` maps
+    /// the workspace directory (or worktree) through the container's mounts.
+    #[serde(default)]
+    pub directory: Option<String>,
+    /// The repository is on this machine, mounted into the container.
+    #[serde(default)]
+    pub repo_on_host: bool,
+}
+
+impl DevContainerSetting {
+    pub fn container(&self) -> Option<&str> {
+        self.container.as_deref().map(str::trim).filter(|c| !c.is_empty())
+    }
+
+    /// The directory inside the container for a repository on this machine;
+    /// `None` when it lives in the container (its path is the directory).
+    pub fn directory(&self) -> Option<&str> {
+        if !self.repo_on_host {
+            return None;
+        }
+        self.directory.as_deref().map(str::trim).filter(|d| !d.is_empty())
+    }
+
+    /// The container the repository lives in, when it lives in one.
+    pub fn repo_container(&self) -> Option<&str> {
+        if self.repo_on_host {
+            return None;
+        }
+        self.container()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeFiles {
@@ -14,6 +61,8 @@ pub struct NodeFiles {
     pub worktree_path: Option<String>,
     pub worktree_lease_id: Option<String>,
     pub worktree_lease_holder: Option<String>,
+    /// Set when the node's launches run in a dev container.
+    pub dev_container: Option<DevContainerSetting>,
 }
 
 impl NodeFiles {
@@ -39,7 +88,8 @@ impl<'a> NodeFilesRepo<'a> {
         let blob = node_id_blob(node_id)?;
         self.conn
             .query_row(
-                "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder
+                "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
+                        dev_container, container, container_dir, container_repo_on_host
                  FROM node_files WHERE node_id = ?1",
                 params![blob],
                 row_to_files,
@@ -55,6 +105,42 @@ impl<'a> NodeFilesRepo<'a> {
              ON CONFLICT(node_id) DO UPDATE SET
                use_worktree = excluded.use_worktree, updated_at = excluded.updated_at",
             params![blob, i32::from(use_worktree), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Run the node's launches in a dev container (`Some`), or on this machine.
+    pub fn set_dev_container(
+        &self,
+        node_id: &str,
+        dev_container: Option<&DevContainerSetting>,
+    ) -> Result<()> {
+        let blob = node_id_blob(node_id)?;
+        let (on, container, directory, on_host) = match dev_container {
+            Some(setting) => (
+                1,
+                setting.container().map(str::to_string),
+                setting
+                    .directory
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string),
+                i32::from(setting.repo_on_host),
+            ),
+            None => (0, None, None, 0),
+        };
+        self.conn.execute(
+            "INSERT INTO node_files
+               (node_id, use_worktree, dev_container, container, container_dir, container_repo_on_host, updated_at)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(node_id) DO UPDATE SET
+               dev_container = excluded.dev_container,
+               container = excluded.container,
+               container_dir = excluded.container_dir,
+               container_repo_on_host = excluded.container_repo_on_host,
+               updated_at = excluded.updated_at",
+            params![blob, on, container, directory, on_host, now_ms()],
         )?;
         Ok(())
     }
@@ -91,7 +177,8 @@ impl<'a> NodeFilesRepo<'a> {
     /// Nodes with a recorded worktree path.
     pub fn list_with_worktree(&self) -> Result<Vec<NodeFiles>> {
         let mut stmt = self.conn.prepare(
-            "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder
+            "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
+                    dev_container, container, container_dir, container_repo_on_host
              FROM node_files WHERE worktree_path IS NOT NULL AND worktree_path != ''",
         )?;
         let rows = stmt
@@ -138,6 +225,15 @@ fn row_to_files(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeFiles> {
         worktree_path: row.get(2)?,
         worktree_lease_id: row.get(3)?,
         worktree_lease_holder: row.get(4)?,
+        dev_container: if row.get::<_, i64>(5)? != 0 {
+            Some(DevContainerSetting {
+                container: row.get(6)?,
+                directory: row.get(7)?,
+                repo_on_host: row.get::<_, i64>(8)? != 0,
+            })
+        } else {
+            None
+        },
     })
 }
 
@@ -176,6 +272,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn dev_container_round_trip_keeps_the_worktree() {
+        let (dir, conn) = test_writer_conn();
+        let a = seed_node(&conn);
+        let repo = NodeFilesRepo::new(&conn);
+        repo.update_worktree(&a, Some("/wt/a"), None, None).unwrap();
+
+        let setting = DevContainerSetting {
+            container: Some(" my-dev ".into()),
+            directory: Some("".into()),
+            repo_on_host: true,
+        };
+        repo.set_dev_container(&a, Some(&setting)).unwrap();
+        let files = repo.get(&a).unwrap().unwrap();
+        assert_eq!(files.worktree_path(), Some("/wt/a"));
+        let dev = files.dev_container.expect("dev container");
+        assert_eq!(dev.container.as_deref(), Some("my-dev"));
+        assert_eq!(dev.directory, None);
+        assert!(dev.repo_on_host);
+        assert_eq!(dev.repo_container(), None);
+
+        // Chosen, but no container picked yet.
+        repo.set_dev_container(&a, Some(&DevContainerSetting::default()))
+            .unwrap();
+        let dev = repo.get(&a).unwrap().unwrap().dev_container.unwrap();
+        assert_eq!(dev.container(), None);
+        assert!(!dev.repo_on_host, "the repository lives in the container by default");
+
+        repo.set_dev_container(&a, None).unwrap();
+        assert_eq!(repo.get(&a).unwrap().unwrap().dev_container, None);
         cleanup_test_dir(&dir);
     }
 }

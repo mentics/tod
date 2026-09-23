@@ -1327,7 +1327,17 @@ impl TaskListView {
             }
             let repo = task_row.repo.as_deref().unwrap_or("");
             let branch = task_row.branch.as_deref().unwrap_or("");
-            if let Err(err) = validate_interview_workspace(PathBuf::from(repo).as_path(), branch) {
+            // A repository inside a dev container can't be checked from here.
+            let in_container = self
+                .fleet
+                .resolve_files_for_node(task_id)
+                .ok()
+                .flatten()
+                .is_some_and(|files| files.repo_container().is_some());
+            if !in_container
+                && let Err(err) =
+                    validate_interview_workspace(PathBuf::from(repo).as_path(), branch)
+            {
                 self.show_error(format!("{label} workspace: {err:#}"), window, cx);
                 return;
             }

@@ -11,6 +11,7 @@
 //! Nothing runs on its own: there are no automatic turns, no backoff, and no
 //! summaries. A turn starts only from [`ConversationDriver::send`].
 
+use tod_store::fleet::Workdir;
 use crate::conversation::context::{ReportedStale, focus_selection, last_action_at};
 use crate::conversation::protocol::{
     Next, Protocol, ProtocolEnv, RunNotice, TurnContext, protocol_for,
@@ -612,10 +613,24 @@ impl ConversationDriver {
                 self.protocol.progress(&env).ok().flatten(),
             )
         };
+        // A node whose Files name a dev container runs its agent there.
+        let environment = match self.focus.node_id() {
+            Some(node) => fleet.agent_environment(&node.to_string(), &cwd)?,
+            None => tod_store::fleet::dev_container::environment_for(
+                None,
+                &cwd,
+                fleet.paths().root(),
+            )?,
+        };
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
-            context.map(|context| crate::codebase_rules::with_codebase_rules(context, &cwd));
+            context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
+        // An agent inside a dev container is started from the data root here.
+        let cwd = match cwd {
+            Workdir::Host(path) => path,
+            Workdir::Container { .. } => fleet.paths().root().to_path_buf(),
+        };
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),
         });
@@ -634,6 +649,7 @@ impl ConversationDriver {
             message,
             purpose: self.protocol.purpose(),
             env: turn_env,
+            environment,
         });
         let handle = match handle {
             Ok(handle) => handle,

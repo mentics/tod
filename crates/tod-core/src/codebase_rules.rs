@@ -7,6 +7,7 @@
 //! from any build.
 
 use std::path::Path;
+use tod_store::fleet::Workdir;
 
 /// `media/context/workspace/codebase.md`.
 pub const CODEBASE_RULES: &str =
@@ -19,8 +20,21 @@ pub fn is_codebase(cwd: &Path) -> bool {
 }
 
 /// `context` with [`CODEBASE_RULES`] appended when `cwd` is a codebase.
-pub fn with_codebase_rules(mut context: String, cwd: &Path) -> String {
-    if is_codebase(cwd) {
+pub fn with_codebase_rules(context: String, cwd: &Path) -> String {
+    append_rules(context, is_codebase(cwd))
+}
+
+/// [`with_codebase_rules`] for a directory that may be inside a dev
+/// container. One there is the node's Files directory, always a checkout.
+pub fn with_codebase_rules_in(context: String, cwd: &Workdir) -> String {
+    match cwd {
+        Workdir::Host(path) => with_codebase_rules(context, path),
+        Workdir::Container { .. } => append_rules(context, true),
+    }
+}
+
+fn append_rules(mut context: String, codebase: bool) -> String {
+    if codebase {
         if !context.is_empty() {
             context.push_str("\n\n---\n\n");
         }

@@ -24,6 +24,7 @@ COMMANDS:
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
     set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
+                         [--container <NAME|ID>] [--mounted on|off] [--container-dir <PATH>]
     set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
@@ -37,6 +38,14 @@ agent, an open shell, a worktree). `set` changes only the settings given; an
 empty value (`--model ''`) clears one. `--ticket`/`--pr` replace the whole
 list when given. The capability must already be enabled. A node's lifecycle
 state cannot be set here.
+
+`--container` runs the node's agents, terminals, and git inside that running
+dev container (`--container ''` runs them on this machine again). The
+repository lives in the container: `--dir` is its path there, and worktrees
+are made there. `--mounted on` is for a repository on this machine mounted
+into the container: `--dir` stays the host path, git runs here, and the
+directory inside the container follows from its mounts unless
+`--container-dir` names it.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -66,6 +75,50 @@ fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
             "unknown capability `{raw}` (expected: spec, lifecycle, agent, generator, tags, files, ticket)"
         )
     })
+}
+
+/// `--container` / `--mounted` / `--container-dir` over the node's current
+/// dev container.
+fn files_dev_container(
+    args: &Args,
+    current: Option<tod_store::fleet::DevContainerSetting>,
+) -> anyhow::Result<Option<tod_store::fleet::DevContainerSetting>> {
+    let mut dev = match args.get("--container").map(str::trim) {
+        None => current,
+        Some("") => None,
+        Some(container) => {
+            let current = current.unwrap_or_default();
+            Some(tod_store::fleet::DevContainerSetting {
+                container: Some(container.to_string()),
+                ..current
+            })
+        }
+    };
+    let needs_container = |flag: &str| {
+        anyhow::anyhow!("{flag} needs a dev container: pass --container too")
+    };
+    if let Some(mounted) = args.get("--mounted") {
+        let dev = dev.as_mut().ok_or_else(|| needs_container("--mounted"))?;
+        dev.repo_on_host = match mounted.trim() {
+            "on" => true,
+            "off" => false,
+            other => anyhow::bail!("--mounted must be on or off, not `{other}`"),
+        };
+    }
+    if let Some(dir) = args.get("--container-dir").map(str::trim) {
+        let dev = dev.as_mut().ok_or_else(|| needs_container("--container-dir"))?;
+        if !dev.repo_on_host {
+            anyhow::bail!(
+                "--container-dir is for a repository mounted from this machine (--mounted on); \
+                 otherwise --dir is the path in the container"
+            );
+        }
+        if !dir.is_empty() && !dir.starts_with('/') {
+            anyhow::bail!("--container-dir must be an absolute path in the container");
+        }
+        dev.directory = (!dir.is_empty()).then(|| dir.to_string());
+    }
+    Ok(dev)
 }
 
 /// The node's enabled capabilities and settings.
@@ -113,10 +166,11 @@ fn list(inv: &Invocation, node: Uuid) -> anyhow::Result<String> {
                 or_none(&s.agent_effort)
             ),
             Capability::Files => format!(
-                "files: dir {}, branch {}, worktree {}",
+                "files: dir {}, branch {}, worktree {}, runs in {}",
                 or_none(&s.repo),
                 or_none(&s.branch),
-                if s.use_worktree { "on" } else { "off" }
+                if s.use_worktree { "on" } else { "off" },
+                tod_store::conversation::runs_in(&s.dev_container),
             ),
             Capability::Ticket => format!(
                 "ticket: tickets {}; pull requests {}",
@@ -227,6 +281,7 @@ fn set(inv: &Invocation, node: Uuid, args: &Args) -> anyhow::Result<String> {
                 Some("off") => false,
                 Some(other) => anyhow::bail!("--worktree must be on or off, not `{other}`"),
             },
+            dev_container: files_dev_container(args, s.dev_container)?,
         },
         Capability::Ticket => {
             let given = |flag: &str, old: Vec<String>| {

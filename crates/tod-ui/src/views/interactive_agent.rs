@@ -428,6 +428,7 @@ impl InteractiveAgentView {
                     message: text,
                     purpose: tod_agent::SessionPurpose::Chat,
                     env: Vec::new(),
+                    environment: Default::default(),
                 })
             }
             Err(_) => Err(anyhow::anyhow!("Agent busy — try again shortly")),

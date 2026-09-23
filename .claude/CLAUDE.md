@@ -308,6 +308,57 @@ stay only for the interview.
 
 Tracks agents running against git worktrees: provisioning (`provision.rs`), launching (`launch.rs`, `runtime.rs`), reattaching to running processes (`reattach.rs`), terminal sessions (`terminal/`), prompt queuing (`prompt_queue.rs`), and an undo log (`undo.rs`). `store.rs` / `writer.rs` / `schema.rs` / `migration.rs` are the SQLite persistence core; `projection.rs` derives read-side views for the UI.
 
+### Dev containers
+
+The Files capability can run a node's work in a running dev container
+instead of on this machine (`node_files.dev_container` / `container` /
+`container_dir` / `container_repo_on_host`, schema v57; the task editor's
+"Runs in" section, which lists `docker ps` in the background, or `tod-cli
+capabilities set <node> files --container <name|id> [--mounted on|off]`).
+Nothing starts or builds a container; tod only uses a running one.
+
+- **Repository in the container** (the default): the workspace directory is a
+  container path, and git runs there too. Worktrees go to
+  `<repo>/.worktrees/<branch>`, which is added to the repository's
+  `info/exclude`. Treehouse is host-only, so these always use git worktrees.
+- **Mounted** (`container_repo_on_host`): the repository is on this machine,
+  git runs here, and only launches go into the container. The directory there
+  is mapped through the container's mounts unless `container_dir` names it.
+
+- `tod_store::fleet::Workdir` (`Host(path)` / `Container { container, path }`)
+  is the directory type for every git and worktree operation and every launch
+  cwd (`FilesDirectory::Ready`, `resolve_launch_cwd`, `Protocol::cwd`). Its
+  `git`/`output` run on the host or through `docker exec`
+  (`tod_agent::devcontainer::ContainerExec`, which caches `docker inspect` for
+  30s). A container directory is never checked from the UI thread.
+
+- `tod_agent::devcontainer` is the transport: `docker ps`/`inspect`, mount
+  mapping, `prepare` (check the container is running, resolve directory, user
+  from `remoteUser`, and `PATH`; write files as root), and `docker exec`
+  commands. `AgentEnvironment` on `SessionTurn` / `start_fleet_agent` tells
+  the provider where to spawn the agent; Docker only runs on the provider's
+  worker thread.
+- `tod_store::fleet::dev_container::launch_for` / `FleetStore::agent_environment`
+  decide the environment for a node and a `Workdir`: a container directory
+  always launches in its container; a host one only when it is inside a
+  mounted repository's ready Files directory (a turn that runs in the data
+  root stays on this machine). The agent process itself is started from the
+  data root on the host. Every launch site that has a node passes it: the
+  conversation driver, the background run, and terminals.
+- Agents in the container reach `tod-cli` through `fleet::cli_relay`: a bash
+  shim at `/tmp/tod-cli-relay/tod-cli` sends its args, `TOD_*` env, and stdin
+  over TCP (`host.docker.internal`) to a loopback listener in the app, which
+  checks a per-process token and runs the real `tod-cli` with the app's own
+  data root. This needs Docker Desktop (native Linux Docker does not forward
+  `host.docker.internal` to the host's loopback).
+- Shells and terminal agents open a host terminal whose startup command is
+  `docker exec -it [-u user] <id> sh /tmp/tod-cli-relay/launch-<id>.sh`; the
+  script sets the directory, `PATH`, and relay env, so the token never goes on
+  a command line.
+- Tests that need a real container are skipped unless `TOD_TEST_DEV_CONTAINER`
+  (a running container with git; some also need
+  `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set.
+
 ### `tod-store::outline` — task tree
 
 A hierarchical task/outline model with its own DDL/migration path (`ddl.rs`, `migrate_interview.rs`), slug-based addressing (`slug.rs`), and import from the older interview-session format (`import.rs`).
