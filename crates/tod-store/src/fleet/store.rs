@@ -282,6 +282,18 @@ impl FleetStore {
         crate::journey_submissions::JourneySubmissionRepo::new(&conn).set_status(bundle_id, status)
     }
 
+    /// Every still-`queued` milestone entry for `node_id`
+    /// (`crate::journey_submissions::JourneySubmissionRepo::queued_milestones_for_node`).
+    /// Used by the change-feed thread to find entries a just-recorded
+    /// milestone for the same node supersedes.
+    pub fn queued_milestones_for_node(
+        &self,
+        node_id: uuid::Uuid,
+    ) -> Result<Vec<crate::journey_submissions::SubmissionEntry>> {
+        let conn = rusqlite::Connection::open(self.writer.db_path())?;
+        crate::journey_submissions::JourneySubmissionRepo::new(&conn).queued_milestones_for_node(node_id)
+    }
+
     /// Enqueue a fleet mutation for the async writer.
     pub fn enqueue(&self, mutation: FleetMutation) -> Result<(), FleetWriterError> {
         if self.migration.is_some() {

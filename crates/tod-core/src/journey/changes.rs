@@ -56,6 +56,7 @@ pub struct ValidityCache(HashMap<Uuid, Option<String>>);
 /// Returns the new high-water mark (unchanged when there was nothing new).
 pub fn process_once(
     conn: &Connection,
+    store: &FleetStore,
     recorder: &Recorder,
     settings: &JourneySettings,
     validity_cache: &mut ValidityCache,
@@ -102,12 +103,18 @@ pub fn process_once(
                 },
             );
             if settings.milestone_states.iter().any(|state| state == &to) {
-                recorder.record(
+                let seq = recorder.record_and_get_seq(
                     JourneyKey::Node(*node_id),
                     Actor::App,
-                    Event::Milestone { state: to },
+                    Event::Milestone { state: to.clone() },
                 );
                 recorder.compact(JourneyKey::Node(*node_id));
+
+                if let Some(seq) = seq {
+                    if settings.send {
+                        queue_milestone_submission(store, recorder, *node_id, &to, seq as i64);
+                    }
+                }
             }
         }
 
@@ -136,6 +143,53 @@ pub fn process_once(
     }
 
     Ok(new_high_water)
+}
+
+/// Queues a bundle submission for a just-recorded `Milestone` event
+/// (`doc/journeys/spec.md` §6): inserts a `journey_submissions` entry with
+/// reason `milestone:<state>` and records the corresponding
+/// `Event::Submission`, mirroring `submit_report`'s pattern in
+/// `tod-ui`'s `app::window`. Before inserting, abandons any still-`queued`
+/// milestone entry for the same node — a later bundle contains everything an
+/// earlier, unsent one did — but never touches a `report` entry.
+fn queue_milestone_submission(store: &FleetStore, recorder: &Recorder, node_id: Uuid, state: &str, seq: i64) {
+    match store.queued_milestones_for_node(node_id) {
+        Ok(stale) => {
+            for entry in stale {
+                if let Err(err) = store.set_journey_submission_status(
+                    entry.bundle_id,
+                    tod_store::journey_submissions::STATUS_ABANDONED,
+                ) {
+                    tracing::warn!(
+                        "journey: failed to abandon superseded milestone submission {}: {err:#}",
+                        entry.bundle_id
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("journey: failed to list queued milestones for node {node_id}: {err:#}");
+            return;
+        }
+    }
+
+    let bundle_id = Uuid::new_v4();
+    let reason = format!("milestone:{state}");
+    match store.queue_journey_submission(bundle_id, Some(node_id), seq, &reason) {
+        Ok(entry) => {
+            recorder.record(
+                JourneyKey::Node(node_id),
+                Actor::App,
+                Event::Submission {
+                    bundle: entry.bundle_id,
+                    status: "queued".to_string(),
+                },
+            );
+        }
+        Err(err) => {
+            tracing::warn!("journey: failed to queue milestone submission for node {node_id}: {err:#}");
+        }
+    }
 }
 
 /// Starts the change-feed thread: subscribes to `store.subscribe_changes()`
@@ -184,7 +238,7 @@ fn run_once(
     let guard = store.projection();
     let projection = guard.lock().expect("fleet projection mutex");
     let conn = projection.connection();
-    match process_once(&conn, recorder, settings, validity_cache, *high_water) {
+    match process_once(&conn, store, recorder, settings, validity_cache, *high_water) {
         Ok(new_high_water) => *high_water = new_high_water,
         Err(err) => tracing::warn!("journey: change feed failed: {err:#}"),
     }
@@ -260,7 +314,7 @@ mod tests {
         let high_water = {
             let projection = guard.lock().unwrap();
             let conn = projection.connection();
-            process_once(&conn, &recorder, &settings, &mut validity_cache, 0).unwrap()
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, 0).unwrap()
         };
         assert!(high_water > 0);
 
@@ -299,7 +353,7 @@ mod tests {
             let guard = fleet.projection();
             let projection = guard.lock().unwrap();
             let conn = projection.connection();
-            process_once(&conn, &recorder, &settings, &mut validity_cache, 0).unwrap();
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, 0).unwrap();
         }
 
         fleet
@@ -317,7 +371,7 @@ mod tests {
                 .last()
                 .map(|r| r.id - 1)
                 .unwrap_or(0);
-            process_once(&conn, &recorder, &settings, &mut validity_cache, hw).unwrap()
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, hw).unwrap()
         };
         assert!(high_water > 0);
 
@@ -340,6 +394,146 @@ mod tests {
         // Compaction happened: the tail is now empty (or the .zst exists).
         let zst = journeys_dir.join(format!("{node}.journey.zst"));
         assert!(zst.exists(), "expected a compacted .zst for the node journey");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn later_milestone_supersedes_the_earlier_still_queued_one_for_the_same_node() {
+        let (root, fleet, node) = fixture();
+        let journeys_dir = root.join("journeys");
+        let recorder = crate::journey::recorder::spawn(journeys_dir.clone(), 1024);
+        let mut settings = JourneySettings::default();
+        settings.send = true;
+        let mut validity_cache = ValidityCache::default();
+
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Lifecycle],
+            })
+            .unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle {
+                node_id: node,
+                state: "active".into(),
+            })
+            .unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle {
+                node_id: node,
+                state: "verifying".into(),
+            })
+            .unwrap();
+
+        {
+            let guard = fleet.projection();
+            let projection = guard.lock().unwrap();
+            let conn = projection.connection();
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, 0).unwrap();
+        }
+
+        // Both "active" and "verifying" are milestone states (defaults), so
+        // both fire in this one drain, in order. Only the later one should
+        // still be queued: the earlier one is superseded.
+        let queued = fleet.queued_milestones_for_node(node).unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].reason, "milestone:verifying");
+
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_report_entry_for_the_same_node_is_never_superseded_by_a_milestone() {
+        let (root, fleet, node) = fixture();
+        let journeys_dir = root.join("journeys");
+        let recorder = crate::journey::recorder::spawn(journeys_dir.clone(), 1024);
+        let mut settings = JourneySettings::default();
+        settings.send = true;
+        let mut validity_cache = ValidityCache::default();
+
+        let report_bundle = Uuid::new_v4();
+        fleet
+            .queue_journey_submission(report_bundle, Some(node), 1, "report")
+            .unwrap();
+
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Lifecycle],
+            })
+            .unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle {
+                node_id: node,
+                state: "active".into(),
+            })
+            .unwrap();
+
+        {
+            let guard = fleet.projection();
+            let projection = guard.lock().unwrap();
+            let conn = projection.connection();
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, 0).unwrap();
+        }
+
+        let conn = rusqlite::Connection::open(fleet.writer().db_path()).unwrap();
+        let repo = tod_store::journey_submissions::JourneySubmissionRepo::new(&conn);
+        let report = repo.get_by_bundle(report_bundle).unwrap().unwrap();
+        assert_eq!(report.status, tod_store::journey_submissions::STATUS_QUEUED);
+
+        // The milestone still got its own queued entry.
+        let queued = fleet.queued_milestones_for_node(node).unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].reason, "milestone:active");
+
+        drop(recorder);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn milestone_with_sending_off_never_queues_a_submission() {
+        let (root, fleet, node) = fixture();
+        let journeys_dir = root.join("journeys");
+        let recorder = crate::journey::recorder::spawn(journeys_dir.clone(), 1024);
+        let settings = JourneySettings::default(); // send: false
+        let mut validity_cache = ValidityCache::default();
+
+        fleet
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: node,
+                capabilities: vec![Capability::Lifecycle],
+            })
+            .unwrap();
+        fleet
+            .enqueue_outline(OutlineMutation::SetLifecycle {
+                node_id: node,
+                state: "active".into(),
+            })
+            .unwrap();
+
+        {
+            let guard = fleet.projection();
+            let projection = guard.lock().unwrap();
+            let conn = projection.connection();
+            process_once(&conn, &fleet, &recorder, &settings, &mut validity_cache, 0).unwrap();
+        }
+
+        let queued = fleet.queued_milestones_for_node(node).unwrap();
+        assert!(queued.is_empty(), "{queued:?}");
+
+        // The milestone event itself was still recorded (existing Step 2
+        // behavior), sending being off only gates the submission side-effect.
+        drop(recorder);
+        std::thread::sleep(Duration::from_millis(200));
+        let reader = tod_journey::JourneyReader::open(&journeys_dir, JourneyKey::Node(node)).unwrap();
+        let records = reader.all();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(&r.event, Event::Milestone { state } if state == "active")),
+            "{records:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

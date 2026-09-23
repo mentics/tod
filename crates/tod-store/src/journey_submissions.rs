@@ -148,6 +148,24 @@ impl<'a> JourneySubmissionRepo<'a> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Every still-`queued` milestone entry (`reason` starting with
+    /// `"milestone:"`) for `node_id`, oldest first. A newer milestone bundle
+    /// for the same node contains everything an older, still-unsent one did
+    /// (`doc/journeys/spec.md` §6), so the caller uses this to find entries a
+    /// just-recorded milestone supersedes. Reports (`reason == "report"`)
+    /// never match this query.
+    pub fn queued_milestones_for_node(&self, node_id: Uuid) -> Result<Vec<SubmissionEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM journey_submissions
+             WHERE status = 'queued' AND node_id = ?1 AND reason LIKE 'milestone:%'
+             ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(params![uuid_to_blob(node_id)], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionEntry> {
@@ -279,5 +297,39 @@ mod tests {
             .map(|e| e.bundle_id)
             .collect();
         assert_eq!(sent, [second]);
+    }
+
+    #[test]
+    fn queued_milestones_for_node_matches_only_queued_milestone_entries_for_that_node() {
+        let fx = setup();
+        let repo = JourneySubmissionRepo::new(&fx.conn);
+        let node = Uuid::new_v4();
+        let other_node = Uuid::new_v4();
+
+        let milestone_a = Uuid::new_v4();
+        repo.insert_queued(milestone_a, Some(node), 1, "milestone:active").unwrap();
+        let milestone_b = Uuid::new_v4();
+        repo.insert_queued(milestone_b, Some(node), 2, "milestone:verifying").unwrap();
+
+        // A report on the same node must never be picked up.
+        let report = Uuid::new_v4();
+        repo.insert_queued(report, Some(node), 3, "report").unwrap();
+
+        // A milestone on a different node must never be picked up.
+        let other = Uuid::new_v4();
+        repo.insert_queued(other, Some(other_node), 4, "milestone:active").unwrap();
+
+        // Already-sent milestone must never be picked up.
+        let sent = Uuid::new_v4();
+        repo.insert_queued(sent, Some(node), 5, "milestone:review").unwrap();
+        repo.set_status(sent, STATUS_SENT).unwrap();
+
+        let found: Vec<_> = repo
+            .queued_milestones_for_node(node)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.bundle_id)
+            .collect();
+        assert_eq!(found, [milestone_a, milestone_b]);
     }
 }
