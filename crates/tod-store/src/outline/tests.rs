@@ -874,15 +874,21 @@ fn gate_criteria_seed_on_migration() {
     assert_eq!(active_verifying.len(), 1);
     let verifying_review = repo.list_for_transition("verifying", "review").unwrap();
     assert_eq!(verifying_review.len(), 11);
-    let review_approved = repo.list_for_transition("review", "approved").unwrap();
-    assert_eq!(review_approved.len(), 2);
+    let review_pr = repo.list_for_transition("review", "pr").unwrap();
+    assert_eq!(review_pr.len(), 2);
+    let pr_approved = repo.list_for_transition("pr", "approved").unwrap();
+    assert_eq!(pr_approved.len(), 1);
+    let approved_merged = repo.list_for_transition("approved", "merged").unwrap();
+    assert_eq!(approved_merged.len(), 1);
     assert_eq!(
         design_planning.len()
             + planning_ready.len()
             + ready_active.len()
             + active_verifying.len()
             + verifying_review.len()
-            + review_approved.len(),
+            + review_pr.len()
+            + pr_approved.len()
+            + approved_merged.len(),
         GATE_CRITERIA.len() - superseded
     );
     let _ = fs::remove_dir_all(root);

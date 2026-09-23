@@ -202,6 +202,28 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
     blocks: IMPLEMENT_SESSION.blocks,
 };
 
+/// A pr session: an agent opening and driving a node's pull request. The `pr`
+/// state agent's role doc goes ahead of the dynamic blocks; `surface/pr`
+/// scopes it to opening the PR and driving it to mergeable — no approval, no
+/// gate — through the `pr` noun.
+pub const PR_SESSION: ContextRecipe = ContextRecipe {
+    name: "pull request session",
+    situational: false,
+    layers: &[
+        "stance/autonomous-session",
+        "domain/outline",
+        "domain/obligations",
+        "domain/plan",
+        "domain/lifecycle",
+        "cli/intro",
+        "cli/obligations",
+        "cli/plan",
+        "cli/pr",
+        "surface/pr",
+    ],
+    blocks: IMPLEMENT_SESSION.blocks,
+};
+
 /// A fix session: an agent resolving a node's open review findings in its
 /// worktree — fixing each, or rejecting it with a note saying why it is not a
 /// problem. It gets what an implementation session gets, plus the open
@@ -443,6 +465,7 @@ pub const ALL_RECIPES: &[ContextRecipe] = &[
     IMPLEMENT_SESSION,
     VERIFY_SESSION,
     REVIEW_SESSION,
+    PR_SESSION,
     FIX_SESSION,
     GATE_CHECK,
     LEARN_GATE_CHECK,

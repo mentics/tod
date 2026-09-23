@@ -114,6 +114,16 @@ pub fn build_review_message(
     build_plan_session_message(paths, &REVIEW_SESSION, Some(role_doc), request)
 }
 
+/// Build the full pr-session first message: what an implementation session
+/// is given, plus the `pr` state's role doc ahead of it.
+pub fn build_pr_message(
+    paths: &MediaPaths,
+    request: &ImplementRequest<'_>,
+    role_doc: &str,
+) -> Result<String> {
+    build_plan_session_message(paths, &crate::context_recipes::PR_SESSION, Some(role_doc), request)
+}
+
 /// Build the full fix-session first message: what an implementation session
 /// is given, plus the node's open review findings to resolve.
 pub fn build_fix_message(

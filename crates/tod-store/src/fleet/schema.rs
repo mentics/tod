@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 58;
+pub const CURRENT_USER_VERSION: i32 = 59;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -373,6 +373,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v57_to_v58(conn)?;
         conn.pragma_update(None, "user_version", 58)?;
     }
+    if version < 59 {
+        migrate_v58_to_v59(conn)?;
+        conn.pragma_update(None, "user_version", 59)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -724,6 +728,24 @@ fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE node_files ADD COLUMN {column} {ddl};"))?;
         }
     }
+    Ok(())
+}
+
+/// The `pr` lifecycle state's PR reference: one row per node once its pull
+/// request has been opened (`tod-cli pr open`), read by the `pr -> approved`
+/// and `approved -> merged` gates and shown in the side pane.
+fn migrate_v58_to_v59(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS node_pr (
+            node_id BLOB PRIMARY KEY,
+            owner TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            pr_number INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+        );",
+    )?;
     Ok(())
 }
 

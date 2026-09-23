@@ -507,6 +507,7 @@ pub(super) fn kind_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Verification => "verification",
         ProtocolKind::Review => "review",
         ProtocolKind::Fix => "fix",
+        ProtocolKind::Pr => "pr",
         ProtocolKind::Chat => "chat",
         ProtocolKind::VisualDesign => "visual design",
         ProtocolKind::GateCheck => "gate check",
@@ -523,6 +524,8 @@ pub(super) fn new_label(kind: ProtocolKind) -> &'static str {
         ProtocolKind::Verification => "New verification",
         ProtocolKind::Review => "New review",
         ProtocolKind::Fix => "New fix",
+        // Started by the lifecycle buttons, which know the transition.
+        ProtocolKind::Pr => "New pr",
         ProtocolKind::Chat => "New conversation",
         ProtocolKind::VisualDesign => "New visual design",
         // Started by the lifecycle buttons, which know the transition.

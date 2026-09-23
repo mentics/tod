@@ -208,17 +208,18 @@ pub fn lifecycle_rank(lifecycle: &str) -> usize {
         "active" => 4,
         "verifying" => 5,
         "review" => 6,
-        "approved" => 7,
-        "merged" => 8,
-        "released" => 9,
-        "learn" => 10,
-        "done" => 11,
+        "pr" => 7,
+        "approved" => 8,
+        "merged" => 9,
+        "released" => 10,
+        "learn" => 11,
+        "done" => 12,
         _ => 99,
     }
 }
 
 /// Ordered lifecycle states, indexed by `lifecycle_rank`.
-pub const LIFECYCLE_STATES: [&str; 12] = [
+pub const LIFECYCLE_STATES: [&str; 13] = [
     "proposed",
     "design",
     "planning",
@@ -226,6 +227,7 @@ pub const LIFECYCLE_STATES: [&str; 12] = [
     "active",
     "verifying",
     "review",
+    "pr",
     "approved",
     "merged",
     "released",
@@ -252,9 +254,12 @@ pub fn previous_lifecycle(lifecycle: &str) -> Option<&'static str> {
 
 /// Whether `lifecycle` has a state agent at all (see `assets/process/agents/state/base.md`:
 /// "States `ready` and `done` have no agent"). Gates whether an on-entry or
-/// gate-check turn should ever be fired for it.
+/// gate-check turn should ever be fired for it. `approved` is also agent-less:
+/// it is a thin holding state between the PR becoming mergeable (the `pr`
+/// state's job) and the user clicking merge — both its gates are app-checked
+/// against GitHub, not agent-decided.
 pub fn state_has_agent(lifecycle: &str) -> bool {
-    !matches!(lifecycle, "ready" | "done")
+    !matches!(lifecycle, "ready" | "done" | "approved")
 }
 
 #[cfg(test)]
