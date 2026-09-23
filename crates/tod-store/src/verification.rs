@@ -364,6 +364,43 @@ mod tests {
         assert!(latest[&broken].is_failed());
     }
 
+    /// Code changed after verification (a fix): every verified step and
+    /// verdict is withdrawn, the failures that prompted the change stay, and
+    /// a step's note survives.
+    #[test]
+    fn reopening_verification_withdraws_verified_steps_and_verdicts() {
+        let fx = setup();
+        let repo = VerdictRepo::new(&fx.conn);
+        let holds = obligation(&fx, "Holds");
+        let broken = obligation(&fx, "Broken");
+        repo.record(fx.node, holds, None, "verified", "Saw it work.").unwrap();
+        repo.record(fx.node, broken, None, "failed", "Saw it fail.").unwrap();
+        let steps = PlanStepRepo::new(&fx.conn);
+        let (checked, failing) = (Uuid::new_v4(), Uuid::new_v4());
+        steps.insert_at(checked, fx.node, 0, "Build it").unwrap();
+        steps.insert_at(failing, fx.node, 1, "Wire it").unwrap();
+        steps
+            .update_status(checked, STATUS_VERIFIED, Some("Ran it."), None)
+            .unwrap();
+        steps
+            .update_status(failing, crate::outline::repos::plan_steps::STATUS_FAILED, Some("Broken."), None)
+            .unwrap();
+
+        let reopened = steps.reopen_verification(fx.node, "Fixed since.").unwrap();
+        assert_eq!(reopened, (1, 1));
+        let now = steps.list_for_node(fx.node).unwrap();
+        let status = |id| now.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(status(checked).status, STATUS_IMPLEMENTED);
+        assert_eq!(status(checked).note.as_deref(), Some("Ran it."));
+        assert_eq!(status(failing).status, crate::outline::repos::plan_steps::STATUS_FAILED);
+        let latest = repo.latest_for_node(fx.node).unwrap();
+        assert_eq!(latest[&holds].status, VERDICT_REOPENED);
+        assert_eq!(latest[&holds].evidence, "Fixed since.");
+        assert!(latest[&broken].is_failed());
+        // Nothing left to withdraw.
+        assert_eq!(steps.reopen_verification(fx.node, "Again.").unwrap(), (0, 0));
+    }
+
     /// Rewording an obligation withdraws its `verified` verdict and no other.
     #[test]
     fn rewording_an_obligation_reopens_its_verdict() {

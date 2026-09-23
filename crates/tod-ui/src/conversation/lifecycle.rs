@@ -19,13 +19,11 @@ use tod_core::conversation::gate_check::{
     GateReportRecord, latest_gate_report, settle_derived_criteria,
 };
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
-use tod_core::conversation::review::review_recorded_done;
+use tod_core::lifecycle_next::{NextStep, Standing, next_step};
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::fleet::FleetStore;
-use tod_store::outline::repos::plan_steps::{STATUS_FAILED, STATUS_VERIFIED};
 use tod_store::outline::types::Capability;
-use tod_store::review::ReviewRepo;
 use uuid::Uuid;
 
 const IMPLEMENT: &str = "lifecycle:implement";
@@ -44,18 +42,14 @@ pub(crate) struct LifecycleSnapshot {
     pub node: Uuid,
     pub lifecycle: String,
     pub plan: PlanProgress,
-    pub verified: usize,
-    pub failed: usize,
-    /// In `review`: whether the node has a review conversation, whether it
-    /// last reported the review done, and how many findings are still open.
+    /// In `review`: whether the node has a review conversation. Whether it
+    /// finished, and its open findings, are in [`Self::standing`].
     pub review_started: bool,
-    pub review_done: bool,
-    pub open_findings: usize,
-    /// The node's own obligations verification has not ruled on (or whose
-    /// verdict was reopened).
-    pub unchecked_obligations: usize,
     /// What the node's latest gate check, of its current transition, said.
     pub gate: Option<GateReportRecord>,
+    /// Where its work stands in the store, which decides the recommended
+    /// next step ([`next_step`]).
+    pub standing: Standing,
     /// Why implementation, verification, or review cannot run here, when it
     /// cannot.
     pub blocked: Option<String>,
@@ -76,52 +70,41 @@ impl LifecycleSnapshot {
         }
         let task_id = node.to_string();
         let lifecycle = fleet.get_node(&task_id).ok()??.lifecycle;
-        let steps = fleet.list_plan_steps_for_node(node).unwrap_or_default();
-        let count = |status: &str| steps.iter().filter(|s| s.status == status).count();
         // Implementation, verification, and review all run in the node's
         // worktree.
         let blocked = matches!(lifecycle.as_str(), "active" | "verifying" | "review")
             .then(|| implement_directory(fleet, &task_id).err())
             .flatten();
-        let (review_started, review_done, open_findings) = if lifecycle == "review" {
-            fleet
+        let review_started = lifecycle == "review"
+            && fleet
                 .read(|conn| {
-                    let started = ConversationRepo::new(conn)
+                    Ok(ConversationRepo::new(conn)
                         .latest_for_focus_with_protocol(focus, ProtocolKind::Review)?
-                        .is_some();
-                    let done = review_recorded_done(conn, node)?;
-                    let open = ReviewRepo::new(conn)
-                        .list_for_node(node)?
-                        .iter()
-                        .filter(|f| f.is_open())
-                        .count();
-                    Ok((started, done, open))
+                        .is_some())
                 })
-                .unwrap_or_default()
-        } else {
-            (false, false, 0)
-        };
+                .unwrap_or_default();
         let gate = fleet
             .read(|conn| latest_gate_report(conn, node, &lifecycle))
             .ok()
             .flatten()
             .map(|(_, report)| report);
+        let standing = fleet
+            .read(|conn| Standing::load(conn, node, &lifecycle))
+            .unwrap_or_default();
         Some(Self {
             node,
             plan: plan_progress(fleet, node),
-            verified: count(STATUS_VERIFIED),
-            failed: count(STATUS_FAILED),
             review_started,
-            review_done,
-            open_findings,
-            unchecked_obligations: tod_core::conversation::verify::standings(fleet, node)
-                .iter()
-                .filter(|standing| standing.is_unchecked())
-                .count(),
             gate,
+            standing,
             lifecycle,
             blocked,
         })
+    }
+
+    /// The step the stored state recommends next.
+    fn next_step(&self) -> Option<NextStep> {
+        next_step(&self.standing)
     }
 
     fn total(&self) -> usize {
@@ -163,6 +146,7 @@ impl ConversationView {
         let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation);
         let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
             || self.checking_incoming(snapshot.node, cx);
+        let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix);
         let mut gate_offered = next.is_some();
         match snapshot.lifecycle.as_str() {
             "active" => match snapshot.plan {
@@ -196,33 +180,32 @@ impl ConversationView {
                 PlanProgress::Complete { .. } if implementing => gate_offered = false,
                 PlanProgress::Complete { .. } => {}
             },
+            // A fix or reimplementation on the node changes what verification
+            // would check: neither verifying nor the gate can start until it
+            // is done, and the change reopens verification when it lands.
+            "verifying" if changing => gate_offered = false,
             "verifying" if snapshot.total() > 0 && !open_is(ProtocolKind::Verification) => {
-                let unchecked = snapshot.total() - snapshot.verified - snapshot.failed
-                    + snapshot.unchecked_obligations;
-                if snapshot.failed > 0 && unchecked == 0 {
+                let due = snapshot.standing.verification_due();
+                if snapshot.next_step() == Some(NextStep::FixFailed) {
                     // Failed steps are fixed in `active`, where implementation
                     // works each one again from its note: one press moves the
                     // node there and starts that implementation.
                     actions.push(
-                        PanelAction::new(FIX_FAILED, format!("Fix failed ({})", snapshot.failed))
-                            .primary(true)
-                            .disabled(blocked),
+                        PanelAction::new(
+                            FIX_FAILED,
+                            format!("Fix failed ({})", snapshot.standing.steps_failed),
+                        )
+                        .primary(true)
+                        .disabled(blocked),
                     );
                     gate_offered = false;
                 } else {
                     actions.push(
-                        PanelAction::new(
-                            VERIFY,
-                            if unchecked > 0 {
-                                "Verify"
-                            } else {
-                                "Verify again"
-                            },
-                        )
-                        .primary(unchecked > 0)
-                        .disabled(blocked),
+                        PanelAction::new(VERIFY, if due { "Verify" } else { "Verify again" })
+                            .primary(due)
+                            .disabled(blocked),
                     );
-                    gate_offered &= unchecked == 0;
+                    gate_offered &= !due;
                 }
             }
             "verifying" if open_is(ProtocolKind::Verification) => gate_offered = false,
@@ -231,7 +214,8 @@ impl ConversationView {
             }
             "review" => {
                 let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix);
-                let fix_first = snapshot.review_done && snapshot.open_findings > 0;
+                let fix_first =
+                    snapshot.standing.review_done && snapshot.standing.open_findings > 0;
                 actions.push(
                     PanelAction::new(
                         REVIEW,
@@ -241,19 +225,19 @@ impl ConversationView {
                             "Review"
                         },
                     )
-                    .primary(!snapshot.review_done)
+                    .primary(!snapshot.standing.review_done)
                     .disabled(blocked),
                 );
                 // Fixing resolves the open findings — fixed, or rejected with
                 // a note — in a fix conversation, while the node stays here.
-                if snapshot.open_findings > 0 || fixing {
+                if snapshot.standing.open_findings > 0 || fixing {
                     actions.push(
                         PanelAction::new(
                             FIX,
                             if fixing {
                                 "Fixing…".to_string()
                             } else {
-                                format!("Fix ({} open)", snapshot.open_findings)
+                                format!("Fix ({} open)", snapshot.standing.open_findings)
                             },
                         )
                         .primary(fix_first)
@@ -262,12 +246,14 @@ impl ConversationView {
                 }
                 // Approval waits for a finished review with every finding
                 // answered — the gate's two app-checked criteria.
-                gate_offered &= snapshot.review_done && snapshot.open_findings == 0 && !fixing;
-                if snapshot.open_findings > 0 {
-                    let needs = if snapshot.open_findings == 1 {
+                gate_offered &= snapshot.standing.review_done
+                    && snapshot.standing.open_findings == 0
+                    && !fixing;
+                if snapshot.standing.open_findings > 0 {
+                    let needs = if snapshot.standing.open_findings == 1 {
                         "1 review finding needs".to_string()
                     } else {
-                        format!("{} review findings need", snapshot.open_findings)
+                        format!("{} review findings need", snapshot.standing.open_findings)
                     };
                     notices.push(PanelNotice::new(
                         NoticeTone::Error,
@@ -297,7 +283,10 @@ impl ConversationView {
                 actions.push(PanelAction::new(ADVANCE, format!("Advance to {next}")).primary(true));
                 actions.push(PanelAction::new(GATE_CHECK, "Check again"));
             } else {
-                let primary = !actions.iter().any(|a| a.primary);
+                // Only once nothing earlier is owed: a gate check before then
+                // just reports what the stored state already says.
+                let primary = snapshot.next_step() == Some(NextStep::GateCheck)
+                    && !actions.iter().any(|a| a.primary);
                 actions.push(
                     PanelAction::new(GATE_CHECK, format!("Gate check → {next}")).primary(primary),
                 );
@@ -336,17 +325,27 @@ impl ConversationView {
         let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
             || self.checking_incoming(snapshot.node, cx);
         // A gate check recorded earlier says nothing once the work has moved
-        // on: after a verification that failed steps, or a review with open
-        // findings, its "all criteria satisfied" would be wrong.
-        let unchecked = snapshot
-            .total()
-            .saturating_sub(snapshot.verified + snapshot.failed);
+        // on: after a fix that reopened verification, a verification that
+        // failed steps, or a review with open findings, its verdict — pass or
+        // fail — would point the user at the wrong thing.
         let gate_stale = !checking
             && match snapshot.lifecycle.as_str() {
-                "verifying" => snapshot.failed > 0 || unchecked > 0,
-                "review" => snapshot.open_findings > 0 || !snapshot.review_done,
+                "verifying" => {
+                    snapshot.standing.verification_due() || snapshot.standing.steps_failed > 0
+                }
+                "review" => snapshot.standing.open_findings > 0 || !snapshot.standing.review_done,
                 _ => false,
             };
+        // Say so, rather than let the old verdict vanish without a word.
+        if gate_stale
+            && snapshot.standing.verification_due()
+            && (snapshot.gate.is_some() || !gate.gate_status.is_empty())
+        {
+            notices.push(
+                PanelNotice::new(NoticeTone::Error, reverify_first(&snapshot.standing))
+                    .with_action(PanelAction::new(VERIFY, "Verify")),
+            );
+        }
         if !gate.gate_status.is_empty() && !gate_stale {
             notices.push(PanelNotice::new(
                 NoticeTone::Muted,
@@ -482,6 +481,34 @@ impl ConversationView {
                 .update(cx, |controller, _| controller.load_persisted(&task_id));
         }
     }
+}
+
+/// Why the last gate check's verdict no longer stands in `verifying`: what
+/// verification owes a verdict on again.
+fn reverify_first(standing: &Standing) -> String {
+    let mut owed = Vec::new();
+    let count = |n: usize, one: &str, many: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    if standing.steps_unchecked > 0 {
+        owed.push(count(standing.steps_unchecked, "plan step", "plan steps"));
+    }
+    if standing.obligations_unchecked > 0 {
+        owed.push(count(
+            standing.obligations_unchecked,
+            "requirement",
+            "requirements",
+        ));
+    }
+    if owed.is_empty() {
+        return "Verify again before the gate check: a failed requirement has no failed                 plan step to carry it back to implementation."
+            .to_string();
+    }
+    format!(
+        "Verify again before the gate check: {} not verified against the current          code (changed since the last verification, or never checked).",
+        owed.join(" and ")
+    )
 }
 
 /// What a gate check concluded, as lines above the input: why, each blocker

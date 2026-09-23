@@ -271,7 +271,9 @@ mirror for a `verifying` node (the lifecycle panel's Verify). What it
 verifies is the node's **obligations**, not only the plan: the agent
 exercises each one in the running work and records a verdict with evidence
 through `tod-cli verdicts` (`tod_store::verification`, an append-only
-history per obligation; reimplementing a step reopens the `verified` ones).
+history per obligation; reimplementing a step reopens the `verified` ones,
+and a Fix or Implement turn on a `verifying` node reopens every verified step
+and verdict, so `tod_core::lifecycle_next` recommends Verify, not the gate).
 It loops until every own obligation and every plan step is `verified` or
 `failed`, every failed obligation has a `failed` step to carry it back to
 implementation, and a test run is recorded; it replaces the old `verifying`

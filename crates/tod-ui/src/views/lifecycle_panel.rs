@@ -51,6 +51,7 @@ use std::sync::Arc;
 use tod_core::conversation::implement::{PlanProgress, plan_progress};
 use tod_core::gate::GateAction;
 use tod_core::incoming::NodeOutcome;
+use tod_core::lifecycle_next::{NextStep, Standing, next_step};
 use tod_core::lifecycle_validity::{Regression, regression};
 use tod_core::process::interview_phase_for_lifecycle;
 use tod_core::task::model::{next_lifecycle, previous_lifecycle};
@@ -189,6 +190,10 @@ pub struct LifecyclePanelView {
     /// The node's state no longer holds and should go back; re-read on open
     /// and whenever the store changes.
     regression: Option<Regression>,
+    /// Where the node's work stands in the store, which decides which step
+    /// the panel highlights next; re-read on open and whenever the store
+    /// changes.
+    standing: Option<Standing>,
     /// The node's pending incoming changes, netted per item
     /// (`doc/conversation/incoming-changes.md` §6); re-read on open and
     /// whenever the store changes.
@@ -241,7 +246,12 @@ impl LifecyclePanelView {
                     let Ok(()) = poll_entity.update(cx, |this: &mut Self, cx| {
                         let incoming_changed = this.refresh_incoming();
                         let learnings_changed = this.refresh_learnings();
-                        if this.refresh_regression() | incoming_changed | learnings_changed {
+                        let standing_changed = this.refresh_standing();
+                        if this.refresh_regression()
+                            | incoming_changed
+                            | learnings_changed
+                            | standing_changed
+                        {
                             this.clamp_focus_index();
                             cx.notify();
                         }
@@ -264,6 +274,7 @@ impl LifecyclePanelView {
             implement_status: HashMap::new(),
             active_control: None,
             regression: None,
+            standing: None,
             incoming: Vec::new(),
             learnings: Vec::new(),
             focus_handle: cx.focus_handle(),
@@ -424,6 +435,29 @@ impl LifecyclePanelView {
         let changed = found != self.regression;
         self.regression = found;
         changed
+    }
+
+    /// Re-read where the node's work stands. `true` when it changed.
+    fn refresh_standing(&mut self) -> bool {
+        let found = self
+            .task_id
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .filter(|_| self.lifecycle_capable)
+            .and_then(|node| {
+                self.fleet
+                    .read(|conn| Standing::load(conn, node, &self.lifecycle))
+                    .ok()
+            });
+        let changed = found != self.standing;
+        self.standing = found;
+        changed
+    }
+
+    /// The step the stored state recommends next, which the panel shows as
+    /// its primary button.
+    fn recommended(&self) -> Option<NextStep> {
+        self.standing.as_ref().and_then(next_step)
     }
 
     /// Re-read the node's pending incoming changes. `true` when they changed.
@@ -827,10 +861,12 @@ impl LifecyclePanelView {
         let standings = tod_core::conversation::verify::standings(&self.fleet, node_id);
         let obligations_verified = standings.iter().filter(|s| s.is_verified()).count();
         let obligations_failed = standings.iter().filter(|s| s.is_failed()).count();
-        // "Verify" until every obligation and step has a verdict, then
-        // "Verify again".
-        let unchecked =
-            steps.len() - verified - failed + standings.iter().filter(|s| s.is_unchecked()).count();
+        // "Verify" while verification owes a verdict — never checked, or
+        // reopened by a change since — then "Verify again".
+        let due = self
+            .standing
+            .as_ref()
+            .is_some_and(Standing::verification_due);
         let status = self
             .task_id
             .as_ref()
@@ -869,13 +905,9 @@ impl LifecyclePanelView {
                     })
                     .child(
                         Button::new("lifecycle-panel-verify")
-                            .label(if unchecked > 0 {
-                                "Verify"
-                            } else {
-                                "Verify again"
-                            })
-                            .when(unchecked > 0, |b| b.primary())
-                            .when(unchecked == 0, |b| b.ghost())
+                            .label(if due { "Verify" } else { "Verify again" })
+                            .when(due, |b| b.primary())
+                            .when(!due, |b| b.ghost())
                             .w_full()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.launch_verification(window, cx);
@@ -906,7 +938,8 @@ impl LifecyclePanelView {
                         } else {
                             format!("Back to active to fix {failed} failed {steps_word}")
                         })
-                        .primary()
+                        // Once verification has finished; until then, Verify.
+                        .when(!due, |b| b.primary())
                         .w_full()
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.revert_lifecycle(cx);
@@ -1029,6 +1062,7 @@ impl LifecyclePanelView {
                     });
                 self.refresh_active_control();
                 self.refresh_regression();
+                self.refresh_standing();
                 self.refresh_incoming();
                 self.refresh_learnings();
                 true
@@ -1171,6 +1205,7 @@ impl Render for LifecyclePanelView {
             .child(div().text_sm().font_semibold().child(self.title.clone()));
 
         let run_gate_check_focused = self.is_focused(LifecyclePanelStop::RunGateCheck);
+        let gate_check_recommended = matches!(self.recommended(), Some(NextStep::GateCheck));
         if !self.lifecycle_capable {
             body = body.child(
                 div()
@@ -1330,7 +1365,9 @@ impl Render for LifecyclePanelView {
                         .child(
                             Button::new("lifecycle-panel-run-gate-check")
                                 .label(format!("Run gate check to advance to {next}"))
-                                .primary()
+                                // Only the recommendation once nothing earlier
+                                // (verifying, fixing failures, review) is owed.
+                                .when(gate_check_recommended, |b| b.primary())
                                 .w_full()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.run_gate_check(window, cx);

@@ -115,6 +115,10 @@ impl Protocol for ImplementationProtocol {
         prepare_submodules(env, &self.cwd(env)?)
     }
 
+    fn on_reply(&self, env: &ProtocolEnv<'_>, _reply: &str) -> Vec<RunNotice> {
+        reopen_verification_after_change(env, "Implementation")
+    }
+
     /// Its writes are not a reversible change set, so no conversation actor:
     /// plan-step and file changes are the agent's own, like any other caller.
     fn turn_env(&self, env: &ProtocolEnv<'_>) -> Vec<(String, String)> {
@@ -659,6 +663,44 @@ pub(super) fn commit_run(
     }
     notices.extend(sync_branch(env, node, cwd));
     notices
+}
+
+/// The lifecycle state whose verification a change to the code invalidates.
+const VERIFYING: &str = "verifying";
+
+/// After a turn that may have changed the node's code, withdraw what
+/// verification confirmed against the code before it, when the node is in
+/// `verifying`: a fix or reimplementation there means the node has to be
+/// verified again before its gate can pass, and the stored verdicts are what
+/// every button, the gate's criteria, and the verification loop read. Past
+/// `verifying` a fix answers a review finding and does not send the node back.
+pub(super) fn reopen_verification_after_change(
+    env: &ProtocolEnv<'_>,
+    what: &str,
+) -> Vec<RunNotice> {
+    let reopen = || -> Result<()> {
+        let node = node_id(env)?;
+        let lifecycle = env
+            .fleet
+            .read(|conn| NodeRepo::new(conn).get_lifecycle(node))?;
+        if lifecycle.as_deref() != Some(VERIFYING) {
+            return Ok(());
+        }
+        env.fleet.interview(
+            tod_store::interview::ACTOR_USER,
+            tod_store::interview::InterviewCommand::ReopenVerification {
+                node_id: node,
+                why: format!("{what} changed the code after this was verified."),
+            },
+        )?;
+        Ok(())
+    };
+    match reopen() {
+        Ok(()) => Vec::new(),
+        Err(err) => vec![RunNotice::Error(format!(
+            "Could not reopen verification after the change: {err:#}"
+        ))],
+    }
 }
 
 /// The branch a run on a detached HEAD commits to: the Files branch, which
