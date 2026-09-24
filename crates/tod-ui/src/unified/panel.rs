@@ -92,6 +92,7 @@ impl PlaceholderPanel {
             PanelKind::Details(id)
             | PanelKind::Obligations(id)
             | PanelKind::Plan(id)
+            | PanelKind::Findings(id)
             | PanelKind::Settings(id)
             | PanelKind::Transcript(id) => Some(id),
             PanelKind::Decisions => None,
@@ -114,6 +115,12 @@ impl PlaceholderPanel {
                 links.push(PlaceholderLink {
                     label: "Plan".into(),
                     target: PanelKind::Plan(id),
+                });
+            }
+            if !matches!(self.kind, PanelKind::Findings(_)) {
+                links.push(PlaceholderLink {
+                    label: "Findings".into(),
+                    target: PanelKind::Findings(id),
                 });
             }
             if !matches!(self.kind, PanelKind::Settings(_)) {
@@ -144,6 +151,7 @@ impl PlaceholderPanel {
             PanelKind::Details(id)
             | PanelKind::Obligations(id)
             | PanelKind::Plan(id)
+            | PanelKind::Findings(id)
             | PanelKind::Settings(id)
             | PanelKind::Transcript(id) => self
                 .fleet
@@ -167,6 +175,7 @@ impl ColumnPanel for PlaceholderPanel {
             PanelKind::Decisions => "Decisions".into(),
             PanelKind::Obligations(_) => "Obligations".into(),
             PanelKind::Plan(_) => "Plan".into(),
+            PanelKind::Findings(_) => "Findings".into(),
             PanelKind::Settings(_) => "Settings".into(),
             PanelKind::Transcript(_) => "Transcript".into(),
         }
