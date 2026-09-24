@@ -122,7 +122,7 @@ impl ConversationView {
     /// whichever conversation is open.
     fn protocol_running(&self, node: Uuid, protocol: ProtocolKind) -> bool {
         self.drivers.iter().any(|d| {
-            d.focus() == Focus::Node(node) && d.protocol().kind() == protocol && d.status().running
+            d.focus == Focus::Node(node) && d.protocol == protocol && d.status.running
         })
     }
 

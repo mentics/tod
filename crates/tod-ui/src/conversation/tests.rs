@@ -2223,6 +2223,48 @@ fn every_lifecycle_run_starts_a_new_conversation(cx: &mut TestAppContext) {
     }
 }
 
+/// Starting a run never holds up the UI: it runs git, Docker, and `tod-cli`,
+/// so the click only shows the agent starting and the driver starts the turn
+/// on the background executor.
+#[gpui::test]
+fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "review");
+    let node = Focus::Node(fixture.node_id);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    // The view builds its drivers from the installed data root, which a
+    // test has none of; give it one built from the fixture's.
+    let config = ConversationConfig {
+        data_root: fixture.store.paths().root().to_path_buf(),
+        media: tod_core::media::MediaPaths::discover().expect("media paths"),
+        launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
+        context: Default::default(),
+    };
+    view.update(cx, |view, _| {
+        let driver = ConversationDriver::new(config, node, ProtocolKind::Fix);
+        view.drivers.push(DriverSlot::new(0, driver));
+    });
+
+    view.update_in(cx, |view, window, cx| {
+        view.run(node, ProtocolKind::Fix, window, cx)
+    });
+    view.read_with(cx, |v, _| {
+        assert!(v.status.running, "the view shows the agent starting: {:?}", v.error);
+        assert_eq!(v.status.activity.as_deref(), Some("Starting the agent…"));
+        assert_eq!(v.conversation_id(), None, "nothing was sent on the main thread");
+        assert!(v.running_work().len() == 1, "a starting run is work in flight");
+    });
+
+    cx.run_until_parked();
+    view.read_with(cx, |v, _| {
+        assert_ne!(v.status.activity.as_deref(), Some("Starting the agent…"));
+        assert!(
+            v.conversation_id().is_some() || v.error.is_some(),
+            "the driver came back with the conversation, or why not"
+        );
+    });
+}
+
 /// With findings open, Fix sits beside Review. A fix conversation's pane
 /// lists the same findings under a status filter, and a rejection shows its
 /// note.

@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use tod_agent::{
     AgentLaunchOptions, AgentProvider, AgentRunState, PermissionRequest, RunId, SessionOpening,
-    SessionTurn,
+    SessionTurn, SharedAgent,
 };
 use tod_store::conversation::{
     Conversation, ConversationRepo, Focus, ProtocolKind, ReplyPart, TurnRole, reply_answer,
@@ -33,6 +33,44 @@ use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use tod_store::settings::InterviewContextSettings;
 use tod_journey::{Actor, Decision, Event, JourneyKey, TurnPhase};
 use uuid::Uuid;
+
+/// How the driver reaches the agent: for one provider call at a time.
+///
+/// Starting and finishing a turn runs git, Docker, and `tod-cli`, which can
+/// take seconds, so callers run the driver off the UI thread. A provider
+/// shared with the UI ([`SharedAgentAccess`]) is locked only for each call,
+/// never across that work, so the UI never waits on it.
+pub trait AgentAccess {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R;
+}
+
+impl<T: AgentProvider> AgentAccess for T {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+impl AgentAccess for dyn AgentProvider + '_ {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+impl AgentAccess for dyn AgentProvider + Send + '_ {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        f(self)
+    }
+}
+
+/// The app's shared provider, locked for each call and released between.
+pub struct SharedAgentAccess<'a>(pub &'a SharedAgent);
+
+impl AgentAccess for SharedAgentAccess<'_> {
+    fn with<R>(&mut self, f: impl FnOnce(&mut dyn AgentProvider) -> R) -> R {
+        let mut agent = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f(agent.as_mut())
+    }
+}
 
 /// The body of the transcript entry that marks a fresh agent session.
 pub const ROTATION_NOTE: &str = "Started a fresh agent session";
@@ -207,11 +245,11 @@ impl ConversationDriver {
 
     /// Stop the turn in flight. Its user turn stays in the transcript with an
     /// error turn after it.
-    pub fn cancel(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> Result<()> {
+    pub fn cancel<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
         let Some(run) = self.run.take() else {
             return Ok(());
         };
-        let _ = agent.cancel_run(run.id);
+        let _ = agent.with(|a| a.cancel_run(run.id));
         self.activity = None;
         self.permission = None;
         let id = self
@@ -235,10 +273,10 @@ impl ConversationDriver {
     /// the caller as the journey's `send` `UserAction` (spec §3.1), along
     /// with the text's length rather than its content, which is already in
     /// the transcript.
-    pub fn send(
+    pub fn send<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         text: &str,
     ) -> Result<i64> {
         if self.run.is_some() {
@@ -287,7 +325,7 @@ impl ConversationDriver {
         // A user message ends whatever loop the previous one started.
         self.continuations = 0;
 
-        let live = agent.session_id(&key).is_some();
+        let live = agent.with(|a| a.session_id(&key).is_some());
         let resumable = live || conversation.agent_session_id.is_some();
         let budget = self.config.context.context_budget_tokens as i64;
         if resumable && self.session_tokens.is_none() {
@@ -335,10 +373,10 @@ impl ConversationDriver {
     }
 
     /// Collect a finished turn. Call on every poll.
-    pub fn tick(
+    pub fn tick<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
     ) -> Vec<ConversationEvent> {
         let mut events = Vec::new();
         if let Err(err) = self.poll(fleet, agent, &mut events) {
@@ -349,16 +387,16 @@ impl ConversationDriver {
         events
     }
 
-    fn poll(
+    fn poll<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         events: &mut Vec<ConversationEvent>,
     ) -> Result<()> {
         let Some(run) = &self.run else {
             return Ok(());
         };
-        let outcome = match agent.poll_run(run.id) {
+        let outcome = match agent.with(|a| a.poll_run(run.id)) {
             Some(AgentRunState::InFlight(activity)) => {
                 self.activity = activity;
                 self.permission = None;
@@ -385,11 +423,13 @@ impl ConversationDriver {
             .conversation_id
             .context("a run without a conversation")?;
         let chars = agent
-            .session_context_chars(&run.key)
+            .with(|a| a.session_context_chars(&run.key))
             .unwrap_or(run.chars_at_start);
         match outcome {
             Ok(reply) => {
-                let parts = agent.session_reply_parts(&run.key).unwrap_or_default();
+                let parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 let reply = reply.trim();
                 let added = (chars.saturating_sub(run.chars_at_start) / 4) as i64;
                 self.session_tokens =
@@ -402,7 +442,7 @@ impl ConversationDriver {
                     ACTOR_USER,
                     InterviewCommand::SetConversationSession {
                         conversation_id: id,
-                        agent_session_id: agent.session_id(&run.key),
+                        agent_session_id: agent.with(|a| a.session_id(&run.key)),
                         session_name: name,
                     },
                 )?;
@@ -477,10 +517,10 @@ impl ConversationDriver {
     /// during the turn whether the exchange is over or another turn goes out
     /// without the user. Returns the agent turn's own seq.
     #[allow(clippy::too_many_arguments)]
-    fn land_reply(
+    fn land_reply<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         id: Uuid,
         body: &str,
         parts: Vec<ReplyPart>,
@@ -553,10 +593,10 @@ impl ConversationDriver {
 
     /// Send another turn on the conversation's own session, without a user
     /// message behind it.
-    fn resend(
+    fn resend<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         id: Uuid,
         message: String,
     ) -> Result<()> {
@@ -566,7 +606,7 @@ impl ConversationDriver {
             let last_seq = repo.turns(id)?.last().map_or(0, |t| t.seq);
             Ok((conversation, last_seq))
         })?;
-        let live = agent.session_id(&Self::session_key(id)).is_some();
+        let live = agent.with(|a| a.session_id(&Self::session_key(id)).is_some());
         let resume = conversation.agent_session_id.clone().filter(|_| !live);
         self.start(fleet, agent, &conversation, last_seq, None, message, resume)
     }
@@ -646,10 +686,10 @@ impl ConversationDriver {
     /// one that gets the conversation's snapshot. `reason` is recorded to the
     /// journey ("over budget" | "not resumable" | "cold resume failed").
     #[allow(clippy::too_many_arguments)]
-    fn rotate_and_start(
+    fn rotate_and_start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         conversation: &Conversation,
         user_seq: i64,
         changes: &str,
@@ -657,7 +697,7 @@ impl ConversationDriver {
         reason: &str,
     ) -> Result<()> {
         let id = conversation.id;
-        agent.close_session(&Self::session_key(id));
+        agent.with(|a| a.close_session(&Self::session_key(id)));
         self.append(fleet, id, TurnRole::Rotation, ROTATION_NOTE)?;
         crate::journey::record(
             self.journey_key(),
@@ -692,10 +732,10 @@ impl ConversationDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start(
+    fn start<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         conversation: &Conversation,
         user_seq: i64,
         context: Option<String>,
@@ -746,9 +786,8 @@ impl ConversationDriver {
         });
         let sent = context.as_deref().map_or(0, estimate_tokens) + estimate_tokens(&message);
         self.session_tokens = Some(self.session_tokens.unwrap_or(0) + sent);
-        let chars_at_start = agent.session_context_chars(&key).unwrap_or(0);
         let cold_resume = resume.is_some();
-        let handle = agent.send_session_turn(SessionTurn {
+        let turn = SessionTurn {
             key: key.clone(),
             owner_id: id.to_string(),
             title: title.clone(),
@@ -760,6 +799,11 @@ impl ConversationDriver {
             purpose: self.protocol.purpose(),
             env: turn_env,
             environment,
+        };
+        let (chars_at_start, handle, chars_sent) = agent.with(|a| {
+            let before = a.session_context_chars(&key).unwrap_or(0);
+            let handle = a.send_session_turn(turn);
+            (before, handle, a.session_context_chars(&key).unwrap_or(0))
         });
         let handle = match handle {
             Ok(handle) => handle,
@@ -771,7 +815,7 @@ impl ConversationDriver {
             }
         };
         // Once sent, the chars the provider reports include this message.
-        let chars_at_start = chars_at_start.max(agent.session_context_chars(&key).unwrap_or(0));
+        let chars_at_start = chars_at_start.max(chars_sent);
         self.run = Some(Run {
             id: handle.id,
             key,
@@ -797,14 +841,14 @@ impl ConversationDriver {
     /// Store the session's id on the conversation as soon as the agent has
     /// given one, not when the turn ends: a turn that never ends still leaves
     /// the session resumable.
-    fn save_session_id(&mut self, fleet: &FleetStore, agent: &dyn AgentProvider) -> Result<()> {
+    fn save_session_id<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> Result<()> {
         let (Some(run), Some(id)) = (self.run.as_mut(), self.conversation_id) else {
             return Ok(());
         };
         if run.session_saved {
             return Ok(());
         }
-        let Some(session) = agent.session_id(&run.key) else {
+        let Some(session) = agent.with(|a| a.session_id(&run.key)) else {
             return Ok(());
         };
         run.session_saved = true;
