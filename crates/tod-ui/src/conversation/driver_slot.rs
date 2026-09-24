@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// What the view shows while a turn is being started.
 const STARTING: &str = "Starting the agent…";
 
-pub(super) struct DriverSlot {
+pub(crate) struct DriverSlot {
     /// Finds the slot again when its driver comes back.
     pub id: u64,
     /// `None` while the driver is away on the background executor.
