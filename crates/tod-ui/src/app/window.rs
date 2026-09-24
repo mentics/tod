@@ -2379,20 +2379,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
 
     #[cfg(feature = "agent-socket")]
     if let Some((listener, addr)) = socket_listener {
-        // `cx.open_window`'s root-view closure runs on the foreground
-        // executor, which (called from this `AsyncApp` context) is not
-        // guaranteed to have finished by the time `open_window` returns —
-        // the window's own view (now heavier, with the unified view built
-        // eagerly) can still be mid-construction. Wait briefly for the slot
-        // it sets rather than assuming it is already there.
-        let mut shell_weak = None;
-        for _ in 0..200 {
-            shell_weak = shell_for_socket.lock().ok().and_then(|slot| slot.clone());
-            if shell_weak.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // `open_window` builds the root view synchronously, so the slot is
+        // set by now unless the window is not a `Shell` (`FleetBlockedView`).
+        let shell_weak = shell_for_socket.lock().ok().and_then(|slot| slot.clone());
         match shell_weak {
             Some(shell_weak) => {
                 agent_socket::start(
@@ -2406,9 +2395,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                     shell_weak,
                 );
             }
-            // The window never got a `Shell` (e.g. `FleetBlockedView`, or
-            // construction is taking unusually long): no shell to drive, so
-            // skip the socket instead of crashing the whole app.
+            // No shell to drive: skip the socket instead of crashing the app.
             None => {
                 tracing::error!(
                     "agent socket: no shell entity became available; control socket not started"
