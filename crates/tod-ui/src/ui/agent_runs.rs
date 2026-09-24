@@ -21,11 +21,16 @@ use crate::interview::{TodPaths, TodSettings};
 use anyhow::Context as _;
 use gpui::Context;
 use std::sync::Arc;
+use tod_core::conversation::implement::{HandoffAnswer, handoff_answer_message};
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
 use tod_store::decisions::{Decision, DecisionRepo};
 use tod_store::fleet::FleetStore;
 use tod_store::interview::{ACTOR_USER, InterviewCommand};
+use tod_store::outline::OutlineMutation;
+use tod_store::outline::repos::PlanStepRepo;
+use tod_store::outline::repos::plan_steps::STATUS_IN_PROGRESS;
+use tod_store::review::ReviewRepo;
 use uuid::Uuid;
 
 /// One node's runs, as a status label (`state` / `state →` / `→ state`, W11)
@@ -460,6 +465,102 @@ impl AgentRuns {
             tracing::warn!(
                 "answer_decision: could not deliver the answer to conversation {conversation_id}"
             );
+        }
+        Ok(())
+    }
+
+    /// The conversation that most recently handed a plan step back on
+    /// `focus`: whichever of its implementation/verification conversations
+    /// was updated last (there is at most one of each per focus —
+    /// `Protocol::cwd` — so "most recent" picks the one whose agent produced
+    /// the handoff).
+    fn latest_handoff_conversation(&self, focus: Focus) -> anyhow::Result<Option<Uuid>> {
+        let (implement, verify) = self.fleet.read(|conn| {
+            let repo = ConversationRepo::new(conn);
+            let implement =
+                repo.latest_for_focus_with_protocol(focus, ProtocolKind::Implementation)?;
+            let verify = repo.latest_for_focus_with_protocol(focus, ProtocolKind::Verification)?;
+            anyhow::Ok((implement, verify))
+        })?;
+        let latest = match (implement, verify) {
+            (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        Ok(latest.map(|c| c.id))
+    }
+
+    /// Answer a plan step the agent handed back to the user (`HandoffReason`),
+    /// from outside the conversation view — the unified Decisions panel's
+    /// `PlanStep` items (`crate::unified::panels::decisions`). Sends the same
+    /// message `conversation::side_pane::answer_handoff` sends, to whichever
+    /// implementation/verification conversation on the step's node most
+    /// recently handed work back, then sets the step back to `in_progress`
+    /// as a `ConversationEdit` under that conversation — the same mutation
+    /// `ConversationView::choose_status` makes after a handoff answer, so it
+    /// is reversible and the agent hears of it.
+    pub fn answer_plan_step_handoff(
+        &mut self,
+        step_id: Uuid,
+        answer: HandoffAnswer,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let step = self
+            .fleet
+            .read(|conn| PlanStepRepo::new(conn).get(step_id))?
+            .with_context(|| format!("plan step {step_id} not found"))?;
+        let focus = Focus::Node(step.node_id);
+        let conversation_id = self
+            .latest_handoff_conversation(focus)?
+            .with_context(|| {
+                format!(
+                    "no implementation/verification conversation found for node {}",
+                    step.node_id
+                )
+            })?;
+
+        let message = handoff_answer_message(&step, &answer);
+        self.ensure_for_conversation(conversation_id)?;
+        if !self.send_to_conversation(conversation_id, &message, cx) {
+            tracing::warn!(
+                "answer_plan_step_handoff: could not deliver the answer to conversation {conversation_id}"
+            );
+        }
+
+        self.fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::ConversationEdit {
+                conversation_id,
+                mutation: OutlineMutation::UpdatePlanStepStatus {
+                    step_id,
+                    status: STATUS_IN_PROGRESS.to_string(),
+                    note: None,
+                    reason: None,
+                },
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Answer an open review finding, from outside the conversation view —
+    /// the unified Decisions panel's `Finding` items. Mirrors
+    /// `conversation::side_pane::respond_to_finding`: a pure status write,
+    /// nothing to deliver to an agent (a fix conversation answers findings on
+    /// its own initiative instead).
+    pub fn respond_review_finding(&mut self, finding_id: Uuid, status: &str) -> anyhow::Result<()> {
+        let current = self
+            .fleet
+            .read(|conn| ReviewRepo::new(conn).get(finding_id))?
+            .with_context(|| format!("finding {finding_id} not found"))?;
+        if current.status != status {
+            self.fleet.interview(
+                ACTOR_USER,
+                InterviewCommand::RespondReviewFinding {
+                    finding_id,
+                    status: status.to_string(),
+                    response: current.response.clone(),
+                },
+            )?;
         }
         Ok(())
     }

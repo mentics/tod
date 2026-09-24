@@ -42,6 +42,7 @@ use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
+use crate::views::lifecycle_control::LifecycleController;
 use crate::views::task_list::{TaskListEvent, TaskListView};
 
 /// One column-2+ panel entity. Every kind but `Details` and `Decisions`
@@ -151,6 +152,10 @@ pub struct UnifiedView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
     agent_runs: Entity<AgentRuns>,
+    /// The one lifecycle controller the shell shares with the conversation
+    /// view and the lifecycle panel (`.claude/CLAUDE.md`): a gate check
+    /// started or waived in either shows in the Decisions panel too.
+    lifecycle: Entity<LifecycleController>,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
@@ -178,6 +183,7 @@ impl UnifiedView {
         paths: TodPaths,
         agent: SharedAgent,
         agent_runs: Entity<AgentRuns>,
+        lifecycle: Entity<LifecycleController>,
     ) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
         let _task_list_subscription =
@@ -195,6 +201,7 @@ impl UnifiedView {
             fleet,
             paths,
             agent_runs,
+            lifecycle,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
@@ -359,6 +366,7 @@ impl UnifiedView {
                         node_id,
                         self.fleet.clone(),
                         self.agent_runs.clone(),
+                        self.lifecycle.clone(),
                         window,
                         cx,
                     )
@@ -817,9 +825,20 @@ mod tests {
             Box::new(tod_agent::MockAgentProvider::new()),
         ));
         let agent_runs_for_test = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
+        let lifecycle_for_test = cx.new(|_| LifecycleController::new(store.clone()));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| UnifiedView::new(window, cx, store, paths, agent, agent_runs_for_test));
+            let view = cx.new(|cx| {
+                UnifiedView::new(
+                    window,
+                    cx,
+                    store,
+                    paths,
+                    agent,
+                    agent_runs_for_test,
+                    lifecycle_for_test,
+                )
+            });
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });

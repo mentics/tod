@@ -1902,6 +1902,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 paths.clone(),
                                 agent.clone(),
                                 agent_runs.clone(),
+                                lifecycle.clone(),
                             )
                         });
                         let view = cx.new(|cx| {
