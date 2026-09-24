@@ -24,6 +24,20 @@ pub enum PanelKind {
 }
 
 impl PanelKind {
+    /// The node this panel is about, when it targets one; `None` for a
+    /// singleton with no target (`Decisions`) or a conversation's transcript.
+    pub fn node(&self) -> Option<uuid::Uuid> {
+        match self {
+            PanelKind::Details(id)
+            | PanelKind::Obligations(id)
+            | PanelKind::Plan(id)
+            | PanelKind::Findings(id)
+            | PanelKind::Settings(id) => Some(*id),
+            // A transcript's id is its conversation's, not a node's.
+            PanelKind::Transcript(_) | PanelKind::Decisions => None,
+        }
+    }
+
     /// Whether this panel kind may exist in at most one column at a time.
     /// Opening one that is already shown retargets and focuses it instead of
     /// opening a new column (`doc/ui/unified-view.md` "Singleton panels").
