@@ -313,7 +313,9 @@ driver goes to the background executor and `tod_ui::conversation::driver_slot`
 holds what the view shows meanwhile ("Starting the agent…"; Stop is applied
 when it is back). The driver takes the shared agent through `AgentAccess`,
 which `SharedAgentAccess` locks for one provider call at a time, so the UI's
-own locks never wait on that work.
+own locks never wait on that work. The same holds for the incoming-changes
+check (`views::incoming_check` ticks its `IncomingRunner` there) and for
+settling a gate check's derived criteria, which may call GitHub.
 
 ### `tod-store::fleet` — agent/worktree orchestration
 
