@@ -461,6 +461,45 @@ fn after_a_reversal_the_next_send_carries_a_delta_and_resumes_the_session() {
     assert_eq!(turn.message, "ask Again?");
 }
 
+/// `ask <question> | <option> | <option>` records a decision on the
+/// conversation's focus node instead of just echoing the question back, so
+/// `--agent mock` can exercise the whole decisions loop.
+#[test]
+fn ask_with_pipes_records_a_decision_plain_ask_still_just_asks() {
+    let fx = fixture();
+    let mut agent = FakeAgent::new(&fx.fleet);
+    let mut driver = ConversationDriver::new(
+        config(&fx, 100_000),
+        Focus::Node(fx.node),
+        ProtocolKind::Outline,
+    );
+    say(
+        &mut driver,
+        &fx,
+        &mut agent,
+        "ask Round per line or per invoice? | per line | per invoice",
+    );
+    let id = driver.conversation_id().unwrap();
+    let decisions = fx
+        .fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(decisions.len(), 1);
+    let decision = &decisions[0];
+    assert_eq!(decision.question, "Round per line or per invoice?");
+    assert_eq!(decision.options, ["per line", "per invoice"]);
+    assert_eq!(decision.conversation_id, Some(id));
+    assert_eq!(decision.status, tod_store::decisions::DECISION_PENDING);
+
+    // Plain ask, with no pipes, keeps the old behaviour: no decision.
+    say(&mut driver, &fx, &mut agent, "ask Still there?");
+    let decisions = fx
+        .fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(fx.node))
+        .unwrap();
+    assert_eq!(decisions.len(), 1, "plain ask must not add a decision");
+}
+
 #[test]
 fn a_send_with_a_delta_stores_it_as_sent_context_on_the_user_turn() {
     let fx = fixture();
