@@ -427,3 +427,25 @@ Drawer panels in the Tasks view do not move focus themselves — they emit a `Fo
 ### Journeys
 
 `crates/tod-journey` defines the append-only record format (`Record`/`Actor`/`Event`) that captures what a user, the app, and agents did, for later analysis and for filing problem reports. Recording happens through `tod_core::journey::record`, which is a no-op when the app is not installed with a journey sink configured — call sites never need to branch on whether journeys are on. Every new user-facing lifecycle action (a button in the conversation view or lifecycle panel) must record a `UserAction` with a `Presented` snapshot of the buttons that were on screen and which was primary, following the pattern in `crates/tod-ui/src/conversation/lifecycle.rs` and `crates/tod-ui/src/views/lifecycle_panel.rs` — this is what lets later analysis tell whether the highlighted action was the one actually clicked. Any new node-scoped table needs a `journey_changes` trigger (`crates/tod-store/src/journey_changes.rs`'s pattern) so its writes surface as `DataChanged` rows in the journey; a table intentionally left out needs a documented reason at its definition site. `crates/tod-journeys` is the standalone receiver binary (`init`/`pull`/`show`/`stats`) that decrypts and analyzes bundles sent from `tod`; see `doc/journeys/spec.md` for the full format and protocol.
+
+### Unified view
+
+`crates/tod-ui/src/unified/` is the multi-column workbench for supervising
+many nodes at once: `mod.rs` (`UnifiedView`, `ColumnModel`, column
+placement), `panels/` (`DetailsPanel`, `DecisionsPanel`, `ObligationsPanel`,
+`PlanPanel`, `FindingsPanel`, `SettingsPanel`, `TranscriptPanel`), and
+`chat_drawer.rs`. Column 1 is always the node tree; a panel opens in the
+first unpinned column from the one it was opened from, or a new column is
+appended — `ColumnModel::open` is the one place that rule lives. Some panels
+(today, `Decisions`) are singletons: opening one that is already shown
+retargets it in place instead of opening a second copy, and a column the
+user pinned is never unpinned or replaced by that rule. **Alt+Q** /
+**Alt+Shift+Q** jump the tree selection to the next/previous node waiting on
+the user, longest-waiting first (wrapping), and show it in the singleton
+decisions panel, opening and pinning its column if it is not shown yet
+(`UnifiedView::advance_waiting`). What each node is waiting on comes from
+`tod_core::attention` (`for_node` / `for_nodes`), recomputed off the UI
+thread on every store change by `unified/attention_feed.rs` and pushed into
+the tree with `TaskListView::set_attention`. See `doc/ui/unified-view.md` for
+the full design (layout, pinning, panels, keys) and
+`doc/ui/unified-view-plan.md` for the work-item breakdown.

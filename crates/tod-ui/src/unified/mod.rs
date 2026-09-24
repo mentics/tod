@@ -7,6 +7,7 @@
 //! wires both into a GPUI view root, hosts `TaskListView` in column 1, and
 //! registers the view's keys.
 
+mod attention_feed;
 mod chat_drawer;
 mod columns;
 mod panel;
@@ -19,6 +20,7 @@ use chat_drawer::ChatDrawer;
 use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenRequest, PlaceholderPanel};
 use panels::DetailsPanel;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -28,6 +30,7 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
+use tod_core::attention::NodeAttention;
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
@@ -111,7 +114,7 @@ impl HostedPanel {
 }
 pub use chat_drawer::register_chat_drawer_keyboard_bindings;
 
-actions!(unified, [UnifiedTogglePinFocused]);
+actions!(unified, [UnifiedTogglePinFocused, UnifiedNextWaiting, UnifiedPrevWaiting]);
 
 pub const UNIFIED_CONTEXT: &str = "Unified";
 
@@ -123,7 +126,11 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
     panels::details::register_details_panel_keyboard_bindings(cx);
     panels::decisions::register_decisions_panel_keyboard_bindings(cx);
     let context = Some(key_context::excluding_input(UNIFIED_CONTEXT));
-    cx.bind_keys([KeyBinding::new("alt-w", UnifiedTogglePinFocused, context)]);
+    cx.bind_keys([
+        KeyBinding::new("alt-w", UnifiedTogglePinFocused, context),
+        KeyBinding::new("alt-q", UnifiedNextWaiting, context),
+        KeyBinding::new("alt-shift-q", UnifiedPrevWaiting, context),
+    ]);
     let panel_context = Some(key_context::excluding_input(panel::UNIFIED_PANEL_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("enter", PanelActivateFocusedLink, panel_context),
@@ -153,8 +160,14 @@ pub struct UnifiedView {
     chat_drawer: Entity<ChatDrawer>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
+    /// What every node is waiting on the user for, recomputed off the UI
+    /// thread on every store change (`attention_feed`) and fed to the tree
+    /// via `TaskListView::set_attention`; Alt+Q walks the same data
+    /// (`doc/ui/unified-view-plan.md` W12).
+    attention: HashMap<Uuid, NodeAttention>,
     _task_list_subscription: Subscription,
     _agent_runs_subscription: Subscription,
+    _attention_poll: gpui::Task<()>,
 }
 
 impl UnifiedView {
@@ -177,6 +190,7 @@ impl UnifiedView {
         let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
             this.apply_status_overrides(cx);
         });
+        let _attention_poll = Self::spawn_attention_poll(fleet.clone(), cx);
         let mut this = Self {
             fleet,
             paths,
@@ -187,11 +201,52 @@ impl UnifiedView {
             chat_drawer,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
+            attention: HashMap::new(),
             _task_list_subscription,
             _agent_runs_subscription,
+            _attention_poll,
         };
         this.apply_status_overrides(cx);
         this
+    }
+
+    /// Recomputes `attention_feed::compute` off the UI thread whenever the
+    /// store changes (`FleetStore::subscribe_changes`), once immediately at
+    /// startup, then feeds it to the tree and keeps it for Alt+Q
+    /// (`doc/ui/unified-view-plan.md` W12 "Feed attention into the tree").
+    fn spawn_attention_poll(fleet: Arc<FleetStore>, cx: &mut Context<Self>) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
+            let mut rx = fleet.subscribe_changes();
+            loop {
+                let fleet_for_read = fleet.clone();
+                let computed = cx
+                    .background_executor()
+                    .spawn(async move { attention_feed::compute(&fleet_for_read) })
+                    .await;
+                let Ok(()) = this.update(cx, |this, cx| this.apply_attention(computed, cx)) else {
+                    break;
+                };
+                if rx.recv().await.is_err() {
+                    break;
+                }
+                // Coalesce any further changes that arrived while computing.
+                while rx.try_recv().is_ok() {}
+            }
+        })
+    }
+
+    /// Store the freshly computed attention map and hand its
+    /// `TaskListView::set_attention` shape to the tree.
+    fn apply_attention(
+        &mut self,
+        map: HashMap<Uuid, NodeAttention>,
+        cx: &mut Context<Self>,
+    ) {
+        let for_tree = attention_feed::to_task_list_map(&map);
+        self.attention = map;
+        self.task_list.update(cx, |task_list, cx| {
+            task_list.set_attention(for_tree, cx);
+        });
     }
 
     /// Recomputes every running node's status label (W11) from
@@ -220,19 +275,47 @@ impl UnifiedView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let TaskListEvent::SelectionChanged { task_id } = event {
-            let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-            if let Some(id) = node_id {
-                // The node tree (column 1) always counts as pinned, so a
-                // selection opens Details in the first unpinned column
-                // starting at column 2 (index 0), as a plain (non-ctrl) open.
-                self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+        match event {
+            TaskListEvent::SelectionChanged { task_id } => {
+                let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+                if let Some(id) = node_id {
+                    // The node tree (column 1) always counts as pinned, so a
+                    // selection opens Details in the first unpinned column
+                    // starting at column 2 (index 0), as a plain (non-ctrl) open.
+                    self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+                }
+                // The decisions panel is a singleton with no target of its own:
+                // it always follows whichever node is current
+                // (`doc/ui/unified-view.md` "Decisions"), so any open column
+                // retargets in place rather than through the placement rule.
+                self.sync_decisions_node(node_id, window, cx);
             }
-            // The decisions panel is a singleton with no target of its own:
-            // it always follows whichever node is current
-            // (`doc/ui/unified-view.md` "Decisions"), so any open column
-            // retargets in place rather than through the placement rule.
-            self.sync_decisions_node(node_id, window, cx);
+            // The tree's right-click menu (W4) and the attention badge on a
+            // row emit these; map each to the column it opens
+            // (`doc/ui/unified-view-plan.md` W12 "map the tree's
+            // right-click menu to columns").
+            TaskListEvent::OpenTaskEdit { task_id } | TaskListEvent::OpenActionPanel { task_id } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+                }
+            }
+            TaskListEvent::OpenObligations { task_id, .. } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.open_panel(PanelKind::Obligations(id), 0, false, window, cx);
+                }
+            }
+            TaskListEvent::OpenPlan { task_id, .. } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.open_panel(PanelKind::Plan(id), 0, false, window, cx);
+                }
+            }
+            TaskListEvent::OpenDecisions { task_id } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.sync_decisions_node(Some(id), window, cx);
+                    self.open_panel(PanelKind::Decisions, 0, false, window, cx);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -434,6 +517,67 @@ impl UnifiedView {
         cx.notify();
     }
 
+    /// The Alt+Q order (longest-waiting first, matching the tree's
+    /// `SortKey::WaitingLongest`) and the node adjacent to the current
+    /// selection in it, wrapping around
+    /// (`doc/ui/unified-view.md` "Alt+Q").
+    fn next_waiting_node(&self, forward: bool, cx: &Context<Self>) -> Option<Uuid> {
+        let order = attention_feed::waiting_order(&self.attention);
+        if order.is_empty() {
+            return None;
+        }
+        let current = self.task_list.read(cx).selected_node_id();
+        let index = current.and_then(|id| order.iter().position(|n| *n == id));
+        let next_index = match (index, forward) {
+            (Some(ix), true) => (ix + 1) % order.len(),
+            (Some(ix), false) => (ix + order.len() - 1) % order.len(),
+            (None, true) => 0,
+            (None, false) => order.len() - 1,
+        };
+        Some(order[next_index])
+    }
+
+    /// Alt+Q / Alt+Shift+Q: select the next (or previous) node waiting on
+    /// the user, and show it in the singleton decisions panel, opening and
+    /// pinning its column if it is not shown yet. A column the user pinned
+    /// is never unpinned or replaced: the decisions panel is a singleton
+    /// (`ColumnModel::open`), so it either retargets in place wherever it
+    /// already is, or opens in the first unpinned column (appending one if
+    /// every column is pinned) — the same rule every other panel follows
+    /// (`doc/ui/unified-view.md` "Where a panel opens", "Singleton panels").
+    fn advance_waiting(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.next_waiting_node(forward, cx) else {
+            return;
+        };
+        let already_shown = self
+            .hosted
+            .iter()
+            .any(|h| matches!(h.panel, HostedPanel::Decisions(_)));
+        let task_id = target.to_string();
+        self.task_list
+            .update(cx, |task_list, cx| task_list.reveal_node(&task_id, window, cx));
+        self.sync_decisions_node(Some(target), window, cx);
+        self.open_panel(PanelKind::Decisions, 0, false, window, cx);
+        if !already_shown {
+            if let Some(ix) = self
+                .hosted
+                .iter()
+                .position(|h| matches!(h.panel, HostedPanel::Decisions(_)))
+            {
+                self.columns.set_pinned(ix, true);
+            }
+        }
+        cx.notify();
+    }
+
+    fn next_waiting(&mut self, _: &UnifiedNextWaiting, window: &mut Window, cx: &mut Context<Self>) {
+        self.advance_waiting(true, window, cx);
+    }
+
+    fn prev_waiting(&mut self, _: &UnifiedPrevWaiting, window: &mut Window, cx: &mut Context<Self>) {
+        self.advance_waiting(false, window, cx);
+    }
+
     fn focus_left(&mut self, _: &PaneFocusLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.columns.focus_left();
         self.sync_window_focus(window, cx);
@@ -612,6 +756,8 @@ impl Render for UnifiedView {
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::toggle_pin_focused))
+            .on_action(cx.listener(Self::next_waiting))
+            .on_action(cx.listener(Self::prev_waiting))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .size_full()
@@ -795,6 +941,194 @@ mod tests {
 
         view.read_with(cx, |view, cx| {
             assert_eq!(view.chat_drawer.read(cx).focus(), Focus::Node(node_id));
+        });
+    }
+
+    /// Adds a second node to the fixture (which only creates one) and a
+    /// pending decision on it, so Alt+Q tests have two waiting nodes to
+    /// order between.
+    fn add_waiting_node(fixture: &Fixture, question: &str, waiting_before: Uuid) -> Uuid {
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        let node_id = Uuid::new_v4();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node_id),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: CreatePosition::Below,
+                title: "Second node".into(),
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        // `waiting_before` already has (or will get) a decision asked with an
+        // earlier `since`; this one is asked after, so it waits less long.
+        let _ = waiting_before;
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: question.to_string(),
+                        options: vec!["a".to_string(), "b".to_string()],
+                        evidence: Vec::new(),
+                    },
+                },
+            )
+            .unwrap();
+        node_id
+    }
+
+    fn ask_decision(fixture: &Fixture, node_id: Uuid, question: &str) {
+        use tod_store::interview::{ACTOR_USER, InterviewCommand};
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: question.to_string(),
+                        options: vec!["a".to_string(), "b".to_string()],
+                        evidence: Vec::new(),
+                    },
+                },
+            )
+            .unwrap();
+    }
+
+    /// Loads `attention_feed::compute` synchronously and applies it, rather
+    /// than waiting on the background poll — the poll itself is exercised
+    /// end to end by the mock smoke test.
+    fn load_attention(view: &Entity<UnifiedView>, cx: &mut VisualTestContext) {
+        view.update(cx, |view, cx| {
+            let map = attention_feed::compute(&view.fleet);
+            view.apply_attention(map, cx);
+        });
+    }
+
+    #[gpui::test]
+    fn alt_q_visits_the_longest_waiting_node_first_and_wraps(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let first = fixture.node_id;
+        ask_decision(&fixture, first, "On the first node?");
+        // Give the store's millisecond clock room to separate the two.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let second = add_waiting_node(&fixture, "On the second node?", first);
+        let (view, cx) = open_view(&fixture, cx);
+        load_attention(&view, cx);
+        let order = view.read_with(cx, |view, _| attention_feed::waiting_order(&view.attention));
+        // `add_waiting_node` asked its decision after `first`'s, so `first`
+        // waits longer and sorts first — same rule as `SortKey::WaitingLongest`.
+        assert_eq!(order, vec![first, second]);
+
+        // The tree may already have a row selected (its own default), so
+        // don't assume where the first press lands — only that it is one of
+        // the two waiting nodes, and that every further press cycles
+        // through `order`, wrapping around.
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+        let after_first = view
+            .read_with(cx, |view, cx| view.task_list.read(cx).selected_node_id())
+            .expect("alt+q selects a waiting node");
+        let start_ix = order
+            .iter()
+            .position(|id| *id == after_first)
+            .expect("selection is one of the waiting nodes");
+
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.task_list.read(cx).selected_node_id(),
+                Some(order[(start_ix + 1) % order.len()]),
+            );
+        });
+
+        // Wraps back around to where the first press landed.
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.task_list.read(cx).selected_node_id(), Some(after_first));
+        });
+
+        // Alt+Shift+Q walks backward, wrapping the other way.
+        view.update_in(cx, |view, window, cx| {
+            view.prev_waiting(&UnifiedPrevWaiting, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.task_list.read(cx).selected_node_id(),
+                Some(order[(start_ix + order.len() - 1) % order.len()]),
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn alt_q_opens_and_pins_decisions_without_touching_an_already_pinned_column(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id;
+        ask_decision(&fixture, node_id, "Only decision?");
+        let (view, cx) = open_view(&fixture, cx);
+        load_attention(&view, cx);
+
+        // Pin an unrelated column first (Details) so Alt+Q has to route
+        // around it rather than replace or unpin it.
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.columns.set_pinned(0, true);
+        });
+        draw(cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, _| {
+            // The pinned Details column is untouched...
+            assert!(view.columns.is_pinned(0));
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
+            // ...and Decisions opened in a new column and was pinned, since
+            // it was not shown anywhere yet.
+            let decisions_ix = view
+                .columns
+                .columns()
+                .iter()
+                .position(|c| c.panel == PanelKind::Decisions)
+                .expect("decisions column opened");
+            assert!(view.columns.is_pinned(decisions_ix));
+        });
+
+        // A second Alt+Q press on the same lone waiting node re-targets the
+        // existing (already pinned) Decisions column rather than opening
+        // another one.
+        let before = view.read_with(cx, |view, _| view.columns.len());
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), before);
         });
     }
 }
