@@ -580,16 +580,22 @@ impl ObligationsView {
 
     /// The rows the list shows: phase, then kind, then section, then the
     /// obligations in that section.
+    ///
+    /// The requirements and design phases, with their kinds, show even with
+    /// nothing in them, so a new node has somewhere to add the first one.
+    /// `unknown` only shows when it holds something, and a search or status
+    /// filter hides whatever it leaves empty.
     fn flat_rows(&self) -> Vec<ObRow> {
         let mut rows = Vec::new();
         let matching = self.search_matches();
+        let narrowed = !self.search_query.trim().is_empty() || !self.filter.is_empty();
         for phase in Self::phase_order() {
             let phase_items: Vec<_> = matching
                 .iter()
                 .filter(|o| o.phase == phase)
                 .copied()
                 .collect();
-            if phase_items.is_empty() {
+            if phase_items.is_empty() && (narrowed || phase == PHASE_UNKNOWN) {
                 continue;
             }
             let key = phase_row_key(phase);
@@ -2083,6 +2089,73 @@ mod tests {
         cx: &mut VisualTestContext,
     ) -> Option<Uuid> {
         view.read_with(cx, |view, _| view.selected_obligation_id())
+    }
+
+    #[gpui::test]
+    fn a_node_with_no_obligations_shows_where_to_add_one(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, _, cx) = open_view(&fixture, true, cx);
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        let empty_node = Uuid::new_v4();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(empty_node),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "Brand new".into(),
+            })
+            .unwrap();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: empty_node,
+                capabilities: vec![tod_store::outline::types::Capability::Spec],
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        view.update_in(cx, |v, window, cx| {
+            v.open(empty_node, "Brand new", None, window, cx)
+        });
+        draw(cx);
+        let labels = view.read_with(cx, |v, _| v.group_labels());
+        assert_eq!(
+            labels,
+            [
+                "Requirements phase",
+                "Requirements",
+                "Constraints",
+                "Design phase",
+                "Requirements",
+                "Constraints",
+            ]
+        );
+
+        // Enter on the empty Constraints group starts a constraint there.
+        view.update_in(cx, |v, window, cx| {
+            let key = group_row_key(PHASE_REQUIREMENTS, KIND_CONSTRAINT);
+            let ix = v.list.rows().iter().position(|row| row.key() == key);
+            v.select_row(ix.unwrap(), cx);
+            v.on_smart_enter(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |v, _| {
+            let draft = v.draft_id.expect("a draft was started");
+            let created = v.items.iter().find(|o| o.id == draft).unwrap();
+            assert_eq!(created.kind, KIND_CONSTRAINT);
+            assert_eq!(created.phase, PHASE_REQUIREMENTS);
+        });
+
+        // A search that matches nothing hides the empty groups.
+        view.update_in(cx, |v, window, cx| {
+            v.search_input.update(cx, |input, cx| {
+                input.set_value("nothing matches this", window, cx);
+            });
+            v.sync_search_from_input(window, cx);
+        });
+        assert!(view.read_with(cx, |v, _| v.group_labels()).is_empty());
     }
 
     #[gpui::test]
