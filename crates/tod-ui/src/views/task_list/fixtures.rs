@@ -89,6 +89,7 @@ pub fn load_tasks_from_store(store: &FleetStore, list_id: Option<Uuid>) -> Vec<T
                 // Filled in by `TaskListView::set_attention`, not the store load.
                 needs_you_count: 0,
                 waiting_since: None,
+                status_override: None,
             }
         })
         .collect()
@@ -138,6 +139,7 @@ pub fn large_fixture_set(base_count: usize) -> Vec<TaskItem> {
             accept_ready: false,
             needs_you_count: 0,
             waiting_since: None,
+            status_override: None,
         })
         .collect()
 }

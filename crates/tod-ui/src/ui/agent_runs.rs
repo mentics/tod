@@ -255,6 +255,34 @@ impl AgentRuns {
         self.slots.iter().filter(|s| s.status.running)
     }
 
+    /// The status label (W11, `unified::status_label`) for every node with a
+    /// gate check or on-entry run in flight, keyed by node id. Nodes with
+    /// nothing running are left out — the tree row falls back to its own
+    /// plain lifecycle text. Computed once per call (the host calls it only
+    /// when this registry notifies, never per row per frame) since it reads
+    /// each running slot's conversation row.
+    pub fn running_status_labels(&self, lifecycle_of: impl Fn(Uuid) -> Option<String>) -> std::collections::HashMap<Uuid, String> {
+        let mut nodes: Vec<Uuid> = self
+            .slots
+            .iter()
+            .filter(|s| s.status.running && s.protocol.has_transition())
+            .filter_map(|s| match s.focus {
+                Focus::Node(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        nodes.sort();
+        nodes.dedup();
+        nodes
+            .into_iter()
+            .filter_map(|node| {
+                let lifecycle = lifecycle_of(node)?;
+                let runs = self.runs_for_node(node);
+                Some((node, crate::unified::status_label::text(&lifecycle, &runs).to_string()))
+            })
+            .collect()
+    }
+
     /// A hook for W10 (answering decisions from outside the conversation
     /// view): behaves like the user typing `text` into the conversation
     /// `conversation_id` and sending it — finds the matching slot and sends

@@ -10,6 +10,7 @@
 mod columns;
 mod panel;
 mod panels;
+pub mod status_label;
 
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
@@ -28,6 +29,7 @@ use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
@@ -92,16 +94,23 @@ struct HostedColumn {
 
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
+    agent_runs: Entity<AgentRuns>,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     _task_list_subscription: Subscription,
+    _agent_runs_subscription: Subscription,
 }
 
 impl UnifiedView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fleet: Arc<FleetStore>,
+        agent_runs: Entity<AgentRuns>,
+    ) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
         let _task_list_subscription = cx.subscribe_in(
             &task_list,
@@ -110,15 +119,42 @@ impl UnifiedView {
                 this.on_task_list_event(event, window, cx);
             },
         );
-        Self {
+        let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
+            this.apply_status_overrides(cx);
+        });
+        let mut this = Self {
             fleet,
+            agent_runs,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             _task_list_subscription,
-        }
+            _agent_runs_subscription,
+        };
+        this.apply_status_overrides(cx);
+        this
+    }
+
+    /// Recomputes every running node's status label (W11) from
+    /// [`AgentRuns`] and hands the map to `TaskListView` in one call — never
+    /// per row per frame, since `AgentRuns::running_status_labels` reads
+    /// each running slot's conversation row.
+    fn apply_status_overrides(&mut self, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        let map = self.agent_runs.read(cx).running_status_labels(|node| {
+            fleet
+                .get_node(&node.to_string())
+                .ok()
+                .flatten()
+                .map(|task| task.lifecycle)
+        });
+        let map: std::collections::HashMap<String, String> =
+            map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
+        self.task_list.update(cx, |task_list, cx| {
+            task_list.set_status_overrides(map, cx);
+        });
     }
 
     fn on_task_list_event(
@@ -190,7 +226,9 @@ impl UnifiedView {
     ) -> HostedColumn {
         match target {
             PanelKind::Details(node_id) => {
-                let panel = cx.new(|cx| DetailsPanel::new(node_id, self.fleet.clone(), window, cx));
+                let panel = cx.new(|cx| {
+                    DetailsPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), window, cx)
+                });
                 let panel_id = panel.entity_id();
                 let subscription = cx.subscribe_in(
                     &panel,
@@ -457,9 +495,13 @@ mod tests {
         crate::interview::set_data_root(config_root);
         let slot = Rc::new(RefCell::new(None));
         let store = fixture.store.clone();
+        let agent: crate::interview::agent::SharedAgent = std::sync::Arc::new(std::sync::Mutex::new(
+            Box::new(tod_agent::MockAgentProvider::new()),
+        ));
+        let agent_runs_for_test = cx.new(|_| AgentRuns::new(store.clone(), agent));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| UnifiedView::new(window, cx, store));
+            let view = cx.new(|cx| UnifiedView::new(window, cx, store, agent_runs_for_test));
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
