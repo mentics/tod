@@ -18,6 +18,7 @@ actions!(
         ShellGoConversation,
         ShellGoSettings,
         ShellGoDatabase,
+        ShellGoWorkbench,
         AppNavSelectUp,
         AppNavSelectDown,
         AppNavConfirm,
@@ -26,7 +27,7 @@ actions!(
 );
 
 const APP_NAV_POPUP_CONTEXT: &str = "AppNavPopup";
-const APP_NAV_ITEMS: [&str; 4] = ["Tasks", "Conversation", "Settings", "Database"];
+const APP_NAV_ITEMS: [&str; 5] = ["Tasks", "Conversation", "Settings", "Database", "Workbench"];
 
 /// Shared handler for `` ` `` / app-nav toggle — attach via [`HasAppNav::bind_app_nav_toggle`].
 pub fn on_app_nav_toggle<V: Render + HasAppNav + 'static>(
@@ -58,6 +59,7 @@ pub enum AppDestination {
     Conversation,
     Settings,
     Database,
+    Workbench,
 }
 
 struct AppNavPopup {
@@ -80,7 +82,8 @@ impl AppNavPopup {
             0 => Box::new(ShellGoTasks),
             1 => Box::new(ShellGoConversation),
             2 => Box::new(ShellGoSettings),
-            _ => Box::new(ShellGoDatabase),
+            3 => Box::new(ShellGoDatabase),
+            _ => Box::new(ShellGoWorkbench),
         };
         self.action_context.focus(window, cx);
         window.dispatch_action(action, cx);
@@ -360,6 +363,7 @@ fn nav_item_index(current: Option<AppDestination>) -> usize {
         Some(AppDestination::Conversation) => 1,
         Some(AppDestination::Settings) => 2,
         Some(AppDestination::Database) => 3,
+        Some(AppDestination::Workbench) => 4,
         Some(AppDestination::Tasks) | None => 0,
     }
 }

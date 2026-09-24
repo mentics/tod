@@ -20,10 +20,11 @@ use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, Settin
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::report_problem::{OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem};
 use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
-    register_app_nav_keyboard_bindings,
+    ShellGoWorkbench, register_app_nav_keyboard_bindings,
 };
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
@@ -39,6 +40,7 @@ use crate::views::obligations::{ObligationsEvent, ObligationsView};
 use crate::views::plan_steps::{PlanStepsEvent, PlanStepsView};
 use crate::views::task_edit::{TaskEditEvent, TaskEditView};
 use crate::views::task_list::{TaskListEvent, TaskListView};
+use crate::unified::UnifiedView;
 use crate::views::visual_design_panel::{
     EmbeddedChatParams, VisualDesignPanelEvent, VisualDesignPanelView,
 };
@@ -82,6 +84,8 @@ enum ShellView {
     Conversation,
     Settings,
     Database,
+    /// The unified view ("Workbench") — `doc/ui/unified-view.md`.
+    Unified,
 }
 
 struct PendingOpenInterview {
@@ -107,6 +111,7 @@ pub struct Shell {
     view_before_conversation: ShellView,
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
+    unified: Entity<UnifiedView>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
     agent: SharedAgent,
@@ -203,7 +208,7 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
-    for item in conversation.read(cx).running_work() {
+    for item in conversation.read(cx).running_work(cx) {
         items.push(SharedString::from(item));
     }
     items
@@ -221,6 +226,8 @@ impl Shell {
             .update(cx, |settings, _| settings.app_nav_mut().close());
         self.database
             .update(cx, |database, _| database.app_nav_mut().close());
+        self.unified
+            .update(cx, |unified, _| unified.app_nav_mut().close());
         if self.active_view == view {
             if view == ShellView::Tasks {
                 self.task_list.update(cx, |list, cx| {
@@ -262,6 +269,10 @@ impl Shell {
             }
             ShellView::Database => {
                 let focus = self.database.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            }
+            ShellView::Unified => {
+                let focus = self.unified.read(cx).focus_handle(cx);
                 focus.focus(window, cx);
             }
         }
@@ -1018,7 +1029,10 @@ impl Shell {
         let source = match self.active_view {
             ShellView::Tasks => StatusSource::Tasks,
             ShellView::Conversation => StatusSource::Conversation,
-            ShellView::Interview | ShellView::Settings | ShellView::Database => {
+            ShellView::Interview
+            | ShellView::Settings
+            | ShellView::Database
+            | ShellView::Unified => {
                 return SharedString::default();
             }
         };
@@ -1205,6 +1219,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShellGoDatabase, window, cx| {
                 this.select_view(ShellView::Database, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ShellGoWorkbench, window, cx| {
+                this.select_view(ShellView::Unified, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ShellOpenAgentTranscripts, _, cx| {
                 this.open_transcript_window(cx);
             }))
@@ -1270,6 +1287,7 @@ impl Shell {
             ShellView::Conversation => self.conversation.clone().into_any_element(),
             ShellView::Settings => self.settings.clone().into_any_element(),
             ShellView::Database => self.database.clone().into_any_element(),
+            ShellView::Unified => self.unified.clone().into_any_element(),
         }
     }
 
@@ -1860,6 +1878,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
                         let agent_for_conversation = agent.clone();
+                        let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), agent.clone()));
                         let conversation = cx.new(|cx| {
                             ConversationView::new(
                                 window,
@@ -1867,6 +1886,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent_for_conversation,
                                 fleet.clone(),
                                 lifecycle.clone(),
+                                agent_runs.clone(),
                             )
                         });
                         conversation.update(cx, |conversation, cx| {
@@ -1874,6 +1894,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
+                        let unified = cx.new(|cx| UnifiedView::new(window, cx, fleet.clone()));
                         let view = cx.new(|cx| {
                             let _task_list_subscription =
                                 cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {
@@ -1971,6 +1992,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
+                                        // The unified view (W12) will map this to its
+                                        // decisions panel; the Tasks view has none yet.
+                                        TaskListEvent::OpenDecisions { .. } => {}
                                     }
                                 });
                             let _task_edit_subscription =
@@ -2211,6 +2235,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 view_before_conversation: ShellView::Tasks,
                                 settings,
                                 database,
+                                unified,
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
                                 agent: agent.clone(),

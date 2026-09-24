@@ -57,6 +57,12 @@ pub struct TaskItem {
     /// True for a managed ticket whose generator has a quick-accept
     /// destination configured — the Accept action is inert otherwise.
     pub accept_ready: bool,
+    /// Pending decisions waiting on the user for this node (fed by the
+    /// host via `TaskListView::set_attention`; zero until it calls in).
+    pub needs_you_count: usize,
+    /// When this node started waiting on the user, for "waiting longest"
+    /// sort. `None` when `needs_you_count` is zero.
+    pub waiting_since: Option<DateTime<Utc>>,
 }
 
 impl TaskItem {
@@ -75,6 +81,9 @@ pub enum SortKey {
     Title,
     Lifecycle,
     TicketId,
+    /// Nodes with `needs_you_count > 0` first, oldest `waiting_since` first;
+    /// everything else keeps tree order after them.
+    WaitingLongest,
 }
 
 impl SortKey {
@@ -85,6 +94,7 @@ impl SortKey {
             Self::Title => "Title",
             Self::Lifecycle => "Lifecycle",
             Self::TicketId => "Ticket",
+            Self::WaitingLongest => "Waiting longest",
         }
     }
 
@@ -94,16 +104,18 @@ impl SortKey {
             Self::InteractionTimestamp => Self::Title,
             Self::Title => Self::Lifecycle,
             Self::Lifecycle => Self::TicketId,
-            Self::TicketId => Self::TreeOrder,
+            Self::TicketId => Self::WaitingLongest,
+            Self::WaitingLongest => Self::TreeOrder,
         }
     }
 
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::TreeOrder,
         Self::InteractionTimestamp,
         Self::Title,
         Self::Lifecycle,
         Self::TicketId,
+        Self::WaitingLongest,
     ];
 }
 
@@ -165,6 +177,10 @@ pub struct ListWorkingSet {
     pub generator_sorts: HashMap<String, GeneratorSubtreeSort>,
     /// Show only nodes with pending incoming changes, plus their ancestors.
     pub pending_changes_only: bool,
+    /// Show only nodes with `needs_you_count > 0`, plus their ancestors.
+    pub needs_you_only: bool,
+    /// Show only nodes with `live_run_count > 0`, plus their ancestors.
+    pub running_only: bool,
 }
 
 impl ListWorkingSet {
@@ -177,6 +193,8 @@ impl ListWorkingSet {
             active_list_id: None,
             generator_sorts: HashMap::new(),
             pending_changes_only: false,
+            needs_you_only: false,
+            running_only: false,
         }
     }
 
@@ -186,6 +204,9 @@ impl ListWorkingSet {
             SortKey::InteractionTimestamp => SortDirection::Desc,
             SortKey::Lifecycle => SortDirection::Desc,
             SortKey::TicketId => SortDirection::Desc,
+            // Ascending already puts the longest-waiting node first (see
+            // `compare_tasks`); no need to reverse it up front.
+            SortKey::WaitingLongest => SortDirection::Asc,
         }
     }
 
@@ -326,6 +347,15 @@ pub fn compare_tasks(a: &TaskItem, b: &TaskItem, key: SortKey, dir: SortDirectio
         SortKey::Title => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
         SortKey::Lifecycle => lifecycle_rank(&a.lifecycle).cmp(&lifecycle_rank(&b.lifecycle)),
         SortKey::TicketId => compare_ticket_id(a.ticket_id.as_deref(), b.ticket_id.as_deref()),
+        SortKey::WaitingLongest => {
+            let a_waiting = a.needs_you_count > 0;
+            let b_waiting = b.needs_you_count > 0;
+            match b_waiting.cmp(&a_waiting) {
+                Ordering::Equal if a_waiting => a.waiting_since.cmp(&b.waiting_since),
+                Ordering::Equal => a.tree_ordinal.cmp(&b.tree_ordinal),
+                other => other,
+            }
+        }
     };
     match dir {
         SortDirection::Asc => ord,
@@ -381,14 +411,15 @@ fn owning_generator_id(by_id: &HashMap<&str, &TaskItem>, start_id: &str) -> Opti
     None
 }
 
-/// Ids of the nodes with pending incoming changes and every ancestor of
-/// one, so the filtered tree keeps its context.
-fn pending_changes_with_ancestors<'a>(
+/// Ids of the nodes matching `matches` and every ancestor of one, so the
+/// filtered tree keeps its context.
+fn matching_with_ancestors<'a>(
     tasks: &'a [TaskItem],
     by_id: &HashMap<&str, &'a TaskItem>,
+    matches: impl Fn(&TaskItem) -> bool,
 ) -> HashSet<&'a str> {
     let mut ids = HashSet::new();
-    for task in tasks.iter().filter(|t| t.incoming_count > 0) {
+    for task in tasks.iter().filter(|t| matches(t)) {
         let mut cur = Some(task);
         while let Some(t) = cur {
             if !ids.insert(t.id.as_str()) {
@@ -467,13 +498,25 @@ pub fn filter_and_sort_tasks(
     let by_id: HashMap<&str, &TaskItem> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let pending = working_set
         .pending_changes_only
-        .then(|| pending_changes_with_ancestors(tasks, &by_id));
+        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.incoming_count > 0));
+    let needs_you = working_set
+        .needs_you_only
+        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.needs_you_count > 0));
+    let running = working_set
+        .running_only
+        .then(|| matching_with_ancestors(tasks, &by_id, |t| t.live_run_count > 0));
     let filtered: Vec<TaskItem> = tasks
         .iter()
         .filter(|t| {
             pending
                 .as_ref()
                 .is_none_or(|ids| ids.contains(t.id.as_str()))
+                && needs_you
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(t.id.as_str()))
+                && running
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(t.id.as_str()))
                 && task_matches_tag_filter(t, working_set.tag_filter.as_deref())
                 && task_matches_search(t, search_query)
                 && task_matches_generator_filter(t, &by_id, working_set)
@@ -538,6 +581,8 @@ pub fn nearest_visible_id(
             active_list_id: working_set.active_list_id.clone(),
             generator_sorts: working_set.generator_sorts.clone(),
             pending_changes_only: working_set.pending_changes_only,
+            needs_you_only: working_set.needs_you_only,
+            running_only: working_set.running_only,
         },
     );
     let prev_ix = match all.iter().position(|t| t.id == previous_id) {
@@ -590,6 +635,8 @@ mod tests {
             generator_status: None,
             generator_error: None,
             accept_ready: false,
+            needs_you_count: 0,
+            waiting_since: None,
         }
     }
 
@@ -621,6 +668,73 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["root", "mid", "leaf"]);
         assert_eq!(filter_and_sort_tasks(&tasks, "", &ListWorkingSet::default()).len(), 5);
+    }
+
+    #[test]
+    fn needs_you_filter_keeps_matching_nodes_and_their_ancestors() {
+        let root = sample("root", "Root", "ready", &[]);
+        let mut mid = sample("mid", "Mid", "ready", &[]);
+        mid.parent_id = Some("root".into());
+        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
+        leaf.parent_id = Some("mid".into());
+        leaf.needs_you_count = 1;
+        let mut sibling = sample("sib", "Sibling", "ready", &[]);
+        sibling.parent_id = Some("root".into());
+        let tasks = vec![root, mid, leaf, sibling];
+        let ws = ListWorkingSet {
+            needs_you_only: true,
+            ..Default::default()
+        };
+        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["root", "mid", "leaf"]);
+    }
+
+    #[test]
+    fn running_filter_keeps_matching_nodes_and_their_ancestors() {
+        let root = sample("root", "Root", "ready", &[]);
+        let mut leaf = sample("leaf", "Leaf", "ready", &[]);
+        leaf.parent_id = Some("root".into());
+        leaf.live_run_count = 1;
+        let mut other = sample("other", "Other", "ready", &[]);
+        other.parent_id = Some("root".into());
+        let tasks = vec![root, leaf, other];
+        let ws = ListWorkingSet {
+            running_only: true,
+            ..Default::default()
+        };
+        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(ids, vec!["root", "leaf"]);
+    }
+
+    #[test]
+    fn waiting_longest_sorts_needs_you_nodes_first_by_oldest_wait() {
+        use chrono::Duration;
+        let now = Utc::now();
+        let mut a = sample("a", "A", "ready", &[]);
+        a.needs_you_count = 1;
+        a.waiting_since = Some(now - Duration::minutes(5));
+        let mut b = sample("b", "B", "ready", &[]);
+        b.needs_you_count = 1;
+        b.waiting_since = Some(now - Duration::minutes(30));
+        let c = sample("c", "C", "ready", &[]);
+        let tasks = vec![a, b, c];
+        let ws = ListWorkingSet {
+            sort_key: SortKey::WaitingLongest,
+            sort_direction: SortDirection::Asc,
+            ..Default::default()
+        };
+        let ids: Vec<String> = filter_and_sort_tasks(&tasks, "", &ws)
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        // "b" waited longer than "a"; "c" isn't waiting at all.
+        assert_eq!(ids, vec!["b", "a", "c"]);
     }
 
     #[test]
