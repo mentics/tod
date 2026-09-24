@@ -226,6 +226,9 @@ impl Protocol for ImplementationProtocol {
     /// one stuck step never stops work on the rest. Otherwise another turn
     /// goes out, until the cap or a turn that changed nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
+        if let Some(done) = super::protocol::hand_back_for_pending_decision(turn)? {
+            return Ok(done);
+        }
         let node = node_id(turn.env)?;
         let steps = plan_steps(turn.env.fleet, node);
         let open: Vec<&PlanStepWithLinks> = steps

@@ -123,10 +123,10 @@ impl LifecycleSnapshot {
 impl ConversationView {
     /// Whether a conversation running `protocol` on `node` is working now,
     /// whichever conversation is open.
-    fn protocol_running(&self, node: Uuid, protocol: ProtocolKind) -> bool {
-        self.drivers.iter().any(|d| {
-            d.focus == Focus::Node(node) && d.protocol == protocol && d.status.running
-        })
+    fn protocol_running(&self, node: Uuid, protocol: ProtocolKind, cx: &App) -> bool {
+        self.agent_runs
+            .read(cx)
+            .protocol_running(Focus::Node(node), protocol)
     }
 
     /// Whether a gate check on `node` is under way: waiting on its incoming
@@ -134,7 +134,7 @@ impl ConversationView {
     fn gate_checking(&self, node: Uuid, cx: &App) -> bool {
         self.settling_gate.contains(&node)
             || self.checking_incoming(node, cx)
-            || self.protocol_running(node, ProtocolKind::GateCheck)
+            || self.protocol_running(node, ProtocolKind::GateCheck, cx)
     }
 
     /// The buttons beside Send and the short notices above the input (why a
@@ -156,9 +156,9 @@ impl ConversationView {
         // What the open conversation is already doing needs no button.
         let open_is = |protocol| self.data.protocol == protocol && self.status.running;
 
-        let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation);
+        let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation, cx);
         let checking = self.gate_checking(snapshot.node, cx);
-        let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix);
+        let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix, cx);
         let mut gate_offered = next.is_some();
         match snapshot.lifecycle.as_str() {
             "active" => match snapshot.plan {
@@ -225,7 +225,7 @@ impl ConversationView {
                 gate_offered = false;
             }
             "review" => {
-                let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix);
+                let fixing = self.protocol_running(snapshot.node, ProtocolKind::Fix, cx);
                 let fix_first =
                     snapshot.standing.review_done && snapshot.standing.open_findings > 0;
                 actions.push(

@@ -80,6 +80,14 @@ pub enum RowAction {
     AcceptTicket {
         task_id: String,
     },
+    /// Right-click anywhere on the row: select it and open the context menu.
+    OpenContextMenu {
+        task_id: String,
+    },
+    /// The row's attention badge (needs-you count).
+    OpenDecisions {
+        task_id: String,
+    },
 }
 
 pub struct TaskListDelegate {
@@ -243,6 +251,36 @@ impl ListDelegate for TaskListDelegate {
             });
 
         let mut chips = h_flex().gap_1().items_center().ml_auto();
+        if item.needs_you_count > 0 {
+            let task_id_badge = item.id.clone();
+            let sink_badge = sink.clone();
+            let warning_text = crate::ui::style::color::callout_warning_text();
+            let warning_fill = crate::ui::style::color::callout_warning_fill();
+            let warning_edge = crate::ui::style::color::callout_warning_edge();
+            chips = chips.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(warning_edge)
+                    .bg(warning_fill)
+                    .text_color(warning_text)
+                    .child(format!("Needs you · {}", item.needs_you_count))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            cx.stop_propagation();
+                            sink_badge.borrow_mut().push(RowAction::OpenDecisions {
+                                task_id: task_id_badge.clone(),
+                            });
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
         if managed && self.recently_updated.contains(&item.id) {
             chips = chips.child(
                 div()
@@ -605,11 +643,10 @@ impl ListDelegate for TaskListDelegate {
                 ),
             ));
         }
-        let chips_menu_open = selected
-            && self
-                .open_row_menu
-                .as_ref()
-                .is_some_and(|(kind, id)| matches!(kind, RowMenuKind::Shells) && id == &item.id);
+        let chips_menu_open = self.open_row_menu.as_ref().is_some_and(|(kind, id)| {
+            (selected && matches!(kind, RowMenuKind::Shells) || matches!(kind, RowMenuKind::Context))
+                && id == &item.id
+        });
         let title_line = if chips_menu_open {
             title_row.child(row_menu_anchor(chips, self.row_menu.clone()))
         } else {
@@ -662,6 +699,17 @@ impl ListDelegate for TaskListDelegate {
                     }
                 }),
             )
+            .on_mouse_down(MouseButton::Right, {
+                let task_id = item.id.clone();
+                let sink = sink.clone();
+                cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    sink.borrow_mut().push(RowAction::OpenContextMenu {
+                        task_id: task_id.clone(),
+                    });
+                    cx.notify();
+                })
+            })
             .when(has_spec, |el| {
                 // An obligation dragged off the obligations panel: the same
                 // payload every item list drags, so the row it came from did

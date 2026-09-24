@@ -139,6 +139,7 @@ pub const IMPLEMENT_SESSION: ContextRecipe = ContextRecipe {
         "cli/plan",
         "cli/tests",
         "cli/secrets",
+        "cli/decisions",
         "surface/implement",
     ],
     blocks: &[
@@ -174,6 +175,7 @@ pub const VERIFY_SESSION: ContextRecipe = ContextRecipe {
         "cli/verdicts",
         "cli/tests",
         "cli/secrets",
+        "cli/decisions",
         "surface/verify",
     ],
     blocks: IMPLEMENT_SESSION.blocks,
@@ -197,6 +199,7 @@ pub const REVIEW_SESSION: ContextRecipe = ContextRecipe {
         "cli/obligations",
         "cli/plan",
         "cli/review",
+        "cli/decisions",
         "surface/review",
     ],
     blocks: IMPLEMENT_SESSION.blocks,
@@ -244,6 +247,7 @@ pub const FIX_SESSION: ContextRecipe = ContextRecipe {
         "cli/review",
         "cli/tests",
         "cli/secrets",
+        "cli/decisions",
         "surface/fix",
     ],
     blocks: &[

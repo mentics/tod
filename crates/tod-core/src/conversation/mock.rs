@@ -13,6 +13,7 @@
 //! move <id> under <node-slug>
 //! flag <id>: <reason>
 //! ask <text>
+//! ask <question> | <option> | <option> ...
 //! think <text>
 //! permission <title>
 //! ```
@@ -20,7 +21,9 @@
 //! `<id>` is a node slug or UUID, or an obligation or plan-step id (full or
 //! 8-character prefix). The reply is empty, except that `ask` echoes its text
 //! and a line the mock cannot carry out gets a one-line note, each note its
-//! own markdown paragraph.
+//! own markdown paragraph. `ask` with pipes records a decision
+//! (`tod_store::decisions`) on the conversation's focus node instead of just
+//! asking in prose, so `--agent mock` can exercise the decisions loop.
 //!
 //! Like a real agent, the mock also reports the reply's parts
 //! ([`MockReply::parts`]): when there is work, a note that it is working, a
@@ -194,7 +197,49 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
         })
     };
     if let Some(text) = line.strip_prefix("ask ") {
-        return Ok(Some(text.trim().to_string()));
+        let text = text.trim();
+        // `ask <question> | <option> | <option> ...` records a decision on
+        // the conversation's focus node, so `--agent mock` can exercise the
+        // decisions loop end to end. Plain `ask <text>` (no pipes) keeps the
+        // old behaviour: a freeform question, just echoed back.
+        if text.contains('|') {
+            let mut parts = text.split('|').map(str::trim);
+            let question = parts.next().unwrap_or_default();
+            let options: Vec<String> = parts
+                .filter(|o| !o.is_empty())
+                .map(str::to_string)
+                .collect();
+            if question.is_empty() {
+                bail!("expected `ask <question> | <option> | <option> ...`");
+            }
+            if options.is_empty() {
+                bail!("`ask {text}` has pipes but no options after the question");
+            }
+            let node_id = client
+                .read(|conn| {
+                    Ok(tod_store::conversation::ConversationRepo::new(conn)
+                        .get(conversation)?
+                        .and_then(|c| c.focus.node_id()))
+                })?
+                .context("the conversation has no node to put a decision on")?;
+            let protocol = client.read(|conn| {
+                Ok(tod_store::conversation::ConversationRepo::new(conn)
+                    .get(conversation)?
+                    .map(|c| c.protocol.as_str().to_string()))
+            })?;
+            client.interview(InterviewCommand::AskDecision {
+                node_id,
+                conversation_id: Some(conversation),
+                protocol,
+                decision: tod_store::decisions::NewDecision {
+                    question: question.to_string(),
+                    options,
+                    evidence: Vec::new(),
+                },
+            })?;
+            return Ok(Some(question.to_string()));
+        }
+        return Ok(Some(text.to_string()));
     }
     if let Some(rest) = line.strip_prefix("add obligation ") {
         let (slug, text) = split_colon(rest)?;

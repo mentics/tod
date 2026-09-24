@@ -64,6 +64,30 @@ pub enum Stop {
     NoProgress,
 }
 
+/// When this conversation's node has a pending decision that this same
+/// conversation asked (`tod-cli decisions ask`), hand back instead of
+/// sending another turn: the user's answer is what resumes it
+/// (`AgentRuns::answer_decision` delivers it as the next turn). Every
+/// looping protocol's `next` checks this first, before its own "done" logic.
+pub fn hand_back_for_pending_decision(turn: &TurnContext<'_>) -> Result<Option<Next>> {
+    let Some(node_id) = turn.env.focus.node_id() else {
+        return Ok(None);
+    };
+    let pending = turn
+        .env
+        .fleet
+        .read(|conn| tod_store::decisions::DecisionRepo::new(conn).list_pending_for_node(node_id))?;
+    let waiting = pending
+        .iter()
+        .any(|d| d.conversation_id == Some(turn.env.conversation_id));
+    if waiting {
+        return Ok(Some(Next::Done(Stop::HandBack(
+            "waiting on a decision the user has not answered yet".to_string(),
+        ))));
+    }
+    Ok(None)
+}
+
 /// Shared stop logic for the continuation cap and stalled progress, used by
 /// every looping protocol's `next` once its own "done" check has passed.
 /// Returns `None` when neither applies, so the loop should send another turn.

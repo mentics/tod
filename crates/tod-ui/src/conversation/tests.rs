@@ -35,7 +35,10 @@ fn open_view<'a>(
     let (_, cx) = cx.add_window_view(move |window, cx| {
         let agent: SharedAgent = Arc::new(Mutex::new(Box::new(MockAgentProvider::new())));
         let lifecycle = cx.new(|_| LifecycleController::new(store.clone()));
-        let view = cx.new(|cx| ConversationView::new(window, cx, agent, store, lifecycle));
+        let agent_runs = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
+        let view = cx.new(|cx| {
+            ConversationView::new(window, cx, agent, store, lifecycle, agent_runs)
+        });
         cx.subscribe(&view, move |_, _, event: &ConversationViewEvent, _| {
             events_in.borrow_mut().push(event.clone());
         })
@@ -2241,19 +2244,22 @@ fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
         launch: tod_agent::AgentLaunchOptions::for_platform(tod_agent::AgentPlatform::Claude),
         context: Default::default(),
     };
-    view.update(cx, |view, _| {
+    view.update(cx, |view, cx| {
         let driver = ConversationDriver::new(config, node, ProtocolKind::Fix);
-        view.drivers.push(DriverSlot::new(0, driver));
+        view.agent_runs.update(cx, |runs, cx| {
+            runs.ensure(node, ProtocolKind::Fix, None, || Ok(driver)).unwrap();
+            cx.notify();
+        });
     });
 
     view.update_in(cx, |view, window, cx| {
         view.run(node, ProtocolKind::Fix, window, cx)
     });
-    view.read_with(cx, |v, _| {
+    view.read_with(cx, |v, app| {
         assert!(v.status.running, "the view shows the agent starting: {:?}", v.error);
         assert_eq!(v.status.activity.as_deref(), Some("Starting the agent…"));
         assert_eq!(v.conversation_id(), None, "nothing was sent on the main thread");
-        assert!(v.running_work().len() == 1, "a starting run is work in flight");
+        assert!(v.running_work(app).len() == 1, "a starting run is work in flight");
     });
 
     cx.run_until_parked();
