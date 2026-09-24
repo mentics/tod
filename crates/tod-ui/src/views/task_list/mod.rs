@@ -415,7 +415,7 @@ impl TaskListView {
                     this.sync_selected_id(cx);
                 }
                 // A click confirms via the nested list widget and leaves it focused;
-                // reclaim focus for the task-list surface so Enter still creates a node
+                // reclaim focus for the task-list surface so Enter still edits the node
                 // instead of being swallowed as another list Confirm.
                 this.pending_refocus_list = true;
                 cx.notify();

@@ -336,7 +336,17 @@ impl TaskListView {
             cx.notify();
             return;
         }
-        self.create_tree_node_and_edit(CreatePosition::Below, window, cx);
+        // As in every item list, Enter on a row edits it; only an empty tree
+        // has nothing to edit, so there it starts the first node.
+        let selected = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id));
+        match selected {
+            Some(task_id) => self.start_inline_edit(&task_id, window, cx),
+            None => self.create_tree_node_and_edit(CreatePosition::Below, window, cx),
+        }
     }
 
     /// Before opening another draft: drop an untitled draft, or commit the edit in progress.
