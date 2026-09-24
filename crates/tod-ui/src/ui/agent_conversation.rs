@@ -37,6 +37,7 @@ use gpui::{
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Textarea, TextareaState};
 use gpui_component::spinner::Spinner;
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Disableable, Selectable, Sizable, h_flex, v_flex};
 use std::collections::HashMap;
 
@@ -181,6 +182,9 @@ pub struct AgentConversationPanel {
     /// The host's status lines above the input.
     notices: Vec<PanelNotice>,
     lifecycle_state: Option<String>,
+    /// The session's token usage: a line under the title, and every figure
+    /// in its tooltip.
+    usage: Option<(SharedString, SharedString)>,
     input: Entity<TextareaState>,
     editing: bool,
     return_focus: Option<FocusHandle>,
@@ -229,6 +233,7 @@ impl AgentConversationPanel {
             header_actions: Vec::new(),
             notices: Vec::new(),
             lifecycle_state: None,
+            usage: None,
             input,
             editing: false,
             return_focus: None,
@@ -319,6 +324,16 @@ impl AgentConversationPanel {
     pub fn set_lifecycle_state(&mut self, state: Option<String>, cx: &mut Context<Self>) {
         if state != self.lifecycle_state {
             self.lifecycle_state = state;
+            cx.notify();
+        }
+    }
+
+    /// The token usage shown under the title: a one-line summary, and the
+    /// full breakdown shown on hover. `None` hides the line.
+    pub fn set_usage(&mut self, usage: Option<(String, String)>, cx: &mut Context<Self>) {
+        let usage = usage.map(|(line, details)| (line.into(), details.into()));
+        if usage != self.usage {
+            self.usage = usage;
             cx.notify();
         }
     }
@@ -705,6 +720,21 @@ impl Render for AgentConversationPanel {
                     )
                     .children(header_actions),
             )
+            .children(self.usage.clone().map(|(line, details)| {
+                div()
+                    .id("agent-conversation-usage")
+                    .px(style::space::INSET)
+                    .py(style::space::HAIRLINE)
+                    .border_b(style::size::BORDER)
+                    .border_color(style::color::divider())
+                    .tooltip(move |window, cx| Tooltip::new(details.clone()).build(window, cx))
+                    .child(style::text_dense_muted(div()).child(selectable_text(
+                        "agent-conversation-usage-text",
+                        line,
+                        window,
+                        cx,
+                    )))
+            }))
             .child(div().flex_1().min_h_0().child(self.list.clone()))
             .child(
                 style::panel_footer(v_flex()).child(field).child(

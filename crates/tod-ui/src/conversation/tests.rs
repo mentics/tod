@@ -2014,6 +2014,7 @@ fn the_gate_check_waive_and_advance_run_from_the_conversation(cx: &mut TestAppCo
     set_lifecycle(&fixture, "ready");
     let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
     press_lifecycle(&view, "Gate check → active", cx);
+    cx.run_until_parked();
 
     let waive = view
         .read_with(cx, |view, cx| view.gate_notices(cx))
@@ -2263,6 +2264,48 @@ fn a_lifecycle_run_starts_off_the_main_thread(cx: &mut TestAppContext) {
             "the driver came back with the conversation, or why not"
         );
     });
+}
+
+/// The gate check answers the criteria the app can on the background
+/// executor: some read the pull request from GitHub, so the click only shows
+/// the check started, here and in the lifecycle panel, and the verdict
+/// arrives when the work is done.
+#[gpui::test]
+fn the_gate_check_settles_its_criteria_off_the_main_thread(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    set_lifecycle(&fixture, "ready");
+    let (view, _, cx) = open_view(&fixture, Focus::Node(fixture.node_id), cx);
+    let task_id = fixture.node_id.to_string();
+    let gate_status = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.lifecycle
+                .read(cx)
+                .state(&task_id)
+                .map(|s| (s.gate_status.clone(), s.criteria_detail.len()))
+                .unwrap_or_default()
+        })
+    };
+
+    press_lifecycle(&view, "Gate check → active", cx);
+    assert_eq!(
+        gate_status(&view, cx),
+        (lifecycle::SETTLING.to_string(), 0),
+        "the check shows as started, and nothing is settled on the main thread"
+    );
+    let labels = lifecycle_labels(&view, cx);
+    assert!(
+        labels.contains(&"Checking gate…".to_string()),
+        "no second check while one runs: {labels:?}"
+    );
+
+    cx.run_until_parked();
+    let (status, criteria) = gate_status(&view, cx);
+    assert_ne!(status, lifecycle::SETTLING);
+    assert!(criteria > 0, "the settled criteria are shown");
+    assert!(
+        lifecycle_labels(&view, cx).contains(&"Gate check → active".to_string()),
+        "the check is over, so it can be run again"
+    );
 }
 
 /// With findings open, Fix sits beside Review. A fix conversation's pane

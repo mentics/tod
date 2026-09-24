@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 62;
+pub const CURRENT_USER_VERSION: i32 = 63;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -390,6 +390,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(crate::journey_submissions::CREATE_JOURNEY_SUBMISSIONS)?;
         conn.pragma_update(None, "user_version", 62)?;
     }
+    if version < 63 {
+        migrate_v62_to_v63(conn)?;
+        conn.pragma_update(None, "user_version", 63)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -740,6 +744,32 @@ fn migrate_v56_to_v57(conn: &Connection) -> Result<()> {
             conn.execute_batch(&format!("ALTER TABLE node_files ADD COLUMN {column} {ddl};"))?;
         }
     }
+    Ok(())
+}
+
+/// `node_lifecycle.state`'s CHECK constraint predates the `pr` state; SQLite
+/// cannot alter a CHECK, so rebuild the table with the current list.
+fn migrate_v62_to_v63(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE node_lifecycle RENAME TO node_lifecycle_old;
+         CREATE TABLE node_lifecycle (
+             node_id     BLOB PRIMARY KEY NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+             state       TEXT NOT NULL CHECK (state IN (
+                             'proposed', 'design', 'planning', 'ready', 'active',
+                             'verifying', 'review', 'pr', 'approved', 'merged',
+                             'released', 'learn', 'done'
+                         )),
+             updated_at  INTEGER NOT NULL
+         );
+         INSERT INTO node_lifecycle SELECT node_id, state, updated_at FROM node_lifecycle_old;
+         DROP TABLE node_lifecycle_old;",
+    )?;
+    // The drop took the triggers on the table with it; both sets are
+    // `IF NOT EXISTS`.
+    tx.execute_batch(crate::learn::CREATE_LEARN_TABLES)?;
+    tx.execute_batch(&crate::journey_changes::create_triggers_sql())?;
+    tx.commit()?;
     Ok(())
 }
 

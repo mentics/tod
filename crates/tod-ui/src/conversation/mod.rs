@@ -116,7 +116,23 @@ const AGENT_TURN: &str = "agent-turn";
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Polls between reloads when the store has not signalled a commit.
 const FALLBACK_POLLS: u32 = 8;
+/// How often a running turn's usage is read again from its platform's
+/// record: the read is the whole session log.
+const USAGE_REFRESH: Duration = Duration::from_secs(10);
 const TRANSCRIPT_WIDTH: f32 = 420.;
+
+/// The open conversation's token usage as its sessions' platform records
+/// say, and when it was last read.
+#[derive(Default)]
+struct ConversationUsage {
+    /// The conversation `recorded` is for.
+    conversation: Option<Uuid>,
+    recorded: Option<tod_agent::TokenUsage>,
+    read_at: Option<std::time::Instant>,
+    /// A turn ended since the last read.
+    stale: bool,
+    reading: bool,
+}
 const CONTEXT_WIDTH: f32 = 420.;
 
 /// What follows a message the view sends, once the driver is back with it.
@@ -432,6 +448,9 @@ pub struct ConversationView {
     /// Files the implementation protocol's worktree has changed, refreshed
     /// off the main thread when a turn ends.
     side_files: Vec<String>,
+    /// The open conversation's token usage, from its sessions' platform
+    /// records; read off the main thread (see [`Self::refresh_usage`]).
+    usage: ConversationUsage,
     /// Turns the protocol's loop has sent since the last user message.
     loop_turns: u32,
     /// Notices from finished runs, emitted as events on the next poll.
@@ -442,6 +461,9 @@ pub struct ConversationView {
     /// Nodes whose gate check just finished a turn: the criteria rows it
     /// recorded are re-read on the next poll, so Advance appears on a pass.
     pending_gate_reloads: Vec<Uuid>,
+    /// Nodes whose gate check is answering the criteria the app answers
+    /// itself, on the background executor.
+    settling_gate: Vec<Uuid>,
     /// The review pane's findings, on the shared item list: it owns the
     /// cursor, the scrolling, and the rows.
     findings: ItemList<FindingItem>,
@@ -560,6 +582,7 @@ impl ConversationView {
                 };
                 let Ok(want_files) = this.update(cx, |this, cx| {
                     let (changed, want_files) = this.poll(committed, ticked);
+                    this.refresh_usage(cx);
                     this.publish_status(cx);
                     for notice in std::mem::take(&mut this.pending_notices) {
                         cx.emit(ConversationViewEvent::Notice(notice));
@@ -634,10 +657,12 @@ impl ConversationView {
             nav: None,
             protocol: ProtocolKind::Outline,
             side_files: Vec::new(),
+            usage: ConversationUsage::default(),
             loop_turns: 0,
             pending_notices: Vec::new(),
             pending_entries: Vec::new(),
             pending_gate_reloads: Vec::new(),
+            settling_gate: Vec::new(),
             change_filter: StatusFilter::default(),
             // No columns: a change set is a plain list of items of several
             // kinds, not a table of one value per row.
@@ -1036,6 +1061,9 @@ impl ConversationView {
             self.loop_turns = turns;
         }
         let want_files = finished.then(|| self.implementation_worktree()).flatten();
+        if finished {
+            self.usage.stale = true;
+        }
         let current = self
             .current_driver()
             .map(|d| d.status.clone())
@@ -1066,6 +1094,72 @@ impl ConversationView {
             changed = true;
         }
         (changed, want_files)
+    }
+
+    /// Read the open conversation's usage again when it is due: a different
+    /// conversation is open, a turn ended, or a turn has been running for
+    /// [`USAGE_REFRESH`]. Reading is the platforms' whole session logs, so it
+    /// happens on the background executor.
+    fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.conversation_id else {
+            self.usage = ConversationUsage::default();
+            return;
+        };
+        if self.usage.conversation != Some(id) {
+            self.usage = ConversationUsage {
+                conversation: Some(id),
+                ..ConversationUsage::default()
+            };
+        }
+        let due = self.usage.stale
+            || self.usage.read_at.is_none_or(|at| {
+                self.status.running && at.elapsed() >= USAGE_REFRESH
+            });
+        if !due || self.usage.reading {
+            return;
+        }
+        self.usage.stale = false;
+        self.usage.reading = true;
+        self.usage.read_at = Some(std::time::Instant::now());
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let usage = cx
+                .background_executor()
+                .spawn(async move {
+                    tod_core::run_transcript::usage_for_key(
+                        &fleet,
+                        &ConversationDriver::session_key(id),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.usage.conversation == Some(id) {
+                    this.usage.reading = false;
+                    if this.usage.recorded != usage {
+                        this.usage.recorded = usage;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The usage to show: the platform records', filled in with what the
+    /// agent reported live where the records say nothing.
+    fn shown_usage(&self) -> Option<tod_agent::TokenUsage> {
+        let recorded = self
+            .usage
+            .recorded
+            .clone()
+            .filter(|_| self.usage.conversation == self.conversation_id);
+        match (recorded, self.status.live_usage.as_ref()) {
+            (Some(mut recorded), Some(live)) => {
+                recorded.fill_from_live(live);
+                Some(recorded)
+            }
+            (recorded, live) => recorded.or_else(|| live.cloned()),
+        }
     }
 
     /// The worktree an implementation conversation is running in, when that

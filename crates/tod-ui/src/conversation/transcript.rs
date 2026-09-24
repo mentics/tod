@@ -2,6 +2,7 @@
 //! by the general-purpose [`AgentConversationPanel`].
 
 use super::{ConversationView, Pane, Stop};
+use crate::ui::token_usage;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
@@ -187,6 +188,9 @@ impl ConversationView {
         let return_focus = self.focus_handle.clone();
         let (actions, notices) = self.lifecycle_controls(cx);
         let lifecycle_state = self.data.lifecycle.as_ref().map(|s| s.lifecycle.clone());
+        let usage = self
+            .shown_usage()
+            .map(|usage| (token_usage::summary(&usage), token_usage::details(&usage)));
         let mut header_actions = if self.data.has_opening_context {
             vec![PanelAction::new(COPY_CONTEXT, "Copy context")]
         } else {
@@ -199,6 +203,7 @@ impl ConversationView {
             panel.set_actions(actions, cx);
             panel.set_notices(notices, cx);
             panel.set_lifecycle_state(lifecycle_state, cx);
+            panel.set_usage(usage, cx);
             panel.set_return_focus(return_focus);
             panel.set_entries(entries, cx);
             panel.set_empty_message(empty, cx);

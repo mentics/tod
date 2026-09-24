@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::platform::AgentPlatform;
 use crate::reply::{self, ReplyPart};
+use crate::usage::TokenUsage;
 
 /// A transcript as read, and what in the platform's record this reader did
 /// not expect. The formats are the platforms' own and change without notice:
@@ -128,7 +129,12 @@ fn tool_title(name: &str, args: &Value) -> String {
 /// Bumped when the stored shape changes; a stored transcript of any other
 /// version (or the plain text stored before there was one) reads as absent,
 /// so it is read again.
-const VERSION: u32 = 1;
+///
+/// Version 1 had no usage. It still reads — the platform may have deleted
+/// its own record since, and the turns are all there is — but as
+/// [`Transcript::usage_read`] false, so it is read again while it can be.
+const VERSION: u32 = 2;
+const VERSION_WITHOUT_USAGE: u32 = 1;
 
 /// One turn of a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,24 +164,47 @@ impl TranscriptTurn {
     }
 }
 
-/// A session's history, oldest turn first.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A session's history, oldest turn first, and what it spent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transcript {
     pub turns: Vec<TranscriptTurn>,
+    /// The tokens the session spent, as its platform's record says; `None`
+    /// when the record says nothing of them.
+    pub usage: Option<TokenUsage>,
+    /// Whether `usage` was read at all: `false` for a transcript stored
+    /// before usage was.
+    pub usage_read: bool,
+}
+
+impl Default for Transcript {
+    fn default() -> Self {
+        Self {
+            turns: Vec::new(),
+            usage: None,
+            usage_read: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
     version: u32,
     turns: Vec<TranscriptTurn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<TokenUsage>,
 }
 
 impl Transcript {
     /// The form kept in the database.
     pub fn to_stored(&self) -> String {
         serde_json::to_string(&Stored {
-            version: VERSION,
+            version: if self.usage_read {
+                VERSION
+            } else {
+                VERSION_WITHOUT_USAGE
+            },
             turns: self.turns.clone(),
+            usage: self.usage.clone(),
         })
         .unwrap_or_default()
     }
@@ -184,9 +213,22 @@ impl Transcript {
     /// write, which the caller treats as not read yet.
     pub fn from_stored(stored: &str) -> Option<Self> {
         let stored: Stored = serde_json::from_str(stored).ok()?;
-        (stored.version == VERSION).then_some(Self {
+        let usage_read = match stored.version {
+            VERSION => true,
+            VERSION_WITHOUT_USAGE => false,
+            _ => return None,
+        };
+        Some(Self {
             turns: stored.turns,
+            usage: stored.usage,
+            usage_read,
         })
+    }
+
+    /// Set what the session spent, as the platform's record says; nothing
+    /// said reads as `None`.
+    pub(crate) fn set_usage(&mut self, usage: TokenUsage) {
+        self.usage = (!usage.is_empty()).then_some(usage);
     }
 
     /// Plain text, for a view or a clipboard that has no use for the parts.
@@ -337,7 +379,25 @@ mod tests {
         transcript.push_text(false, "Hello.");
         assert_eq!(
             Transcript::from_stored(&transcript.to_stored()),
+            Some(transcript.clone())
+        );
+        let mut usage = TokenUsage::default();
+        usage.total.input = 5;
+        transcript.set_usage(usage);
+        assert_eq!(
+            Transcript::from_stored(&transcript.to_stored()),
             Some(transcript)
+        );
+        // Stored before usage was: the turns still read, the usage is to
+        // be read again.
+        let before_usage =
+            Transcript::from_stored(r#"{"version":1,"turns":[{"role":"user","text":"Hi."}]}"#)
+                .unwrap();
+        assert_eq!(before_usage.turns.len(), 1);
+        assert!(!before_usage.usage_read);
+        assert_eq!(
+            Transcript::from_stored(&before_usage.to_stored()),
+            Some(before_usage)
         );
         assert_eq!(
             Transcript::from_stored("User:\nHi.\n\nAssistant:\nHello."),

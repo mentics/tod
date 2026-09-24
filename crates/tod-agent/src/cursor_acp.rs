@@ -14,6 +14,7 @@ use crate::agent_traffic::{
 use crate::ReplyPart;
 use crate::process_tree::AgentProcess;
 use crate::reply::{self, SharedReplyParts};
+use crate::usage::AcpUsage;
 use crate::util::normalize_absolute;
 use crate::util::path_is_under;
 use anyhow::{Context, Result, bail};
@@ -111,6 +112,9 @@ struct ConversationSpec {
     environment: AgentEnvironment,
 }
 
+/// What a conversation's agent reported spending, shared with the provider.
+type SharedAcpUsage = Arc<Mutex<AcpUsage>>;
+
 /// A long-lived conversation: a worker thread owning at most one agent process.
 struct LiveConversation {
     cmd_tx: Sender<ConversationCommand>,
@@ -130,6 +134,9 @@ struct LiveConversation {
     /// The parts of the latest turn (see
     /// [`AgentProvider::session_reply_parts`]).
     reply_parts: SharedReplyParts,
+    /// What the agent reported spending (see
+    /// [`AgentProvider::session_token_usage`]).
+    usage: SharedAcpUsage,
 }
 
 impl LiveConversation {
@@ -146,6 +153,7 @@ impl LiveConversation {
             pending_permission: Arc::new(Mutex::new(None)),
             context_chars: Arc::new(AtomicU64::new(0)),
             reply_parts: SharedReplyParts::default(),
+            usage: SharedAcpUsage::default(),
         };
         let conversation = Self {
             cmd_tx,
@@ -158,6 +166,7 @@ impl LiveConversation {
             purpose,
             context_chars: worker.context_chars.clone(),
             reply_parts: worker.reply_parts.clone(),
+            usage: worker.usage.clone(),
         };
         thread::spawn(move || worker.run(cmd_rx));
         conversation
@@ -189,6 +198,7 @@ struct ConversationWorker {
     pending_permission: PendingPermissionSlot,
     context_chars: Arc<AtomicU64>,
     reply_parts: SharedReplyParts,
+    usage: SharedAcpUsage,
 }
 
 impl ConversationWorker {
@@ -287,6 +297,7 @@ impl ConversationWorker {
                 &spec.environment,
                 Some(self.context_chars.clone()),
                 Some(self.reply_parts.clone()),
+                Some(self.usage.clone()),
             )?;
             *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(session.session_id.clone());
@@ -642,6 +653,16 @@ impl AgentProvider for CursorAcpProvider {
         self.conversations
             .get(key)
             .map(|conversation| conversation.context_chars.load(Ordering::Relaxed))
+    }
+
+    fn session_token_usage(&self, key: &str) -> Option<crate::TokenUsage> {
+        self.conversations.get(key).and_then(|conversation| {
+            conversation
+                .usage
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .usage()
+        })
     }
 
     fn session_reply_parts(&self, key: &str) -> Option<Vec<ReplyPart>> {
@@ -1011,6 +1032,7 @@ fn run_acp_session(
         pending_permission,
         context_chars: None,
         reply_parts: None,
+        usage: None,
     };
 
     let client_name = host.client_name();
@@ -1157,6 +1179,8 @@ struct AcpClient {
     context_chars: Option<Arc<AtomicU64>>,
     /// The current turn's reply, part by part, when the caller keeps it.
     reply_parts: Option<SharedReplyParts>,
+    /// What the agent reports spending, when the caller keeps it.
+    usage: Option<SharedAcpUsage>,
 }
 
 impl AcpClient {
@@ -1172,6 +1196,12 @@ impl AcpClient {
         };
         self.tag
             .record(log, self.kind.traffic_category(), direction, content);
+    }
+
+    fn update_usage(&self, update: impl FnOnce(&mut AcpUsage)) {
+        if let Some(usage) = &self.usage {
+            update(&mut usage.lock().unwrap_or_else(|e| e.into_inner()));
+        }
     }
 
     fn update_reply(&self, update: impl FnOnce(&mut Vec<ReplyPart>)) {
@@ -1346,6 +1376,8 @@ impl AcpClient {
                             self.update_reply(|parts| reply::push_text(parts, true, text));
                         }
                         self.set_activity(Some("Thinking…".to_string()));
+                    } else if kind == "usage_update" {
+                        self.update_usage(|usage| usage.apply_update(update));
                     } else if kind == "tool_call" || kind == "tool_call_update" {
                         let title = update.get("title").and_then(Value::as_str).unwrap_or("");
                         let status = update.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1833,6 +1865,7 @@ impl PersistentAcpSession {
         environment: &AgentEnvironment,
         context_chars: Option<Arc<AtomicU64>>,
         reply_parts: Option<SharedReplyParts>,
+        usage: Option<SharedAcpUsage>,
     ) -> Result<Self> {
         let SpawnedAgent {
             mut child,
@@ -1869,6 +1902,7 @@ impl PersistentAcpSession {
             pending_permission,
             context_chars,
             reply_parts,
+            usage,
         };
 
         let client_name = host.client_name();
@@ -1971,7 +2005,10 @@ impl PersistentAcpSession {
         if let Some((host, title)) = name {
             name_session_in_background(host, self.session_id.clone(), title.to_string());
         }
-        self.client.await_response(PROMPT_TIMEOUT)?;
+        let response = self.client.await_response(PROMPT_TIMEOUT)?;
+        if let Some(usage) = response.get("usage") {
+            self.client.update_usage(|kept| kept.apply_turn(usage));
+        }
         self.client.count_context(self.client.assistant_text.len());
         Ok(self.client.assistant_text.clone())
     }

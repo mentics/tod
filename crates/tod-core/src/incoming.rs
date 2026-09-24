@@ -14,14 +14,15 @@
 //! [`TodSettings::parallel_agent_sessions`]: tod_store::settings::TodSettings::parallel_agent_sessions
 
 use crate::context_recipes::{INCOMING_CHANGES, build_message};
-use crate::conversation::driver::{ConversationConfig, ConversationDriver, ConversationEvent};
+use crate::conversation::driver::{
+    AgentAccess, ConversationConfig, ConversationDriver, ConversationEvent,
+};
 use crate::dynamic::{DynamicContext, IncomingChangeItem, NodeSelection};
 use crate::media::MediaPaths;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::VecDeque;
 use std::path::Path;
-use tod_agent::AgentProvider;
 use tod_store::conversation::{ConversationRepo, EntitySnapshot, Focus, NetOp, ProtocolKind};
 use tod_store::fleet::FleetStore;
 use tod_store::incoming::{IncomingRepo, IncomingVerdict, PendingChange};
@@ -328,6 +329,12 @@ impl IncomingRunner {
         self.running.iter().map(|(node, _)| *node).collect()
     }
 
+    /// Nodes this run covers and has not finished.
+    pub fn unfinished(&self) -> Vec<Uuid> {
+        let running = self.running.iter().map(|(node, _)| *node);
+        self.queue.iter().copied().chain(running).collect()
+    }
+
     /// Whether `node` is part of this run and not finished yet.
     pub fn covers(&self, node: Uuid) -> bool {
         self.queue.contains(&node) || self.running.iter().any(|(n, _)| *n == node)
@@ -343,7 +350,11 @@ impl IncomingRunner {
 
     /// Start what the cap allows and collect finished sessions. Returns
     /// whether anything changed.
-    pub fn tick(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider) -> bool {
+    ///
+    /// Starting and collecting a session runs git, Docker, and `tod-cli`, so
+    /// the app calls this off the UI thread, reaching its shared provider
+    /// through [`crate::conversation::SharedAgentAccess`].
+    pub fn tick<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A) -> bool {
         let mut changed = false;
         let mut still = Vec::new();
         for (node, mut driver) in std::mem::take(&mut self.running) {
@@ -379,7 +390,7 @@ impl IncomingRunner {
         changed
     }
 
-    fn start(&mut self, fleet: &FleetStore, agent: &mut dyn AgentProvider, node: Uuid) {
+    fn start<A: AgentAccess + ?Sized>(&mut self, fleet: &FleetStore, agent: &mut A, node: Uuid) {
         let net = match fleet.read(|conn| IncomingRepo::new(conn).net_pending(node)) {
             Ok(net) => net,
             Err(err) => return self.push(fleet, node, NodeOutcome::Failed(format!("{err:#}"))),
@@ -425,17 +436,17 @@ impl IncomingRunner {
         }
     }
 
-    fn finish(
+    fn finish<A: AgentAccess + ?Sized>(
         &mut self,
         fleet: &FleetStore,
-        agent: &mut dyn AgentProvider,
+        agent: &mut A,
         node: Uuid,
         driver: &ConversationDriver,
         outcome: NodeOutcome,
     ) {
         // Short-lived: nothing follows up on an evaluation session.
         if let Some(id) = driver.conversation_id() {
-            agent.close_session(&ConversationDriver::session_key(id));
+            agent.with(|a| a.close_session(&ConversationDriver::session_key(id)));
         }
         self.push(fleet, node, outcome);
     }

@@ -38,6 +38,9 @@ const FIX_FAILED: &str = "lifecycle:fix-failed";
 const BACK: &str = "lifecycle:back";
 const WAIVE: &str = "lifecycle:waive:";
 
+/// The gate check's status while the app answers the criteria it can.
+pub(super) const SETTLING: &str = "Checking the gate criteria…";
+
 /// Where the focused node stands, read with the rest of the view's data.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LifecycleSnapshot {
@@ -126,6 +129,14 @@ impl ConversationView {
         })
     }
 
+    /// Whether a gate check on `node` is under way: waiting on its incoming
+    /// changes, settling the criteria the app answers, or in conversation.
+    fn gate_checking(&self, node: Uuid, cx: &App) -> bool {
+        self.settling_gate.contains(&node)
+            || self.checking_incoming(node, cx)
+            || self.protocol_running(node, ProtocolKind::GateCheck)
+    }
+
     /// The buttons beside Send and the short notices above the input (why a
     /// step cannot run), for where the focused node's lifecycle stands. The
     /// gate check's verdict is [`Self::gate_notices`].
@@ -146,8 +157,7 @@ impl ConversationView {
         let open_is = |protocol| self.data.protocol == protocol && self.status.running;
 
         let implementing = self.protocol_running(snapshot.node, ProtocolKind::Implementation);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
-            || self.checking_incoming(snapshot.node, cx);
+        let checking = self.gate_checking(snapshot.node, cx);
         let changing = implementing || self.protocol_running(snapshot.node, ProtocolKind::Fix);
         let mut gate_offered = next.is_some();
         match snapshot.lifecycle.as_str() {
@@ -324,8 +334,7 @@ impl ConversationView {
         let task_id = snapshot.node.to_string();
         let empty = GateCheckState::default();
         let gate = self.lifecycle.read(cx).state(&task_id).unwrap_or(&empty);
-        let checking = self.protocol_running(snapshot.node, ProtocolKind::GateCheck)
-            || self.checking_incoming(snapshot.node, cx);
+        let checking = self.gate_checking(snapshot.node, cx);
         // A gate check recorded earlier says nothing once the work has moved
         // on: after a fix that reopened verification, a verification that
         // failed steps, or a review with open findings, its verdict — pass or
@@ -448,9 +457,7 @@ impl ConversationView {
             // the data root, and needs no worktree.
             GATE_CHECK => self.check_gate(node, window, cx),
             ADVANCE => {
-                if self.protocol_running(node, ProtocolKind::GateCheck)
-                    || self.checking_incoming(node, cx)
-                {
+                if self.gate_checking(node, cx) {
                     return;
                 }
                 let entered = lifecycle.update(cx, |c, cx| c.advance_after_criteria(&task_id, cx));
@@ -490,15 +497,53 @@ impl ConversationView {
             cx.notify();
             return;
         }
-        match settle_derived_criteria(&self.fleet, node) {
-            Ok(false) => {
-                let task_id = node.to_string();
-                self.lifecycle
-                    .update(cx, |c, cx| c.reload_criteria(&task_id, cx));
-            }
+        if self.settling_gate.contains(&node) {
+            return;
+        }
+        // Answering the criteria reads the pull request from GitHub (through
+        // the OS keyring's token), may give the node a branch, and waits on
+        // the writer, so it runs on the background executor; meanwhile the
+        // check shows as started here and in the lifecycle panel.
+        self.settling_gate.push(node);
+        let task_id = node.to_string();
+        self.lifecycle.update(cx, |c, cx| {
+            c.report_before_gate(&task_id, Some(SETTLING.to_string()), None, cx)
+        });
+        cx.notify();
+        let fleet = self.fleet.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let settled = cx
+                .background_executor()
+                .spawn(async move { settle_derived_criteria(&fleet, node) })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.settled_gate(node, settled, window, cx)
+            });
+        })
+        .detach();
+    }
+
+    /// The criteria the app answers are settled: show them, or hand what is
+    /// left to a gate-check conversation.
+    fn settled_gate(
+        &mut self,
+        node: Uuid,
+        settled: anyhow::Result<bool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settling_gate.retain(|n| *n != node);
+        let task_id = node.to_string();
+        self.lifecycle
+            .update(cx, |c, cx| c.report_before_gate(&task_id, None, None, cx));
+        match settled {
+            Ok(false) => self
+                .lifecycle
+                .update(cx, |c, cx| c.reload_criteria(&task_id, cx)),
             Ok(true) => self.run(Focus::Node(node), ProtocolKind::GateCheck, window, cx),
             Err(err) => self.error = Some(format!("{err:#}").into()),
         }
+        cx.notify();
     }
 
     /// Run `protocol` on `node` in a new conversation (see
