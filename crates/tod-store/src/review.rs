@@ -243,6 +243,27 @@ impl<'a> ReviewRepo<'a> {
         Ok(rows)
     }
 
+    /// Open findings across every node in `node_ids`, oldest first, in one
+    /// query — for a list view over many nodes at once (e.g.
+    /// `tod_core::attention`).
+    pub fn list_open_for_nodes(&self, node_ids: &[Uuid]) -> Result<Vec<ReviewFinding>> {
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = node_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT {COLUMNS} FROM review_findings
+             WHERE status = 'open' AND node_id IN ({placeholders})
+             ORDER BY created_at"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<Vec<u8>> = node_ids.iter().copied().map(uuid_to_blob).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// A finding from its full id or the 8-character prefix listings show.
     pub fn resolve(&self, raw: &str) -> Result<Uuid> {
         let raw = raw.trim();
