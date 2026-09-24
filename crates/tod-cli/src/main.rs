@@ -10,6 +10,7 @@
 
 mod args;
 mod capabilities;
+mod decisions;
 mod help;
 mod changeset;
 mod doc_sync;
@@ -59,6 +60,7 @@ NOUNS:
     incoming               Changes a node inherits, and the verdict that resolves them
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
+    decisions              What the user answers: ask, list, show
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
 `tod-cli help <WORDS>` to find the commands that mention them
@@ -84,6 +86,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("incoming", crate::incoming::USAGE),
     ("learn", crate::learn::USAGE),
     ("secrets", crate::secrets::USAGE),
+    ("decisions", crate::decisions::USAGE),
 ];
 
 fn main() -> ExitCode {
@@ -203,8 +206,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "incoming" => incoming::run(invocation),
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
+        "decisions" => decisions::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions)"
         ),
     }
 }
@@ -788,6 +792,52 @@ Second."), "{listed}");
             .unwrap(),
             "ok"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn decisions_round_trip_ask_list_and_show() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+
+        assert_eq!(
+            cli(&root, &["decisions", "list", "--node", &node]).unwrap(),
+            "(no pending decisions)"
+        );
+
+        let err = cli(&root, &["decisions", "ask", "--node", &node, "Round how?"]).unwrap_err();
+        assert!(err.to_string().contains("--option"), "{err}");
+
+        let asked = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Round per line or per invoice?",
+                "--option", "per line", "--option", "per invoice",
+                "--evidence", &format!("node:{node}"),
+            ],
+        )
+        .unwrap();
+        let short = asked.strip_prefix("ok ").expect("one-line ack").to_string();
+        assert_eq!(short.len(), 8);
+
+        let listed = cli(&root, &["decisions", "list", "--node", &node]).unwrap();
+        assert!(listed.contains("pending Round per line or per invoice?"), "{listed}");
+        assert!(listed.contains("1. per line | 2. per invoice"), "{listed}");
+
+        let shown = cli(&root, &["decisions", "show", &short]).unwrap();
+        assert!(shown.contains("(no answers yet)"), "{shown}");
+
+        // Bad evidence kind is refused before anything is recorded.
+        let err = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Bad evidence?",
+                "--option", "a", "--evidence", "spaceship:not-a-real-id",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("evidence kind"), "{err}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

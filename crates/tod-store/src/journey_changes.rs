@@ -30,6 +30,12 @@
 //! - `review_findings` (`tod_store::review`)
 //! - `node_subtree_archives` (insert-only; `root_node_id` stands in for
 //!   `node_id`)
+//! - `decisions` (`tod_store::decisions`) and `decision_answers`
+//!   (insert-only; joins to `decisions` for its `node_id`, since a decision
+//!   never moves nodes). Both tables were added after the schema epoch
+//!   `create_triggers_sql` above is seeded at, so their triggers are created
+//!   by [`decisions_triggers_sql`] instead, run by the same migration step
+//!   that creates the tables.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -234,6 +240,24 @@ pub fn create_triggers_sql() -> String {
         "
     ));
 
+    sql
+}
+
+/// Triggers for `decisions` (simple `(id, node_id)` shape, can be updated —
+/// answering flips `status`) and `decision_answers` (insert-only, append-only
+/// by design, keyed by `decision_id` rather than `node_id`; the trigger joins
+/// to `decisions` to find the node).
+pub fn decisions_triggers_sql() -> String {
+    let mut sql = simple_id_triggers("decisions");
+    sql.push_str(&format!(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_journey_decision_answers_insert AFTER INSERT ON decision_answers BEGIN
+            INSERT INTO journey_changes (node_id, tbl, row_id, op, at)
+            SELECT decisions.node_id, 'decision_answers', CAST(NEW.id AS TEXT), 'insert', {NOW}
+            FROM decisions WHERE decisions.id = NEW.decision_id;
+        END;
+        "
+    ));
     sql
 }
 
