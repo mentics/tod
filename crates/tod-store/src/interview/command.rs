@@ -221,6 +221,17 @@ pub enum InterviewCommand {
         protocol: Option<String>,
         decision: crate::decisions::NewDecision,
     },
+    /// Record the user's answer to a pending decision (`crate::decisions`):
+    /// append-only, so a change of mind is a new answer row, never an
+    /// update. Not offered by `tod-cli`: answering is the user's, from the
+    /// decisions panel, which runs this through `AgentRuns::answer_decision`.
+    AnswerDecision {
+        decision_id: Uuid,
+        #[serde(default)]
+        option: Option<i64>,
+        #[serde(default)]
+        text: Option<String>,
+    },
     /// Record an open code review finding on a node (`crate::review`).
     AddReviewFinding {
         node_id: Uuid,
@@ -888,6 +899,19 @@ pub fn execute(
                 decision,
             )?;
             Ok(json!({ "id": decision.id.to_string() }))
+        }
+        InterviewCommand::AnswerDecision {
+            decision_id,
+            option,
+            text,
+        } => {
+            let answer = crate::decisions::DecisionRepo::new(conn).answer(
+                *decision_id,
+                *option,
+                text.as_deref(),
+                author,
+            )?;
+            Ok(json!({ "id": answer.id }))
         }
         InterviewCommand::AddReviewFinding {
             node_id,

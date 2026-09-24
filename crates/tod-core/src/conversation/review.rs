@@ -175,6 +175,9 @@ impl Protocol for ReviewProtocol {
     /// Done when this turn recorded the review finished. Otherwise another
     /// turn goes out, until the cap or a turn that recorded nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
+        if let Some(done) = super::protocol::hand_back_for_pending_decision(turn)? {
+            return Ok(done);
+        }
         if turn.report.is_some_and(is_done_report) {
             return Ok(Next::Done(Stop::Complete));
         }
