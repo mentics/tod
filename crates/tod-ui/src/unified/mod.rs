@@ -7,31 +7,104 @@
 //! wires both into a GPUI view root, hosts `TaskListView` in column 1, and
 //! registers the view's keys.
 
+mod chat_drawer;
 mod columns;
 mod panel;
-mod panels;
+pub mod panels;
+pub mod status_label;
 
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
+use chat_drawer::ChatDrawer;
 use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenRequest, PlaceholderPanel};
 use panels::DetailsPanel;
 
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, Styled, Subscription, Window,
-    actions, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement,
+    Render, SharedString, Styled, Subscription, Window, actions, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
+use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::interview::TodPaths;
+use crate::interview::agent::SharedAgent;
+use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::views::task_list::{TaskListEvent, TaskListView};
+
+/// One column-2+ panel entity. Every kind but `Details` and `Decisions`
+/// (still `PlaceholderPanel`, W5's and W9's respectively) is the real panel
+/// W7 adds; each hosts an existing view embedded, as
+/// `conversation/context_panel.rs` already does.
+enum HostedPanel {
+    Placeholder(Entity<PlaceholderPanel>),
+    Details(Entity<DetailsPanel>),
+    Obligations(Entity<panels::obligations::ObligationsPanel>),
+    Plan(Entity<panels::plan::PlanPanel>),
+    Findings(Entity<panels::findings::FindingsPanel>),
+    Settings(Entity<panels::settings::SettingsPanel>),
+    Transcript(Entity<panels::transcript::TranscriptPanel>),
+}
+
+impl HostedPanel {
+    fn title(&self, cx: &App) -> SharedString {
+        match self {
+            Self::Placeholder(e) => e.read(cx).title(cx),
+            Self::Details(e) => e.read(cx).title(cx),
+            Self::Obligations(e) => e.read(cx).title(cx),
+            Self::Plan(e) => e.read(cx).title(cx),
+            Self::Findings(e) => e.read(cx).title(cx),
+            Self::Settings(e) => e.read(cx).title(cx),
+            Self::Transcript(e) => e.read(cx).title(cx),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Placeholder(e) => e.read(cx).focus_handle(cx),
+            Self::Details(e) => e.read(cx).focus_handle(cx),
+            Self::Obligations(e) => e.read(cx).focus_handle(cx),
+            Self::Plan(e) => e.read(cx).focus_handle(cx),
+            Self::Findings(e) => e.read(cx).focus_handle(cx),
+            Self::Settings(e) => e.read(cx).focus_handle(cx),
+            Self::Transcript(e) => e.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Placeholder(e) => e.entity_id(),
+            Self::Details(e) => e.entity_id(),
+            Self::Obligations(e) => e.entity_id(),
+            Self::Plan(e) => e.entity_id(),
+            Self::Findings(e) => e.entity_id(),
+            Self::Settings(e) => e.entity_id(),
+            Self::Transcript(e) => e.entity_id(),
+        }
+    }
+
+    fn render(&self) -> AnyElement {
+        match self {
+            Self::Placeholder(e) => e.clone().into_any_element(),
+            Self::Details(e) => e.clone().into_any_element(),
+            Self::Obligations(e) => e.clone().into_any_element(),
+            Self::Plan(e) => e.clone().into_any_element(),
+            Self::Findings(e) => e.clone().into_any_element(),
+            Self::Settings(e) => e.clone().into_any_element(),
+            Self::Transcript(e) => e.clone().into_any_element(),
+        }
+    }
+}
+pub use chat_drawer::register_chat_drawer_keyboard_bindings;
 
 actions!(unified, [UnifiedTogglePinFocused]);
 
@@ -42,6 +115,7 @@ pub const UNIFIED_CONTEXT: &str = "Unified";
 /// alongside every other `register_*_keyboard_bindings`.
 pub fn register_unified_keyboard_bindings(cx: &mut App) {
     bind_pane_nav(cx, UNIFIED_CONTEXT);
+    panels::details::register_details_panel_keyboard_bindings(cx);
     let context = Some(key_context::excluding_input(UNIFIED_CONTEXT));
     cx.bind_keys([KeyBinding::new("alt-w", UnifiedTogglePinFocused, context)]);
     let panel_context = Some(key_context::excluding_input(panel::UNIFIED_PANEL_CONTEXT));
@@ -49,76 +123,89 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", PanelActivateFocusedLink, panel_context),
         KeyBinding::new("ctrl-enter", PanelCtrlActivateFocusedLink, panel_context),
     ]);
-    panels::details::register_details_panel_keyboard_bindings(cx);
-}
-
-/// A column-2+ slot's panel: `PlaceholderPanel` for every kind not yet given
-/// a real implementation, replaced kind by kind (W5, W7, W9).
-#[derive(Clone)]
-enum HostedPanel {
-    Placeholder(Entity<PlaceholderPanel>),
-    Details(Entity<DetailsPanel>),
-}
-
-impl HostedPanel {
-    fn title(&self, cx: &App) -> gpui::SharedString {
-        match self {
-            HostedPanel::Placeholder(panel) => panel.read(cx).title(cx),
-            HostedPanel::Details(panel) => panel.read(cx).title(cx),
-        }
-    }
-
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match self {
-            HostedPanel::Placeholder(panel) => panel.read(cx).focus_handle(cx),
-            HostedPanel::Details(panel) => panel.read(cx).focus_handle(cx),
-        }
-    }
-
-    fn into_any_element(self) -> gpui::AnyElement {
-        match self {
-            HostedPanel::Placeholder(panel) => panel.into_any_element(),
-            HostedPanel::Details(panel) => panel.into_any_element(),
-        }
-    }
+    register_chat_drawer_keyboard_bindings(cx);
 }
 
 /// A column-2+ slot: the model's bookkeeping plus the panel entity backing
-/// it and the subscription that carries its open requests up to the root.
+/// it and the subscription (where the panel kind emits one) that carries its
+/// open requests up to the root.
 struct HostedColumn {
     panel: HostedPanel,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
+    paths: TodPaths,
+    agent_runs: Entity<AgentRuns>,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
+    /// The bottom-of-window chat drawer (W8): a freeform conversation about
+    /// whichever node is currently in focus. Never shown for the tree
+    /// itself; see `chat_drawer`.
+    chat_drawer: Entity<ChatDrawer>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     _task_list_subscription: Subscription,
+    _agent_runs_subscription: Subscription,
 }
 
 impl UnifiedView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fleet: Arc<FleetStore>,
+        paths: TodPaths,
+        agent: SharedAgent,
+        agent_runs: Entity<AgentRuns>,
+    ) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
-        let _task_list_subscription = cx.subscribe_in(
-            &task_list,
-            window,
-            |this, _, event: &TaskListEvent, window, cx| {
+        let _task_list_subscription =
+            cx.subscribe_in(&task_list, window, |this, _, event: &TaskListEvent, window, cx| {
                 this.on_task_list_event(event, window, cx);
-            },
-        );
-        Self {
+            });
+        let chat_drawer = cx.new(|cx| {
+            ChatDrawer::new(window, cx, fleet.clone(), agent, agent_runs.clone())
+        });
+        let _agent_runs_subscription = cx.observe(&agent_runs, |this, _, cx| {
+            this.apply_status_overrides(cx);
+        });
+        let mut this = Self {
             fleet,
+            paths,
+            agent_runs,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
+            chat_drawer,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             _task_list_subscription,
-        }
+            _agent_runs_subscription,
+        };
+        this.apply_status_overrides(cx);
+        this
+    }
+
+    /// Recomputes every running node's status label (W11) from
+    /// [`AgentRuns`] and hands the map to `TaskListView` in one call — never
+    /// per row per frame, since `AgentRuns::running_status_labels` reads
+    /// each running slot's conversation row.
+    fn apply_status_overrides(&mut self, cx: &mut Context<Self>) {
+        let fleet = self.fleet.clone();
+        let map = self.agent_runs.read(cx).running_status_labels(|node| {
+            fleet
+                .get_node(&node.to_string())
+                .ok()
+                .flatten()
+                .map(|task| task.lifecycle)
+        });
+        let map: std::collections::HashMap<String, String> =
+            map.into_iter().map(|(id, label)| (id.to_string(), label)).collect();
+        self.task_list.update(cx, |task_list, cx| {
+            task_list.set_status_overrides(map, cx);
+        });
     }
 
     fn on_task_list_event(
@@ -137,6 +224,142 @@ impl UnifiedView {
         }
     }
 
+    /// Build the panel entity for `target`, and its subscription when its
+    /// kind can emit [`PanelOpenRequest`] (`Findings` today; every other
+    /// real panel has no links of its own yet).
+    fn construct_hosted(
+        &self,
+        target: PanelKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> HostedColumn {
+        match target {
+            PanelKind::Details(node_id) => {
+                let panel = cx.new(|cx| {
+                    DetailsPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), window, cx)
+                });
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Details(panel),
+                    _subscription: Some(subscription),
+                }
+            }
+            PanelKind::Decisions => {
+                let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Placeholder(panel),
+                    _subscription: Some(subscription),
+                }
+            }
+            PanelKind::Obligations(id) => {
+                let panel = cx.new(|cx| {
+                    panels::obligations::ObligationsPanel::new(id, self.fleet.clone(), window, cx)
+                });
+                HostedColumn {
+                    panel: HostedPanel::Obligations(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Plan(id) => {
+                let panel =
+                    cx.new(|cx| panels::plan::PlanPanel::new(id, self.fleet.clone(), window, cx));
+                HostedColumn {
+                    panel: HostedPanel::Plan(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Findings(id) => {
+                let panel = cx
+                    .new(|cx| panels::findings::FindingsPanel::new(id, self.fleet.clone(), window, cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Findings(panel),
+                    _subscription: Some(subscription),
+                }
+            }
+            PanelKind::Settings(id) => {
+                let panel = cx.new(|cx| {
+                    panels::settings::SettingsPanel::new(
+                        id,
+                        self.fleet.clone(),
+                        self.paths.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                HostedColumn {
+                    panel: HostedPanel::Settings(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Transcript(id) => {
+                let panel = cx
+                    .new(|cx| panels::transcript::TranscriptPanel::new(id, self.fleet.clone(), window, cx));
+                HostedColumn {
+                    panel: HostedPanel::Transcript(panel),
+                    _subscription: None,
+                }
+            }
+        }
+    }
+
+    /// A hosted panel's own `PanelOpenRequest`: open it from the column that
+    /// emitted it, by entity id (a column's index can move under it as
+    /// others close).
+    fn route_open_request(
+        &mut self,
+        panel_id: EntityId,
+        event: &PanelOpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(col) = self
+            .hosted
+            .iter()
+            .position(|h| h.panel.entity_id() == panel_id)
+        else {
+            return;
+        };
+        self.open_panel(event.target, col, event.ctrl, window, cx);
+    }
+
+    /// The unified view's current focus for the chat drawer (W8): the
+    /// focused column's target node, else the node tree's selection, else
+    /// the whole project.
+    fn chat_focus(&self, cx: &App) -> Focus {
+        if let Some(ix) = self.columns.focused_index()
+            && let Some(column) = self.columns.columns().get(ix)
+            && let Some(node) = column.panel.node()
+        {
+            return Focus::Node(node);
+        }
+        match self.task_list.read(cx).selected_node_id() {
+            Some(id) => Focus::Node(id),
+            None => Focus::Project,
+        }
+    }
+
+    /// Ctrl+J toggles the chat drawer here instead of opening the old
+    /// conversation view: captured before the tree's own `OpenAgentChat`
+    /// handler can consume it.
+    fn on_open_agent_chat(&mut self, _: &OpenAgentChat, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_drawer.update(cx, |drawer, cx| drawer.toggle(window, cx));
+        cx.stop_propagation();
+    }
+
     /// Apply the column-placement rule and keep `hosted` in sync with the
     /// resulting `columns` model.
     fn open_panel(
@@ -150,88 +373,21 @@ impl UnifiedView {
         let before = self.columns.len();
         let ix = self.columns.open(target, from_column, ctrl);
         if ix < before {
-            // An existing column was replaced or retargeted in place.
-            let retarget_details = match (&self.hosted[ix].panel, target) {
-                (HostedPanel::Details(panel), PanelKind::Details(node_id)) => {
-                    Some((panel.clone(), node_id))
-                }
-                _ => None,
-            };
-            if let Some((panel, node_id)) = retarget_details {
-                panel.update(cx, |panel, cx| {
-                    panel.set_node(node_id, window, cx);
-                });
-            } else if !matches!(target, PanelKind::Details(_))
-                && matches!(self.hosted[ix].panel, HostedPanel::Placeholder(_))
+            // Details keeps its entity (and any unsaved edit state) when it
+            // is only retargeted to another node.
+            if let (HostedPanel::Details(panel), PanelKind::Details(node_id)) =
+                (&self.hosted[ix].panel, target)
             {
-                let HostedPanel::Placeholder(panel) = self.hosted[ix].panel.clone() else {
-                    unreachable!()
-                };
-                panel.update(cx, |panel, cx| {
-                    panel.set_kind(target, cx);
-                });
+                let panel = panel.clone();
+                panel.update(cx, |panel, cx| panel.set_node(node_id, window, cx));
             } else {
-                // Retargeting across a placeholder/real-panel boundary:
-                // replace the hosted panel outright.
-                self.hosted[ix] = self.build_hosted_column(target, window, cx);
+                self.hosted[ix] = self.construct_hosted(target, window, cx);
             }
         } else {
-            let hosted = self.build_hosted_column(target, window, cx);
+            let hosted = self.construct_hosted(target, window, cx);
             self.hosted.push(hosted);
         }
         cx.notify();
-    }
-
-    fn build_hosted_column(
-        &self,
-        target: PanelKind,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> HostedColumn {
-        match target {
-            PanelKind::Details(node_id) => {
-                let panel = cx.new(|cx| DetailsPanel::new(node_id, self.fleet.clone(), window, cx));
-                let panel_id = panel.entity_id();
-                let subscription = cx.subscribe_in(
-                    &panel,
-                    window,
-                    move |this, _, event: &PanelOpenRequest, window, cx| {
-                        let Some(col) = this.hosted.iter().position(|h| match &h.panel {
-                            HostedPanel::Details(p) => p.entity_id() == panel_id,
-                            HostedPanel::Placeholder(_) => false,
-                        }) else {
-                            return;
-                        };
-                        this.open_panel(event.target, col, event.ctrl, window, cx);
-                    },
-                );
-                HostedColumn {
-                    panel: HostedPanel::Details(panel),
-                    _subscription: subscription,
-                }
-            }
-            _ => {
-                let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
-                let panel_id = panel.entity_id();
-                let subscription = cx.subscribe_in(
-                    &panel,
-                    window,
-                    move |this, _, event: &PanelOpenRequest, window, cx| {
-                        let Some(col) = this.hosted.iter().position(|h| match &h.panel {
-                            HostedPanel::Placeholder(p) => p.entity_id() == panel_id,
-                            HostedPanel::Details(_) => false,
-                        }) else {
-                            return;
-                        };
-                        this.open_panel(event.target, col, event.ctrl, window, cx);
-                    },
-                );
-                HostedColumn {
-                    panel: HostedPanel::Placeholder(panel),
-                    _subscription: subscription,
-                }
-            }
-        }
     }
 
     fn close_column(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -367,7 +523,7 @@ impl UnifiedView {
                 .into_any_element();
         }
         let header = self.render_column_header(index, cx);
-        let panel = self.hosted[index].panel.clone().into_any_element();
+        let panel = self.hosted[index].panel.render();
         div()
             .id(("unified-col", index))
             .flex()
@@ -404,8 +560,15 @@ impl HasAppNav for UnifiedView {
     }
 }
 
+/// The node tree column's fixed width, shared by the top row and the bottom
+/// row's spacer so the chat drawer lines up under columns 2+ only.
+const TREE_COLUMN_WIDTH: f32 = 280.;
+
 impl Render for UnifiedView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.chat_focus(cx);
+        self.chat_drawer.update(cx, |drawer, cx| drawer.set_focus(focus, cx));
+
         let border = cx.theme().border;
         let visible_slots = DEFAULT_VISIBLE_COLUMNS;
         let folded = self.columns.folded(visible_slots);
@@ -417,21 +580,37 @@ impl Render for UnifiedView {
             .id("unified-view")
             .key_context(UNIFIED_CONTEXT)
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::toggle_pin_focused))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .size_full()
             .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(TREE_COLUMN_WIDTH))
+                            .h_full()
+                            .border_r_1()
+                            .border_color(border)
+                            .child(self.task_list.clone()),
+                    )
+                    .children(column_elements),
+            )
             .child(
                 div()
                     .flex_shrink_0()
-                    .w(px(280.))
-                    .h_full()
-                    .border_r_1()
-                    .border_color(border)
-                    .child(self.task_list.clone()),
+                    .w_full()
+                    .flex()
+                    .child(div().flex_shrink_0().w(px(TREE_COLUMN_WIDTH)))
+                    .child(div().flex_1().min_w(px(220.)).child(self.chat_drawer.clone())),
             )
-            .children(column_elements)
     }
 }
 
@@ -455,11 +634,16 @@ mod tests {
             std::env::temp_dir().join(format!("tod-unified-config-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
         crate::interview::set_data_root(config_root);
+        let paths = crate::interview::TodPaths::discover().unwrap();
         let slot = Rc::new(RefCell::new(None));
         let store = fixture.store.clone();
+        let agent: crate::interview::agent::SharedAgent = std::sync::Arc::new(std::sync::Mutex::new(
+            Box::new(tod_agent::MockAgentProvider::new()),
+        ));
+        let agent_runs_for_test = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| UnifiedView::new(window, cx, store));
+            let view = cx.new(|cx| UnifiedView::new(window, cx, store, paths, agent, agent_runs_for_test));
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -545,6 +729,42 @@ mod tests {
                 view.columns.columns()[1].panel,
                 PanelKind::Obligations(node_id)
             );
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_j_toggles_the_chat_drawer_without_reaching_the_tree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+
+        view.read_with(cx, |view, cx| {
+            assert!(!view.chat_drawer.read(cx).expanded());
+        });
+        cx.dispatch_action(crate::ui::agent_chat::OpenAgentChat);
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.chat_drawer.read(cx).expanded());
+        });
+        cx.dispatch_action(crate::ui::agent_chat::OpenAgentChat);
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.chat_drawer.read(cx).expanded());
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_a_node_points_the_chat_drawer_at_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.chat_drawer.read(cx).focus(), Focus::Node(node_id));
         });
     }
 }

@@ -63,6 +63,13 @@ pub struct TaskItem {
     /// When this node started waiting on the user, for "waiting longest"
     /// sort. `None` when `needs_you_count` is zero.
     pub waiting_since: Option<DateTime<Utc>>,
+    /// The unified view's status label for this node (`unified::status_label`,
+    /// e.g. `"verifying"` / `"verifying →"` / `"→ verifying"`), fed by the
+    /// host via `TaskListView::set_status_overrides`; `None` in the existing
+    /// Tasks view, which never calls it. Precomputed there (not read live
+    /// per row) since building it touches `AgentRuns::runs_for_node`, a
+    /// `fleet.read`.
+    pub status_override: Option<String>,
 }
 
 impl TaskItem {
@@ -637,6 +644,7 @@ mod tests {
             accept_ready: false,
             needs_you_count: 0,
             waiting_since: None,
+            status_override: None,
         }
     }
 

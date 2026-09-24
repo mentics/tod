@@ -351,6 +351,9 @@ pub struct TaskListView {
     /// the next render, which is when a `Window` is available (mirrors
     /// `pending_live_refresh`).
     pending_attention_apply: bool,
+    /// `set_status_overrides` changed `all_tasks` and needs a rebuild;
+    /// applied the same way `pending_attention_apply` is.
+    pending_status_override_apply: bool,
 }
 
 impl TaskListView {
@@ -507,6 +510,7 @@ impl TaskListView {
             _incoming_check_subscription: None,
             attention: std::collections::HashMap::new(),
             pending_attention_apply: false,
+            pending_status_override_apply: false,
         };
 
         cx.defer_in(window, move |this, window, cx| {
@@ -2611,6 +2615,31 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// The unified view (W11) reports each node's status label, keyed by
+    /// node id, computed once from `AgentRuns` whenever it notifies —
+    /// never read per row per frame, since building it touches
+    /// `AgentRuns::runs_for_node` (a `fleet.read`). Nodes not present in
+    /// `map` are cleared to `None`. The existing Tasks view never calls
+    /// this, so `status_override` stays `None` there and no chip renders.
+    pub fn set_status_overrides(
+        &mut self,
+        map: std::collections::HashMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for task in self.all_tasks.iter_mut() {
+            let next = map.get(&task.id).cloned();
+            if task.status_override != next {
+                task.status_override = next;
+                changed = true;
+            }
+        }
+        if changed {
+            self.pending_status_override_apply = true;
+        }
+        cx.notify();
+    }
+
     /// Records toggling a "Needs you" / "Running" tree filter chip as a
     /// journey `UserAction`, on the project (the toggle isn't about one node).
     fn record_quick_filter_toggle(&self, chip: &str, on: bool, cx: &mut Context<Self>) {
@@ -3280,6 +3309,10 @@ impl Render for TaskListView {
         }
         if self.pending_attention_apply {
             self.pending_attention_apply = false;
+            self.rebuild_visible_list(window, cx);
+        }
+        if self.pending_status_override_apply {
+            self.pending_status_override_apply = false;
             self.rebuild_visible_list(window, cx);
         }
         self.apply_pending_revert(window, cx);

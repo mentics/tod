@@ -29,6 +29,7 @@ use crate::views::plan_steps::register_plan_steps_keyboard_bindings;
 use crate::views::task_edit::register_task_edit_keyboard_bindings;
 use crate::views::task_list::register_task_list_keyboard_bindings;
 use crate::views::visual_design_panel::register_visual_design_panel_keyboard_bindings;
+use crate::unified::panels::findings::register_findings_keyboard_bindings;
 use crate::unified::register_unified_keyboard_bindings;
 use gpui::*;
 
@@ -55,6 +56,7 @@ pub fn register_main_keyboard_bindings(cx: &mut gpui::App) {
     register_interactive_agent_keyboard_bindings(cx);
     register_visual_design_panel_keyboard_bindings(cx);
     register_unified_keyboard_bindings(cx);
+    register_findings_keyboard_bindings(cx);
     window::register_shell_keyboard_bindings(cx);
     register_app_journey_keystrokes(cx);
 }
