@@ -39,6 +39,8 @@ pub fn load_working_set(config_dir: &Path) -> ListWorkingSet {
         selected_id: persisted.selected_id,
         active_list_id: persisted.active_list_id,
         pending_changes_only: false,
+        needs_you_only: false,
+        running_only: false,
         generator_sorts: persisted
             .generator_sorts
             .into_iter()
@@ -98,6 +100,7 @@ fn sort_key_name(key: SortKey) -> &'static str {
         SortKey::Title => "title",
         SortKey::Lifecycle => "lifecycle",
         SortKey::TicketId => "ticket",
+        SortKey::WaitingLongest => "waiting_longest",
     }
 }
 
@@ -107,6 +110,7 @@ fn parse_sort_key(s: &str) -> SortKey {
         "lifecycle" => SortKey::Lifecycle,
         "ticket" => SortKey::TicketId,
         "tree" => SortKey::TreeOrder,
+        "waiting_longest" => SortKey::WaitingLongest,
         _ => SortKey::TreeOrder,
     }
 }
