@@ -16,7 +16,10 @@ pub enum PanelKind {
     Decisions,
     Obligations(uuid::Uuid),
     Plan(uuid::Uuid),
+    Findings(uuid::Uuid),
     Settings(uuid::Uuid),
+    /// A single conversation's transcript; the id is the conversation's, not
+    /// a node's.
     Transcript(uuid::Uuid),
 }
 

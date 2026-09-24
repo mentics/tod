@@ -1891,7 +1891,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
-                        let unified = cx.new(|cx| UnifiedView::new(window, cx, fleet.clone()));
+                        let unified =
+                            cx.new(|cx| UnifiedView::new(window, cx, fleet.clone(), paths.clone()));
                         let view = cx.new(|cx| {
                             let _task_list_subscription =
                                 cx.subscribe(&task_list, |this: &mut Shell, _, event, cx| {

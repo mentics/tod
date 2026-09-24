@@ -9,6 +9,7 @@
 
 mod columns;
 mod panel;
+pub mod panels;
 
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
@@ -17,19 +18,79 @@ use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenReq
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, Styled, Subscription, Window,
-    actions, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement,
+    Render, SharedString, Styled, Subscription, Window, actions, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::interview::TodPaths;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::views::task_list::{TaskListEvent, TaskListView};
+
+/// One column-2+ panel entity. Every kind but `Details` and `Decisions`
+/// (still `PlaceholderPanel`, W5's and W9's respectively) is the real panel
+/// W7 adds; each hosts an existing view embedded, as
+/// `conversation/context_panel.rs` already does.
+enum HostedPanel {
+    Placeholder(Entity<PlaceholderPanel>),
+    Obligations(Entity<panels::obligations::ObligationsPanel>),
+    Plan(Entity<panels::plan::PlanPanel>),
+    Findings(Entity<panels::findings::FindingsPanel>),
+    Settings(Entity<panels::settings::SettingsPanel>),
+    Transcript(Entity<panels::transcript::TranscriptPanel>),
+}
+
+impl HostedPanel {
+    fn title(&self, cx: &App) -> SharedString {
+        match self {
+            Self::Placeholder(e) => e.read(cx).title(cx),
+            Self::Obligations(e) => e.read(cx).title(cx),
+            Self::Plan(e) => e.read(cx).title(cx),
+            Self::Findings(e) => e.read(cx).title(cx),
+            Self::Settings(e) => e.read(cx).title(cx),
+            Self::Transcript(e) => e.read(cx).title(cx),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Placeholder(e) => e.read(cx).focus_handle(cx),
+            Self::Obligations(e) => e.read(cx).focus_handle(cx),
+            Self::Plan(e) => e.read(cx).focus_handle(cx),
+            Self::Findings(e) => e.read(cx).focus_handle(cx),
+            Self::Settings(e) => e.read(cx).focus_handle(cx),
+            Self::Transcript(e) => e.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn entity_id(&self) -> EntityId {
+        match self {
+            Self::Placeholder(e) => e.entity_id(),
+            Self::Obligations(e) => e.entity_id(),
+            Self::Plan(e) => e.entity_id(),
+            Self::Findings(e) => e.entity_id(),
+            Self::Settings(e) => e.entity_id(),
+            Self::Transcript(e) => e.entity_id(),
+        }
+    }
+
+    fn render(&self) -> AnyElement {
+        match self {
+            Self::Placeholder(e) => e.clone().into_any_element(),
+            Self::Obligations(e) => e.clone().into_any_element(),
+            Self::Plan(e) => e.clone().into_any_element(),
+            Self::Findings(e) => e.clone().into_any_element(),
+            Self::Settings(e) => e.clone().into_any_element(),
+            Self::Transcript(e) => e.clone().into_any_element(),
+        }
+    }
+}
 
 actions!(unified, [UnifiedTogglePinFocused]);
 
@@ -49,16 +110,17 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
     ]);
 }
 
-/// A column-2+ slot: the model's bookkeeping plus the placeholder panel
-/// entity backing it and the subscription that carries its open requests up
-/// to the root.
+/// A column-2+ slot: the model's bookkeeping plus the panel entity backing
+/// it and the subscription (where the panel kind emits one) that carries its
+/// open requests up to the root.
 struct HostedColumn {
-    panel: Entity<PlaceholderPanel>,
-    _subscription: Subscription,
+    panel: HostedPanel,
+    _subscription: Option<Subscription>,
 }
 
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
+    paths: TodPaths,
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
@@ -68,14 +130,20 @@ pub struct UnifiedView {
 }
 
 impl UnifiedView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fleet: Arc<FleetStore>,
+        paths: TodPaths,
+    ) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
         let _task_list_subscription =
-            cx.subscribe(&task_list, |this, _, event: &TaskListEvent, cx| {
-                this.on_task_list_event(event, cx);
+            cx.subscribe_in(&task_list, window, |this, _, event: &TaskListEvent, window, cx| {
+                this.on_task_list_event(event, window, cx);
             });
         Self {
             fleet,
+            paths,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
@@ -85,44 +153,137 @@ impl UnifiedView {
         }
     }
 
-    fn on_task_list_event(&mut self, event: &TaskListEvent, cx: &mut Context<Self>) {
+    fn on_task_list_event(
+        &mut self,
+        event: &TaskListEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let TaskListEvent::SelectionChanged { task_id } = event {
             if let Some(id) = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
                 // The node tree (column 1) always counts as pinned, so a
                 // selection opens Details in the first unpinned column
                 // starting at column 2 (index 0), as a plain (non-ctrl) open.
-                self.open_panel(PanelKind::Details(id), 0, false, cx);
+                self.open_panel(PanelKind::Details(id), 0, false, window, cx);
             }
         }
     }
 
+    /// Build the panel entity for `target`, and its subscription when its
+    /// kind can emit [`PanelOpenRequest`] (`Findings` today; every other
+    /// real panel has no links of its own yet).
+    fn construct_hosted(
+        &self,
+        target: PanelKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> HostedColumn {
+        match target {
+            PanelKind::Details(_) | PanelKind::Decisions => {
+                let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Placeholder(panel),
+                    _subscription: Some(subscription),
+                }
+            }
+            PanelKind::Obligations(id) => {
+                let panel = cx.new(|cx| {
+                    panels::obligations::ObligationsPanel::new(id, self.fleet.clone(), window, cx)
+                });
+                HostedColumn {
+                    panel: HostedPanel::Obligations(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Plan(id) => {
+                let panel =
+                    cx.new(|cx| panels::plan::PlanPanel::new(id, self.fleet.clone(), window, cx));
+                HostedColumn {
+                    panel: HostedPanel::Plan(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Findings(id) => {
+                let panel = cx
+                    .new(|cx| panels::findings::FindingsPanel::new(id, self.fleet.clone(), window, cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Findings(panel),
+                    _subscription: Some(subscription),
+                }
+            }
+            PanelKind::Settings(id) => {
+                let panel = cx.new(|cx| {
+                    panels::settings::SettingsPanel::new(
+                        id,
+                        self.fleet.clone(),
+                        self.paths.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                HostedColumn {
+                    panel: HostedPanel::Settings(panel),
+                    _subscription: None,
+                }
+            }
+            PanelKind::Transcript(id) => {
+                let panel = cx
+                    .new(|cx| panels::transcript::TranscriptPanel::new(id, self.fleet.clone(), window, cx));
+                HostedColumn {
+                    panel: HostedPanel::Transcript(panel),
+                    _subscription: None,
+                }
+            }
+        }
+    }
+
+    /// A hosted panel's own `PanelOpenRequest`: open it from the column that
+    /// emitted it, by entity id (a column's index can move under it as
+    /// others close).
+    fn route_open_request(
+        &mut self,
+        panel_id: EntityId,
+        event: &PanelOpenRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(col) = self
+            .hosted
+            .iter()
+            .position(|h| h.panel.entity_id() == panel_id)
+        else {
+            return;
+        };
+        self.open_panel(event.target, col, event.ctrl, window, cx);
+    }
+
     /// Apply the column-placement rule and keep `hosted` in sync with the
     /// resulting `columns` model.
-    fn open_panel(&mut self, target: PanelKind, from_column: usize, ctrl: bool, cx: &mut Context<Self>) {
+    fn open_panel(
+        &mut self,
+        target: PanelKind,
+        from_column: usize,
+        ctrl: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.columns.len();
         let ix = self.columns.open(target, from_column, ctrl);
+        let hosted = self.construct_hosted(target, window, cx);
         if ix < before {
-            // An existing column was replaced or retargeted in place.
-            self.hosted[ix].panel.update(cx, |panel, cx| {
-                panel.set_kind(target, cx);
-            });
+            self.hosted[ix] = hosted;
         } else {
-            let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
-            let panel_id = panel.entity_id();
-            let subscription = cx.subscribe(&panel, move |this, _, event: &PanelOpenRequest, cx| {
-                let Some(col) = this
-                    .hosted
-                    .iter()
-                    .position(|h| h.panel.entity_id() == panel_id)
-                else {
-                    return;
-                };
-                this.open_panel(event.target, col, event.ctrl, cx);
-            });
-            self.hosted.push(HostedColumn {
-                panel,
-                _subscription: subscription,
-            });
+            self.hosted.push(hosted);
         }
         cx.notify();
     }
@@ -155,7 +316,7 @@ impl UnifiedView {
         match self.columns.focused_index() {
             Some(ix) => {
                 if let Some(hosted) = self.hosted.get(ix) {
-                    let handle = hosted.panel.read(cx).focus_handle(cx);
+                    let handle = hosted.panel.focus_handle(cx);
                     window.focus(&handle, cx);
                 }
             }
@@ -176,7 +337,7 @@ impl UnifiedView {
         let accent = cx.theme().accent;
         let muted = cx.theme().muted_foreground;
         let hosted = &self.hosted[index];
-        let title = hosted.panel.read(cx).title(cx);
+        let title = hosted.panel.title(cx);
         let pinned = self.columns.is_pinned(index);
         let focused = self.columns.focused_index() == Some(index);
         div()
@@ -260,7 +421,7 @@ impl UnifiedView {
                 .into_any_element();
         }
         let header = self.render_column_header(index, cx);
-        let panel = self.hosted[index].panel.clone();
+        let panel = self.hosted[index].panel.render();
         div()
             .id(("unified-col", index))
             .flex()
@@ -348,11 +509,12 @@ mod tests {
             std::env::temp_dir().join(format!("tod-unified-config-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
         crate::interview::set_data_root(config_root);
+        let paths = crate::interview::TodPaths::discover().unwrap();
         let slot = Rc::new(RefCell::new(None));
         let store = fixture.store.clone();
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| UnifiedView::new(window, cx, store));
+            let view = cx.new(|cx| UnifiedView::new(window, cx, store, paths));
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -373,8 +535,8 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         let node_id = fixture.node_id;
 
-        view.update(cx, |view, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
         });
         draw(cx);
 
@@ -391,11 +553,11 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         let node_id = fixture.node_id;
 
-        view.update(cx, |view, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
             // Opening from column 2 (index 0), non-ctrl: since column 0 is
             // unpinned it is *replaced* — mirrors a click in that column.
-            view.open_panel(PanelKind::Obligations(node_id), 0, true, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 0, true, window, cx);
         });
         draw(cx);
 
@@ -419,11 +581,11 @@ mod tests {
         let node_id = fixture.node_id;
 
         view.update_in(cx, |view, window, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
             view.toggle_pin_focused(&UnifiedTogglePinFocused, window, cx);
             // Clicking column 2 again (now pinned) opens the next panel in a
             // new column instead of replacing it.
-            view.open_panel(PanelKind::Obligations(node_id), 0, false, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 0, false, window, cx);
         });
         draw(cx);
 
