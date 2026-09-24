@@ -2,6 +2,7 @@
 
 pub mod conversation;
 pub mod credentials;
+pub mod decisions;
 pub mod fleet;
 pub mod incoming;
 pub mod install;
