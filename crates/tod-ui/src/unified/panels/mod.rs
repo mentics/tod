@@ -2,6 +2,7 @@
 //! one panel kind at a time (W5, W7, W9). Each module owns one `PanelKind`'s
 //! implementation.
 
+pub mod decisions;
 pub mod details;
 pub mod findings;
 pub mod obligations;

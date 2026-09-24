@@ -23,7 +23,7 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    Styled, Subscription, Window, actions, div, prelude::FluentBuilder,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, div, prelude::FluentBuilder,
 };
 use gpui_component::button::Button;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -55,18 +55,22 @@ pub struct DecisionOptionKey(pub usize);
 actions!(
     unified_decisions_panel,
     [
-        DecisionsFreeformEnterEdit,
+        DecisionsActivate,
+        DecisionsCtrlActivate,
         DecisionsFreeformEscape,
         DecisionsLinkPrev,
         DecisionsLinkNext,
     ]
 );
 
-/// Registers the decisions panel's own keys: digits 1-9 (answer the top
-/// pending decision), and the freeform field's edit-mode Enter/Escape. Call
-/// once alongside `unified::register_unified_keyboard_bindings`. Evidence
-/// links reuse the panel-wide `PanelActivateFocusedLink` /
-/// `PanelCtrlActivateFocusedLink` bindings already registered there.
+/// Registers the decisions panel's own keys: digits 1-9 answer the top
+/// pending decision (`doc/ui/unified-view.md` "Keys"); Up/Down move a
+/// keyboard "stop" across the current decision's evidence links and its
+/// freeform field; Enter activates the stop (opens an evidence link, or
+/// enters freeform edit mode), Ctrl+Enter does the ctrl-click equivalent
+/// (`doc/ui/unified-view.md`: "Evidence links open panels by the column
+/// rule: Enter acts like a click, Ctrl+Enter like a Ctrl+click"). Call once
+/// alongside `unified::register_unified_keyboard_bindings`.
 pub fn register_decisions_panel_keyboard_bindings(cx: &mut App) {
     let outside_input = Some(key_context::excluding_input(UNIFIED_DECISIONS_CONTEXT));
     let with_input = Some(key_context::including_tag(
@@ -82,7 +86,8 @@ pub fn register_decisions_panel_keyboard_bindings(cx: &mut App) {
     });
     cx.bind_keys(digit_bindings);
     cx.bind_keys([
-        KeyBinding::new("enter", DecisionsFreeformEnterEdit, outside_input),
+        KeyBinding::new("enter", DecisionsActivate, outside_input),
+        KeyBinding::new("ctrl-enter", DecisionsCtrlActivate, outside_input),
         KeyBinding::new("escape", DecisionsFreeformEscape, with_input),
         KeyBinding::new("up", DecisionsLinkPrev, outside_input),
         KeyBinding::new("down", DecisionsLinkNext, outside_input),
@@ -354,16 +359,8 @@ impl DecisionsPanel {
         self.answer(decision, Some(option), None, Source::Click, cx);
     }
 
-    fn enter_freeform_edit(
-        &mut self,
-        _: &DecisionsFreeformEnterEdit,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(decision) = self.top_freeform_target() else {
-            return;
-        };
-        self.freeform_editing = Some(decision);
+    fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.freeform_editing = Some(decision_id);
         self.freeform_input.update(cx, |input, cx| {
             input.set_value(String::new(), window, cx);
         });
@@ -376,11 +373,49 @@ impl DecisionsPanel {
         });
     }
 
-    /// The decision the freeform field would edit if Enter were pressed
-    /// right now: whichever decision is being changed, else the top pending
-    /// one.
-    fn top_freeform_target(&self) -> Option<Uuid> {
-        self.changing.or_else(|| self.loaded.pending.first().map(|d| d.id))
+    /// The decision keyboard "stops" (Up/Down, Enter/Ctrl+Enter) currently
+    /// act on: whichever decision is being changed in the log, else the top
+    /// pending one.
+    fn current_decision(&self) -> Option<Decision> {
+        if let Some(changing) = self.changing {
+            self.loaded
+                .log
+                .iter()
+                .find(|e| e.decision.id == changing)
+                .map(|e| e.decision.clone())
+        } else {
+            self.loaded.pending.first().cloned()
+        }
+    }
+
+    /// Enter/Ctrl+Enter on the current decision's focused stop: its
+    /// evidence links, then its freeform field.
+    fn activate(&mut self, ctrl: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(decision) = self.current_decision() else {
+            return;
+        };
+        let links = evidence_links(decision.node_id, &decision.evidence);
+        if let Some(link) = links.get(self.selected_link) {
+            if let Some(target) = link.target {
+                self.open(target, ctrl, cx);
+            }
+            return;
+        }
+        // Past the evidence links: the freeform stop.
+        self.begin_freeform_edit(decision.id, window, cx);
+    }
+
+    fn on_activate(&mut self, _: &DecisionsActivate, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(false, window, cx);
+    }
+
+    fn on_ctrl_activate(
+        &mut self,
+        _: &DecisionsCtrlActivate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate(true, window, cx);
     }
 
     fn exit_freeform_edit(
@@ -442,22 +477,23 @@ impl DecisionsPanel {
         cx.emit(PanelOpenRequest { target, ctrl });
     }
 
+    /// The number of keyboard stops on the current decision: its evidence
+    /// links, plus one for the freeform field.
+    fn stop_count(&self) -> usize {
+        self.current_decision()
+            .map(|d| evidence_links(d.node_id, &d.evidence).len() + 1)
+            .unwrap_or(0)
+    }
+
     fn link_prev(&mut self, _: &DecisionsLinkPrev, _window: &mut Window, cx: &mut Context<Self>) {
         self.selected_link = self.selected_link.saturating_sub(1);
         cx.notify();
     }
 
     fn link_next(&mut self, _: &DecisionsLinkNext, _window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_link = self.selected_link.saturating_add(1);
+        let max = self.stop_count().saturating_sub(1);
+        self.selected_link = (self.selected_link + 1).min(max);
         cx.notify();
-    }
-
-    fn activate_selected_link(&mut self, decision: &Decision, ctrl: bool, cx: &mut Context<Self>) {
-        let node_id = decision.node_id;
-        let links = evidence_links(node_id, &decision.evidence);
-        if let Some(Some(target)) = links.get(self.selected_link).map(|l| l.target) {
-            self.open(target, ctrl, cx);
-        }
     }
 
     fn render_options(
@@ -475,7 +511,7 @@ impl DecisionsPanel {
                 .map(|(ix, label)| {
                     let option = ix + 1;
                     let decision = decision.clone();
-                    Button::new(("unified-decisions-option", decision.id, option))
+                    Button::new(SharedString::from(format!("unified-decisions-option-{}-{option}", decision.id)))
                         .label(format!("{option}. {label}"))
                         .small()
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -486,8 +522,8 @@ impl DecisionsPanel {
     }
 
     fn render_evidence(&self, decision: &Decision, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().accent;
         let links = evidence_links(decision.node_id, &decision.evidence);
         div()
             .flex()
@@ -497,9 +533,9 @@ impl DecisionsPanel {
                 let selected = ix == self.selected_link;
                 match link.target {
                     Some(target) => div()
-                        .id(("unified-decisions-evidence", decision.id, ix))
+                        .id(SharedString::from(format!("unified-decisions-evidence-{}-{ix}", decision.id)))
                         .text_xs()
-                        .when(selected, |el| el.text_color(theme.accent))
+                        .when(selected, |el| el.text_color(accent))
                         .when(!selected, |el| el.text_color(muted))
                         .cursor_pointer()
                         .on_mouse_down(
@@ -525,21 +561,13 @@ impl DecisionsPanel {
         let editing = self.freeform_editing == Some(decision_id);
         key_context::set_input_tab_stop(&self.freeform_input, editing, cx);
         div()
-            .id(("unified-decisions-freeform", decision_id))
+            .id(SharedString::from(format!("unified-decisions-freeform-{decision_id}")))
             .key_context(FREEFORM_TAG)
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    this.freeform_editing = Some(decision_id);
-                    this.freeform_input.update(cx, |input, cx| {
-                        input.set_value(String::new(), window, cx);
-                    });
-                    cx.notify();
-                    let input = this.freeform_input.clone();
-                    cx.on_next_frame(window, move |_, window, cx| {
-                        input.update(cx, |input, cx| input.focus(window, cx));
-                    });
+                    this.begin_freeform_edit(decision_id, window, cx);
                 }),
             )
             .child(if editing {
@@ -560,18 +588,19 @@ impl DecisionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
+        let border = cx.theme().border;
+        let radius = cx.theme().radius;
         div()
-            .id(("unified-decisions-pending", decision.id))
+            .id(SharedString::from(format!("unified-decisions-pending-{}", decision.id)))
             .flex()
             .flex_col()
             .gap_1()
             .p_2()
             .border_1()
-            .border_color(theme.border)
-            .rounded(theme.radius)
+            .border_color(border)
+            .rounded(radius)
             .child(selectable_markdown(
-                ("unified-decisions-question", decision.id),
+                SharedString::from(format!("unified-decisions-question-{}", decision.id)),
                 decision.question.clone(),
                 window,
                 cx,
@@ -588,7 +617,8 @@ impl DecisionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
         let decision = entry.decision.clone();
         let decision_id = decision.id;
         let chosen = describe_answer(&decision, &entry.answer);
@@ -600,7 +630,7 @@ impl DecisionsPanel {
             .gap_1()
             .p_2()
             .border_b_1()
-            .border_color(theme.border)
+            .border_color(border)
             .child(
                 div().text_sm().child(selectable_text(
                     ("unified-decisions-log-question", entry.answer.id as u64),
@@ -617,7 +647,7 @@ impl DecisionsPanel {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted_foreground)
+                            .text_color(muted)
                             .child(format!("Answered: {chosen} · {}", entry.answer.actor)),
                     )
                     .child(
@@ -702,8 +732,7 @@ impl Render for DecisionsPanel {
             self.pending_refresh = false;
             self.reload(cx);
         }
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
+        let muted = cx.theme().muted_foreground;
 
         let body = if self.node_id.is_none() {
             div()
@@ -714,6 +743,7 @@ impl Render for DecisionsPanel {
                 .into_any_element()
         } else {
             div()
+                .id("unified-decisions-body")
                 .flex()
                 .flex_col()
                 .gap_3()
@@ -726,7 +756,8 @@ impl Render for DecisionsPanel {
                         .flex_col()
                         .gap_2()
                         .children(self.loaded.pending.iter().enumerate().map(|(ix, d)| {
-                            self.render_pending_decision(d, ix == 0, cx).into_any_element()
+                            self.render_pending_decision(d, ix == 0, window, cx)
+                                .into_any_element()
                         }))
                         .when(self.loaded.pending.is_empty(), |el| {
                             el.child(
@@ -742,13 +773,9 @@ impl Render for DecisionsPanel {
                         .flex()
                         .flex_col()
                         .child(div().text_xs().text_color(muted).child("Answer log"))
-                        .children(
-                            self.loaded
-                                .log
-                                .iter()
-                                .rev()
-                                .map(|entry| self.render_log_entry(entry, cx).into_any_element()),
-                        )
+                        .children(self.loaded.log.iter().rev().map(|entry| {
+                            self.render_log_entry(entry, window, cx).into_any_element()
+                        }))
                         .when(self.loaded.log.is_empty(), |el| {
                             el.child(
                                 div()
@@ -766,11 +793,196 @@ impl Render for DecisionsPanel {
             .key_context(UNIFIED_DECISIONS_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::answer_option_key))
-            .on_action(cx.listener(Self::enter_freeform_edit))
+            .on_action(cx.listener(Self::on_activate))
+            .on_action(cx.listener(Self::on_ctrl_activate))
             .on_action(cx.listener(Self::exit_freeform_edit))
             .on_action(cx.listener(Self::link_prev))
             .on_action(cx.listener(Self::link_next))
             .size_full()
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interview::agent::SharedAgent;
+    use crate::views::rows::fixture::Fixture;
+    use gpui::{TestAppContext, VisualTestContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Mutex;
+    use tod_agent::MockAgentProvider;
+    use tod_store::interview::{ACTOR_USER, InterviewCommand};
+
+    fn mock_agent() -> SharedAgent {
+        Arc::new(Mutex::new(Box::new(MockAgentProvider::new())))
+    }
+
+    fn ask(fixture: &Fixture, question: &str, options: &[&str]) -> Uuid {
+        let id = fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: question.to_string(),
+                        options: options.iter().map(|o| o.to_string()).collect(),
+                        evidence: Vec::new(),
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+        id
+    }
+
+    fn open_panel<'a>(
+        node_id: Option<Uuid>,
+        fixture: &Fixture,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<DecisionsPanel>, Entity<AgentRuns>, &'a mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let fleet = fixture.store.clone();
+        let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), mock_agent()));
+        let agent_runs_for_view = agent_runs.clone();
+        let slot = Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let view =
+                cx.new(|cx| DecisionsPanel::new(node_id, fleet, agent_runs_for_view, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        draw(cx);
+        (view, agent_runs, cx)
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    fn loads_pending_decisions_oldest_first(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let first = ask(&fixture, "First?", &["a", "b"]);
+        let second = ask(&fixture, "Second?", &["a", "b"]);
+        let (view, _agent_runs, cx) = open_panel(Some(fixture.node_id), &fixture, cx);
+
+        view.read_with(cx, |view, _| {
+            let ids: Vec<_> = view.loaded.pending.iter().map(|d| d.id).collect();
+            assert_eq!(ids, [first, second]);
+        });
+    }
+
+    #[gpui::test]
+    fn digit_key_answers_the_top_pending_decision(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let decision_id = ask(&fixture, "Round per line or per invoice?", &["per line", "per invoice"]);
+        let (view, _agent_runs, cx) = open_panel(Some(fixture.node_id), &fixture, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.answer_option_key(&DecisionOptionKey(2), window, cx);
+        });
+        cx.run_until_parked();
+        draw(cx);
+
+        let with_answers = fixture
+            .store
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_answers.answers.len(), 1);
+        assert_eq!(with_answers.answers[0].option, Some(2));
+        view.read_with(cx, |view, _| {
+            assert!(view.loaded.pending.is_empty(), "answered decision drops off the pending list");
+            assert_eq!(view.loaded.log.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn changing_an_answer_appends_a_new_log_entry_without_touching_the_first(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let decision_id = ask(&fixture, "Which?", &["a", "b"]);
+        let (view, agent_runs, cx) = open_panel(Some(fixture.node_id), &fixture, cx);
+
+        agent_runs
+            .update(cx, |runs, cx| runs.answer_decision(decision_id, Some(1), None, cx))
+            .unwrap();
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.reload(cx));
+        draw(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.loaded.log.len(), 1);
+        });
+
+        view.update(cx, |view, cx| {
+            view.start_change(decision_id, cx);
+            view.click_option(
+                view.loaded.log[0].decision.clone(),
+                2,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        draw(cx);
+
+        let with_answers = fixture
+            .store
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_answers.answers.len(), 2, "the first answer is never overwritten");
+        assert_eq!(with_answers.answers[0].option, Some(1));
+        assert_eq!(with_answers.answers[1].option, Some(2));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.loaded.log.len(), 2);
+            assert!(view.changing.is_none(), "answering clears the change-in-progress state");
+        });
+    }
+
+    #[gpui::test]
+    fn set_node_reloads_for_the_new_target(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let _first = ask(&fixture, "On node one?", &["a"]);
+        let other_node = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id: other_node,
+                    conversation_id: None,
+                    protocol: None,
+                    decision: tod_store::decisions::NewDecision {
+                        question: "won't be created: node missing".to_string(),
+                        options: vec!["a".to_string()],
+                        evidence: Vec::new(),
+                    },
+                },
+            )
+            .ok();
+        let (view, _agent_runs, cx) = open_panel(Some(fixture.node_id), &fixture, cx);
+        view.read_with(cx, |view, _| assert_eq!(view.loaded.pending.len(), 1));
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(None, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.node_id.is_none());
+            assert!(view.loaded.pending.is_empty());
+        });
     }
 }

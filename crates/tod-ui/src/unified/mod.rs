@@ -48,6 +48,7 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 enum HostedPanel {
     Placeholder(Entity<PlaceholderPanel>),
     Details(Entity<DetailsPanel>),
+    Decisions(Entity<panels::decisions::DecisionsPanel>),
     Obligations(Entity<panels::obligations::ObligationsPanel>),
     Plan(Entity<panels::plan::PlanPanel>),
     Findings(Entity<panels::findings::FindingsPanel>),
@@ -60,6 +61,7 @@ impl HostedPanel {
         match self {
             Self::Placeholder(e) => e.read(cx).title(cx),
             Self::Details(e) => e.read(cx).title(cx),
+            Self::Decisions(e) => e.read(cx).title(cx),
             Self::Obligations(e) => e.read(cx).title(cx),
             Self::Plan(e) => e.read(cx).title(cx),
             Self::Findings(e) => e.read(cx).title(cx),
@@ -72,6 +74,7 @@ impl HostedPanel {
         match self {
             Self::Placeholder(e) => e.read(cx).focus_handle(cx),
             Self::Details(e) => e.read(cx).focus_handle(cx),
+            Self::Decisions(e) => e.read(cx).focus_handle(cx),
             Self::Obligations(e) => e.read(cx).focus_handle(cx),
             Self::Plan(e) => e.read(cx).focus_handle(cx),
             Self::Findings(e) => e.read(cx).focus_handle(cx),
@@ -84,6 +87,7 @@ impl HostedPanel {
         match self {
             Self::Placeholder(e) => e.entity_id(),
             Self::Details(e) => e.entity_id(),
+            Self::Decisions(e) => e.entity_id(),
             Self::Obligations(e) => e.entity_id(),
             Self::Plan(e) => e.entity_id(),
             Self::Findings(e) => e.entity_id(),
@@ -96,6 +100,7 @@ impl HostedPanel {
         match self {
             Self::Placeholder(e) => e.clone().into_any_element(),
             Self::Details(e) => e.clone().into_any_element(),
+            Self::Decisions(e) => e.clone().into_any_element(),
             Self::Obligations(e) => e.clone().into_any_element(),
             Self::Plan(e) => e.clone().into_any_element(),
             Self::Findings(e) => e.clone().into_any_element(),
@@ -116,6 +121,7 @@ pub const UNIFIED_CONTEXT: &str = "Unified";
 pub fn register_unified_keyboard_bindings(cx: &mut App) {
     bind_pane_nav(cx, UNIFIED_CONTEXT);
     panels::details::register_details_panel_keyboard_bindings(cx);
+    panels::decisions::register_decisions_panel_keyboard_bindings(cx);
     let context = Some(key_context::excluding_input(UNIFIED_CONTEXT));
     cx.bind_keys([KeyBinding::new("alt-w", UnifiedTogglePinFocused, context)]);
     let panel_context = Some(key_context::excluding_input(panel::UNIFIED_PANEL_CONTEXT));
@@ -215,11 +221,26 @@ impl UnifiedView {
         cx: &mut Context<Self>,
     ) {
         if let TaskListEvent::SelectionChanged { task_id } = event {
-            if let Some(id) = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
+            let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+            if let Some(id) = node_id {
                 // The node tree (column 1) always counts as pinned, so a
                 // selection opens Details in the first unpinned column
                 // starting at column 2 (index 0), as a plain (non-ctrl) open.
                 self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+            }
+            // The decisions panel is a singleton with no target of its own:
+            // it always follows whichever node is current
+            // (`doc/ui/unified-view.md` "Decisions"), so any open column
+            // retargets in place rather than through the placement rule.
+            self.sync_decisions_node(node_id, window, cx);
+        }
+    }
+
+    fn sync_decisions_node(&mut self, node_id: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
+        for hosted in &self.hosted {
+            if let HostedPanel::Decisions(panel) = &hosted.panel {
+                let panel = panel.clone();
+                panel.update(cx, |panel, cx| panel.set_node(node_id, window, cx));
             }
         }
     }
@@ -249,14 +270,23 @@ impl UnifiedView {
                 }
             }
             PanelKind::Decisions => {
-                let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
+                let node_id = self.task_list.read(cx).selected_node_id();
+                let panel = cx.new(|cx| {
+                    panels::decisions::DecisionsPanel::new(
+                        node_id,
+                        self.fleet.clone(),
+                        self.agent_runs.clone(),
+                        window,
+                        cx,
+                    )
+                });
                 let panel_id = panel.entity_id();
                 let subscription =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
                         this.route_open_request(panel_id, event, window, cx);
                     });
                 HostedColumn {
-                    panel: HostedPanel::Placeholder(panel),
+                    panel: HostedPanel::Decisions(panel),
                     _subscription: Some(subscription),
                 }
             }
