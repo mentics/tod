@@ -9,10 +9,12 @@
 
 mod columns;
 mod panel;
+mod panels;
 
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
 use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenRequest, PlaceholderPanel};
+use panels::DetailsPanel;
 
 use std::sync::Arc;
 
@@ -47,13 +49,44 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", PanelActivateFocusedLink, panel_context),
         KeyBinding::new("ctrl-enter", PanelCtrlActivateFocusedLink, panel_context),
     ]);
+    panels::details::register_details_panel_keyboard_bindings(cx);
 }
 
-/// A column-2+ slot: the model's bookkeeping plus the placeholder panel
-/// entity backing it and the subscription that carries its open requests up
-/// to the root.
+/// A column-2+ slot's panel: `PlaceholderPanel` for every kind not yet given
+/// a real implementation, replaced kind by kind (W5, W7, W9).
+#[derive(Clone)]
+enum HostedPanel {
+    Placeholder(Entity<PlaceholderPanel>),
+    Details(Entity<DetailsPanel>),
+}
+
+impl HostedPanel {
+    fn title(&self, cx: &App) -> gpui::SharedString {
+        match self {
+            HostedPanel::Placeholder(panel) => panel.read(cx).title(cx),
+            HostedPanel::Details(panel) => panel.read(cx).title(cx),
+        }
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            HostedPanel::Placeholder(panel) => panel.read(cx).focus_handle(cx),
+            HostedPanel::Details(panel) => panel.read(cx).focus_handle(cx),
+        }
+    }
+
+    fn into_any_element(self) -> gpui::AnyElement {
+        match self {
+            HostedPanel::Placeholder(panel) => panel.into_any_element(),
+            HostedPanel::Details(panel) => panel.into_any_element(),
+        }
+    }
+}
+
+/// A column-2+ slot: the model's bookkeeping plus the panel entity backing
+/// it and the subscription that carries its open requests up to the root.
 struct HostedColumn {
-    panel: Entity<PlaceholderPanel>,
+    panel: HostedPanel,
     _subscription: Subscription,
 }
 
@@ -70,10 +103,13 @@ pub struct UnifiedView {
 impl UnifiedView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
-        let _task_list_subscription =
-            cx.subscribe(&task_list, |this, _, event: &TaskListEvent, cx| {
-                this.on_task_list_event(event, cx);
-            });
+        let _task_list_subscription = cx.subscribe_in(
+            &task_list,
+            window,
+            |this, _, event: &TaskListEvent, window, cx| {
+                this.on_task_list_event(event, window, cx);
+            },
+        );
         Self {
             fleet,
             task_list,
@@ -85,46 +121,117 @@ impl UnifiedView {
         }
     }
 
-    fn on_task_list_event(&mut self, event: &TaskListEvent, cx: &mut Context<Self>) {
+    fn on_task_list_event(
+        &mut self,
+        event: &TaskListEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let TaskListEvent::SelectionChanged { task_id } = event {
             if let Some(id) = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok()) {
                 // The node tree (column 1) always counts as pinned, so a
                 // selection opens Details in the first unpinned column
                 // starting at column 2 (index 0), as a plain (non-ctrl) open.
-                self.open_panel(PanelKind::Details(id), 0, false, cx);
+                self.open_panel(PanelKind::Details(id), 0, false, window, cx);
             }
         }
     }
 
     /// Apply the column-placement rule and keep `hosted` in sync with the
     /// resulting `columns` model.
-    fn open_panel(&mut self, target: PanelKind, from_column: usize, ctrl: bool, cx: &mut Context<Self>) {
+    fn open_panel(
+        &mut self,
+        target: PanelKind,
+        from_column: usize,
+        ctrl: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let before = self.columns.len();
         let ix = self.columns.open(target, from_column, ctrl);
         if ix < before {
             // An existing column was replaced or retargeted in place.
-            self.hosted[ix].panel.update(cx, |panel, cx| {
-                panel.set_kind(target, cx);
-            });
-        } else {
-            let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
-            let panel_id = panel.entity_id();
-            let subscription = cx.subscribe(&panel, move |this, _, event: &PanelOpenRequest, cx| {
-                let Some(col) = this
-                    .hosted
-                    .iter()
-                    .position(|h| h.panel.entity_id() == panel_id)
-                else {
-                    return;
+            let retarget_details = match (&self.hosted[ix].panel, target) {
+                (HostedPanel::Details(panel), PanelKind::Details(node_id)) => {
+                    Some((panel.clone(), node_id))
+                }
+                _ => None,
+            };
+            if let Some((panel, node_id)) = retarget_details {
+                panel.update(cx, |panel, cx| {
+                    panel.set_node(node_id, window, cx);
+                });
+            } else if !matches!(target, PanelKind::Details(_))
+                && matches!(self.hosted[ix].panel, HostedPanel::Placeholder(_))
+            {
+                let HostedPanel::Placeholder(panel) = self.hosted[ix].panel.clone() else {
+                    unreachable!()
                 };
-                this.open_panel(event.target, col, event.ctrl, cx);
-            });
-            self.hosted.push(HostedColumn {
-                panel,
-                _subscription: subscription,
-            });
+                panel.update(cx, |panel, cx| {
+                    panel.set_kind(target, cx);
+                });
+            } else {
+                // Retargeting across a placeholder/real-panel boundary:
+                // replace the hosted panel outright.
+                self.hosted[ix] = self.build_hosted_column(target, window, cx);
+            }
+        } else {
+            let hosted = self.build_hosted_column(target, window, cx);
+            self.hosted.push(hosted);
         }
         cx.notify();
+    }
+
+    fn build_hosted_column(
+        &self,
+        target: PanelKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> HostedColumn {
+        match target {
+            PanelKind::Details(node_id) => {
+                let panel = cx.new(|cx| DetailsPanel::new(node_id, self.fleet.clone(), window, cx));
+                let panel_id = panel.entity_id();
+                let subscription = cx.subscribe_in(
+                    &panel,
+                    window,
+                    move |this, _, event: &PanelOpenRequest, window, cx| {
+                        let Some(col) = this.hosted.iter().position(|h| match &h.panel {
+                            HostedPanel::Details(p) => p.entity_id() == panel_id,
+                            HostedPanel::Placeholder(_) => false,
+                        }) else {
+                            return;
+                        };
+                        this.open_panel(event.target, col, event.ctrl, window, cx);
+                    },
+                );
+                HostedColumn {
+                    panel: HostedPanel::Details(panel),
+                    _subscription: subscription,
+                }
+            }
+            _ => {
+                let panel = cx.new(|cx| PlaceholderPanel::new(target, self.fleet.clone(), cx));
+                let panel_id = panel.entity_id();
+                let subscription = cx.subscribe_in(
+                    &panel,
+                    window,
+                    move |this, _, event: &PanelOpenRequest, window, cx| {
+                        let Some(col) = this.hosted.iter().position(|h| match &h.panel {
+                            HostedPanel::Placeholder(p) => p.entity_id() == panel_id,
+                            HostedPanel::Details(_) => false,
+                        }) else {
+                            return;
+                        };
+                        this.open_panel(event.target, col, event.ctrl, window, cx);
+                    },
+                );
+                HostedColumn {
+                    panel: HostedPanel::Placeholder(panel),
+                    _subscription: subscription,
+                }
+            }
+        }
     }
 
     fn close_column(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -155,7 +262,7 @@ impl UnifiedView {
         match self.columns.focused_index() {
             Some(ix) => {
                 if let Some(hosted) = self.hosted.get(ix) {
-                    let handle = hosted.panel.read(cx).focus_handle(cx);
+                    let handle = hosted.panel.focus_handle(cx);
                     window.focus(&handle, cx);
                 }
             }
@@ -176,7 +283,7 @@ impl UnifiedView {
         let accent = cx.theme().accent;
         let muted = cx.theme().muted_foreground;
         let hosted = &self.hosted[index];
-        let title = hosted.panel.read(cx).title(cx);
+        let title = hosted.panel.title(cx);
         let pinned = self.columns.is_pinned(index);
         let focused = self.columns.focused_index() == Some(index);
         div()
@@ -260,7 +367,7 @@ impl UnifiedView {
                 .into_any_element();
         }
         let header = self.render_column_header(index, cx);
-        let panel = self.hosted[index].panel.clone();
+        let panel = self.hosted[index].panel.clone().into_any_element();
         div()
             .id(("unified-col", index))
             .flex()
@@ -373,8 +480,8 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         let node_id = fixture.node_id;
 
-        view.update(cx, |view, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
         });
         draw(cx);
 
@@ -391,11 +498,11 @@ mod tests {
         let (view, cx) = open_view(&fixture, cx);
         let node_id = fixture.node_id;
 
-        view.update(cx, |view, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
             // Opening from column 2 (index 0), non-ctrl: since column 0 is
             // unpinned it is *replaced* — mirrors a click in that column.
-            view.open_panel(PanelKind::Obligations(node_id), 0, true, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 0, true, window, cx);
         });
         draw(cx);
 
@@ -419,11 +526,11 @@ mod tests {
         let node_id = fixture.node_id;
 
         view.update_in(cx, |view, window, cx| {
-            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
             view.toggle_pin_focused(&UnifiedTogglePinFocused, window, cx);
             // Clicking column 2 again (now pinned) opens the next panel in a
             // new column instead of replacing it.
-            view.open_panel(PanelKind::Obligations(node_id), 0, false, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 0, false, window, cx);
         });
         draw(cx);
 
