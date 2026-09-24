@@ -3,6 +3,7 @@ mod cli;
 mod conversation;
 mod interview;
 mod ui;
+pub(crate) mod unified;
 mod views;
 
 #[cfg(feature = "agent-socket")]
