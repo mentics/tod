@@ -505,7 +505,14 @@ impl ListDelegate for TaskListDelegate {
         }
         if is_work {
             if !item.lifecycle.is_empty() {
-                let lifecycle = item.lifecycle.clone();
+                // The unified view (W11) may override the plain lifecycle
+                // name with its status label (`state`, `state →`, `→
+                // state`), precomputed by the host from `AgentRuns` and fed
+                // in via `TaskListView::set_status_overrides`; the existing
+                // Tasks view never calls it, so `status_override` stays
+                // `None` there and this chip shows the plain lifecycle name
+                // exactly as before.
+                let lifecycle = item.status_override.clone().unwrap_or_else(|| item.lifecycle.clone());
                 let task_id_lc = item.id.clone();
                 chips = chips.child(action_chip(
                     cx,
