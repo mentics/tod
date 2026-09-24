@@ -1346,3 +1346,104 @@ fn the_cli_docs_follow_the_focus() {
     assert!(text.contains("tod-cli help"), "{text}");
     assert!(!text.contains("obligations add"), "{text}");
 }
+
+/// A node with a decision pending that a given conversation asked, for the
+/// hand-back-on-pending-decision tests below.
+mod pending_decision_hand_back {
+    use super::*;
+    use crate::conversation::protocol::{
+        Next, ProtocolEnv, Stop, TurnContext, hand_back_for_pending_decision, protocol_for,
+    };
+    use tod_store::decisions::NewDecision;
+
+    fn ask(fx: &Fixture, conversation_id: Uuid, kind: ProtocolKind) {
+        fx.user(InterviewCommand::CreateConversation {
+            id: conversation_id,
+            focus: Focus::Node(fx.node),
+            protocol: kind,
+            platform: None,
+            model: None,
+            effort: None,
+        });
+        fx.user(InterviewCommand::AskDecision {
+            node_id: fx.node,
+            conversation_id: Some(conversation_id),
+            protocol: Some(kind.as_str().to_string()),
+            decision: NewDecision {
+                question: "Round per line or per invoice?".to_string(),
+                options: vec!["per line".to_string(), "per invoice".to_string()],
+                evidence: Vec::new(),
+            },
+        });
+    }
+
+    fn turn<'a>(env: &'a ProtocolEnv<'a>) -> TurnContext<'a> {
+        TurnContext {
+            env,
+            report: None,
+            continuations: 0,
+            progressed: true,
+        }
+    }
+
+    /// The shared helper itself: no pending decision asked by this
+    /// conversation means no hand-back; one asked by a different
+    /// conversation on the same node does not count either.
+    #[test]
+    fn the_helper_only_hands_back_for_a_decision_this_conversation_asked() {
+        let fx = fixture();
+        let conversation_id = Uuid::new_v4();
+        let other_conversation = Uuid::new_v4();
+        let media = media();
+        let env = ProtocolEnv {
+            fleet: &fx.fleet,
+            media: &media,
+            data_root: &fx.root,
+            conversation_id,
+            focus: Focus::Node(fx.node),
+        };
+        assert!(hand_back_for_pending_decision(&turn(&env)).unwrap().is_none());
+
+        ask(&fx, other_conversation, ProtocolKind::Implementation);
+        assert!(
+            hand_back_for_pending_decision(&turn(&env)).unwrap().is_none(),
+            "a decision another conversation asked is not this one's to wait on"
+        );
+
+        ask(&fx, conversation_id, ProtocolKind::Implementation);
+        match hand_back_for_pending_decision(&turn(&env)).unwrap() {
+            Some(Next::Done(Stop::HandBack(_))) => {}
+            _ => panic!("expected a hand-back"),
+        }
+    }
+
+    /// Every looping protocol (implement, verify, review, fix) hands back
+    /// instead of continuing once its own conversation has a pending
+    /// decision on the node it is about.
+    #[test]
+    fn every_looping_protocol_hands_back_on_its_own_pending_decision() {
+        let fx = fixture();
+        let media = media();
+        for kind in [
+            ProtocolKind::Implementation,
+            ProtocolKind::Verification,
+            ProtocolKind::Review,
+            ProtocolKind::Fix,
+        ] {
+            let conversation_id = Uuid::new_v4();
+            ask(&fx, conversation_id, kind);
+            let env = ProtocolEnv {
+                fleet: &fx.fleet,
+                media: &media,
+                data_root: &fx.root,
+                conversation_id,
+                focus: Focus::Node(fx.node),
+            };
+            let protocol = protocol_for(kind);
+            match protocol.next(&turn(&env)).unwrap() {
+                Next::Done(Stop::HandBack(_)) => {}
+                _ => panic!("{kind:?}: expected a hand-back"),
+            }
+        }
+    }
+}

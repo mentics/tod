@@ -17,11 +17,15 @@
 
 use crate::conversation::driver_slot::DriverSlot;
 use crate::interview::agent::SharedAgent;
+use crate::interview::{TodPaths, TodSettings};
+use anyhow::Context as _;
 use gpui::Context;
 use std::sync::Arc;
-use tod_core::conversation::{ConversationDriver, ConversationStatus, SharedAgentAccess};
+use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind};
+use tod_store::decisions::{Decision, DecisionRepo};
 use tod_store::fleet::FleetStore;
+use tod_store::interview::{ACTOR_USER, InterviewCommand};
 use uuid::Uuid;
 
 /// One node's runs, as a status label (`state` / `state →` / `→ state`, W11)
@@ -306,6 +310,131 @@ impl AgentRuns {
         .detach();
         true
     }
+
+    /// Tool-agnostic config for a new driver, built on demand the same way
+    /// `ConversationView::driver_config` does.
+    fn driver_config(&self) -> Result<ConversationConfig, String> {
+        let paths = TodPaths::discover().map_err(|e| format!("{e:#}"))?;
+        let settings = TodSettings::load(&paths).unwrap_or_default();
+        let media =
+            tod_core::media::MediaPaths::discover().map_err(|e| format!("Media bundle: {e}"))?;
+        Ok(ConversationConfig {
+            data_root: self.fleet.paths().root().to_path_buf(),
+            media,
+            launch: settings.interview_launch_options(),
+            context: settings.interview_context.clone(),
+        })
+    }
+
+    /// The slot for `conversation_id`, resuming it from its stored row when
+    /// there is none here yet — so [`Self::answer_decision`] can deliver even
+    /// when nobody has opened this conversation's view since the app
+    /// started.
+    fn ensure_for_conversation(&mut self, conversation_id: Uuid) -> anyhow::Result<usize> {
+        let conversation = self
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).get(conversation_id))?
+            .with_context(|| format!("conversation {conversation_id} not found"))?;
+        let config = self.driver_config();
+        let fleet = self.fleet.clone();
+        self.ensure(
+            conversation.focus,
+            conversation.protocol,
+            Some(conversation_id),
+            move || {
+                let config = config?;
+                ConversationDriver::open(config, &fleet, conversation_id).map_err(|e| format!("{e:#}"))
+            },
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// "option 2 (\"per invoice\")", "\"do it Tuesday\"", or "option 1" when
+    /// there is no free text and the option's own label is empty.
+    fn describe_answer(decision: &Decision, option: Option<i64>, text: Option<&str>) -> String {
+        let picked = option.and_then(|o| {
+            usize::try_from(o)
+                .ok()
+                .and_then(|ix| decision.options.get(ix.checked_sub(1)?))
+        });
+        match (picked, text) {
+            (Some(label), Some(text)) if !text.is_empty() => format!("\"{label}\" ({text})"),
+            (Some(label), _) => format!("\"{label}\""),
+            (None, Some(text)) if !text.is_empty() => format!("\"{text}\""),
+            _ => "(no answer recorded)".to_string(),
+        }
+    }
+
+    /// Records the user's answer to `decision_id` (append-only: a change of
+    /// mind is a new `decision_answers` row, never an update — see
+    /// `tod_store::decisions`), then delivers a turn to the asking
+    /// conversation with the question, the chosen option/text, and — if this
+    /// is a change of mind — the previous answer, so the agent knows to
+    /// review what it did based on it.
+    ///
+    /// Delivery resumes the conversation's slot when it is not hosted yet
+    /// (`Self::ensure_for_conversation`), so this always reaches the agent
+    /// once the decision has a conversation, regardless of what a view has
+    /// open. It never blocks the UI thread: recording the answer is a single
+    /// SQLite write (as every other conversation action is), and sending the
+    /// turn itself runs off it via `Self::send_to_conversation`.
+    pub fn answer_decision(
+        &mut self,
+        decision_id: Uuid,
+        option: Option<usize>,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let before = self
+            .fleet
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
+            .with_context(|| format!("decision {decision_id} not found"))?;
+        let option_index = option.map(|o| o as i64);
+
+        self.fleet.interview(
+            ACTOR_USER,
+            InterviewCommand::AnswerDecision {
+                decision_id,
+                option: option_index,
+                text: text.clone(),
+            },
+        )?;
+
+        let after = self
+            .fleet
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))?
+            .with_context(|| format!("decision {decision_id} vanished after answering"))?;
+
+        let Some(conversation_id) = after.decision.conversation_id else {
+            return Ok(());
+        };
+
+        let chosen = Self::describe_answer(&after.decision, option_index, text.as_deref());
+        let message = match before.answers.last() {
+            Some(prev) => {
+                let previous =
+                    Self::describe_answer(&after.decision, prev.option, prev.text.as_deref());
+                format!(
+                    "Decision answered: {}\n\nThe user answered {chosen}.\n\nThe user changed \
+                     their answer from {previous} to {chosen}: review what you did based on \
+                     {previous} and adjust.",
+                    after.decision.question
+                )
+            }
+            None => format!(
+                "Decision answered: {}\n\nThe user answered {chosen}.",
+                after.decision.question
+            ),
+        };
+
+        self.ensure_for_conversation(conversation_id)?;
+        if !self.send_to_conversation(conversation_id, &message, cx) {
+            tracing::warn!(
+                "answer_decision: could not deliver the answer to conversation {conversation_id}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +517,222 @@ mod tests {
             notified.load(std::sync::atomic::Ordering::SeqCst),
             "the observer should see the running-flag change"
         );
+    }
+
+    /// A minimal [`AgentProvider`] that always succeeds with an empty reply
+    /// and records every message it was sent, for [`answer_decision`] tests
+    /// that need a real turn to go out without the full mock-interview
+    /// machinery `--agent mock` uses in the running app.
+    struct RecordingAgent {
+        sessions: std::collections::HashMap<String, String>,
+        runs: std::collections::HashMap<tod_agent::RunId, tod_agent::AgentRunState>,
+        sent: Vec<String>,
+    }
+
+    impl RecordingAgent {
+        fn new() -> Self {
+            Self {
+                sessions: Default::default(),
+                runs: Default::default(),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl tod_agent::AgentProvider for RecordingAgent {
+        fn start_fleet_agent(
+            &mut self,
+            _owner_id: &str,
+            _cwd: std::path::PathBuf,
+            _prompt: String,
+            _options: tod_agent::AgentLaunchOptions,
+            _session_title: String,
+            _environment: tod_agent::AgentEnvironment,
+        ) -> anyhow::Result<tod_agent::AgentRunHandle> {
+            anyhow::bail!("not used")
+        }
+
+        fn send_session_turn(
+            &mut self,
+            turn: tod_agent::SessionTurn,
+        ) -> anyhow::Result<tod_agent::AgentRunHandle> {
+            self.sent.push(turn.message.clone());
+            let session = turn
+                .resume_session_id
+                .clone()
+                .unwrap_or_else(|| format!("agent-side-{}", Uuid::new_v4()));
+            self.sessions.insert(turn.key.clone(), session);
+            let id = tod_agent::RunId::new();
+            self.runs
+                .insert(id, tod_agent::AgentRunState::Success(Some(String::new())));
+            Ok(tod_agent::AgentRunHandle { id })
+        }
+
+        fn session_id(&self, key: &str) -> Option<String> {
+            self.sessions.get(key).cloned()
+        }
+
+        fn fleet_run_session_id(&self, _id: tod_agent::RunId) -> Option<String> {
+            None
+        }
+
+        fn session_context_chars(&self, _key: &str) -> Option<u64> {
+            None
+        }
+
+        fn close_session(&mut self, key: &str) {
+            self.sessions.remove(key);
+        }
+
+        fn poll_run(&mut self, id: tod_agent::RunId) -> Option<tod_agent::AgentRunState> {
+            self.runs.get(&id).cloned()
+        }
+
+        fn respond_to_permission(&mut self, _id: tod_agent::RunId, _option_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("not used")
+        }
+
+        fn cancel_run(&mut self, _id: tod_agent::RunId) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn interview_status_counts(&self) -> tod_agent::agent_traffic::InterviewAgentCounts {
+            Default::default()
+        }
+    }
+
+    /// Answering a decision records an append-only answer (a change of mind
+    /// is a second row, not an update to the first) and delivers a turn to
+    /// the conversation that asked, naming the previous answer when this is
+    /// a change of mind — even though nobody has opened that conversation's
+    /// view, so [`AgentRuns`] has no slot for it yet.
+    #[gpui::test]
+    fn answer_decision_records_append_only_and_delivers_a_turn(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        // `ensure_for_conversation` resolves a driver config through
+        // `TodPaths::discover`, which reads this process-wide override
+        // rather than a real install; point it at the fixture's own root.
+        tod_store::paths::set_data_root(fixture.store.paths().root().to_path_buf());
+        let node = fixture.node_id;
+        let agent: SharedAgent = Arc::new(Mutex::new(Box::new(RecordingAgent::new())));
+        let registry = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+
+        let conversation_id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::CreateConversation {
+                    id: conversation_id,
+                    focus: Focus::Node(node),
+                    protocol: ProtocolKind::Outline,
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        let decision_id = fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                tod_store::interview::InterviewCommand::AskDecision {
+                    node_id: node,
+                    conversation_id: Some(conversation_id),
+                    protocol: Some("outline".to_string()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Round per line or per invoice?".to_string(),
+                        options: vec!["per line".to_string(), "per invoice".to_string()],
+                        evidence: Vec::new(),
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+
+        // Drives every slot's driver to collect the turn the background
+        // executor's send finished: nothing else in this test polls it (in
+        // the running app, `ConversationView`'s own timer does), so a send
+        // that isn't ticked leaves the driver's `run` set and the next
+        // `send` on it bails with "still working on the previous message".
+        fn complete_running(registry: &gpui::Entity<AgentRuns>, cx: &mut TestAppContext) {
+            registry.update(cx, |registry, cx| {
+                let agent = registry.agent().clone();
+                let fleet = registry.fleet().clone();
+                for (id, mut driver) in registry.take_running() {
+                    driver.tick(&fleet, &mut SharedAgentAccess(&agent));
+                    registry.put_back(id, driver);
+                }
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+
+        registry
+            .update(cx, |registry, cx| {
+                registry.answer_decision(decision_id, Some(1), None, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        complete_running(&registry, cx);
+
+        let with_answers = fixture
+            .store
+            .read(|conn| {
+                tod_store::decisions::DecisionRepo::new(conn).get_with_answers(decision_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_answers.answers.len(), 1);
+        assert_eq!(with_answers.answers[0].option, Some(1));
+
+        let turns = fixture
+            .store
+            .read(|conn| ConversationRepo::new(conn).turns(conversation_id))
+            .unwrap();
+        assert!(
+            turns.iter().any(|t| t.body.contains("per line")),
+            "expected a delivered turn naming the chosen option: {turns:?}"
+        );
+        assert!(
+            !turns.iter().any(|t| t.body.contains("changed their answer")),
+            "the first answer is not a change of mind"
+        );
+
+        // A change of mind: a second, append-only answer row, and a
+        // delivered turn naming the previous answer.
+        registry
+            .update(cx, |registry, cx| {
+                registry.answer_decision(decision_id, Some(2), Some("changed my mind".to_string()), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        complete_running(&registry, cx);
+
+        let with_answers = fixture
+            .store
+            .read(|conn| {
+                tod_store::decisions::DecisionRepo::new(conn).get_with_answers(decision_id)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_answers.answers.len(), 2, "the first answer is never overwritten");
+        assert_eq!(with_answers.answers[0].option, Some(1));
+        assert_eq!(with_answers.answers[1].option, Some(2));
+
+        let turns = fixture
+            .store
+            .read(|conn| ConversationRepo::new(conn).turns(conversation_id))
+            .unwrap();
+        let change_turn = turns
+            .iter()
+            .find(|t| t.body.contains("changed their answer"));
+        assert!(change_turn.is_some(), "expected a turn about the change of mind: {turns:?}");
+        let body = &change_turn.unwrap().body;
+        assert!(body.contains("per line"), "{body}");
+        assert!(body.contains("per invoice"), "{body}");
     }
 }

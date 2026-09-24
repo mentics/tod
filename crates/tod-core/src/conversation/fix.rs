@@ -202,6 +202,9 @@ impl Protocol for FixProtocol {
     /// Otherwise another turn goes out, until the cap or a turn that changed
     /// nothing.
     fn next(&self, turn: &TurnContext<'_>) -> Result<Next> {
+        if let Some(done) = super::protocol::hand_back_for_pending_decision(turn)? {
+            return Ok(done);
+        }
         let open = open_findings(turn.env.fleet, node_id(turn.env)?);
         let tests = turn.report.and_then(TestRun::from_report);
         if open.is_empty() && tests.as_ref().is_some_and(TestRun::green) {
