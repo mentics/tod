@@ -7,11 +7,13 @@
 //! wires both into a GPUI view root, hosts `TaskListView` in column 1, and
 //! registers the view's keys.
 
+mod chat_drawer;
 mod columns;
 mod panel;
 
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
+use chat_drawer::ChatDrawer;
 use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenRequest, PlaceholderPanel};
 
 use std::sync::Arc;
@@ -23,13 +25,19 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
+use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
+use crate::interview::agent::SharedAgent;
+use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::views::task_list::{TaskListEvent, TaskListView};
+
+pub use chat_drawer::register_chat_drawer_keyboard_bindings;
 
 actions!(unified, [UnifiedTogglePinFocused]);
 
@@ -47,6 +55,7 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", PanelActivateFocusedLink, panel_context),
         KeyBinding::new("ctrl-enter", PanelCtrlActivateFocusedLink, panel_context),
     ]);
+    register_chat_drawer_keyboard_bindings(cx);
 }
 
 /// A column-2+ slot: the model's bookkeeping plus the placeholder panel
@@ -62,23 +71,37 @@ pub struct UnifiedView {
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
+    /// The bottom-of-window chat drawer (W8): a freeform conversation about
+    /// whichever node is currently in focus. Never shown for the tree
+    /// itself; see `chat_drawer`.
+    chat_drawer: Entity<ChatDrawer>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     _task_list_subscription: Subscription,
 }
 
 impl UnifiedView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, fleet: Arc<FleetStore>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fleet: Arc<FleetStore>,
+        agent: SharedAgent,
+        agent_runs: Entity<AgentRuns>,
+    ) -> Self {
         let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
         let _task_list_subscription =
             cx.subscribe(&task_list, |this, _, event: &TaskListEvent, cx| {
                 this.on_task_list_event(event, cx);
             });
+        let chat_drawer = cx.new(|cx| {
+            ChatDrawer::new(window, cx, fleet.clone(), agent, agent_runs)
+        });
         Self {
             fleet,
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
+            chat_drawer,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             _task_list_subscription,
@@ -94,6 +117,30 @@ impl UnifiedView {
                 self.open_panel(PanelKind::Details(id), 0, false, cx);
             }
         }
+    }
+
+    /// The unified view's current focus for the chat drawer (W8): the
+    /// focused column's target node, else the node tree's selection, else
+    /// the whole project.
+    fn chat_focus(&self, cx: &App) -> Focus {
+        if let Some(ix) = self.columns.focused_index()
+            && let Some(hosted) = self.hosted.get(ix)
+            && let Some(node) = hosted.panel.read(cx).kind().node()
+        {
+            return Focus::Node(node);
+        }
+        match self.task_list.read(cx).selected_node_id() {
+            Some(id) => Focus::Node(id),
+            None => Focus::Project,
+        }
+    }
+
+    /// Ctrl+J toggles the chat drawer here instead of opening the old
+    /// conversation view: captured before the tree's own `OpenAgentChat`
+    /// handler can consume it.
+    fn on_open_agent_chat(&mut self, _: &OpenAgentChat, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_drawer.update(cx, |drawer, cx| drawer.toggle(window, cx));
+        cx.stop_propagation();
     }
 
     /// Apply the column-placement rule and keep `hosted` in sync with the
@@ -297,8 +344,15 @@ impl HasAppNav for UnifiedView {
     }
 }
 
+/// The node tree column's fixed width, shared by the top row and the bottom
+/// row's spacer so the chat drawer lines up under columns 2+ only.
+const TREE_COLUMN_WIDTH: f32 = 280.;
+
 impl Render for UnifiedView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.chat_focus(cx);
+        self.chat_drawer.update(cx, |drawer, cx| drawer.set_focus(focus, cx));
+
         let border = cx.theme().border;
         let visible_slots = DEFAULT_VISIBLE_COLUMNS;
         let folded = self.columns.folded(visible_slots);
@@ -310,21 +364,37 @@ impl Render for UnifiedView {
             .id("unified-view")
             .key_context(UNIFIED_CONTEXT)
             .track_focus(&self.focus_handle)
+            .capture_action(cx.listener(Self::on_open_agent_chat))
             .on_action(cx.listener(Self::toggle_pin_focused))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .size_full()
             .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(TREE_COLUMN_WIDTH))
+                            .h_full()
+                            .border_r_1()
+                            .border_color(border)
+                            .child(self.task_list.clone()),
+                    )
+                    .children(column_elements),
+            )
             .child(
                 div()
                     .flex_shrink_0()
-                    .w(px(280.))
-                    .h_full()
-                    .border_r_1()
-                    .border_color(border)
-                    .child(self.task_list.clone()),
+                    .w_full()
+                    .flex()
+                    .child(div().flex_shrink_0().w(px(TREE_COLUMN_WIDTH)))
+                    .child(div().flex_1().min_w(px(220.)).child(self.chat_drawer.clone())),
             )
-            .children(column_elements)
     }
 }
 
@@ -352,7 +422,10 @@ mod tests {
         let store = fixture.store.clone();
         let slot_in = slot.clone();
         let (_, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| UnifiedView::new(window, cx, store));
+            let agent: SharedAgent =
+                Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+            let agent_runs = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
+            let view = cx.new(|cx| UnifiedView::new(window, cx, store, agent, agent_runs));
             *slot_in.borrow_mut() = Some(view.clone());
             Root::new(view, window, cx)
         });
@@ -438,6 +511,42 @@ mod tests {
                 view.columns.columns()[1].panel,
                 PanelKind::Obligations(node_id)
             );
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_j_toggles_the_chat_drawer_without_reaching_the_tree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+
+        view.read_with(cx, |view, cx| {
+            assert!(!view.chat_drawer.read(cx).expanded());
+        });
+        cx.dispatch_action(crate::ui::agent_chat::OpenAgentChat);
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.chat_drawer.read(cx).expanded());
+        });
+        cx.dispatch_action(crate::ui::agent_chat::OpenAgentChat);
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(!view.chat_drawer.read(cx).expanded());
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_a_node_points_the_chat_drawer_at_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        view.update(cx, |view, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.chat_drawer.read(cx).focus(), Focus::Node(node_id));
         });
     }
 }
