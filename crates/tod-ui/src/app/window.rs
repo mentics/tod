@@ -20,6 +20,7 @@ use crate::interview::views::{SessionsEvent, SessionsView, SettingsEvent, Settin
 use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::report_problem::{OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem};
 use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
@@ -207,7 +208,7 @@ fn collect_running_work(
     for item in sessions.read(cx).running_interview_work() {
         items.push(SharedString::from(item));
     }
-    for item in conversation.read(cx).running_work() {
+    for item in conversation.read(cx).running_work(cx) {
         items.push(SharedString::from(item));
     }
     items
@@ -1877,6 +1878,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
                         });
                         let agent_for_conversation = agent.clone();
+                        let agent_runs = cx.new(|_| AgentRuns::new(fleet.clone(), agent.clone()));
                         let conversation = cx.new(|cx| {
                             ConversationView::new(
                                 window,
@@ -1884,6 +1886,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 agent_for_conversation,
                                 fleet.clone(),
                                 lifecycle.clone(),
+                                agent_runs.clone(),
                             )
                         });
                         conversation.update(cx, |conversation, cx| {

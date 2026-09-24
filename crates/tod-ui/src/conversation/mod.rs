@@ -17,7 +17,7 @@
 
 mod change_set;
 mod context_panel;
-mod driver_slot;
+pub(crate) mod driver_slot;
 mod header;
 mod keyboard;
 mod lifecycle;
@@ -58,6 +58,7 @@ pub use keyboard::register_conversation_keyboard_bindings;
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
 use crate::ui::agent_chat::OpenAgentChat;
+use crate::ui::agent_runs::AgentRuns;
 use crate::ui::report_problem::{OpenReportDialog, ReportProblem};
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
@@ -420,12 +421,11 @@ pub struct ConversationView {
     /// The open conversation; `None` for an unsaved new one.
     conversation_id: Option<Uuid>,
     history: FocusHistory,
-    /// Drivers with work in flight, plus the current conversation's. Idle
-    /// ones for other conversations are dropped: everything they know is in
-    /// the database.
-    drivers: Vec<DriverSlot>,
-    /// The next [`DriverSlot::id`].
-    next_slot: u64,
+    /// The shared registry hosting every conversation's driver
+    /// (`ui::agent_runs::AgentRuns`). Idle slots for other conversations are
+    /// dropped there once this view stops needing them: everything they know
+    /// is in the database.
+    agent_runs: Entity<AgentRuns>,
     status: ConversationStatus,
     data: Snapshot,
 
@@ -526,6 +526,7 @@ impl ConversationView {
         agent: SharedAgent,
         fleet: Arc<FleetStore>,
         lifecycle: Entity<LifecycleController>,
+        agent_runs: Entity<AgentRuns>,
     ) -> Self {
         let (transcript, transcript_events) = Self::new_transcript(window, cx);
         let lifecycle_changes = cx.observe(&lifecycle, |_, _, cx| cx.notify());
@@ -560,7 +561,7 @@ impl ConversationView {
                 // Collecting a finished turn records the reply and may commit
                 // the work or start the loop's next turn (git, Docker,
                 // `tod-cli`), so it happens here, off the main thread.
-                let Ok(away) = this.update(cx, |this, _| this.take_running()) else {
+                let Ok(away) = this.update(cx, |this, cx| this.take_running(cx)) else {
                     break;
                 };
                 let ticked = if away.is_empty() {
@@ -581,7 +582,7 @@ impl ConversationView {
                         .await
                 };
                 let Ok(want_files) = this.update(cx, |this, cx| {
-                    let (changed, want_files) = this.poll(committed, ticked);
+                    let (changed, want_files) = this.poll(committed, ticked, cx);
                     this.refresh_usage(cx);
                     this.publish_status(cx);
                     for notice in std::mem::take(&mut this.pending_notices) {
@@ -644,8 +645,7 @@ impl ConversationView {
             opened: false,
             conversation_id: None,
             history: FocusHistory::default(),
-            drivers: Vec::new(),
-            next_slot: 0,
+            agent_runs,
             status: ConversationStatus::default(),
             data: Snapshot::default(),
             pane: Pane::Transcript,
@@ -758,10 +758,9 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         let running = self
-            .drivers
-            .iter()
-            .find(|d| d.focus == focus && d.protocol == protocol && d.status.running)
-            .map(|d| d.conversation_id);
+            .agent_runs
+            .read(cx)
+            .running_conversation(focus, protocol);
         self.protocol = protocol;
         self.show(focus, running.flatten(), true, cx);
         self.settle_on_transcript(window, cx);
@@ -851,10 +850,7 @@ impl ConversationView {
         }
         self.reload();
         self.load_lifecycle_state(cx);
-        self.status = self
-            .current_driver()
-            .map(|d| d.status.clone())
-            .unwrap_or_default();
+        self.status = self.current_status(cx).unwrap_or_default();
         self.publish_status(cx);
         cx.notify();
     }
@@ -925,7 +921,7 @@ impl ConversationView {
         let Some(starter) = protocol_for(self.protocol).starter() else {
             return;
         };
-        if self.current_driver().is_some_and(|d| d.status.running) {
+        if self.current_status(cx).is_some_and(|s| s.running) {
             return;
         }
         self.send(starter, window, cx);
@@ -959,59 +955,70 @@ impl ConversationView {
         }
     }
 
-    fn current_driver(&self) -> Option<&DriverSlot> {
-        self.drivers.iter().find(|d| self.is_current(d))
+    /// The registry's slot index for what this view has open, when there is
+    /// one.
+    fn current_index(&self, cx: &App) -> Option<usize> {
+        self.agent_runs
+            .read(cx)
+            .find_index(self.focus, self.protocol, self.conversation_id)
     }
 
-    fn ensure_current_driver(&mut self) -> Result<usize, String> {
-        if let Some(ix) = self.drivers.iter().position(|d| self.is_current(d)) {
-            return Ok(ix);
-        }
-        let config = self.driver_config()?;
-        let driver = match self.conversation_id {
-            Some(id) => {
-                ConversationDriver::open(config, &self.fleet, id).map_err(|e| format!("{e:#}"))?
-            }
-            None => ConversationDriver::new(config, self.focus, self.protocol),
-        };
-        self.next_slot += 1;
-        self.drivers.push(DriverSlot::new(self.next_slot, driver));
-        Ok(self.drivers.len() - 1)
+    fn current_status(&self, cx: &App) -> Option<ConversationStatus> {
+        let ix = self.current_index(cx)?;
+        self.agent_runs.read(cx).status_at(ix)
+    }
+
+    fn ensure_current_driver(&mut self, cx: &mut Context<Self>) -> Result<usize, String> {
+        let config = self.driver_config();
+        let focus = self.focus;
+        let protocol = self.protocol;
+        let conversation_id = self.conversation_id;
+        let fleet = self.fleet.clone();
+        self.agent_runs.update(cx, |runs, cx| {
+            let result = runs.ensure(focus, protocol, conversation_id, move || {
+                let config = config?;
+                match conversation_id {
+                    Some(id) => {
+                        ConversationDriver::open(config, &fleet, id).map_err(|e| format!("{e:#}"))
+                    }
+                    None => Ok(ConversationDriver::new(config, focus, protocol)),
+                }
+            });
+            cx.notify();
+            result
+        })
     }
 
     /// Work in flight, for the close-window warning.
-    pub fn running_work(&self) -> Vec<String> {
-        self.drivers
-            .iter()
-            .filter(|d| d.status.running)
-            .map(|d| {
-                let id = d.conversation_id.map(short_id).unwrap_or_default();
-                format!("Conversation agent running: {id}")
-            })
-            .collect()
+    pub fn running_work(&self, cx: &App) -> Vec<String> {
+        self.agent_runs.read(cx).running_work()
     }
 
     /// The drivers with a turn in flight, taken to be ticked off the main
     /// thread; [`Self::poll`] puts them back.
-    fn take_running(&mut self) -> Vec<(u64, ConversationDriver)> {
-        self.drivers
-            .iter_mut()
-            .filter_map(|slot| slot.take_to_tick().map(|driver| (slot.id, driver)))
-            .collect()
+    fn take_running(&mut self, cx: &mut Context<Self>) -> Vec<(u64, ConversationDriver)> {
+        self.agent_runs.update(cx, |runs, cx| {
+            let taken = runs.take_running();
+            cx.notify();
+            taken
+        })
     }
 
     /// Put back a driver that was away, stopping its turn if Stop was
     /// pressed meanwhile.
-    fn put_back(&mut self, slot: u64, mut driver: ConversationDriver) {
-        let Some(ix) = self.drivers.iter().position(|d| d.id == slot) else {
-            return;
-        };
-        if std::mem::take(&mut self.drivers[ix].cancel)
+    fn put_back(&mut self, slot: u64, mut driver: ConversationDriver, cx: &mut Context<Self>) {
+        let cancelled = self
+            .agent_runs
+            .update(cx, |runs, _| runs.take_cancel(slot));
+        if cancelled
             && let Err(err) = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent))
         {
             self.error = Some(format!("{err:#}").into());
         }
-        self.drivers[ix].put_back(driver);
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.put_back(slot, driver);
+            cx.notify();
+        });
     }
 
     /// Take back the drivers ticked off the main thread, act on what they
@@ -1022,6 +1029,7 @@ impl ConversationView {
         &mut self,
         committed: bool,
         ticked: Vec<(u64, ConversationDriver, Vec<ConversationEvent>)>,
+        cx: &mut Context<Self>,
     ) -> (bool, Option<tod_store::fleet::Workdir>) {
         let mut finished = false;
         let mut current_error = None;
@@ -1055,7 +1063,7 @@ impl ConversationView {
                     loop_turns = Some(driver.continuations());
                 }
             }
-            self.put_back(slot, driver);
+            self.put_back(slot, driver, cx);
         }
         if let Some(turns) = loop_turns {
             self.loop_turns = turns;
@@ -1064,10 +1072,7 @@ impl ConversationView {
         if finished {
             self.usage.stale = true;
         }
-        let current = self
-            .current_driver()
-            .map(|d| d.status.clone())
-            .unwrap_or_default();
+        let current = self.current_status(cx).unwrap_or_default();
         if let Some(request) = current.permission.clone() {
             queue_permission_request(self.agent.clone(), request);
         }
@@ -1075,12 +1080,17 @@ impl ConversationView {
         let conversation_id = self.conversation_id;
         let focus = self.focus;
         let protocol = self.protocol;
-        self.drivers.retain(|d| {
-            let current = match conversation_id {
-                Some(id) => d.conversation_id == Some(id),
-                None => d.conversation_id.is_none() && d.focus == focus && d.protocol == protocol,
-            };
-            current || d.status.running
+        self.agent_runs.update(cx, |runs, cx| {
+            runs.retain(|d| {
+                let current = match conversation_id {
+                    Some(id) => d.conversation_id == Some(id),
+                    None => {
+                        d.conversation_id.is_none() && d.focus == focus && d.protocol == protocol
+                    }
+                };
+                current || d.status.running
+            });
+            cx.notify();
         });
         let mut changed = false;
         if current != self.status {
@@ -1503,7 +1513,7 @@ impl ConversationView {
         if text.is_empty() {
             return false;
         }
-        let ix = match self.ensure_current_driver() {
+        let ix = match self.ensure_current_driver(cx) {
             Ok(ix) => ix,
             Err(err) => {
                 self.error = Some(err.into());
@@ -1511,15 +1521,20 @@ impl ConversationView {
                 return false;
             }
         };
-        let slot = &mut self.drivers[ix];
-        let Some(mut driver) = slot.take_to_send() else {
+        let Some((slot, mut driver)) = self
+            .agent_runs
+            .update(cx, |runs, cx| {
+                let taken = runs.take_to_send(ix);
+                cx.notify();
+                taken
+            })
+        else {
             self.error = Some("the agent is still working on the previous message".into());
             cx.notify();
             return false;
         };
-        let slot = slot.id;
         self.error = None;
-        self.status = self.drivers[ix].status.clone();
+        self.status = self.current_status(cx).unwrap_or_default();
         self.publish_status(cx);
         cx.notify();
         let fleet = self.fleet.clone();
@@ -1568,13 +1583,13 @@ impl ConversationView {
     ) -> Option<AnyWindowHandle> {
         // Still what the view shows, unless the user moved on meanwhile.
         let shown = self
-            .drivers
-            .iter()
-            .find(|d| d.id == slot)
+            .agent_runs
+            .read(cx)
+            .slot_by_id(slot)
             .is_some_and(|d| self.is_current(d));
         let focus = driver.focus();
         let conversation = driver.conversation_id();
-        self.put_back(slot, driver);
+        self.put_back(slot, driver, cx);
         let mut restore = None;
         match result {
             Ok(user_seq) => {
@@ -1607,10 +1622,7 @@ impl ConversationView {
             }
         }
         if shown {
-            self.status = self
-                .current_driver()
-                .map(|d| d.status.clone())
-                .unwrap_or_default();
+            self.status = self.current_status(cx).unwrap_or_default();
         }
         self.reload();
         self.publish_status(cx);
@@ -1619,22 +1631,32 @@ impl ConversationView {
     }
 
     fn stop_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(ix) = self.drivers.iter().position(|d| self.is_current(d)) else {
+        let Some(ix) = self.current_index(cx) else {
             return;
         };
-        let slot = &mut self.drivers[ix];
-        match slot.driver_mut() {
-            Some(driver) => {
-                if let Err(err) = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent)) {
-                    self.error = Some(format!("{err:#}").into());
+        let mut cancel_error = None;
+        self.agent_runs.update(cx, |runs, cx| {
+            let Some(slot) = runs.slot_by_index(ix).map(|s| s.id) else {
+                return;
+            };
+            match runs.driver_mut(slot) {
+                Some(driver) => {
+                    if let Err(err) = driver.cancel(&self.fleet, &mut SharedAgentAccess(&self.agent))
+                    {
+                        cancel_error = Some(format!("{err:#}"));
+                    }
+                    let driver_status = driver.status();
+                    runs.set_status(slot, driver_status);
                 }
-                let driver_status = driver.status();
-                slot.status = driver_status;
+                // Away starting (or collecting) the turn: stopped when it is back.
+                None => runs.set_cancel(slot),
             }
-            // Away starting (or collecting) the turn: stopped when it is back.
-            None => slot.cancel = true,
+            cx.notify();
+        });
+        if let Some(err) = cancel_error {
+            self.error = Some(err.into());
         }
-        self.status = self.drivers[ix].status.clone();
+        self.status = self.current_status(cx).unwrap_or_default();
         self.reload();
         self.publish_status(cx);
         cx.notify();
