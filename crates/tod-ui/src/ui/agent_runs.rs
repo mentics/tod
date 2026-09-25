@@ -521,10 +521,11 @@ impl AgentRuns {
 
         let message = handoff_answer_message(&step, &answer);
         self.ensure_for_conversation(conversation_id)?;
+        // As in the conversation view, the step goes back to `in_progress`
+        // only once the answer has gone out: otherwise it would read as
+        // answered while the agent never heard it.
         if !self.send_to_conversation(conversation_id, &message, cx) {
-            tracing::warn!(
-                "answer_plan_step_handoff: could not deliver the answer to conversation {conversation_id}"
-            );
+            anyhow::bail!("the agent is busy; the answer was not sent");
         }
 
         self.fleet.interview(

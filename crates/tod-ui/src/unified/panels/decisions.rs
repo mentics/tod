@@ -57,6 +57,7 @@ use crate::ui::agent_runs::AgentRuns;
 use crate::ui::journey::{Source, record_action};
 use crate::ui::key_context;
 use crate::ui::selectable_text::{selectable_markdown, selectable_text};
+use crate::ui::style;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::views::lifecycle_control::LifecycleController;
@@ -246,6 +247,8 @@ pub struct DecisionsPanel {
     /// the top pending one, or the one being changed).
     selected_link: usize,
     pending_refresh: bool,
+    /// Why the last answer did not go through, shown until the next one.
+    last_error: Option<String>,
     _freeform_subscription: Subscription,
     _lifecycle_subscription: Subscription,
     _poll: gpui::Task<()>,
@@ -316,6 +319,7 @@ impl DecisionsPanel {
             changing: None,
             selected_link: 0,
             pending_refresh: false,
+            last_error: None,
             _freeform_subscription,
             _lifecycle_subscription,
             _poll,
@@ -408,10 +412,12 @@ impl DecisionsPanel {
             .unwrap_or_else(|| "freeform".to_string());
         Self::record_answer_journey(&decision, &chosen, source, cx);
         let decision_id = decision.id;
-        self.agent_runs.update(cx, |runs, cx| {
-            if let Err(err) = runs.answer_decision(decision_id, option, text, cx) {
-                tracing::warn!("decisions panel: failed to record answer: {err:#}");
-            }
+        let result = self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_decision(decision_id, option, text, cx)
+        });
+        self.last_error = result.err().map(|err| {
+            tracing::warn!("decisions panel: failed to record answer: {err:#}");
+            format!("{err:#}")
         });
         self.freeform_editing = None;
         self.changing = None;
@@ -511,10 +517,12 @@ impl DecisionsPanel {
             Self::presented_for_step(step),
         );
         let step_id = step.id;
-        self.agent_runs.update(cx, |runs, cx| {
-            if let Err(err) = runs.answer_plan_step_handoff(step_id, answer, cx) {
-                tracing::warn!("decisions panel: failed to answer plan step: {err:#}");
-            }
+        let result = self.agent_runs.update(cx, |runs, cx| {
+            runs.answer_plan_step_handoff(step_id, answer, cx)
+        });
+        self.last_error = result.err().map(|err| {
+            tracing::warn!("decisions panel: failed to answer plan step: {err:#}");
+            format!("{err:#}")
         });
         self.reload(cx);
     }
@@ -550,10 +558,12 @@ impl DecisionsPanel {
         );
         let finding_id = finding.id;
         let status = status.to_string();
-        self.agent_runs.update(cx, |runs, _| {
-            if let Err(err) = runs.respond_review_finding(finding_id, &status) {
-                tracing::warn!("decisions panel: failed to answer finding: {err:#}");
-            }
+        let result = self.agent_runs.update(cx, |runs, _| {
+            runs.respond_review_finding(finding_id, &status)
+        });
+        self.last_error = result.err().map(|err| {
+            tracing::warn!("decisions panel: failed to answer finding: {err:#}");
+            format!("{err:#}")
         });
         self.reload(cx);
     }
@@ -1205,6 +1215,14 @@ impl Render for DecisionsPanel {
                 .p_3()
                 .size_full()
                 .overflow_y_scroll()
+                .when_some(self.last_error.clone(), |el, err| {
+                    el.child(style::text_error(div().text_sm()).child(selectable_text(
+                        "unified-decisions-error",
+                        err,
+                        window,
+                        cx,
+                    )))
+                })
                 .child(
                     div()
                         .flex()
