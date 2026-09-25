@@ -17,6 +17,7 @@ mod provider;
 mod reply;
 mod routing;
 pub mod run_state;
+pub mod sandbox;
 mod transcript;
 mod usage;
 pub mod util;

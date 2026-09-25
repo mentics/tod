@@ -82,7 +82,7 @@ pub const CONTAINER_WORKTREES_DIR: &str = ".worktrees";
 pub fn worktree_dest_for(data_root: &Path, repo: &Workdir, branch: &str) -> Result<Workdir> {
     match repo {
         Workdir::Host(path) => Ok(Workdir::Host(worktree_dest(data_root, path, branch)?)),
-        Workdir::Container { .. } => Ok(repo
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => Ok(repo
             .join(CONTAINER_WORKTREES_DIR)
             .join(&branch_slug(branch))),
     }
@@ -427,7 +427,7 @@ fn git_path_arg(dir: &Workdir) -> Result<String> {
             .to_str()
             .context("worktree path utf8")?
             .to_string(),
-        Workdir::Container { path, .. } => path.clone(),
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => path.clone(),
     })
 }
 
@@ -451,7 +451,7 @@ fn git_worktree_add(repo: &Workdir, dest: &Workdir, branch: &str) -> Result<Work
             .create_dir_all()
             .with_context(|| format!("create worktree parent {parent}"))?;
     }
-    if matches!(repo, Workdir::Container { .. }) {
+    if repo.is_remote() {
         exclude_container_worktrees(repo)?;
     }
     let dest_str = git_path_arg(dest)?;
@@ -502,28 +502,30 @@ struct TreehouseLeaseJson {
 }
 
 /// Whether Treehouse can serve `repo`: the configured executable here, or a
-/// `treehouse` in the repository's dev container.
+/// `treehouse` in the repository's dev container or sandbox.
 fn treehouse_available_for(repo: &Workdir, settings: &TodSettings) -> bool {
     match repo {
         Workdir::Host(_) => treehouse_available(settings),
-        Workdir::Container { container, .. } => {
-            matches!(container_treehouse(container), Ok(Some(_)))
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+            matches!(remote_treehouse(repo), Ok(Some(_)))
         }
     }
 }
 
-/// The `treehouse` in `container`: the one on its `PATH`, which sets up its
-/// own environment there. Tod's settings for Treehouse name paths on this
-/// machine, so none of them apply.
-fn container_treehouse(container: &str) -> Result<Option<String>> {
-    tod_agent::devcontainer::ContainerExec::connect(container)?.find_program("treehouse")
+/// The `treehouse` where `dir` is (a container or sandbox): the one on its
+/// `PATH`, which sets up its own environment there. Tod's settings for
+/// Treehouse name paths on this machine, so none of them apply.
+fn remote_treehouse(dir: &Workdir) -> Result<Option<String>> {
+    dir.find_remote_program("treehouse")
 }
 
-/// Run Treehouse with `args` in `dir`, which is in a dev container.
+/// Run Treehouse with `args` in `dir`, which is in a dev container or sandbox.
 fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process::Output> {
-    let container = dir.container_name().context("not a container directory")?;
-    let program = container_treehouse(container)?.with_context(|| {
-        format!("No `treehouse` on the PATH in dev container {container}: install it there")
+    if !dir.is_remote() {
+        bail!("not a container or sandbox directory: {dir}");
+    }
+    let program = remote_treehouse(dir)?.with_context(|| {
+        format!("No `treehouse` on the PATH where {dir} is: install it there")
     })?;
     let no_update_check = format!("{TREEHOUSE_NO_UPDATE_CHECK_ENV}=1");
     // Treehouse runs git itself (in submodules too), which needs the same
@@ -544,7 +546,7 @@ fn run_container_treehouse(dir: &Workdir, args: &[&str]) -> Result<std::process:
 fn has_gitmodules(repo: &Workdir) -> bool {
     match repo {
         Workdir::Host(path) => path.join(".gitmodules").is_file(),
-        Workdir::Container { .. } => repo
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => repo
             .output("test", &["-f", ".gitmodules"])
             .is_ok_and(|out| out.status.success()),
     }
@@ -577,7 +579,9 @@ fn treehouse_get_lease(
                 .output()
                 .context("spawn treehouse get --lease")?
         }
-        Workdir::Container { .. } => run_container_treehouse(repo, &args)?,
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => {
+            run_container_treehouse(repo, &args)?
+        }
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -778,7 +782,9 @@ fn comparable_path(path: &Workdir) -> String {
                 text.to_string()
             }
         }
-        Workdir::Container { path, .. } => path.trim_end_matches('/').to_string(),
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => {
+            path.trim_end_matches('/').to_string()
+        }
     }
 }
 
@@ -801,7 +807,7 @@ pub fn treehouse_return(
                 .output()
                 .context("spawn treehouse return")?
         }
-        Workdir::Container { path, .. } => run_container_treehouse(
+        Workdir::Container { path, .. } | Workdir::Sandbox { path, .. } => run_container_treehouse(
             &worktree.at("/"),
             &["return", path, "--if-lease-id", lease_id],
         )?,
@@ -821,7 +827,7 @@ pub fn validate_git_repo(repo: &Workdir) -> Result<Workdir> {
             path.canonicalize()
                 .with_context(|| format!("repo path {}", path.display()))?,
         ),
-        Workdir::Container { .. } => repo.clone(),
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => repo.clone(),
     };
     run_git(&checked, &["rev-parse", "--git-dir"])?;
     Ok(checked)

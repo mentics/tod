@@ -25,11 +25,12 @@ pub fn with_codebase_rules(context: String, cwd: &Path) -> String {
 }
 
 /// [`with_codebase_rules`] for a directory that may be inside a dev
-/// container. One there is the node's Files directory, always a checkout.
+/// container or cloud sandbox. One there is the node's Files directory,
+/// always a checkout.
 pub fn with_codebase_rules_in(context: String, cwd: &Workdir) -> String {
     match cwd {
         Workdir::Host(path) => with_codebase_rules(context, path),
-        Workdir::Container { .. } => append_rules(context, true),
+        Workdir::Container { .. } | Workdir::Sandbox { .. } => append_rules(context, true),
     }
 }
 

@@ -163,6 +163,7 @@ mod tests {
         let dev_container = DevContainerSetting {
             container: Some("my-dev".into()),
             repo_on_host: false,
+            ..Default::default()
         };
 
         let snapshot = settings_snapshot(

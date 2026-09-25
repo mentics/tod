@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 /// `repo_on_host`, the repository is on this machine and mounted into the
 /// container: the workspace directory stays a host path, git runs here, and
 /// only the launches go into the container.
+///
+/// With `sandbox`, `container` names a cloud sandbox (see
+/// [`crate::fleet::sandbox`]) instead: the repository always lives in it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevContainerSetting {
     /// Container name or id; `None` until one is chosen.
@@ -25,6 +28,9 @@ pub struct DevContainerSetting {
     /// The repository is on this machine, mounted into the container.
     #[serde(default)]
     pub repo_on_host: bool,
+    /// `container` is a cloud sandbox, not a Docker container.
+    #[serde(default)]
+    pub sandbox: bool,
 }
 
 impl DevContainerSetting {
@@ -32,12 +38,38 @@ impl DevContainerSetting {
         self.container.as_deref().map(str::trim).filter(|c| !c.is_empty())
     }
 
-    /// The container the repository lives in, when it lives in one.
+    /// The Docker container the repository lives in, when it lives in one.
     pub fn repo_container(&self) -> Option<&str> {
-        if self.repo_on_host {
+        if self.repo_on_host || self.sandbox {
             return None;
         }
         self.container()
+    }
+
+    /// The cloud sandbox the repository lives in, when it lives in one.
+    pub fn repo_sandbox(&self) -> Option<&str> {
+        if !self.sandbox {
+            return None;
+        }
+        self.container()
+    }
+
+    /// The Docker container a repository on this machine is mounted into.
+    pub fn mounted_container(&self) -> Option<&str> {
+        if !self.repo_on_host || self.sandbox {
+            return None;
+        }
+        self.container()
+    }
+
+    /// The repository is not on this machine (a container or a sandbox holds it).
+    pub fn repo_is_remote(&self) -> bool {
+        self.repo_container().is_some() || self.repo_sandbox().is_some()
+    }
+
+    /// `container_kind` as stored.
+    pub fn kind(&self) -> &'static str {
+        if self.sandbox { "sandbox" } else { "docker" }
     }
 }
 
@@ -76,7 +108,7 @@ impl<'a> NodeFilesRepo<'a> {
         self.conn
             .query_row(
                 "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
-                        dev_container, container, container_repo_on_host
+                        dev_container, container, container_repo_on_host, container_kind
                  FROM node_files WHERE node_id = ?1",
                 params![blob],
                 row_to_files,
@@ -103,24 +135,27 @@ impl<'a> NodeFilesRepo<'a> {
         dev_container: Option<&DevContainerSetting>,
     ) -> Result<()> {
         let blob = node_id_blob(node_id)?;
-        let (on, container, on_host) = match dev_container {
+        let (on, container, on_host, kind) = match dev_container {
             Some(setting) => (
                 1,
                 setting.container().map(str::to_string),
-                i32::from(setting.repo_on_host),
+                i32::from(setting.repo_on_host && !setting.sandbox),
+                setting.kind(),
             ),
-            None => (0, None, 0),
+            None => (0, None, 0, "docker"),
         };
         self.conn.execute(
             "INSERT INTO node_files
-               (node_id, use_worktree, dev_container, container, container_repo_on_host, updated_at)
-             VALUES (?1, 0, ?2, ?3, ?4, ?5)
+               (node_id, use_worktree, dev_container, container, container_repo_on_host,
+                container_kind, updated_at)
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(node_id) DO UPDATE SET
                dev_container = excluded.dev_container,
                container = excluded.container,
                container_repo_on_host = excluded.container_repo_on_host,
+               container_kind = excluded.container_kind,
                updated_at = excluded.updated_at",
-            params![blob, on, container, on_host, now_ms()],
+            params![blob, on, container, on_host, kind, now_ms()],
         )?;
         Ok(())
     }
@@ -158,7 +193,7 @@ impl<'a> NodeFilesRepo<'a> {
     pub fn list_with_worktree(&self) -> Result<Vec<NodeFiles>> {
         let mut stmt = self.conn.prepare(
             "SELECT node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder,
-                    dev_container, container, container_repo_on_host
+                    dev_container, container, container_repo_on_host, container_kind
              FROM node_files WHERE worktree_path IS NOT NULL AND worktree_path != ''",
         )?;
         let rows = stmt
@@ -209,6 +244,7 @@ fn row_to_files(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeFiles> {
             Some(DevContainerSetting {
                 container: row.get(6)?,
                 repo_on_host: row.get::<_, i64>(7)? != 0,
+                sandbox: row.get::<_, String>(8)? == "sandbox",
             })
         } else {
             None
@@ -264,6 +300,7 @@ mod tests {
         let setting = DevContainerSetting {
             container: Some(" my-dev ".into()),
             repo_on_host: true,
+            ..Default::default()
         };
         repo.set_dev_container(&a, Some(&setting)).unwrap();
         let files = repo.get(&a).unwrap().unwrap();

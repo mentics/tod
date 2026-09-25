@@ -3,6 +3,7 @@
 use crate::fleet::code_editor::CodeEditor;
 use crate::fleet::terminal::path_util::normalize_launch_path;
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -73,6 +74,29 @@ pub fn spawn_zed(cwd: &Path) -> Result<()> {
     if !cwd.is_dir() {
         bail!("workspace directory does not exist: {}", cwd.display());
     }
+    let env = crate::paths::TodPaths::discover()
+        .ok()
+        .and_then(|paths| zed_env(paths.data_root()).ok())
+        .unwrap_or_default();
+    spawn_zed_with(&zed_open_args(&cwd), &env)
+}
+
+/// Opens `ssh://...` in Zed with the environment [`zed_env`] gives for `data_root`.
+/// The Zed URL for `path` in sandbox `sandbox`, which tod's shim routes.
+pub fn sandbox_url(sandbox: &str, path: &str) -> String {
+    format!(
+        "ssh://root@{}/{}",
+        tod_sandbox::config::host_for(sandbox),
+        path.trim_start_matches('/')
+    )
+}
+
+pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
+    let env = zed_env(data_root)?;
+    spawn_zed_with(&[url.to_string()], &env)
+}
+
+fn spawn_zed_with(args: &[String], env: &[(String, OsString)]) -> Result<()> {
     let bin = resolve_zed_bin().ok_or_else(|| {
         anyhow::anyhow!(
             "Zed CLI not found. Install Zed and ensure `zed` is on PATH \
@@ -80,15 +104,77 @@ pub fn spawn_zed(cwd: &Path) -> Result<()> {
              Windows: typically %LOCALAPPDATA%\\Programs\\Zed\\bin)."
         )
     })?;
-    let args = zed_open_args(&cwd);
     Command::new(&bin)
-        .args(&args)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawn `{} {}`", bin.display(), args.join(" ")))
         .map(|_| ())
+}
+
+/// Where Zed's `ssh`, `scp`, and `sftp` stand-ins live, under the data root.
+pub const SHIM_DIR: &str = "zed-shim";
+
+fn exe_name(stem: &str) -> String {
+    format!("{stem}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// The environment for a Zed that tod starts.
+///
+/// tod is assumed to be the only thing that starts Zed. Its `ssh` is
+/// `tod-zed-shim` (installed beside this executable), copied into
+/// `<data_root>/zed-shim/` as `ssh`, `scp`, and `sftp` and put first on Zed's
+/// PATH: hosts named `<sandbox>.tod` go to the sandbox's relay, every other
+/// host to the real `ssh`. The shim finds `tod-sandbox` and the data root
+/// through `TOD_SANDBOX_BIN` and `TOD_DATA_ROOT`. Without an installed shim
+/// the environment is empty and Zed starts as it always did.
+pub fn zed_env(data_root: &Path) -> Result<Vec<(String, OsString)>> {
+    let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else {
+        return Ok(Vec::new());
+    };
+    let shim = exe_dir.join(exe_name("tod-zed-shim"));
+    if !shim.is_file() {
+        return Ok(Vec::new());
+    }
+    let dir = data_root.join(SHIM_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let bytes = std::fs::read(&shim).with_context(|| format!("read {}", shim.display()))?;
+    for name in ["ssh", "scp", "sftp"] {
+        let target = dir.join(exe_name(name));
+        if std::fs::read(&target).is_ok_and(|current| current == bytes) {
+            continue;
+        }
+        // A running Zed holds the old copy open on Windows; it is replaced
+        // the next time Zed is not running.
+        if let Err(err) = std::fs::write(&target, &bytes) {
+            if !target.is_file() {
+                return Err(err).with_context(|| format!("install {}", target.display()));
+            }
+            tracing::warn!("keeping the older {}: {err}", target.display());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let mut path = OsString::from(dir.as_os_str());
+    if let Some(old) = std::env::var_os("PATH") {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(old);
+    }
+    let mut env = vec![
+        ("PATH".to_string(), path),
+        ("TOD_DATA_ROOT".to_string(), data_root.as_os_str().to_os_string()),
+    ];
+    let sandbox_bin = exe_dir.join(exe_name("tod-sandbox"));
+    if sandbox_bin.is_file() {
+        env.push(("TOD_SANDBOX_BIN".to_string(), sandbox_bin.into_os_string()));
+    }
+    Ok(env)
 }
 
 /// The Zed [`CodeEditor`] plugin.

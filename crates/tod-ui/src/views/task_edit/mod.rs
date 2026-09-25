@@ -783,9 +783,11 @@ impl TaskEditView {
             if self.own_files().is_some() {
                 stops.push(TaskEditField::RunsIn);
             }
-            if self.own_dev_container().is_some() {
+            if let Some(dev) = self.own_dev_container() {
+                if !dev.sandbox {
+                    stops.push(TaskEditField::RepoLocation);
+                }
                 stops.extend([
-                    TaskEditField::RepoLocation,
                     TaskEditField::ContainerName,
                     TaskEditField::ContainerRefresh,
                 ]);
@@ -3086,11 +3088,15 @@ impl TaskEditView {
         }
         if !value.is_empty() && self.repo_in_container() {
             if !value.starts_with('/') {
-                self.pending_toast = Some(
-                    "The repository is inside the dev container: give its path there, \
-                     like /workspaces/app"
-                        .into(),
-                );
+                let example = if self.runs_in_sandbox() {
+                    "/root/app"
+                } else {
+                    "/workspaces/app"
+                };
+                self.pending_toast = Some(format!(
+                    "The repository is inside {}: give its path there, like {example}",
+                    self.remote_place()
+                ));
                 self.pending_repo_revert = true;
                 cx.notify();
                 return;
@@ -3789,7 +3795,9 @@ impl TaskEditView {
                                 .w(px(280.))
                                 .flex_shrink_0()
                                 .child(Self::render_field_label(
-                                    if self.repo_in_container() {
+                                    if self.runs_in_sandbox() {
+                                        "Workspace directory (in the sandbox)"
+                                    } else if self.repo_in_container() {
                                         "Workspace directory (in the container)"
                                     } else {
                                         "Workspace directory"
@@ -3947,8 +3955,7 @@ impl TaskEditView {
                 if let Some(container) = resolved
                     .dev_container
                     .as_ref()
-                    .filter(|dev| dev.repo_on_host)
-                    .and_then(|dev| dev.container())
+                    .and_then(|dev| dev.mounted_container())
                 {
                     summary = format!("{summary} · in dev container {container}");
                 }

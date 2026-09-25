@@ -789,10 +789,11 @@ impl ConversationDriver {
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
             context.map(|context| crate::codebase_rules::with_codebase_rules_in(context, &cwd));
-        // An agent inside a dev container is started from the data root here.
+        // An agent inside a dev container or sandbox is started from the
+        // data root here.
         let cwd = match cwd {
             Workdir::Host(path) => path,
-            Workdir::Container { .. } => fleet.paths().root().to_path_buf(),
+            Workdir::Container { .. } | Workdir::Sandbox { .. } => fleet.paths().root().to_path_buf(),
         };
         let opening = context.as_ref().map(|context| SessionOpening {
             context: Some(context.clone()),

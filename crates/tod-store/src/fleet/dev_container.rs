@@ -1,8 +1,9 @@
-//! Where a node's launches run: this machine, or the dev container its Files
-//! capability names.
+//! Where a node's launches run: this machine, or the dev container or cloud
+//! sandbox its Files capability names.
 //!
 //! [`launch_for`] only describes the launch; `tod_agent::devcontainer::prepare`
-//! checks it against the running container (off the UI thread).
+//! checks it against the running container (off the UI thread), and the
+//! `tod-sandbox` launcher makes a sandbox ready as it starts.
 
 use crate::fleet::cli_relay;
 use crate::fleet::node_actions::ResolvedFiles;
@@ -11,6 +12,7 @@ use anyhow::Result;
 use std::path::Path;
 use tod_agent::AgentEnvironment;
 use tod_agent::devcontainer::{ContainerFile, DevContainerLaunch};
+use tod_agent::sandbox::SandboxLaunch;
 
 /// The container path of the `tod-cli` shim.
 pub fn shim_path() -> String {
@@ -22,13 +24,15 @@ pub fn shim_path() -> String {
 /// directory on this machine launches in the node's dev container only when
 /// its repository is mounted into one and `cwd` is in its Files directory
 /// (not the data root, for a turn that needs no workspace); `None` means
-/// this machine. Starts the `tod-cli` relay.
+/// this machine, or a sandbox (see [`sandbox_launch_for`]). Starts the
+/// `tod-cli` relay.
 pub fn launch_for(
     files: Option<&ResolvedFiles>,
     cwd: &Workdir,
     data_root: &Path,
 ) -> Result<Option<DevContainerLaunch>> {
     let (container, host_dir, directory) = match cwd {
+        Workdir::Sandbox { .. } => return Ok(None),
         Workdir::Container { container, path } => {
             (container.clone(), data_root.to_path_buf(), Some(path.clone()))
         }
@@ -36,10 +40,11 @@ pub fn launch_for(
             let Some(files) = files else {
                 return Ok(None);
             };
-            let Some(dev) = files.dev_container.as_ref().filter(|dev| dev.repo_on_host) else {
-                return Ok(None);
-            };
-            let Some(container) = dev.container() else {
+            let Some(container) = files
+                .dev_container
+                .as_ref()
+                .and_then(|dev| dev.mounted_container())
+            else {
                 return Ok(None);
             };
             let Some(Workdir::Host(root)) = files.ready_directory() else {
@@ -67,12 +72,33 @@ pub fn launch_for(
     }))
 }
 
-/// [`launch_for`] as the environment an agent runs in.
+/// The sandbox launch for a process that runs in `cwd`, when that is in a
+/// cloud sandbox: through `tod-sandbox` beside this executable, with the
+/// sandbox's `tod-cli` carried back to the relay. Starts the relay.
+pub fn sandbox_launch_for(cwd: &Workdir, data_root: &Path) -> Result<Option<SandboxLaunch>> {
+    let Workdir::Sandbox { sandbox, path } = cwd else {
+        return Ok(None);
+    };
+    let relay = cli_relay::ensure_started(data_root)?;
+    Ok(Some(SandboxLaunch {
+        launcher: crate::fleet::sandbox::sibling_exe("tod-sandbox"),
+        data_root: data_root.to_path_buf(),
+        sandbox: sandbox.clone(),
+        directory: path.clone(),
+        env: Vec::new(),
+        cli_relay: relay.env(),
+    }))
+}
+
+/// [`launch_for`] or [`sandbox_launch_for`] as the environment an agent runs in.
 pub fn environment_for(
     files: Option<&ResolvedFiles>,
     cwd: &Workdir,
     data_root: &Path,
 ) -> Result<AgentEnvironment> {
+    if let Some(launch) = sandbox_launch_for(cwd, data_root)? {
+        return Ok(AgentEnvironment::Sandbox(launch));
+    }
     Ok(match launch_for(files, cwd, data_root)? {
         Some(launch) => AgentEnvironment::DevContainer(launch),
         None => AgentEnvironment::Host,
@@ -108,6 +134,7 @@ mod tests {
         let dev = DevContainerSetting {
             container: Some("my-dev".into()),
             repo_on_host: true,
+            ..Default::default()
         };
         let on_host = files(&dir, None);
         assert!(launch_for(Some(&on_host), &cwd, &data_root).unwrap().is_none());
@@ -143,5 +170,17 @@ mod tests {
             Some("/workspaces/app/.worktrees/x")
         );
         assert_eq!(launch.host_dir, data_root);
+    }
+
+    #[test]
+    fn a_directory_in_a_sandbox_launches_there() {
+        let data_root = std::env::temp_dir();
+        let cwd = Workdir::sandbox("dev", "/root/app");
+        assert!(launch_for(None, &cwd, &data_root).unwrap().is_none());
+        let AgentEnvironment::Sandbox(launch) = environment_for(None, &cwd, &data_root).unwrap() else {
+            panic!("sandbox launch");
+        };
+        assert_eq!((launch.sandbox.as_str(), launch.directory.as_str()), ("dev", "/root/app"));
+        assert!(launch.cli_relay.iter().any(|(k, _)| k == cli_relay::PORT_ENV));
     }
 }

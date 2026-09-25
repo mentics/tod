@@ -95,6 +95,8 @@ impl FleetStore {
         recover_incomplete_storage_migration(&paths).map_err(FleetLaunchError::Other)?;
         FleetLaunch::prepare(&paths)?;
         let lock = FleetLock::try_acquire(paths.root()).map_err(map_lock_error)?;
+        // One app per data root: its cloud sandboxes are this root's.
+        crate::fleet::sandbox::set_data_root(paths.root());
         let command_log = CommandLog::shared();
         let writer = FleetWriter::open_with_debounce(
             paths.db(),

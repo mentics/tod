@@ -257,7 +257,9 @@ pub fn runs_in(dev: &Option<crate::fleet::repos::node_files::DevContainerSetting
         None => "this machine".into(),
         Some(dev) => {
             let container = dev.container().unwrap_or("(none chosen)");
-            if dev.repo_on_host {
+            if dev.sandbox {
+                format!("cloud sandbox {container}")
+            } else if dev.repo_on_host {
                 format!("dev container {container}, mounted")
             } else {
                 format!("dev container {container}")

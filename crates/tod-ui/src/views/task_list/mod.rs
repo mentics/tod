@@ -1417,13 +1417,14 @@ impl TaskListView {
             }
             let repo = task_row.repo.as_deref().unwrap_or("");
             let branch = task_row.branch.as_deref().unwrap_or("");
-            // A repository inside a dev container can't be checked from here.
+            // A repository inside a dev container or sandbox can't be checked
+            // from here.
             let in_container = self
                 .fleet
                 .resolve_files_for_node(task_id)
                 .ok()
                 .flatten()
-                .is_some_and(|files| files.repo_container().is_some());
+                .is_some_and(|files| files.repo_is_remote());
             if !in_container
                 && let Err(err) =
                     validate_interview_workspace(PathBuf::from(repo).as_path(), branch)

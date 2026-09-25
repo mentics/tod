@@ -1634,6 +1634,26 @@ fn spawn_agent(
                 in_container: true,
             })
         }
+        AgentEnvironment::Sandbox(launch) => {
+            let bin = crate::acp_host::sandbox_agent_bin(host, launch)?;
+            tracing::info!(
+                event = "agent",
+                action = "acp_spawn_sandbox",
+                host = host.label(),
+                sandbox = %launch.sandbox,
+                cwd = %launch.directory,
+                agent_bin = %bin,
+                "starting ACP agent in cloud sandbox"
+            );
+            let child = crate::acp_host::spawn_acp_in_sandbox(host, launch, &bin, env)?;
+            Ok(SpawnedAgent {
+                child,
+                agent_bin: PathBuf::from(bin),
+                cwd: PathBuf::from(&launch.directory),
+                write_roots: vec![PathBuf::from(&launch.directory)],
+                in_container: true,
+            })
+        }
     }
 }
 
