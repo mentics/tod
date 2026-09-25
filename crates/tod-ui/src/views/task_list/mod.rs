@@ -2841,6 +2841,7 @@ impl TaskListView {
 
         let row = div()
             .h_flex()
+            .flex_wrap()
             .items_center()
             .gap_2()
             .px_3()
@@ -2896,7 +2897,7 @@ impl TaskListView {
                 TASK_LIST_CONTEXT,
                 cx,
             ))
-            .child(div().flex_1().min_w_0().child(search));
+            .child(div().flex_1().min_w(px(120.)).child(search));
 
         let mut row = row;
 
@@ -3004,6 +3005,7 @@ impl TaskListView {
         });
         Some(
             gpui_component::h_flex()
+                .flex_wrap()
                 .items_center()
                 .gap(crate::ui::style::space::HAIRLINE)
                 .px(crate::ui::style::space::RELATED)

@@ -416,8 +416,11 @@ impl Render for ChatDrawer {
                 .into_any_element();
         }
 
-        let about = self.about.clone();
         let error = self.error.clone();
+        // The transcript panel's own header already shows "Chat — {about}"
+        // (`AgentConversationPanel::set_title`), so this bar only holds the
+        // collapse control and any error — showing the title again here
+        // would duplicate it.
         let header = div()
             .id("chat-drawer-header")
             .flex()
@@ -437,7 +440,6 @@ impl Render for ChatDrawer {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().text_sm().child(format!("Chat — {about}")))
                     .when_some(error, |el, err| {
                         el.child(style::text_error(div()).text_xs().child(err))
                     }),

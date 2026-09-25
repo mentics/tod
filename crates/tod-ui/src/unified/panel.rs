@@ -11,6 +11,7 @@ use gpui::{
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, Sizable};
+use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 
 use super::columns::PanelKind;
@@ -42,6 +43,14 @@ pub struct PanelOpenRequest {
     pub target: PanelKind,
     pub ctrl: bool,
 }
+
+/// Emitted by a panel when its own selection changes to something that can
+/// hold an agent session (an obligation or a plan step, alongside a node
+/// selection in the tree or Details). The chat drawer follows whichever of
+/// these happened most recently, across panels
+/// (`doc/ui/unified-view.md` "The chat drawer").
+#[derive(Debug, Clone, Copy)]
+pub struct PanelFocusSelected(pub Focus);
 
 /// One link inside a placeholder panel: a label and the panel it opens.
 #[derive(Debug, Clone)]
