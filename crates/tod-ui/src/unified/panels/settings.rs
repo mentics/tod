@@ -34,6 +34,7 @@ impl SettingsPanel {
         let id = node_id.to_string();
         let inner = cx.new(|cx| {
             let mut view = TaskEditView::new(window, cx, fleet.clone(), paths);
+            view.set_embedded(true);
             view.open(&id, window, cx);
             view
         });

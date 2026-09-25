@@ -54,9 +54,15 @@ view is meant to end both.
 
 - **Column 1 is always the node tree panel.** It never leaves the screen: to
   answer one node's question the user often has to go and look at another.
-- **Columns 2 onward hold whatever the user opened.** The window fits four or
-  five columns comfortably. When there are more than fit, the oldest unpinned
-  columns fold into narrow strips instead of squeezing every column.
+  It keeps a width of its own — a default until the user drags the divider
+  beside it, then theirs — whatever opens or closes beside it.
+- **Columns 2 onward hold whatever the user opened**, and share the rest of
+  the width equally. The first takes all of it; a second halves it; a third
+  takes a third. There is no limit and nothing folds away: many columns are
+  just narrow ones.
+- The focused column's header is tinted (`column-header` in
+  `doc/ui-style-guide.yaml`). Column 1's header is the node tree's own
+  toolbar, on one fixed-height row.
 - When the app opens, only the tree is shown. Selecting a node opens its
   details panel in column 2.
 

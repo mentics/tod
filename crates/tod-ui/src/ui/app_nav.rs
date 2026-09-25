@@ -322,26 +322,53 @@ pub trait HasAppNav {
     where
         Self: Render + HasAppNav + Sized + 'static,
     {
+        self.render_app_nav_with_badge(true, window, cx)
+    }
+
+    /// [`Self::render_app_nav`] without the shortcut badge hanging below the
+    /// button, for a fixed-height header that has no room for it.
+    fn render_app_nav_without_badge(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        Self: Render + HasAppNav + Sized + 'static,
+    {
+        self.render_app_nav_with_badge(false, window, cx)
+    }
+
+    fn render_app_nav_with_badge(
+        &mut self,
+        badge: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement
+    where
+        Self: Render + HasAppNav + Sized + 'static,
+    {
         let menu_open = self.app_nav_mut().is_open();
         let menu_focused = self.app_nav_mut().menu_focused(window, cx);
         let menu = self.app_nav_mut().menu.clone();
 
+        let trigger = Button::new("app-nav-trigger")
+            .icon(IconName::Menu)
+            .compact()
+            .selected(menu_open || menu_focused)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_app_nav(window, cx);
+            }));
+        let trigger = if badge {
+            chrome_control_with_shortcut_in_context(trigger, window, &AppNavToggle, None, cx)
+                .into_any_element()
+        } else {
+            trigger.into_any_element()
+        };
+
         div()
             .id("app-nav-menu")
             .relative()
-            .child(chrome_control_with_shortcut_in_context(
-                Button::new("app-nav-trigger")
-                    .icon(IconName::Menu)
-                    .compact()
-                    .selected(menu_open || menu_focused)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_app_nav(window, cx);
-                    })),
-                window,
-                &AppNavToggle,
-                None,
-                cx,
-            ))
+            .child(trigger)
             .when(menu_open, |el| {
                 el.when_some(menu, |el, menu| {
                     el.child(
