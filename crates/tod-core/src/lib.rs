@@ -42,6 +42,7 @@ pub mod process_bundle;
 pub mod run_transcript;
 pub mod session_name;
 pub mod task;
+pub mod workbench_layout;
 
 pub use interview::{TodPaths, set_data_root};
 
