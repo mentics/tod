@@ -54,6 +54,12 @@ view is meant to end both.
 
 - **Column 1 is always the node tree panel.** It never leaves the screen: to
   answer one node's question the user often has to go and look at another.
+  It starts wide enough for about 80 characters of a node's title, unless
+  that would leave no room for a panel beside it.
+- **Every divider between two columns can be dragged** to resize them. A drag
+  moves width between the two columns beside the divider and leaves the rest
+  where they are; the last column always takes whatever is left. Folded
+  strips have no divider.
 - **Columns 2 onward hold whatever the user opened.** The window fits four or
   five columns comfortably. When there are more than fit, the oldest unpinned
   columns fold into narrow strips instead of squeezing every column.
@@ -107,9 +113,9 @@ That one mechanism covers several layouts no one has to configure:
   deliberate: pinning a panel on the right and unpinning column 2 is how a user
   changes what appears in the middle.
 
-Pinning is the only layout control. A fully user-configurable layout (any
-panel in any slot, docking, dragging) was considered and rejected as not worth
-building.
+Pinning and dragging dividers are the only layout controls. A fully
+user-configurable layout (any panel in any slot, docking, dragging panels
+around) was considered and rejected as not worth building.
 
 ### The chat drawer
 
