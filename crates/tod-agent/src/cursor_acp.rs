@@ -1098,6 +1098,7 @@ fn run_acp_session(
             model,
             effort,
         )?;
+        apply_permission_mode(&mut session, host, session_id, &session_result)?;
 
         if cancelled.load(Ordering::SeqCst) {
             bail!("ACP run cancelled");
@@ -1856,6 +1857,92 @@ fn apply_session_config_options(
     Ok(())
 }
 
+/// Claude permission modes to run in, most preferred first: Claude Code's
+/// `auto`, else `acceptEdits` for adapters that predate it. The adapter
+/// otherwise starts every session in `default`, which stops to ask before
+/// each edit.
+const CLAUDE_PERMISSION_MODES: &[&str] = &["auto", "acceptEdits"];
+
+/// The first of `preferred` among the modes `result` (a `session/new`,
+/// `session/load`, or `session/resume` response) offers, and how to set it:
+/// `Some(Some(config_id))` through `session/set_config_option`, `Some(None)`
+/// through `session/set_mode`. `None` when it offers none of them, or already
+/// runs in the first one it offers.
+fn pick_permission_mode(result: &Value, preferred: &[&str]) -> Option<(String, Option<Value>)> {
+    let mode_option = result
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("mode"))
+        });
+    if let Some(option) = mode_option {
+        let target = preferred
+            .iter()
+            .find(|mode| has_config_option_value(option, mode))?;
+        if option.get("currentValue").and_then(Value::as_str) == Some(target) {
+            return None;
+        }
+        let id = option.get("id").cloned().unwrap_or(json!("mode"));
+        return Some((target.to_string(), Some(id)));
+    }
+    let modes = result.get("modes")?;
+    let available = modes.get("availableModes")?.as_array()?;
+    let target = preferred.iter().find(|mode| {
+        available
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == Some(mode))
+    })?;
+    if modes.get("currentModeId").and_then(Value::as_str) == Some(target) {
+        return None;
+    }
+    Some((target.to_string(), None))
+}
+
+/// Put a Claude session in [`CLAUDE_PERMISSION_MODES`]' first offered mode.
+/// Other hosts keep their own mode.
+fn apply_permission_mode(
+    session: &mut AcpClient,
+    host: AcpHost,
+    session_id: &str,
+    result: &Value,
+) -> Result<()> {
+    if host != AcpHost::Claude {
+        return Ok(());
+    }
+    let Some((mode, config_id)) = pick_permission_mode(result, CLAUDE_PERMISSION_MODES) else {
+        let modes = result.get("modes").map(Value::to_string).unwrap_or_default();
+        tracing::debug!(
+            event = "agent",
+            action = "acp_permission_mode_kept",
+            session_id,
+            modes = %modes,
+            "Claude session keeps its permission mode"
+        );
+        return Ok(());
+    };
+    tracing::info!(
+        event = "agent",
+        action = "acp_set_permission_mode",
+        session_id,
+        mode = %mode,
+        "ACP set permission mode"
+    );
+    match config_id {
+        Some(config_id) => session.send_request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": config_id, "value": mode }),
+        )?,
+        None => session.send_request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": mode }),
+        )?,
+    };
+    session.await_response(AUTH_TIMEOUT)?;
+    Ok(())
+}
+
 struct PersistentAcpSession {
     client: AcpClient,
     session_id: String,
@@ -1992,6 +2079,7 @@ impl PersistentAcpSession {
             model,
             effort,
         )?;
+        apply_permission_mode(&mut client, host, &session_id, &session_result)?;
 
         Ok(Self {
             client,
@@ -2091,6 +2179,51 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    fn session_with_modes(current: &str, ids: &[&str]) -> Value {
+        json!({
+            "sessionId": "s1",
+            "modes": {
+                "currentModeId": current,
+                "availableModes": ids.iter().map(|id| json!({ "id": id, "name": id })).collect::<Vec<_>>(),
+            }
+        })
+    }
+
+    #[test]
+    fn permission_mode_prefers_auto_then_accept_edits() {
+        let with_auto = session_with_modes("default", &["default", "acceptEdits", "auto"]);
+        assert_eq!(
+            pick_permission_mode(&with_auto, CLAUDE_PERMISSION_MODES),
+            Some(("auto".to_string(), None))
+        );
+        let without_auto = session_with_modes("default", &["default", "acceptEdits", "plan"]);
+        assert_eq!(
+            pick_permission_mode(&without_auto, CLAUDE_PERMISSION_MODES),
+            Some(("acceptEdits".to_string(), None))
+        );
+        let already = session_with_modes("auto", &["default", "auto"]);
+        assert_eq!(pick_permission_mode(&already, CLAUDE_PERMISSION_MODES), None);
+        let neither = session_with_modes("default", &["default", "plan"]);
+        assert_eq!(pick_permission_mode(&neither, CLAUDE_PERMISSION_MODES), None);
+        assert_eq!(pick_permission_mode(&json!({}), CLAUDE_PERMISSION_MODES), None);
+    }
+
+    #[test]
+    fn permission_mode_uses_a_mode_config_option_when_offered() {
+        let result = json!({
+            "configOptions": [{
+                "id": "permission",
+                "category": "mode",
+                "currentValue": "default",
+                "options": [{ "value": "default" }, { "value": "auto" }],
+            }]
+        });
+        assert_eq!(
+            pick_permission_mode(&result, CLAUDE_PERMISSION_MODES),
+            Some(("auto".to_string(), Some(json!("permission"))))
+        );
     }
 
     #[test]

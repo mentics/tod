@@ -1036,6 +1036,13 @@ impl ConversationView {
         let mut loop_turns = None;
         let current = self.conversation_id;
         for (slot, driver, events) in ticked {
+            // Every run this loop collects can block on a permission, not
+            // only the one this view shows: the workbench's chat drawer and
+            // the lifecycle panel's background runs have no poll loop of
+            // their own, so nothing else would ever ask the user.
+            if let Some(request) = driver.status().permission {
+                queue_permission_request(self.agent.clone(), request);
+            }
             for event in events {
                 finished = true;
                 match event {
@@ -1073,9 +1080,6 @@ impl ConversationView {
             self.usage.stale = true;
         }
         let current = self.current_status(cx).unwrap_or_default();
-        if let Some(request) = current.permission.clone() {
-            queue_permission_request(self.agent.clone(), request);
-        }
         // A finished run for another conversation leaves nothing to show.
         let conversation_id = self.conversation_id;
         let focus = self.focus;
