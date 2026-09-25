@@ -34,7 +34,7 @@ view is meant to end both.
 | **Bottom region** | The status bar. |
 | **Panel** | One piece of content placed in a slot: the node tree panel, the details panel, the decisions panel, the obligations panel, the settings panel. |
 | **Pane** | A subsection of a panel. |
-| **Drawer** | A panel that slides out over the columns from an edge and collapses back on its own. The chat drawer is the only one so far. |
+| **Drawer** | A panel that slides out from an edge and collapses back on its own. It pushes what is above it up rather than covering it. The chat drawer is the only one so far. |
 
 ## Layout
 
@@ -44,9 +44,10 @@ view is meant to end both.
 │ column 1  │ column 2     │ column 3     │ column 4     │ …               │
 │ node tree │ (any panel)  │ (any panel)  │ (any panel)  │                 │
 │           │              │              │              │                 │
-│           ├──────────────┴──────────────┴──────────────┤                 │
-│           │ chat drawer (collapsed to a "Chat" tab)     │                 │
-├───────────┴─────────────────────────────────────────────┴─────────────────┤
+├───────────┤              │              │              │                 │
+│ chat      │              │              │              │                 │
+│ drawer    │              │              │              │                 │
+├───────────┴──────────────┴──────────────┴──────────────┴─────────────────┤
 │                        bottom region: status bar                           │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -77,7 +78,8 @@ view is meant to end both.
 - From the keyboard, **Enter** on a focused link is a click and **Ctrl+Enter**
   is a Ctrl+click. On an item (a node, an obligation, a plan step), Enter
   edits it, as it does in every list and in the node tree; **E** opens the
-  item's panel instead, as it already opens the node tree's edit panel.
+  item's panel instead, as it already opens the node tree's edit panel, and
+  **Ctrl+E** opens it as a Ctrl+click would.
 
 ### Singleton panels
 
@@ -111,15 +113,19 @@ building.
 
 ### The chat drawer
 
-Freeform conversation with the agent lives in a drawer in the bottom region,
-not in a column.
+Freeform conversation with the agent lives in a drawer at the bottom of
+column 1, under the node tree.
 
 - Collapsed, it is a small **Chat** tab at the bottom. Clicking the tab expands
   it upward. Clicking its header collapses it again.
-- It is not tied to any column and collapses independently of everything else.
-- It is about the current selection, and says so ("About: Totals match
-  ledger"). When the selection changes, it shows the most recent conversation
-  about the new selection, which the user can continue or replace with a new
+- Expanding it pushes the node tree up; nothing is hidden behind it. For now
+  it sits under column 1 only, and collapses independently of everything
+  else.
+- It is about the **most recent selection that can have an agent session**
+  (a node, an obligation, a plan step), in whichever panel that selection was
+  made, and says so ("About: Totals match ledger"). Selecting something that
+  cannot have one (a finding, a decision) leaves it where it was. When its
+  subject changes, it shows the most recent conversation about it, which the user can continue or replace with a new
   conversation (**Ctrl+N**).
 - **Ctrl+J** toggles it: expands it when collapsed, collapses it when
   expanded.
@@ -223,6 +229,8 @@ visibly distinct from structured work.
 | **Enter** / **Ctrl+Enter** | Click / Ctrl+click the focused link. |
 | **Enter** on an item | Edit it (lists and the node tree alike). |
 | **E** on an item | Open its panel. |
+| **Ctrl+E** on an item | Open its panel as a Ctrl+click would: after the current column. |
+| **Ctrl+W** | Close the focused column (never column 1). |
 | **1**, **2**, **3** … | Answer the top pending decision with that option. |
 | **Ctrl+J** | Expand or collapse the chat drawer. |
 | **Ctrl+N** | Start a new conversation in the chat drawer. |
@@ -234,12 +242,10 @@ the app binds Alt+letter yet.
 
 ## Open questions
 
-- **The Ctrl+click of E.** E opens an item's panel by the column rule; what
-  opens it in the next column instead?
-- **A key to close the focused column.**
-- **The chat drawer** overlays the columns or pushes them up?
-- **Which panel "about" follows.** The chat drawer follows the selection. Is
-  that the selection in the focused column?
+None at the moment. Settled: **Ctrl+E** is the Ctrl+click of E, **Ctrl+W**
+closes the focused column, the chat drawer pushes content up (under column 1
+for now), and it follows the most recent selection that can have an agent
+session.
 
 ## Deferred
 
