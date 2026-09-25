@@ -227,7 +227,7 @@ impl Shell {
         self.database
             .update(cx, |database, _| database.app_nav_mut().close());
         self.unified
-            .update(cx, |unified, _| unified.app_nav_mut().close());
+            .update(cx, |unified, cx| unified.close_app_nav(cx));
         if self.active_view == view {
             if view == ShellView::Tasks {
                 self.task_list.update(cx, |list, cx| {

@@ -86,7 +86,16 @@ impl AppNavPopup {
             _ => Box::new(ShellGoWorkbench),
         };
         self.action_context.focus(window, cx);
-        window.dispatch_action(action, cx);
+        // Dispatch from the popup's own node, not from the restored focus:
+        // the popup is rendered inside the view that opened it, so its path
+        // always reaches the shell's handlers. The restored focus may not be
+        // in the rendered frame (at startup, focus can sit on a view that is
+        // not shown), and GPUI would then dispatch from the window root,
+        // where nothing handles the action.
+        let popup_focus = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            popup_focus.dispatch_action(action.as_ref(), window, cx);
+        });
         cx.emit(DismissEvent);
     }
 

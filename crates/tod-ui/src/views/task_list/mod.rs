@@ -3493,7 +3493,12 @@ impl HasAppNav for TaskListView {
     }
 
     fn app_nav_current(&self) -> Option<AppDestination> {
-        Some(AppDestination::Tasks)
+        // Hosted as a column only in the workbench.
+        if self.marks_focused_column {
+            Some(AppDestination::Workbench)
+        } else {
+            Some(AppDestination::Tasks)
+        }
     }
 
     fn app_nav_fallback_focus(&self) -> FocusHandle {

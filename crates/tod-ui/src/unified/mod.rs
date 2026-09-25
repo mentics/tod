@@ -48,7 +48,7 @@ use crate::interview::TodPaths;
 use crate::interview::agent::SharedAgent;
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_runs::AgentRuns;
-use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
+use crate::ui::app_nav::{AppNavToggle, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::ui::style;
@@ -207,7 +207,6 @@ pub struct UnifiedView {
     /// that cannot have one (a finding, a decision) leaves this alone.
     last_chat_focus: Focus,
     focus_handle: FocusHandle,
-    app_nav: AppNavMenu,
     /// What every node is waiting on the user for, recomputed off the UI
     /// thread on every store change (`attention_feed`) and fed to the tree
     /// via `TaskListView::set_attention`; Alt+Q walks the same data
@@ -260,7 +259,6 @@ impl UnifiedView {
             chat_drawer,
             last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
-            app_nav: AppNavMenu::default(),
             attention: HashMap::new(),
             _task_list_subscription,
             _agent_runs_subscription,
@@ -661,6 +659,20 @@ impl UnifiedView {
         self.sync_window_focus(window, cx);
     }
 
+    /// The app menu is the tree's (it sits in the tree's header), but `` ` ``
+    /// must open it from anywhere in the view, not only with focus in the
+    /// tree: with focus there the tree handles it first.
+    fn toggle_app_nav(&mut self, _: &AppNavToggle, window: &mut Window, cx: &mut Context<Self>) {
+        self.task_list
+            .update(cx, |list, cx| list.toggle_app_nav(window, cx));
+    }
+
+    /// Close the app menu, e.g. when the shell switches views.
+    pub fn close_app_nav(&mut self, cx: &mut Context<Self>) {
+        self.task_list
+            .update(cx, |list, _| list.app_nav_mut().close());
+    }
+
     fn toggle_pin_focused(&mut self, _: &UnifiedTogglePinFocused, _: &mut Window, cx: &mut Context<Self>) {
         self.columns.toggle_pin_focused();
         cx.notify();
@@ -953,20 +965,6 @@ impl Focusable for UnifiedView {
     }
 }
 
-impl HasAppNav for UnifiedView {
-    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
-        &mut self.app_nav
-    }
-
-    fn app_nav_current(&self) -> Option<AppDestination> {
-        Some(AppDestination::Workbench)
-    }
-
-    fn app_nav_fallback_focus(&self) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
 /// A mouse-down anywhere in a column moves keyboard focus into it (and so
 /// the focused column, which `sync_focused_column` reads from focus). Capture
 /// phase, so a control inside that stops the click still counts; and only
@@ -1025,6 +1023,7 @@ impl Render for UnifiedView {
             .key_context(UNIFIED_CONTEXT)
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::toggle_app_nav))
             .on_action(cx.listener(Self::toggle_pin_focused))
             .on_action(cx.listener(Self::next_waiting))
             .on_action(cx.listener(Self::prev_waiting))
