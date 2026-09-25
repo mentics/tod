@@ -1270,6 +1270,7 @@ impl SettingsView {
         }
         let _ = logging::reload_level(self.settings.log_level);
         let _ = logging::set_max_size_kb(self.settings.log_max_size_kb);
+        crate::ui::report_problem::set_available_from(&self.settings.journeys, cx);
         for key in std::mem::take(&mut self.pending_changed_keys) {
             crate::ui::journey::record_settings_changed(cx, key, "");
         }

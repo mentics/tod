@@ -21,7 +21,9 @@ use crate::interview::{TaskListProceedContext, TodPaths, TodSettings};
 use crate::ui::actionable::render_shortcut_pill_in_context;
 use crate::ui::agent_chat::{OpenAgentChat, OpenConversation};
 use crate::ui::agent_runs::AgentRuns;
-use crate::ui::report_problem::{OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem};
+use crate::ui::report_problem::{
+    self, OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem,
+};
 use crate::ui::app_nav::{
     HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
     ShellGoWorkbench, register_app_nav_keyboard_bindings,
@@ -760,6 +762,11 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Every way in (shortcut, menus, views) ends here; with reporting
+        // not set up, none of them opens a dialog whose report goes nowhere.
+        if !report_problem::is_available(cx) {
+            return;
+        }
         let key = action.key;
         let title: SharedString = match key {
             JourneyKey::Project => "Report a problem: project".into(),
@@ -1135,24 +1142,26 @@ impl Shell {
                             None,
                             cx,
                         ))
-                        .child(
-                            Button::new("title-report-problem")
-                                .icon(gpui_component::Icon::new(
-                                    gpui_kit_assets::IconName::Flag,
-                                ))
-                                .label("Report a problem")
-                                .ghost()
-                                .compact()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ReportProblem), cx);
-                                }),
-                        )
-                        .children(render_shortcut_pill_in_context(
-                            window,
-                            &ReportProblem,
-                            None,
-                            cx,
-                        )),
+                        .when(report_problem::is_available(cx), |bar| {
+                            bar.child(
+                                Button::new("title-report-problem")
+                                    .icon(gpui_component::Icon::new(
+                                        gpui_kit_assets::IconName::Flag,
+                                    ))
+                                    .label("Report a problem")
+                                    .ghost()
+                                    .compact()
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(Box::new(ReportProblem), cx);
+                                    }),
+                            )
+                            .children(render_shortcut_pill_in_context(
+                                window,
+                                &ReportProblem,
+                                None,
+                                cx,
+                            ))
+                        }),
                 )
                 .when(always_on_top::is_supported(), |bar| {
                     bar.child(
@@ -1516,7 +1525,9 @@ pub(crate) fn journey_key_for_focus(focus: Focus) -> JourneyKey {
 /// app journey ring buffer is snapshotted synchronously (cheap, in-memory)
 /// before this runs; screenshot capture and the journey write happen on a
 /// background thread since the screenshot can be slow (Win32 GDI) and must
-/// never block the UI. Shows a toast once the write completes.
+/// never block the UI. Toasts once the report is queued, and again once the
+/// submission worker has tried to send it; anything that goes wrong along
+/// the way is an error toast saying what.
 fn submit_report(
     key: JourneyKey,
     note: String,
@@ -1533,70 +1544,145 @@ fn submit_report(
         .collect();
     let window_handle = window.window_handle();
 
+    // How the worker's first attempt to send went, or `None` if it did not
+    // happen within `REPORT_SEND_WAIT`.
+    let (outcome_tx, outcome_rx) = async_channel::unbounded::<Option<Result<(), String>>>();
     cx.spawn(async move |cx| {
         let (app_journey, note) = (app_journey, note);
-        let seq = cx
+        let timeout_tx = outcome_tx.clone();
+        let queued = cx
             .background_spawn(async move {
-                let screenshot = crate::ui::screenshot::capture_app_screenshot().map(|img| {
-                    let bytes = crate::ui::screenshot::encode_png(&img).unwrap_or_default();
-                    tod_journey::Blob {
+                let screenshot = crate::ui::screenshot::capture_app_screenshot()
+                    .and_then(|img| {
+                        crate::ui::screenshot::encode_png(&img)
+                            .inspect_err(|err| {
+                                tracing::warn!("report: encoding the screenshot failed: {err}")
+                            })
+                            .ok()
+                    })
+                    .map(|bytes| tod_journey::Blob {
                         mime: "image/png".into(),
                         bytes,
-                    }
-                });
+                    });
                 let event = tod_journey::Event::Report {
                     note,
                     app_journey,
                     screenshot,
                 };
-                tod_core::journey::record_and_get_seq(key, tod_journey::Actor::User, event)
+                let seq =
+                    tod_core::journey::record_and_get_seq(key, tod_journey::Actor::User, event);
+                queue_report(seq, key, &fleet, &paths, outcome_tx)
             })
             .await;
 
-        let settings = TodSettings::load(&paths).unwrap_or_default();
-
-        // Step 6d: queue the report for submission when the setting is on
-        // and the report itself was actually recorded. The queue entry gets
-        // its own bundle id now (the bundle itself is built later, by the
-        // submission worker, Step 6e) so the journey's own `Submission`
-        // event can point at it.
-        let queued = if let (Some(seq), true) = (seq, settings.journeys.send) {
-            let node_id = match key {
-                JourneyKey::Project => None,
-                JourneyKey::Node(id) => Some(id),
-            };
-            let bundle_id = uuid::Uuid::new_v4();
-            match fleet.queue_journey_submission(bundle_id, node_id, seq as i64, "report") {
-                Ok(entry) => {
-                    tod_core::journey::record(
-                        key,
-                        tod_journey::Actor::App,
-                        tod_journey::Event::Submission {
-                            bundle: entry.bundle_id,
-                            status: "queued".to_string(),
-                        },
-                    );
-                    true
-                }
-                Err(err) => {
-                    tracing::warn!("journey: failed to queue report submission: {err}");
-                    false
-                }
+        let listening = match queued {
+            Ok(listening) => listening,
+            Err(message) => {
+                tracing::warn!("report: {message}");
+                let _ = cx.update_window(window_handle, move |_view, window, cx| {
+                    error_toast(window, cx, message);
+                });
+                return;
             }
-        } else {
-            false
         };
-
-        let _ = cx.update_window(window_handle, move |_view, window, cx| {
-            let message = if queued {
-                "Report recorded and queued to send"
-            } else {
-                "Report recorded"
-            };
-            info_toast(window, cx, message);
+        if !listening {
+            // No submission worker to hear back from (it starts with the
+            // store, so only when that failed to open).
+            let _ = cx.update_window(window_handle, |_view, window, cx| {
+                info_toast(window, cx, "Report recorded and queued to send");
+            });
+            return;
+        }
+        let _ = cx.update_window(window_handle, |_view, window, cx| {
+            info_toast(window, cx, "Report recorded, sending…");
+        });
+        cx.background_spawn({
+            let timer = cx.background_executor().timer(REPORT_SEND_WAIT);
+            async move {
+                timer.await;
+                let _ = timeout_tx.try_send(None);
+            }
+        })
+        .detach();
+        let outcome = outcome_rx.recv().await.ok().flatten();
+        let _ = cx.update_window(window_handle, move |_view, window, cx| match outcome {
+            Some(Ok(())) => info_toast(window, cx, "Report sent"),
+            Some(Err(err)) => error_toast(
+                window,
+                cx,
+                format!(
+                    "The report could not be sent: {err}. It stays queued, and tod keeps \
+                     trying while it is running."
+                ),
+            ),
+            None => warning_toast(
+                window,
+                cx,
+                "The report has not been sent yet. It stays queued, and tod keeps trying \
+                 while it is running.",
+            ),
         });
     })
     .detach();
+}
+
+/// How long [`submit_report`] waits to hear how the first send went.
+const REPORT_SEND_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Queues a just-recorded report for the submission worker (spec §9.6), and
+/// has the worker send how its first attempt went on `outcome`. Runs on a
+/// background thread.
+///
+/// `Ok(false)` when no worker is running to hear back from; `Err` says why
+/// the report could not be queued at all.
+fn queue_report(
+    seq: Option<u64>,
+    key: JourneyKey,
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    outcome: async_channel::Sender<Option<Result<(), String>>>,
+) -> Result<bool, String> {
+    let seq = seq.ok_or(
+        "The report could not be recorded: the journey writer is not running or could not \
+         open the journey file (see the log)",
+    )?;
+    let settings = TodSettings::load(paths)
+        .map_err(|err| format!("The report was recorded but not sent: reading settings: {err:#}"))?;
+    if !settings.journeys.can_submit() {
+        return Err("The report was recorded but not sent: sending journeys is not set up in \
+                    Settings"
+            .to_string());
+    }
+
+    // The queue entry gets its own bundle id now (the worker builds the
+    // bundle itself later) so the journey's `Submission` event can point at
+    // it. Listen for the worker before queuing, so its attempt can't be
+    // missed.
+    let bundle_id = Uuid::new_v4();
+    let listening = tod_core::journey::on_next_send_attempt(
+        bundle_id,
+        Box::new(move |result| {
+            let _ = outcome.try_send(Some(result));
+        }),
+    );
+    let node_id = match key {
+        JourneyKey::Project => None,
+        JourneyKey::Node(id) => Some(id),
+    };
+    let entry = fleet
+        .queue_journey_submission(bundle_id, node_id, seq as i64, "report")
+        .map_err(|err| {
+            format!("The report was recorded but could not be queued to send: {err:#}")
+        })?;
+    tod_core::journey::record(
+        key,
+        tod_journey::Actor::App,
+        tod_journey::Event::Submission {
+            bundle: entry.bundle_id,
+            status: "queued".to_string(),
+        },
+    );
+    Ok(listening)
 }
 
 #[cfg(feature = "agent-socket")]
@@ -1827,6 +1913,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                             fleet.clone(),
                             app_settings.journeys.clone(),
                         );
+                        report_problem::set_available_from(&app_settings.journeys, cx);
                         transcript_window.bind(fleet.clone(), traffic_log.clone());
                         history_window.bind(fleet.clone());
                         let app_settings = TodSettings::load(&paths).unwrap_or_default();

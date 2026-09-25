@@ -36,9 +36,18 @@ pub const ABANDON_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// Fallback wake interval when nothing else signals the worker.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
-/// Shared last-error state the settings UI (8d) reads from.
+/// Told how the worker's next attempt to send one bundle went: `Ok` once it is
+/// on the relay, `Err` with what stopped it.
+pub type SendOutcome = Box<dyn FnOnce(Result<(), String>) + Send>;
+
+/// Shared last-error state the settings UI (8d) reads from, and whoever is
+/// waiting to hear how a particular bundle's send went (a report the user
+/// just submitted).
 #[derive(Clone, Default)]
-pub struct WorkerStatus(Arc<Mutex<Option<String>>>);
+pub struct WorkerStatus {
+    error: Arc<Mutex<Option<String>>>,
+    waiters: Arc<Mutex<Vec<(Uuid, SendOutcome)>>>,
+}
 
 impl WorkerStatus {
     pub fn new() -> Self {
@@ -46,15 +55,52 @@ impl WorkerStatus {
     }
 
     pub fn set_error(&self, msg: impl Into<String>) {
-        *self.0.lock().expect("worker status mutex") = Some(msg.into());
+        *self.error.lock().expect("worker status mutex") = Some(msg.into());
     }
 
     pub fn clear_error(&self) {
-        *self.0.lock().expect("worker status mutex") = None;
+        *self.error.lock().expect("worker status mutex") = None;
     }
 
     pub fn last_error(&self) -> Option<String> {
-        self.0.lock().expect("worker status mutex").clone()
+        self.error.lock().expect("worker status mutex").clone()
+    }
+
+    /// Calls `outcome` once, after the worker next tries to send
+    /// `bundle_id`, or when a wake stops before sending anything. Register
+    /// before queuing the entry, so the attempt cannot be missed.
+    pub fn on_next_attempt(&self, bundle_id: Uuid, outcome: SendOutcome) {
+        self.waiters
+            .lock()
+            .expect("worker status mutex")
+            .push((bundle_id, outcome));
+    }
+
+    fn report(&self, bundle_id: Uuid, result: Result<(), String>) {
+        let matching: Vec<SendOutcome> = {
+            let mut waiters = self.waiters.lock().expect("worker status mutex");
+            let (matching, rest) = std::mem::take(&mut *waiters)
+                .into_iter()
+                .partition(|(id, _)| *id == bundle_id);
+            *waiters = rest;
+            matching.into_iter().map(|(_, outcome)| outcome).collect()
+        };
+        for outcome in matching {
+            outcome(result.clone());
+        }
+    }
+
+    /// A wake that could not send anything: every waiter hears why.
+    fn fail_waiting(&self, msg: &str) {
+        let waiting = std::mem::take(&mut *self.waiters.lock().expect("worker status mutex"));
+        for (_, outcome) in waiting {
+            outcome(Err(msg.to_string()));
+        }
+    }
+
+    fn fail(&self, msg: String) {
+        self.fail_waiting(&msg);
+        self.set_error(msg);
     }
 }
 
@@ -83,6 +129,23 @@ pub fn tick(
     now_ms: i64,
     build: impl Fn(&SubmissionEntry) -> Result<Vec<u8>>,
 ) -> Result<()> {
+    tick_reporting(store, recorder, relay, recipient, ack_cursor, now_ms, build, &mut |_, _| {})
+}
+
+/// [`tick`], telling `on_attempt` how each send went. A failed send does not
+/// fail the tick (the entry is retried on a later one), so this is the only
+/// place it shows.
+#[allow(clippy::too_many_arguments)]
+pub fn tick_reporting(
+    store: &FleetStore,
+    recorder: &Recorder,
+    relay: &dyn Relay,
+    recipient: &str,
+    ack_cursor: &mut String,
+    now_ms: i64,
+    build: impl Fn(&SubmissionEntry) -> Result<Vec<u8>>,
+    on_attempt: &mut dyn FnMut(Uuid, Result<(), String>),
+) -> Result<()> {
     let mut due: Vec<SubmissionEntry> = Vec::new();
     let mut to_abandon: Vec<SubmissionEntry> = Vec::new();
 
@@ -105,8 +168,12 @@ pub fn tick(
     }
 
     for entry in due {
-        if let Err(err) = send_one(store, recorder, relay, recipient, &entry, &build) {
-            tracing::warn!("journey: failed to send submission {}: {err:#}", entry.bundle_id);
+        match send_one(store, recorder, relay, recipient, &entry, &build) {
+            Ok(()) => on_attempt(entry.bundle_id, Ok(())),
+            Err(err) => {
+                tracing::warn!("journey: failed to send submission {}: {err:#}", entry.bundle_id);
+                on_attempt(entry.bundle_id, Err(format!("{err:#}")));
+            }
         }
     }
 
@@ -240,60 +307,83 @@ fn run_tick(
     let paths = match TodPaths::discover() {
         Ok(p) => p,
         Err(err) => {
-            status.set_error(format!("resolving data root: {err:#}"));
+            status.fail(format!("resolving data root: {err:#}"));
             return;
         }
     };
-    let settings = TodSettings::load(&paths).unwrap_or_default();
+    let settings = match TodSettings::load(&paths) {
+        Ok(settings) => settings,
+        Err(err) => {
+            status.fail(format!("reading settings: {err:#}"));
+            return;
+        }
+    };
     if !settings.journeys.send {
+        status.fail_waiting("sending journeys is turned off in Settings");
         return;
     }
     let relay_code = match settings.journeys.relay_code.as_deref() {
         Some(code) => code,
         None => {
-            status.set_error("sending is on but no relay code is set");
+            status.fail("sending is on but no relay code is set".to_string());
             return;
         }
     };
     let relay = match NtfyRelay::parse(relay_code) {
         Ok(relay) => relay,
         Err(err) => {
-            status.set_error(format!("invalid relay code: {err:#}"));
+            status.fail(format!("invalid relay code: {err:#}"));
             return;
         }
     };
     let install = match crate::process_bundle::TodInstallPaths::discover() {
         Ok(p) => p,
         Err(err) => {
-            status.set_error(format!("resolving install paths: {err:#}"));
+            status.fail(format!("resolving install paths: {err:#}"));
             return;
         }
     };
     let media = match crate::media::MediaPaths::discover() {
         Ok(p) => p,
         Err(err) => {
-            status.set_error(format!("resolving media paths: {err:#}"));
+            status.fail(format!("resolving media paths: {err:#}"));
             return;
         }
     };
     let cli_path = crate::interview::tod_cli_path();
     let recipient = relay.recipient().to_string();
 
-    let result = tick(store, recorder, &relay, &recipient, ack_cursor, tod_store::outline::uuid_blob::now_ms(), |entry| {
-        crate::journey::build_bundle(
-            store,
-            journeys_dir,
-            paths.data_root(),
-            &install,
-            &media,
-            &cli_path,
-            &settings,
-            entry,
-        )
-    });
-    match result {
-        Ok(()) => status.clear_error(),
-        Err(err) => status.set_error(format!("{err:#}")),
+    let mut send_error = None;
+    let result = tick_reporting(
+        store,
+        recorder,
+        &relay,
+        &recipient,
+        ack_cursor,
+        tod_store::outline::uuid_blob::now_ms(),
+        |entry| {
+            crate::journey::build_bundle(
+                store,
+                journeys_dir,
+                paths.data_root(),
+                &install,
+                &media,
+                &cli_path,
+                &settings,
+                entry,
+            )
+        },
+        &mut |bundle_id, outcome| {
+            if let Err(err) = &outcome {
+                send_error = Some(format!("sending {bundle_id}: {err}"));
+            }
+            status.report(bundle_id, outcome);
+        },
+    );
+    match (result, send_error) {
+        (Err(err), _) => status.set_error(format!("{err:#}")),
+        (Ok(()), Some(err)) => status.set_error(err),
+        (Ok(()), None) => status.clear_error(),
     }
 }
 
@@ -351,6 +441,59 @@ mod tests {
 
         let files: Vec<_> = std::fs::read_dir(relay.dir()).unwrap().collect();
         assert!(files.iter().any(|f| f.as_ref().unwrap().file_name().to_string_lossy().contains(&entry.bundle_id.to_string())));
+    }
+
+    #[test]
+    fn a_waiter_hears_how_its_bundles_send_went() {
+        let fx = setup();
+        let (_identity, recipient) = test_recipient();
+        let relay = FolderRelay::new(relay_dir(&fx, "w")).unwrap();
+        let (good, bad) = (Uuid::new_v4(), Uuid::new_v4());
+        fx.store.queue_journey_submission(good, None, 1, "report").unwrap();
+        fx.store.queue_journey_submission(bad, None, 1, "report").unwrap();
+
+        let status = WorkerStatus::new();
+        let heard: Arc<Mutex<Vec<(Uuid, Result<(), String>)>>> = Arc::default();
+        for id in [good, bad] {
+            let heard = heard.clone();
+            status.on_next_attempt(id, Box::new(move |outcome| heard.lock().unwrap().push((id, outcome))));
+        }
+
+        let mut cursor = ACK_CURSOR_START.to_string();
+        tick_reporting(
+            &fx.store,
+            &fx.recorder,
+            &relay,
+            &recipient,
+            &mut cursor,
+            1_000,
+            |entry| {
+                if entry.bundle_id == bad {
+                    anyhow::bail!("could not build")
+                }
+                Ok(b"hello".to_vec())
+            },
+            &mut |id, outcome| status.report(id, outcome),
+        )
+        .unwrap();
+
+        let mut heard = heard.lock().unwrap().clone();
+        heard.sort_by_key(|(id, _)| *id != good);
+        assert_eq!(heard[0], (good, Ok(())));
+        assert_eq!(heard[1].0, bad);
+        assert!(heard[1].1.as_ref().unwrap_err().contains("could not build"));
+        assert!(status.waiters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_wake_that_cannot_send_fails_every_waiter() {
+        let status = WorkerStatus::new();
+        let heard: Arc<Mutex<Vec<Result<(), String>>>> = Arc::default();
+        let sink = heard.clone();
+        status.on_next_attempt(Uuid::new_v4(), Box::new(move |outcome| sink.lock().unwrap().push(outcome)));
+        status.fail("invalid relay code".to_string());
+        assert_eq!(heard.lock().unwrap().as_slice(), [Err("invalid relay code".to_string())]);
+        assert_eq!(status.last_error().as_deref(), Some("invalid relay code"));
     }
 
     #[test]

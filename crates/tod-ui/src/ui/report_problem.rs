@@ -49,6 +49,32 @@ impl OpenReportDialog {
     }
 }
 
+/// Whether reports can be sent (`JourneySettings::can_submit`). While not,
+/// nothing offers "Report a problem" and the shortcut does nothing: a report
+/// that goes nowhere looks sent and isn't.
+#[derive(Default)]
+struct ReportingAvailable(bool);
+
+impl gpui::Global for ReportingAvailable {}
+
+/// Re-reads availability from `journeys`. Call at startup and whenever
+/// settings are saved.
+pub fn set_available_from(journeys: &tod_store::settings::JourneySettings, cx: &mut App) {
+    set_available(journeys.can_submit(), cx);
+}
+
+pub(crate) fn set_available(available: bool, cx: &mut App) {
+    if cx.try_global::<ReportingAvailable>().map(|g| g.0) != Some(available) {
+        cx.set_global(ReportingAvailable(available));
+        cx.refresh_windows();
+    }
+}
+
+/// Whether to show "Report a problem" anywhere, or act on its shortcut.
+pub fn is_available(cx: &App) -> bool {
+    cx.try_global::<ReportingAvailable>().is_some_and(|g| g.0)
+}
+
 pub fn register_report_problem_keyboard_bindings(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("ctrl-shift-r", ReportProblem, None)]);
     let input = Some(key_context::including_input(REPORT_DIALOG_CONTEXT));

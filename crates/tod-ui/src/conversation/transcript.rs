@@ -220,7 +220,9 @@ impl ConversationView {
         } else {
             Vec::new()
         };
-        header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        if crate::ui::report_problem::is_available(cx) {
+            header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        }
         let tools = vec![terminal_handoff::tool(
             self.agent_session().is_some(),
             self.status.running,

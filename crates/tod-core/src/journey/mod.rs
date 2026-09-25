@@ -56,3 +56,16 @@ fn install_worker_status(status: WorkerStatus) {
 pub fn worker_last_error() -> Option<String> {
     WORKER_STATUS.get().and_then(|s| s.last_error())
 }
+
+/// Calls `outcome` after the submission worker next tries to send
+/// `bundle_id` (see [`WorkerStatus::on_next_attempt`]). Returns `false`, and
+/// never calls it, when no worker is running.
+pub fn on_next_send_attempt(bundle_id: uuid::Uuid, outcome: worker::SendOutcome) -> bool {
+    match WORKER_STATUS.get() {
+        Some(status) => {
+            status.on_next_attempt(bundle_id, outcome);
+            true
+        }
+        None => false,
+    }
+}
