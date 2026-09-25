@@ -306,6 +306,17 @@ its change set with `tod-cli changeset`. Drafting, which this replaced, is gone
 (schema v37); the legacy `Role::Drafter` / `SessionPurpose::Drafter` variants
 stay only for the interview.
 
+Starting and collecting a turn run git, Docker, and `tod-cli` (a protocol's
+`prepare`, `progress`, and `finish`, the container environment, the build
+stamp), so the view never calls `send` or `tick` on the main thread: the
+driver goes to the background executor and `tod_ui::conversation::driver_slot`
+holds what the view shows meanwhile ("Starting the agent…"; Stop is applied
+when it is back). The driver takes the shared agent through `AgentAccess`,
+which `SharedAgentAccess` locks for one provider call at a time, so the UI's
+own locks never wait on that work. The same holds for the incoming-changes
+check (`views::incoming_check` ticks its `IncomingRunner` there) and for
+settling a gate check's derived criteria, which may call GitHub.
+
 ### `tod-store::fleet` — agent/worktree orchestration
 
 Tracks agents running against git worktrees: provisioning (`provision.rs`), launching (`launch.rs`, `runtime.rs`), reattaching to running processes (`reattach.rs`), terminal sessions (`terminal/`), prompt queuing (`prompt_queue.rs`), and an undo log (`undo.rs`). `store.rs` / `writer.rs` / `schema.rs` / `migration.rs` are the SQLite persistence core; `projection.rs` derives read-side views for the UI.
