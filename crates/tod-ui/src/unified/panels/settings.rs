@@ -15,14 +15,7 @@ use crate::interview::TodPaths;
 use crate::unified::panel::ColumnPanel;
 use crate::views::task_edit::TaskEditView;
 
-fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
-    fleet
-        .get_task(&node_id.to_string())
-        .ok()
-        .flatten()
-        .map(|t| t.title)
-        .unwrap_or_else(|| node_id.to_string())
-}
+use super::node_title;
 
 pub struct SettingsPanel {
     fleet: Arc<FleetStore>,

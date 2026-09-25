@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ui::key_context;
 use crate::unified::PanelKind;
-use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenRequest};
+use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use crate::views::plan_steps::PlanStepsView;
 
 const PLAN_PANEL_CONTEXT: &str = "UnifiedPlanPanel";
@@ -34,14 +34,7 @@ pub fn register_plan_panel_keyboard_bindings(cx: &mut App) {
     ]);
 }
 
-fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
-    fleet
-        .get_task(&node_id.to_string())
-        .ok()
-        .flatten()
-        .map(|t| t.title)
-        .unwrap_or_else(|| node_id.to_string())
-}
+use super::node_title;
 
 pub struct PlanPanel {
     fleet: Arc<FleetStore>,
@@ -119,6 +112,10 @@ impl PlanPanel {
             .fleet
             .read(|conn| ConversationRepo::new(conn).latest_conversation_for_entity(step_id))
         else {
+            cx.emit(PanelOpenChat(Focus::PlanStep {
+                node: self.node_id,
+                id: step_id,
+            }));
             return;
         };
         cx.emit(PanelOpenRequest {
@@ -139,6 +136,7 @@ impl ColumnPanel for PlanPanel {
 }
 
 impl EventEmitter<PanelOpenRequest> for PlanPanel {}
+impl EventEmitter<PanelOpenChat> for PlanPanel {}
 impl EventEmitter<PanelFocusSelected> for PlanPanel {}
 
 impl Focusable for PlanPanel {

@@ -18,7 +18,7 @@ pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::ChatDrawer;
 use panel::{
-    PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelFocusSelected, PanelOpenRequest,
+    PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelFocusSelected, PanelOpenChat, PanelOpenRequest,
     PlaceholderPanel,
 };
 use panels::DetailsPanel;
@@ -427,9 +427,16 @@ impl UnifiedView {
                         this.set_chat_focus(event.0, cx);
                     },
                 );
+                let chat_sub = cx.subscribe_in(
+                    &panel,
+                    window,
+                    |this, _, event: &PanelOpenChat, window, cx| {
+                        this.open_chat_on(event.0, window, cx);
+                    },
+                );
                 HostedColumn {
                     panel: HostedPanel::Obligations(panel),
-                    _subscriptions: vec![open_sub, focus_sub],
+                    _subscriptions: vec![open_sub, focus_sub, chat_sub],
                 }
             }
             PanelKind::Plan(id) => {
@@ -447,9 +454,16 @@ impl UnifiedView {
                         this.set_chat_focus(event.0, cx);
                     },
                 );
+                let chat_sub = cx.subscribe_in(
+                    &panel,
+                    window,
+                    |this, _, event: &PanelOpenChat, window, cx| {
+                        this.open_chat_on(event.0, window, cx);
+                    },
+                );
                 HostedColumn {
                     panel: HostedPanel::Plan(panel),
-                    _subscriptions: vec![open_sub, focus_sub],
+                    _subscriptions: vec![open_sub, focus_sub, chat_sub],
                 }
             }
             PanelKind::Findings(id) => {
@@ -565,6 +579,13 @@ impl UnifiedView {
             self.hosted.push(hosted);
         }
         cx.notify();
+    }
+
+    /// E on an item with no conversation yet: point the chat drawer at it
+    /// and expand it, where its first conversation starts.
+    fn open_chat_on(&mut self, focus: Focus, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_chat_focus(focus, cx);
+        self.chat_drawer.update(cx, |drawer, cx| drawer.expand(window, cx));
     }
 
     fn close_column(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -822,9 +843,10 @@ impl HasAppNav for UnifiedView {
     }
 }
 
-/// The node tree column's fixed width, shared by the top row and the bottom
-/// row's spacer so the chat drawer lines up under columns 2+ only.
-const TREE_COLUMN_WIDTH: f32 = 280.;
+/// The node tree column's fixed width, which the chat drawer beneath it
+/// shares. Wide enough that a row with both its "Needs you" and its
+/// requirement-count chips still shows a readable title.
+const TREE_COLUMN_WIDTH: f32 = 340.;
 
 impl Render for UnifiedView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

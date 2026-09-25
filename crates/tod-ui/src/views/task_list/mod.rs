@@ -458,7 +458,10 @@ impl TaskListView {
             }
             ListEvent::Confirm(ix) => {
                 this.close_sort_menu(cx);
-                this.clamp_selection(*ix, cx);
+                // A click lands where it was aimed: only arrow keys wrap, so
+                // only `Select` is checked for a wrap (a click from the first
+                // row to the last used to be undone as one).
+                this.last_selected = Some(*ix);
                 if this.pending_revert.is_none() {
                     this.sync_selected_id(cx);
                 }
@@ -3715,6 +3718,59 @@ mod tests {
         view.read_with(cx, |view, cx| {
             let visible = view.list_state.read(cx).delegate().items();
             assert!(visible.iter().any(|t| t.id == node_id));
+        });
+    }
+
+    /// Only arrow keys wrap from the first row to the last; a click there
+    /// must land. Regression test for clicks on the last row being undone as
+    /// if they were a wrap.
+    #[gpui::test]
+    fn clicking_the_last_row_from_the_first_selects_it(cx: &mut TestAppContext) {
+        use gpui_component::IndexPath;
+        use gpui_component::list::ListEvent;
+        use tod_store::outline::{CreatePosition, OutlineMutation};
+
+        let fixture = Fixture::new();
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        for title in ["Second node", "Third node"] {
+            fixture
+                .store
+                .enqueue_outline(OutlineMutation::CreateNode {
+                    node_id: Some(uuid::Uuid::new_v4()),
+                    list_id,
+                    parent_id: None,
+                    anchor_id: None,
+                    position: CreatePosition::Below,
+                    title: title.into(),
+                })
+                .unwrap();
+        }
+        fixture.store.writer().flush().unwrap();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.refresh(window, cx);
+        });
+        draw(cx);
+
+        let last = view.read_with(cx, |view, cx| {
+            view.list_state.read(cx).delegate().items_count() - 1
+        });
+        assert!(last >= 2, "the fixture should show at least three rows");
+        let list_state = view.read_with(cx, |view, _| view.list_state.clone());
+        list_state.update_in(cx, |state, window, cx| {
+            state.set_selected_index(Some(IndexPath::new(0)), window, cx);
+        });
+        view.update(cx, |view, _| view.last_selected = Some(IndexPath::new(0)));
+        list_state.update_in(cx, |state, window, cx| {
+            state.set_selected_index(Some(IndexPath::new(last)), window, cx);
+            cx.emit(ListEvent::Confirm(IndexPath::new(last)));
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.last_selected.map(|ix| ix.row), Some(last));
+            let selected = view.list_state.read(cx).selected_index().map(|ix| ix.row);
+            assert_eq!(selected, Some(last));
         });
     }
 

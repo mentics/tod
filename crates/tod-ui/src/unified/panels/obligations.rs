@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::ui::key_context;
 use crate::unified::PanelKind;
-use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenRequest};
+use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use crate::views::obligations::ObligationsView;
 
 const OBLIGATIONS_PANEL_CONTEXT: &str = "UnifiedObligationsPanel";
@@ -37,14 +37,7 @@ pub fn register_obligations_panel_keyboard_bindings(cx: &mut App) {
     ]);
 }
 
-fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
-    fleet
-        .get_task(&node_id.to_string())
-        .ok()
-        .flatten()
-        .map(|t| t.title)
-        .unwrap_or_else(|| node_id.to_string())
-}
+use super::node_title;
 
 pub struct ObligationsPanel {
     fleet: Arc<FleetStore>,
@@ -139,6 +132,10 @@ impl ObligationsPanel {
             .fleet
             .read(|conn| ConversationRepo::new(conn).latest_conversation_for_entity(obligation_id))
         else {
+            cx.emit(PanelOpenChat(Focus::Obligation {
+                node: self.node_id,
+                id: obligation_id,
+            }));
             return;
         };
         cx.emit(PanelOpenRequest {
@@ -159,6 +156,7 @@ impl ColumnPanel for ObligationsPanel {
 }
 
 impl EventEmitter<PanelOpenRequest> for ObligationsPanel {}
+impl EventEmitter<PanelOpenChat> for ObligationsPanel {}
 impl EventEmitter<PanelFocusSelected> for ObligationsPanel {}
 
 impl Focusable for ObligationsPanel {
@@ -298,15 +296,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn e_does_nothing_when_no_conversation_changed_the_obligation(cx: &mut TestAppContext) {
+    fn e_opens_the_chat_drawer_when_no_conversation_changed_the_obligation(
+        cx: &mut TestAppContext,
+    ) {
         let fixture = Fixture::new();
         let (view, cx) = open_view(&fixture, cx);
+        let obligation_id = fixture.offline_obligation;
+        view.update_in(cx, |view, window, cx| {
+            view.inner.update(cx, |inner, cx| {
+                inner.highlight_item(obligation_id, window, cx);
+            });
+        });
 
-        let events: Rc<RefCell<Vec<PanelOpenRequest>>> = Rc::new(RefCell::new(Vec::new()));
-        let events_in = events.clone();
+        let opens: Rc<RefCell<Vec<PanelOpenRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let chats: Rc<RefCell<Vec<Focus>>> = Rc::new(RefCell::new(Vec::new()));
+        let (opens_in, chats_in) = (opens.clone(), chats.clone());
         cx.update(|_window, cx| {
             cx.subscribe(&view, move |_, event: &PanelOpenRequest, _| {
-                events_in.borrow_mut().push(event.clone());
+                opens_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+            cx.subscribe(&view, move |_, event: &PanelOpenChat, _| {
+                chats_in.borrow_mut().push(event.0);
             })
             .detach();
         });
@@ -315,6 +326,13 @@ mod tests {
             view.on_open_transcript(&ObligationsPanelOpenTranscript, window, cx);
         });
 
-        assert!(events.borrow().is_empty());
+        assert!(opens.borrow().is_empty());
+        assert_eq!(
+            *chats.borrow(),
+            vec![Focus::Obligation {
+                node: fixture.node_id,
+                id: obligation_id,
+            }]
+        );
     }
 }

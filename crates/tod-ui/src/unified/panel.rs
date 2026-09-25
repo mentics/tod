@@ -52,6 +52,12 @@ pub struct PanelOpenRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct PanelFocusSelected(pub Focus);
 
+/// Emitted by a panel when **E** is pressed on an item that has no
+/// conversation yet: there is no transcript to open, so the chat drawer
+/// opens on the item instead, where its first conversation starts.
+#[derive(Debug, Clone, Copy)]
+pub struct PanelOpenChat(pub Focus);
+
 /// One link inside a placeholder panel: a label and the panel it opens.
 #[derive(Debug, Clone)]
 struct PlaceholderLink {
@@ -164,10 +170,10 @@ impl PlaceholderPanel {
             | PanelKind::Settings(id)
             | PanelKind::Transcript(id) => self
                 .fleet
-                .get_task(&id.to_string())
+                .get_node(&id.to_string())
                 .ok()
                 .flatten()
-                .map(|t| t.title)
+                .map(|node| node.title)
                 .unwrap_or_else(|| id.to_string()),
             PanelKind::Decisions => {
                 let _ = cx;

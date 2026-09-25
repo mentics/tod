@@ -211,17 +211,14 @@ fn plan_step_item(step: &PlanStep, updated_at: i64) -> AttentionItem {
         Some(HandoffReason::Decision { options }) => options.clone(),
         _ => Vec::new(),
     };
-    let summary = step
-        .reason
-        .as_ref()
-        .map(HandoffReason::describe)
-        .or_else(|| step.note.clone())
-        .unwrap_or_else(|| step.body.clone());
+    // The step itself is what the user is answering about; its reason and
+    // note say why, and a `Decision`'s options are offered as `options`, so
+    // repeating them here would only say the same thing twice.
     AttentionItem {
         kind: AttentionKind::PlanStep,
         id: step.id,
         node_id: step.node_id,
-        summary,
+        summary: step.body.clone(),
         options,
         since: updated_at,
     }

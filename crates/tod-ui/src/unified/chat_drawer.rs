@@ -166,9 +166,24 @@ impl ChatDrawer {
     fn about_text(&self) -> SharedString {
         self.fleet
             .read(|conn| focus_selection(conn, self.focus))
-            .map(|s| s.title)
+            // An obligation's or plan step's `title` is its kind and short
+            // id; what it says is in `text`, and that is what names it.
+            .map(|s| {
+                s.text
+                    .as_deref()
+                    .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+                    .map(|line| line.trim().to_string())
+                    .unwrap_or(s.title)
+            })
             .unwrap_or_else(|_| "Project".to_string())
             .into()
+    }
+
+    /// Expand the drawer, if it is not already.
+    pub fn expand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.expanded {
+            self.toggle(window, cx);
+        }
     }
 
     /// Expand or collapse the drawer.

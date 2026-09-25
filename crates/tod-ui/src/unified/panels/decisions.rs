@@ -948,6 +948,28 @@ impl DecisionsPanel {
         let Some(step) = step else {
             return card.into_any_element();
         };
+        // Why the agent handed it back: the reason, unless it is a decision
+        // (whose options are the buttons below), and the agent's note.
+        let why = [
+            step.reason
+                .as_ref()
+                .filter(|reason| !matches!(reason, HandoffReason::Decision { .. }))
+                .map(HandoffReason::describe),
+            step.note.clone().filter(|note| !note.trim().is_empty()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !why.is_empty() {
+            card = card.child(
+                style::text_muted(div().text_sm()).child(selectable_text(
+                    SharedString::from(format!("unified-decisions-plan-step-why-{}", item.id)),
+                    why.join("\n"),
+                    window,
+                    cx,
+                )),
+            );
+        }
         let buttons = div().flex().flex_wrap().gap_1();
         let buttons = match &step.reason {
             Some(HandoffReason::Decision { options }) => buttons.children(
@@ -1167,14 +1189,7 @@ impl ColumnPanel for DecisionsPanel {
 
     fn target_label(&self, cx: &App) -> SharedString {
         match self.node_id {
-            Some(id) => self
-                .fleet
-                .get_task(&id.to_string())
-                .ok()
-                .flatten()
-                .map(|t| t.title)
-                .unwrap_or_else(|| id.to_string())
-                .into(),
+            Some(id) => super::node_title(&self.fleet, id).into(),
             None => {
                 let _ = cx;
                 "no node selected".into()

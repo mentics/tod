@@ -106,6 +106,9 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
     loaded
 }
 
+/// The details field's height while it is being edited.
+const DETAILS_EDIT_HEIGHT: f32 = 200.;
+
 pub struct DetailsPanel {
     node_id: Uuid,
     fleet: Arc<FleetStore>,
@@ -395,9 +398,12 @@ impl Render for DetailsPanel {
                         }),
                     )
                     .child(if self.editing {
+                        // A textarea has no height of its own (`rows` is
+                        // not one): given none it collapses to a line.
                         Textarea::new(&self.details_input)
                             .disabled(false)
                             .w_full()
+                            .h(gpui::px(DETAILS_EDIT_HEIGHT))
                             .into_any_element()
                     } else if self.loaded.details.is_empty() {
                         div()
