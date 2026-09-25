@@ -12,25 +12,34 @@ mod chat_drawer;
 mod columns;
 mod panel;
 pub mod panels;
+mod resize;
 pub mod status_label;
 
-pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
+pub use columns::{ColumnModel, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::ChatDrawer;
 use panel::{PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use panels::DetailsPanel;
+use resize::{
+    ColumnDivider, DIVIDER_WIDTH, PANEL_MIN_WIDTH, ResizeStart, TREE_MIN_WIDTH,
+    starting_tree_width,
+};
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, actions, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Bounds, Context, DragMoveEvent, Entity, EntityId, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyBinding, MouseDownEvent, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions,
+    canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_core::attention::NodeAttention;
+use tod_core::workbench_layout::{self, WorkbenchLayout};
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
@@ -39,9 +48,10 @@ use crate::interview::TodPaths;
 use crate::interview::agent::SharedAgent;
 use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_runs::AgentRuns;
-use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
+use crate::ui::app_nav::{AppNavToggle, HasAppNav};
 use crate::ui::key_context;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
+use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::task_list::{TaskListEvent, TaskListView};
 
@@ -145,6 +155,25 @@ struct HostedColumn {
     _subscriptions: Vec<Subscription>,
 }
 
+/// A column-2+ slot's width, kept beside `UnifiedView::hosted` (same index)
+/// so it survives the slot's panel being replaced.
+#[derive(Default)]
+struct ColumnWidth {
+    /// The width the user dragged it to; `None` shares what is left evenly.
+    dragged: Option<Pixels>,
+    /// Where it was at the last layout, which a drag starts from.
+    laid_out: Rc<Cell<Bounds<Pixels>>>,
+}
+
+/// The empty view GPUI shows under the pointer while a divider is dragged.
+struct DividerDrag;
+
+impl Render for DividerDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
@@ -156,6 +185,17 @@ pub struct UnifiedView {
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
+    column_widths: Vec<ColumnWidth>,
+    /// Column 1's width: about 80 characters (`resize::starting_tree_width`)
+    /// until the user drags its divider. `None` until the first render,
+    /// which has the window to measure the font with.
+    tree_width: Option<Pixels>,
+    /// The divider drag in progress, from its first move.
+    resize: Option<ResizeStart>,
+    /// The widths saved from the last drag, in this or an earlier run
+    /// (`tod_core::workbench_layout`); a column opening at a position takes
+    /// the width saved for it.
+    layout: WorkbenchLayout,
     /// The bottom-of-window chat drawer (W8): a freeform conversation about
     /// whichever node is currently in focus. Never shown for the tree
     /// itself; see `chat_drawer`.
@@ -167,7 +207,6 @@ pub struct UnifiedView {
     /// that cannot have one (a finding, a decision) leaves this alone.
     last_chat_focus: Focus,
     focus_handle: FocusHandle,
-    app_nav: AppNavMenu,
     /// What every node is waiting on the user for, recomputed off the UI
     /// thread on every store change (`attention_feed`) and fed to the tree
     /// via `TaskListView::set_attention`; Alt+Q walks the same data
@@ -188,7 +227,11 @@ impl UnifiedView {
         agent_runs: Entity<AgentRuns>,
         lifecycle: Entity<LifecycleController>,
     ) -> Self {
-        let task_list = cx.new(|cx| TaskListView::new(window, cx, fleet.clone()));
+        let task_list = cx.new(|cx| {
+            let mut task_list = TaskListView::new(window, cx, fleet.clone());
+            task_list.set_marks_focused_column(true);
+            task_list
+        });
         let _task_list_subscription =
             cx.subscribe_in(&task_list, window, |this, _, event: &TaskListEvent, window, cx| {
                 this.on_task_list_event(event, window, cx);
@@ -200,6 +243,7 @@ impl UnifiedView {
             this.apply_status_overrides(cx);
         });
         let _attention_poll = Self::spawn_attention_poll(fleet.clone(), cx);
+        let layout = workbench_layout::load(paths.config_dir());
         let mut this = Self {
             fleet,
             paths,
@@ -208,10 +252,13 @@ impl UnifiedView {
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
+            column_widths: Vec::new(),
+            tree_width: None,
+            resize: None,
+            layout,
             chat_drawer,
             last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
-            app_nav: AppNavMenu::default(),
             attention: HashMap::new(),
             _task_list_subscription,
             _agent_runs_subscription,
@@ -336,6 +383,13 @@ impl UnifiedView {
                 if let Ok(id) = Uuid::parse_str(task_id) {
                     self.open_panel(PanelKind::Settings(id), 0, false, window, cx);
                 }
+            }
+            // The tree keeps Ctrl+Right for itself (it would open the Tasks
+            // view's drawer); here it moves to the next column.
+            TaskListEvent::FocusDrawer => {
+                self.columns.focus_tree();
+                self.columns.focus_right();
+                self.sync_window_focus(window, cx);
             }
             _ => {}
         }
@@ -562,6 +616,11 @@ impl UnifiedView {
         } else {
             let hosted = self.construct_hosted(target, window, cx);
             self.hosted.push(hosted);
+            let position = self.column_widths.len();
+            self.column_widths.push(ColumnWidth {
+                dragged: self.layout.column_width(position).map(px),
+                ..Default::default()
+            });
         }
         cx.notify();
     }
@@ -578,6 +637,7 @@ impl UnifiedView {
             return;
         }
         self.hosted.remove(index);
+        self.column_widths.remove(index);
         self.columns.close(index);
         cx.notify();
     }
@@ -597,6 +657,20 @@ impl UnifiedView {
         };
         self.close_column(ix, cx);
         self.sync_window_focus(window, cx);
+    }
+
+    /// The app menu is the tree's (it sits in the tree's header), but `` ` ``
+    /// must open it from anywhere in the view, not only with focus in the
+    /// tree: with focus there the tree handles it first.
+    fn toggle_app_nav(&mut self, _: &AppNavToggle, window: &mut Window, cx: &mut Context<Self>) {
+        self.task_list
+            .update(cx, |list, cx| list.toggle_app_nav(window, cx));
+    }
+
+    /// Close the app menu, e.g. when the shell switches views.
+    pub fn close_app_nav(&mut self, cx: &mut Context<Self>) {
+        self.task_list
+            .update(cx, |list, _| list.app_nav_mut().close());
     }
 
     fn toggle_pin_focused(&mut self, _: &UnifiedTogglePinFocused, _: &mut Window, cx: &mut Context<Self>) {
@@ -673,13 +747,33 @@ impl UnifiedView {
     }
 
     fn focus_left(&mut self, _: &PaneFocusLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_column(window, cx);
         self.columns.focus_left();
         self.sync_window_focus(window, cx);
     }
 
     fn focus_right(&mut self, _: &PaneFocusRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_focused_column(window, cx);
         self.columns.focus_right();
         self.sync_window_focus(window, cx);
+    }
+
+    /// Point `columns`' focused index at the column that actually holds
+    /// keyboard focus, so Ctrl+Left/Right step from where the user really is
+    /// and the focused header marks where keys go. A click, or an open that
+    /// leaves keys where they were (selecting a tree row opens Details, but
+    /// the tree keeps focus), otherwise leaves the model somewhere else.
+    /// Focus outside every column (the chat drawer) leaves it alone.
+    fn sync_focused_column(&mut self, window: &Window, cx: &App) {
+        if let Some(ix) = self
+            .hosted
+            .iter()
+            .position(|h| h.panel.focus_handle(cx).contains_focused(window, cx))
+        {
+            self.columns.focus(ix);
+        } else if self.task_list.read(cx).focus_handle(cx).contains_focused(window, cx) {
+            self.columns.focus_tree();
+        }
     }
 
     fn sync_window_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -703,35 +797,13 @@ impl UnifiedView {
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let border = cx.theme().border;
-        let accent = cx.theme().accent;
-        let muted = cx.theme().muted_foreground;
         let hosted = &self.hosted[index];
         let title = hosted.panel.title(cx);
         let pinned = self.columns.is_pinned(index);
         let focused = self.columns.focused_index() == Some(index);
-        div()
-            .flex()
-            .items_center()
+        style::column_header(div(), focused)
             .justify_between()
-            .px_2()
-            .py_1()
-            .border_b_1()
-            .border_color(border)
-            .when(focused, |el| el.bg(accent.opacity(0.08)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(format!("{}", index + 2)),
-                    )
-                    .child(div().text_sm().child(title)),
-            )
+            .child(style::text_title(div()).child(title))
             .child(
                 div()
                     .flex()
@@ -758,50 +830,129 @@ impl UnifiedView {
             )
     }
 
-    fn render_column(&self, index: usize, folded: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
-        let accent = cx.theme().accent;
-        let focused = self.columns.focused_index() == Some(index);
-        if folded {
-            return div()
-                .id(("unified-col-strip", index))
-                .w(px(28.))
-                .h_full()
-                .flex_shrink_0()
-                .border_l_1()
-                .border_color(border)
-                .flex()
-                .items_start()
-                .justify_center()
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        this.columns.focus(index);
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(format!("{}", index + 2)),
-                )
-                .into_any_element();
+    /// A draggable divider; `divider` as in [`ColumnDivider`].
+    fn render_divider(&self, divider: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (line, drag_border) = (theme.border, theme.drag_border);
+        let view = cx.entity().downgrade();
+        div()
+            .id(("unified-divider", divider))
+            .flex_shrink_0()
+            .w(px(DIVIDER_WIDTH))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .hover(move |el| el.bg(drag_border))
+            .child(div().w(px(1.)).h_full().bg(line))
+            .on_drag(ColumnDivider(divider), move |_, _, _, cx| {
+                // A new drag measures from where the columns are now.
+                let _ = view.update(cx, |this, _| this.resize = None);
+                cx.new(|_| DividerDrag)
+            })
+            .into_any_element()
+    }
+
+    /// Follow a divider drag: the first move records where the column left
+    /// of it starts and the pair's width, and every move puts the divider
+    /// under the pointer (`resize`). `view_left` is this view's left edge,
+    /// where the tree starts.
+    fn drag_divider(
+        &mut self,
+        divider: usize,
+        x: Pixels,
+        view_left: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let last = self.hosted.len().saturating_sub(1);
+        if self.hosted.is_empty() || divider > last {
+            return;
         }
-        let header = self.render_column_header(index, cx);
+        let start = match self.resize {
+            Some(start) if start.divider == divider => start,
+            _ => {
+                let (left_edge, left) = match divider {
+                    0 => (view_left, self.tree_width.unwrap_or(px(TREE_MIN_WIDTH))),
+                    n => {
+                        let bounds = self.column_widths[n - 1].laid_out.get();
+                        (bounds.left(), bounds.size.width)
+                    }
+                };
+                let pair = (divider < last)
+                    .then(|| left + self.column_widths[divider].laid_out.get().size.width);
+                let start = ResizeStart {
+                    divider,
+                    left_edge,
+                    pair,
+                };
+                self.resize = Some(start);
+                start
+            }
+        };
+        let min_left = px(if divider == 0 { TREE_MIN_WIDTH } else { PANEL_MIN_WIDTH });
+        let (left, right) = start.widths_at(x, min_left, px(PANEL_MIN_WIDTH));
+        match divider {
+            0 => self.tree_width = Some(left),
+            n => self.column_widths[n - 1].dragged = Some(left),
+        }
+        if let Some(right) = right {
+            self.column_widths[divider].dragged = Some(right);
+        }
+        cx.notify();
+    }
+
+    /// A divider drag ended: save every width, for the next launch too.
+    /// Positions not open now keep what was saved for them.
+    fn save_layout(&mut self, cx: &mut Context<Self>) {
+        self.resize = None;
+        self.layout.tree_width = self.tree_width.map(f32::from);
+        for (position, column) in self.column_widths.iter().enumerate() {
+            self.layout
+                .set_column_width(position, column.dragged.map(f32::from));
+        }
+        let (config_dir, layout) = (self.paths.config_dir().to_path_buf(), self.layout.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = workbench_layout::save(&config_dir, &layout) {
+                    tracing::warn!("workbench: failed to save column widths: {err:#}");
+                }
+            })
+            .detach();
+    }
+
+    /// Column `index + 2`, with a divider on its left. One the user has not
+    /// sized takes an equal share of what is left; a new column squeezes the
+    /// others rather than scrolling or folding them away.
+    fn render_column(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.hosted[index].panel.focus_handle(cx);
+        let header = self.render_column_header(index, cx).into_any_element();
         let panel = self.hosted[index].panel.render();
+        // The last column has no width of its own: it takes what is left.
+        let last = index + 1 == self.hosted.len();
+        let dragged = self.column_widths[index].dragged.filter(|_| !last);
+        let laid_out = self.column_widths[index].laid_out.clone();
         div()
             .id(("unified-col", index))
+            .relative()
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w(px(220.))
+            .map(|el| match dragged {
+                // Shrinks with the window like the rest, but never grows.
+                Some(width) => el.w(width),
+                None => el.flex_1(),
+            })
+            .min_w_0()
             .h_full()
-            .border_l_1()
-            .border_color(border)
-            .when(focused, |el| el.border_color(accent))
+            .debug_selector(move || format!("unified-col-{index}"))
+            .capture_any_mouse_down(focus_on_click(focus_handle))
+            .child(
+                canvas(
+                    move |bounds, _, _| laid_out.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(header)
             .child(div().flex_1().overflow_hidden().child(panel))
             .into_any_element()
@@ -814,60 +965,76 @@ impl Focusable for UnifiedView {
     }
 }
 
-impl HasAppNav for UnifiedView {
-    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
-        &mut self.app_nav
-    }
-
-    fn app_nav_current(&self) -> Option<AppDestination> {
-        Some(AppDestination::Workbench)
-    }
-
-    fn app_nav_fallback_focus(&self) -> FocusHandle {
-        self.focus_handle.clone()
+/// A mouse-down anywhere in a column moves keyboard focus into it (and so
+/// the focused column, which `sync_focused_column` reads from focus). Capture
+/// phase, so a control inside that stops the click still counts; and only
+/// when focus is not in the column already, so a click on something in it
+/// that takes focus itself (a field) keeps it.
+fn focus_on_click(handle: FocusHandle) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if !handle.contains_focused(window, cx) {
+            window.focus(&handle, cx);
+        }
     }
 }
 
-/// The node tree column's fixed width, which the chat drawer beneath it
-/// shares. Wide enough that a row with both its "Needs you" and its
-/// requirement-count chips still shows a readable title.
-const TREE_COLUMN_WIDTH: f32 = 340.;
-
 impl Render for UnifiedView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_focused_column(window, cx);
         let border = cx.theme().border;
-        let visible_slots = DEFAULT_VISIBLE_COLUMNS;
-        let folded = self.columns.folded(visible_slots);
+        let tree_width = *self
+            .tree_width
+            .get_or_insert_with(|| starting_tree_width(window, self.layout.tree_width.map(px)));
         let total = self.columns.len();
-        let column_elements: Vec<_> = (0..total)
-            .map(|ix| self.render_column(ix, folded.contains(&ix), cx).into_any_element())
-            .collect();
+        // Divider `ix` sits left of column `ix`.
+        let mut column_elements = Vec::new();
+        for ix in 0..total {
+            column_elements.push(self.render_divider(ix, cx));
+            column_elements.push(self.render_column(ix, cx).into_any_element());
+        }
         // Column 1: node tree on top (shrinks and scrolls as the drawer
         // below it expands), the chat drawer under it — never over it
         // (`doc/ui/unified-view.md` "The chat drawer"). Columns 2+ take the
         // full height.
+        let task_list_focus = self.task_list.read(cx).focus_handle(cx);
         let tree_column = div()
             .flex_shrink_0()
-            .w(px(TREE_COLUMN_WIDTH))
+            .w(tree_width)
             .h_full()
             .overflow_hidden()
-            .border_r_1()
-            .border_color(border)
+            .when(total == 0, |el| el.border_r_1().border_color(border))
             .flex()
             .flex_col()
-            .child(div().flex_1().min_h_0().overflow_hidden().child(self.task_list.clone()))
+            .child(
+                // On the tree, not the whole column: a click in the chat
+                // drawer is not a click in the tree.
+                div()
+                    .id("unified-tree")
+                    .debug_selector(|| "unified-tree".into())
+                    .capture_any_mouse_down(focus_on_click(task_list_focus))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.task_list.clone()),
+            )
             .child(self.chat_drawer.clone());
         div()
             .id("unified-view")
             .key_context(UNIFIED_CONTEXT)
             .track_focus(&self.focus_handle)
             .capture_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(Self::toggle_app_nav))
             .on_action(cx.listener(Self::toggle_pin_focused))
             .on_action(cx.listener(Self::next_waiting))
             .on_action(cx.listener(Self::prev_waiting))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::close_focused_column))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ColumnDivider>, _, cx| {
+                let divider = event.drag(cx).0;
+                this.drag_divider(divider, event.event.position.x, event.bounds.left(), cx);
+            }))
+            .on_drop(cx.listener(|this, _: &ColumnDivider, _, cx| this.save_layout(cx)))
             .size_full()
             .flex()
             .child(tree_column)
@@ -879,7 +1046,7 @@ impl Render for UnifiedView {
 mod tests {
     use super::*;
     use crate::views::rows::fixture::Fixture;
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point};
     use gpui_component::Root;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -894,7 +1061,16 @@ mod tests {
         let config_root =
             std::env::temp_dir().join(format!("tod-unified-config-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
-        crate::interview::set_data_root(config_root);
+        open_view_in(fixture, &config_root, cx)
+    }
+
+    /// `open_view` on a config root that already exists, as a later launch.
+    fn open_view_in<'a>(
+        fixture: &Fixture,
+        config_root: &std::path::Path,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<UnifiedView>, &'a mut VisualTestContext) {
+        crate::interview::set_data_root(config_root.to_path_buf());
         let paths = crate::interview::TodPaths::discover().unwrap();
         let slot = Rc::new(RefCell::new(None));
         let store = fixture.store.clone();
@@ -930,6 +1106,39 @@ mod tests {
         });
     }
 
+    /// Widths saved when a drag ends come back on the next launch: the tree
+    /// takes its width, and a column opened at a position takes that
+    /// position's.
+    #[gpui::test]
+    fn dragged_widths_are_saved_and_taken_by_the_next_launch(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.tree_width = Some(px(412.));
+            view.column_widths[0].dragged = Some(px(300.));
+            view.save_layout(cx);
+        });
+        cx.run_until_parked();
+
+        let config_dir = view.read_with(cx, |view, _| view.paths.config_dir().to_path_buf());
+        let saved = workbench_layout::load(&config_dir);
+        assert_eq!(saved.tree_width, Some(412.));
+        assert_eq!(saved.column_width(0), Some(300.));
+
+        // A later launch: a fresh view reads the file.
+        let (next, cx) = open_view_in(&fixture, &config_dir, cx);
+        next.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+        next.read_with(cx, |view, _| {
+            assert_eq!(view.tree_width, Some(px(412.)));
+            assert_eq!(view.column_widths[0].dragged, Some(px(300.)));
+        });
+    }
+
     #[gpui::test]
     fn selecting_a_node_opens_details_in_column_two(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
@@ -944,7 +1153,8 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.columns.len(), 1);
             assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
-            assert_eq!(view.columns.focused_index(), Some(0));
+            // Keys stay in the tree, so its column is still the focused one.
+            assert_eq!(view.columns.focused_index(), None);
         });
     }
 
@@ -1310,9 +1520,11 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
             view.open_panel(PanelKind::Obligations(node_id), 1, true, window, cx);
+            // The second open() appended and focused a new column; move keys
+            // there as Ctrl+Right would.
+            view.sync_window_focus(window, cx);
         });
         draw(cx);
-        // The second open() appended and focused a new column.
         view.read_with(cx, |view, _| {
             assert_eq!(view.columns.len(), 2);
             assert_eq!(view.columns.focused_index(), Some(1));
@@ -1334,7 +1546,8 @@ mod tests {
         // Focus the node tree (column 1) directly, then Ctrl+W must be a
         // no-op: there is no focused column-2+ index to close.
         view.update_in(cx, |view, window, cx| {
-            view.columns.focus_left();
+            view.columns.focus_tree();
+            view.sync_window_focus(window, cx);
             view.close_focused_column(&UnifiedCloseFocusedColumn, window, cx);
         });
         draw(cx);
@@ -1356,6 +1569,7 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             // Column 2 (index 0) holds Details, focused.
             view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.sync_window_focus(window, cx);
             // A Ctrl+E from that same column (as `route_open_request` would
             // dispatch, using the panel's own column as `from_column`) opens
             // strictly after it rather than replacing it.
@@ -1373,7 +1587,8 @@ mod tests {
                 view.columns.columns()[1].panel,
                 PanelKind::Transcript(conversation_id)
             );
-            assert_eq!(view.columns.focused_index(), Some(1));
+            // Keys stay in Details, where Ctrl+E was pressed.
+            assert_eq!(view.columns.focused_index(), Some(0));
         });
     }
 
@@ -1401,6 +1616,89 @@ mod tests {
                 PanelKind::Obligations(node_id)
             );
         });
+    }
+
+    /// Ctrl+Left/Right move keyboard focus between columns from wherever it
+    /// really is: the tree (which keeps Ctrl+Right for itself), a column
+    /// focused by a click rather than by the model, and a Settings column
+    /// (whose `TaskEditView` handles Ctrl+Left on its own when standalone).
+    #[gpui::test]
+    fn ctrl_arrows_move_focus_between_columns(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.open_panel(PanelKind::Settings(node_id), 0, true, window, cx);
+            // Keyboard focus on the tree, as after clicking a row.
+            let handle = view.task_list.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
+        draw(cx);
+        let (tree, details, settings) = view.read_with(cx, |view, cx| {
+            (
+                view.task_list.read(cx).focus_handle(cx),
+                view.hosted[0].panel.focus_handle(cx),
+                view.hosted[1].panel.focus_handle(cx),
+            )
+        });
+
+        cx.dispatch_action(PaneFocusRight);
+        draw(cx);
+        cx.update(|window, cx| assert!(details.contains_focused(window, cx), "tree -> details"));
+
+        cx.dispatch_action(PaneFocusRight);
+        draw(cx);
+        cx.update(|window, cx| assert!(settings.contains_focused(window, cx), "details -> settings"));
+
+        cx.dispatch_action(PaneFocusLeft);
+        draw(cx);
+        cx.update(|window, cx| assert!(details.contains_focused(window, cx), "settings -> details"));
+
+        // A click into the tree moves focus without telling the model.
+        cx.update(|window, cx| window.focus(&tree, cx));
+        cx.dispatch_action(PaneFocusRight);
+        draw(cx);
+        cx.update(|window, cx| assert!(details.contains_focused(window, cx), "clicked tree -> details"));
+
+        cx.dispatch_action(PaneFocusLeft);
+        draw(cx);
+        cx.update(|window, cx| assert!(tree.contains_focused(window, cx), "details -> tree"));
+    }
+
+    /// A click in a column moves keyboard focus into it, and the focused
+    /// column (the one whose header is marked) follows.
+    #[gpui::test]
+    fn clicking_a_column_focuses_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.open_panel(PanelKind::Findings(node_id), 0, true, window, cx);
+            view.sync_window_focus(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| assert_eq!(view.columns.focused_index(), Some(1)));
+
+        let click = |cx: &mut VisualTestContext, selector: &'static str| {
+            let bounds = cx.debug_bounds(selector).expect(selector);
+            cx.simulate_click(bounds.bottom_right() - point(px(4.), px(4.)), Modifiers::default());
+            draw(cx);
+        };
+
+        click(cx, "unified-col-0");
+        let details = view.read_with(cx, |view, cx| view.hosted[0].panel.focus_handle(cx));
+        cx.update(|window, cx| assert!(details.contains_focused(window, cx)));
+        view.read_with(cx, |view, _| assert_eq!(view.columns.focused_index(), Some(0)));
+
+        click(cx, "unified-tree");
+        view.read_with(cx, |view, _| assert_eq!(view.columns.focused_index(), None));
+
+        click(cx, "unified-col-1");
+        view.read_with(cx, |view, _| assert_eq!(view.columns.focused_index(), Some(1)));
     }
 
     /// Alt+Q must move keyboard focus into the Decisions panel it opens —

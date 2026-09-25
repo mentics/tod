@@ -42,6 +42,9 @@ pub mod color {
     pub fn highlight_edge() -> Hsla {
         hex(0x1d4ed8ff)
     }
+    pub fn highlight_faint() -> Hsla {
+        hex(0x1d4ed840)
+    }
     // Pane styles: no pane uses them yet (gpui-component draws its own
     // resizable handles).
     #[allow(dead_code)]
@@ -177,6 +180,7 @@ pub mod size {
     use super::*;
 
     pub const BORDER: Pixels = px(1.);
+    pub const CONTROL: Pixels = px(32.);
     pub const PANE_MIN: Pixels = px(320.);
     pub const CONTROL_XSMALL: Pixels = px(20.);
     pub const GROUP_ROW: Pixels = px(28.);
@@ -461,6 +465,35 @@ pub fn panel_header<E: Styled>(el: E) -> E {
         .gap(space::RELATED)
         .border_b(size::BORDER)
         .border_color(color::divider())
+}
+
+/// `styles.column-header`, in its `column-focused` state while `focused`.
+pub fn column_header<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    let el = el
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .h(size::CONTROL)
+        .px(space::RELATED)
+        .gap(space::INLINE)
+        .border_b(size::BORDER)
+        .border_color(color::divider());
+    if focused { column_focused(el) } else { el }
+}
+
+/// `states.column-focused`: the header of the column that has focus — a
+/// faint highlight behind it and a highlight-edge line along its top, drawn
+/// as an overlay so the header does not shift when focus arrives.
+pub fn column_focused<E: Styled + ParentElement>(el: E) -> E {
+    el.relative().bg(color::highlight_faint()).child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(size::BORDER)
+            .bg(color::highlight_edge()),
+    )
 }
 
 /// `styles.panel-footer`.

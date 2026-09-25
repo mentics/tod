@@ -336,6 +336,10 @@ pub struct TaskEditView {
     loaded_summary: Option<NodeSummary>,
     /// The store changed; reload what other writers (agents) may have touched.
     pending_live_refresh: bool,
+    /// Hosted in another view (the workbench's Settings column): Left and
+    /// Ctrl+Left (`PaneFocusLeft`) go to the host instead of emitting
+    /// `FocusTaskList`.
+    embedded: bool,
     notes: Vec<NoteItem>,
     details_collapsed: bool,
     notes_collapsed: bool,
@@ -664,6 +668,7 @@ impl TaskEditView {
             loaded_details: String::new(),
             loaded_summary: None,
             pending_live_refresh: false,
+            embedded: false,
             notes: Vec::new(),
             details_collapsed: false,
             notes_collapsed: false,
@@ -703,6 +708,11 @@ impl TaskEditView {
 
     pub fn open_task_id(&self, _cx: &Context<Self>) -> Option<String> {
         self.task_id.clone()
+    }
+
+    /// Host this view inside another; see `embedded`.
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
     }
 
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -5746,7 +5756,7 @@ impl Render for TaskEditView {
             .border_l_2()
             .border_color(accent)
             .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
-                if this.editing.is_some() {
+                if this.editing.is_some() || this.embedded {
                     cx.propagate();
                     return;
                 }

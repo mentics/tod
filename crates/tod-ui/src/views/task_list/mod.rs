@@ -297,6 +297,9 @@ pub struct TaskListView {
     list_view: ListView<TaskListDelegate>,
     search_input: Entity<InputState>,
     focus_handle: FocusHandle,
+    /// Hosted as a column of a multi-column view (the workbench): the
+    /// header takes the `column-focused` state while the tree has focus.
+    marks_focused_column: bool,
     last_selected: Option<IndexPath>,
     pending_revert: Option<IndexPath>,
     action_sink: Rc<RefCell<Vec<RowAction>>>,
@@ -482,6 +485,7 @@ impl TaskListView {
             list_view,
             search_input,
             focus_handle,
+            marks_focused_column: false,
             last_selected: initial_selection.0,
             pending_revert: None,
             action_sink,
@@ -2690,6 +2694,11 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// Host this view as a column; see `marks_focused_column`.
+    pub fn set_marks_focused_column(&mut self, marks: bool) {
+        self.marks_focused_column = marks;
+    }
+
     /// The host (e.g. W6's attention feed) reports what each node is
     /// waiting on the user for, keyed by node id. Nodes not present in
     /// `map` are cleared back to zero. Rows with `count > 0` show a badge
@@ -2919,7 +2928,104 @@ impl TaskListView {
         self.open_plan_panel(&task_id, window, cx);
     }
 
-    fn render_header(
+    fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        use gpui::IntoElement as _;
+        if self.marks_focused_column {
+            self.render_column_header(window, cx).into_any_element()
+        } else {
+            self.render_toolbar(window, cx).into_any_element()
+        }
+    }
+
+    /// The header as a column of a multi-column view: the toolbar's controls
+    /// on one fixed-height `column-header` row, marked while the tree has
+    /// focus. Only the search field keeps its (inline) shortcut badge; the
+    /// others hang below their controls, which a fixed height has no room
+    /// for. What does not fit the column's width is clipped at the right.
+    fn render_column_header(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl gpui::IntoElement {
+        let focused = self.focus_handle.contains_focused(window, cx);
+        let sort_label = format!(
+            "Sort {} {}",
+            self.working_set.sort_key.label(),
+            self.working_set.sort_direction.arrow()
+        );
+        let mut search = Input::new(&self.search_input).cleanable(true).small().w_full();
+        if let Some(pill) =
+            render_shortcut_pill(window, &TaskListFocusSearch, TASK_LIST_CONTEXT, cx)
+        {
+            search = search.suffix(pill);
+        }
+        let list_count = self.outline_lists.len();
+
+        let mut row = crate::ui::style::column_header(div(), focused)
+            .overflow_hidden()
+            .child(self.render_app_nav_without_badge(window, cx))
+            .child(
+                Button::new("prev-list")
+                    .label("◀")
+                    .small()
+                    .disabled(list_count <= 1)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_prev_list(&TaskListPrevList, window, cx);
+                    })),
+            )
+            .child(
+                crate::ui::style::text(div())
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
+                    .child(self.active_list_title()),
+            )
+            .child(
+                Button::new("next-list")
+                    .label("▶")
+                    .small()
+                    .disabled(list_count <= 1)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_next_list(&TaskListNextList, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("new-list")
+                    .label("New list")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_new_list(&TaskListNewList, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("new-task")
+                    .label("New item")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_create_below(&TaskListCreateBelow, window, cx);
+                    })),
+            )
+            .child(div().flex_1().min_w_0().child(search));
+        if let Some(tag) = &self.working_set.tag_filter {
+            row = row.child(
+                Button::new("active-tag-filter")
+                    .label(format!("Tag: {tag}"))
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.on_clear_tag_filter(&TaskListClearTagFilter, window, cx);
+                    })),
+            );
+        }
+        row.child(
+            Button::new("sort-toggle")
+                .label(sort_label)
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.cycle_sort_and_show_menu(window, cx);
+                })),
+        )
+    }
+
+    fn render_toolbar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3388,7 +3494,12 @@ impl HasAppNav for TaskListView {
     }
 
     fn app_nav_current(&self) -> Option<AppDestination> {
-        Some(AppDestination::Tasks)
+        // Hosted as a column only in the workbench.
+        if self.marks_focused_column {
+            Some(AppDestination::Workbench)
+        } else {
+            Some(AppDestination::Tasks)
+        }
     }
 
     fn app_nav_fallback_focus(&self) -> FocusHandle {

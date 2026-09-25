@@ -43,8 +43,8 @@ The facts that shape the plan:
 - `unified/columns.rs`: the column model as plain Rust with no GPUI, fully unit
   tested. It holds the columns, which are pinned, and which has focus; the
   "first unpinned column starting from the clicked one" rule; Ctrl+click;
-  singleton panels; unpinning; closing; folding into strips when the columns
-  do not fit.
+  singleton panels; unpinning; closing. (Folding into strips when the columns
+  did not fit was dropped: the columns share the width equally instead.)
 - A `PanelKind` enum and a `ColumnPanel` trait (render, title, focus handle,
   "open this" requests up to the root) with placeholder panels, so later items
   only add implementations.

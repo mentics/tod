@@ -93,7 +93,9 @@ fn capabilities_snapshot(conn: &Connection, node_id: Uuid) -> Result<Option<Enti
         settings.agent_model = agent.model;
         settings.agent_effort = agent.effort;
     }
-    if let Some(task) = TaskRepo::new(conn).get(&id)? {
+    // `get_node`, not `get`: `get` only finds nodes with the Agent capability,
+    // and Files, Tags, and Ticket settings do not depend on it.
+    if let Some(task) = TaskRepo::new(conn).get_node(&id)? {
         settings.repo = task.repo;
         settings.branch = task.branch;
         settings.tags = task.tags;
