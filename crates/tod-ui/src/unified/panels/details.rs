@@ -6,6 +6,7 @@
 //! their own (`PanelKind::Obligations` / `PanelKind::Plan`), reached through
 //! the links below.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::selectable_text::selectable_markdown;
+use crate::ui::style;
 use crate::unified::columns::PanelKind;
 use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::unified::status_label;
@@ -113,6 +115,10 @@ pub struct DetailsPanel {
     editing: bool,
     loaded: Loaded,
     pending_refresh: bool,
+    /// Unsaved details text per node, kept so switching the selection away
+    /// and back does not silently drop an in-progress edit (explicit save
+    /// only, `.claude/CLAUDE.md`: a node switch is not a save or a discard).
+    drafts: HashMap<Uuid, String>,
     _agent_runs_subscription: Subscription,
     _poll: gpui::Task<()>,
 }
@@ -175,27 +181,75 @@ impl DetailsPanel {
             editing: false,
             loaded,
             pending_refresh: false,
+            drafts: HashMap::new(),
             _agent_runs_subscription,
             _poll,
         }
     }
 
     /// Retarget this column to a different node, in place. An edit in
-    /// progress on the old node is discarded — it was never saved.
+    /// progress on the old node is kept as a draft (`self.drafts`), not
+    /// discarded — a node switch is not a save or a discard
+    /// (`.claude/CLAUDE.md`: explicit save only). Switching back to a node
+    /// with a pending draft restores it, still in edit mode.
     pub fn set_node(&mut self, node_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if node_id == self.node_id {
+            return;
+        }
+        self.capture_draft(cx);
         self.node_id = node_id;
         self.editing = false;
         self.reload(window, cx);
+        self.restore_draft(window, cx);
+    }
+
+    /// Stash the in-progress edit for the current node, if any, so it is not
+    /// lost when the selection moves elsewhere. A no-op unless `editing` and
+    /// the text actually differs from what is saved.
+    fn capture_draft(&mut self, cx: &mut Context<Self>) {
+        if !self.editing {
+            return;
+        }
+        let text = self.details_input.read(cx).text().to_string();
+        if text == self.loaded.details {
+            self.drafts.remove(&self.node_id);
+        } else {
+            self.drafts.insert(self.node_id, text);
+        }
+    }
+
+    /// Restore a draft stashed for `self.node_id`, if one exists, back into
+    /// the textarea and into edit mode.
+    fn restore_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(draft) = self.drafts.get(&self.node_id).cloned() {
+            self.details_input.update(cx, |input, cx| {
+                input.set_value(draft, window, cx);
+            });
+            self.editing = true;
+        }
+    }
+
+    /// True while the current node has an unsaved draft — shows the
+    /// "Unsaved changes" marker with Save/Discard regardless of whether the
+    /// textarea happens to be focused right now.
+    fn has_draft(&self) -> bool {
+        self.drafts.contains_key(&self.node_id)
     }
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.loaded = load(&self.fleet, self.node_id);
-        let details = self.loaded.details.clone();
-        self.details_input.update(cx, |input, cx| {
-            if input.text().to_string() != details {
-                input.set_value(details, window, cx);
-            }
-        });
+        // Don't clobber an in-progress edit or a stashed draft with the
+        // freshly loaded stored text — if the node's stored text changed
+        // elsewhere while a draft is pending, the draft still wins; it is
+        // shown as unsaved rather than silently overwritten.
+        if !self.editing && !self.has_draft() {
+            let details = self.loaded.details.clone();
+            self.details_input.update(cx, |input, cx| {
+                if input.text().to_string() != details {
+                    input.set_value(details, window, cx);
+                }
+            });
+        }
         cx.notify();
     }
 
@@ -221,6 +275,7 @@ impl DetailsPanel {
             input.set_value(details, window, cx);
         });
         self.editing = false;
+        self.drafts.remove(&self.node_id);
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -240,6 +295,7 @@ impl DetailsPanel {
     fn persist_details(&mut self, cx: &mut Context<Self>) {
         let value = self.details_input.read(cx).text().to_string();
         if value == self.loaded.details {
+            self.drafts.remove(&self.node_id);
             return;
         }
         if self
@@ -252,6 +308,7 @@ impl DetailsPanel {
             .is_ok()
         {
             self.loaded.details = value;
+            self.drafts.remove(&self.node_id);
         }
     }
 
@@ -294,6 +351,9 @@ impl Render for DetailsPanel {
         let obligations_label = format!("Obligations ({})", self.loaded.obligation_count);
         let decisions_waiting = self.loaded.decisions_waiting;
         let editing = self.editing;
+        let dirty = editing
+            && self.details_input.read(cx).text().to_string() != self.loaded.details;
+        let has_draft = self.has_draft() || dirty;
         let runs = self.agent_runs.read(cx).runs_for_node(self.node_id);
 
         div()
@@ -339,6 +399,19 @@ impl Render for DetailsPanel {
                             .disabled(false)
                             .w_full()
                             .into_any_element()
+                    } else if self.loaded.details.is_empty() {
+                        div()
+                            .id("unified-details-empty")
+                            .w_full()
+                            .border(style::size::BORDER)
+                            .border_color(style::color::divider())
+                            .rounded(style::radius::CONTROL)
+                            .px(style::space::INSET)
+                            .py(style::space::RELATED)
+                            .child(style::empty_message(div().child(
+                                "No details — press Enter to add",
+                            )))
+                            .into_any_element()
                     } else {
                         selectable_markdown(
                             "unified-details-body",
@@ -349,16 +422,31 @@ impl Render for DetailsPanel {
                         .into_any_element()
                     }),
             )
-            .when(editing, |el| {
+            .when(has_draft, |el| {
                 el.child(
-                    div().flex().gap_2().child(
-                        Button::new("unified-details-save")
-                            .label("Save")
-                            .small()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_edit(&DetailsSave, window, cx);
-                            })),
-                    ),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(style::text_muted(div().child("Unsaved changes")))
+                        .when(editing, |el| {
+                            el.child(
+                                Button::new("unified-details-save")
+                                    .label("Save")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_edit(&DetailsSave, window, cx);
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("unified-details-discard")
+                                .label("Discard")
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.discard_edit(&DetailsEscape, window, cx);
+                                })),
+                        ),
                 )
             })
             .child(
@@ -616,5 +704,181 @@ mod tests {
             assert!(!view.editing);
             assert_eq!(view.details_input.read(cx).text().to_string(), original, "escape restores the text");
         });
+    }
+
+    /// A second node in the same store, for tests that switch the panel's
+    /// target.
+    fn second_node(fixture: &Fixture) -> Uuid {
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        let node_id = Uuid::new_v4();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(node_id),
+                list_id,
+                parent_id: None,
+                anchor_id: None,
+                position: tod_store::outline::CreatePosition::Below,
+                title: "Mobile client".into(),
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        node_id
+    }
+
+    #[gpui::test]
+    fn switching_away_and_back_restores_the_unsaved_draft_without_writing_it(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let other_node = second_node(&fixture);
+        let (view, _agent_runs, cx) = open_panel(fixture.node_id, fixture.store.clone(), cx);
+        let original = view.read_with(cx, |view, _| view.loaded.details.clone());
+        let draft_text = format!("{original} draft, not yet saved");
+
+        view.update_in(cx, |view, window, cx| {
+            view.enter_edit(&DetailsEnterEdit, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            let draft_text = draft_text.clone();
+            view.details_input.update(cx, |input, cx| {
+                input.set_value(draft_text, window, cx);
+            });
+        });
+        draw(cx);
+
+        // Switch to another node: the draft must not be written to the
+        // store (explicit save only — a node switch is not a save).
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(other_node, window, cx);
+        });
+        draw(cx);
+        let stored_on_other_node = fixture
+            .store
+            .get_extra_content(fixture.node_id, EXTRA_CONTENT_DETAILS)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert_eq!(
+            stored_on_other_node, original,
+            "switching away must not persist the draft"
+        );
+        view.read_with(cx, |view, _| {
+            assert!(!view.editing, "the other node starts out of edit mode");
+        });
+
+        // Switch back: the draft is restored, still in edit mode.
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(fixture.node_id, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert!(view.editing, "switching back restores edit mode");
+            assert_eq!(
+                view.details_input.read(cx).text().to_string(),
+                draft_text,
+                "switching back restores the draft text"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn discard_after_switching_back_drops_the_draft(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let other_node = second_node(&fixture);
+        let (view, _agent_runs, cx) = open_panel(fixture.node_id, fixture.store.clone(), cx);
+        let original = view.read_with(cx, |view, _| view.loaded.details.clone());
+
+        view.update_in(cx, |view, window, cx| {
+            view.enter_edit(&DetailsEnterEdit, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.details_input.update(cx, |input, cx| {
+                input.set_value(format!("{original} discard me too"), window, cx);
+            });
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(other_node, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(fixture.node_id, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.editing, "draft is restored in edit mode before discard");
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.discard_edit(&DetailsEscape, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert!(!view.editing);
+            assert!(!view.has_draft());
+            assert_eq!(view.details_input.read(cx).text().to_string(), original);
+        });
+
+        // Switching away and back again confirms nothing was kept.
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(other_node, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(fixture.node_id, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert!(!view.editing, "no draft remains after discard");
+        });
+    }
+
+    #[gpui::test]
+    fn saving_after_switching_back_writes_the_draft(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let other_node = second_node(&fixture);
+        let (view, _agent_runs, cx) = open_panel(fixture.node_id, fixture.store.clone(), cx);
+        let original = view.read_with(cx, |view, _| view.loaded.details.clone());
+        let draft_text = format!("{original} saved after returning");
+
+        view.update_in(cx, |view, window, cx| {
+            view.enter_edit(&DetailsEnterEdit, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            let draft_text = draft_text.clone();
+            view.details_input.update(cx, |input, cx| {
+                input.set_value(draft_text, window, cx);
+            });
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(other_node, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.set_node(fixture.node_id, window, cx);
+        });
+        draw(cx);
+        view.update_in(cx, |view, window, cx| {
+            view.save_edit(&DetailsSave, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.loaded.details, draft_text);
+            assert!(!view.has_draft());
+        });
+        let stored = fixture
+            .store
+            .get_extra_content(fixture.node_id, EXTRA_CONTENT_DETAILS)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert_eq!(stored, draft_text, "save writes the restored draft");
     }
 }

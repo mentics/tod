@@ -107,7 +107,7 @@ impl PlanPanel {
 
 impl ColumnPanel for PlanPanel {
     fn title(&self, _cx: &App) -> SharedString {
-        "Plan".into()
+        format!("Plan — {}", node_title(&self.fleet, self.node_id)).into()
     }
 
     fn target_label(&self, _cx: &App) -> SharedString {
