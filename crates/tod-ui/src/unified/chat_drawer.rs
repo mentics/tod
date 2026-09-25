@@ -4,6 +4,11 @@
 //! when nothing is focused. See `doc/ui/unified-view.md` ("The chat
 //! drawer").
 //!
+//! Expanded, its top edge is a thick line that drags to make it taller or
+//! shorter (`resize::ChatDrawerEdge`, handled by `UnifiedView`, which saves
+//! the height), and its one header line — "Chat — {about}" and a collapse
+//! chevron — takes the focused-column tint while the drawer has focus.
+//!
 //! Freeform means the plain/default protocol (`ProtocolKind::Outline`), the
 //! same one Ctrl+J opens everywhere else. A structured lifecycle
 //! conversation (implement, verify, review, fix, gate check, on-entry) never
@@ -20,12 +25,12 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Styled,
-    Subscription, Window, actions, div, prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions, div,
+    prelude::FluentBuilder, px, relative,
 };
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, IconName, Sizable};
+use gpui_component::{ActiveTheme, Icon, IconName, Sizable};
 use tod_core::conversation::context::focus_selection;
 use tod_core::conversation::{ConversationConfig, ConversationDriver, ConversationStatus, SharedAgentAccess};
 use tod_store::conversation::{ConversationRepo, Focus, ProtocolKind, Turn, TurnRole};
@@ -37,12 +42,14 @@ use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPan
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::style;
+use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
 pub const CHAT_DRAWER_CONTEXT: &str = "ChatDrawer";
 
-/// The drawer's fixed height while expanded.
-const DRAWER_HEIGHT: f32 = 320.;
+/// How thick the expanded drawer's top edge is drawn, inside its
+/// `DIVIDER_WIDTH` grab area.
+const EDGE_LINE: f32 = 3.;
 
 actions!(chat_drawer, [ChatDrawerNewConversation]);
 
@@ -73,6 +80,11 @@ fn entry_of(turn: &Turn) -> Entry {
     }
 }
 
+pub enum ChatDrawerEvent {
+    /// The drawer collapsed; focus should go back to the columns.
+    Collapsed,
+}
+
 pub struct ChatDrawer {
     fleet: Arc<FleetStore>,
     agent: SharedAgent,
@@ -81,6 +93,9 @@ pub struct ChatDrawer {
     /// What the header says this is about (a node's title, or "Project").
     about: SharedString,
     expanded: bool,
+    /// The expanded height the user dragged it to; `None` is
+    /// `CHAT_START_HEIGHT`.
+    height: Option<Pixels>,
     conversation_id: Option<Uuid>,
     status: ConversationStatus,
     error: Option<SharedString>,
@@ -97,6 +112,7 @@ impl ChatDrawer {
         fleet: Arc<FleetStore>,
         agent: SharedAgent,
         agent_runs: Entity<AgentRuns>,
+        height: Option<Pixels>,
     ) -> Self {
         let transcript = cx.new(|cx| {
             let mut panel = AgentConversationPanel::new(
@@ -106,6 +122,9 @@ impl ChatDrawer {
                 cx,
             );
             panel.set_extra_hint("Ctrl+N new conversation");
+            // The drawer's own header line shows the title, beside its
+            // collapse chevron.
+            panel.set_header_visible(false, cx);
             panel
         });
         let transcript_events = cx.subscribe_in(&transcript, window, Self::on_transcript_event);
@@ -117,6 +136,7 @@ impl ChatDrawer {
             focus: Focus::Project,
             about: "Project".into(),
             expanded: false,
+            height,
             conversation_id: None,
             status: ConversationStatus::default(),
             error: None,
@@ -142,6 +162,18 @@ impl ChatDrawer {
     #[cfg(test)]
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// The expanded height, as dragged.
+    pub fn height(&self) -> Option<Pixels> {
+        self.height
+    }
+
+    pub fn set_height(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        if self.height != Some(height) {
+            self.height = Some(height);
+            cx.notify();
+        }
     }
 
     /// Point the drawer at a new focus: swaps to that focus's latest
@@ -192,6 +224,8 @@ impl ChatDrawer {
         if self.expanded {
             self.focus_handle.focus(window, cx);
             self.transcript.update(cx, |panel, cx| panel.set_active(true, cx));
+        } else {
+            cx.emit(ChatDrawerEvent::Collapsed);
         }
         cx.notify();
     }
@@ -382,7 +416,6 @@ impl ChatDrawer {
         let about = self.about.clone();
         let empty = format!("No conversation about {about} yet. Give direction below.");
         self.transcript.update(cx, |panel, cx| {
-            panel.set_title(format!("Chat — {about}"), cx);
             panel.set_entries(entries, cx);
             panel.set_status(running, activity, cx);
             panel.set_empty_message(empty, cx);
@@ -391,6 +424,8 @@ impl ChatDrawer {
     }
 }
 
+impl EventEmitter<ChatDrawerEvent> for ChatDrawer {}
+
 impl Focusable for ChatDrawer {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -398,9 +433,13 @@ impl Focusable for ChatDrawer {
 }
 
 impl Render for ChatDrawer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted_foreground;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted, accent, drag_border) =
+            (theme.border, theme.muted_foreground, theme.accent, theme.drag_border);
+        // Its header is in the `column-focused` state while it has focus, as
+        // a focused column's is; only one of them shows it.
+        let focused = self.focus_handle.contains_focused(window, cx);
 
         if !self.expanded {
             return div()
@@ -411,6 +450,7 @@ impl Render for ChatDrawer {
                 .w_full()
                 .border_t_1()
                 .border_color(border)
+                .map(|el| style::header_focusable(el, focused))
                 .px_2()
                 .py_1()
                 .cursor_pointer()
@@ -431,20 +471,36 @@ impl Render for ChatDrawer {
                 .into_any_element();
         }
 
+        // The top edge: a thick line that drags to resize, in the accent
+        // color while the drawer has focus, like a focused column's divider.
+        let line = if focused { accent } else { muted.opacity(0.6) };
+        let edge = div()
+            .id("chat-drawer-edge")
+            .flex_shrink_0()
+            .w_full()
+            .h(px(DIVIDER_WIDTH))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .cursor_row_resize()
+            .hover(move |el| el.bg(drag_border))
+            .child(div().w_full().h(px(EDGE_LINE)).bg(line))
+            .on_drag(ChatDrawerEdge, |_, _, _, cx| cx.new(|_| DividerDrag));
+
+        // One header line: the title, any error, and the collapse chevron.
+        // Clicking anywhere on it collapses the drawer.
         let error = self.error.clone();
-        // The transcript panel's own header already shows "Chat — {about}"
-        // (`AgentConversationPanel::set_title`), so this bar only holds the
-        // collapse control and any error — showing the title again here
-        // would duplicate it.
         let header = div()
             .id("chat-drawer-header")
+            .flex_shrink_0()
             .flex()
             .items_center()
-            .justify_between()
+            .gap_2()
             .px_2()
             .py_1()
             .border_b_1()
             .border_color(border)
+            .map(|el| style::header_focusable(el, focused))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -452,20 +508,18 @@ impl Render for ChatDrawer {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .when_some(error, |el, err| {
-                        el.child(style::text_error(div()).text_xs().child(err))
-                    }),
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_sm()
+                    .child(format!("Chat — {}", self.about)),
             )
-            .child(
-                Button::new("chat-drawer-collapse")
-                    .icon(IconName::ChevronDown)
-                    .ghost()
-                    .small()
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle(window, cx))),
-            );
+            .when_some(error, |el, err| {
+                el.child(style::text_error(div()).text_xs().child(err))
+            })
+            .child(Icon::new(IconName::ChevronDown).small().text_color(muted));
 
         div()
             .id("chat-drawer")
@@ -476,11 +530,13 @@ impl Render for ChatDrawer {
             }))
             .flex_shrink_0()
             .w_full()
-            .h(px(DRAWER_HEIGHT))
-            .border_t_1()
-            .border_color(border)
+            .h(self.height.unwrap_or(px(CHAT_START_HEIGHT)))
+            // A window made shorter than the dragged height still shows
+            // some of the tree.
+            .max_h(relative(0.85))
             .flex()
             .flex_col()
+            .child(edge)
             .child(header)
             .child(
                 div()
@@ -543,7 +599,7 @@ mod tests {
         let (_, cx) = cx.add_window_view(move |window, cx| {
             let agent_runs = cx.new(|_| AgentRuns::new(store.clone(), agent.clone()));
             let drawer = cx.new(|cx| {
-                ChatDrawer::new(window, cx, store.clone(), agent.clone(), agent_runs.clone())
+                ChatDrawer::new(window, cx, store.clone(), agent.clone(), agent_runs.clone(), None)
             });
             *runs_slot_in.borrow_mut() = Some(agent_runs.clone());
             *drawer_slot_in.borrow_mut() = Some(drawer.clone());

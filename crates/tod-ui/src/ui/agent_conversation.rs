@@ -172,6 +172,9 @@ pub struct AgentConversationPanel {
     running: bool,
     activity: Option<SharedString>,
     title: SharedString,
+    /// Whether the panel draws its own title bar; a host that has its own
+    /// header turns it off.
+    header_visible: bool,
     empty_message: SharedString,
     /// Shown after the panel's own hint while not writing.
     extra_hint: Option<SharedString>,
@@ -227,6 +230,7 @@ impl AgentConversationPanel {
             running: false,
             activity: None,
             title: SharedString::from(title.to_string()),
+            header_visible: true,
             empty_message: SharedString::default(),
             extra_hint: None,
             actions: Vec::new(),
@@ -307,6 +311,15 @@ impl AgentConversationPanel {
         let title = title.into();
         if title != self.title {
             self.title = title;
+            cx.notify();
+        }
+    }
+
+    /// Hide the panel's title bar (title and header buttons) when the host
+    /// draws its own header.
+    pub fn set_header_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible != self.header_visible {
+            self.header_visible = visible;
             cx.notify();
         }
     }
@@ -705,21 +718,23 @@ impl Render for AgentConversationPanel {
                     }
                 }),
             )
-            .child(
-                style::panel_header(h_flex())
-                    .items_center()
-                    .child(
-                        if self.active {
-                            style::text_title(div())
-                        } else {
-                            style::text_muted(div())
-                        }
-                        .flex_1()
-                        .min_w_0()
-                        .child(self.title.clone()),
-                    )
-                    .children(header_actions),
-            )
+            .when(self.header_visible, |el| {
+                el.child(
+                    style::panel_header(h_flex())
+                        .items_center()
+                        .child(
+                            if self.active {
+                                style::text_title(div())
+                            } else {
+                                style::text_muted(div())
+                            }
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.title.clone()),
+                        )
+                        .children(header_actions),
+                )
+            })
             .children(self.usage.clone().map(|(line, details)| {
                 div()
                     .id("agent-conversation-usage")
