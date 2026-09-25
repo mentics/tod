@@ -134,12 +134,12 @@ styles:
   panel:
     background: surface
   # Every header (a panel's, a workbench column's, the chat drawer's) sits
-  # on a faint gray band, so it reads as a header. One that tracks focus
-  # turns the band blue while its region has focus; only one header in a
-  # window shows the focused band at a time.
+  # on a faint gray band, so it reads as a header even when its region does
+  # not have focus. One that tracks focus takes the column-focused state
+  # instead while its region has focus; only one header in a window does.
   header:
     background: header-fill
-    focused: header-focused
+    focused: column-focused
   panel-header:
     extends: header
     padding-x: inset
@@ -162,6 +162,18 @@ styles:
     border-top: divider
   pane:
     min-width: pane-min
+  # The strip atop each panel column of a multi-column view (the workbench).
+  # The focused column's is tinted, so which column the keys go to shows at a
+  # glance without competing with a highlighted row. The node tree column has
+  # no column-header: its own toolbar is its header, and takes the same
+  # column-focused state.
+  column-header:
+    extends: header
+    height: control
+    padding-x: related
+    gap: inline
+    border-bottom: divider
+    focused: column-focused
   pane-divider:
     background: divider
     dragging: dragging
@@ -380,8 +392,10 @@ states:
     border: highlight-edge
   dragging:
     background: drag-edge
-  header-focused:
-    background: header-fill-focused
+  # The top edge is drawn over the header, so it takes no layout space.
+  column-focused:
+    background: highlight-faint
+    border-top: highlight-edge
   disabled:
     color: text-muted
   toggle-on:
@@ -427,9 +441,9 @@ properties:
   highlighted: state
   disabled: state
   selected: state
+  focused: state
   font-weight: "regular | semibold"
   dragging: state
-  focused: state
 
 tokens:
   color:
@@ -473,11 +487,11 @@ tokens:
     # A group heading's rule, and the band behind an outermost heading.
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
-    # A header's band, and the band of the header whose region has focus;
-    # about equally faint, gray and blue.
-    header-fill: "#ffffff08"
-    header-fill-focused: "#1d4ed814"
+    # The band behind every header: gray about as faint as highlight-faint.
+    header-fill: "#ffffff10"
     highlight-edge: "#1d4ed8"
+    # highlight-edge at 25%: tints the header of the column that has focus.
+    highlight-faint: "#1d4ed840"
     toggle-on-fill: "#1d4ed8"
     toggle-on-edge: "#93c5fd"
     accent: "#1d4ed88c"

@@ -336,6 +336,10 @@ pub struct TaskEditView {
     loaded_summary: Option<NodeSummary>,
     /// The store changed; reload what other writers (agents) may have touched.
     pending_live_refresh: bool,
+    /// Hosted in another view (the workbench's Settings column): Left and
+    /// Ctrl+Left (`PaneFocusLeft`) go to the host instead of emitting
+    /// `FocusTaskList`.
+    embedded: bool,
     notes: Vec<NoteItem>,
     details_collapsed: bool,
     notes_collapsed: bool,
@@ -664,6 +668,7 @@ impl TaskEditView {
             loaded_details: String::new(),
             loaded_summary: None,
             pending_live_refresh: false,
+            embedded: false,
             notes: Vec::new(),
             details_collapsed: false,
             notes_collapsed: false,
@@ -703,6 +708,11 @@ impl TaskEditView {
 
     pub fn open_task_id(&self, _cx: &Context<Self>) -> Option<String> {
         self.task_id.clone()
+    }
+
+    /// Host this view inside another; see `embedded`.
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
     }
 
     pub fn open(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -783,9 +793,11 @@ impl TaskEditView {
             if self.own_files().is_some() {
                 stops.push(TaskEditField::RunsIn);
             }
-            if self.own_dev_container().is_some() {
+            if let Some(dev) = self.own_dev_container() {
+                if !dev.sandbox {
+                    stops.push(TaskEditField::RepoLocation);
+                }
                 stops.extend([
-                    TaskEditField::RepoLocation,
                     TaskEditField::ContainerName,
                     TaskEditField::ContainerRefresh,
                 ]);
@@ -3086,11 +3098,15 @@ impl TaskEditView {
         }
         if !value.is_empty() && self.repo_in_container() {
             if !value.starts_with('/') {
-                self.pending_toast = Some(
-                    "The repository is inside the dev container: give its path there, \
-                     like /workspaces/app"
-                        .into(),
-                );
+                let example = if self.runs_in_sandbox() {
+                    "/root/app"
+                } else {
+                    "/workspaces/app"
+                };
+                self.pending_toast = Some(format!(
+                    "The repository is inside {}: give its path there, like {example}",
+                    self.remote_place()
+                ));
                 self.pending_repo_revert = true;
                 cx.notify();
                 return;
@@ -3789,7 +3805,9 @@ impl TaskEditView {
                                 .w(px(280.))
                                 .flex_shrink_0()
                                 .child(Self::render_field_label(
-                                    if self.repo_in_container() {
+                                    if self.runs_in_sandbox() {
+                                        "Workspace directory (in the sandbox)"
+                                    } else if self.repo_in_container() {
                                         "Workspace directory (in the container)"
                                     } else {
                                         "Workspace directory"
@@ -3947,8 +3965,7 @@ impl TaskEditView {
                 if let Some(container) = resolved
                     .dev_container
                     .as_ref()
-                    .filter(|dev| dev.repo_on_host)
-                    .and_then(|dev| dev.container())
+                    .and_then(|dev| dev.mounted_container())
                 {
                     summary = format!("{summary} · in dev container {container}");
                 }
@@ -5739,7 +5756,7 @@ impl Render for TaskEditView {
             .border_l_2()
             .border_color(accent)
             .on_action(cx.listener(|this, _: &PaneFocusLeft, _, cx| {
-                if this.editing.is_some() {
+                if this.editing.is_some() || this.embedded {
                     cx.propagate();
                     return;
                 }

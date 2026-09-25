@@ -801,9 +801,12 @@ fn container_startup(
     terminal: &TerminalSettings,
 ) -> Result<Option<String>> {
     use tod_agent::devcontainer::{self, ContainerFile, sh_quote};
-    let tod_agent::AgentEnvironment::DevContainer(launch) = fleet.agent_environment(node_id, cwd)?
-    else {
-        return Ok(None);
+    let launch = match fleet.agent_environment(node_id, cwd)? {
+        tod_agent::AgentEnvironment::DevContainer(launch) => launch,
+        tod_agent::AgentEnvironment::Sandbox(launch) => {
+            return sandbox_startup(fleet, &launch, session_id, inner, terminal).map(Some);
+        }
+        tod_agent::AgentEnvironment::Host => return Ok(None),
     };
     let container = devcontainer::prepare(&launch)?;
     let mut script = format!(
@@ -850,6 +853,43 @@ fn container_startup(
     )))
 }
 
+/// The host command that opens the terminal's shell in a cloud sandbox
+/// through `tod-sandbox shell`, in the sandbox's directory, with `tod-cli`
+/// carried back, running `inner` first if given. The relay's token goes in a
+/// file `tod-sandbox` reads and deletes, never on the command line.
+fn sandbox_startup(
+    fleet: &FleetStore,
+    launch: &tod_agent::sandbox::SandboxLaunch,
+    session_id: &str,
+    inner: Option<&str>,
+    terminal: &TerminalSettings,
+) -> Result<String> {
+    let dir = fleet.paths().root().join(SANDBOX_RELAY_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let relay_file = dir.join(format!("{session_id}.json"));
+    let relay: std::collections::HashMap<_, _> = launch.cli_relay.iter().cloned().collect();
+    std::fs::write(&relay_file, serde_json::to_string(&relay)?)
+        .with_context(|| format!("write {}", relay_file.display()))?;
+    let mut parts = vec![
+        host_invocation(&launch.launcher, terminal),
+        "--data-root".into(),
+        host_quote(&launch.data_root.to_string_lossy(), terminal),
+        "shell".into(),
+        launch.sandbox.clone(),
+        "--cwd".into(),
+        host_quote(&launch.directory, terminal),
+        "--cli-relay-file".into(),
+        host_quote(&relay_file.to_string_lossy(), terminal),
+    ];
+    if let Some(inner) = inner.map(str::trim).filter(|c| !c.is_empty()) {
+        parts.extend(["--run".into(), host_quote(inner, terminal)]);
+    }
+    Ok(parts.join(" "))
+}
+
+/// Where a sandbox terminal's relay endpoint waits for `tod-sandbox`.
+const SANDBOX_RELAY_DIR: &str = "sandbox-relay";
+
 /// How the terminal's shell runs `docker`: bare when it is on `PATH`, else
 /// its full path, quoted the way the shell needs.
 fn docker_invocation(terminal: &TerminalSettings) -> String {
@@ -860,28 +900,50 @@ fn docker_invocation(terminal: &TerminalSettings) -> String {
     if on_path || bin.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         return "docker".into();
     }
+    host_invocation(&bin, terminal)
+}
+
+/// How the terminal's shell runs the program at `bin`: its full path,
+/// quoted the way the shell needs.
+fn host_invocation(bin: &Path, terminal: &TerminalSettings) -> String {
     let path = bin.to_string_lossy().into_owned();
     if !path.contains(' ') {
         return path.replace('\\', "/");
     }
     #[cfg(windows)]
+    if terminal_is_powershell(terminal) {
+        return format!("& {}", host_quote(&path, terminal));
+    }
+    #[cfg(windows)]
+    return format!("\"{}\"", path.replace('\\', "/"));
+    #[cfg(not(windows))]
+    host_quote(&path, terminal)
+}
+
+/// `arg` as one word for the terminal's shell.
+fn host_quote(arg: &str, terminal: &TerminalSettings) -> String {
+    #[cfg(windows)]
     {
-        let powershell = terminal
-            .program
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .is_none_or(is_powershell);
-        if powershell {
-            return format!("& '{path}'");
+        if terminal_is_powershell(terminal) {
+            return format!("'{}'", arg.replace('\'', "''"));
         }
-        return format!("\"{}\"", path.replace('\\', "/"));
+        format!("\"{}\"", arg.replace('"', "\\\""))
     }
     #[cfg(not(windows))]
     {
         let _ = terminal;
-        tod_agent::devcontainer::sh_quote(&path)
+        tod_agent::devcontainer::sh_quote(arg)
     }
+}
+
+#[cfg(windows)]
+fn terminal_is_powershell(terminal: &TerminalSettings) -> bool {
+    terminal
+        .program
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .is_none_or(is_powershell)
 }
 
 /// Launch the agent CLI in an OS terminal, tracked as a `terminal` agent run (not a shell).

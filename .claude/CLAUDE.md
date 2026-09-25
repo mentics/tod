@@ -69,6 +69,7 @@ reverse.**
 - `crates/tod-core` — policy and orchestration shared by the UI and the CLI: conversation and interview flow, process/phase rules, bundled process- and media-doc resolution, path/settings resolution, the task model, and agent context assembly. Decides *when* and *what* to persist.
 - `crates/tod-agent` — agent transport: the provider interface and its implementations across platforms (Cursor, Claude, mock) and environments. **A leaf crate with no `tod-*` dependencies by design** — it knows how to hold conversations and sessions, and nothing about paths, settings, process docs, or persistence. It is told what to say and reports back.
 - `crates/tod-store` — durable persistence. SQLite-backed (`rusqlite`) storage for **fleet** (agents/tasks/worktrees) and **outline** (task tree) data, plus credentials (OS keyring + `chacha20poly1305` encryption), settings, paths, and Linear API integration. Depends on `tod-agent` for the agent types it persists (`AgentPlatform`, `AgentLaunchOptions`).
+- Cloud sandboxes (Blaxel; [doc/cloud-sandboxes/setup.md](../doc/cloud-sandboxes/setup.md), design in `blaxel-remote.md`): `crates/tod-sandbox` (leaf lib: Blaxel API, relay client, provisioning, `sandboxes.toml`), `crates/tod-sandbox-cli` (the `tod-sandbox` binary), `crates/tod-zed-shim` (the `ssh`/`scp`/`sftp` Zed runs, routing `<name>.tod` hosts to sandboxes), `crates/tod-relay` (the Linux server inside each sandbox, cross-built for `x86_64-unknown-linux-musl`; protocol in `relay-protocol.md`), and `assets/sandbox/bootstrap.sh` (installs dependencies on any image).
 - `crates/nov-viz` — a separate visualization crate (layout/nav/keyboard model), not part of the main app binary path.
 - `assets/process/` — version-controlled source for agent behavior docs (SKILL files, agent definitions, manifest). Copied by `build.rs` to `target/{debug,release}/process/` so dev runs mirror an installed layout.
 - `crates/tod/media/context/` — version-controlled agent context documents (see **Agent chat context** below). Copied by `build.rs` to `target/{debug,release}/media/`.
@@ -391,6 +392,22 @@ Nothing starts or builds a container; tod only uses a running one.
   `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set; the
   Treehouse one needs `TOD_TEST_DEV_CONTAINER_TREEHOUSE` (a container with
   `treehouse` on its `PATH`).
+- **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
+  `node_files.container_kind = 'sandbox'`, with the sandbox's name in
+  `container`; `tod-cli capabilities set <node> files --sandbox <name>`). The
+  repository always lives in the sandbox. `Workdir::Sandbox`
+  runs git through `tod-sandbox exec`, and `AgentEnvironment::Sandbox`
+  (`tod_agent::sandbox::SandboxLaunch`, built by
+  `dev_container::sandbox_launch_for`) spawns the agent as `tod-sandbox agent
+  … -- <adapter>`, whose stdio bridges to the relay. `tod-cli` there comes
+  back through the relay's `/tunnel` to the same `cli_relay` listener, and a
+  bridge keeps a Zed on that sandbox attached for the turn. Check
+  `DevContainerSetting::repo_is_remote` (container or sandbox) or `mounted_container`,
+  not `dev_container`, for "git runs elsewhere". Terminals run `tod-sandbox
+  shell`, and code editors open only Zed (`zed::sandbox_url`). The smoke test
+  `fleet::sandbox` needs `TOD_TEST_SANDBOX` (a sandbox created with
+  `--agents`) and `TOD_TEST_SANDBOX_ROOT` (an absolute data root with
+  `sandboxes.toml`). Docs: `doc/cloud-sandboxes/`.
 
 ### `tod-store::outline` — task tree
 

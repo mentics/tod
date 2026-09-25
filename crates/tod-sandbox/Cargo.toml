@@ -1,0 +1,28 @@
+[package]
+name = "tod-sandbox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Cloud sandboxes for tod: the provider's API, the relay client, provisioning, and terminals"
+
+# A leaf crate, like tod-agent: nothing here knows about tod's data root,
+# settings, or credentials. Callers pass the token and the files to install.
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "net", "io-std", "io-util", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+toml = "0.8"
+ureq = { version = "3", features = ["json"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }

@@ -1,7 +1,9 @@
 //! Where a node's files are: a directory on this machine, or one inside the
-//! dev container its Files capability names (when the repository lives
-//! there). Git and the other workspace commands run wherever the files are.
+//! dev container or cloud sandbox its Files capability names (when the
+//! repository lives there). Git and the other workspace commands run
+//! wherever the files are.
 
+use crate::fleet::sandbox::SandboxExec;
 use anyhow::{Result, bail};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,18 @@ pub enum Workdir {
     /// An absolute directory inside a running dev container, reached with
     /// `docker exec` (as the container's dev user).
     Container { container: String, path: String },
+    /// An absolute directory in a cloud sandbox, reached through its relay.
+    Sandbox { sandbox: String, path: String },
+}
+
+/// `path` without a trailing slash, `/` for the root.
+fn posix_dir(path: String) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 impl Workdir {
@@ -36,11 +50,16 @@ impl Workdir {
     }
 
     pub fn container(container: impl Into<String>, path: impl Into<String>) -> Self {
-        let path = path.into();
-        let trimmed = path.trim_end_matches('/');
         Self::Container {
             container: container.into(),
-            path: if trimmed.is_empty() { "/".into() } else { trimmed.to_string() },
+            path: posix_dir(path.into()),
+        }
+    }
+
+    pub fn sandbox(sandbox: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::Sandbox {
+            sandbox: sandbox.into(),
+            path: posix_dir(path.into()),
         }
     }
 
@@ -48,15 +67,36 @@ impl Workdir {
     pub fn host_path(&self) -> Option<&Path> {
         match self {
             Self::Host(path) => Some(path),
-            Self::Container { .. } => None,
+            Self::Container { .. } | Self::Sandbox { .. } => None,
         }
+    }
+
+    /// The path, when it is not on this machine (a POSIX path).
+    pub fn remote_path(&self) -> Option<&str> {
+        match self {
+            Self::Host(_) => None,
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => Some(path),
+        }
+    }
+
+    /// Whether it is somewhere other than this machine.
+    pub fn is_remote(&self) -> bool {
+        self.remote_path().is_some()
     }
 
     /// The container it is in, when it is in one.
     pub fn container_name(&self) -> Option<&str> {
         match self {
-            Self::Host(_) => None,
             Self::Container { container, .. } => Some(container),
+            Self::Host(_) | Self::Sandbox { .. } => None,
+        }
+    }
+
+    /// The cloud sandbox it is in, when it is in one.
+    pub fn sandbox_name(&self) -> Option<&str> {
+        match self {
+            Self::Sandbox { sandbox, .. } => Some(sandbox),
+            Self::Host(_) | Self::Container { .. } => None,
         }
     }
 
@@ -64,7 +104,7 @@ impl Workdir {
     pub fn path_text(&self) -> String {
         match self {
             Self::Host(path) => path.display().to_string(),
-            Self::Container { path, .. } => path.clone(),
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => path.clone(),
         }
     }
 
@@ -72,16 +112,17 @@ impl Workdir {
     pub fn storage(&self) -> String {
         match self {
             Self::Host(path) => crate::path_util::path_for_storage(path),
-            Self::Container { path, .. } => path.clone(),
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => path.clone(),
         }
     }
 
-    /// Another directory in the same place (this machine, or the same
-    /// container), such as one `git` printed.
+    /// Another directory in the same place (this machine, the same
+    /// container, or the same sandbox), such as one `git` printed.
     pub fn at(&self, path: &str) -> Self {
         match self {
             Self::Host(_) => Self::Host(PathBuf::from(path)),
             Self::Container { container, .. } => Self::container(container.clone(), path),
+            Self::Sandbox { sandbox, .. } => Self::sandbox(sandbox.clone(), path),
         }
     }
 
@@ -89,7 +130,7 @@ impl Workdir {
     pub fn join(&self, rel: &str) -> Self {
         match self {
             Self::Host(path) => Self::Host(path.join(rel)),
-            Self::Container { container, path } => {
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => {
                 let rel = rel.trim_matches('/');
                 let joined = if rel.is_empty() {
                     path.clone()
@@ -98,7 +139,7 @@ impl Workdir {
                 } else {
                     format!("{path}/{rel}")
                 };
-                Self::container(container.clone(), joined)
+                self.at(&joined)
             }
         }
     }
@@ -107,9 +148,9 @@ impl Workdir {
     pub fn parent(&self) -> Option<Self> {
         match self {
             Self::Host(path) => path.parent().map(|p| Self::Host(p.to_path_buf())),
-            Self::Container { container, path } => {
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => {
                 let (parent, _) = path.rsplit_once('/')?;
-                (path != "/").then(|| Self::container(container.clone(), parent))
+                (path != "/").then(|| self.at(parent))
             }
         }
     }
@@ -118,7 +159,7 @@ impl Workdir {
     pub fn file_name(&self) -> Option<String> {
         match self {
             Self::Host(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()),
-            Self::Container { path, .. } => path
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => path
                 .rsplit('/')
                 .next()
                 .filter(|n| !n.is_empty())
@@ -126,13 +167,17 @@ impl Workdir {
         }
     }
 
-    /// Whether the directory exists. Talks to Docker for a container.
+    /// Whether the directory exists. Talks to Docker for a container, and to
+    /// the sandbox for a sandbox.
     pub fn is_dir(&self) -> bool {
         match self {
             Self::Host(path) => path.is_dir(),
             Self::Container { container, path } => ContainerExec::connect(container)
                 .and_then(|exec| exec.is_dir(path))
                 .unwrap_or(false),
+            Self::Sandbox { sandbox, path } => {
+                SandboxExec::new(sandbox).is_dir(path).unwrap_or(false)
+            }
         }
     }
 
@@ -140,7 +185,7 @@ impl Workdir {
     pub fn create_dir_all(&self) -> Result<()> {
         match self {
             Self::Host(path) => Ok(std::fs::create_dir_all(path)?),
-            Self::Container { path, .. } => {
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => {
                 let out = self.run_in("/", "mkdir", &["-p", path])?;
                 if !out.status.success() {
                     bail!(
@@ -159,7 +204,7 @@ impl Workdir {
             Self::Host(path) => {
                 let _ = std::fs::remove_dir(path);
             }
-            Self::Container { path, .. } => {
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => {
                 let _ = self.run_in("/", "rmdir", &[path]);
             }
         }
@@ -173,19 +218,36 @@ impl Workdir {
                 .current_dir(path)
                 .stdin(std::process::Stdio::null())
                 .output()?),
-            Self::Container { path, .. } => self.run_in(path, program, args),
+            Self::Container { path, .. } | Self::Sandbox { path, .. } => {
+                self.run_in(path, program, args)
+            }
         }
     }
 
     fn run_in(&self, dir: &str, program: &str, args: &[&str]) -> Result<Output> {
-        let Self::Container { container, .. } = self else {
-            unreachable!("run_in is for containers");
-        };
-        ContainerExec::connect(container)?.output(dir, program, args)
+        match self {
+            Self::Container { container, .. } => {
+                ContainerExec::connect(container)?.output(dir, program, args)
+            }
+            Self::Sandbox { sandbox, .. } => SandboxExec::new(sandbox).output(dir, program, args),
+            Self::Host(_) => unreachable!("run_in is for containers and sandboxes"),
+        }
     }
 
-    /// `git args…` in this directory. In a container, git's ownership check
-    /// is off (see [`CONTAINER_GIT_CONFIG`]).
+    /// Where `program` is in the container or sandbox this directory is in;
+    /// `None` on this machine.
+    pub fn find_remote_program(&self, program: &str) -> Result<Option<String>> {
+        match self {
+            Self::Container { container, .. } => {
+                ContainerExec::connect(container)?.find_program(program)
+            }
+            Self::Sandbox { sandbox, .. } => SandboxExec::new(sandbox).find_program(program),
+            Self::Host(_) => Ok(None),
+        }
+    }
+
+    /// `git args…` in this directory. In a container or sandbox, git's
+    /// ownership check is off (see [`CONTAINER_GIT_CONFIG`]).
     pub fn git_output(&self, args: &[&str]) -> Result<Output> {
         match self {
             Self::Host(path) => {
@@ -197,7 +259,7 @@ impl Workdir {
                     .stdin(std::process::Stdio::null())
                     .output()?)
             }
-            Self::Container { .. } => {
+            Self::Container { .. } | Self::Sandbox { .. } => {
                 let args: Vec<&str> = CONTAINER_GIT_CONFIG.iter().chain(args).copied().collect();
                 self.output("git", &args)
             }
@@ -231,6 +293,10 @@ impl Workdir {
             (
                 Self::Container { container: c1, path: p1 },
                 Self::Container { container: c2, path: p2 },
+            )
+            | (
+                Self::Sandbox { sandbox: c1, path: p1 },
+                Self::Sandbox { sandbox: c2, path: p2 },
             ) => c1 == c2 && p1.trim_end_matches('/') == p2.trim_end_matches('/'),
             _ => false,
         }
@@ -242,6 +308,7 @@ impl fmt::Display for Workdir {
         match self {
             Self::Host(path) => write!(f, "{}", strip_verbatim(path).display()),
             Self::Container { container, path } => write!(f, "{path} (in {container})"),
+            Self::Sandbox { sandbox, path } => write!(f, "{path} (in sandbox {sandbox})"),
         }
     }
 }
@@ -278,5 +345,21 @@ mod tests {
         assert!(repo.same_location(&Workdir::container("dev", "/workspaces/app")));
         assert!(!repo.same_location(&Workdir::container("other", "/workspaces/app")));
         assert_eq!(repo.to_string(), "/workspaces/app (in dev)");
+    }
+
+    #[test]
+    fn sandbox_paths_stay_in_their_sandbox() {
+        let repo = Workdir::sandbox("dev", "/root/app/");
+        assert_eq!(repo.remote_path(), Some("/root/app"));
+        assert_eq!(
+            repo.join(".worktrees/x"),
+            Workdir::sandbox("dev", "/root/app/.worktrees/x")
+        );
+        assert_eq!(repo.parent(), Some(Workdir::sandbox("dev", "/root")));
+        assert_eq!(repo.at("/tmp"), Workdir::sandbox("dev", "/tmp"));
+        assert_eq!(repo.sandbox_name(), Some("dev"));
+        assert_eq!(repo.container_name(), None);
+        assert!(!repo.same_location(&Workdir::container("dev", "/root/app")));
+        assert_eq!(repo.to_string(), "/root/app (in sandbox dev)");
     }
 }

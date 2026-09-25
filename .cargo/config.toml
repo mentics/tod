@@ -10,3 +10,8 @@ linker = "rust-lld"
 c = "check"
 # Check only library code (UI/domain); use when iterating on non-CLI code.
 cl = "check --lib -p tod"
+
+[target.x86_64-unknown-linux-musl]
+# The sandbox relay (`tod-relay`) is a static Linux binary built from any host;
+# rust-lld links it without a Linux toolchain.
+linker = "rust-lld"

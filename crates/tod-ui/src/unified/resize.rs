@@ -1,10 +1,10 @@
 //! Dragging the dividers between the unified view's columns.
 //!
-//! Every divider between two shown columns can be dragged. A drag trades
+//! Every divider between two columns can be dragged. A drag trades
 //! width between the two columns beside it and leaves every other column
 //! alone; the last column has no width of its own and takes whatever is
 //! left, so dragging the divider before it only resizes its left neighbor.
-//! Folded columns keep their strip width and have no divider beside them.
+//! Opening a column squeezes the others; none is ever folded away.
 //!
 //! The chat drawer's top edge drags the same way, vertically: it trades
 //! height between the drawer and the node tree above it.
@@ -13,7 +13,8 @@ use gpui::{Context, IntoElement, Pixels, Render, Window, px};
 
 /// Width of a divider's grab area. Only its centre pixel is drawn.
 pub const DIVIDER_WIDTH: f32 = 7.;
-/// The narrowest a panel column can be dragged or squeezed to.
+/// The narrowest a panel column can be dragged to (opening more columns
+/// can still squeeze it narrower).
 pub const PANEL_MIN_WIDTH: f32 = 220.;
 /// The narrowest the node tree can be dragged to.
 pub const TREE_MIN_WIDTH: f32 = 200.;

@@ -792,8 +792,7 @@ impl ActionPanelView {
             .files
             .as_ref()
             .and_then(|files| files.dev_container.as_ref())
-            .filter(|dev| dev.repo_on_host)
-            .and_then(|dev| dev.container());
+            .and_then(|dev| dev.mounted_container());
         let directory = match self.files.as_ref().map(ResolvedFiles::directory) {
             Some(FilesDirectory::Ready(path)) => match mounted_container {
                 Some(container) => format!("{path} · runs in dev container {container}"),

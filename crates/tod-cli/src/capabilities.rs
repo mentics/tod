@@ -24,7 +24,7 @@ COMMANDS:
     disable <NODE> <CAP>
     set     <NODE> agent [--platform claude|cursor] [--model <TEXT>] [--effort <TEXT>]
     set     <NODE> files [--dir <PATH>] [--branch <TEXT>] [--worktree on|off]
-                         [--container <NAME|ID>] [--mounted on|off]
+                         [--container <NAME|ID>] [--mounted on|off] [--sandbox <NAME>]
     set     <NODE> ticket [--ticket <ID>]... [--pr <URL>]...
     set     <NODE> tags (--tags <A,B,..> | --add <TAG> | --remove <TAG>)
     set     <NODE> generator --source <TYPE> --config <JSON>
@@ -44,7 +44,10 @@ dev container (`--container ''` runs them on this machine again). The
 repository lives in the container: `--dir` is its path there, and worktrees
 are made there. `--mounted on` is for a repository on this machine mounted
 into the container: `--dir` stays the host path, git runs here, and the
-directory inside the container follows from its mounts.
+directory inside the container follows from its mounts. `--sandbox` does
+the same in a cloud sandbox (`--sandbox ''` runs them on this machine
+again); the repository always lives in the sandbox, so `--dir` is its path
+there.
 ";
 
 pub fn run(inv: Invocation) -> anyhow::Result<String> {
@@ -76,22 +79,35 @@ fn parse_cap(raw: &str) -> anyhow::Result<Capability> {
     })
 }
 
-/// `--container` / `--mounted` over the node's current dev container.
+/// `--container` / `--sandbox` / `--mounted` over the node's current dev
+/// container or sandbox.
 fn files_dev_container(
     args: &Args,
     current: Option<tod_store::fleet::DevContainerSetting>,
 ) -> anyhow::Result<Option<tod_store::fleet::DevContainerSetting>> {
-    let mut dev = match args.get("--container").map(str::trim) {
-        None => current,
-        Some("") => None,
-        Some(container) => {
-            let current = current.unwrap_or_default();
+    let container = args.get("--container").map(str::trim);
+    let sandbox = args.get("--sandbox").map(str::trim);
+    let mut dev = match (container, sandbox) {
+        (Some(_), Some(_)) => anyhow::bail!("pass --container or --sandbox, not both"),
+        (None, None) => current,
+        (Some(""), None) | (None, Some("")) => None,
+        (Some(container), None) => Some(tod_store::fleet::DevContainerSetting {
+            container: Some(container.to_string()),
+            sandbox: false,
+            ..current.unwrap_or_default()
+        }),
+        (None, Some(sandbox)) => {
+            tod_store::fleet::sandbox::validate_name(sandbox)?;
             Some(tod_store::fleet::DevContainerSetting {
-                container: Some(container.to_string()),
-                ..current
+                container: Some(sandbox.to_string()),
+                repo_on_host: false,
+                sandbox: true,
             })
         }
     };
+    if dev.as_ref().is_some_and(|dev| dev.sandbox) && args.get("--mounted").is_some() {
+        anyhow::bail!("--mounted is for a dev container; a sandbox always holds its repository");
+    }
     let needs_container = |flag: &str| {
         anyhow::anyhow!("{flag} needs a dev container: pass --container too")
     };

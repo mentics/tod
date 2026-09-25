@@ -437,8 +437,8 @@ impl Render for ChatDrawer {
         let theme = cx.theme();
         let (border, muted, accent, drag_border) =
             (theme.border, theme.muted_foreground, theme.accent, theme.drag_border);
-        // Its header takes the focused band (`style::header`) as a focused
-        // column's does; only one of them shows it.
+        // Its header is in the `column-focused` state while it has focus, as
+        // a focused column's is; only one of them shows it.
         let focused = self.focus_handle.contains_focused(window, cx);
 
         if !self.expanded {
@@ -450,7 +450,7 @@ impl Render for ChatDrawer {
                 .w_full()
                 .border_t_1()
                 .border_color(border)
-                .map(|el| style::header(el, focused))
+                .map(|el| style::header_focusable(el, focused))
                 .px_2()
                 .py_1()
                 .cursor_pointer()
@@ -500,7 +500,7 @@ impl Render for ChatDrawer {
             .py_1()
             .border_b_1()
             .border_color(border)
-            .map(|el| style::header(el, focused))
+            .map(|el| style::header_focusable(el, focused))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,

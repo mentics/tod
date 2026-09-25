@@ -60,56 +60,100 @@ The other options, and why not, are under [Alternatives considered](#alternative
 
 ### 1. Sandbox image
 
-- `relay` listening on 0.0.0.0:2222, started at boot through the process API
-  (no `keepAlive`, so it does not block standby). Port 2222 declared at
-  creation, next to 8080 (`sandbox-api`).
-- The agent adapter (today `@zed-industries/claude-code-acp`), started by the
-  relay.
-- `sftp-server` (`/usr/lib/ssh/sftp-server`, Alpine `openssh-sftp-server`): Zed
-  uploads extensions with `scp`, which speaks SFTP.
-- Recommended: Zed's remote server for the pinned Zed version, preinstalled in
-  `~/.zed_server`, to skip a download on first connect (about 1.8 s measured).
-- `sshd` only if tod offers interactive terminals over SSH (see Terminals).
+Any image works, in one of two ways, both automated by `tod-sandbox` (setup
+and use: [setup.md](setup.md)):
 
-The prototype used Alpine 3.21 with `openssh-server websocat git bash curl`,
-Node, and `ws`. A production relay should be a single static binary (Rust),
-so the image needs no Node for it.
+- **Install on first connect** (`tod-sandbox create <name> --image <image>`).
+  Blaxel's own images (`blaxel/...`) and images built in the workspace
+  (`sandbox/...`) run as they are. Any other image (Docker Hub, a private
+  registry) is first wrapped by a three-line Dockerfile that adds Blaxel's
+  `sandbox-api` as the entrypoint. Blaxel builds it remotely with `bl push`
+  (about 16 s, no local Docker). Blaxel's "metamorph" import of a registry
+  image alone is not enough: the image's own `CMD` runs and `sandbox-api`
+  never starts. On the first connect, `tod-sandbox` uploads
+  `assets/sandbox/bootstrap.sh` and the relay, runs the script (it installs
+  what is missing with apk, apt-get, dnf, microdnf, or yum), and starts the
+  relay.
+- **Baked** (`tod-sandbox bake <base-image>`). The same script runs at build
+  time and the relay is copied in, so a new sandbox only has to start the
+  relay.
+
+What a ready sandbox has:
+- `tod-relay` at `/opt/tod/tod-relay`, started through the process API as
+  `tod-relay`, restarted on failure. It runs with no `keepAlive`, so it does not
+  block standby. Port 2222 is declared at creation, next to 8080
+  (`sandbox-api`).
+- `git`, `curl` (Zed downloads its remote server with it), `tar`/`gzip`,
+  `bash`, `ps`, `scp`, and `sftp-server`, linked as `/opt/tod/bin/sftp-server`
+  wherever the distribution keeps it. Zed uploads extensions with `scp`, which
+  speaks SFTP.
+- With `--agents`: Node.js 18+ and `@zed-industries/claude-code-acp`.
+- `/opt/tod/manifest`: hashes of the bootstrap script and the relay, and
+  whether agents were asked for. Connecting checks it in one relay round trip
+  (0.3 s) and reprovisions only when it differs, for example after a tod
+  update. A baked image carries the same manifest.
+
+Measured end to end with `tod-sandbox create`:
+
+| Image | Ready in |
+|---|---|
+| `blaxel/base-image` (Alpine; has everything already) | 7.5 s |
+| `docker.io/library/ubuntu:24.04` with `--agents` (wrap 16 s, deploy 3.5 s, install 43 s) | 70 s |
+| That Ubuntu, baked (bake: 57 s, once) | 10 s |
 
 ### 2. The relay (in the sandbox)
 
-One WebSocket server, routed by path. Every frame format is simple enough to
-implement on both sides in a few hundred lines.
+`crates/tod-relay`, a static Linux binary (musl, linked with `rust-lld`, so it
+cross-builds from Windows or macOS). The wire protocol is in
+[relay-protocol.md](relay-protocol.md). In short, it is one WebSocket server,
+routed by path:
 
-**`/exec`**: run one command.
-- The first message is text JSON `{"cmd": "...", "session": "..."?}`.
-- The relay spawns `sh -c cmd` with `HOME=/root`, cwd `/root`. It has to set
-  these itself: the process API's environment has `HOME=/blaxel`, and a command
-  started through it inherits that.
-- Binary frames in are stdin; text `eof` closes stdin; text `bye` kills the
-  process.
-- Binary frames out are stdout, text frames out are stderr, and the last frame
-  is text `exit:N`.
-- **Without a session id**, closing the socket kills the process.
-- **With a session id**, the process outlives the socket. Output while no
-  socket is attached is buffered, and replayed when a socket attaches with the
-  same id. Zed's proxy uses this.
+- **`/exec`** runs a command, or a terminal on a pty. With a session id, the
+  process outlives the socket and its output is held (up to 32 MB) for the
+  next attach. Zed's proxy and terminals use this.
+- **`/agent/<name>`** attaches to one long-lived, line-oriented agent process
+  (ACP). A new attach replaces the old one, and output is held while detached.
+- **`/tunnel`** carries connections made to `127.0.0.1:2223` in the sandbox
+  out to the client. `tod-cli` in the sandbox uses it to reach the app.
 
-**`/agent`** (the prototype's `/acp`): attach to the one persistent ACP adapter.
-- One client at a time. A new attach replaces the old one.
-- Messages are newline-delimited JSON-RPC, one per text frame.
-- Output while detached is buffered by line and replayed on attach, so a turn's
-  late notifications are never lost.
+It sets `HOME` and the working directory itself, because the process API's
+environment has `HOME=/blaxel`. The port proxy was verified to require the
+Blaxel token for every request (401 without it), so the relay has no auth of
+its own.
 
-**`/ssh`** (optional): raw bytes to `sshd` on 127.0.0.1:22.
+**Holding the sandbox awake.** A process started through the sandbox's local
+API with `keepAlive` disables standby while it runs; this was verified, and
+with no connection open. The relay runs one `sleep` that way while there is
+work no client is watching:
+- a terminal with a foreground job,
+- a command started with `keep_awake`,
+- an agent that owes its client an answer.
 
-Production needs, not in the prototype:
-- A bound on buffered output per session, and a way to discard a session nobody
-  will come back for (Zed was killed, not closed).
-- More than one agent session per sandbox, if a node ever runs two agents.
-- Its own auth check if the port proxy turns out not to require the Blaxel
-  token for every request (not verified; the prototype always sent it).
+It kills that process when the last one ends. `--max-hold-secs` (default 4 h)
+caps any one hold.
 
 ### 3. tod's transport (`tod-agent`)
+
+*As built:* the app does not open WebSockets itself. A node whose Files
+directory is in a sandbox has `Workdir::Sandbox` (git and worktrees run
+through `tod-sandbox exec`) and launches with `AgentEnvironment::Sandbox`
+(`tod_agent::sandbox::SandboxLaunch`). The ACP host spawns `tod-sandbox agent
+<sandbox> --name acp-<pid>-<n> -- <adapter>` as the agent's process, and
+that command bridges its stdio to `/agent/<name>`:
+
+- It opens `/tunnel` first and waits for it, so the agent's first `tod-cli`
+  finds it. The tunnel carries `tod-cli` to the app's `fleet::cli_relay`
+  listener. The relay token and port are set on the local process and passed
+  into the sandbox by name (`--env NAME`), so they never appear on a command
+  line.
+- While attached, it keeps a file fresh in `<data root>/zed-shim/awake/<sandbox>/`,
+  which keeps a Zed on the sandbox attached for the turn. See below.
+- It detaches after `--idle` seconds (default 30) with nothing owed in either
+  direction. The agent keeps running in the sandbox, and the next turn
+  reattaches.
+
+`tod-store` builds the launch (`fleet::dev_container::sandbox_launch_for`),
+next to the dev-container one. The notes below are the original design.
 
 - A WebSocket client (`tokio-tungstenite` with rustls; the ring provider must be
   installed explicitly, or rustls panics on first use).
@@ -157,7 +201,7 @@ after the destination) and handles four cases:
    the remote exit code passed back.
 3. **The proxy** (`... proxy --identifier X [--reconnect]`): this becomes
    `/exec` with a session id. The shim then *parks* it: after
-   `ZSHIM_PARK_SECS` (20 s in testing) with no real message in either
+   `TOD_ZED_PARK_SECS` (default 30 s; 20 s in testing) with no real message in either
    direction, it closes the WebSocket. Zed's pipe stays open, and Zed never
    learns it was disconnected. The first real message from Zed reattaches
    (about 90–130 ms warm), and the relay replays anything the server sent
@@ -186,9 +230,11 @@ hung for 2 minutes, retried, and held the sandbox awake throughout.
 starts on its own (a file an agent changed, new diagnostics) wait in the relay
 until Zed next sends something. So while tod is running an agent turn in the
 sandbox, it tells the shim to stay attached; the sandbox is awake for the turn
-anyway. The prototype uses a flag file (`awake.flag` beside the shim). tod
-should use something per sandbox, such as a local socket or a file per host.
-When the hold is cleared, the shim parks again after the idle time.
+anyway. The flag is a directory per sandbox, `<data root>/zed-shim/awake/<name>/`:
+each agent bridge keeps a file of its own there fresh (every 30 s) while it
+is attached. The shim counts the sandbox as held while any file there changed
+in the last 120 s, so a bridge that crashed stops counting on its own. Once
+none are fresh, the shim parks again after the idle time.
 
 **Zed's settings.** The host entry needs no ProxyCommand or key options. With
 none, nothing Zed runs can reach the sandbox except through the shims, and a
@@ -201,10 +247,25 @@ starts a real Zed through the shim and checks connect, park, and reattach.
 
 ### 5. Terminals
 
-Not yet designed. `/exec` has no pty. The options are SSH over `/ssh` (the
-prototype's `wsbridge` ProxyCommand) or a pty mode on `/exec`. An open terminal
-is an open connection, so it keeps the sandbox awake; that is probably what a
-user with a terminal open expects, but it counts against the idle rule.
+A terminal is an `/exec` session on a pty. That covers Zed's terminals (`ssh
+-t` through the shim) and `tod-sandbox shell`, which share
+`tod_sandbox::terminal`. After 60 s with no input, no output, and no foreground
+job, the client closes the socket and the sandbox can sleep. The shell stays
+where it was, and the next keypress reattaches (a wake plus a reattach: about
+0.5–0.8 s cold). While a foreground job runs, such as a build, a test run, or a
+dev server, the terminal stays attached and the relay holds the sandbox
+awake, so the job never freezes mid-way. `TOD_TERMINAL_PARK_SECS` sets the
+idle time; 0 never parks.
+
+tod's own shells for a sandbox node run `tod-sandbox shell <sandbox> --cwd
+<dir> --cli-relay-file <file>`. The app writes the relay environment to a
+file under `<data root>/sandbox-relay/`, which the command reads and deletes,
+so the token never goes on a command line. The shell then carries the tunnel
+too, and `tod-cli` works in it.
+
+The catch: a dev server left running in a terminal holds the sandbox awake
+until it is stopped or the hold cap (4 h) ends. That is what a running server
+needs, but it costs until then.
 
 ## Expected performance
 
@@ -257,12 +318,18 @@ length up to the 60 minutes tested.
 
 ## Risks and open questions
 
-- **Zed internals.** Covered under Version above. It is the biggest risk, and it
-  is contained: if the shim breaks, Zed still works through plain SSH over
-  `/ssh`; the sandbox just stays awake while Zed is open.
+- **Zed internals.** Covered under Version above. It is the biggest risk. The
+  relay has no SSH fallback, so a Zed release that changes these internals
+  breaks remote editing until the shim is updated.
 - **Only Windows tested.** On macOS and Linux, Zed uses SSH ControlMaster
   (`-M`, `-S`, `-O` options), a different path from the Windows master. The
-  shim needs to handle it, and that is untested.
+  shim answers it locally: it creates a placeholder at the control path and
+  answers `-O` requests itself. That path is untested.
+- **A Zed not started by tod.** tod assumes it is the only thing that starts
+  Zed, because the shim reaches Zed only through `PATH`. Windows Zed is
+  single-instance, so if Zed is already open, a launch from tod is handed to
+  that instance, which has no shim. `tod-sandbox zed` notices that no
+  connection came through the shim within 20 s and says to quit Zed first.
 - **A simpler relay, untested.** Zed's own server already keeps messages the
   client has not acknowledged, and resends them when a proxy connects with
   `--reconnect`. So parking could end the proxy process, and reattaching could

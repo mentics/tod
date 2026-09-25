@@ -31,6 +31,8 @@ use std::time::Duration;
 pub const SHIM_DIR: &str = "/tmp/tod-cli-relay";
 pub const PORT_ENV: &str = "TOD_CLI_RELAY_PORT";
 pub const TOKEN_ENV: &str = "TOD_CLI_RELAY_TOKEN";
+/// Where the shim finds the relay (`host.docker.internal` when unset).
+pub const HOST_ENV: &str = "TOD_CLI_RELAY_HOST";
 
 /// The `tod-cli` a dev container runs.
 pub const SHIM_SCRIPT: &str = r#"#!/usr/bin/env bash

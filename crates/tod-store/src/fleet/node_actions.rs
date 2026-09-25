@@ -31,11 +31,11 @@ pub struct ResolvedFiles {
     pub worktree_path: Option<String>,
     pub worktree_lease_id: Option<String>,
     pub worktree_lease_holder: Option<String>,
-    /// Set when launches run in a dev container. When the repository lives
-    /// in it, `repo` and `worktree_path` are container paths; when it is
-    /// mounted from this machine they stay host paths, and the container's
-    /// own is resolved against the running container at launch (see
-    /// [`crate::fleet::dev_container`]).
+    /// Set when launches run in a dev container or cloud sandbox. When the
+    /// repository lives in it, `repo` and `worktree_path` are paths there;
+    /// when it is mounted from this machine they stay host paths, and the
+    /// container's own is resolved against the running container at launch
+    /// (see [`crate::fleet::dev_container`]).
     pub dev_container: Option<DevContainerSetting>,
 }
 
@@ -74,13 +74,30 @@ impl ResolvedFiles {
             .and_then(DevContainerSetting::repo_container)
     }
 
+    /// The cloud sandbox the repository lives in, when it lives in one.
+    pub fn repo_sandbox(&self) -> Option<&str> {
+        self.dev_container
+            .as_ref()
+            .and_then(DevContainerSetting::repo_sandbox)
+    }
+
+    /// The repository is not on this machine.
+    pub fn repo_is_remote(&self) -> bool {
+        self.dev_container
+            .as_ref()
+            .is_some_and(DevContainerSetting::repo_is_remote)
+    }
+
     /// `path` (the workspace directory or worktree) where it is: in the
-    /// repository's container, else on this machine.
+    /// repository's container or sandbox, else on this machine.
     pub fn workdir(&self, path: &str) -> Workdir {
-        match self.repo_container() {
-            Some(container) => Workdir::container(container, path),
-            None => Workdir::host(path),
+        if let Some(container) = self.repo_container() {
+            return Workdir::container(container, path);
         }
+        if let Some(sandbox) = self.repo_sandbox() {
+            return Workdir::sandbox(sandbox, path);
+        }
+        Workdir::host(path)
     }
 
     /// The workspace directory, where it is.
@@ -95,24 +112,25 @@ impl ResolvedFiles {
 
     /// The resolved directory: the worktree when enabled, else the workspace
     /// directory. With the repository mounted into a dev container, the host
-    /// side of it. One inside a container is not checked here (that takes
-    /// Docker); a launch into a missing one fails.
+    /// side of it. One inside a container or sandbox is not checked here
+    /// (that takes Docker, or the network); a launch into a missing one fails.
     pub fn directory(&self) -> FilesDirectory {
-        if self
-            .dev_container
-            .as_ref()
-            .is_some_and(|dev| dev.container().is_none())
-        {
-            return FilesDirectory::Missing("Choose a dev container".into());
+        if let Some(dev) = self.dev_container.as_ref().filter(|dev| dev.container().is_none()) {
+            let what = if dev.sandbox { "Choose a cloud sandbox" } else { "Choose a dev container" };
+            return FilesDirectory::Missing(what.into());
         }
         let Some(repo) = self.repo() else {
             return FilesDirectory::Missing("Set a workspace directory".into());
         };
-        if let Some(container) = self.repo_container() {
+        let remote = self
+            .repo_container()
+            .map(|c| (format!("dev container {c}"), "/workspaces/app"))
+            .or_else(|| self.repo_sandbox().map(|s| (format!("sandbox {s}"), "/root/app")));
+        if let Some((place, example)) = remote {
             if !repo.starts_with('/') {
                 return FilesDirectory::Missing(format!(
-                    "The workspace directory is inside dev container {container}: \
-                     give its path there, like /workspaces/app"
+                    "The workspace directory is inside {place}: \
+                     give its path there, like {example}"
                 ));
             }
             if self.use_worktree {
@@ -575,6 +593,7 @@ mod tests {
         files.dev_container = Some(DevContainerSetting {
             container: Some("dev".into()),
             repo_on_host: true,
+            ..Default::default()
         });
         assert_eq!(files.directory(), FilesDirectory::Ready(host));
     }
@@ -609,5 +628,42 @@ mod tests {
             files.directory(),
             FilesDirectory::Ready(Workdir::container("dev", "/workspaces/app/.worktrees/x"))
         );
+    }
+
+    #[test]
+    fn a_repository_in_a_sandbox_is_a_sandbox_path() {
+        let mut files = ResolvedFiles {
+            source_node_id: Uuid::new_v4().to_string(),
+            source_title: "N".into(),
+            inherited: false,
+            repo: Some("/root/app".into()),
+            branch: None,
+            use_worktree: false,
+            worktree_path: None,
+            worktree_lease_id: None,
+            worktree_lease_holder: None,
+            dev_container: Some(DevContainerSetting {
+                sandbox: true,
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            files.directory(),
+            FilesDirectory::Missing("Choose a cloud sandbox".into())
+        );
+        files.dev_container = Some(DevContainerSetting {
+            container: Some("dev".into()),
+            // Ignored for a sandbox: the repository is always in it.
+            repo_on_host: true,
+            sandbox: true,
+        });
+        assert!(files.repo_is_remote());
+        assert_eq!(files.repo_container(), None);
+        assert_eq!(
+            files.directory(),
+            FilesDirectory::Ready(Workdir::sandbox("dev", "/root/app"))
+        );
+        files.repo = Some(r"C:\src\app".into());
+        assert!(matches!(files.directory(), FilesDirectory::Missing(_)));
     }
 }

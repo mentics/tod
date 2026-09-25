@@ -795,6 +795,32 @@ Second."), "{listed}");
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A node without the Agent capability still lists the Files, Tags, and
+    /// Ticket settings it was given, and a later `set` keeps the ones it
+    /// does not name.
+    #[test]
+    fn capabilities_set_then_list_without_the_agent_capability() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        cli(&root, &["capabilities", "enable", &node, "files", "tags", "ticket"]).unwrap();
+        let dir = root.join("repo").display().to_string();
+        cli(&root, &["capabilities", "set", &node, "files", "--dir", &dir, "--branch", "feat"])
+            .unwrap();
+        cli(&root, &["capabilities", "set", &node, "tags", "--add", "ui"]).unwrap();
+        cli(&root, &["capabilities", "set", &node, "ticket", "--ticket", "ABC-1"]).unwrap();
+        // Changing only the worktree setting leaves the directory and branch alone.
+        cli(&root, &["capabilities", "set", &node, "files", "--worktree", "on"]).unwrap();
+
+        let listed = cli(&root, &["capabilities", "list", &node]).unwrap();
+        assert!(
+            listed.contains(&format!("files: dir {dir}, branch feat, worktree on,")),
+            "{listed}"
+        );
+        assert!(listed.contains("tags: ui"), "{listed}");
+        assert!(listed.contains("ticket: tickets ABC-1;"), "{listed}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn decisions_round_trip_ask_list_and_show() {
         let (root, node, _) = data_root();

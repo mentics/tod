@@ -42,6 +42,9 @@ pub mod color {
     pub fn highlight_edge() -> Hsla {
         hex(0x1d4ed8ff)
     }
+    pub fn highlight_faint() -> Hsla {
+        hex(0x1d4ed840)
+    }
     // Pane styles: no pane uses them yet (gpui-component draws its own
     // resizable handles).
     #[allow(dead_code)]
@@ -97,10 +100,7 @@ pub mod color {
         hex(0xa3a3a380)
     }
     pub fn header_fill() -> Hsla {
-        hex(0xffffff08)
-    }
-    pub fn header_fill_focused() -> Hsla {
-        hex(0x1d4ed814)
+        hex(0xffffff10)
     }
     pub fn group_band() -> Hsla {
         hex(0x26262680)
@@ -183,6 +183,7 @@ pub mod size {
     use super::*;
 
     pub const BORDER: Pixels = px(1.);
+    pub const CONTROL: Pixels = px(32.);
     pub const PANE_MIN: Pixels = px(320.);
     pub const CONTROL_XSMALL: Pixels = px(20.);
     pub const GROUP_ROW: Pixels = px(28.);
@@ -460,24 +461,54 @@ pub fn pane_divider<E: Styled>(el: E, dragging: bool) -> E {
     }
 }
 
-/// `styles.header`: the band behind every header, blue in the
-/// `header-focused` state while `focused`.
-pub fn header<E: Styled>(el: E, focused: bool) -> E {
-    el.bg(if focused {
-        color::header_fill_focused()
-    } else {
-        color::header_fill()
-    })
+/// `styles.header`: the faint gray band behind every header.
+pub fn header<E: Styled>(el: E) -> E {
+    el.bg(color::header_fill())
+}
+
+/// `styles.header` for a header that tracks focus: in the `column-focused`
+/// state while `focused`, else the gray band.
+pub fn header_focusable<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    if focused { column_focused(el) } else { header(el) }
 }
 
 /// `styles.panel-header`.
 pub fn panel_header<E: Styled>(el: E) -> E {
-    header(el, false)
+    header(el)
         .px(space::INSET)
         .py(space::RELATED)
         .gap(space::RELATED)
         .border_b(size::BORDER)
         .border_color(color::divider())
+}
+
+/// `styles.column-header`, in its `column-focused` state while `focused`.
+pub fn column_header<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    let el = el
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .h(size::CONTROL)
+        .px(space::RELATED)
+        .gap(space::INLINE)
+        .border_b(size::BORDER)
+        .border_color(color::divider());
+    header_focusable(el, focused)
+}
+
+/// `states.column-focused`: the header of the column that has focus — a
+/// faint highlight behind it and a highlight-edge line along its top, drawn
+/// as an overlay so the header does not shift when focus arrives.
+pub fn column_focused<E: Styled + ParentElement>(el: E) -> E {
+    el.relative().bg(color::highlight_faint()).child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(size::BORDER)
+            .bg(color::highlight_edge()),
+    )
 }
 
 /// `styles.panel-footer`.

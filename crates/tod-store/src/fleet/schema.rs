@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 64;
+pub const CURRENT_USER_VERSION: i32 = 65;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -399,6 +399,10 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::decisions_triggers_sql())?;
         conn.pragma_update(None, "user_version", 64)?;
     }
+    if version < 65 {
+        migrate_v64_to_v65(conn)?;
+        conn.pragma_update(None, "user_version", 65)?;
+    }
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
@@ -731,6 +735,20 @@ fn migrate_v57_to_v58(conn: &Connection) -> Result<()> {
                 "ALTER TABLE node_generator_config ADD COLUMN {column} {ddl};"
             ))?;
         }
+    }
+    Ok(())
+}
+
+/// The Files capability's container can be a cloud sandbox
+/// (`container_kind = 'sandbox'`) instead of a Docker container.
+fn migrate_v64_to_v65(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('node_files') WHERE name = 'container_kind'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch(
+            "ALTER TABLE node_files ADD COLUMN container_kind TEXT NOT NULL DEFAULT 'docker';",
+        )?;
     }
     Ok(())
 }

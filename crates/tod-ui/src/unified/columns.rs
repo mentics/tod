@@ -81,10 +81,6 @@ pub struct ColumnModel {
     focused: Option<usize>,
 }
 
-/// How many columns 2+ can render at full width before folding into strips
-/// (kept in one place so folding logic and tests agree).
-pub const DEFAULT_VISIBLE_COLUMNS: usize = 4;
-
 impl ColumnModel {
     pub fn new() -> Self {
         Self::default()
@@ -210,6 +206,11 @@ impl ColumnModel {
         }
     }
 
+    /// Move focus to the node tree (column 1), which has no index here.
+    pub fn focus_tree(&mut self) {
+        self.focused = None;
+    }
+
     /// Move focus one column left. Index 0 (column 2) moving left goes to
     /// the node tree (column 1), reported as `None` here — the caller (the
     /// view root) is what actually knows about column 1.
@@ -237,33 +238,6 @@ impl ColumnModel {
             Some(ix) if ix + 1 < self.columns.len() => self.focused = Some(ix + 1),
             Some(_) => {}
         }
-    }
-
-    /// Which columns (by index into `columns()`) fold into strips given
-    /// `visible_slots` full-width slots are available. The oldest unpinned
-    /// columns fold first; pinned columns never fold; if pinned columns
-    /// alone exceed `visible_slots`, all unpinned columns fold and the
-    /// pinned ones still render full width (folding pinned columns is not
-    /// supported).
-    ///
-    /// "Oldest" means lowest index: columns are opened left to right, so a
-    /// lower index is older.
-    pub fn folded(&self, visible_slots: usize) -> Vec<usize> {
-        let total = self.columns.len();
-        if total <= visible_slots {
-            return Vec::new();
-        }
-        let excess = total - visible_slots;
-        let mut folded = Vec::new();
-        for (ix, col) in self.columns.iter().enumerate() {
-            if folded.len() >= excess {
-                break;
-            }
-            if !col.pinned {
-                folded.push(ix);
-            }
-        }
-        folded
     }
 }
 
@@ -494,50 +468,5 @@ mod tests {
         assert_eq!(m.focused_index(), None);
         m.focus_right();
         assert_eq!(m.focused_index(), Some(0));
-    }
-
-    #[test]
-    fn folded_returns_empty_when_everything_fits() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false);
-        m.open(obligations(2), 1, false);
-        assert!(m.folded(4).is_empty());
-    }
-
-    #[test]
-    fn folded_picks_oldest_unpinned_columns_first() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false); // 0, oldest
-        m.open(obligations(2), 1, false); // 1
-        m.open(details(3), 2, false); // 2
-        m.open(obligations(4), 3, false); // 3
-        m.open(details(5), 4, false); // 4, newest
-        // 5 columns, 4 fit: the single oldest unpinned folds.
-        let folded = m.folded(4);
-        assert_eq!(folded, vec![0]);
-    }
-
-    #[test]
-    fn folded_skips_pinned_columns() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false); // 0
-        m.open(obligations(2), 1, false); // 1
-        m.open(details(3), 2, false); // 2
-        m.toggle_pin(0); // pin the oldest
-        // 3 columns, 2 fit: oldest is pinned, so the next-oldest unpinned folds.
-        let folded = m.folded(2);
-        assert_eq!(folded, vec![1]);
-    }
-
-    #[test]
-    fn folded_when_pinned_columns_alone_exceed_visible_slots() {
-        let mut m = ColumnModel::new();
-        m.open(details(1), 0, false);
-        m.open(obligations(2), 1, false);
-        m.toggle_pin(0);
-        m.toggle_pin(1);
-        // Both pinned, only 1 slot "fits": nothing unpinned to fold.
-        let folded = m.folded(1);
-        assert!(folded.is_empty());
     }
 }

@@ -26,13 +26,22 @@ pub enum AgentEnvironment {
     Host,
     /// Inside a running dev container, via `docker exec`.
     DevContainer(DevContainerLaunch),
+    /// In a cloud sandbox, via the `tod-sandbox` launcher.
+    Sandbox(crate::sandbox::SandboxLaunch),
 }
 
 impl AgentEnvironment {
     pub fn dev_container(&self) -> Option<&DevContainerLaunch> {
         match self {
-            Self::Host => None,
             Self::DevContainer(launch) => Some(launch),
+            Self::Host | Self::Sandbox(_) => None,
+        }
+    }
+
+    pub fn sandbox(&self) -> Option<&crate::sandbox::SandboxLaunch> {
+        match self {
+            Self::Sandbox(launch) => Some(launch),
+            Self::Host | Self::DevContainer(_) => None,
         }
     }
 }

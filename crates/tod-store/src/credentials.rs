@@ -19,10 +19,13 @@ const FILE_MAGIC: &[u8; 7] = b"TODENC1";
 pub enum CredentialKind {
     LinearApiKey,
     GithubToken,
+    /// Creates and deletes cloud sandboxes (`tod-sandbox`). Deliberately not in
+    /// [`CredentialKind::ALL`], so no agent can read it through `tod-cli secrets`.
+    BlaxelApiKey,
 }
 
 impl CredentialKind {
-    /// Every kind, in the order `tod-cli secrets list` shows them.
+    /// Every kind an agent may use, in the order `tod-cli secrets list` shows them.
     pub const ALL: [Self; 2] = [Self::LinearApiKey, Self::GithubToken];
 
     /// The name an agent uses for this secret (`tod-cli secrets`).
@@ -38,6 +41,7 @@ impl CredentialKind {
         match self {
             Self::LinearApiKey => "Linear API key",
             Self::GithubToken => "GitHub token",
+            Self::BlaxelApiKey => "Blaxel API key",
         }
     }
 
@@ -45,6 +49,7 @@ impl CredentialKind {
         match self {
             Self::LinearApiKey => "linear_api_key",
             Self::GithubToken => "github_token",
+            Self::BlaxelApiKey => "blaxel_api_key",
         }
     }
 
@@ -52,6 +57,7 @@ impl CredentialKind {
         match self {
             Self::LinearApiKey => "linear_api_key.enc",
             Self::GithubToken => "github_token.enc",
+            Self::BlaxelApiKey => "blaxel_api_key.enc",
         }
     }
 
@@ -59,6 +65,7 @@ impl CredentialKind {
         match self {
             Self::LinearApiKey => Some("LINEAR_API_KEY"),
             Self::GithubToken => Some("GITHUB_TOKEN"),
+            Self::BlaxelApiKey => Some("BL_API_KEY"),
         }
     }
 }

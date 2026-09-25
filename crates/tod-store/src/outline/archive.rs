@@ -80,6 +80,12 @@ pub struct ArchivedNodeFiles {
     pub container: Option<String>,
     #[serde(default)]
     pub container_repo_on_host: bool,
+    #[serde(default = "docker_kind")]
+    pub container_kind: String,
+}
+
+fn docker_kind() -> String {
+    "docker".into()
 }
 
 /// Agent capability row (`node_agent`).
@@ -296,7 +302,7 @@ fn snapshot_fields(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedFi
 fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<ArchivedNodeFiles>> {
     conn.query_row(
         "SELECT use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_repo_on_host
+                dev_container, container, container_repo_on_host, container_kind
          FROM node_files WHERE node_id = ?1",
         params![uuid_to_blob(node_id)],
         |row| {
@@ -309,6 +315,7 @@ fn snapshot_node_files(conn: &Connection, node_id: Uuid) -> Result<Option<Archiv
                 dev_container: row.get::<_, i64>(5)? != 0,
                 container: row.get(6)?,
                 container_repo_on_host: row.get::<_, i64>(7)? != 0,
+                container_kind: row.get(8)?,
             })
         },
     )
@@ -736,8 +743,8 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO node_files
                (node_id, use_worktree, worktree_path, worktree_lease_id, worktree_lease_holder, updated_at,
-                dev_container, container, container_repo_on_host)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                dev_container, container, container_repo_on_host, container_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 blob,
                 i32::from(files.use_worktree),
@@ -748,6 +755,7 @@ fn restore_node(conn: &Connection, archived: &ArchivedNode) -> Result<()> {
                 i32::from(files.dev_container),
                 files.container,
                 i32::from(files.container_repo_on_host),
+                files.container_kind,
             ],
         )?;
     }

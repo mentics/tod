@@ -18,6 +18,7 @@ pub mod reattach;
 pub mod reconnect_identity;
 pub mod repos;
 pub mod runtime;
+pub mod sandbox;
 pub mod schema;
 pub mod store;
 pub mod terminal;

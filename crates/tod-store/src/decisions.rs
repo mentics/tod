@@ -575,8 +575,8 @@ mod tests {
             // A fresh store already at the current version; wind it back and
             // drop the tables this version adds, as if it predated them.
             let conn = schema::open_writer_connection(&db_path).unwrap();
-            conn.pragma_update(None, "user_version", schema::CURRENT_USER_VERSION - 1)
-                .unwrap();
+            // v64 added them.
+            conn.pragma_update(None, "user_version", 63).unwrap();
             conn.execute_batch(
                 "DROP TABLE IF EXISTS decision_answers; DROP TABLE IF EXISTS decisions;",
             )

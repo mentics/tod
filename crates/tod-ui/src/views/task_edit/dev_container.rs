@@ -1,12 +1,13 @@
-//! The Files capability's "Runs in" section: this machine, or a running dev
-//! container the user picks from `docker ps` (or names by hand).
+//! The Files capability's "Runs in" section: this machine, a running dev
+//! container the user picks from `docker ps` (or names by hand), or a cloud
+//! sandbox from the ones `tod-sandbox` knows.
 //!
 //! The repository usually lives in the container, and the workspace
 //! directory is its path there. "Repository" switches to one on this machine
 //! mounted into the container; the directory in the container then follows
-//! from its mounts.
+//! from its mounts. In a sandbox the repository is always there.
 //!
-//! Docker is only ever called off the UI thread. The container name
+//! Docker and the sandbox are only ever called off the UI thread. The container name
 //! autosaves after a short pause in typing (Enter saves at once); choosing a
 //! listed container saves immediately.
 
@@ -22,6 +23,7 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::{ActiveTheme, Disableable, h_flex, v_flex};
 use std::time::Duration;
 use tod_agent::devcontainer::{self, ContainerSummary};
+use tod_store::fleet::sandbox as sandboxes;
 use tod_store::fleet::{DevContainerSetting, FleetMutation};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -101,22 +103,42 @@ impl TaskEditView {
         }
     }
 
-    /// "Runs in": this machine ↔ dev container.
+    /// "Runs in": this machine → dev container → cloud sandbox → this machine.
     pub(super) fn toggle_dev_container(&mut self, cx: &mut Context<Self>) {
         if self.own_files().is_none() {
             return;
         }
         let next = match self.own_dev_container() {
-            Some(_) => None,
+            Some(dev) if dev.sandbox => None,
+            Some(_) => Some(DevContainerSetting {
+                sandbox: true,
+                ..Default::default()
+            }),
             None => Some(DevContainerSetting {
                 container: Some(input_text(&self.dev.container_input, cx))
                     .filter(|c| !c.trim().is_empty()),
-                repo_on_host: false,
+                ..Default::default()
             }),
         };
         let turning_on = next.is_some();
+        // What was listed is the other kind's.
+        self.dev.containers.clear();
         if self.save_dev_container(next, cx) && turning_on {
             self.refresh_containers(cx);
+        }
+    }
+
+    /// Whether this node's own work runs in a cloud sandbox.
+    pub(super) fn runs_in_sandbox(&self) -> bool {
+        self.own_dev_container().is_some_and(|dev| dev.sandbox)
+    }
+
+    /// Where the node's own repository is, when not on this machine.
+    pub(super) fn remote_place(&self) -> &'static str {
+        if self.runs_in_sandbox() {
+            "the sandbox"
+        } else {
+            "the dev container"
         }
     }
 
@@ -134,9 +156,11 @@ impl TaskEditView {
         );
     }
 
-    /// Whether this node's own repository lives in its dev container.
+    /// Whether this node's own repository lives in its dev container or
+    /// sandbox.
     pub(super) fn repo_in_container(&self) -> bool {
-        self.own_dev_container().is_some_and(|dev| !dev.repo_on_host)
+        self.own_dev_container()
+            .is_some_and(|dev| dev.repo_is_remote())
     }
 
     fn schedule_dev_container_save(&mut self, cx: &mut Context<Self>) {
@@ -156,8 +180,14 @@ impl TaskEditView {
             return;
         }
         let container = input_text(&self.dev.container_input, cx).trim().to_string();
+        let sandbox = self.runs_in_sandbox();
+        let valid = if sandbox {
+            sandboxes::validate_name(&container)
+        } else {
+            devcontainer::validate_container_ref(&container)
+        };
         if !container.is_empty()
-            && let Err(err) = devcontainer::validate_container_ref(&container)
+            && let Err(err) = valid
         {
             self.dev.check = Some(Err(format!("{err:#}")));
             cx.notify();
@@ -168,6 +198,7 @@ impl TaskEditView {
             Some(DevContainerSetting {
                 container: (!container.is_empty()).then_some(container),
                 repo_on_host,
+                sandbox,
             }),
             cx,
         );
@@ -210,7 +241,8 @@ impl TaskEditView {
         let normalize = |dev: Option<DevContainerSetting>| {
             dev.map(|dev| DevContainerSetting {
                 container: dev.container().map(str::to_string),
-                repo_on_host: dev.repo_on_host,
+                repo_on_host: dev.repo_on_host && !dev.sandbox,
+                sandbox: dev.sandbox,
             })
         };
         let setting = normalize(setting);
@@ -234,7 +266,7 @@ impl TaskEditView {
         true
     }
 
-    /// `docker ps`, off the UI thread.
+    /// `docker ps`, or the sandboxes `tod-sandbox` knows, off the UI thread.
     pub(super) fn refresh_containers(&mut self, cx: &mut Context<Self>) {
         if self.dev.listing {
             return;
@@ -242,8 +274,18 @@ impl TaskEditView {
         self.dev.listing = true;
         self.dev.list_error = None;
         cx.notify();
+        let sandbox = self.runs_in_sandbox();
+        let root = self.fleet.paths().root().to_path_buf();
         cx.spawn(async move |this, cx| {
-            let result = cx.background_spawn(async { devcontainer::list_running() }).await;
+            let result = cx
+                .background_spawn(async move {
+                    if sandbox {
+                        Ok(sandbox_choices(&root))
+                    } else {
+                        devcontainer::list_running()
+                    }
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.dev.listing = false;
                 match result {
@@ -276,7 +318,14 @@ impl TaskEditView {
             self.dev.checking = false;
             return;
         };
-        let check: Box<dyn FnOnce() -> Result<String, String> + Send> = if dev.repo_on_host {
+        let check: Box<dyn FnOnce() -> Result<String, String> + Send> = if dev.sandbox {
+            let repo = self
+                .own_files()
+                .and_then(|files| files.repo_dir())
+                .filter(|dir| dir.sandbox_name().is_some())
+                .map(|dir| dir.path_text());
+            Box::new(move || check_repo_in_sandbox(&container, repo.as_deref()))
+        } else if dev.repo_on_host {
             let Some(host_dir) = self
                 .own_files()
                 .and_then(|files| files.ready_directory())
@@ -348,10 +397,10 @@ impl TaskEditView {
                     this.enter_field_edit(TaskEditField::RunsIn, window, cx);
                 }))
                 .child(Self::render_field_label("Runs in", cx))
-                .child(div().text_sm().text_color(foreground).child(if dev.is_some() {
-                    "Dev container"
-                } else {
-                    "This machine"
+                .child(div().text_sm().text_color(foreground).child(match &dev {
+                    Some(dev) if dev.sandbox => "Cloud sandbox",
+                    Some(_) => "Dev container",
+                    None => "This machine",
                 }))
                 .child(div().text_xs().text_color(muted).child("Enter or click to switch")),
         );
@@ -395,7 +444,10 @@ impl TaskEditView {
                     .gap_1()
                     .w(gpui::px(200.))
                     .flex_shrink_0()
-                    .child(Self::render_field_label("Container", cx))
+                    .child(Self::render_field_label(
+                        if dev.sandbox { "Sandbox" } else { "Container" },
+                        cx,
+                    ))
                     .child(self.render_nav_input(
                         TaskEditField::ContainerName,
                         self.dev.container_input.clone(),
@@ -409,7 +461,14 @@ impl TaskEditView {
         let list_header = h_flex()
             .gap_2()
             .items_center()
-            .child(Self::render_field_label("Running containers", cx))
+            .child(Self::render_field_label(
+                if dev.sandbox {
+                    "Sandboxes"
+                } else {
+                    "Running containers"
+                },
+                cx,
+            ))
             .child(self.apply_focus_scroll_anchor(
                 TaskEditField::ContainerRefresh,
                 div()
@@ -495,21 +554,28 @@ impl TaskEditView {
             ));
         }
         if self.dev.containers.is_empty() && !self.dev.listing && self.dev.list_error.is_none() {
-            list = list.child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("No running containers. Start the dev container, then Refresh."),
-            );
+            list = list.child(div().text_xs().text_color(muted).child(if dev.sandbox {
+                "No sandboxes yet. Create one with `tod-sandbox create <name>`, then Refresh."
+            } else {
+                "No running containers. Start the dev container, then Refresh."
+            }));
         }
 
         let status = if self.dev.checking {
-            Some((muted, "Checking the container…".to_string()))
+            let checking = if dev.sandbox {
+                "Checking the sandbox (this wakes it)…"
+            } else {
+                "Checking the container…"
+            };
+            Some((muted, checking.to_string()))
         } else {
             match &self.dev.check {
                 Some(Ok(text)) => Some((muted, text.clone())),
                 Some(Err(err)) => Some((danger, err.clone())),
-                None if chosen.is_none() => Some((muted, "Choose a container".to_string())),
+                None if chosen.is_none() => {
+                    let choose = if dev.sandbox { "Choose a sandbox" } else { "Choose a container" };
+                    Some((muted, choose.to_string()))
+                }
                 None => None,
             }
         };
@@ -517,7 +583,8 @@ impl TaskEditView {
         v_flex()
             .gap_2()
             .child(runs_in)
-            .child(location)
+            // A sandbox always holds its repository.
+            .when(!dev.sandbox, |el| el.child(location))
             .child(fields)
             .when_some(status, |el, (color, text)| {
                 el.child(div().text_xs().text_color(color).child(selectable_text(
@@ -538,6 +605,42 @@ impl TaskEditView {
             })
             .child(list)
     }
+}
+
+/// The sandboxes `tod-sandbox` knows, shown as the list's choices.
+fn sandbox_choices(root: &std::path::Path) -> Vec<ContainerSummary> {
+    sandboxes::known(root)
+        .into_iter()
+        .map(|name| ContainerSummary {
+            id: name.clone(),
+            name,
+            image: "cloud sandbox".into(),
+            status: String::new(),
+            local_folder: None,
+        })
+        .collect()
+}
+
+/// The sandbox can be reached (made ready for tod if it is not) and `repo`
+/// (a path in it) is a git repository there. Talks to Blaxel.
+fn check_repo_in_sandbox(sandbox: &str, repo: Option<&str>) -> Result<String, String> {
+    let exec = sandboxes::SandboxExec::new(sandbox);
+    let Some(repo) = repo else {
+        exec.output("/", "true", &[]).map_err(|err| format!("{err:#}"))?;
+        return Ok(format!(
+            "Sandbox {sandbox} is ready. Set the workspace directory to the repository's path in it."
+        ));
+    };
+    let out = exec
+        .output("/", "git", &["-C", repo, "rev-parse", "--show-toplevel"])
+        .map_err(|err| format!("{err:#}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{repo} is not a git repository in sandbox {sandbox}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(format!("Repository {repo} in sandbox {sandbox}"))
 }
 
 /// The chosen container is running and `repo` (a path in it) is a git

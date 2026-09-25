@@ -46,6 +46,15 @@ pub fn open_code_editor_for_node(
         crate::fleet::Workdir::Container { container, path } => anyhow::bail!(
             "{path} is inside dev container {container}; open it from an editor attached to the container"
         ),
+        crate::fleet::Workdir::Sandbox { sandbox, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
+            }
+            let url = zed::sandbox_url(&sandbox, &path);
+            zed::spawn_zed_url(&url, fleet.paths().root())
+                .with_context(|| format!("open {url} in Zed"))?;
+            return Ok(PathBuf::from(path));
+        }
     };
     editor
         .open(&cwd)

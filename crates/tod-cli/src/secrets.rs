@@ -128,6 +128,8 @@ fn how_to_set(kind: CredentialKind) -> &'static str {
             "set GITHUB_TOKEN in the environment tod is launched from, or store it with \
              `tod-cli secrets set github_token <token>`"
         }
+        // Not in `CredentialKind::ALL`, so `from_name` never yields it here.
+        CredentialKind::BlaxelApiKey => "only `tod-sandbox setup` stores it; agents cannot use it",
     }
 }
 
