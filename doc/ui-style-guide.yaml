@@ -133,7 +133,15 @@ styles:
   # Panels
   panel:
     background: surface
+  # Every header (a panel's, a workbench column's, the chat drawer's) sits
+  # on a faint gray band, so it reads as a header even when its region does
+  # not have focus. One that tracks focus takes the column-focused state
+  # instead while its region has focus; only one header in a window does.
+  header:
+    background: header-fill
+    focused: column-focused
   panel-header:
+    extends: header
     padding-x: inset
     padding-y: related
     gap: related
@@ -160,6 +168,7 @@ styles:
   # no column-header: its own toolbar is its header, and takes the same
   # column-focused state.
   column-header:
+    extends: header
     height: control
     padding-x: related
     gap: inline
@@ -478,6 +487,8 @@ tokens:
     # A group heading's rule, and the band behind an outermost heading.
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
+    # The band behind every header: gray about as faint as highlight-faint.
+    header-fill: "#ffffff10"
     highlight-edge: "#1d4ed8"
     # highlight-edge at 25%: tints the header of the column that has focus.
     highlight-faint: "#1d4ed840"

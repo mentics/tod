@@ -5,8 +5,11 @@
 //! alone; the last column has no width of its own and takes whatever is
 //! left, so dragging the divider before it only resizes its left neighbor.
 //! Opening a column squeezes the others; none is ever folded away.
+//!
+//! The chat drawer's top edge drags the same way, vertically: it trades
+//! height between the drawer and the node tree above it.
 
-use gpui::{Pixels, Window, px};
+use gpui::{Context, IntoElement, Pixels, Render, Window, px};
 
 /// Width of a divider's grab area. Only its centre pixel is drawn.
 pub const DIVIDER_WIDTH: f32 = 7.;
@@ -19,6 +22,35 @@ pub const TREE_MIN_WIDTH: f32 = 200.;
 const TREE_START_CHARS: f32 = 80.;
 /// A tree row's indent, marker, and padding, beside its title.
 const TREE_ROW_CHROME: f32 = 48.;
+
+/// The chat drawer's height until the user drags its edge.
+pub const CHAT_START_HEIGHT: f32 = 320.;
+/// The shortest the chat drawer can be dragged to.
+pub const CHAT_MIN_HEIGHT: f32 = 140.;
+/// How much of the node tree stays in view above the chat drawer.
+pub const TREE_MIN_HEIGHT: f32 = 120.;
+
+/// The empty view GPUI shows under the pointer while a divider is dragged.
+pub struct DividerDrag;
+
+impl Render for DividerDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The drag payload for the chat drawer's top edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatDrawerEdge;
+
+/// The chat drawer's height that puts its edge under the pointer at `y`, in
+/// a column spanning `top` to `bottom` (the drawer sits at the bottom),
+/// neither the drawer nor the tree above it going below its minimum.
+pub fn chat_height_at(y: Pixels, top: Pixels, bottom: Pixels) -> Pixels {
+    let wanted = bottom - y + px(DIVIDER_WIDTH / 2.);
+    let most = (bottom - top - px(TREE_MIN_HEIGHT)).max(px(CHAT_MIN_HEIGHT));
+    wanted.max(px(CHAT_MIN_HEIGHT)).min(most)
+}
 
 /// The drag payload: which divider is being dragged. Divider 0 is the one
 /// right of the node tree; divider `n` is the one left of column `n`
@@ -103,6 +135,19 @@ mod tests {
         assert_eq!((left, right), (px(480.), Some(px(220.))));
         let (left, right) = start(Some(700.)).widths_at(px(0.), px(220.), px(220.));
         assert_eq!((left, right), (px(220.), Some(px(480.))));
+    }
+
+    #[test]
+    fn the_chat_edge_follows_the_pointer_within_its_limits() {
+        let (top, bottom) = (px(0.), px(1000.));
+        assert_eq!(chat_height_at(px(603.5), top, bottom), px(400.));
+        assert_eq!(chat_height_at(px(990.), top, bottom), px(CHAT_MIN_HEIGHT));
+        assert_eq!(
+            chat_height_at(px(10.), top, bottom),
+            px(1000. - TREE_MIN_HEIGHT)
+        );
+        // Too short a window for both minimums: the drawer keeps its own.
+        assert_eq!(chat_height_at(px(10.), top, px(200.)), px(CHAT_MIN_HEIGHT));
     }
 
     #[test]

@@ -99,6 +99,9 @@ pub mod color {
     pub fn divider_strong() -> Hsla {
         hex(0xa3a3a380)
     }
+    pub fn header_fill() -> Hsla {
+        hex(0xffffff10)
+    }
     pub fn group_band() -> Hsla {
         hex(0x26262680)
     }
@@ -458,9 +461,21 @@ pub fn pane_divider<E: Styled>(el: E, dragging: bool) -> E {
     }
 }
 
+/// `styles.header`: the faint gray band behind every header.
+pub fn header<E: Styled>(el: E) -> E {
+    el.bg(color::header_fill())
+}
+
+/// `styles.header` for a header that tracks focus: in the `column-focused`
+/// state while `focused`, else the gray band.
+pub fn header_focusable<E: Styled + ParentElement>(el: E, focused: bool) -> E {
+    if focused { column_focused(el) } else { header(el) }
+}
+
 /// `styles.panel-header`.
 pub fn panel_header<E: Styled>(el: E) -> E {
-    el.px(space::INSET)
+    header(el)
+        .px(space::INSET)
         .py(space::RELATED)
         .gap(space::RELATED)
         .border_b(size::BORDER)
@@ -478,7 +493,7 @@ pub fn column_header<E: Styled + ParentElement>(el: E, focused: bool) -> E {
         .gap(space::INLINE)
         .border_b(size::BORDER)
         .border_color(color::divider());
-    if focused { column_focused(el) } else { el }
+    header_focusable(el, focused)
 }
 
 /// `states.column-focused`: the header of the column that has focus — a

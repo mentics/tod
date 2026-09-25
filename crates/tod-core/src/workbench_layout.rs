@@ -1,4 +1,4 @@
-//! The workbench's column widths, kept across restarts in
+//! The workbench's column widths and chat drawer height, kept across restarts in
 //! `workbench-layout.json` beside the task list's working set.
 //!
 //! Panels are not reopened on launch, so a width belongs to a column's
@@ -21,6 +21,10 @@ pub struct WorkbenchLayout {
     /// Columns 2 onward, by position.
     #[serde(default)]
     pub column_widths: Vec<Option<f32>>,
+    /// The chat drawer's expanded height in pixels, once the user has
+    /// dragged its top edge.
+    #[serde(default)]
+    pub chat_height: Option<f32>,
 }
 
 impl WorkbenchLayout {
@@ -68,6 +72,7 @@ mod tests {
         let dir = scratch_dir();
         let mut layout = WorkbenchLayout {
             tree_width: Some(412.),
+            chat_height: Some(250.),
             ..Default::default()
         };
         layout.set_column_width(2, Some(300.));
