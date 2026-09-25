@@ -111,8 +111,9 @@ try {
                 Write-Warning "tod-sandbox setup failed. If tod has not chosen a data root yet, run tod once, then: `"$sandbox`" setup --workspace $SandboxWorkspace"
             }
         } else {
-            Write-Host "Cloud sandboxes: run `"$sandbox`" setup --workspace <blaxel-workspace>"
-            Write-Host "  then `"$sandbox`" create <name>, and `"$sandbox`" zed <name> to open it in Zed."
+            Write-Host "Cloud sandboxes: set the Blaxel workspace in tod's Settings -> Cloud sandboxes"
+            Write-Host "  (or run `"$sandbox`" setup --workspace <blaxel-workspace>), sign in once with"
+            Write-Host "  bl login <workspace>, then create sandboxes from a node's Files section."
         }
     }
 } finally {

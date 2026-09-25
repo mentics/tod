@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tod_sandbox::blaxel::Blaxel;
+use tod_sandbox::blaxel::{Blaxel, NewSandbox};
 use tod_sandbox::config::{self, Account, AuthMode, Config, Sandbox};
 use tod_sandbox::provision::{self, Payload};
 use tod_sandbox::relay;
 
+pub use tod_sandbox::config::DEFAULT_IMAGE;
 pub use tod_sandbox::provision::{TOD_CLI_PATH, TUNNEL_PORT};
 
 /// Installs what tod needs in any image (see `assets/sandbox/`).
@@ -51,7 +52,13 @@ impl Sandboxes {
         self.config
             .blaxel
             .as_ref()
-            .ok_or_else(|| anyhow!("cloud sandboxes are not set up: run `tod-sandbox setup`"))
+            .filter(|acct| !acct.workspace.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "cloud sandboxes are not set up: set the Blaxel workspace in \
+                     Settings → Cloud sandboxes, or run `tod-sandbox setup`"
+                )
+            })
     }
 
     pub fn credentials(&self) -> CredentialStore {
@@ -131,6 +138,250 @@ impl Sandboxes {
         }
         Ok(url)
     }
+}
+
+/// What a new sandbox starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewSandboxSource {
+    /// A cold start from an image; empty means the account's default. An
+    /// image not built for Blaxel is wrapped first (a build on Blaxel, with
+    /// `bl`).
+    Image(String),
+    /// A copy of another sandbox's current state (Blaxel's fork; not every
+    /// workspace has it).
+    Fork(String),
+}
+
+impl Sandboxes {
+    /// Create sandbox `name` from `source`, wait for it, and make it ready
+    /// for tod. Returns its URL. Slow (seconds for a fork or a baked image,
+    /// a minute or more when an image is wrapped and set up): never on the UI
+    /// thread. `inherit_output` shows `bl`'s build output on this process's
+    /// terminal; otherwise it is only reported on failure.
+    pub fn create(
+        &mut self,
+        name: &str,
+        source: &NewSandboxSource,
+        agents: bool,
+        inherit_output: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<String> {
+        validate_name(name)?;
+        let acct = self.account()?.clone();
+        let bx = self.blaxel()?;
+        if let Some(info) = bx.get(name)?
+            && info.status != "TERMINATED"
+        {
+            bail!("a sandbox named {name} already exists ({})", info.status);
+        }
+        let started = Instant::now();
+        let image = match source {
+            NewSandboxSource::Image(image) => {
+                let image = match image.trim() {
+                    "" => acct.default_image.as_str(),
+                    image => image,
+                };
+                let runtime_image = if runs_as_is(image) {
+                    image.to_string()
+                } else {
+                    let wrapped = format!("tod-{}", label_value(short_image(image)));
+                    progress(&format!(
+                        "{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} \
+                         (adds Blaxel's sandbox API)…"
+                    ));
+                    let dir = build_dir(&wrapped)?;
+                    std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(image))?;
+                    std::fs::write(
+                        dir.join("blaxel.toml"),
+                        provision::blaxel_toml(&wrapped, acct.memory_mb),
+                    )?;
+                    self.bl_push(&dir, inherit_output, progress)?;
+                    format!("sandbox/{wrapped}:latest")
+                };
+                let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
+                let mut labels = vec![("tod", "1")];
+                if !owner.is_empty() {
+                    labels.push(("tod-owner", owner.as_str()));
+                }
+                progress(&format!("creating {name} from {runtime_image}…"));
+                bx.create(&NewSandbox {
+                    name,
+                    image: &runtime_image,
+                    region: &acct.region,
+                    memory_mb: acct.memory_mb,
+                    labels: &labels,
+                })?;
+                runtime_image
+            }
+            NewSandboxSource::Fork(source) => {
+                validate_name(source)?;
+                let image = bx
+                    .get(source)?
+                    .ok_or_else(|| anyhow!("no sandbox named {source} to fork"))?
+                    .image;
+                progress(&format!("forking {source} into {name}…"));
+                bx.fork(source, name)?;
+                image
+            }
+        };
+        let info = bx.wait_deployed(name, Duration::from_secs(300))?;
+        progress(&format!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64()));
+        self.config.upsert(Sandbox { name: name.to_string(), image, url: info.url, agents });
+        self.save()?;
+        forget(name);
+        self.ensure(&bx, name, progress)
+    }
+
+    /// Build `dir` (a Dockerfile and blaxel.toml) into the workspace's
+    /// registry. The build runs on Blaxel; no local Docker is needed.
+    pub fn bl_push(
+        &self,
+        dir: &Path,
+        inherit_output: bool,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<()> {
+        let acct = self.account()?;
+        let mut cmd = Command::new("bl");
+        // `bl` does not find blaxel.toml through `-d` with a Windows path; run it there.
+        cmd.args(["-w", &acct.workspace, "push", "--skip-version-warning"]).current_dir(dir);
+        if acct.auth == AuthMode::ApiKey {
+            cmd.env("BL_API_KEY", self.token()?).env("BL_WORKSPACE", &acct.workspace);
+        }
+        let missing = || {
+            anyhow!(
+                "building an image needs the Blaxel CLI (`bl`); \
+                 see https://docs.blaxel.ai/cli-reference/introduction"
+            )
+        };
+        let started = Instant::now();
+        let (status, detail) = if inherit_output {
+            (cmd.status().map_err(|_| missing())?, String::new())
+        } else {
+            no_window(&mut cmd);
+            let out = cmd.output().map_err(|_| missing())?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(15)..].join("\n");
+            (out.status, tail)
+        };
+        if !status.success() {
+            bail!(
+                "`bl push` failed ({status}); the build context is in {}\n{detail}",
+                dir.display()
+            );
+        }
+        progress(&format!("built in {}s", started.elapsed().as_secs()));
+        let _ = std::fs::remove_dir_all(dir);
+        Ok(())
+    }
+}
+
+/// A fresh directory to build an image in.
+pub fn build_dir(name: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("tod-sandbox-build-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// A label value Blaxel accepts: lowercase alphanumerics and dashes.
+pub fn label_value(s: &str) -> String {
+    let v: String = s
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    v.trim_matches('-').chars().take(63).collect()
+}
+
+/// `ubuntu:24.04` for `docker.io/library/ubuntu:24.04`, for naming images after it.
+pub fn short_image(image: &str) -> &str {
+    let image = image.strip_prefix("docker.io/").unwrap_or(image);
+    image.strip_prefix("library/").unwrap_or(image)
+}
+
+/// Images Blaxel can run as they are: its own and ones built in the workspace.
+pub fn runs_as_is(image: &str) -> bool {
+    image.starts_with("blaxel/") || image.starts_with("sandbox/")
+}
+
+/// A sandbox in the workspace, for choosing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedSandbox {
+    pub name: String,
+    /// As Blaxel reports it (`DEPLOYED`, `STANDBY`, …).
+    pub status: String,
+    pub image: String,
+    /// Who created it (the `tod-owner` label).
+    pub owner: Option<String>,
+    /// In this data root's `sandboxes.toml`.
+    pub known: bool,
+}
+
+/// Every sandbox in the workspace, by name. Asks Blaxel (which does not wake
+/// any): never on the UI thread.
+pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
+    let sandboxes = Sandboxes::load(root)?;
+    let mut all: Vec<ListedSandbox> = sandboxes
+        .blaxel()?
+        .list()?
+        .into_iter()
+        .filter(|info| !matches!(info.status.as_str(), "TERMINATED" | "DELETING"))
+        .map(|info| ListedSandbox {
+            owner: info.label("tod-owner").map(str::to_string),
+            known: sandboxes.config.sandbox(&info.name).is_some(),
+            name: info.name,
+            status: info.status,
+            image: info.image,
+        })
+        .collect();
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(all)
+}
+
+/// The Blaxel workspace and the image new sandboxes start from, as set up
+/// in this data root. Reads the file only.
+pub fn account_settings(root: &Path) -> (String, String) {
+    let acct = Sandboxes::load(root).ok().and_then(|s| s.config.blaxel);
+    match acct {
+        Some(acct) => (acct.workspace, acct.default_image),
+        None => (String::new(), config::DEFAULT_IMAGE.to_string()),
+    }
+}
+
+/// Record the workspace (a new one signs in with `bl login`; one already
+/// set up keeps its sign-in) and the default image. An empty image means
+/// Blaxel's base image.
+pub fn set_account_settings(root: &Path, workspace: &str, default_image: &str) -> Result<()> {
+    let mut sandboxes = Sandboxes::load(root)?;
+    let workspace = workspace.trim();
+    let default_image = match default_image.trim() {
+        "" => config::DEFAULT_IMAGE,
+        image => image,
+    };
+    let mut acct = match sandboxes.config.blaxel.take() {
+        // Clearing the workspace, or setting it again, keeps how to sign in.
+        Some(acct) if workspace.is_empty() || acct.workspace.is_empty() || acct.workspace == workspace => acct,
+        _ => Account::new(workspace),
+    };
+    if acct.workspace != workspace {
+        sandboxes.forget_token();
+    }
+    acct.workspace = workspace.to_string();
+    acct.default_image = default_image.to_string();
+    sandboxes.config.blaxel = Some(acct);
+    sandboxes.save()
+}
+
+/// A name for a new sandbox for the node `node_slug`.
+pub fn suggested_name(node_slug: &str) -> String {
+    let name: String = label_value(node_slug).chars().take(48).collect();
+    let name = name.trim_matches('-');
+    if name.is_empty() { "sandbox".into() } else { name.to_string() }
 }
 
 /// What gets installed into a sandbox.
@@ -407,6 +658,33 @@ pub fn validate_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggested_names_are_valid() {
+        for slug in ["fix-login", "Big Task: v2!", "", "---", &"x".repeat(80)] {
+            let name = suggested_name(slug);
+            assert!(validate_name(&name).is_ok(), "{slug:?} -> {name:?}");
+        }
+        assert_eq!(suggested_name("fix-login"), "fix-login");
+    }
+
+    #[test]
+    fn account_settings_round_trip() {
+        let root = std::env::temp_dir().join(format!("tod-sbx-acct-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(account_settings(&root), (String::new(), config::DEFAULT_IMAGE.to_string()));
+        assert!(Sandboxes::load(&root).unwrap().account().is_err());
+        set_account_settings(&root, " team ", "sandbox/baked:latest").unwrap();
+        assert_eq!(account_settings(&root), ("team".into(), "sandbox/baked:latest".into()));
+        // An empty image goes back to the default; the account stays.
+        set_account_settings(&root, "team", "").unwrap();
+        assert_eq!(account_settings(&root).1, config::DEFAULT_IMAGE);
+        assert_eq!(Sandboxes::load(&root).unwrap().account().unwrap().workspace, "team");
+        // No workspace is not set up, whatever else is there.
+        set_account_settings(&root, "", "x").unwrap();
+        assert!(Sandboxes::load(&root).unwrap().account().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn exit_codes_round_trip() {

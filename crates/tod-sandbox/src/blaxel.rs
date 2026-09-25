@@ -28,6 +28,12 @@ pub struct SandboxInfo {
     pub labels: Vec<(String, String)>,
 }
 
+impl SandboxInfo {
+    pub fn label(&self, key: &str) -> Option<&str> {
+        self.labels.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcessResult {
     #[serde(rename = "exitCode", default)]
@@ -90,6 +96,9 @@ impl Blaxel {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(15)))
+            // A control-plane call that hangs would hang whoever waits on it
+            // (a listing in the app); `run` sets its own, longer one.
+            .timeout_global(Some(Duration::from_secs(60)))
             .build();
         Self { workspace: workspace.into(), token: token.into(), agent: config.into() }
     }
@@ -144,6 +153,33 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// Creates `target` as a copy of `source`'s current state (Blaxel's
+    /// fork; not every workspace has it). Returns once the control plane
+    /// accepted it; see [`Blaxel::wait_deployed`].
+    pub fn fork(&self, source: &str, target: &str) -> Result<()> {
+        let body = json!({ "targetType": "sandbox", "targetName": target });
+        let mut resp = self
+            .auth(self.agent.post(&format!("{API}/sandboxes/{source}/fork")))
+            .send_json(&body)
+            .context("Blaxel API")?;
+        match resp.status().as_u16() {
+            404 => bail!("fork: no sandbox named {source}"),
+            409 => bail!("fork: a sandbox named {target} already exists"),
+            // The same sign-in can create sandboxes: forking is what is refused.
+            403 => {
+                // Blaxel's message, without the stack trace that follows it.
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                let message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["message"].as_str().map(str::to_string))
+                    .and_then(|m| m.lines().next().map(str::to_string))
+                    .unwrap_or_else(|| "this Blaxel workspace may not have forking enabled".into());
+                bail!("fork {source}: refused (403 Forbidden): {message}")
+            }
+            _ => check(&mut resp, &format!("fork {source}")),
+        }
+    }
+
     pub fn delete(&self, name: &str) -> Result<()> {
         let mut resp =
             self.auth(self.agent.delete(&format!("{API}/sandboxes/{name}"))).call().context("Blaxel API")?;
@@ -161,7 +197,10 @@ impl Blaxel {
                 Some(info) if matches!(info.status.as_str(), "FAILED" | "TERMINATED" | "DELETING") => {
                     bail!("sandbox {name} is {}", info.status)
                 }
-                None => bail!("sandbox {name} does not exist"),
+                // A fork can take a moment to appear.
+                None if start.elapsed() > Duration::from_secs(30) => {
+                    bail!("sandbox {name} does not exist")
+                }
                 _ => {}
             }
             if start.elapsed() > timeout {
@@ -239,6 +278,9 @@ impl Blaxel {
         let mut resp = self
             .auth(self.agent.put(&target))
             .header("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
+            .config()
+            .timeout_global(Some(Duration::from_secs(300)))
+            .build()
             .send(&body[..])
             .context("sandbox filesystem API")?;
         check(&mut resp, &format!("upload {path}"))

@@ -89,6 +89,11 @@ fn field_anchor_id(field: TaskEditField) -> &'static str {
         TaskEditField::ContainerName => "task-edit-field-container",
         TaskEditField::ContainerRefresh => "task-edit-field-container-refresh",
         TaskEditField::ContainerChoice(_) => "task-edit-field-container-choice",
+        TaskEditField::NewSandboxSource => "task-edit-field-new-sandbox-source",
+        TaskEditField::NewSandboxImage => "task-edit-field-new-sandbox-image",
+        TaskEditField::NewSandboxForkSource => "task-edit-field-new-sandbox-fork",
+        TaskEditField::NewSandboxName => "task-edit-field-new-sandbox-name",
+        TaskEditField::NewSandboxCreate => "task-edit-field-new-sandbox-create",
         TaskEditField::Capability(Capability::Agent) => "task-edit-field-cap-agent",
         TaskEditField::Capability(Capability::Files) => "task-edit-field-cap-files",
         TaskEditField::Capability(Capability::Ticket) => "task-edit-field-cap-ticket",
@@ -159,6 +164,16 @@ enum TaskEditField {
     ContainerRefresh,
     /// One listed running container, by index; Enter chooses it.
     ContainerChoice(usize),
+    /// New sandbox: from an image or a fork (Enter switches).
+    NewSandboxSource,
+    /// New sandbox: the image; empty uses the default from Settings.
+    NewSandboxImage,
+    /// New sandbox: the sandbox to fork (Enter takes the next listed one).
+    NewSandboxForkSource,
+    /// New sandbox: its name.
+    NewSandboxName,
+    /// New sandbox: create it and use it for this node.
+    NewSandboxCreate,
     /// Generator capability: pick the data source (only until one is saved).
     GeneratorSource,
     /// One field of the generator's configuration form, by index into
@@ -199,6 +214,9 @@ impl TaskEditField {
                 | Self::RepoLocation
                 | Self::ContainerRefresh
                 | Self::ContainerChoice(_)
+                | Self::NewSandboxSource
+                | Self::NewSandboxForkSource
+                | Self::NewSandboxCreate
                 | Self::GeneratorSource
                 | Self::GeneratorSave
                 | Self::GeneratorRefresh
@@ -802,6 +820,15 @@ impl TaskEditView {
                     TaskEditField::ContainerRefresh,
                 ]);
                 stops.extend((0..self.dev.container_count()).map(TaskEditField::ContainerChoice));
+                if dev.sandbox {
+                    stops.push(TaskEditField::NewSandboxSource);
+                    stops.push(if self.dev.new_from_fork() {
+                        TaskEditField::NewSandboxForkSource
+                    } else {
+                        TaskEditField::NewSandboxImage
+                    });
+                    stops.extend([TaskEditField::NewSandboxName, TaskEditField::NewSandboxCreate]);
+                }
             }
             stops.extend([
                 TaskEditField::Repo,
@@ -931,6 +958,8 @@ impl TaskEditView {
             TaskEditField::Branch => self.branch_input.clone().into(),
             TaskEditField::Details => self.details_input.clone().into(),
             TaskEditField::ContainerName => self.dev.container_input.clone().into(),
+            TaskEditField::NewSandboxImage => self.dev.new_image_input.clone().into(),
+            TaskEditField::NewSandboxName => self.dev.new_name_input.clone().into(),
             TaskEditField::GeneratorAcceptDestination => {
                 self.generator_accept_destination_input.clone().into()
             }
@@ -939,6 +968,9 @@ impl TaskEditView {
             | TaskEditField::RepoLocation
             | TaskEditField::ContainerRefresh
             | TaskEditField::ContainerChoice(_)
+            | TaskEditField::NewSandboxSource
+            | TaskEditField::NewSandboxForkSource
+            | TaskEditField::NewSandboxCreate
             | TaskEditField::AgentPlatform
             | TaskEditField::AgentModel
             | TaskEditField::AgentEffort
@@ -968,6 +1000,14 @@ impl TaskEditView {
             (
                 TaskEditField::ContainerName,
                 self.dev.container_input.clone().into(),
+            ),
+            (
+                TaskEditField::NewSandboxImage,
+                self.dev.new_image_input.clone().into(),
+            ),
+            (
+                TaskEditField::NewSandboxName,
+                self.dev.new_name_input.clone().into(),
             ),
             (
                 TaskEditField::GeneratorAcceptDestination,
@@ -1073,6 +1113,18 @@ impl TaskEditView {
             }
             TaskEditField::ContainerChoice(index) => {
                 self.choose_container(index, window, cx);
+                return;
+            }
+            TaskEditField::NewSandboxSource => {
+                self.toggle_new_sandbox_source(cx);
+                return;
+            }
+            TaskEditField::NewSandboxForkSource => {
+                self.cycle_fork_source(cx);
+                return;
+            }
+            TaskEditField::NewSandboxCreate => {
+                self.create_sandbox(window, cx);
                 return;
             }
             _ => {

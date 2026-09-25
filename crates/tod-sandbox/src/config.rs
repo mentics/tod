@@ -49,11 +49,29 @@ pub struct Account {
     pub owner: Option<String>,
 }
 
+/// What a new sandbox starts from when neither the account nor the request
+/// names an image.
+pub const DEFAULT_IMAGE: &str = "blaxel/base-image:latest";
+
+impl Account {
+    /// An account signed in with `bl login`, with the defaults.
+    pub fn new(workspace: impl Into<String>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            region: default_region(),
+            auth: AuthMode::Bl,
+            default_image: default_image(),
+            memory_mb: default_memory(),
+            owner: std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok(),
+        }
+    }
+}
+
 fn default_region() -> String {
     "us-pdx-1".into()
 }
 fn default_image() -> String {
-    "blaxel/base-image:latest".into()
+    DEFAULT_IMAGE.into()
 }
 fn default_memory() -> u32 {
     4096

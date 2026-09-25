@@ -395,7 +395,12 @@ Nothing starts or builds a container; tod only uses a running one.
 - **Cloud sandboxes** are the third place ("Runs in → Cloud sandbox";
   `node_files.container_kind = 'sandbox'`, with the sandbox's name in
   `container`; `tod-cli capabilities set <node> files --sandbox <name>`). The
-  repository always lives in the sandbox. `Workdir::Sandbox`
+  repository always lives in the sandbox. The Files section lists the
+  workspace's sandboxes (`fleet::sandbox::list`) and makes new ones from an
+  image or as a fork (`Sandboxes::create` with `NewSandboxSource`, off the UI
+  thread); the workspace and default image are in Settings → Cloud sandboxes
+  (`account_settings` / `set_account_settings`, kept in `sandboxes.toml`,
+  not the settings file). `Workdir::Sandbox`
   runs git through `tod-sandbox exec`, and `AgentEnvironment::Sandbox`
   (`tod_agent::sandbox::SandboxLaunch`, built by
   `dev_container::sandbox_launch_for`) spawns the agent as `tod-sandbox agent

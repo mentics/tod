@@ -12,14 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tod_sandbox::blaxel::{Blaxel, NewSandbox};
-use tod_sandbox::config::{self, Account, AuthMode, Sandbox};
+use tod_sandbox::blaxel::Blaxel;
+use tod_sandbox::config::{self, Account, AuthMode};
 use tod_sandbox::provision;
 use tod_sandbox::relay::{self, ExecRequest};
 use tod_sandbox::terminal::{self, TerminalOptions};
 use tod_store::credentials::CredentialKind;
 use tod_store::fleet::cli_relay;
-use tod_store::fleet::sandbox::{self as sandboxes, BOOTSTRAP, Sandboxes};
+use tod_store::fleet::sandbox::{self as sandboxes, BOOTSTRAP, NewSandboxSource, Sandboxes};
 
 const USAGE: &str = "\
 tod-sandbox: cloud sandboxes for tod (Blaxel)
@@ -32,6 +32,10 @@ setup [--workspace W] [--auth bl|api-key] [--api-key-stdin] [--region R]
 create <name> [--image IMAGE] [--agents]
                          Create a sandbox and install what tod needs in it. Any
                          image works: one not built for Blaxel is wrapped first.
+fork <source> <name> [--agents]
+                         Create a sandbox as a copy of another one's current
+                         state (it may be in standby). Needs a Blaxel workspace
+                         with forking.
 ensure <name>            Install or update tod's pieces in a sandbox (idempotent).
 bake <base-image> [--name IMAGE-NAME] [--agents]
                          Build an image with everything preinstalled.
@@ -130,27 +134,6 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(f)
 }
 
-/// A label value Blaxel accepts: lowercase alphanumerics and dashes.
-fn label_value(s: &str) -> String {
-    let v: String = s
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    v.trim_matches('-').chars().take(63).collect()
-}
-
-/// `ubuntu:24.04` for `docker.io/library/ubuntu:24.04`, for naming images after it.
-fn short_image(image: &str) -> &str {
-    let image = image.strip_prefix("docker.io/").unwrap_or(image);
-    image.strip_prefix("library/").unwrap_or(image)
-}
-
-/// Images Blaxel can run as they are: its own and ones built in the workspace.
-fn runs_as_is(image: &str) -> bool {
-    image.starts_with("blaxel/") || image.starts_with("sandbox/")
-}
-
 fn prompt(question: &str) -> Result<String> {
     eprint!("{question}: ");
     std::io::stderr().flush()?;
@@ -180,6 +163,7 @@ fn run() -> Result<i32> {
     match cmd.as_str() {
         "setup" | "login" => setup(&mut ctx, args),
         "create" => create(&mut ctx, args),
+        "fork" => fork(&mut ctx, args),
         "ensure" => {
             let name = args.positional("sandbox name")?;
             args.done()?;
@@ -318,95 +302,43 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
 
 fn create(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let name = args.positional("sandbox name")?;
-    sandboxes::validate_name(&name)?;
     let agents = args.flag("--agents");
-    let acct = ctx.account()?.clone();
-    let image = args.opt("--image").unwrap_or(acct.default_image.clone());
+    let image = args.opt("--image").unwrap_or_default();
     args.done()?;
-    let bx = ctx.blaxel()?;
-    if let Some(info) = bx.get(&name)? {
-        if info.status != "TERMINATED" {
-            bail!("a sandbox named {name} already exists ({}); `tod-sandbox ensure {name}` prepares it", info.status);
-        }
-    }
-    let runtime_image = if runs_as_is(&image) {
-        image.clone()
-    } else {
-        let wrapped = format!("tod-{}", label_value(short_image(&image)));
-        eprintln!("{image} is not built for Blaxel; wrapping it as sandbox/{wrapped} (adds Blaxel's sandbox API)…");
-        let dir = build_dir(&wrapped)?;
-        std::fs::write(dir.join("Dockerfile"), provision::wrap_dockerfile(&image))?;
-        std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&wrapped, acct.memory_mb))?;
-        bl_push(ctx, &dir)?;
-        format!("sandbox/{wrapped}:latest")
-    };
-    let owner = acct.owner.as_deref().map(label_value).unwrap_or_default();
-    let mut labels = vec![("tod", "1")];
-    if !owner.is_empty() {
-        labels.push(("tod-owner", owner.as_str()));
-    }
-    let started = Instant::now();
-    bx.create(&NewSandbox {
-        name: &name,
-        image: &runtime_image,
-        region: &acct.region,
-        memory_mb: acct.memory_mb,
-        labels: &labels,
-    })?;
-    let info = bx.wait_deployed(&name, Duration::from_secs(300))?;
-    eprintln!("{name}: deployed in {:.1}s", started.elapsed().as_secs_f64());
-    ctx.config.upsert(Sandbox { name: name.clone(), image: runtime_image, url: info.url, agents });
-    ctx.save()?;
-    ensure(ctx, &bx, &name)?;
+    ctx.create(&name, &NewSandboxSource::Image(image), agents, true, &mut |m| eprintln!("{m}"))?;
     println!("{name}: ready. Open it with `tod-sandbox zed {name}` or `tod-sandbox shell {name}`.");
     Ok(0)
 }
 
-fn build_dir(name: &str) -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("tod-sandbox-build-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-/// Builds `dir` (a Dockerfile and blaxel.toml) into the workspace's registry.
-/// The build runs on Blaxel; no local Docker is needed.
-fn bl_push(ctx: &Ctx, dir: &Path) -> Result<()> {
-    let acct = ctx.account()?;
-    let mut cmd = Command::new("bl");
-    // `bl` does not find blaxel.toml through `-d` with a Windows path; run it there.
-    cmd.args(["-w", &acct.workspace, "push", "--skip-version-warning"]).current_dir(dir);
-    if acct.auth == AuthMode::ApiKey {
-        cmd.env("BL_API_KEY", ctx.token()?).env("BL_WORKSPACE", &acct.workspace);
-    }
-    let started = Instant::now();
-    let status = cmd
-        .status()
-        .map_err(|_| anyhow!("building an image needs the Blaxel CLI (`bl`); see https://docs.blaxel.ai/cli-reference/introduction"))?;
-    if !status.success() {
-        bail!("`bl push` failed ({status}); the build context is in {}", dir.display());
-    }
-    eprintln!("built in {}s", started.elapsed().as_secs());
-    let _ = std::fs::remove_dir_all(dir);
-    Ok(())
+fn fork(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
+    let source = args.positional("sandbox to fork")?;
+    let name = args.positional("new sandbox name")?;
+    let agents = args.flag("--agents")
+        || ctx.config.sandbox(&source).is_some_and(|s| s.agents);
+    args.done()?;
+    ctx.create(&name, &NewSandboxSource::Fork(source), agents, true, &mut |m| eprintln!("{m}"))?;
+    println!("{name}: ready. Open it with `tod-sandbox zed {name}` or `tod-sandbox shell {name}`.");
+    Ok(0)
 }
 
 fn bake(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let base = args.positional("base image")?;
     let agents = args.flag("--agents");
-    let name = args.opt("--name").unwrap_or_else(|| format!("tod-baked-{}", label_value(short_image(&base))));
+    let name = args
+        .opt("--name")
+        .unwrap_or_else(|| format!("tod-baked-{}", sandboxes::label_value(sandboxes::short_image(&base))));
     args.done()?;
     let acct = ctx.account()?.clone();
     let relay_bin = sandboxes::relay_binary()?;
     let payload = sandboxes::payload(&relay_bin, agents);
-    let dir = build_dir(&name)?;
+    let dir = sandboxes::build_dir(&name)?;
     std::fs::write(dir.join("Dockerfile"), provision::bake_dockerfile(&base, &payload))?;
     std::fs::write(dir.join("bootstrap.sh"), BOOTSTRAP)?;
     std::fs::write(dir.join("tod-relay"), &relay_bin)?;
     std::fs::write(dir.join("tod-cli"), payload.tod_cli)?;
     std::fs::write(dir.join("blaxel.toml"), provision::blaxel_toml(&name, acct.memory_mb))?;
     eprintln!("baking {base} with tod's dependencies into sandbox/{name}…");
-    bl_push(ctx, &dir)?;
+    ctx.bl_push(&dir, true, &mut |m| eprintln!("{m}"))?;
     let flag = if agents { " --agents" } else { "" };
     println!(
         "built sandbox/{name}:latest. Create sandboxes from it with\n  tod-sandbox create <name> --image sandbox/{name}:latest{flag}\n\

@@ -57,11 +57,20 @@ whose sandbox is whose. Keep API keys for automation.
 Building images (a wrapped or baked image, below) also needs the Blaxel CLI.
 With an API key, `tod-sandbox` passes the key to `bl`.
 
+**In the app**, Settings → **Cloud sandboxes** sets the same two things
+`sandboxes.toml` holds for everyone on this data root: the **Blaxel
+workspace** and the **default image** new sandboxes start from. Setting a
+workspace there signs in with `bl login` (run it once yourself); a workspace
+already set up with `tod-sandbox setup` keeps how it signs in. An empty
+workspace turns cloud sandboxes off, and an empty image means Blaxel's base
+image.
+
 ## Sandboxes
 
 ```sh
 tod-sandbox create dev                                   # Blaxel's base image (Alpine)
 tod-sandbox create dev2 --image ubuntu:24.04 --agents    # any image, plus Node and the agent adapter
+tod-sandbox fork dev2 dev2-copy                          # a copy of dev2 as it is now
 tod-sandbox zed dev /root/project                        # open it in Zed
 tod-sandbox shell dev                                    # a terminal
 tod-sandbox exec dev -- git -C /root/project status      # one command
@@ -91,6 +100,11 @@ A baked image already has everything installed, so a sandbox created from it
 is ready in about 10 s. `tod-sandbox setup --image <image>` makes an image the
 default for `create`.
 
+**Forks.** `tod-sandbox fork <source> <name>` makes a new sandbox from
+another one's current state, files and installed tools included, even while
+the source is in standby. Not every Blaxel workspace has forking; one without
+it refuses with "fork feature is not enabled for this workspace".
+
 **Updates.** Whenever `tod-sandbox` connects, it checks the sandbox's manifest
 of what was installed (one round trip, 0.3 s). After a tod update it
 reinstalls what changed in place, so a rebake is optional.
@@ -99,8 +113,16 @@ reinstalls what changed in place, so a rebake is optional.
 
 In the task editor, a node's **Files** section has **Runs in**, which cycles
 through *This machine*, *Dev container*, and *Cloud sandbox*. Choose *Cloud
-sandbox*, pick a sandbox from the list (the ones in `sandboxes.toml`), and give
-the workspace directory as a path in the sandbox (`/root/app`). tod checks the
+sandbox*, pick a sandbox from the list (every sandbox in the workspace, with
+its status, image, and owner), and give the workspace directory as a path in
+the sandbox (`/root/app`).
+
+To make a new one there, use **New sandbox** below the list. **Start from**
+chooses between *An image* (a cold start; empty uses the default image from
+Settings) and *A fork of a sandbox* (pick which one; see **Forks** above).
+The name defaults to the node's slug. **Create and use it** makes the
+sandbox, installs what agents need, and selects it for the node; a baked
+image takes seconds, any other image a minute or more. tod checks the
 directory there, which wakes the sandbox. An agent can set the same thing:
 
 ```sh

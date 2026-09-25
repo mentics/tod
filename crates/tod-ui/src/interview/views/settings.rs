@@ -33,11 +33,12 @@ const SIDEBAR_MIN: f32 = 140.0;
 const PANEL_MIN: f32 = 320.0;
 const SETTINGS_CONTEXT: &str = "Settings";
 
-const SECTIONS: [SettingsSection; 6] = [
+const SECTIONS: [SettingsSection; 7] = [
     SettingsSection::Agents,
     SettingsSection::QuestionMaker,
     SettingsSection::AnswerProcessor,
     SettingsSection::Workspaces,
+    SettingsSection::CloudSandboxes,
     SettingsSection::Logging,
     SettingsSection::Journeys,
 ];
@@ -111,6 +112,7 @@ enum SettingsSection {
     QuestionMaker,
     AnswerProcessor,
     Workspaces,
+    CloudSandboxes,
     Logging,
     Journeys,
 }
@@ -122,6 +124,7 @@ impl SettingsSection {
             Self::QuestionMaker => "Question maker",
             Self::AnswerProcessor => "Agent context",
             Self::Workspaces => "Workspaces",
+            Self::CloudSandboxes => "Cloud sandboxes",
             Self::Logging => "Logging",
             Self::Journeys => "Journeys",
         }
@@ -133,6 +136,7 @@ impl SettingsSection {
             Self::QuestionMaker => "question-maker",
             Self::AnswerProcessor => "answer-processor",
             Self::Workspaces => "workspaces",
+            Self::CloudSandboxes => "cloud-sandboxes",
             Self::Logging => "logging",
             Self::Journeys => "journeys",
         }
@@ -156,6 +160,7 @@ impl SettingsSection {
                 TreehouseWorktreesRoot,
                 TerminalProgram,
             ],
+            Self::CloudSandboxes => &[SandboxWorkspace, SandboxDefaultImage],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
                 JourneysSend,
@@ -181,6 +186,10 @@ enum SettingField {
     TreehouseExecutable,
     TreehouseWorktreesRoot,
     TerminalProgram,
+    /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
+    SandboxWorkspace,
+    /// The image a new sandbox starts from unless one is given.
+    SandboxDefaultImage,
     LogLevel,
     LogMaxSize,
     ChatLaunchMode,
@@ -207,6 +216,8 @@ impl SettingField {
             Self::TreehouseExecutable => "treehouse-executable",
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
+            Self::SandboxWorkspace => "sandbox-workspace",
+            Self::SandboxDefaultImage => "sandbox-default-image",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::ChatLaunchMode => "chat-launch-mode",
@@ -320,6 +331,13 @@ pub struct SettingsView {
     treehouse_executable_input: Entity<InputState>,
     relay_code_input: Entity<InputState>,
     milestone_states_input: Entity<InputState>,
+    /// Cloud sandboxes: kept in `sandboxes.toml` (shared with `tod-sandbox`),
+    /// not in the settings file; saved when leaving the field with
+    /// Enter or Escape.
+    sandbox_workspace_input: Entity<InputState>,
+    sandbox_image_input: Entity<InputState>,
+    sandbox_editing: Option<SettingField>,
+    sandbox_status: Option<Result<SharedString, SharedString>>,
     agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
@@ -366,6 +384,21 @@ impl SettingsView {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default(),
                 )
+        });
+        let (sandbox_workspace, sandbox_image) =
+            tod_store::fleet::sandbox::account_settings(paths.data_root());
+        let sandbox_workspace_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Enter to edit · Not set up")
+                .default_value(sandbox_workspace)
+        });
+        let sandbox_image_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format!(
+                    "Enter to edit · Default: {}",
+                    tod_store::fleet::sandbox::DEFAULT_IMAGE
+                ))
+                .default_value(sandbox_image)
         });
         let treehouse_executable_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -473,6 +506,10 @@ impl SettingsView {
             terminal_program_input,
             treehouse_worktrees_root_input,
             treehouse_executable_input,
+            sandbox_workspace_input,
+            sandbox_image_input,
+            sandbox_editing: None,
+            sandbox_status: None,
             relay_code_input,
             milestone_states_input,
             agent_selects,
@@ -560,7 +597,8 @@ impl SettingsView {
     }
 
     fn text_editing(&self) -> bool {
-        self.terminal_program_editing
+        self.sandbox_editing.is_some()
+            || self.terminal_program_editing
             || self.treehouse_worktrees_root_editing
             || self.treehouse_executable_editing
             || self.relay_code_editing
@@ -577,7 +615,61 @@ impl SettingsView {
         self.treehouse_executable_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
+        if self.sandbox_editing.take().is_some() {
+            self.save_sandbox_account(cx);
+        }
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn enter_sandbox_edit(
+        &mut self,
+        field: SettingField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = match field {
+            SettingField::SandboxWorkspace => self.sandbox_workspace_input.clone(),
+            SettingField::SandboxDefaultImage => self.sandbox_image_input.clone(),
+            _ => return,
+        };
+        if self.selected_field() != field {
+            return;
+        }
+        // Moving from one to the other keeps what was typed in the first.
+        if self.sandbox_editing.is_some_and(|editing| editing != field) {
+            self.save_sandbox_account(cx);
+        }
+        self.focus_region = SettingsFocus::Panel;
+        self.sandbox_editing = Some(field);
+        cx.notify();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+    }
+
+    /// Write the workspace and default image to `sandboxes.toml`.
+    fn save_sandbox_account(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.sandbox_workspace_input.read(cx).text().to_string();
+        let image = self.sandbox_image_input.read(cx).text().to_string();
+        if (workspace.trim().to_string(), image.trim().to_string())
+            == tod_store::fleet::sandbox::account_settings(self.paths.data_root())
+        {
+            return;
+        }
+        self.sandbox_status = Some(
+            match tod_store::fleet::sandbox::set_account_settings(
+                self.paths.data_root(),
+                &workspace,
+                &image,
+            ) {
+                Ok(()) if workspace.trim().is_empty() => {
+                    Ok("Saved. Cloud sandboxes are off until a workspace is set.".into())
+                }
+                Ok(()) => Ok("Saved.".into()),
+                Err(err) => Err(format!("Could not save: {err:#}").into()),
+            },
+        );
         cx.notify();
     }
 
@@ -592,6 +684,9 @@ impl SettingsView {
         self.treehouse_executable_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
+        if self.sandbox_editing.take().is_some() {
+            self.save_sandbox_account(cx);
+        }
         self.active_section = section;
         self.selected_field_index = 0;
         self.selected_agent_column = 0;
@@ -721,7 +816,9 @@ impl SettingsView {
             SettingField::MaxParallelSessions => self.step_max_parallel_sessions(delta, cx),
             SettingField::TreehouseExecutable
             | SettingField::TreehouseWorktreesRoot
-            | SettingField::TerminalProgram => {}
+            | SettingField::TerminalProgram
+            | SettingField::SandboxWorkspace
+            | SettingField::SandboxDefaultImage => {}
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
                 let step = if delta >= 0 { 1024 } else { -1024 };
@@ -755,6 +852,9 @@ impl SettingsView {
                 self.enter_treehouse_worktrees_root_edit(window, cx)
             }
             SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
+            field @ (SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage) => {
+                self.enter_sandbox_edit(field, window, cx)
+            }
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
@@ -1326,6 +1426,16 @@ impl Render for SettingsView {
             cx,
         );
         key_context::set_input_tab_stop(&self.relay_code_input, self.relay_code_editing, cx);
+        for (field, input) in [
+            (SettingField::SandboxWorkspace, self.sandbox_workspace_input.clone()),
+            (SettingField::SandboxDefaultImage, self.sandbox_image_input.clone()),
+        ] {
+            let editing = self.sandbox_editing == Some(field);
+            key_context::set_input_tab_stop(&input, editing, cx);
+            if !editing && input.read(cx).focus_handle(cx).is_focused(window) {
+                self.enter_sandbox_edit(field, window, cx);
+            }
+        }
         key_context::set_input_tab_stop(
             &self.milestone_states_input,
             self.milestone_states_editing,
@@ -1679,6 +1789,47 @@ impl SettingsView {
                     self.terminal_program_editing,
                     theme,
                 ))
+                .into_any_element(),
+            SettingsSection::CloudSandboxes => v_flex()
+                .gap_1()
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxWorkspace,
+                    "Blaxel workspace",
+                    "The Blaxel workspace nodes' cloud sandboxes live in. Sign in to it once with `bl login <workspace>`. A team shares one workspace, and each person signs in as themselves. Empty turns cloud sandboxes off.",
+                    &self.sandbox_workspace_input,
+                    self.sandbox_editing == Some(SettingField::SandboxWorkspace),
+                    theme,
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxDefaultImage,
+                    "Default image",
+                    "What a new sandbox starts from unless the Files capability names another image. A baked image (`tod-sandbox bake`) is ready in seconds. Any other image is set up the first time, which takes a minute or more.",
+                    &self.sandbox_image_input,
+                    self.sandbox_editing == Some(SettingField::SandboxDefaultImage),
+                    theme,
+                ))
+                .when_some(self.sandbox_status.clone(), |el, status| {
+                    let (color, text) = match status {
+                        Ok(text) => (theme.muted_foreground, text),
+                        Err(text) => (theme.danger, text),
+                    };
+                    el.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(color)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-sandbox-status",
+                                text,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
                 .into_any_element(),
             SettingsSection::Logging => v_flex()
                 .gap_1()
@@ -2038,6 +2189,11 @@ fn text_input_row(
                     SettingField::TreehouseExecutable => {
                         if !this.treehouse_executable_editing {
                             this.enter_treehouse_executable_edit(window, cx);
+                        }
+                    }
+                    SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
+                        if this.sandbox_editing != Some(field) {
+                            this.enter_sandbox_edit(field, window, cx);
                         }
                     }
                     _ => {}
