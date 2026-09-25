@@ -245,7 +245,6 @@ impl PlanStepsView {
     }
 
     /// The step under the cursor.
-    #[cfg(test)]
     pub(crate) fn selected_id(&self) -> Option<Uuid> {
         self.selected_step().map(|step| step.id)
     }

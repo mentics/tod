@@ -471,7 +471,7 @@ impl ObligationsView {
 
     /// Id of the selected obligation, when the selection is an item rather than
     /// a group or section header.
-    fn selected_obligation_id(&self) -> Option<Uuid> {
+    pub(crate) fn selected_obligation_id(&self) -> Option<Uuid> {
         Some(self.list.cursor_item()?.obligation.id)
     }
 

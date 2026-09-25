@@ -1,18 +1,39 @@
 //! The obligations column panel: [`ObligationsView`] hosted embedded, as
 //! `conversation/context_panel.rs` already does for the conversation view's
 //! own context pane.
+//!
+//! **E** on the selected obligation opens the conversation that last changed
+//! it (its transcript), when one did.
 
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div,
+    App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, ParentElement, Render, SharedString, Styled, Window, actions, div,
 };
+use tod_store::conversation::ConversationRepo;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
-use crate::unified::panel::ColumnPanel;
+use crate::ui::key_context;
+use crate::unified::PanelKind;
+use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
 use crate::views::obligations::ObligationsView;
+
+const OBLIGATIONS_PANEL_CONTEXT: &str = "UnifiedObligationsPanel";
+
+actions!(unified_obligations_panel, [ObligationsPanelOpenTranscript]);
+
+/// Register this panel's own keys, alongside every other
+/// `register_*_keyboard_bindings`.
+pub fn register_obligations_panel_keyboard_bindings(cx: &mut App) {
+    let context = Some(key_context::excluding_input(OBLIGATIONS_PANEL_CONTEXT));
+    cx.bind_keys([KeyBinding::new(
+        "e",
+        ObligationsPanelOpenTranscript,
+        context,
+    )]);
+}
 
 fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
     fleet
@@ -63,6 +84,29 @@ impl ObligationsPanel {
         });
         cx.notify();
     }
+
+    /// `E`: open the selected obligation's own transcript — the conversation
+    /// that last changed it, while one did.
+    fn on_open_transcript(
+        &mut self,
+        _: &ObligationsPanelOpenTranscript,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(obligation_id) = self.inner.read(cx).selected_obligation_id() else {
+            return;
+        };
+        let Ok(Some(conversation_id)) = self
+            .fleet
+            .read(|conn| ConversationRepo::new(conn).latest_conversation_for_entity(obligation_id))
+        else {
+            return;
+        };
+        cx.emit(PanelOpenRequest {
+            target: PanelKind::Transcript(conversation_id),
+            ctrl: false,
+        });
+    }
 }
 
 impl ColumnPanel for ObligationsPanel {
@@ -75,6 +119,8 @@ impl ColumnPanel for ObligationsPanel {
     }
 }
 
+impl EventEmitter<PanelOpenRequest> for ObligationsPanel {}
+
 impl Focusable for ObligationsPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.inner.read(cx).focus_handle(cx)
@@ -82,8 +128,12 @@ impl Focusable for ObligationsPanel {
 }
 
 impl Render for ObligationsPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .key_context(OBLIGATIONS_PANEL_CONTEXT)
+            .size_full()
+            .on_action(cx.listener(Self::on_open_transcript))
+            .child(self.inner.clone())
     }
 }
 
@@ -95,6 +145,7 @@ mod tests {
     use gpui_component::Root;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use tod_store::interview::InterviewCommand;
 
     fn open_view<'a>(
         fixture: &Fixture,
@@ -126,5 +177,90 @@ mod tests {
             let shown = view.inner.read(cx).is_open();
             assert!(shown);
         });
+    }
+
+    fn create_conversation(fixture: &Fixture) -> Uuid {
+        let id = Uuid::new_v4();
+        fixture
+            .store
+            .interview(
+                tod_store::interview::ACTOR_USER,
+                InterviewCommand::CreateConversation {
+                    id,
+                    protocol: tod_store::conversation::ProtocolKind::Outline,
+                    focus: tod_store::conversation::Focus::Node(fixture.node_id),
+                    platform: None,
+                    model: None,
+                    effort: None,
+                },
+            )
+            .unwrap();
+        id
+    }
+
+    #[gpui::test]
+    fn e_opens_the_transcript_of_the_conversation_that_last_changed_the_selected_obligation(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let conversation = create_conversation(&fixture);
+        let (view, cx) = open_view(&fixture, cx);
+        let obligation_id = fixture.offline_obligation;
+        view.update_in(cx, |view, window, cx| {
+            view.inner.update(cx, |inner, cx| {
+                inner.highlight_item(obligation_id, window, cx);
+            });
+        });
+        fixture
+            .store
+            .interview(
+                &tod_store::conversation::actor_for(conversation),
+                InterviewCommand::Outline {
+                    mutation: tod_store::outline::OutlineMutation::UpdateObligationBody {
+                        obligation_id,
+                        body: "Agent edit.".into(),
+                    },
+                    target: None,
+                },
+            )
+            .unwrap();
+
+        let events: Rc<RefCell<Vec<PanelOpenRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_in = events.clone();
+        cx.update(|_window, cx| {
+            cx.subscribe(&view, move |_, event: &PanelOpenRequest, _| {
+                events_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_open_transcript(&ObligationsPanelOpenTranscript, window, cx);
+        });
+
+        let got = events.borrow();
+        assert_eq!(got.len(), 1);
+        assert!(matches!(got[0].target, PanelKind::Transcript(id) if id == conversation));
+    }
+
+    #[gpui::test]
+    fn e_does_nothing_when_no_conversation_changed_the_obligation(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+
+        let events: Rc<RefCell<Vec<PanelOpenRequest>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_in = events.clone();
+        cx.update(|_window, cx| {
+            cx.subscribe(&view, move |_, event: &PanelOpenRequest, _| {
+                events_in.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.on_open_transcript(&ObligationsPanelOpenTranscript, window, cx);
+        });
+
+        assert!(events.borrow().is_empty());
     }
 }
