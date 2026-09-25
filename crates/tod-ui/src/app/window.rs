@@ -272,8 +272,8 @@ impl Shell {
                 focus.focus(window, cx);
             }
             ShellView::Unified => {
-                let focus = self.unified.read(cx).focus_handle(cx);
-                focus.focus(window, cx);
+                self.unified
+                    .update(cx, |unified, cx| unified.focus_tree(window, cx));
             }
         }
         cx.notify();
@@ -2241,7 +2241,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 format_status_bar(&AgentStatusGroups::default()).into();
                             let tasks_split_state = cx.new(|_| PanelSplitState::centered());
                             let shell = Shell {
-                                active_view: ShellView::Tasks,
+                                active_view: ShellView::Unified,
                                 task_list,
                                 drawer: RightDrawer {
                                     task_edit,
@@ -2253,7 +2253,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 },
                                 sessions,
                                 conversation,
-                                view_before_conversation: ShellView::Tasks,
+                                view_before_conversation: ShellView::Unified,
                                 settings,
                                 database,
                                 unified,
@@ -2371,6 +2371,14 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 );
                                 false
                             }
+                        });
+                        // The app opens on the workbench with keys on the
+                        // node tree, whatever took focus while the views
+                        // were being built.
+                        view.update(cx, |shell, cx| {
+                            shell
+                                .unified
+                                .update(cx, |unified, cx| unified.focus_tree(window, cx));
                         });
                         cx.new(|cx| Root::new(view, window, cx))
                     }
