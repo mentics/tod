@@ -371,6 +371,14 @@ styles:
     # against: rare, so it must stand out from every other row.
     extends: text-title
     color: incoming-text
+  node-title-linked-copy:
+    # A tree row copied out of a generator that still receives its source
+    # item's updates.
+    color: linked-copy-text
+  node-title-has-copies:
+    # A generator-managed row with a linked copy elsewhere: the copy's
+    # amber, faded as far as text-muted is from text.
+    color: linked-source-text
   scrim:
     background: scrim
 
@@ -473,6 +481,8 @@ tokens:
     callout-warning-edge: "#ef4444"
     callout-warning-text: "#fca5a5"
     incoming-text: "#facc15"
+    linked-copy-text: "#f59e0b"
+    linked-source-text: "#a06707"
     notice-fill: "#ffff00"
     notice-text: "#000000"
     badge-fill: "#262626"

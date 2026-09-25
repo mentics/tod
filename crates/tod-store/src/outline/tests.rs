@@ -1704,6 +1704,12 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
                 .find(|e| e.parent_id == Some(outside_parent))
                 .unwrap()
                 .node_id;
+            let rows = crate::outline::repos::TreeLoader::new(conn)
+                .flatten_visible(list_id)
+                .unwrap();
+            let row = |id| rows.iter().find(|r| r.node.id == id).unwrap();
+            assert!(row(managed_id).has_copies && !row(managed_id).linked_copy);
+            assert!(row(copy_id).linked_copy && !row(copy_id).has_copies);
             Ok(copy_id)
         })
         .unwrap();
@@ -1720,6 +1726,11 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
                 !gen_repo.is_greyed_out(managed_id).unwrap(),
                 "greyed-out state should clear immediately once the last copy is deleted"
             );
+            let rows = crate::outline::repos::TreeLoader::new(conn)
+                .flatten_visible(list_id)
+                .unwrap();
+            let original = rows.iter().find(|r| r.node.id == managed_id).unwrap();
+            assert!(!original.has_copies);
             Ok(())
         })
         .unwrap();

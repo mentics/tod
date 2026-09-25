@@ -631,8 +631,14 @@ impl ListDelegate for TaskListDelegate {
         } else {
             let title_color = if item.title.is_empty() {
                 muted_foreground
+            } else if item.has_copies {
+                // `styles.node-title-has-copies`
+                crate::ui::style::color::linked_source_text()
             } else if managed {
                 muted_foreground
+            } else if item.linked_copy {
+                // `styles.node-title-linked-copy`
+                crate::ui::style::color::linked_copy_text()
             } else {
                 foreground
             };

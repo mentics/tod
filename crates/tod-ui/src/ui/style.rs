@@ -87,6 +87,12 @@ pub mod color {
     pub fn incoming_text() -> Hsla {
         hex(0xfacc15ff)
     }
+    pub fn linked_copy_text() -> Hsla {
+        hex(0xf59e0bff)
+    }
+    pub fn linked_source_text() -> Hsla {
+        hex(0xa06707ff)
+    }
     pub fn callout_warning_fill() -> Hsla {
         hex(0x7f1d1d33)
     }

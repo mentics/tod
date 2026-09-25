@@ -53,6 +53,10 @@ struct TreeData {
     generator_status: HashMap<Uuid, (Option<String>, Option<String>)>,
     /// Generator node → quick-accept destination, when configured.
     accept_destinations: HashMap<Uuid, Uuid>,
+    /// External ids some non-managed node is a linked copy of — the rule
+    /// `GeneratorRepo::is_greyed_out` applies per node. Not scoped to the
+    /// list: a copy may live anywhere.
+    copied: HashSet<String>,
 }
 
 impl TreeData {
@@ -207,6 +211,21 @@ impl TreeData {
             let id_blob: Vec<u8> = row.get(0)?;
             generator_status.insert(blob_to_uuid_sql(&id_blob)?, (row.get(1)?, row.get(2)?));
         }
+        drop(rows);
+        drop(stmt);
+
+        let mut copied = HashSet::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT l.external_id
+             FROM managed_node_links l JOIN nodes n ON n.id = l.node_id
+             WHERE n.managed = 0",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            copied.insert(row.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
 
         Ok(Self {
             nodes,
@@ -219,6 +238,7 @@ impl TreeData {
             managed_counts,
             generator_status,
             accept_destinations,
+            copied,
         })
     }
 }
@@ -294,6 +314,8 @@ fn walk(
         let accept_ready = link
             .map(|(_, _, generator_node_id)| data.accept_destinations.contains_key(generator_node_id))
             .unwrap_or(false);
+        let linked_copy = !managed && data.links.contains_key(&entry.node_id);
+        let has_copies = link.is_some_and(|(external_id, _, _)| data.copied.contains(external_id));
         out.push(FlatNodeRow {
             node,
             depth,
@@ -312,6 +334,8 @@ fn walk(
             generator_status,
             generator_error,
             accept_ready,
+            linked_copy,
+            has_copies,
         });
         if !entry.collapsed {
             walk(by_parent, data, Some(entry.node_id), depth + 1, out);

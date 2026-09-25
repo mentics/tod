@@ -57,6 +57,11 @@ pub struct TaskItem {
     /// True for a managed ticket whose generator has a quick-accept
     /// destination configured — the Accept action is inert otherwise.
     pub accept_ready: bool,
+    /// True for a copied-out (non-managed) node still linked to its
+    /// data-source item.
+    pub linked_copy: bool,
+    /// True for a managed node that has at least one linked copy elsewhere.
+    pub has_copies: bool,
     /// Pending decisions waiting on the user for this node (fed by the
     /// host via `TaskListView::set_attention`; zero until it calls in).
     pub needs_you_count: usize,
@@ -642,6 +647,8 @@ mod tests {
             generator_status: None,
             generator_error: None,
             accept_ready: false,
+            linked_copy: false,
+            has_copies: false,
             needs_you_count: 0,
             waiting_since: None,
             status_override: None,
