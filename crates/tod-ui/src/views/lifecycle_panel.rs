@@ -1540,7 +1540,9 @@ impl Render for LifecyclePanelView {
                                         })),
                                 ),
                         )
-                        .when_some(node_id, |el, node_id| {
+                        .when_some(
+                            node_id.filter(|_| crate::ui::report_problem::is_available(cx)),
+                            |el, node_id| {
                             el.child(
                                 Button::new("lifecycle-panel-regression-report-problem")
                                     .label("Report a problem")
@@ -1557,7 +1559,8 @@ impl Render for LifecyclePanelView {
                                         );
                                     }),
                             )
-                        }),
+                            },
+                        ),
                 );
             }
 
@@ -1802,7 +1805,10 @@ impl Render for LifecyclePanelView {
                     window,
                     cx,
                 )));
-                if let Some(node_id) = self.node_id_for_stops() {
+                if let Some(node_id) = self
+                    .node_id_for_stops()
+                    .filter(|_| crate::ui::report_problem::is_available(cx))
+                {
                     body = body.child(
                         Button::new("lifecycle-panel-gate-error-report-problem")
                             .label("Report a problem")
