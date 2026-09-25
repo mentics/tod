@@ -95,13 +95,9 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
     }
     loaded.decisions_waiting = fleet
         .read(|conn| tod_core::attention::for_node(conn, node_id))
-        .map(|attention| {
-            attention
-                .items
-                .iter()
-                .filter(|item| item.kind == tod_core::attention::AttentionKind::Decision)
-                .count()
-        })
+        // Everything the Decisions panel lists for the node (blocked plan
+        // steps too), so the count matches the tree's "needs you" badge.
+        .map(|attention| attention.items.len())
         .unwrap_or(0);
     loaded
 }
