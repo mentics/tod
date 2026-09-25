@@ -585,6 +585,13 @@ impl UnifiedView {
                 self.columns.set_pinned(ix, true);
             }
         }
+        // `open_panel` -> `ColumnModel::open` already points `focused_index`
+        // at the Decisions column, but keyboard focus itself stays wherever
+        // it was (the tree, or another column) unless we move it: without
+        // this, the number keys that answer a decision do nothing until the
+        // user clicks the panel. Move it the same way `focus_left`/`focus_right`
+        // do, so the very next keypress lands on the panel Alt+Q just opened.
+        self.sync_window_focus(window, cx);
         cx.notify();
     }
 
@@ -1158,6 +1165,63 @@ mod tests {
         draw(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(view.columns.len(), before);
+        });
+    }
+
+    /// Alt+Q must move keyboard focus into the Decisions panel it opens —
+    /// not just point `ColumnModel::focused_index` at it — so the number
+    /// keys that answer the top pending decision work on the very next
+    /// keypress with no click in between (the bug this closes: focus stayed
+    /// on the tree after Alt+Q).
+    #[gpui::test]
+    fn alt_q_focuses_the_decisions_panel(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id;
+        ask_decision(&fixture, node_id, "Focus me?");
+        let (view, cx) = open_view(&fixture, cx);
+        load_attention(&view, cx);
+
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+
+        let decisions_focus = view.read_with(cx, |view, cx| {
+            let ix = view
+                .columns
+                .columns()
+                .iter()
+                .position(|c| c.panel == PanelKind::Decisions)
+                .expect("decisions column opened");
+            view.hosted[ix].panel.focus_handle(cx)
+        });
+        cx.update(|window, _| {
+            assert!(
+                decisions_focus.is_focused(window),
+                "Alt+Q should focus the Decisions panel so the next keypress can answer it"
+            );
+        });
+
+        // Pressing Alt+Q again while focus is already in the Decisions panel
+        // must still work (repeat presses from inside the panel): the
+        // singleton retarget reconstructs the panel entity (`open_panel`),
+        // so re-fetch its (now different) focus handle rather than reusing
+        // the one from before, and check that one is focused.
+        view.update_in(cx, |view, window, cx| {
+            view.next_waiting(&UnifiedNextWaiting, window, cx);
+        });
+        draw(cx);
+        let decisions_focus_again = view.read_with(cx, |view, cx| {
+            let ix = view
+                .columns
+                .columns()
+                .iter()
+                .position(|c| c.panel == PanelKind::Decisions)
+                .expect("decisions column still open");
+            view.hosted[ix].panel.focus_handle(cx)
+        });
+        cx.update(|window, _| {
+            assert!(decisions_focus_again.is_focused(window));
         });
     }
 }

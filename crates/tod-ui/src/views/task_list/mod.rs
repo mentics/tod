@@ -1678,6 +1678,15 @@ impl TaskListView {
     }
 
     /// Load the active list's rows, with the draft row spliced in where it will be created.
+    ///
+    /// `load_tasks_from_store` reads fresh rows straight from the outline
+    /// store, which knows nothing about `set_attention`'s "needs you" data —
+    /// every freshly loaded row starts at zero. Re-apply the last attention
+    /// map we were given so a reload (a live-refresh triggered by any store
+    /// change, not just an attention change) never wipes the "needs you"
+    /// badge out from under a node that is still waiting: it would otherwise
+    /// flicker off here and only come back once the next attention poll
+    /// lands.
     fn reload_all_tasks(&mut self) {
         let mut tasks = load_tasks_from_store(&self.fleet, self.active_list_id);
         if let Some(draft) = &self.draft {
@@ -1685,7 +1694,25 @@ impl TaskListView {
                 edit::insert_draft_row(&mut tasks, draft);
             }
         }
+        Self::apply_attention_map(&mut tasks, &self.attention);
         self.all_tasks = tasks;
+    }
+
+    /// Stamp `needs_you_count` / `waiting_since` from `map` onto `tasks`,
+    /// leaving nodes absent from `map` at zero. The shared core of
+    /// `set_attention` and `reload_all_tasks`'s re-application of it.
+    fn apply_attention_map(
+        tasks: &mut [TaskItem],
+        map: &std::collections::HashMap<String, Attention>,
+    ) {
+        for task in tasks.iter_mut() {
+            let (count, waiting_since) = map
+                .get(&task.id)
+                .map(|a| (a.count, Some(a.waiting_since)))
+                .unwrap_or((0, None));
+            task.needs_you_count = count;
+            task.waiting_since = waiting_since;
+        }
     }
 
     /// Apply a reload that the change watcher read off the UI thread.
@@ -1712,15 +1739,17 @@ impl TaskListView {
             self.request_live_refresh(cx);
             return;
         }
-        if snapshot.tasks == self.all_tasks {
+        let mut tasks = snapshot.tasks;
+        Self::apply_attention_map(&mut tasks, &self.attention);
+        if tasks == self.all_tasks {
             return;
         }
-        let visible = Self::visible_tasks(&snapshot.tasks, &self.search_query, &self.working_set);
+        let visible = Self::visible_tasks(&tasks, &self.search_query, &self.working_set);
         if !same_visible_rows(self.list_state.read(cx).delegate().items(), &visible) {
             self.request_live_refresh(cx);
             return;
         }
-        self.all_tasks = snapshot.tasks;
+        self.all_tasks = tasks;
         self.list_state.update(cx, |state, cx| {
             state.delegate_mut().set_items(visible);
             cx.notify();
@@ -2603,12 +2632,11 @@ impl TaskListView {
                 .map(|a| (a.count, Some(a.waiting_since)))
                 .unwrap_or((0, None));
             if task.needs_you_count != count || task.waiting_since != waiting_since {
-                task.needs_you_count = count;
-                task.waiting_since = waiting_since;
                 changed = true;
             }
         }
         self.attention = map;
+        Self::apply_attention_map(&mut self.all_tasks, &self.attention);
         if changed {
             self.pending_attention_apply = true;
         }
@@ -3612,6 +3640,51 @@ mod tests {
         view.read_with(cx, |view, cx| {
             let visible = view.list_state.read(cx).delegate().items();
             assert!(visible.iter().any(|t| t.id == node_id));
+        });
+    }
+
+    /// A store-change-triggered reload (`refresh` -> `live_refresh` ->
+    /// `reload_all_tasks`) reads rows straight from the outline store, which
+    /// knows nothing about `set_attention`'s "needs you" data. Regression
+    /// test for a bug where any such reload — triggered by any store change,
+    /// not just an attention change — silently wiped the badge back to zero
+    /// until the next attention poll happened to land, showing as a flicker
+    /// in the unified view's tree.
+    #[gpui::test]
+    fn refresh_after_set_attention_keeps_the_badge(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let node_id = fixture.node_id.to_string();
+        let (view, _events, cx) = open_view(&fixture, cx);
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            node_id.clone(),
+            Attention {
+                count: 1,
+                waiting_since: Utc::now(),
+            },
+        );
+        view.update(cx, |view, cx| {
+            view.set_attention(map, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let task = view.all_tasks.iter().find(|t| t.id == node_id).unwrap();
+            assert_eq!(task.needs_you_count, 1);
+        });
+
+        // Any store change reruns `live_refresh`/`reload_all_tasks`, unrelated
+        // to attention — the badge must survive it.
+        view.update_in(cx, |view, window, cx| {
+            view.refresh(window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            let task = view.all_tasks.iter().find(|t| t.id == node_id).unwrap();
+            assert_eq!(
+                task.needs_you_count, 1,
+                "a reload triggered by an unrelated store change must not clear the \"needs you\" badge"
+            );
+            assert!(task.waiting_since.is_some());
         });
     }
 
