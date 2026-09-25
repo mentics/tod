@@ -96,6 +96,12 @@ pub mod color {
     pub fn divider_strong() -> Hsla {
         hex(0xa3a3a380)
     }
+    pub fn header_fill() -> Hsla {
+        hex(0xffffff08)
+    }
+    pub fn header_fill_focused() -> Hsla {
+        hex(0x1d4ed814)
+    }
     pub fn group_band() -> Hsla {
         hex(0x26262680)
     }
@@ -454,9 +460,20 @@ pub fn pane_divider<E: Styled>(el: E, dragging: bool) -> E {
     }
 }
 
+/// `styles.header`: the band behind every header, blue in the
+/// `header-focused` state while `focused`.
+pub fn header<E: Styled>(el: E, focused: bool) -> E {
+    el.bg(if focused {
+        color::header_fill_focused()
+    } else {
+        color::header_fill()
+    })
+}
+
 /// `styles.panel-header`.
 pub fn panel_header<E: Styled>(el: E) -> E {
-    el.px(space::INSET)
+    header(el, false)
+        .px(space::INSET)
         .py(space::RELATED)
         .gap(space::RELATED)
         .border_b(size::BORDER)

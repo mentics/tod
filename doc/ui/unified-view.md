@@ -125,7 +125,12 @@ Freeform conversation with the agent lives in a drawer at the bottom of
 column 1, under the node tree.
 
 - Collapsed, it is a small **Chat** tab at the bottom. Clicking the tab expands
-  it upward. Clicking its header collapses it again.
+  it upward. Expanded, it has one header line ("Chat — {about}" and a
+  collapse chevron); clicking anywhere on it collapses the drawer again.
+- Its top edge is a thick line that drags to make the drawer taller or
+  shorter. The height is kept across restarts, beside the column widths.
+- While it has focus, its header takes the focused-column tint and its top
+  edge the accent color, and no column header shows the tint.
 - Expanding it pushes the node tree up; nothing is hidden behind it. For now
   it sits under column 1 only, and collapses independently of everything
   else.

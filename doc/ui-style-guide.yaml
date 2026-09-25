@@ -133,7 +133,15 @@ styles:
   # Panels
   panel:
     background: surface
+  # Every header (a panel's, a workbench column's, the chat drawer's) sits
+  # on a faint gray band, so it reads as a header. One that tracks focus
+  # turns the band blue while its region has focus; only one header in a
+  # window shows the focused band at a time.
+  header:
+    background: header-fill
+    focused: header-focused
   panel-header:
+    extends: header
     padding-x: inset
     padding-y: related
     gap: related
@@ -372,6 +380,8 @@ states:
     border: highlight-edge
   dragging:
     background: drag-edge
+  header-focused:
+    background: header-fill-focused
   disabled:
     color: text-muted
   toggle-on:
@@ -419,6 +429,7 @@ properties:
   selected: state
   font-weight: "regular | semibold"
   dragging: state
+  focused: state
 
 tokens:
   color:
@@ -462,6 +473,10 @@ tokens:
     # A group heading's rule, and the band behind an outermost heading.
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
+    # A header's band, and the band of the header whose region has focus;
+    # about equally faint, gray and blue.
+    header-fill: "#ffffff08"
+    header-fill-focused: "#1d4ed814"
     highlight-edge: "#1d4ed8"
     toggle-on-fill: "#1d4ed8"
     toggle-on-edge: "#93c5fd"
