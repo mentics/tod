@@ -281,7 +281,7 @@ impl ListDelegate for TaskListDelegate {
                     ),
             );
         }
-        if managed && self.recently_updated.contains(&item.id) {
+        if item.linked_copy && self.recently_updated.contains(&item.id) {
             chips = chips.child(
                 div()
                     .size(px(6.0))

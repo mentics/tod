@@ -1668,16 +1668,11 @@ fn editing_body_on_linked_node_marks_it_dirty_independently_of_title() {
 #[test]
 fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
     let (store, root, list_id) = setup_store_with_list();
-    let (_generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);
+    let (generator_id, managed_id, _child_id) = setup_generator_with_managed_tree(&store, list_id);
     let outside_parent = create_node_in(&store, list_id, None, "Outside");
 
-    store
-        .read(|conn| {
-            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(!gen_repo.is_greyed_out(managed_id).unwrap());
-            Ok(())
-        })
-        .unwrap();
+    assert!(!tree_row(&store, list_id, managed_id).has_copies);
+    let managed_count = tree_row(&store, list_id, generator_id).managed_count;
 
     store
         .enqueue_outline(OutlineMutation::PasteManagedNodeCopy {
@@ -1691,11 +1686,6 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
 
     let copy_id = store
         .read(|conn| {
-            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(
-                gen_repo.is_greyed_out(managed_id).unwrap(),
-                "original should grey out once a copy exists"
-            );
             let outline = crate::outline::repos::OutlineRepo::new(conn);
             let copy_id = outline
                 .list_for_list(list_id)
@@ -1704,36 +1694,31 @@ fn copying_out_a_managed_node_greys_out_the_original_and_clears_on_delete() {
                 .find(|e| e.parent_id == Some(outside_parent))
                 .unwrap()
                 .node_id;
-            let rows = crate::outline::repos::TreeLoader::new(conn)
-                .flatten_visible(list_id)
-                .unwrap();
-            let row = |id| rows.iter().find(|r| r.node.id == id).unwrap();
-            assert!(row(managed_id).has_copies && !row(managed_id).linked_copy);
-            assert!(row(copy_id).linked_copy && !row(copy_id).has_copies);
             Ok(copy_id)
         })
         .unwrap();
+    let original = tree_row(&store, list_id, managed_id);
+    assert!(
+        original.has_copies && !original.linked_copy,
+        "original should show as copied once a copy exists"
+    );
+    let copy = tree_row(&store, list_id, copy_id);
+    assert!(copy.linked_copy && !copy.has_copies);
+    assert_eq!(
+        tree_row(&store, list_id, generator_id).managed_count,
+        managed_count,
+        "a copied-out node is not counted as one the generator manages"
+    );
 
     store
         .enqueue_outline(OutlineMutation::DeleteNode { node_id: copy_id })
         .unwrap();
     store.writer().flush().unwrap();
 
-    store
-        .read(|conn| {
-            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(
-                !gen_repo.is_greyed_out(managed_id).unwrap(),
-                "greyed-out state should clear immediately once the last copy is deleted"
-            );
-            let rows = crate::outline::repos::TreeLoader::new(conn)
-                .flatten_visible(list_id)
-                .unwrap();
-            let original = rows.iter().find(|r| r.node.id == managed_id).unwrap();
-            assert!(!original.has_copies);
-            Ok(())
-        })
-        .unwrap();
+    assert!(
+        !tree_row(&store, list_id, managed_id).has_copies,
+        "copied state should clear immediately once the last copy is deleted"
+    );
 
     drop(store);
     let _ = fs::remove_dir_all(root);
@@ -1760,14 +1745,13 @@ fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
         .unwrap();
     store.writer().flush().unwrap();
 
+    assert!(tree_row(&store, list_id, managed_a).has_copies);
+    assert!(
+        tree_row(&store, list_id, managed_b).has_copies,
+        "sibling generator sharing the external id also shows as copied"
+    );
     let copy_id = store
         .read(|conn| {
-            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(gen_repo.is_greyed_out(managed_a).unwrap());
-            assert!(
-                gen_repo.is_greyed_out(managed_b).unwrap(),
-                "sibling generator sharing the external id also greys out"
-            );
             let outline = crate::outline::repos::OutlineRepo::new(conn);
             let copy_id = outline
                 .list_for_list(list_id)
@@ -1785,17 +1769,21 @@ fn two_generators_sharing_an_external_id_both_grey_out_when_one_is_copied() {
         .unwrap();
     store.writer().flush().unwrap();
 
-    store
-        .read(|conn| {
-            let gen_repo = crate::outline::repos::GeneratorRepo::new(conn);
-            assert!(!gen_repo.is_greyed_out(managed_a).unwrap());
-            assert!(!gen_repo.is_greyed_out(managed_b).unwrap());
-            Ok(())
-        })
-        .unwrap();
+    assert!(!tree_row(&store, list_id, managed_a).has_copies);
+    assert!(!tree_row(&store, list_id, managed_b).has_copies);
 
     drop(store);
     let _ = fs::remove_dir_all(root);
+}
+
+/// The flattened tree row for `node_id`, which must be visible.
+fn tree_row(store: &FleetStore, list_id: Uuid, node_id: Uuid) -> crate::outline::FlatNodeRow {
+    store
+        .flatten_outline(list_id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.node.id == node_id)
+        .expect("row visible in the flattened tree")
 }
 
 #[test]
@@ -1921,14 +1909,13 @@ fn generator_state_survives_store_restart() {
             );
             assert!(!gen_repo.is_managed(copy_id).unwrap());
 
-            assert!(
-                gen_repo.is_greyed_out(managed_id).unwrap(),
-                "greyed-out state must be recomputed correctly on startup from persisted links"
-            );
-
             Ok(())
         })
         .unwrap();
+    assert!(
+        tree_row(&store, list_id, managed_id).has_copies,
+        "copied state must be recomputed correctly on startup from persisted links"
+    );
 
     drop(store);
     let _ = fs::remove_dir_all(root);
