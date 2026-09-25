@@ -1446,6 +1446,26 @@ fn unsure_flags_live_on_the_change_set() {
 }
 
 #[test]
+fn latest_conversation_for_entity_finds_the_conversation_that_last_changed_it() {
+    let fx = setup();
+    let o = add_obligation(&fx.conn, fx.n1, "Original.");
+    let repo = ConversationRepo::new(&fx.conn);
+
+    // Nothing has changed it through a conversation yet.
+    assert_eq!(repo.latest_conversation_for_entity(o).unwrap(), None);
+
+    fx.agent(M::UpdateObligationBody {
+        obligation_id: o,
+        body: "Agent.".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        repo.latest_conversation_for_entity(o).unwrap(),
+        Some(fx.conv)
+    );
+}
+
+#[test]
 fn agent_writes_record_one_conversation_action_and_other_actors_record_outside_it() {
     let fx = setup();
     let o = add_obligation(&fx.conn, fx.n1, "Original.");

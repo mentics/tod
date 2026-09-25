@@ -385,17 +385,27 @@ impl UnifiedView {
                 let panel = cx.new(|cx| {
                     panels::obligations::ObligationsPanel::new(id, self.fleet.clone(), window, cx)
                 });
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
                 HostedColumn {
                     panel: HostedPanel::Obligations(panel),
-                    _subscription: None,
+                    _subscription: Some(subscription),
                 }
             }
             PanelKind::Plan(id) => {
                 let panel =
                     cx.new(|cx| panels::plan::PlanPanel::new(id, self.fleet.clone(), window, cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
                 HostedColumn {
                     panel: HostedPanel::Plan(panel),
-                    _subscription: None,
+                    _subscription: Some(subscription),
                 }
             }
             PanelKind::Findings(id) => {

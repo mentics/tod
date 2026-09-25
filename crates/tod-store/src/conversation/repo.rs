@@ -459,6 +459,21 @@ impl<'a> ConversationRepo<'a> {
             .transpose()
     }
 
+    /// The most recent conversation whose recorded actions changed
+    /// `entity_id` — what `E` on that item's row opens as its transcript.
+    pub fn latest_conversation_for_entity(&self, entity_id: Uuid) -> Result<Option<Uuid>> {
+        let blob: Option<Option<Vec<u8>>> = self
+            .conn
+            .query_row(
+                "SELECT conversation_id FROM conversation_actions
+                 WHERE entity_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![uuid_to_blob(entity_id)],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        blob.flatten().map(|blob| blob_to_uuid_sql(&blob)).transpose().map_err(Into::into)
+    }
+
     /// Unsure flags, keyed by item.
     pub fn flags(&self, conversation_id: Uuid) -> Result<HashMap<(Entity, Uuid), String>> {
         let mut stmt = self.conn.prepare(
