@@ -35,6 +35,7 @@ pub(super) fn build(
         labels.push("Obligations (O)".to_string());
     }
     labels.push("Plan (P)".to_string());
+    labels.push("Settings".to_string());
     if task.is_work_node && !task.lifecycle.is_empty() {
         labels.push("Lifecycle (L)".to_string());
     }
@@ -82,6 +83,14 @@ pub(super) fn build(
         task_id.clone(),
         presented.clone(),
         |this, id, window, cx| this.open_plan_panel(&id, window, cx),
+    ));
+
+    menu = menu.item(entry(
+        "Settings",
+        view.clone(),
+        task_id.clone(),
+        presented.clone(),
+        |this, id, window, cx| this.open_settings_panel(&id, window, cx),
     ));
 
     if task.is_work_node && !task.lifecycle.is_empty() {

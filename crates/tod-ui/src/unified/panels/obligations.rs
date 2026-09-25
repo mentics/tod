@@ -22,17 +22,19 @@ use crate::views::obligations::ObligationsView;
 
 const OBLIGATIONS_PANEL_CONTEXT: &str = "UnifiedObligationsPanel";
 
-actions!(unified_obligations_panel, [ObligationsPanelOpenTranscript]);
+actions!(
+    unified_obligations_panel,
+    [ObligationsPanelOpenTranscript, ObligationsPanelOpenTranscriptCtrl]
+);
 
 /// Register this panel's own keys, alongside every other
 /// `register_*_keyboard_bindings`.
 pub fn register_obligations_panel_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(OBLIGATIONS_PANEL_CONTEXT));
-    cx.bind_keys([KeyBinding::new(
-        "e",
-        ObligationsPanelOpenTranscript,
-        context,
-    )]);
+    cx.bind_keys([
+        KeyBinding::new("e", ObligationsPanelOpenTranscript, context),
+        KeyBinding::new("ctrl-e", ObligationsPanelOpenTranscriptCtrl, context),
+    ]);
 }
 
 fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
@@ -112,6 +114,21 @@ impl ObligationsPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_transcript(false, cx);
+    }
+
+    /// Ctrl+E: the same, opened as a Ctrl+click would (beside this column,
+    /// not replacing it).
+    fn on_open_transcript_ctrl(
+        &mut self,
+        _: &ObligationsPanelOpenTranscriptCtrl,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transcript(true, cx);
+    }
+
+    fn open_transcript(&mut self, ctrl: bool, cx: &mut Context<Self>) {
         let Some(obligation_id) = self.inner.read(cx).selected_obligation_id() else {
             return;
         };
@@ -123,7 +140,7 @@ impl ObligationsPanel {
         };
         cx.emit(PanelOpenRequest {
             target: PanelKind::Transcript(conversation_id),
-            ctrl: false,
+            ctrl,
         });
     }
 }
@@ -163,6 +180,7 @@ impl Render for ObligationsPanel {
             .key_context(OBLIGATIONS_PANEL_CONTEXT)
             .size_full()
             .on_action(cx.listener(Self::on_open_transcript))
+            .on_action(cx.listener(Self::on_open_transcript_ctrl))
             .child(self.inner.clone())
     }
 }

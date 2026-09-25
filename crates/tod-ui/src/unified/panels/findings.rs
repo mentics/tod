@@ -38,7 +38,10 @@ use uuid::Uuid;
 
 const FINDINGS_CONTEXT: &str = "UnifiedFindings";
 
-actions!(unified_findings, [FindingsOpenTranscript, FindingsStatusMenu]);
+actions!(
+    unified_findings,
+    [FindingsOpenTranscript, FindingsOpenTranscriptCtrl, FindingsStatusMenu]
+);
 
 /// Register the findings panel's own keys, alongside every other
 /// `register_*_keyboard_bindings`.
@@ -50,6 +53,7 @@ pub fn register_findings_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(FINDINGS_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("e", FindingsOpenTranscript, context),
+        KeyBinding::new("ctrl-e", FindingsOpenTranscriptCtrl, context),
         KeyBinding::new("t", FindingsStatusMenu, context),
     ]);
 }
@@ -312,13 +316,28 @@ impl FindingsPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_transcript(false, cx);
+    }
+
+    /// Ctrl+E: the same, opened as a Ctrl+click would (beside this column,
+    /// not replacing it).
+    fn on_open_transcript_ctrl(
+        &mut self,
+        _: &FindingsOpenTranscriptCtrl,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transcript(true, cx);
+    }
+
+    fn open_transcript(&mut self, ctrl: bool, cx: &mut Context<Self>) {
         let Some(conversation_id) = self.selected_finding().and_then(|f| f.conversation_id)
         else {
             return;
         };
         cx.emit(PanelOpenRequest {
             target: PanelKind::Transcript(conversation_id),
-            ctrl: false,
+            ctrl,
         });
     }
 }
@@ -442,6 +461,7 @@ impl Render for FindingsPanel {
             .on_action(cx.listener(|_, _: &PaneFocusLeft, _, cx| cx.propagate()))
             .on_action(cx.listener(Self::on_status_menu))
             .on_action(cx.listener(Self::on_open_transcript))
+            .on_action(cx.listener(Self::on_open_transcript_ctrl))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
             .on_action(cx.listener(Self::on_page_up))

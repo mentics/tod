@@ -118,7 +118,15 @@ impl HostedPanel {
 }
 pub use chat_drawer::register_chat_drawer_keyboard_bindings;
 
-actions!(unified, [UnifiedTogglePinFocused, UnifiedNextWaiting, UnifiedPrevWaiting]);
+actions!(
+    unified,
+    [
+        UnifiedTogglePinFocused,
+        UnifiedNextWaiting,
+        UnifiedPrevWaiting,
+        UnifiedCloseFocusedColumn
+    ]
+);
 
 pub const UNIFIED_CONTEXT: &str = "Unified";
 
@@ -134,6 +142,7 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("alt-w", UnifiedTogglePinFocused, context),
         KeyBinding::new("alt-q", UnifiedNextWaiting, context),
         KeyBinding::new("alt-shift-q", UnifiedPrevWaiting, context),
+        KeyBinding::new("ctrl-w", UnifiedCloseFocusedColumn, context),
     ]);
     let panel_context = Some(key_context::excluding_input(panel::UNIFIED_PANEL_CONTEXT));
     cx.bind_keys([
@@ -317,6 +326,11 @@ impl UnifiedView {
                     self.open_panel(PanelKind::Details(id), 0, false, window, cx);
                 }
             }
+            TaskListEvent::OpenTaskEditCtrl { task_id } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.open_panel(PanelKind::Details(id), 0, true, window, cx);
+                }
+            }
             TaskListEvent::OpenObligations { task_id, .. } => {
                 if let Ok(id) = Uuid::parse_str(task_id) {
                     self.open_panel(PanelKind::Obligations(id), 0, false, window, cx);
@@ -331,6 +345,11 @@ impl UnifiedView {
                 if let Ok(id) = Uuid::parse_str(task_id) {
                     self.sync_decisions_node(Some(id), window, cx);
                     self.open_panel(PanelKind::Decisions, 0, false, window, cx);
+                }
+            }
+            TaskListEvent::OpenSettings { task_id } => {
+                if let Ok(id) = Uuid::parse_str(task_id) {
+                    self.open_panel(PanelKind::Settings(id), 0, false, window, cx);
                 }
             }
             _ => {}
@@ -549,6 +568,23 @@ impl UnifiedView {
         self.hosted.remove(index);
         self.columns.close(index);
         cx.notify();
+    }
+
+    /// Ctrl+W: close the focused column (never column 1, the node tree,
+    /// which has no `focused_index` of its own). Focus then follows
+    /// `ColumnModel::close`'s neighbor rule (`doc/ui/unified-view.md`
+    /// "Keys").
+    fn close_focused_column(
+        &mut self,
+        _: &UnifiedCloseFocusedColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.columns.focused_index() else {
+            return;
+        };
+        self.close_column(ix, cx);
+        self.sync_window_focus(window, cx);
     }
 
     fn toggle_pin_focused(&mut self, _: &UnifiedTogglePinFocused, _: &mut Window, cx: &mut Context<Self>) {
@@ -811,6 +847,7 @@ impl Render for UnifiedView {
             .on_action(cx.listener(Self::prev_waiting))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
+            .on_action(cx.listener(Self::close_focused_column))
             .size_full()
             .flex()
             .child(tree_column)
@@ -1236,6 +1273,108 @@ mod tests {
         draw(cx);
         view.read_with(cx, |view, _| {
             assert_eq!(view.columns.len(), before);
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_w_closes_the_focused_column_and_not_the_tree(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.open_panel(PanelKind::Obligations(node_id), 1, true, window, cx);
+        });
+        draw(cx);
+        // The second open() appended and focused a new column.
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), 2);
+            assert_eq!(view.columns.focused_index(), Some(1));
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.close_focused_column(&UnifiedCloseFocusedColumn, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), 1);
+            assert_eq!(
+                view.columns.columns()[0].panel,
+                PanelKind::Details(node_id)
+            );
+            assert_eq!(view.columns.focused_index(), Some(0));
+        });
+
+        // Focus the node tree (column 1) directly, then Ctrl+W must be a
+        // no-op: there is no focused column-2+ index to close.
+        view.update_in(cx, |view, window, cx| {
+            view.columns.focus_left();
+            view.close_focused_column(&UnifiedCloseFocusedColumn, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), 1);
+            assert_eq!(view.columns.focused_index(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn ctrl_e_from_a_panel_opens_in_the_next_column_leaving_the_current_one(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+        let conversation_id = Uuid::new_v4();
+
+        view.update_in(cx, |view, window, cx| {
+            // Column 2 (index 0) holds Details, focused.
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            // A Ctrl+E from that same column (as `route_open_request` would
+            // dispatch, using the panel's own column as `from_column`) opens
+            // strictly after it rather than replacing it.
+            view.open_panel(PanelKind::Transcript(conversation_id), 0, true, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), 2);
+            assert_eq!(
+                view.columns.columns()[0].panel,
+                PanelKind::Details(node_id)
+            );
+            assert_eq!(
+                view.columns.columns()[1].panel,
+                PanelKind::Transcript(conversation_id)
+            );
+            assert_eq!(view.columns.focused_index(), Some(1));
+        });
+    }
+
+    #[gpui::test]
+    fn tree_menu_obligations_entry_opens_an_obligations_panel(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        // The right-click menu's "Obligations" entry calls
+        // `TaskListView::open_obligations_panel` (`context_menu.rs`), which
+        // the unified root maps to `PanelKind::Obligations`
+        // (`on_task_list_event`).
+        view.update_in(cx, |view, window, cx| {
+            view.task_list.update(cx, |task_list, cx| {
+                task_list.open_obligations_panel(&node_id.to_string(), window, cx);
+            });
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.columns.len(), 1);
+            assert_eq!(
+                view.columns.columns()[0].panel,
+                PanelKind::Obligations(node_id)
+            );
         });
     }
 }

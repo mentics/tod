@@ -68,6 +68,7 @@ actions!(
         TaskListRowLifecycle,
         TaskListRowEdit,
         TaskListOpenEditPanel,
+        TaskListOpenEditPanelCtrl,
         TaskListOpenObligations,
         TaskListOpenPlan,
         TaskListTag1,
@@ -132,6 +133,11 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("o", TaskListOpenObligations, context),
         KeyBinding::new("p", TaskListOpenPlan, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
+        // Unified view only: Ctrl+E opens the item's panel as a Ctrl+click
+        // would, beside the current column rather than replacing it
+        // (`doc/ui/unified-view.md` "Keys"). The plain Tasks view has no
+        // columns, so it treats this the same as `e`.
+        KeyBinding::new("ctrl-e", TaskListOpenEditPanelCtrl, context),
         KeyBinding::new("f2", TaskListRowEdit, context),
         KeyBinding::new("1", TaskListTag1, context),
         KeyBinding::new("2", TaskListTag2, context),
@@ -266,6 +272,19 @@ pub enum TaskListEvent {
     /// row. The host decides what "open" means (the unified view's
     /// decisions panel); the existing Tasks view may ignore it.
     OpenDecisions {
+        task_id: String,
+    },
+    /// Right-click menu's "Settings" entry: the unified view's settings
+    /// panel (`PanelKind::Settings`, `TaskEditView` hosted). The existing
+    /// Tasks view treats this the same as `OpenTaskEdit`, since its own
+    /// edit drawer already hosts `TaskEditView`.
+    OpenSettings {
+        task_id: String,
+    },
+    /// Ctrl+E on a tree row: open its Details panel as a Ctrl+click would
+    /// (`doc/ui/unified-view.md` "Keys"). The existing Tasks view treats
+    /// this the same as `OpenTaskEdit`, since it has no columns.
+    OpenTaskEditCtrl {
         task_id: String,
     },
 }
@@ -1520,6 +1539,25 @@ impl TaskListView {
         cx.notify();
     }
 
+    /// Right-click menu's "Settings" entry.
+    pub fn open_settings_panel(
+        &mut self,
+        task_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
+            return;
+        };
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::OpenSettings {
+            task_id: task_id.to_string(),
+        });
+        self.set_status_line(format!("Settings: {}", task.title), cx);
+        self.bump_interaction(task_id, window, cx);
+        cx.notify();
+    }
+
     pub fn open_plan_panel(&mut self, task_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
             return;
@@ -2560,6 +2598,40 @@ impl TaskListView {
         self.open_task_edit_panel(&task_id, window, cx);
     }
 
+    fn on_open_edit_panel_ctrl(
+        &mut self,
+        _: &TaskListOpenEditPanelCtrl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task_id) = self
+            .working_set
+            .selected_id
+            .clone()
+            .or_else(|| self.selected_task(cx).map(|t| t.id))
+        else {
+            return;
+        };
+        if self.is_draft_id(&task_id) {
+            return;
+        }
+        let Some(title) = self
+            .all_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.title.clone())
+        else {
+            return;
+        };
+        self.close_chrome_overlays(cx);
+        cx.emit(TaskListEvent::OpenTaskEditCtrl {
+            task_id: task_id.clone(),
+        });
+        self.set_status_line(format!("Edit: {title}"), cx);
+        self.bump_interaction(&task_id, window, cx);
+        cx.notify();
+    }
+
     fn on_open_obligations(
         &mut self,
         _: &TaskListOpenObligations,
@@ -3425,6 +3497,7 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_open_external))
             .on_action(cx.listener(Self::on_row_edit))
             .on_action(cx.listener(Self::on_open_edit_panel))
+            .on_action(cx.listener(Self::on_open_edit_panel_ctrl))
             .on_action(cx.listener(Self::on_open_obligations))
             .on_action(cx.listener(Self::on_open_plan))
             .on_action(cx.listener(Self::on_tag1))
