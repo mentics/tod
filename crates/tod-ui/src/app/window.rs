@@ -1932,7 +1932,8 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                                 cx,
                                             );
                                         }
-                                        TaskListEvent::OpenTaskEdit { task_id } => {
+                                        TaskListEvent::OpenTaskEdit { task_id }
+                                        | TaskListEvent::OpenTaskEditCtrl { task_id } => {
                                             this.queue_drawer(
                                                 DrawerRequest::OpenTaskEdit {
                                                     task_id: task_id.clone(),
@@ -2005,6 +2006,16 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         // The unified view (W12) will map this to its
                                         // decisions panel; the Tasks view has none yet.
                                         TaskListEvent::OpenDecisions { .. } => {}
+                                        // The unified view's settings panel hosts the
+                                        // same `TaskEditView` this drawer already does.
+                                        TaskListEvent::OpenSettings { task_id } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenTaskEdit {
+                                                    task_id: task_id.clone(),
+                                                },
+                                                cx,
+                                            );
+                                        }
                                     }
                                 });
                             let _task_edit_subscription =

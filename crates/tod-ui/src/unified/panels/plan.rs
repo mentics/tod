@@ -22,13 +22,16 @@ use crate::views::plan_steps::PlanStepsView;
 
 const PLAN_PANEL_CONTEXT: &str = "UnifiedPlanPanel";
 
-actions!(unified_plan_panel, [PlanPanelOpenTranscript]);
+actions!(unified_plan_panel, [PlanPanelOpenTranscript, PlanPanelOpenTranscriptCtrl]);
 
 /// Register this panel's own keys, alongside every other
 /// `register_*_keyboard_bindings`.
 pub fn register_plan_panel_keyboard_bindings(cx: &mut App) {
     let context = Some(key_context::excluding_input(PLAN_PANEL_CONTEXT));
-    cx.bind_keys([KeyBinding::new("e", PlanPanelOpenTranscript, context)]);
+    cx.bind_keys([
+        KeyBinding::new("e", PlanPanelOpenTranscript, context),
+        KeyBinding::new("ctrl-e", PlanPanelOpenTranscriptCtrl, context),
+    ]);
 }
 
 fn node_title(fleet: &FleetStore, node_id: Uuid) -> String {
@@ -89,6 +92,21 @@ impl PlanPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_transcript(false, cx);
+    }
+
+    /// Ctrl+E: the same, opened as a Ctrl+click would (beside this column,
+    /// not replacing it).
+    fn on_open_transcript_ctrl(
+        &mut self,
+        _: &PlanPanelOpenTranscriptCtrl,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transcript(true, cx);
+    }
+
+    fn open_transcript(&mut self, ctrl: bool, cx: &mut Context<Self>) {
         let Some(step_id) = self.inner.read(cx).selected_id() else {
             return;
         };
@@ -100,7 +118,7 @@ impl PlanPanel {
         };
         cx.emit(PanelOpenRequest {
             target: PanelKind::Transcript(conversation_id),
-            ctrl: false,
+            ctrl,
         });
     }
 }
@@ -129,6 +147,7 @@ impl Render for PlanPanel {
             .key_context(PLAN_PANEL_CONTEXT)
             .size_full()
             .on_action(cx.listener(Self::on_open_transcript))
+            .on_action(cx.listener(Self::on_open_transcript_ctrl))
             .child(self.inner.clone())
     }
 }
