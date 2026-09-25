@@ -311,10 +311,19 @@ fn spawn_windows_terminal(
     ));
     Command::new(program)
         .env("TOD_TERMINAL_BACKEND", backend)
-        .args(args)
+        .args(args.iter().map(|arg| escape_wt_delimiters(arg)))
         .spawn()
         .map(|_| ())
         .with_context(|| format!("spawn Windows Terminal `{program}` in {}", cwd.display()))
+}
+
+/// `arg` with each `;` escaped as `\;`: Windows Terminal splits its command
+/// line into subcommands at a bare `;`, even inside a quoted argument, so a
+/// startup command of several statements would otherwise run only up to its
+/// first `;`, and `wt` would try to launch the rest as a program.
+#[cfg(any(windows, test))]
+fn escape_wt_delimiters(arg: &str) -> String {
+    arg.replace(';', r"\;")
 }
 
 #[cfg(windows)]
@@ -1245,6 +1254,15 @@ mod tests {
              $env:TOD_INTERVIEW_ACTOR = 'conversation:it''s'; claude --resume abc"
         );
         assert_eq!(posix_startup(&[], None, "claude"), "claude");
+    }
+
+    #[test]
+    fn windows_terminal_arguments_keep_their_semicolons() {
+        assert_eq!(
+            escape_wt_delimiters("$env:A = 'x;'; claude --resume id"),
+            r"$env:A = 'x\;'\; claude --resume id"
+        );
+        assert_eq!(escape_wt_delimiters("new-tab"), "new-tab");
     }
 
     #[test]
