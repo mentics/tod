@@ -94,6 +94,9 @@ impl ObligationsPanel {
         self.inner.update(cx, |inner, cx| {
             inner.highlight_item(id, window, cx);
         });
+        // As a click on the row would.
+        let handle = self.inner.focus_handle(cx);
+        window.focus(&handle, cx);
     }
 
     /// Point this column at a different node, in place.
@@ -165,9 +168,12 @@ impl Focusable for ObligationsPanel {
 }
 
 impl Render for ObligationsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.inner.read(cx).selected_obligation_id();
-        if selected.is_some() && selected != self.last_reported {
+        // The list puts its cursor on a row when it loads; that only counts
+        // as the user's selection once they are working in this panel.
+        let focused = self.inner.focus_handle(cx).contains_focused(window, cx);
+        if focused && selected.is_some() && selected != self.last_reported {
             self.last_reported = selected;
             if let Some(id) = selected {
                 cx.emit(PanelFocusSelected(Focus::Obligation {

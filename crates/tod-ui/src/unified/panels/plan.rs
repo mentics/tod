@@ -148,9 +148,12 @@ impl Focusable for PlanPanel {
 }
 
 impl Render for PlanPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.inner.read(cx).selected_id();
-        if selected.is_some() && selected != self.last_reported {
+        // The list puts its cursor on a row when it loads; that only counts
+        // as the user's selection once they are working in this panel.
+        let focused = self.inner.focus_handle(cx).contains_focused(window, cx);
+        if focused && selected.is_some() && selected != self.last_reported {
             self.last_reported = selected;
             if let Some(id) = selected {
                 cx.emit(PanelFocusSelected(Focus::PlanStep {
