@@ -232,7 +232,7 @@ Warm (just used), for comparison:
 - Shim `/exec`: 113–160 ms.
 
 Waking adds roughly 150–450 ms to the first request, with no trend by sleep
-length so far.
+length up to the 60 minutes tested.
 
 ### Zed
 
