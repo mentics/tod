@@ -34,36 +34,36 @@ skips all of this.
 
 ## The Blaxel account
 
-`tod-sandbox setup` records the workspace, and how to sign in to it, in
-`<data root>/sandboxes.toml`. There are two ways to sign in:
+The workspace, and how to sign in to it, are recorded in
+`<data root>/sandboxes.toml`. Set them in the app under Settings →
+**Cloud sandboxes** (the workspace, **Sign in with**, the **API key**, and the
+**default image** new sandboxes start from), or with `tod-sandbox setup`.
+Saving checks the sign-in and says how many sandboxes the workspace has. An
+empty workspace turns cloud sandboxes off, and an empty image means Blaxel's
+base image. There are two ways to sign in:
 
-- **`bl login` (the default when the Blaxel CLI is installed).** Each person
-  signs in as themselves. tod asks `bl` for a token and caches it until
-  shortly before it expires. If you are not signed in, `setup` runs
-  `bl login <workspace>` for you.
-- **An API key** (`--auth api-key`), for machines without a person at them.
-  The key goes into tod's credential store (the OS keyring, else an encrypted
-  file) as a kind that agents cannot read: `tod-cli secrets` never lists or
-  returns it.
+- **An API key (the default).** Create one in the Blaxel console and paste it
+  into Settings (or give it to `tod-sandbox setup`, which prompts for it or
+  reads it with `--api-key-stdin`). Nothing else needs installing. The key
+  goes into tod's credential store (the OS keyring, else an encrypted file)
+  as a kind agents cannot read: `tod-cli secrets` never lists or returns it,
+  and it is never copied into a sandbox. It is long-lived, so it works until
+  it is revoked in the console.
+- **`bl login`** (`--auth bl`). You sign in through the Blaxel CLI in a
+  browser. tod asks `bl` for a short-lived token and caches it until shortly
+  before it expires, and no key is stored. If you are not signed in, `setup`
+  runs `bl login <workspace>` for you.
 
 **For a team**, use one Blaxel workspace and invite each teammate to it. Each
-person runs `tod-sandbox setup --workspace <team-workspace>` and signs in with
-their own `bl login`. There is no shared secret to hand out or rotate, access
-is removed by removing the person from the workspace, and the workspace's logs
-show who did what. Every sandbox is labeled with its creator (`tod-owner`,
-from `--owner`, which defaults to your OS user name), so `tod-sandbox list` shows
-whose sandbox is whose. Keep API keys for automation.
+person signs in as themselves, with their own key or `bl login`, rather than
+sharing one key: access is removed by removing the person from the workspace,
+and the workspace's logs show who did what. Every sandbox is labeled with its
+creator (`tod-owner`, from `--owner`, which defaults to your OS user name), so
+the sandbox list shows whose sandbox is whose.
 
-Building images (a wrapped or baked image, below) also needs the Blaxel CLI.
-With an API key, `tod-sandbox` passes the key to `bl`.
-
-**In the app**, Settings → **Cloud sandboxes** sets the same two things
-`sandboxes.toml` holds for everyone on this data root: the **Blaxel
-workspace** and the **default image** new sandboxes start from. Setting a
-workspace there signs in with `bl login` (run it once yourself); a workspace
-already set up with `tod-sandbox setup` keeps how it signs in. An empty
-workspace turns cloud sandboxes off, and an empty image means Blaxel's base
-image.
+Building images (a wrapped or baked image, below) needs the Blaxel CLI either
+way. With an API key, tod passes the key to `bl`, so it does not need
+`bl login`.
 
 ## Sandboxes
 

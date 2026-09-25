@@ -160,7 +160,7 @@ impl SettingsSection {
                 TreehouseWorktreesRoot,
                 TerminalProgram,
             ],
-            Self::CloudSandboxes => &[SandboxWorkspace, SandboxDefaultImage],
+            Self::CloudSandboxes => &[SandboxWorkspace, SandboxSignIn, SandboxApiKey, SandboxDefaultImage],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
                 JourneysSend,
@@ -188,6 +188,10 @@ enum SettingField {
     TerminalProgram,
     /// The Blaxel workspace cloud sandboxes live in (`sandboxes.toml`).
     SandboxWorkspace,
+    /// An API key or `bl login`.
+    SandboxSignIn,
+    /// The API key, kept in the credential store (never shown again).
+    SandboxApiKey,
     /// The image a new sandbox starts from unless one is given.
     SandboxDefaultImage,
     LogLevel,
@@ -217,6 +221,8 @@ impl SettingField {
             Self::TreehouseWorktreesRoot => "treehouse-worktrees-root",
             Self::TerminalProgram => "terminal-program",
             Self::SandboxWorkspace => "sandbox-workspace",
+            Self::SandboxSignIn => "sandbox-sign-in",
+            Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
@@ -336,6 +342,13 @@ pub struct SettingsView {
     /// Enter or Escape.
     sandbox_workspace_input: Entity<InputState>,
     sandbox_image_input: Entity<InputState>,
+    sandbox_key_input: Entity<InputState>,
+    sandbox_auth: tod_store::fleet::sandbox::AuthMode,
+    /// Whether an API key is stored; `None` until the keyring has been read
+    /// (off the UI thread: it can prompt).
+    sandbox_has_key: Option<bool>,
+    /// Drops a sign-in check superseded by a later change.
+    sandbox_check_generation: u64,
     sandbox_editing: Option<SettingField>,
     sandbox_status: Option<Result<SharedString, SharedString>>,
     agent_selects: Vec<AgentRoleSelects>,
@@ -400,6 +413,23 @@ impl SettingsView {
                 ))
                 .default_value(sandbox_image)
         });
+        let sandbox_key_input = cx.new(|cx| {
+            InputState::new(window, cx).masked(true).placeholder("Enter to edit · Paste a Blaxel API key")
+        });
+        let sandbox_auth = tod_store::fleet::sandbox::sign_in_mode(paths.data_root());
+        {
+            let root = paths.data_root().to_path_buf();
+            cx.spawn(async move |this, cx| {
+                let has_key = cx
+                    .background_spawn(async move { tod_store::fleet::sandbox::has_api_key(&root) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    this.sandbox_has_key = Some(has_key);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         let treehouse_executable_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!(
@@ -508,6 +538,10 @@ impl SettingsView {
             treehouse_executable_input,
             sandbox_workspace_input,
             sandbox_image_input,
+            sandbox_key_input,
+            sandbox_auth,
+            sandbox_has_key: None,
+            sandbox_check_generation: 0,
             sandbox_editing: None,
             sandbox_status: None,
             relay_code_input,
@@ -615,8 +649,8 @@ impl SettingsView {
         self.treehouse_executable_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
-        if self.sandbox_editing.take().is_some() {
-            self.save_sandbox_account(cx);
+        if let Some(field) = self.sandbox_editing.take() {
+            self.leave_sandbox_field(field, window, cx);
         }
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -630,15 +664,16 @@ impl SettingsView {
     ) {
         let input = match field {
             SettingField::SandboxWorkspace => self.sandbox_workspace_input.clone(),
+            SettingField::SandboxApiKey => self.sandbox_key_input.clone(),
             SettingField::SandboxDefaultImage => self.sandbox_image_input.clone(),
             _ => return,
         };
         if self.selected_field() != field {
             return;
         }
-        // Moving from one to the other keeps what was typed in the first.
-        if self.sandbox_editing.is_some_and(|editing| editing != field) {
-            self.save_sandbox_account(cx);
+        // Moving from one to another keeps what was typed in the first.
+        if let Some(editing) = self.sandbox_editing.filter(|editing| *editing != field) {
+            self.leave_sandbox_field(editing, window, cx);
         }
         self.focus_region = SettingsFocus::Panel;
         self.sandbox_editing = Some(field);
@@ -646,6 +681,86 @@ impl SettingsView {
         cx.on_next_frame(window, move |_, window, cx| {
             input.update(cx, |input, cx| input.focus(window, cx));
         });
+    }
+
+    fn leave_sandbox_field(
+        &mut self,
+        field: SettingField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match field {
+            SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
+            _ => self.save_sandbox_account(cx),
+        }
+    }
+
+    /// Store a pasted API key and sign in with it. The field is cleared: the
+    /// key is never shown again.
+    fn save_sandbox_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.sandbox_key_input.read(cx).text().to_string().trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        self.sandbox_key_input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.sandbox_auth = tod_store::fleet::sandbox::AuthMode::ApiKey;
+        self.sandbox_has_key = Some(true);
+        self.apply_sandbox_sign_in(Some(key), cx);
+    }
+
+    fn cycle_sandbox_sign_in(&mut self, cx: &mut Context<Self>) {
+        use tod_store::fleet::sandbox::AuthMode;
+        self.sandbox_auth = match self.sandbox_auth {
+            AuthMode::ApiKey => AuthMode::Bl,
+            AuthMode::Bl => AuthMode::ApiKey,
+        };
+        self.apply_sandbox_sign_in(None, cx);
+    }
+
+    /// Record how to sign in (and a new key), then check it against Blaxel,
+    /// all off the UI thread (the keyring, `bl`, and the network).
+    fn apply_sandbox_sign_in(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        self.sandbox_check_generation += 1;
+        let generation = self.sandbox_check_generation;
+        let auth = self.sandbox_auth;
+        let root = self.paths.data_root().to_path_buf();
+        self.sandbox_status = Some(Ok("Saving…".into()));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    tod_store::fleet::sandbox::set_sign_in(&root, auth, key.as_deref())?;
+                    Ok::<_, anyhow::Error>(check_sandbox_sign_in(&root))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sandbox_check_generation == generation {
+                    this.sandbox_status = Some(match result {
+                        Ok(status) => status,
+                        Err(err) => Err(format!("Could not save: {err:#}").into()),
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Check the sign-in after the workspace changed.
+    fn recheck_sandbox_sign_in(&mut self, cx: &mut Context<Self>) {
+        self.sandbox_check_generation += 1;
+        let generation = self.sandbox_check_generation;
+        let root = self.paths.data_root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let status = cx.background_spawn(async move { check_sandbox_sign_in(&root) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sandbox_check_generation == generation {
+                    this.sandbox_status = Some(status);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Write the workspace and default image to `sandboxes.toml`.
@@ -666,7 +781,10 @@ impl SettingsView {
                 Ok(()) if workspace.trim().is_empty() => {
                     Ok("Saved. Cloud sandboxes are off until a workspace is set.".into())
                 }
-                Ok(()) => Ok("Saved.".into()),
+                Ok(()) => {
+                    self.recheck_sandbox_sign_in(cx);
+                    Ok("Saved. Checking the sign-in…".into())
+                }
                 Err(err) => Err(format!("Could not save: {err:#}").into()),
             },
         );
@@ -684,8 +802,8 @@ impl SettingsView {
         self.treehouse_executable_editing = false;
         self.relay_code_editing = false;
         self.milestone_states_editing = false;
-        if self.sandbox_editing.take().is_some() {
-            self.save_sandbox_account(cx);
+        if let Some(field) = self.sandbox_editing.take() {
+            self.leave_sandbox_field(field, window, cx);
         }
         self.active_section = section;
         self.selected_field_index = 0;
@@ -818,7 +936,9 @@ impl SettingsView {
             | SettingField::TreehouseWorktreesRoot
             | SettingField::TerminalProgram
             | SettingField::SandboxWorkspace
+            | SettingField::SandboxApiKey
             | SettingField::SandboxDefaultImage => {}
+            SettingField::SandboxSignIn => self.cycle_sandbox_sign_in(cx),
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
                 let step = if delta >= 0 { 1024 } else { -1024 };
@@ -852,9 +972,9 @@ impl SettingsView {
                 self.enter_treehouse_worktrees_root_edit(window, cx)
             }
             SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
-            field @ (SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage) => {
-                self.enter_sandbox_edit(field, window, cx)
-            }
+            field @ (SettingField::SandboxWorkspace
+            | SettingField::SandboxApiKey
+            | SettingField::SandboxDefaultImage) => self.enter_sandbox_edit(field, window, cx),
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
@@ -1341,6 +1461,23 @@ impl SettingsView {
     }
 }
 
+/// Sign in to the workspace and say what came back. Network, and maybe
+/// `bl`: never on the UI thread.
+fn check_sandbox_sign_in(root: &std::path::Path) -> Result<SharedString, SharedString> {
+    let (workspace, _) = tod_store::fleet::sandbox::account_settings(root);
+    if workspace.trim().is_empty() {
+        return Ok("Saved. Set the workspace to sign in.".into());
+    }
+    match tod_store::fleet::sandbox::check_sign_in(root) {
+        Ok(count) => Ok(format!(
+            "Signed in to {workspace}: {count} sandbox{} there.",
+            if count == 1 { "" } else { "es" }
+        )
+        .into()),
+        Err(err) => Err(format!("Saved, but signing in failed: {err:#}").into()),
+    }
+}
+
 fn step_u32(value: u32, delta: i32) -> u32 {
     if delta >= 0 {
         value.saturating_add(delta as u32)
@@ -1428,6 +1565,7 @@ impl Render for SettingsView {
         key_context::set_input_tab_stop(&self.relay_code_input, self.relay_code_editing, cx);
         for (field, input) in [
             (SettingField::SandboxWorkspace, self.sandbox_workspace_input.clone()),
+            (SettingField::SandboxApiKey, self.sandbox_key_input.clone()),
             (SettingField::SandboxDefaultImage, self.sandbox_image_input.clone()),
         ] {
             let editing = self.sandbox_editing == Some(field);
@@ -1797,9 +1935,37 @@ impl SettingsView {
                     self,
                     SettingField::SandboxWorkspace,
                     "Blaxel workspace",
-                    "The Blaxel workspace nodes' cloud sandboxes live in. Sign in to it once with `bl login <workspace>`. A team shares one workspace, and each person signs in as themselves. Empty turns cloud sandboxes off.",
+                    "The Blaxel workspace nodes' cloud sandboxes live in. A team shares one workspace, and each person signs in as themselves. Empty turns cloud sandboxes off.",
                     &self.sandbox_workspace_input,
                     self.sandbox_editing == Some(SettingField::SandboxWorkspace),
+                    theme,
+                ))
+                .child(cycle_row(
+                    cx,
+                    self,
+                    SettingField::SandboxSignIn,
+                    match self.sandbox_auth {
+                        tod_store::fleet::sandbox::AuthMode::ApiKey => "API key",
+                        tod_store::fleet::sandbox::AuthMode::Bl => "bl login",
+                    },
+                    "Sign in with",
+                    "An API key needs nothing else installed: create one in the Blaxel console and paste it below. `bl login` signs you in through the Blaxel CLI in a browser; its tokens are short-lived and no key is stored.",
+                    theme,
+                    |this, _, cx| this.cycle_sandbox_sign_in(cx),
+                    |this, _, cx| this.cycle_sandbox_sign_in(cx),
+                ))
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxApiKey,
+                    "API key",
+                    match self.sandbox_has_key {
+                        Some(true) => "A key is stored, in the OS keyring (else an encrypted file), where agents cannot read it. Paste a new one to replace it.",
+                        Some(false) => "No key is stored. A key pasted here is kept in the OS keyring (else an encrypted file), where agents cannot read it, and is used to sign in.",
+                        None => "Kept in the OS keyring (else an encrypted file), where agents cannot read it.",
+                    },
+                    &self.sandbox_key_input,
+                    self.sandbox_editing == Some(SettingField::SandboxApiKey),
                     theme,
                 ))
                 .child(text_input_row(
@@ -2191,7 +2357,9 @@ fn text_input_row(
                             this.enter_treehouse_executable_edit(window, cx);
                         }
                     }
-                    SettingField::SandboxWorkspace | SettingField::SandboxDefaultImage => {
+                    SettingField::SandboxWorkspace
+                    | SettingField::SandboxApiKey
+                    | SettingField::SandboxDefaultImage => {
                         if this.sandbox_editing != Some(field) {
                             this.enter_sandbox_edit(field, window, cx);
                         }

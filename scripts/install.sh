@@ -105,8 +105,8 @@ if [[ $SANDBOX == 1 ]]; then
             echo "  run tod once, then: $TARGET_DIR/tod-sandbox setup --workspace $SANDBOX_WORKSPACE" >&2
         fi
     else
-        echo "Cloud sandboxes: set the Blaxel workspace in tod's Settings -> Cloud sandboxes"
-        echo "  (or run $TARGET_DIR/tod-sandbox setup --workspace <blaxel-workspace>), sign in"
-        echo "  once with bl login <workspace>, then create sandboxes from a node's Files section."
+        echo "Cloud sandboxes: in tod's Settings -> Cloud sandboxes, set the Blaxel workspace"
+        echo "  and paste an API key (or run $TARGET_DIR/tod-sandbox setup --workspace <workspace>),"
+        echo "  then create sandboxes from a node's Files section."
     fi
 fi

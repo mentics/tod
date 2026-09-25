@@ -1486,6 +1486,10 @@ impl TaskEditView {
         let _ = self.fleet.reload_if_stale();
         self.load_action_capabilities();
         self.clamp_focus_index();
+        if self.repo_in_container() {
+            // Whether the directory must be a git repository changed.
+            self.check_dev_container(cx);
+        }
         self.notify_changed(cx);
     }
 
@@ -3148,7 +3152,7 @@ impl TaskEditView {
         if value == self.loaded_repo {
             return;
         }
-        if !value.is_empty() && self.repo_in_container() {
+        if !value.is_empty() && self.repo_path_is_remote() {
             if !value.starts_with('/') {
                 let example = if self.runs_in_sandbox() {
                     "/root/app"
@@ -3164,10 +3168,16 @@ impl TaskEditView {
                 return;
             }
         } else if !value.is_empty() {
-            if let Err(err) =
+            // Any directory will do; a worktree needs a git repository.
+            let checked = if self.own_files().is_some_and(|files| files.use_worktree) {
                 validate_interview_workspace(std::path::Path::new(&value), &self.loaded_branch)
-            {
-                self.pending_toast = Some(format!("Repository: {err:#}"));
+            } else if std::path::Path::new(&value).is_dir() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("{value} is not a directory"))
+            };
+            if let Err(err) = checked {
+                self.pending_toast = Some(format!("Workspace directory: {err:#}"));
                 self.pending_repo_revert = true;
                 cx.notify();
                 return;
@@ -3210,7 +3220,10 @@ impl TaskEditView {
             self.rename_worktree_branch(id, value, cx);
             return;
         }
-        if !self.loaded_repo.is_empty() && !self.repo_in_container() {
+        if !self.loaded_repo.is_empty()
+            && !self.repo_path_is_remote()
+            && self.own_files().is_some_and(|files| files.use_worktree)
+        {
             if let Err(err) =
                 validate_interview_workspace(std::path::Path::new(&self.loaded_repo), &value)
             {
@@ -3859,7 +3872,7 @@ impl TaskEditView {
                                 .child(Self::render_field_label(
                                     if self.runs_in_sandbox() {
                                         "Workspace directory (in the sandbox)"
-                                    } else if self.repo_in_container() {
+                                    } else if self.repo_path_is_remote() {
                                         "Workspace directory (in the container)"
                                     } else {
                                         "Workspace directory"

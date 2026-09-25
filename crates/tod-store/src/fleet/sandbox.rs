@@ -17,11 +17,11 @@ use std::process::{Command, Output};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tod_sandbox::blaxel::{Blaxel, NewSandbox};
-use tod_sandbox::config::{self, Account, AuthMode, Config, Sandbox};
+use tod_sandbox::config::{self, Account, Config, Sandbox};
 use tod_sandbox::provision::{self, Payload};
 use tod_sandbox::relay;
 
-pub use tod_sandbox::config::DEFAULT_IMAGE;
+pub use tod_sandbox::config::{AuthMode, DEFAULT_IMAGE};
 pub use tod_sandbox::provision::{TOD_CLI_PATH, TUNNEL_PORT};
 
 /// Installs what tod needs in any image (see `assets/sandbox/`).
@@ -69,7 +69,9 @@ impl Sandboxes {
         let acct = self.account()?;
         match acct.auth {
             AuthMode::ApiKey => self.credentials().get(CredentialKind::BlaxelApiKey).ok_or_else(|| {
-                anyhow!("no Blaxel API key stored: run `tod-sandbox setup --auth api-key`")
+                anyhow!(
+                    "no Blaxel API key stored: enter one in Settings → Cloud sandboxes,                      or run `tod-sandbox setup --auth api-key`"
+                )
             }),
             AuthMode::Bl => bl_token(&self.root, &acct.workspace),
         }
@@ -353,9 +355,9 @@ pub fn account_settings(root: &Path) -> (String, String) {
     }
 }
 
-/// Record the workspace (a new one signs in with `bl login`; one already
-/// set up keeps its sign-in) and the default image. An empty image means
-/// Blaxel's base image.
+/// Record the workspace and the default image. How to sign in carries over
+/// (an API key when nothing was set up). An empty image means Blaxel's base
+/// image.
 pub fn set_account_settings(root: &Path, workspace: &str, default_image: &str) -> Result<()> {
     let mut sandboxes = Sandboxes::load(root)?;
     let workspace = workspace.trim();
@@ -363,10 +365,12 @@ pub fn set_account_settings(root: &Path, workspace: &str, default_image: &str) -
         "" => config::DEFAULT_IMAGE,
         image => image,
     };
-    let mut acct = match sandboxes.config.blaxel.take() {
-        // Clearing the workspace, or setting it again, keeps how to sign in.
+    let previous = sandboxes.config.blaxel.take();
+    let auth = previous.as_ref().map_or(AuthMode::ApiKey, |acct| acct.auth);
+    let mut acct = match previous {
+        // Clearing the workspace, or setting it again, keeps the rest.
         Some(acct) if workspace.is_empty() || acct.workspace.is_empty() || acct.workspace == workspace => acct,
-        _ => Account::new(workspace),
+        _ => Account { auth, ..Account::new(workspace) },
     };
     if acct.workspace != workspace {
         sandboxes.forget_token();
@@ -375,6 +379,40 @@ pub fn set_account_settings(root: &Path, workspace: &str, default_image: &str) -
     acct.default_image = default_image.to_string();
     sandboxes.config.blaxel = Some(acct);
     sandboxes.save()
+}
+
+/// How this data root signs in to Blaxel (an API key when nothing is set up
+/// yet). Reads the file only.
+pub fn sign_in_mode(root: &Path) -> AuthMode {
+    Sandboxes::load(root).ok().and_then(|s| s.config.blaxel).map_or(AuthMode::ApiKey, |acct| acct.auth)
+}
+
+/// Whether a Blaxel API key is stored. Reads the OS keyring, which can
+/// prompt: never on the UI thread.
+pub fn has_api_key(root: &Path) -> bool {
+    CredentialStore::from_data_root(root).get(CredentialKind::BlaxelApiKey).is_some()
+}
+
+/// Sign in with `auth` from now on, storing `api_key` when one is given (in
+/// the credential store, as a kind agents cannot read). Touches the keyring:
+/// never on the UI thread.
+pub fn set_sign_in(root: &Path, auth: AuthMode, api_key: Option<&str>) -> Result<()> {
+    let mut sandboxes = Sandboxes::load(root)?;
+    if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+        sandboxes
+            .credentials()
+            .set(CredentialKind::BlaxelApiKey, key)
+            .map_err(|e| anyhow!("could not store the API key: {e}"))?;
+    }
+    sandboxes.config.blaxel.get_or_insert_with(|| Account::new("")).auth = auth;
+    sandboxes.forget_token();
+    sandboxes.save()
+}
+
+/// Sign in and count the workspace's sandboxes, to show that the sign-in
+/// works. Network, and maybe `bl`: never on the UI thread.
+pub fn check_sign_in(root: &Path) -> Result<usize> {
+    Ok(Sandboxes::load(root)?.blaxel()?.list()?.len())
 }
 
 /// A name for a new sandbox for the node `node_slug`.
@@ -414,7 +452,9 @@ fn bl_token(root: &Path, workspace: &str) -> Result<String> {
     command.args(["-w", workspace, "token", "--skip-version-warning"]);
     no_window(&mut command);
     let out = command.output().map_err(|_| {
-        anyhow!("the Blaxel CLI (`bl`) is not installed; see https://docs.blaxel.ai/cli-reference/introduction")
+        anyhow!(
+            "signing in with `bl login` needs the Blaxel CLI (`bl`), which is not installed;              install it (https://docs.blaxel.ai/cli-reference/introduction), or sign in with              an API key in Settings → Cloud sandboxes"
+        )
     })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let token = stdout
@@ -426,7 +466,7 @@ fn bl_token(root: &Path, workspace: &str) -> Result<String> {
         .to_string();
     if !out.status.success() || token.is_empty() || token.contains(' ') {
         bail!(
-            "could not get a Blaxel token; run `bl login {workspace}` ({})",
+            "could not get a Blaxel token; run `bl login {workspace}`, or sign in with an API              key in Settings → Cloud sandboxes ({})",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -675,6 +715,8 @@ mod tests {
         assert_eq!(account_settings(&root), (String::new(), config::DEFAULT_IMAGE.to_string()));
         assert!(Sandboxes::load(&root).unwrap().account().is_err());
         set_account_settings(&root, " team ", "sandbox/baked:latest").unwrap();
+        // Nothing set up before: an API key.
+        assert_eq!(sign_in_mode(&root), AuthMode::ApiKey);
         assert_eq!(account_settings(&root), ("team".into(), "sandbox/baked:latest".into()));
         // An empty image goes back to the default; the account stays.
         set_account_settings(&root, "team", "").unwrap();

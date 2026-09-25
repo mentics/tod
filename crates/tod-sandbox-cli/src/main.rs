@@ -28,7 +28,9 @@ usage: tod-sandbox [--data-root DIR] <command> [args]
 
 setup [--workspace W] [--auth bl|api-key] [--api-key-stdin] [--region R]
       [--image IMAGE] [--memory MB] [--owner NAME]
-                         Choose the Blaxel workspace and how to sign in to it.
+                         Choose the Blaxel workspace and how to sign in to it:
+                         an API key (the default; prompted for, or on stdin) or
+                         your own `bl login`.
 create <name> [--image IMAGE] [--agents]
                          Create a sandbox and install what tod needs in it. Any
                          image works: one not built for Blaxel is wrapped first.
@@ -226,7 +228,7 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
         Some("bl") => AuthMode::Bl,
         Some("api-key") => AuthMode::ApiKey,
         Some(other) => bail!("--auth is bl or api-key, not {other:?}"),
-        None => existing.as_ref().map(|a| a.auth).unwrap_or(if bl_installed { AuthMode::Bl } else { AuthMode::ApiKey }),
+        None => existing.as_ref().map_or(AuthMode::ApiKey, |a| a.auth),
     };
     let key_from_stdin = args.flag("--api-key-stdin");
     let defaults = Account {

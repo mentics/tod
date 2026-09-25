@@ -324,6 +324,13 @@ impl TaskEditView {
             .is_some_and(|dev| dev.repo_is_remote())
     }
 
+    /// "Runs in" puts the repository in a container or sandbox, whether or
+    /// not one is chosen yet: its path is not a path on this machine.
+    pub(super) fn repo_path_is_remote(&self) -> bool {
+        self.own_dev_container()
+            .is_some_and(|dev| dev.sandbox || !dev.repo_on_host)
+    }
+
     fn schedule_dev_container_save(&mut self, cx: &mut Context<Self>) {
         if self.own_dev_container().is_none() {
             return;
@@ -502,13 +509,14 @@ impl TaskEditView {
             self.dev.checking = false;
             return;
         };
+        let use_worktree = self.own_files().is_some_and(|files| files.use_worktree);
         let check: Box<dyn FnOnce() -> Result<String, String> + Send> = if dev.sandbox {
             let repo = self
                 .own_files()
                 .and_then(|files| files.repo_dir())
                 .filter(|dir| dir.sandbox_name().is_some())
                 .map(|dir| dir.path_text());
-            Box::new(move || check_repo_in_sandbox(&container, repo.as_deref()))
+            Box::new(move || check_repo_in_sandbox(&container, repo.as_deref(), use_worktree))
         } else if dev.repo_on_host {
             let Some(host_dir) = self
                 .own_files()
@@ -534,7 +542,7 @@ impl TaskEditView {
                 .and_then(|files| files.repo_dir())
                 .filter(|dir| dir.container_name().is_some())
                 .map(|dir| dir.path_text());
-            Box::new(move || check_repo_in_container(&container, repo.as_deref()))
+            Box::new(move || check_repo_in_container(&container, repo.as_deref(), use_worktree))
         };
         self.dev.checking = true;
         cx.notify();
@@ -952,30 +960,66 @@ fn sandbox_choice(listed: &ListedSandbox) -> ContainerSummary {
 }
 
 /// The sandbox can be reached (made ready for tod if it is not) and `repo`
-/// (a path in it) is a git repository there. Talks to Blaxel.
-fn check_repo_in_sandbox(sandbox: &str, repo: Option<&str>) -> Result<String, String> {
+/// (a path in it) is a directory there: a git repository when the node
+/// uses a worktree. Talks to Blaxel.
+fn check_repo_in_sandbox(
+    sandbox: &str,
+    repo: Option<&str>,
+    use_worktree: bool,
+) -> Result<String, String> {
     let exec = sandboxes::SandboxExec::new(sandbox);
     let Some(repo) = repo else {
         exec.output("/", "true", &[]).map_err(|err| format!("{err:#}"))?;
         return Ok(format!(
-            "Sandbox {sandbox} is ready. Set the workspace directory to the repository's path in it."
+            "Sandbox {sandbox} is ready. Set the workspace directory to a path in it."
         ));
     };
-    let out = exec
+    let place = format!("sandbox {sandbox}");
+    let git = exec
         .output("/", "git", &["-C", repo, "rev-parse", "--show-toplevel"])
         .map_err(|err| format!("{err:#}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "{repo} is not a git repository in sandbox {sandbox}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(format!("Repository {repo} in sandbox {sandbox}"))
+    let is_dir = || -> Result<bool, String> {
+        exec.output("/", "test", &["-d", repo])
+            .map(|out| out.status.success())
+            .map_err(|err| format!("{err:#}"))
+    };
+    directory_verdict(repo, &place, "", git, is_dir, use_worktree)
 }
 
-/// The chosen container is running and `repo` (a path in it) is a git
-/// repository there. Talks to Docker.
-fn check_repo_in_container(container: &str, repo: Option<&str>) -> Result<String, String> {
+/// What checking `repo` in `place` found: a git repository, or (without a
+/// worktree, which needs one) any directory. `is_dir` runs only when `git`
+/// failed.
+fn directory_verdict(
+    repo: &str,
+    place: &str,
+    as_user: &str,
+    git: std::process::Output,
+    is_dir: impl FnOnce() -> Result<bool, String>,
+    use_worktree: bool,
+) -> Result<String, String> {
+    if git.status.success() {
+        return Ok(format!("Repository {repo} in {place}{as_user}"));
+    }
+    if !is_dir()? {
+        return Err(format!("{repo} does not exist in {place}"));
+    }
+    if use_worktree {
+        return Err(format!(
+            "{repo} in {place} is not a git repository, which a worktree needs: {}",
+            String::from_utf8_lossy(&git.stderr).trim()
+        ));
+    }
+    Ok(format!("Directory {repo} in {place}{as_user} (not a git repository)"))
+}
+
+/// The chosen container is running and `repo` (a path in it) is a
+/// directory there: a git repository when the node uses a worktree. Talks
+/// to Docker.
+fn check_repo_in_container(
+    container: &str,
+    repo: Option<&str>,
+    use_worktree: bool,
+) -> Result<String, String> {
     let exec = devcontainer::ContainerExec::connect(container).map_err(|err| format!("{err:#}"))?;
     let as_user = exec
         .user
@@ -984,20 +1028,18 @@ fn check_repo_in_container(container: &str, repo: Option<&str>) -> Result<String
         .unwrap_or_default();
     let Some(repo) = repo else {
         return Ok(format!(
-            "{} is running{as_user}. Set the workspace directory to the repository's path in it.",
+            "{} is running{as_user}. Set the workspace directory to a path in it.",
             exec.name
         ));
     };
     let [config, safe] = tod_store::fleet::workdir::CONTAINER_GIT_CONFIG;
-    let out = exec
+    let git = exec
         .output("/", "git", &[config, safe, "-C", repo, "rev-parse", "--show-toplevel"])
         .map_err(|err| format!("{err:#}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "{repo} is not a git repository in {}: {}",
-            exec.name,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(format!("Repository {repo} in {}{as_user}", exec.name))
+    let is_dir = || -> Result<bool, String> {
+        exec.output("/", "test", &["-d", repo])
+            .map(|out| out.status.success())
+            .map_err(|err| format!("{err:#}"))
+    };
+    directory_verdict(repo, &exec.name, &as_user, git, is_dir, use_worktree)
 }
