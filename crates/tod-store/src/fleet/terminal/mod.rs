@@ -800,8 +800,20 @@ fn container_startup(
     inner: Option<&str>,
     terminal: &TerminalSettings,
 ) -> Result<Option<String>> {
+    let environment = fleet.agent_environment(node_id, cwd)?;
+    environment_startup(fleet, environment, session_id, inner, terminal)
+}
+
+/// [`container_startup`] for an environment already decided.
+fn environment_startup(
+    fleet: &FleetStore,
+    environment: tod_agent::AgentEnvironment,
+    session_id: &str,
+    inner: Option<&str>,
+    terminal: &TerminalSettings,
+) -> Result<Option<String>> {
     use tod_agent::devcontainer::{self, ContainerFile, sh_quote};
-    let launch = match fleet.agent_environment(node_id, cwd)? {
+    let launch = match environment {
         tod_agent::AgentEnvironment::DevContainer(launch) => launch,
         tod_agent::AgentEnvironment::Sandbox(launch) => {
             return sandbox_startup(fleet, &launch, session_id, inner, terminal).map(Some);
@@ -944,6 +956,119 @@ fn terminal_is_powershell(terminal: &TerminalSettings) -> bool {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .is_none_or(is_powershell)
+}
+
+/// Open a terminal that runs `command` in `cwd` with `env` set, wherever
+/// `environment` says the work runs: on this machine, in a dev container, or
+/// in a cloud sandbox. On this machine `tod_cli_dir` goes first on `PATH`;
+/// elsewhere `tod-cli` is the relayed one, as for the agent. The terminal is
+/// not tracked: it is the user's from here on. Talks to Docker or the
+/// sandbox, so never call it on the UI thread.
+#[allow(clippy::too_many_arguments)]
+pub fn open_terminal_command(
+    fleet: &FleetStore,
+    paths: &TodPaths,
+    settings: &TodSettings,
+    cwd: &Workdir,
+    environment: tod_agent::AgentEnvironment,
+    env: &[(String, String)],
+    tod_cli_dir: Option<&Path>,
+    command: &str,
+) -> Result<()> {
+    let terminal = fresh_terminal_settings(paths, &settings.terminal);
+    let assets = ensure_shell_init_assets(paths)?;
+    let session_id = format!("handoff-{}", uuid::Uuid::new_v4());
+    let startup = match environment {
+        tod_agent::AgentEnvironment::Host => host_startup(env, tod_cli_dir, command, &terminal),
+        remote => {
+            let inner = posix_startup(env, None, command);
+            environment_startup(fleet, remote, &session_id, Some(&inner), &terminal)?
+                .context("a dev container or sandbox gave no startup command")?
+        }
+    };
+    launch_shell_terminal(
+        &host_terminal_dir(fleet, cwd),
+        &terminal,
+        &session_id,
+        &assets,
+        Some(&startup),
+    )
+}
+
+/// `command` with `env` set first, for the terminal's own shell on this
+/// machine: PowerShell on Windows unless the terminal is Git Bash, else a
+/// POSIX shell.
+fn host_startup(
+    env: &[(String, String)],
+    tod_cli_dir: Option<&Path>,
+    command: &str,
+    terminal: &TerminalSettings,
+) -> String {
+    #[cfg(windows)]
+    {
+        let git_bash = terminal
+            .program
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(is_git_bash);
+        if !git_bash {
+            return powershell_startup(env, tod_cli_dir, command);
+        }
+        let dir = tod_cli_dir.map(|dir| PathBuf::from(msys_unix_path(dir)));
+        return posix_startup(env, dir.as_deref(), command);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = terminal;
+        posix_startup(env, tod_cli_dir, command)
+    }
+}
+
+/// `export`s for `env` (and `dir` first on `PATH`), then `command`.
+fn posix_startup(env: &[(String, String)], dir: Option<&Path>, command: &str) -> String {
+    use tod_agent::devcontainer::sh_quote;
+    let mut script = String::new();
+    if let Some(dir) = dir {
+        script.push_str(&format!(
+            "export PATH={}:\"$PATH\"; ",
+            sh_quote(&dir.to_string_lossy())
+        ));
+    }
+    for (key, value) in env {
+        script.push_str(&format!("export {key}={}; ", sh_quote(value)));
+    }
+    script.push_str(command);
+    script
+}
+
+/// `$env:` assignments for `env` (and `dir` first on `PATH`), then `command`.
+#[cfg(any(windows, test))]
+fn powershell_startup(env: &[(String, String)], dir: Option<&Path>, command: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut script = String::new();
+    if let Some(dir) = dir {
+        script.push_str(&format!(
+            "$env:PATH = {} + $env:PATH; ",
+            quote(&format!("{};", dir.display()))
+        ));
+    }
+    for (key, value) in env {
+        script.push_str(&format!("$env:{key} = {}; ", quote(value)));
+    }
+    script.push_str(command);
+    script
+}
+
+/// `C:\a\b` as Git Bash writes it on `PATH`: `/c/a/b`.
+#[cfg(any(windows, test))]
+fn msys_unix_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        format!("/{}{}", (bytes[0] as char).to_ascii_lowercase(), &path[2..])
+    } else {
+        path
+    }
 }
 
 /// Launch the agent CLI in an OS terminal, tracked as a `terminal` agent run (not a shell).
@@ -1105,6 +1230,28 @@ pub fn focus_shell_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_startup_sets_the_environment_before_the_command() {
+        let env = [("TOD_INTERVIEW_ACTOR".to_string(), "conversation:it's".to_string())];
+        assert_eq!(
+            posix_startup(&env, Some(Path::new("/opt/tod")), "claude --resume abc"),
+            "export PATH='/opt/tod':\"$PATH\"; \
+             export TOD_INTERVIEW_ACTOR='conversation:it'\\''s'; claude --resume abc"
+        );
+        assert_eq!(
+            powershell_startup(&env, Some(Path::new(r"C:\tod")), "claude --resume abc"),
+            "$env:PATH = 'C:\\tod;' + $env:PATH; \
+             $env:TOD_INTERVIEW_ACTOR = 'conversation:it''s'; claude --resume abc"
+        );
+        assert_eq!(posix_startup(&[], None, "claude"), "claude");
+    }
+
+    #[test]
+    fn git_bash_path_entries_use_the_drive_as_a_directory() {
+        assert_eq!(msys_unix_path(Path::new(r"C:\data\tod")), "/c/data/tod");
+        assert_eq!(msys_unix_path(Path::new("/usr/bin")), "/usr/bin");
+    }
 
     #[cfg(windows)]
     #[test]

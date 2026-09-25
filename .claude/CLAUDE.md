@@ -145,6 +145,16 @@ an empty reply is normal (shown as "Done, no notes"); `surface/conversation.md`
 states this, and that the agent acts without confirming because everything is
 reversible.
 
+The terminal icon left of Send (`ui::terminal_handoff`, in the conversation
+view and the workbench chat drawer) continues the conversation in the agent's
+own CLI (`claude --resume <id> --permission-mode auto`, as the app runs
+Claude, or `cursor-agent --resume <id>`), in a terminal
+opened where the agent ran: this machine, the node's dev container, or its
+cloud sandbox (`tod_core::conversation::handoff`,
+`tod_store::fleet::open_terminal_command`). The terminal gets the
+conversation's actor, so its outline writes stay in the change set; the app
+closes its own session first and resumes it by id on the next Send.
+
 Implement, Verify, Review, and the action panel's Chat now run in the conversation view (see
 **Protocols** below). The one chat left on the old path is the visual-design
 panel's embedded chat, which uses `InteractiveAgentView`; it, the view, and

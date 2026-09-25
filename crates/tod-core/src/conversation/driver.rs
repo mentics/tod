@@ -776,15 +776,7 @@ impl ConversationDriver {
                 self.protocol.progress(&env).ok().flatten(),
             )
         };
-        // A node whose Files name a dev container runs its agent there.
-        let environment = match self.focus.node_id() {
-            Some(node) => fleet.agent_environment(&node.to_string(), &cwd)?,
-            None => tod_store::fleet::dev_container::environment_for(
-                None,
-                &cwd,
-                fleet.paths().root(),
-            )?,
-        };
+        let environment = launch_environment(fleet, self.focus, &cwd)?;
         self.progress_before = progress;
         // Whatever the protocol, an agent running in a codebase gets its rules.
         let context =
@@ -913,6 +905,19 @@ impl ConversationDriver {
             .delta(&self.env(fleet, id), since, &mut reported);
         self.reported_stale = reported;
         result
+    }
+}
+
+/// Where a conversation about `focus` whose protocol works in `cwd` runs its
+/// agent: a node whose Files name a dev container or sandbox runs it there.
+pub(crate) fn launch_environment(
+    fleet: &FleetStore,
+    focus: Focus,
+    cwd: &Workdir,
+) -> Result<tod_agent::AgentEnvironment> {
+    match focus.node_id() {
+        Some(node) => fleet.agent_environment(&node.to_string(), cwd),
+        None => tod_store::fleet::dev_container::environment_for(None, cwd, fleet.paths().root()),
     }
 }
 

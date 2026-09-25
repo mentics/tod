@@ -6,6 +6,7 @@ use crate::ui::token_usage;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
 use gpui::{
     AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
 };
@@ -83,6 +84,17 @@ impl ConversationView {
             AgentConversationEvent::Action(id, _) if id.as_ref() == COPY_CONTEXT => {
                 self.copy_opening_context(cx)
             }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == CONTINUE_IN_TERMINAL => {
+                terminal_handoff::continue_in_terminal(
+                    self.fleet.clone(),
+                    self.agent.clone(),
+                    self.driver_config(),
+                    self.conversation_id,
+                    self.status.running,
+                    window,
+                    cx,
+                )
+            }
             AgentConversationEvent::Action(id, _) if id.as_ref() == REPORT_PROBLEM => {
                 self.on_report_problem(&crate::ui::report_problem::ReportProblem, window, cx);
             }
@@ -127,6 +139,18 @@ impl ConversationView {
             Err(err) => self.status_line = format!("Could not read the context: {err:#}").into(),
         }
         cx.notify();
+    }
+
+    /// The open conversation's agent session, once it has one.
+    fn agent_session(&self) -> Option<&str> {
+        let id = self.conversation_id?;
+        self.data
+            .conversations
+            .iter()
+            .find(|c| c.conversation.id == id)?
+            .conversation
+            .agent_session_id
+            .as_deref()
     }
 
     /// Bring the panel up to date and return it for the layout.
@@ -197,10 +221,15 @@ impl ConversationView {
             Vec::new()
         };
         header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        let tools = vec![terminal_handoff::tool(
+            self.agent_session().is_some(),
+            self.status.running,
+        )];
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);
             panel.set_actions(actions, cx);
+            panel.set_tools(tools, cx);
             panel.set_notices(notices, cx);
             panel.set_lifecycle_state(lifecycle_state, cx);
             panel.set_usage(usage, cx);

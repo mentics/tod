@@ -17,6 +17,7 @@ pub mod selectable_text;
 pub mod status;
 pub mod status_filter;
 pub mod style;
+pub mod terminal_handoff;
 pub mod toast;
 pub mod token_usage;
 pub mod transcript_list;

@@ -57,7 +57,8 @@ pub use runtime::{GuestLivenessCheck, NoopGuestLiveness};
 pub use store::FleetStore;
 pub use terminal::{
     default_terminal_hint, focus_shell_session, focus_terminal_agent_run, launch_shell_terminal,
-    open_shell_for_node, open_terminal_agent_for_node, prune_stale_shell_sessions,
+    open_shell_for_node, open_terminal_agent_for_node, open_terminal_command,
+    prune_stale_shell_sessions,
     prune_stale_terminal_agent_runs, read_shell_state, remove_shell_state, shells_dir,
     state_file_path, verify_shell_session,
 };

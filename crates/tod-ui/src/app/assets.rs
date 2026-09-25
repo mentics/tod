@@ -54,4 +54,10 @@ mod tests {
     fn title_bar_report_icon_is_bundled() {
         assert!(serves("icons/flag.svg"));
     }
+
+    #[test]
+    fn continue_in_terminal_icon_is_bundled() {
+        use gpui_component::{IconName, IconNamed};
+        assert!(serves(&IconName::SquareTerminal.path()));
+    }
 }

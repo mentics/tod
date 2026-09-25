@@ -42,6 +42,7 @@ use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPan
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::style;
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
@@ -97,6 +98,8 @@ pub struct ChatDrawer {
     /// `CHAT_START_HEIGHT`.
     height: Option<Pixels>,
     conversation_id: Option<Uuid>,
+    /// Whether the conversation has an agent session to continue elsewhere.
+    has_session: bool,
     status: ConversationStatus,
     error: Option<SharedString>,
     transcript: Entity<AgentConversationPanel>,
@@ -138,6 +141,7 @@ impl ChatDrawer {
             expanded: false,
             height,
             conversation_id: None,
+            has_session: false,
             status: ConversationStatus::default(),
             error: None,
             transcript,
@@ -253,6 +257,17 @@ impl ChatDrawer {
             AgentConversationEvent::Stop => self.stop_turn(cx),
             AgentConversationEvent::Activated | AgentConversationEvent::EditingChanged(_) => {
                 cx.notify();
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == CONTINUE_IN_TERMINAL => {
+                terminal_handoff::continue_in_terminal(
+                    self.fleet.clone(),
+                    self.agent.clone(),
+                    self.driver_config(),
+                    self.conversation_id,
+                    self.status.running,
+                    window,
+                    cx,
+                )
             }
             AgentConversationEvent::Action(..) => {}
         }
@@ -411,12 +426,21 @@ impl ChatDrawer {
             None => Vec::new(),
         };
         let entries: Vec<Entry> = turns.iter().map(entry_of).collect();
+        self.has_session = self.conversation_id.is_some_and(|id| {
+            self.fleet
+                .read(|conn| ConversationRepo::new(conn).get(id))
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.agent_session_id.is_some())
+        });
+        let tools = vec![terminal_handoff::tool(self.has_session, self.status.running)];
         let running = self.status.running;
         let activity = self.status.activity.clone();
         let about = self.about.clone();
         let empty = format!("No conversation about {about} yet. Give direction below.");
         self.transcript.update(cx, |panel, cx| {
             panel.set_entries(entries, cx);
+            panel.set_tools(tools, cx);
             panel.set_status(running, activity, cx);
             panel.set_empty_message(empty, cx);
         });
