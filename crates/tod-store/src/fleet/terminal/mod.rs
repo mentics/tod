@@ -293,37 +293,83 @@ fn spawn_windows_terminal(
     backend: &str,
     startup_command: Option<&str>,
 ) -> Result<()> {
-    let mut args = vec![
+    let args = vec![
         "-w".into(),
         "-1".into(),
         "new-tab".into(),
         "-d".into(),
         cwd.display().to_string(),
         "powershell.exe".into(),
+        "-NoExit".into(),
+        "-NoLogo".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-EncodedCommand".into(),
+        encode_powershell(&init_invocation(
+            &assets.windows_init,
+            shell_id,
+            &assets.state_dir,
+            cwd,
+            backend,
+            startup_command,
+        )),
     ];
-    args.extend(windows_launch_args(
-        &assets.windows_init,
-        shell_id,
-        &assets.state_dir,
-        cwd,
-        backend,
-        startup_command,
-    ));
     Command::new(program)
         .env("TOD_TERMINAL_BACKEND", backend)
-        .args(args.iter().map(|arg| escape_wt_delimiters(arg)))
+        .args(args)
         .spawn()
         .map(|_| ())
         .with_context(|| format!("spawn Windows Terminal `{program}` in {}", cwd.display()))
 }
 
-/// `arg` with each `;` escaped as `\;`: Windows Terminal splits its command
-/// line into subcommands at a bare `;`, even inside a quoted argument, so a
-/// startup command of several statements would otherwise run only up to its
-/// first `;`, and `wt` would try to launch the rest as a program.
+/// The init script's invocation as one PowerShell command. Windows Terminal
+/// re-tokenizes the command line it is given (splitting at spaces and at
+/// every `;`, quoted or not), so the shell gets it as `-EncodedCommand`,
+/// which has nothing in it for `wt` to split.
 #[cfg(any(windows, test))]
-fn escape_wt_delimiters(arg: &str) -> String {
-    arg.replace(';', r"\;")
+fn init_invocation(
+    init_script: &Path,
+    shell_id: &str,
+    state_dir: &Path,
+    cwd: &Path,
+    backend: &str,
+    startup_command: Option<&str>,
+) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let mut script = format!(
+        "& {} -TodShellId {} -TodStateDir {} -TodCwd {} -TodBackend {}",
+        quote(&init_script.display().to_string()),
+        quote(shell_id),
+        quote(&state_dir.display().to_string()),
+        quote(&cwd.display().to_string()),
+        quote(backend),
+    );
+    if let Some(cmd) = startup_command.map(str::trim).filter(|c| !c.is_empty()) {
+        script.push_str(&format!(" -TodStartupCommand {}", quote(cmd)));
+    }
+    script
+}
+
+/// `script` as `powershell -EncodedCommand` takes it: UTF-16LE, in base64.
+#[cfg(any(windows, test))]
+fn encode_powershell(script: &str) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[cfg(windows)]
@@ -1257,12 +1303,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_terminal_arguments_keep_their_semicolons() {
+    fn windows_terminal_gets_the_init_invocation_encoded() {
+        // What PowerShell's own encoder gives for `echo 'a;b'`.
+        assert_eq!(encode_powershell("echo 'a;b'"), "ZQBjAGgAbwAgACcAYQA7AGIAJwA=");
         assert_eq!(
-            escape_wt_delimiters("$env:A = 'x;'; claude --resume id"),
-            r"$env:A = 'x\;'\; claude --resume id"
+            init_invocation(
+                Path::new(r"C:\d\init.ps1"),
+                "s1",
+                Path::new(r"C:\d"),
+                Path::new(r"C:\my dir"),
+                "windows_terminal",
+                Some("tod-sandbox --run 'export A=x; claude'"),
+            ),
+            r"& 'C:\d\init.ps1' -TodShellId 's1' -TodStateDir 'C:\d' -TodCwd 'C:\my dir' -TodBackend 'windows_terminal' -TodStartupCommand 'tod-sandbox --run ''export A=x; claude'''"
         );
-        assert_eq!(escape_wt_delimiters("new-tab"), "new-tab");
     }
 
     #[test]

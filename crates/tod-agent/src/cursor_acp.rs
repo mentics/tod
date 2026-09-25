@@ -1033,6 +1033,7 @@ fn run_acp_session(
         context_chars: None,
         reply_parts: None,
         usage: None,
+        sign_in_hint: sign_in_hint(host, environment),
     };
 
     let client_name = host.client_name();
@@ -1182,6 +1183,8 @@ struct AcpClient {
     reply_parts: Option<SharedReplyParts>,
     /// What the agent reports spending, when the caller keeps it.
     usage: Option<SharedAcpUsage>,
+    /// What to tell the user when the agent says it is not signed in.
+    sign_in_hint: String,
 }
 
 impl AcpClient {
@@ -1329,6 +1332,9 @@ impl AcpClient {
                     );
                     let code = error.get("code").and_then(Value::as_i64);
                     let data = error.get("data");
+                    if is_auth_required(code, &message) {
+                        bail!("{} (ACP: {message})", self.sign_in_hint);
+                    }
                     match (code, data) {
                         (Some(code), Some(data)) => {
                             bail!("ACP error {code}: {message} ({data})")
@@ -1655,6 +1661,39 @@ fn spawn_agent(
                 in_container: true,
             })
         }
+    }
+}
+
+/// ACP's `auth_required` error: the agent CLI where it runs is not signed in.
+const ACP_AUTH_REQUIRED: i64 = -32000;
+
+fn is_auth_required(code: Option<i64>, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    // -32000 is also the start of JSON-RPC's generic server-error range, so
+    // the code alone is not taken as a sign-in problem.
+    message.contains("authentication required")
+        || (code == Some(ACP_AUTH_REQUIRED) && message.contains("auth"))
+}
+
+/// What the user does when `host`'s agent in `environment` is not signed in:
+/// sign in to its CLI there, which the adapter then uses.
+fn sign_in_hint(host: AcpHost, environment: &AgentEnvironment) -> String {
+    let (who, sign_in) = match host {
+        AcpHost::Claude => ("Claude Code", "run `claude` and sign in with `/login`"),
+        AcpHost::Cursor => ("Cursor Agent", "run `cursor-agent login`"),
+    };
+    match environment {
+        AgentEnvironment::Host => format!(
+            "{who} is not signed in on this machine. In a terminal, {sign_in}, then send again."
+        ),
+        AgentEnvironment::DevContainer(launch) => format!(
+            "{who} is not signed in inside dev container `{}`. Open a shell there (the node's              Files section, Open shell), {sign_in}, then send again.",
+            launch.container
+        ),
+        AgentEnvironment::Sandbox(launch) => format!(
+            "{who} is not signed in inside cloud sandbox `{0}`. Open a shell there (the node's              Files section, Open shell, or `tod-sandbox shell {0}`), {sign_in}, then send again.",
+            launch.sandbox
+        ),
     }
 }
 
@@ -2010,6 +2049,7 @@ impl PersistentAcpSession {
             context_chars,
             reply_parts,
             usage,
+            sign_in_hint: sign_in_hint(host, environment),
         };
 
         let client_name = host.client_name();
@@ -2133,6 +2173,34 @@ impl PersistentAcpSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unsigned_in_agent_says_where_to_sign_in() {
+        use super::{AcpHost, AgentEnvironment, is_auth_required, sign_in_hint};
+        assert!(is_auth_required(Some(-32000), "Authentication required"));
+        assert!(!is_auth_required(Some(-32000), "Internal error"));
+        assert!(!is_auth_required(Some(-32603), "session not found"));
+
+        let host = sign_in_hint(AcpHost::Claude, &AgentEnvironment::Host);
+        assert!(host.contains("on this machine") && host.contains("/login"), "{host}");
+        let sandbox = sign_in_hint(
+            AcpHost::Claude,
+            &AgentEnvironment::Sandbox(crate::sandbox::SandboxLaunch {
+                launcher: "tod-sandbox".into(),
+                data_root: "root".into(),
+                sandbox: "vm1".into(),
+                directory: "/work".into(),
+                env: Vec::new(),
+                cli_relay: Vec::new(),
+            }),
+        );
+        assert!(
+            sandbox.contains("cloud sandbox `vm1`") && sandbox.contains("tod-sandbox shell vm1"),
+            "{sandbox}"
+        );
+        let cursor = sign_in_hint(AcpHost::Cursor, &AgentEnvironment::Host);
+        assert!(cursor.contains("cursor-agent login"), "{cursor}");
+    }
+
     use super::*;
     use std::process::{Command, Stdio};
 
