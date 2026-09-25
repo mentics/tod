@@ -488,7 +488,7 @@ tokens:
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
     # The band behind every header: gray about as faint as highlight-faint.
-    header-fill: "#ffffff10"
+    header-fill: "#ffffff20"
     highlight-edge: "#1d4ed8"
     # highlight-edge at 25%: tints the header of the column that has focus.
     highlight-faint: "#1d4ed840"

@@ -100,7 +100,7 @@ pub mod color {
         hex(0xa3a3a380)
     }
     pub fn header_fill() -> Hsla {
-        hex(0xffffff10)
+        hex(0xffffff20)
     }
     pub fn group_band() -> Hsla {
         hex(0x26262680)
@@ -469,7 +469,11 @@ pub fn header<E: Styled>(el: E) -> E {
 /// `styles.header` for a header that tracks focus: in the `column-focused`
 /// state while `focused`, else the gray band.
 pub fn header_focusable<E: Styled + ParentElement>(el: E, focused: bool) -> E {
-    if focused { column_focused(el) } else { header(el) }
+    if focused {
+        column_focused(el)
+    } else {
+        header(el)
+    }
 }
 
 /// `styles.panel-header`.
