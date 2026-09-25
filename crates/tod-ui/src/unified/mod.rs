@@ -12,6 +12,7 @@ mod chat_drawer;
 mod columns;
 mod panel;
 pub mod panels;
+mod resize;
 pub mod status_label;
 
 pub use columns::{ColumnModel, PanelKind};
@@ -19,18 +20,26 @@ pub use panel::ColumnPanel;
 use chat_drawer::ChatDrawer;
 use panel::{PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use panels::DetailsPanel;
+use resize::{
+    ColumnDivider, DIVIDER_WIDTH, PANEL_MIN_WIDTH, ResizeStart, TREE_MIN_WIDTH,
+    starting_tree_width,
+};
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseDownEvent, ParentElement,
-    Render, SharedString, Styled, Subscription, Window, actions, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Bounds, Context, DragMoveEvent, Entity, EntityId, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyBinding, MouseDownEvent, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, actions,
+    canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::Button;
 use gpui_component::{ActiveTheme, IconName, Selectable, Sizable};
 use tod_core::attention::NodeAttention;
+use tod_core::workbench_layout::{self, WorkbenchLayout};
 use tod_store::conversation::Focus;
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
@@ -41,7 +50,6 @@ use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::key_context;
-use crate::ui::panel_split::{PanelSplitState, h_panel_split};
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::ui::style;
 use crate::views::lifecycle_control::LifecycleController;
@@ -147,6 +155,25 @@ struct HostedColumn {
     _subscriptions: Vec<Subscription>,
 }
 
+/// A column-2+ slot's width, kept beside `UnifiedView::hosted` (same index)
+/// so it survives the slot's panel being replaced.
+#[derive(Default)]
+struct ColumnWidth {
+    /// The width the user dragged it to; `None` shares what is left evenly.
+    dragged: Option<Pixels>,
+    /// Where it was at the last layout, which a drag starts from.
+    laid_out: Rc<Cell<Bounds<Pixels>>>,
+}
+
+/// The empty view GPUI shows under the pointer while a divider is dragged.
+struct DividerDrag;
+
+impl Render for DividerDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 pub struct UnifiedView {
     fleet: Arc<FleetStore>,
     paths: TodPaths,
@@ -158,6 +185,17 @@ pub struct UnifiedView {
     task_list: Entity<TaskListView>,
     columns: ColumnModel,
     hosted: Vec<HostedColumn>,
+    column_widths: Vec<ColumnWidth>,
+    /// Column 1's width: about 80 characters (`resize::starting_tree_width`)
+    /// until the user drags its divider. `None` until the first render,
+    /// which has the window to measure the font with.
+    tree_width: Option<Pixels>,
+    /// The divider drag in progress, from its first move.
+    resize: Option<ResizeStart>,
+    /// The widths saved from the last drag, in this or an earlier run
+    /// (`tod_core::workbench_layout`); a column opening at a position takes
+    /// the width saved for it.
+    layout: WorkbenchLayout,
     /// The bottom-of-window chat drawer (W8): a freeform conversation about
     /// whichever node is currently in focus. Never shown for the tree
     /// itself; see `chat_drawer`.
@@ -169,9 +207,6 @@ pub struct UnifiedView {
     /// that cannot have one (a finding, a decision) leaves this alone.
     last_chat_focus: Focus,
     focus_handle: FocusHandle,
-    /// The tree column's width: the default until the user drags the
-    /// divider, then theirs, whatever columns open or close beside it.
-    tree_split: Entity<PanelSplitState>,
     app_nav: AppNavMenu,
     /// What every node is waiting on the user for, recomputed off the UI
     /// thread on every store change (`attention_feed`) and fed to the tree
@@ -209,6 +244,7 @@ impl UnifiedView {
             this.apply_status_overrides(cx);
         });
         let _attention_poll = Self::spawn_attention_poll(fleet.clone(), cx);
+        let layout = workbench_layout::load(paths.config_dir());
         let mut this = Self {
             fleet,
             paths,
@@ -217,10 +253,13 @@ impl UnifiedView {
             task_list,
             columns: ColumnModel::new(),
             hosted: Vec::new(),
+            column_widths: Vec::new(),
+            tree_width: None,
+            resize: None,
+            layout,
             chat_drawer,
             last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
-            tree_split: cx.new(|_| PanelSplitState::new(px(TREE_COLUMN_WIDTH))),
             app_nav: AppNavMenu::default(),
             attention: HashMap::new(),
             _task_list_subscription,
@@ -579,6 +618,11 @@ impl UnifiedView {
         } else {
             let hosted = self.construct_hosted(target, window, cx);
             self.hosted.push(hosted);
+            let position = self.column_widths.len();
+            self.column_widths.push(ColumnWidth {
+                dragged: self.layout.column_width(position).map(px),
+                ..Default::default()
+            });
         }
         cx.notify();
     }
@@ -595,6 +639,7 @@ impl UnifiedView {
             return;
         }
         self.hosted.remove(index);
+        self.column_widths.remove(index);
         self.columns.close(index);
         cx.notify();
     }
@@ -773,25 +818,129 @@ impl UnifiedView {
             )
     }
 
-    /// Column `index + 2`. Every one takes an equal share of the width the
-    /// tree leaves, however many there are: a new column squeezes the others
-    /// rather than scrolling or folding them away.
+    /// A draggable divider; `divider` as in [`ColumnDivider`].
+    fn render_divider(&self, divider: usize, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (line, drag_border) = (theme.border, theme.drag_border);
+        let view = cx.entity().downgrade();
+        div()
+            .id(("unified-divider", divider))
+            .flex_shrink_0()
+            .w(px(DIVIDER_WIDTH))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .hover(move |el| el.bg(drag_border))
+            .child(div().w(px(1.)).h_full().bg(line))
+            .on_drag(ColumnDivider(divider), move |_, _, _, cx| {
+                // A new drag measures from where the columns are now.
+                let _ = view.update(cx, |this, _| this.resize = None);
+                cx.new(|_| DividerDrag)
+            })
+            .into_any_element()
+    }
+
+    /// Follow a divider drag: the first move records where the column left
+    /// of it starts and the pair's width, and every move puts the divider
+    /// under the pointer (`resize`). `view_left` is this view's left edge,
+    /// where the tree starts.
+    fn drag_divider(
+        &mut self,
+        divider: usize,
+        x: Pixels,
+        view_left: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let last = self.hosted.len().saturating_sub(1);
+        if self.hosted.is_empty() || divider > last {
+            return;
+        }
+        let start = match self.resize {
+            Some(start) if start.divider == divider => start,
+            _ => {
+                let (left_edge, left) = match divider {
+                    0 => (view_left, self.tree_width.unwrap_or(px(TREE_MIN_WIDTH))),
+                    n => {
+                        let bounds = self.column_widths[n - 1].laid_out.get();
+                        (bounds.left(), bounds.size.width)
+                    }
+                };
+                let pair = (divider < last)
+                    .then(|| left + self.column_widths[divider].laid_out.get().size.width);
+                let start = ResizeStart {
+                    divider,
+                    left_edge,
+                    pair,
+                };
+                self.resize = Some(start);
+                start
+            }
+        };
+        let min_left = px(if divider == 0 { TREE_MIN_WIDTH } else { PANEL_MIN_WIDTH });
+        let (left, right) = start.widths_at(x, min_left, px(PANEL_MIN_WIDTH));
+        match divider {
+            0 => self.tree_width = Some(left),
+            n => self.column_widths[n - 1].dragged = Some(left),
+        }
+        if let Some(right) = right {
+            self.column_widths[divider].dragged = Some(right);
+        }
+        cx.notify();
+    }
+
+    /// A divider drag ended: save every width, for the next launch too.
+    /// Positions not open now keep what was saved for them.
+    fn save_layout(&mut self, cx: &mut Context<Self>) {
+        self.resize = None;
+        self.layout.tree_width = self.tree_width.map(f32::from);
+        for (position, column) in self.column_widths.iter().enumerate() {
+            self.layout
+                .set_column_width(position, column.dragged.map(f32::from));
+        }
+        let (config_dir, layout) = (self.paths.config_dir().to_path_buf(), self.layout.clone());
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = workbench_layout::save(&config_dir, &layout) {
+                    tracing::warn!("workbench: failed to save column widths: {err:#}");
+                }
+            })
+            .detach();
+    }
+
+    /// Column `index + 2`, with a divider on its left. One the user has not
+    /// sized takes an equal share of what is left; a new column squeezes the
+    /// others rather than scrolling or folding them away.
     fn render_column(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
         let focus_handle = self.hosted[index].panel.focus_handle(cx);
         let header = self.render_column_header(index, cx).into_any_element();
         let panel = self.hosted[index].panel.render();
+        // The last column has no width of its own: it takes what is left.
+        let last = index + 1 == self.hosted.len();
+        let dragged = self.column_widths[index].dragged.filter(|_| !last);
+        let laid_out = self.column_widths[index].laid_out.clone();
         div()
             .id(("unified-col", index))
+            .relative()
             .flex()
             .flex_col()
-            .flex_1()
+            .map(|el| match dragged {
+                // Shrinks with the window like the rest, but never grows.
+                Some(width) => el.w(width),
+                None => el.flex_1(),
+            })
             .min_w_0()
             .h_full()
-            // The split's handle already divides the first from the tree.
-            .when(index > 0, |el| el.border_l_1().border_color(border))
             .debug_selector(move || format!("unified-col-{index}"))
             .capture_any_mouse_down(focus_on_click(focus_handle))
+            .child(
+                canvas(
+                    move |bounds, _, _| laid_out.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(header)
             .child(div().flex_1().overflow_hidden().child(panel))
             .into_any_element()
@@ -831,27 +980,31 @@ fn focus_on_click(handle: FocusHandle) -> impl Fn(&MouseDownEvent, &mut Window, 
     }
 }
 
-/// The node tree column's width until the user drags its divider (the chat
-/// drawer beneath it shares it). Wide enough that a row with both its
-/// "Needs you" and its requirement-count chips still shows a readable title.
-const TREE_COLUMN_WIDTH: f32 = 340.;
-/// Narrowest the divider lets the tree, and the columns beside it, get.
-const TREE_COLUMN_MIN_WIDTH: f32 = 200.;
-const PANEL_COLUMNS_MIN_WIDTH: f32 = 200.;
-
 impl Render for UnifiedView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_focused_column(window, cx);
-        let column_elements: Vec<_> = (0..self.columns.len())
-            .map(|ix| self.render_column(ix, cx).into_any_element())
-            .collect();
+        let border = cx.theme().border;
+        let tree_width = *self
+            .tree_width
+            .get_or_insert_with(|| starting_tree_width(window, self.layout.tree_width.map(px)));
+        let total = self.columns.len();
+        // Divider `ix` sits left of column `ix`.
+        let mut column_elements = Vec::new();
+        for ix in 0..total {
+            column_elements.push(self.render_divider(ix, cx));
+            column_elements.push(self.render_column(ix, cx).into_any_element());
+        }
         // Column 1: node tree on top (shrinks and scrolls as the drawer
         // below it expands), the chat drawer under it — never over it
         // (`doc/ui/unified-view.md` "The chat drawer"). Columns 2+ take the
         // full height.
         let task_list_focus = self.task_list.read(cx).focus_handle(cx);
         let tree_column = div()
-            .size_full()
+            .flex_shrink_0()
+            .w(tree_width)
+            .h_full()
+            .overflow_hidden()
+            .when(total == 0, |el| el.border_r_1().border_color(border))
             .flex()
             .flex_col()
             .child(
@@ -878,14 +1031,15 @@ impl Render for UnifiedView {
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::close_focused_column))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<ColumnDivider>, _, cx| {
+                let divider = event.drag(cx).0;
+                this.drag_divider(divider, event.event.position.x, event.bounds.left(), cx);
+            }))
+            .on_drop(cx.listener(|this, _: &ColumnDivider, _, cx| this.save_layout(cx)))
             .size_full()
-            .child(
-                h_panel_split("unified-split", &self.tree_split)
-                    .min_left(px(TREE_COLUMN_MIN_WIDTH))
-                    .min_right(px(PANEL_COLUMNS_MIN_WIDTH))
-                    .left(tree_column)
-                    .right(div().size_full().flex().children(column_elements)),
-            )
+            .flex()
+            .child(tree_column)
+            .children(column_elements)
     }
 }
 
@@ -908,7 +1062,16 @@ mod tests {
         let config_root =
             std::env::temp_dir().join(format!("tod-unified-config-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&config_root).unwrap();
-        crate::interview::set_data_root(config_root);
+        open_view_in(fixture, &config_root, cx)
+    }
+
+    /// `open_view` on a config root that already exists, as a later launch.
+    fn open_view_in<'a>(
+        fixture: &Fixture,
+        config_root: &std::path::Path,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<UnifiedView>, &'a mut VisualTestContext) {
+        crate::interview::set_data_root(config_root.to_path_buf());
         let paths = crate::interview::TodPaths::discover().unwrap();
         let slot = Rc::new(RefCell::new(None));
         let store = fixture.store.clone();
@@ -941,6 +1104,39 @@ mod tests {
     fn draw(cx: &mut VisualTestContext) {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
+        });
+    }
+
+    /// Widths saved when a drag ends come back on the next launch: the tree
+    /// takes its width, and a column opened at a position takes that
+    /// position's.
+    #[gpui::test]
+    fn dragged_widths_are_saved_and_taken_by_the_next_launch(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+            view.tree_width = Some(px(412.));
+            view.column_widths[0].dragged = Some(px(300.));
+            view.save_layout(cx);
+        });
+        cx.run_until_parked();
+
+        let config_dir = view.read_with(cx, |view, _| view.paths.config_dir().to_path_buf());
+        let saved = workbench_layout::load(&config_dir);
+        assert_eq!(saved.tree_width, Some(412.));
+        assert_eq!(saved.column_width(0), Some(300.));
+
+        // A later launch: a fresh view reads the file.
+        let (next, cx) = open_view_in(&fixture, &config_dir, cx);
+        next.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+        next.read_with(cx, |view, _| {
+            assert_eq!(view.tree_width, Some(px(412.)));
+            assert_eq!(view.column_widths[0].dragged, Some(px(300.)));
         });
     }
 

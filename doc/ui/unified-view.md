@@ -54,12 +54,18 @@ view is meant to end both.
 
 - **Column 1 is always the node tree panel.** It never leaves the screen: to
   answer one node's question the user often has to go and look at another.
-  It keeps a width of its own — a default until the user drags the divider
-  beside it, then theirs — whatever opens or closes beside it.
+  It starts wide enough for about 80 characters of a node's title, unless
+  that would leave no room for a panel beside it, and keeps its width
+  whatever opens or closes beside it.
 - **Columns 2 onward hold whatever the user opened**, and share the rest of
-  the width equally. The first takes all of it; a second halves it; a third
-  takes a third. There is no limit and nothing folds away: many columns are
-  just narrow ones.
+  the width equally until the user drags them. The first takes all of it; a
+  second halves it; a third takes a third. There is no limit and nothing
+  folds away: many columns are just narrow ones.
+- **Every divider between two columns can be dragged** to resize them. A drag
+  moves width between the two columns beside the divider and leaves the rest
+  where they are; the last column always takes whatever is left. Widths are
+  kept across restarts: the tree's, and each column position's (the next
+  panel opened in the third column takes the third column's width).
 - The focused column's header is tinted (`column-header` in
   `doc/ui-style-guide.yaml`). Column 1's header is the node tree's own
   toolbar, on one fixed-height row.
@@ -113,9 +119,9 @@ That one mechanism covers several layouts no one has to configure:
   deliberate: pinning a panel on the right and unpinning column 2 is how a user
   changes what appears in the middle.
 
-Pinning is the only layout control. A fully user-configurable layout (any
-panel in any slot, docking, dragging) was considered and rejected as not worth
-building.
+Pinning and dragging dividers are the only layout controls. A fully
+user-configurable layout (any panel in any slot, docking, dragging panels
+around) was considered and rejected as not worth building.
 
 ### The chat drawer
 

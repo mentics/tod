@@ -23,6 +23,7 @@ pub struct PanelSplitState {
 }
 
 impl PanelSplitState {
+    #[allow(dead_code)]
     pub fn new(left_width: Pixels) -> Self {
         Self {
             left_width,
