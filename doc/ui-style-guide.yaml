@@ -479,8 +479,8 @@ tokens:
     divider-strong: "#a3a3a380"
     group-band: "#26262680"
     highlight-edge: "#1d4ed8"
-    # highlight-edge at 10%: marks where focus is, fainter than `highlight`.
-    highlight-faint: "#1d4ed81a"
+    # highlight-edge at 25%: tints the header of the column that has focus.
+    highlight-faint: "#1d4ed840"
     toggle-on-fill: "#1d4ed8"
     toggle-on-edge: "#93c5fd"
     accent: "#1d4ed88c"

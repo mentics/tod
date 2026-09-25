@@ -43,7 +43,7 @@ pub mod color {
         hex(0x1d4ed8ff)
     }
     pub fn highlight_faint() -> Hsla {
-        hex(0x1d4ed81a)
+        hex(0x1d4ed840)
     }
     // Pane styles: no pane uses them yet (gpui-component draws its own
     // resizable handles).
