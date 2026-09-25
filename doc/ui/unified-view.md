@@ -59,7 +59,9 @@ view is meant to end both.
 - **Every divider between two columns can be dragged** to resize them. A drag
   moves width between the two columns beside the divider and leaves the rest
   where they are; the last column always takes whatever is left. Folded
-  strips have no divider.
+  strips have no divider. Widths are kept across restarts: the tree's, and
+  each column position's (the next panel opened in the third column takes
+  the third column's width).
 - **Columns 2 onward hold whatever the user opened.** The window fits four or
   five columns comfortably. When there are more than fit, the oldest unpinned
   columns fold into narrow strips instead of squeezing every column.

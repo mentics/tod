@@ -53,17 +53,20 @@ impl ResizeStart {
     }
 }
 
-/// Where the node tree starts: about 80 characters of the UI font, but
-/// never so wide that no panel fits beside it in this window.
-pub fn starting_tree_width(window: &Window) -> Pixels {
-    let style = window.text_style();
-    let font_size = style.font_size.to_pixels(window.rem_size());
-    let font_id = window.text_system().resolve_font(&style.font());
-    let ch = window
-        .text_system()
-        .ch_width(font_id, font_size)
-        .unwrap_or(font_size * 0.6);
-    let wanted = ch * TREE_START_CHARS + px(TREE_ROW_CHROME);
+/// Where the node tree starts: the width saved from the last drag, else
+/// about 80 characters of the UI font, but never so wide that no panel fits
+/// beside it in this window.
+pub fn starting_tree_width(window: &Window, saved: Option<Pixels>) -> Pixels {
+    let wanted = saved.unwrap_or_else(|| {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let font_id = window.text_system().resolve_font(&style.font());
+        let ch = window
+            .text_system()
+            .ch_width(font_id, font_size)
+            .unwrap_or(font_size * 0.6);
+        ch * TREE_START_CHARS + px(TREE_ROW_CHROME)
+    });
     let viewport = window.viewport_size().width;
     let fits = viewport - px(PANEL_MIN_WIDTH + DIVIDER_WIDTH);
     if fits > px(0.) {
