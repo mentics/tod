@@ -59,6 +59,8 @@ struct Loaded {
     plan_done: usize,
     plan_total: usize,
     decisions_waiting: usize,
+    findings_total: usize,
+    findings_open: usize,
 }
 
 impl Loaded {
@@ -71,6 +73,8 @@ impl Loaded {
             plan_done: 0,
             plan_total: 0,
             decisions_waiting: 0,
+            findings_total: 0,
+            findings_open: 0,
         }
     }
 }
@@ -99,6 +103,12 @@ fn load(fleet: &FleetStore, node_id: Uuid) -> Loaded {
         // steps too), so the count matches the tree's "needs you" badge.
         .map(|attention| attention.items.len())
         .unwrap_or(0);
+    if let Ok(findings) =
+        fleet.read(|conn| tod_store::review::ReviewRepo::new(conn).list_for_node(node_id))
+    {
+        loaded.findings_total = findings.len();
+        loaded.findings_open = findings.iter().filter(|f| f.is_open()).count();
+    }
     loaded
 }
 
@@ -349,6 +359,12 @@ impl Render for DetailsPanel {
         let plan_label = format!("Plan ({}/{})", self.loaded.plan_done, self.loaded.plan_total);
         let obligations_label = format!("Obligations ({})", self.loaded.obligation_count);
         let decisions_waiting = self.loaded.decisions_waiting;
+        let (findings_total, findings_open) = (self.loaded.findings_total, self.loaded.findings_open);
+        let findings_label = if findings_open > 0 {
+            format!("Findings ({findings_open} open)")
+        } else {
+            format!("Findings ({findings_total})")
+        };
         let editing = self.editing;
         let dirty = editing
             && self.details_input.read(cx).text().to_string() != self.loaded.details;
@@ -472,6 +488,16 @@ impl Render for DetailsPanel {
                                 this.open(PanelKind::Plan(node_id), cx);
                             })),
                     )
+                    .when(findings_total > 0, |el| {
+                        el.child(
+                            Button::new("unified-details-open-findings")
+                                .label(findings_label)
+                                .small()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open(PanelKind::Findings(node_id), cx);
+                                })),
+                        )
+                    })
                     .when(decisions_waiting > 0, |el| {
                         el.child(
                             Button::new("unified-details-open-decisions")
@@ -534,6 +560,37 @@ mod tests {
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
+    }
+
+    /// The Findings link only shows once the node has a finding, and counts
+    /// the open ones.
+    #[test]
+    fn load_counts_the_node_s_findings() {
+        use tod_store::interview::{ACTOR_AGENT, InterviewCommand};
+        use tod_store::review::NewFinding;
+
+        let fixture = Fixture::new();
+        let before = load(&fixture.store, fixture.node_id);
+        assert_eq!((before.findings_total, before.findings_open), (0, 0));
+        fixture
+            .store
+            .interview(
+                ACTOR_AGENT,
+                InterviewCommand::AddReviewFinding {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    finding: NewFinding {
+                        severity: "high".into(),
+                        summary: "Off-by-one in the loop".into(),
+                        file: None,
+                        line: None,
+                        detail: None,
+                    },
+                },
+            )
+            .unwrap();
+        let after = load(&fixture.store, fixture.node_id);
+        assert_eq!((after.findings_total, after.findings_open), (1, 1));
     }
 
     #[gpui::test]

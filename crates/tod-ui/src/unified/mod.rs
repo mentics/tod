@@ -2,9 +2,9 @@
 //! columns 2 onward, placed by the rule in `doc/ui/unified-view.md`.
 //!
 //! `columns` is the pure layout model (no GPUI); `panel` is the
-//! `ColumnPanel` contract and the `PlaceholderPanel` every panel kind uses
-//! until later work items (W5, W7, W9) supply the real ones. This module
-//! wires both into a GPUI view root, hosts `TaskListView` in column 1, and
+//! `ColumnPanel` contract every panel implements, with the events panels
+//! send the root; the panels themselves are in `panels`. This module wires
+//! them into a GPUI view root, hosts `TaskListView` in column 1, and
 //! registers the view's keys.
 
 mod attention_feed;
@@ -17,10 +17,7 @@ pub mod status_label;
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::ChatDrawer;
-use panel::{
-    PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelFocusSelected, PanelOpenChat, PanelOpenRequest,
-    PlaceholderPanel,
-};
+use panel::{PanelFocusSelected, PanelOpenChat, PanelOpenRequest};
 use panels::DetailsPanel;
 
 use std::collections::HashMap;
@@ -48,12 +45,9 @@ use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight, bind_pane_nav};
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::task_list::{TaskListEvent, TaskListView};
 
-/// One column-2+ panel entity. Every kind but `Details` and `Decisions`
-/// (still `PlaceholderPanel`, W5's and W9's respectively) is the real panel
-/// W7 adds; each hosts an existing view embedded, as
+/// One column-2+ panel entity. Most host an existing view embedded, as
 /// `conversation/context_panel.rs` already does.
 enum HostedPanel {
-    Placeholder(Entity<PlaceholderPanel>),
     Details(Entity<DetailsPanel>),
     Decisions(Entity<panels::decisions::DecisionsPanel>),
     Obligations(Entity<panels::obligations::ObligationsPanel>),
@@ -66,7 +60,6 @@ enum HostedPanel {
 impl HostedPanel {
     fn title(&self, cx: &App) -> SharedString {
         match self {
-            Self::Placeholder(e) => e.read(cx).title(cx),
             Self::Details(e) => e.read(cx).title(cx),
             Self::Decisions(e) => e.read(cx).title(cx),
             Self::Obligations(e) => e.read(cx).title(cx),
@@ -79,7 +72,6 @@ impl HostedPanel {
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
-            Self::Placeholder(e) => e.read(cx).focus_handle(cx),
             Self::Details(e) => e.read(cx).focus_handle(cx),
             Self::Decisions(e) => e.read(cx).focus_handle(cx),
             Self::Obligations(e) => e.read(cx).focus_handle(cx),
@@ -92,7 +84,6 @@ impl HostedPanel {
 
     fn entity_id(&self) -> EntityId {
         match self {
-            Self::Placeholder(e) => e.entity_id(),
             Self::Details(e) => e.entity_id(),
             Self::Decisions(e) => e.entity_id(),
             Self::Obligations(e) => e.entity_id(),
@@ -105,7 +96,6 @@ impl HostedPanel {
 
     fn render(&self) -> AnyElement {
         match self {
-            Self::Placeholder(e) => e.clone().into_any_element(),
             Self::Details(e) => e.clone().into_any_element(),
             Self::Decisions(e) => e.clone().into_any_element(),
             Self::Obligations(e) => e.clone().into_any_element(),
@@ -143,11 +133,6 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("alt-q", UnifiedNextWaiting, context),
         KeyBinding::new("alt-shift-q", UnifiedPrevWaiting, context),
         KeyBinding::new("ctrl-w", UnifiedCloseFocusedColumn, context),
-    ]);
-    let panel_context = Some(key_context::excluding_input(panel::UNIFIED_PANEL_CONTEXT));
-    cx.bind_keys([
-        KeyBinding::new("enter", PanelActivateFocusedLink, panel_context),
-        KeyBinding::new("ctrl-enter", PanelCtrlActivateFocusedLink, panel_context),
     ]);
     register_chat_drawer_keyboard_bindings(cx);
 }
