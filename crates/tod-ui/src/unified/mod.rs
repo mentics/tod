@@ -776,6 +776,13 @@ impl UnifiedView {
         }
     }
 
+    /// Put keyboard focus on the node tree: where keys go when the view is
+    /// shown, at startup or on switching to it.
+    pub fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.columns.focus_tree();
+        self.sync_window_focus(window, cx);
+    }
+
     fn sync_window_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.columns.focused_index() {
             Some(ix) => {
