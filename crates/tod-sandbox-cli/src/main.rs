@@ -42,7 +42,8 @@ ensure <name>            Install or update tod's pieces in a sandbox (idempotent
 bake <base-image> [--name IMAGE-NAME] [--agents]
                          Build an image with everything preinstalled.
 list                     Sandboxes in the workspace.
-status <name>            A sandbox's state (does not wake it).
+status <name>            Whether a sandbox is running or in standby, and its
+                         deployment status (does not wake it).
 exec <name> [--keep-awake] [--cwd DIR] -- <command...>
                          Run a command in the sandbox.
 shell <name> [--cwd DIR] [--park SECS] [--run CMD] [--cli-relay]
@@ -180,7 +181,12 @@ fn run() -> Result<i32> {
             let name = args.positional("sandbox name")?;
             args.done()?;
             match ctx.blaxel()?.get(&name)? {
-                Some(info) => println!("{name}: {} ({})", info.status, info.image),
+                Some(info) => println!(
+                    "{name}: {} ({}, {})",
+                    info.state.as_deref().unwrap_or("state unknown"),
+                    info.status,
+                    info.image
+                ),
                 None => println!("{name}: does not exist"),
             }
             Ok(0)
@@ -354,11 +360,19 @@ fn list(ctx: &Ctx) -> Result<i32> {
     let bx = ctx.blaxel()?;
     let mut all = bx.list()?;
     all.sort_by(|a, b| a.name.cmp(&b.name));
-    println!("{:<28} {:<12} {:<14} IMAGE", "NAME", "STATUS", "OWNER");
+    println!("{:<28} {:<10} {:<12} {:<14} IMAGE", "NAME", "STATE", "STATUS", "OWNER");
     for s in all {
         let owner = s.labels.iter().find(|(k, _)| k == "tod-owner").map(|(_, v)| v.as_str()).unwrap_or("");
         let mark = if ctx.config.sandbox(&s.name).is_some() { "*" } else { "" };
-        println!("{:<28} {:<12} {:<14} {}", format!("{}{mark}", s.name), s.status, owner, s.image);
+        let state = s.state.as_deref().unwrap_or("-");
+        println!(
+            "{:<28} {:<10} {:<12} {:<14} {}",
+            format!("{}{mark}", s.name),
+            state,
+            s.status,
+            owner,
+            s.image
+        );
     }
     println!("(* = known to this tod)");
     Ok(0)

@@ -315,7 +315,8 @@ pub fn runs_as_is(image: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedSandbox {
     pub name: String,
-    /// As Blaxel reports it (`DEPLOYED`, `STANDBY`, …).
+    /// Whether it is running or in standby (`RUNNING`, `STANDBY`, …) when
+    /// Blaxel says, else its deployment status (`DEPLOYED`, …).
     pub status: String,
     pub image: String,
     /// Who created it (the `tod-owner` label).
@@ -334,10 +335,10 @@ pub fn list(root: &Path) -> Result<Vec<ListedSandbox>> {
         .into_iter()
         .filter(|info| !matches!(info.status.as_str(), "TERMINATED" | "DELETING"))
         .map(|info| ListedSandbox {
+            status: info.state_or_status().to_string(),
             owner: info.label("tod-owner").map(str::to_string),
             known: sandboxes.config.sandbox(&info.name).is_some(),
             name: info.name,
-            status: info.status,
             image: info.image,
         })
         .collect();

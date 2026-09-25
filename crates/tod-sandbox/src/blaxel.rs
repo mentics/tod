@@ -22,13 +22,22 @@ pub struct Blaxel {
 #[derive(Debug, Clone)]
 pub struct SandboxInfo {
     pub name: String,
+    /// The deployment's status (`DEPLOYED`, `FAILED`, ...): a sandbox in
+    /// standby is still `DEPLOYED`.
     pub status: String,
+    /// Whether it is running now (`RUNNING`, `STANDBY`, ...), when Blaxel says.
+    pub state: Option<String>,
     pub url: Option<String>,
     pub image: String,
     pub labels: Vec<(String, String)>,
 }
 
 impl SandboxInfo {
+    /// Its state when Blaxel reports one, else its status.
+    pub fn state_or_status(&self) -> &str {
+        self.state.as_deref().unwrap_or(&self.status)
+    }
+
     pub fn label(&self, key: &str) -> Option<&str> {
         self.labels.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
@@ -72,6 +81,7 @@ fn parse_info(v: &Value) -> SandboxInfo {
     SandboxInfo {
         name: meta["name"].as_str().unwrap_or_default().to_string(),
         status: v["status"].as_str().unwrap_or("UNKNOWN").to_string(),
+        state: v["state"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         url: meta["url"].as_str().map(str::to_string),
         image: v["spec"]["runtime"]["image"].as_str().unwrap_or_default().to_string(),
         labels,
