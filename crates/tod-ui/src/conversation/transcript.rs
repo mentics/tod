@@ -196,7 +196,9 @@ impl ConversationView {
         } else {
             Vec::new()
         };
-        header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        if crate::ui::report_problem::is_available(cx) {
+            header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
+        }
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);

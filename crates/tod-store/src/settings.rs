@@ -73,6 +73,16 @@ impl Default for JourneySettings {
 }
 
 impl JourneySettings {
+    /// Whether a report would actually be sent: sending is on and the relay
+    /// code parses. Everything that offers "Report a problem" asks this.
+    pub fn can_submit(&self) -> bool {
+        self.send
+            && self
+                .relay_code
+                .as_deref()
+                .is_some_and(|code| tod_journey::relay_code::RelayCode::parse(code).is_ok())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.send {
             let code = self
@@ -664,6 +674,30 @@ mod tests {
     use super::*;
     use crate::paths::{clear_data_root_override, set_data_root};
     use std::fs;
+
+    #[test]
+    fn journeys_can_submit_only_when_sending_with_a_valid_relay_code() {
+        let (_identity, recipient) = tod_journey::seal::generate_test_identity();
+        let code = tod_journey::relay_code::RelayCode {
+            recipient,
+            server: "https://ntfy.sh".into(),
+            inbox: "inbox".into(),
+            ack: "ack".into(),
+        }
+        .format()
+        .unwrap();
+
+        let mut journeys = JourneySettings::default();
+        assert!(!journeys.can_submit());
+        journeys.relay_code = Some(code);
+        assert!(!journeys.can_submit(), "a relay code alone is not enough");
+        journeys.send = true;
+        assert!(journeys.can_submit());
+        journeys.relay_code = Some("not a relay code".into());
+        assert!(!journeys.can_submit());
+        journeys.relay_code = None;
+        assert!(!journeys.can_submit());
+    }
 
     #[test]
     fn defaults_when_missing() {

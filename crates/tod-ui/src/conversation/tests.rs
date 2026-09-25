@@ -27,6 +27,9 @@ fn open_view<'a>(
     cx.update(|cx| {
         gpui_component::init(cx);
         register_conversation_keyboard_bindings(cx);
+        // The header's navigation order below includes "Report a problem",
+        // which only shows once reporting is set up.
+        crate::ui::report_problem::set_available(true, cx);
     });
     let slot = Rc::new(RefCell::new(None));
     let events: Events = Rc::new(RefCell::new(Vec::new()));
@@ -1915,8 +1918,8 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
     let node = Focus::Node(fixture.node_id);
     let without = create_conversation(&fixture, node);
     let (view, _, cx) = open_view(&fixture, node, cx);
-    // "Report a problem" is always a header action, so its presence isn't a
-    // useful signal; "Copy context" only appears once there's context to
+    // "Report a problem" is always a header action here (`open_view` turns
+    // reporting on), so its presence isn't a useful signal; "Copy context" only appears once there's context to
     // copy, at which point it pushes "Report a problem" out to index 1.
     let header_stop = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
         view.read_with(cx, |view, cx| {
@@ -1960,6 +1963,28 @@ fn copy_context_puts_the_opening_context_on_the_clipboard(cx: &mut TestAppContex
         view.read_with(cx, |v, _| v.status_line.contains("Copied")),
         "the header says it was copied"
     );
+}
+
+#[gpui::test]
+fn report_a_problem_is_not_offered_until_reporting_is_set_up(cx: &mut TestAppContext) {
+    let fixture = Fixture::new();
+    let node = Focus::Node(fixture.node_id);
+    create_conversation(&fixture, node);
+    let (view, _, cx) = open_view(&fixture, node, cx);
+    let has_header_action = |view: &Entity<ConversationView>, cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, cx| {
+            view.transcript
+                .read(cx)
+                .stops()
+                .contains(&PanelStop::HeaderAction(0))
+        })
+    };
+    draw(cx);
+    assert!(has_header_action(&view, cx), "offered once set up");
+
+    cx.update(|_, cx| crate::ui::report_problem::set_available(false, cx));
+    draw(cx);
+    assert!(!has_header_action(&view, cx), "hidden while it is not");
 }
 
 #[gpui::test]

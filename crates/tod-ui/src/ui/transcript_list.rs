@@ -685,7 +685,9 @@ impl TranscriptList {
                             style::text(text).into_any_element()
                         },
                     ));
-                    if entry.kind == EntryKind::Error {
+                    if entry.kind == EntryKind::Error
+                        && crate::ui::report_problem::is_available(cx)
+                    {
                         chunk = chunk.child(
                             gpui_component::button::Button::new((
                                 "transcript-entry-report-problem",
