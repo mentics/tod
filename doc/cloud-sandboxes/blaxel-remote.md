@@ -221,8 +221,8 @@ Time from the request to its complete answer, sandbox asleep:
 | 20 s | 397, 422 ms | 217, 282 ms | 809, 744 ms |
 | 60 s | 431, 440 ms | 270, 281 ms | 708, 781 ms |
 | 5 min | 745 ms (open 686 ms) | 269 ms | 745, 748 ms |
-| 20 min | 491 ms | _pending_ | — |
-| 60 min | _pending_ | — | — |
+| 20 min | 491 ms | 258 ms | — |
+| 60 min | 475 ms (open 367 ms) | — | — |
 
 Warm (just used), for comparison:
 
