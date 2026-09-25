@@ -11,13 +11,13 @@ use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, SharedString, Styled, Window, actions, div,
 };
-use tod_store::conversation::ConversationRepo;
+use tod_store::conversation::{ConversationRepo, Focus};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
 use crate::ui::key_context;
 use crate::unified::PanelKind;
-use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
+use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenRequest};
 use crate::views::obligations::ObligationsView;
 
 const OBLIGATIONS_PANEL_CONTEXT: &str = "UnifiedObligationsPanel";
@@ -48,6 +48,10 @@ pub struct ObligationsPanel {
     fleet: Arc<FleetStore>,
     node_id: Uuid,
     inner: Entity<ObligationsView>,
+    /// The obligation last reported to the chat drawer via
+    /// `PanelFocusSelected`, so a re-render only emits again when the
+    /// selection actually changed.
+    last_reported: Option<Uuid>,
 }
 
 impl ObligationsPanel {
@@ -68,11 +72,26 @@ impl ObligationsPanel {
             fleet,
             node_id,
             inner,
+            last_reported: None,
         }
     }
 
     pub fn node_id(&self) -> Uuid {
         self.node_id
+    }
+
+    /// Select an obligation as the user would by clicking it, so the next
+    /// render reports it to the chat drawer via [`PanelFocusSelected`].
+    #[cfg(test)]
+    pub(crate) fn select_obligation(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inner.update(cx, |inner, cx| {
+            inner.highlight_item(id, window, cx);
+        });
     }
 
     /// Point this column at a different node, in place.
@@ -120,6 +139,7 @@ impl ColumnPanel for ObligationsPanel {
 }
 
 impl EventEmitter<PanelOpenRequest> for ObligationsPanel {}
+impl EventEmitter<PanelFocusSelected> for ObligationsPanel {}
 
 impl Focusable for ObligationsPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -129,6 +149,16 @@ impl Focusable for ObligationsPanel {
 
 impl Render for ObligationsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.inner.read(cx).selected_obligation_id();
+        if selected.is_some() && selected != self.last_reported {
+            self.last_reported = selected;
+            if let Some(id) = selected {
+                cx.emit(PanelFocusSelected(Focus::Obligation {
+                    node: self.node_id,
+                    id,
+                }));
+            }
+        }
         div()
             .key_context(OBLIGATIONS_PANEL_CONTEXT)
             .size_full()

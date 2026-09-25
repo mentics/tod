@@ -17,7 +17,10 @@ pub mod status_label;
 pub use columns::{ColumnModel, DEFAULT_VISIBLE_COLUMNS, PanelKind};
 pub use panel::ColumnPanel;
 use chat_drawer::ChatDrawer;
-use panel::{PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelOpenRequest, PlaceholderPanel};
+use panel::{
+    PanelActivateFocusedLink, PanelCtrlActivateFocusedLink, PanelFocusSelected, PanelOpenRequest,
+    PlaceholderPanel,
+};
 use panels::DetailsPanel;
 
 use std::collections::HashMap;
@@ -145,7 +148,7 @@ pub fn register_unified_keyboard_bindings(cx: &mut App) {
 /// open requests up to the root.
 struct HostedColumn {
     panel: HostedPanel,
-    _subscription: Option<Subscription>,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub struct UnifiedView {
@@ -163,6 +166,12 @@ pub struct UnifiedView {
     /// whichever node is currently in focus. Never shown for the tree
     /// itself; see `chat_drawer`.
     chat_drawer: Entity<ChatDrawer>,
+    /// The most recent selection that can hold an agent session — a node
+    /// (tree, or Details when retargeted), an obligation, or a plan step —
+    /// whichever panel it happened in. Drives the chat drawer
+    /// (`doc/ui/unified-view.md` "The chat drawer"). Selecting something
+    /// that cannot have one (a finding, a decision) leaves this alone.
+    last_chat_focus: Focus,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
     /// What every node is waiting on the user for, recomputed off the UI
@@ -206,6 +215,7 @@ impl UnifiedView {
             columns: ColumnModel::new(),
             hosted: Vec::new(),
             chat_drawer,
+            last_chat_focus: Focus::Project,
             focus_handle: cx.focus_handle(),
             app_nav: AppNavMenu::default(),
             attention: HashMap::new(),
@@ -290,6 +300,7 @@ impl UnifiedView {
                     // selection opens Details in the first unpinned column
                     // starting at column 2 (index 0), as a plain (non-ctrl) open.
                     self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+                    self.set_chat_focus(Focus::Node(id), cx);
                 }
                 // The decisions panel is a singleton with no target of its own:
                 // it always follows whichever node is current
@@ -356,7 +367,7 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Details(panel),
-                    _subscription: Some(subscription),
+                    _subscriptions: vec![subscription],
                 }
             }
             PanelKind::Decisions => {
@@ -378,7 +389,7 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Decisions(panel),
-                    _subscription: Some(subscription),
+                    _subscriptions: vec![subscription],
                 }
             }
             PanelKind::Obligations(id) => {
@@ -386,26 +397,40 @@ impl UnifiedView {
                     panels::obligations::ObligationsPanel::new(id, self.fleet.clone(), window, cx)
                 });
                 let panel_id = panel.entity_id();
-                let subscription =
+                let open_sub =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
                         this.route_open_request(panel_id, event, window, cx);
                     });
+                let focus_sub = cx.subscribe_in(
+                    &panel,
+                    window,
+                    |this, _, event: &PanelFocusSelected, _window, cx| {
+                        this.set_chat_focus(event.0, cx);
+                    },
+                );
                 HostedColumn {
                     panel: HostedPanel::Obligations(panel),
-                    _subscription: Some(subscription),
+                    _subscriptions: vec![open_sub, focus_sub],
                 }
             }
             PanelKind::Plan(id) => {
                 let panel =
                     cx.new(|cx| panels::plan::PlanPanel::new(id, self.fleet.clone(), window, cx));
                 let panel_id = panel.entity_id();
-                let subscription =
+                let open_sub =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
                         this.route_open_request(panel_id, event, window, cx);
                     });
+                let focus_sub = cx.subscribe_in(
+                    &panel,
+                    window,
+                    |this, _, event: &PanelFocusSelected, _window, cx| {
+                        this.set_chat_focus(event.0, cx);
+                    },
+                );
                 HostedColumn {
                     panel: HostedPanel::Plan(panel),
-                    _subscription: Some(subscription),
+                    _subscriptions: vec![open_sub, focus_sub],
                 }
             }
             PanelKind::Findings(id) => {
@@ -418,7 +443,7 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Findings(panel),
-                    _subscription: Some(subscription),
+                    _subscriptions: vec![subscription],
                 }
             }
             PanelKind::Settings(id) => {
@@ -433,7 +458,7 @@ impl UnifiedView {
                 });
                 HostedColumn {
                     panel: HostedPanel::Settings(panel),
-                    _subscription: None,
+                    _subscriptions: Vec::new(),
                 }
             }
             PanelKind::Transcript(id) => {
@@ -441,7 +466,7 @@ impl UnifiedView {
                     .new(|cx| panels::transcript::TranscriptPanel::new(id, self.fleet.clone(), window, cx));
                 HostedColumn {
                     panel: HostedPanel::Transcript(panel),
-                    _subscription: None,
+                    _subscriptions: Vec::new(),
                 }
             }
         }
@@ -467,20 +492,13 @@ impl UnifiedView {
         self.open_panel(event.target, col, event.ctrl, window, cx);
     }
 
-    /// The unified view's current focus for the chat drawer (W8): the
-    /// focused column's target node, else the node tree's selection, else
-    /// the whole project.
-    fn chat_focus(&self, cx: &App) -> Focus {
-        if let Some(ix) = self.columns.focused_index()
-            && let Some(column) = self.columns.columns().get(ix)
-            && let Some(node) = column.panel.node()
-        {
-            return Focus::Node(node);
-        }
-        match self.task_list.read(cx).selected_node_id() {
-            Some(id) => Focus::Node(id),
-            None => Focus::Project,
-        }
+    /// Point the chat drawer at `focus`, the most recent selection that can
+    /// hold an agent session, wherever it happened
+    /// (`doc/ui/unified-view.md` "The chat drawer"). `ChatDrawer::set_focus`
+    /// itself is a no-op when `focus` already matches.
+    fn set_chat_focus(&mut self, focus: Focus, cx: &mut Context<Self>) {
+        self.last_chat_focus = focus;
+        self.chat_drawer.update(cx, |drawer, cx| drawer.set_focus(focus, cx));
     }
 
     /// Ctrl+J toggles the chat drawer here instead of opening the old
@@ -501,6 +519,9 @@ impl UnifiedView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let PanelKind::Details(node_id) = target {
+            self.set_chat_focus(Focus::Node(node_id), cx);
+        }
         let before = self.columns.len();
         let ix = self.columns.open(target, from_column, ctrl);
         if ix < before {
@@ -758,9 +779,6 @@ const TREE_COLUMN_WIDTH: f32 = 280.;
 
 impl Render for UnifiedView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focus = self.chat_focus(cx);
-        self.chat_drawer.update(cx, |drawer, cx| drawer.set_focus(focus, cx));
-
         let border = cx.theme().border;
         let visible_slots = DEFAULT_VISIBLE_COLUMNS;
         let folded = self.columns.folded(visible_slots);
@@ -768,6 +786,21 @@ impl Render for UnifiedView {
         let column_elements: Vec<_> = (0..total)
             .map(|ix| self.render_column(ix, folded.contains(&ix), cx).into_any_element())
             .collect();
+        // Column 1: node tree on top (shrinks and scrolls as the drawer
+        // below it expands), the chat drawer under it — never over it
+        // (`doc/ui/unified-view.md` "The chat drawer"). Columns 2+ take the
+        // full height.
+        let tree_column = div()
+            .flex_shrink_0()
+            .w(px(TREE_COLUMN_WIDTH))
+            .h_full()
+            .overflow_hidden()
+            .border_r_1()
+            .border_color(border)
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().overflow_hidden().child(self.task_list.clone()))
+            .child(self.chat_drawer.clone());
         div()
             .id("unified-view")
             .key_context(UNIFIED_CONTEXT)
@@ -780,31 +813,8 @@ impl Render for UnifiedView {
             .on_action(cx.listener(Self::focus_right))
             .size_full()
             .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .w(px(TREE_COLUMN_WIDTH))
-                            .h_full()
-                            .border_r_1()
-                            .border_color(border)
-                            .child(self.task_list.clone()),
-                    )
-                    .children(column_elements),
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .w_full()
-                    .flex()
-                    .child(div().flex_shrink_0().w(px(TREE_COLUMN_WIDTH)))
-                    .child(div().flex_1().min_w(px(220.)).child(self.chat_drawer.clone())),
-            )
+            .child(tree_column)
+            .children(column_elements)
     }
 }
 
@@ -965,6 +975,74 @@ mod tests {
 
         view.update_in(cx, |view, window, cx| {
             view.open_panel(PanelKind::Details(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.chat_drawer.read(cx).focus(), Focus::Node(node_id));
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_an_obligation_points_the_chat_drawer_at_it(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+        let obligation_id = fixture.offline_obligation;
+
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Obligations(node_id), 0, false, window, cx);
+        });
+        draw(cx);
+
+        view.update_in(cx, |view, window, cx| {
+            let Some(hosted) = view
+                .hosted
+                .iter_mut()
+                .find(|h| matches!(h.panel, HostedPanel::Obligations(_)))
+            else {
+                panic!("obligations column opened");
+            };
+            let HostedPanel::Obligations(panel) = &hosted.panel else {
+                unreachable!()
+            };
+            let panel = panel.clone();
+            panel.update(cx, |panel, cx| {
+                panel.select_obligation(obligation_id, window, cx);
+            });
+        });
+        // The panel reports its selection to the drawer on its next render.
+        draw(cx);
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.chat_drawer.read(cx).focus(),
+                Focus::Obligation {
+                    node: node_id,
+                    id: obligation_id,
+                }
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn selecting_a_finding_leaves_the_chat_drawer_where_it_was(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        let (view, cx) = open_view(&fixture, cx);
+        let node_id = fixture.node_id;
+
+        // Point the drawer at the node first, as selecting it in the tree
+        // would.
+        view.update_in(cx, |view, _window, cx| {
+            view.set_chat_focus(Focus::Node(node_id), cx);
+        });
+        draw(cx);
+
+        // Opening (and rendering) the findings panel — which never reports a
+        // selection to the drawer, since a finding cannot hold an agent
+        // session — must not move the drawer's focus.
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(PanelKind::Findings(node_id), 0, false, window, cx);
         });
         draw(cx);
 

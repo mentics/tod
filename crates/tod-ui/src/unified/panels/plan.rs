@@ -11,13 +11,13 @@ use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, SharedString, Styled, Window, actions, div,
 };
-use tod_store::conversation::ConversationRepo;
+use tod_store::conversation::{ConversationRepo, Focus};
 use tod_store::fleet::FleetStore;
 use uuid::Uuid;
 
 use crate::ui::key_context;
 use crate::unified::PanelKind;
-use crate::unified::panel::{ColumnPanel, PanelOpenRequest};
+use crate::unified::panel::{ColumnPanel, PanelFocusSelected, PanelOpenRequest};
 use crate::views::plan_steps::PlanStepsView;
 
 const PLAN_PANEL_CONTEXT: &str = "UnifiedPlanPanel";
@@ -44,6 +44,10 @@ pub struct PlanPanel {
     fleet: Arc<FleetStore>,
     node_id: Uuid,
     inner: Entity<PlanStepsView>,
+    /// The plan step last reported to the chat drawer via
+    /// `PanelFocusSelected`, so a re-render only emits again when the
+    /// selection actually changed.
+    last_reported: Option<Uuid>,
 }
 
 impl PlanPanel {
@@ -64,6 +68,7 @@ impl PlanPanel {
             fleet,
             node_id,
             inner,
+            last_reported: None,
         }
     }
 
@@ -116,6 +121,7 @@ impl ColumnPanel for PlanPanel {
 }
 
 impl EventEmitter<PanelOpenRequest> for PlanPanel {}
+impl EventEmitter<PanelFocusSelected> for PlanPanel {}
 
 impl Focusable for PlanPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -125,6 +131,16 @@ impl Focusable for PlanPanel {
 
 impl Render for PlanPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.inner.read(cx).selected_id();
+        if selected.is_some() && selected != self.last_reported {
+            self.last_reported = selected;
+            if let Some(id) = selected {
+                cx.emit(PanelFocusSelected(Focus::PlanStep {
+                    node: self.node_id,
+                    id,
+                }));
+            }
+        }
         div()
             .key_context(PLAN_PANEL_CONTEXT)
             .size_full()
