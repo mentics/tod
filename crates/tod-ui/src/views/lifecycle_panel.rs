@@ -100,6 +100,12 @@ enum LifecyclePanelStop {
     RunInCloud,
     /// A cloud node: sync with the orchestrator now.
     SyncCloud,
+    /// A cloud node: take it out of the cloud (asks to confirm first).
+    StopCloud,
+    /// Confirm [`Self::StopCloud`]; `true` deletes the sandbox too.
+    ConfirmStopCloud(bool),
+    /// Back out of [`Self::StopCloud`].
+    CancelStopCloud,
     MoveBack,
     CheckIncoming,
     Implement,
@@ -249,6 +255,8 @@ pub struct LifecyclePanelView {
     /// Keyed by the node it is about.
     cloud_status: Option<(String, String)>,
     cloud_busy: bool,
+    /// "Stop running in the cloud" was pressed and waits for confirmation.
+    cloud_stop_armed: bool,
     focus_handle: FocusHandle,
     focus_index: usize,
     _controller_subscription: Subscription,
@@ -328,6 +336,7 @@ impl LifecyclePanelView {
             cloud: None,
             cloud_status: None,
             cloud_busy: false,
+            cloud_stop_armed: false,
             focus_handle: cx.focus_handle(),
             focus_index: 0,
             _controller_subscription: subscription,
@@ -386,6 +395,13 @@ impl LifecyclePanelView {
         let mut stops = Vec::new();
         if self.lifecycle_capable && self.cloud.is_some() {
             stops.push(LifecyclePanelStop::SyncCloud);
+            if self.cloud_stop_armed {
+                stops.push(LifecyclePanelStop::ConfirmStopCloud(false));
+                stops.push(LifecyclePanelStop::ConfirmStopCloud(true));
+                stops.push(LifecyclePanelStop::CancelStopCloud);
+            } else {
+                stops.push(LifecyclePanelStop::StopCloud);
+            }
             stops.push(LifecyclePanelStop::Close);
             return stops;
         }
@@ -492,6 +508,10 @@ impl LifecyclePanelView {
             LifecyclePanelStop::SyncCloud => {
                 if self.cloud_busy { "Syncing…" } else { "Sync now" }.to_string()
             }
+            LifecyclePanelStop::StopCloud => "Stop running in the cloud".to_string(),
+            LifecyclePanelStop::ConfirmStopCloud(false) => "Confirm: stop, keep the sandbox".to_string(),
+            LifecyclePanelStop::ConfirmStopCloud(true) => "Confirm: stop and delete the sandbox".to_string(),
+            LifecyclePanelStop::CancelStopCloud => "Cancel".to_string(),
             LifecyclePanelStop::MoveBack => self
                 .regression
                 .as_ref()
@@ -586,6 +606,9 @@ impl LifecyclePanelView {
             | LifecyclePanelStop::CheckIncoming
             | LifecyclePanelStop::RunInCloud
             | LifecyclePanelStop::SyncCloud
+            | LifecyclePanelStop::StopCloud
+            | LifecyclePanelStop::ConfirmStopCloud(_)
+            | LifecyclePanelStop::CancelStopCloud
             | LifecyclePanelStop::Close => false,
             #[allow(unreachable_patterns)]
             _ => {
@@ -600,7 +623,10 @@ impl LifecyclePanelView {
     fn stop_disabled(&self, stop: LifecyclePanelStop, cx: &App) -> bool {
         match stop {
             LifecyclePanelStop::Implement => self.implement_directory().is_err(),
-            LifecyclePanelStop::RunInCloud | LifecyclePanelStop::SyncCloud => self.cloud_busy,
+            LifecyclePanelStop::RunInCloud
+            | LifecyclePanelStop::SyncCloud
+            | LifecyclePanelStop::StopCloud
+            | LifecyclePanelStop::ConfirmStopCloud(_) => self.cloud_busy,
             LifecyclePanelStop::AdvanceAfterCriteria => {
                 !self.current_state(cx, |s| s.all_clear())
             }
@@ -640,7 +666,7 @@ impl LifecyclePanelView {
             notices.push(error);
         }
         if let Some(cloud) = &self.cloud {
-            notices.push(crate::views::cloud_node::status_line(cloud, &self.lifecycle));
+            notices.push(self.cloud_line(cloud));
         }
         if let Some(status) = self.cloud_status_line() {
             notices.push(status);
@@ -671,6 +697,16 @@ impl LifecyclePanelView {
         match stop {
             LifecyclePanelStop::RunInCloud => self.run_in_cloud(cx),
             LifecyclePanelStop::SyncCloud => self.sync_cloud(cx),
+            LifecyclePanelStop::StopCloud => {
+                self.cloud_stop_armed = true;
+                cx.notify();
+            }
+            LifecyclePanelStop::CancelStopCloud => {
+                self.cloud_stop_armed = false;
+                self.clamp_focus_index(cx);
+                cx.notify();
+            }
+            LifecyclePanelStop::ConfirmStopCloud(delete) => self.stop_cloud(delete, cx),
             LifecyclePanelStop::MoveBack => self.move_back(cx),
             LifecyclePanelStop::CheckIncoming => self.check_incoming(cx),
             LifecyclePanelStop::Implement => self.launch_implementation(window, cx),
@@ -725,6 +761,30 @@ impl LifecyclePanelView {
         });
     }
 
+    /// Take the node out of the cloud off the UI thread, deleting its
+    /// sandbox when `delete_sandbox`.
+    fn stop_cloud(&mut self, delete_sandbox: bool, cx: &mut Context<Self>) {
+        let Some(task_id) = self.task_id.clone() else {
+            return;
+        };
+        if self.cloud_busy {
+            return;
+        }
+        self.cloud_busy = true;
+        self.cloud_stop_armed = false;
+        self.cloud_status = Some((task_id.clone(), "Leaving the cloud…".to_string()));
+        cx.notify();
+        crate::views::cloud_node::stop_running(self.fleet.clone(), task_id.clone(), delete_sandbox, cx, move |this, update, cx| {
+            this.cloud_update(&task_id, update, cx)
+        });
+    }
+
+    /// A cloud node's status line, with what the last lost-sandbox check did.
+    fn cloud_line(&self, cloud: &tod_core::cloud_sync::CloudNode) -> String {
+        let note = self.task_id.as_deref().and_then(tod_core::cloud_sync::lost::note);
+        crate::views::cloud_node::status_line_with(cloud, &self.lifecycle, note.as_deref())
+    }
+
     /// The cloud job's latest word, when it is about the node shown.
     fn cloud_status_line(&self) -> Option<String> {
         self.cloud_status
@@ -742,6 +802,14 @@ impl LifecyclePanelView {
                 let msg = format!("Running in sandbox {}.", node.sandbox);
                 if self.task_id.as_deref() == Some(task_id) {
                     self.cloud = Some(node);
+                    self.clamp_focus_index(cx);
+                }
+                msg
+            }
+            CloudUpdate::Left(msg) => {
+                self.cloud_busy = false;
+                if self.task_id.as_deref() == Some(task_id) {
+                    self.cloud = None;
                     self.clamp_focus_index(cx);
                 }
                 msg
@@ -1107,7 +1175,7 @@ impl LifecyclePanelView {
         if let Some(cloud) = &self.cloud {
             section = section.child(style::text_dense_muted(div()).child(selectable_text(
                 "lifecycle-panel-cloud-status",
-                crate::views::cloud_node::status_line(cloud, &self.lifecycle),
+                self.cloud_line(cloud),
                 window,
                 cx,
             )));
@@ -1128,6 +1196,36 @@ impl LifecyclePanelView {
                         })),
                 ),
         );
+        if self.cloud.is_some() {
+            let leave: Vec<LifecyclePanelStop> = if self.cloud_stop_armed {
+                vec![
+                    LifecyclePanelStop::ConfirmStopCloud(false),
+                    LifecyclePanelStop::ConfirmStopCloud(true),
+                    LifecyclePanelStop::CancelStopCloud,
+                ]
+            } else {
+                vec![LifecyclePanelStop::StopCloud]
+            };
+            for (i, stop) in leave.into_iter().enumerate() {
+                let focused = self.is_focused(stop, cx);
+                section = section.child(
+                    div()
+                        .w_full()
+                        .rounded_md()
+                        .when(focused, |el| el.border_1().border_color(list_active_border))
+                        .child(
+                            Button::new(("lifecycle-panel-cloud-stop", i))
+                                .label(self.stop_label(stop, cx))
+                                .compact()
+                                .w_full()
+                                .disabled(self.stop_disabled(stop, cx))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.perform(stop, Source::Click, window, cx);
+                                })),
+                        ),
+                );
+            }
+        }
         if let Some(status) = self.cloud_status_line() {
             section = section.child(style::text_dense_muted(div()).child(selectable_text(
                 "lifecycle-panel-cloud-progress",
@@ -1496,8 +1594,12 @@ impl LifecyclePanelView {
                 self.refresh_standing();
                 self.refresh_incoming();
                 self.refresh_learnings();
-                let root = self.fleet.paths().root().to_path_buf();
-                self.cloud = tod_core::cloud_sync::cloud_node(&root, task_id);
+                // The store's open read connection: no database is opened here.
+                let cloud = tod_core::cloud_sync::cloud_node(&self.fleet, task_id);
+                if cloud.is_none() {
+                    self.cloud_stop_armed = false;
+                }
+                self.cloud = cloud;
                 true
             }
             _ => false,
@@ -2340,20 +2442,68 @@ mod tests {
     fn a_cloud_node_shows_its_status_instead_of_lifecycle_buttons(cx: &mut TestAppContext) {
         let fixture = Fixture::new();
         set_lifecycle(&fixture, "design");
-        let mut state = tod_core::cloud_sync::CloudSyncState::default();
-        state.nodes.insert(
-            fixture.node_id.to_string(),
-            tod_core::cloud_sync::CloudNode {
-                sandbox: "node-x".into(),
-                user: "u".into(),
-                accepted_at_ms: 0,
-            },
-        );
-        state.save(fixture.store.paths().root()).unwrap();
+        make_cloud_node(&fixture, "node-x");
         let (view, cx) = open_panel(&fixture, cx);
         let (stops, presented) = view.read_with(cx, |panel, cx| (panel.stops(cx), panel.presented(cx)));
-        assert_eq!(stops, vec![LifecyclePanelStop::SyncCloud, LifecyclePanelStop::Close]);
+        assert_eq!(
+            stops,
+            vec![LifecyclePanelStop::SyncCloud, LifecyclePanelStop::StopCloud, LifecyclePanelStop::Close]
+        );
         assert!(presented.notices.iter().any(|n| n.contains("node-x")), "{presented:?}");
+    }
+
+    fn make_cloud_node(fixture: &Fixture, sandbox: &str) {
+        let _ = fixture.store.flush_on_quit();
+        let conn = rusqlite::Connection::open(fixture.store.paths().db()).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, fixture.node_id, sandbox, "u", 0).unwrap();
+        drop(conn);
+        fixture.store.reload_if_stale().unwrap();
+    }
+
+    /// "Stop running in the cloud" asks first, records what was on offer,
+    /// and removing the row (off the UI thread) turns the panel back into
+    /// the lifecycle buttons.
+    #[gpui::test]
+    fn stopping_a_cloud_node_confirms_then_removes_its_record(cx: &mut TestAppContext) {
+        let fixture = Fixture::new();
+        set_lifecycle(&fixture, "design");
+        make_cloud_node(&fixture, "node-x");
+        let (view, cx) = open_panel(&fixture, cx);
+
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| panel.perform(LifecyclePanelStop::StopCloud, Source::Click, window, cx))
+        });
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(
+            stops,
+            vec![
+                LifecyclePanelStop::SyncCloud,
+                LifecyclePanelStop::ConfirmStopCloud(false),
+                LifecyclePanelStop::ConfirmStopCloud(true),
+                LifecyclePanelStop::CancelStopCloud,
+                LifecyclePanelStop::Close,
+            ],
+            "nothing is removed before the user confirms"
+        );
+        let presented = view.read_with(cx, |panel, cx| panel.presented(cx));
+        assert!(
+            presented.actions.iter().any(|a| a.label == "Confirm: stop and delete the sandbox"),
+            "{presented:?}"
+        );
+
+        cx.update(|window, cx| {
+            view.update(cx, |panel, cx| {
+                panel.perform(LifecyclePanelStop::ConfirmStopCloud(false), Source::Click, window, cx)
+            })
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while view.read_with(cx, |panel, _| panel.cloud.is_some()) && std::time::Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(tod_core::cloud_sync::cloud_node(&fixture.store, &fixture.node_id.to_string()).is_none());
+        let stops = view.read_with(cx, |panel, cx| panel.stops(cx));
+        assert_eq!(stops.first(), Some(&LifecyclePanelStop::RunInCloud));
     }
 
     #[gpui::test]

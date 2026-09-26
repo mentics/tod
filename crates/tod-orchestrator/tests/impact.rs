@@ -145,3 +145,60 @@ fn posted_changes_mark_and_poke_only_the_affected_nodes() {
     drop(fleet);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+struct GonePoker;
+
+impl Poker for GonePoker {
+    fn poke(&self, wake: &Wake) -> anyhow::Result<()> {
+        Err(tod_orchestrator::wakes::SandboxGone(wake.sandbox.clone()).into())
+    }
+}
+
+#[test]
+fn a_poke_that_finds_the_sandbox_gone_marks_the_node_lost() {
+    let base: PathBuf = std::env::temp_dir().join(format!("tod-orch-lost-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let app = base.join("app");
+    let fleet = FleetStore::open(&app).unwrap();
+    fleet.enqueue_outline(OutlineMutation::CreateList { slug: "t".into(), title: "T".into() }).unwrap();
+    fleet.writer().flush().unwrap();
+    let list_id = fleet.list_outline_lists().unwrap()[0].id;
+    let a = node(&fleet, list_id, None, "Running A");
+    {
+        let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+        tod_store::cloud_nodes::upsert(&conn, a, "node-a", "alice", 1).unwrap();
+    }
+    let server = Server::with_poker(
+        Config { base: base.join("orchestrator"), tod_cli: "unused".into(), tod_cli_prefix: Vec::new() },
+        Box::new(GonePoker),
+    )
+    .unwrap();
+    let snap = base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let seeded = server.handle(&request("POST", "/users/alice/seed", "app-1", std::fs::read(&snap).unwrap()));
+    assert_eq!(seeded.status, 200, "{}", String::from_utf8_lossy(&seeded.body));
+    let remote = base.join("orchestrator").join("users").join("alice").join("tod.db");
+
+    server.wakes().poke_now(Wake {
+        id: "w".into(),
+        user: "alice".into(),
+        node: a.to_string(),
+        sandbox: "node-a".into(),
+        at: 0,
+    });
+    let row = |db: &Path| {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        tod_store::cloud_nodes::get(&conn, a).unwrap().unwrap()
+    };
+    assert!(row(&remote).lost_at.is_some(), "the node is marked lost");
+    assert!(server.wakes().list().is_empty(), "and the poke is not retried");
+
+    // The app replacing the sandbox (a fresh upsert) clears the mark.
+    let conn = rusqlite::Connection::open(&remote).unwrap();
+    tod_store::cloud_nodes::upsert(&conn, a, "node-a", "alice", 2).unwrap();
+    drop(conn);
+    assert_eq!(row(&remote).lost_at, None);
+
+    drop(fleet);
+    let _ = std::fs::remove_dir_all(&base);
+}

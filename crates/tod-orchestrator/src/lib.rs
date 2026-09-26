@@ -86,6 +86,7 @@ impl Server {
     pub fn with_sink(config: Config, poker: Box<dyn wakes::Poker>, sink: Box<dyn notify::Sink>) -> Result<Arc<Self>> {
         let users = Arc::new(Users::new(config.base.clone()));
         let wakes = wakes::Wakes::load(&config.base, poker)?;
+        wakes.set_lost_handler(impact_handler::lost_handler(users.clone()));
         let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
         let webhook_secrets = webhooks::Secrets::load(&config.base)?;
         Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets }))

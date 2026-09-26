@@ -12,6 +12,10 @@
 //! in its own state rather than writing back here: a write from the
 //! supervisor would carry the whole row and could overwrite a newer mark.
 //!
+//! `lost_at` (ms, schema v70) is set by the orchestrator when it cannot poke
+//! the node's sandbox because the sandbox is gone; the app replaces the
+//! sandbox (it alone holds the user's tokens) and [`upsert`] clears it.
+//!
 //! Writes go through a plain connection (the caller's), like the rest of
 //! sync; the store's read view is reloaded by the caller.
 
@@ -32,6 +36,17 @@ pub const CREATE_TABLE: &str = "
     );
 ";
 
+/// The v70 migration: the `lost_at` column (idempotent).
+pub fn add_lost_at(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("SELECT 1 FROM pragma_table_info('cloud_nodes') WHERE name = 'lost_at'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE cloud_nodes ADD COLUMN lost_at INTEGER")?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudNodeRow {
     pub node_id: Uuid,
@@ -39,6 +54,8 @@ pub struct CloudNodeRow {
     pub user: String,
     pub accepted_at: i64,
     pub context_changed_at: Option<i64>,
+    /// When the orchestrator found the sandbox gone (ms), until replaced.
+    pub lost_at: Option<i64>,
 }
 
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudNodeRow> {
@@ -49,10 +66,11 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CloudNodeRow> {
         user: row.get(2)?,
         accepted_at: row.get(3)?,
         context_changed_at: row.get(4)?,
+        lost_at: row.get(5)?,
     })
 }
 
-const COLUMNS: &str = "node_id, sandbox, user_name, accepted_at, context_changed_at";
+const COLUMNS: &str = "node_id, sandbox, user_name, accepted_at, context_changed_at, lost_at";
 
 fn has_table(conn: &Connection) -> Result<bool> {
     Ok(conn
@@ -61,12 +79,12 @@ fn has_table(conn: &Connection) -> Result<bool> {
 }
 
 /// Records (or re-records) that `node` runs in `sandbox` for `user`. Keeps
-/// an existing context mark.
+/// an existing context mark; clears a lost mark (the sandbox was replaced).
 pub fn upsert(conn: &Connection, node: Uuid, sandbox: &str, user: &str, accepted_at: i64) -> Result<()> {
     conn.execute(
         "INSERT INTO cloud_nodes (node_id, sandbox, user_name, accepted_at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(node_id) DO UPDATE SET sandbox = excluded.sandbox,
-             user_name = excluded.user_name, accepted_at = excluded.accepted_at",
+             user_name = excluded.user_name, accepted_at = excluded.accepted_at, lost_at = NULL",
         params![uuid_to_blob(node), sandbox, user, accepted_at],
     )?;
     Ok(())
@@ -100,6 +118,15 @@ pub fn mark_context_changed(conn: &Connection, node: Uuid, at: i64) -> Result<()
     conn.execute(
         "UPDATE cloud_nodes SET context_changed_at = ?2
          WHERE node_id = ?1 AND (context_changed_at IS NULL OR context_changed_at < ?2)",
+        params![uuid_to_blob(node), at],
+    )?;
+    Ok(())
+}
+
+/// Marks `node`'s sandbox lost at `at` (kept if already marked).
+pub fn mark_lost(conn: &Connection, node: Uuid, at: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE cloud_nodes SET lost_at = ?2 WHERE node_id = ?1 AND lost_at IS NULL",
         params![uuid_to_blob(node), at],
     )?;
     Ok(())

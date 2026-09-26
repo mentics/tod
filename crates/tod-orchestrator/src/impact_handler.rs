@@ -47,3 +47,27 @@ pub fn poke(wakes: &Wakes, user: &str, nodes: &[CloudNodeRow]) {
         });
     }
 }
+
+/// Marks the wake's node lost in its user's database (under the user's sync
+/// lock), so the app sees `lost_at` on its next sync and replaces the sandbox.
+pub fn mark_lost(users: &crate::users::Users, wake: &Wake, now: i64) -> Result<()> {
+    let node = uuid::Uuid::parse_str(&wake.node)?;
+    let user = users.get(&wake.user)?;
+    let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = user.store.flush_on_quit();
+    let conn = Connection::open(user.store.paths().db())?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    cloud_nodes::mark_lost(&conn, node, now)?;
+    drop(conn);
+    let _ = user.store.reload_if_stale();
+    Ok(())
+}
+
+/// The [`Wakes`] lost handler that calls [`mark_lost`].
+pub fn lost_handler(users: std::sync::Arc<crate::users::Users>) -> crate::wakes::LostHandler {
+    Box::new(move |wake: &Wake| {
+        if let Err(err) = mark_lost(&users, wake, crate::wakes::now_ms()) {
+            eprintln!("tod-orchestrator: mark node {} lost: {err:#}", wake.node);
+        }
+    })
+}

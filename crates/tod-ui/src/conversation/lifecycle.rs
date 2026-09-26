@@ -107,7 +107,7 @@ impl LifecycleSnapshot {
             standing,
             lifecycle,
             blocked,
-            cloud: tod_core::cloud_sync::cloud_node(fleet.paths().root(), &task_id),
+            cloud: tod_core::cloud_sync::cloud_node(fleet, &task_id),
         })
     }
 
@@ -153,7 +153,11 @@ impl ConversationView {
         if let Some(cloud) = &snapshot.cloud {
             notices.push(PanelNotice::new(
                 NoticeTone::Muted,
-                crate::views::cloud_node::status_line(cloud, &snapshot.lifecycle),
+                crate::views::cloud_node::status_line_with(
+                    cloud,
+                    &snapshot.lifecycle,
+                    tod_core::cloud_sync::lost::note(&snapshot.node.to_string()).as_deref(),
+                ),
             ));
             return (actions, notices);
         }

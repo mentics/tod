@@ -141,7 +141,13 @@ pub fn runner(fleet: &Arc<FleetStore>) -> Arc<Coalesced> {
         .or_insert_with(|| {
             let fleet = fleet.clone();
             Coalesced::new(move || match cloud_sync::sync_now(&fleet, &root) {
-                Ok(report) => tracing::info!("cloud sync: {}", report.summary()),
+                Ok(report) => {
+                    tracing::info!("cloud sync: {}", report.summary());
+                    // The orchestrator found a node's sandbox gone: replace it.
+                    if cloud_sync::lost::any_marked(&fleet) {
+                        cloud_sync::lost::spawn_check(fleet.clone(), cloud_sync::lost::Check::Marked);
+                    }
+                }
                 Err(err) => tracing::warn!("cloud sync failed: {err:#}"),
             })
         })
