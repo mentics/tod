@@ -69,6 +69,9 @@ pub struct Entry {
     /// check's verdict). When set, the reply's answer is shown collapsed as
     /// [`PieceKind::Structured`] and this is shown in its place.
     pub summary: Option<String>,
+    /// An agent reply still being streamed: every piece is work so far (none
+    /// is the answer yet), and each starts collapsed.
+    pub live: bool,
 }
 
 impl Entry {
@@ -80,6 +83,19 @@ impl Entry {
             parts: Vec::new(),
             label: Some(label.into()),
             summary: None,
+            live: false,
+        }
+    }
+
+    /// The agent's turn in flight, as streamed so far.
+    pub fn live_reply(parts: Vec<ReplyPart>) -> Self {
+        Self {
+            kind: EntryKind::Agent,
+            body: String::new(),
+            parts,
+            label: None,
+            summary: None,
+            live: true,
         }
     }
 }
@@ -141,11 +157,17 @@ impl PieceKind {
 
 /// The pieces of an agent entry: its parts, or its body as one answer.
 pub fn pieces(entry: &Entry) -> Vec<(PieceKind, &ReplyPart)> {
-    let answer_from = entry
-        .parts
-        .iter()
-        .rposition(|p| !matches!(p, ReplyPart::Text { .. }))
-        .map_or(0, |ix| ix + 1);
+    // Until a live reply ends, its trailing text may yet turn out to be
+    // narration before more work, so none of it is the answer.
+    let answer_from = if entry.live {
+        entry.parts.len()
+    } else {
+        entry
+            .parts
+            .iter()
+            .rposition(|p| !matches!(p, ReplyPart::Text { .. }))
+            .map_or(0, |ix| ix + 1)
+    };
     entry
         .parts
         .iter()
@@ -286,7 +308,8 @@ fn rows(entries: &[Entry], toggled: &HashMap<ChunkId, bool>, start: StartState) 
         }));
         if entry.summary.is_some() {
             rows.push(Row::Summary(entry_ix));
-        } else if entry.body.trim().is_empty()
+        } else if !entry.live
+            && entry.body.trim().is_empty()
             && !pieces.iter().any(|(kind, _)| *kind == PieceKind::Answer)
         {
             rows.push(Row::NoNotes(entry_ix));
@@ -386,8 +409,15 @@ impl TranscriptList {
             let changed: HashSet<usize> = (0..entries.len().max(self.entries.len()))
                 .filter(|ix| entries.get(*ix) != self.entries.get(*ix))
                 .collect();
+            // A live reply grows in place; keep its newest step in view
+            // unless the user has scrolled away from the end.
+            let follow = entries.last().is_some_and(|e| e.live)
+                && self.list.is_scrolled_to_end().unwrap_or(true);
             self.entries = entries;
             self.sync_rows(&changed);
+            if follow {
+                self.list.scroll_to_end();
+            }
             cx.notify();
         }
     }
@@ -709,7 +739,9 @@ impl TranscriptList {
             }
             EntryKind::Agent => {
                 let pieces = pieces(entry);
-                let answer = if let Some(summary) = &entry.summary {
+                let answer = if entry.live {
+                    "working…".to_string()
+                } else if let Some(summary) = &entry.summary {
                     first_line(summary)
                 } else if entry.body.trim().is_empty() {
                     "Done, no notes".to_string()
@@ -859,6 +891,7 @@ mod tests {
             parts,
             label: None,
             summary: None,
+            live: false,
         }
     }
 
@@ -877,6 +910,7 @@ mod tests {
             parts: Vec::new(),
             label: None,
             summary: None,
+            live: false,
         }
     }
 
@@ -1043,6 +1077,48 @@ mod tests {
             answer,
             StartState::Collapsed
         ));
+    }
+
+    #[test]
+    fn a_live_reply_lists_every_step_collapsed() {
+        let entries = vec![Entry::live_reply(vec![
+            text("Let me look."),
+            ReplyPart::Tool {
+                id: "1".into(),
+                title: "Read".into(),
+                status: "in_progress".into(),
+            },
+            text("Now the tests."),
+        ])];
+        let toggled = HashMap::new();
+        let kinds: Vec<PieceKind> = pieces(&entries[0]).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            kinds,
+            [PieceKind::Narration, PieceKind::Tool, PieceKind::Narration]
+        );
+        // The reply is open, so each step is a line of its own, and none of
+        // them is open.
+        assert_eq!(
+            rows(&entries, &toggled, StartState::Reading),
+            [
+                Row::Entry {
+                    entry: 0,
+                    marker: false
+                },
+                Row::Piece { entry: 0, part: 0 },
+                Row::Piece { entry: 0, part: 1 },
+                Row::Piece { entry: 0, part: 2 },
+            ]
+        );
+        assert!((0..3).all(|part| !is_expanded(
+            &entries,
+            &toggled,
+            ChunkId {
+                entry: 0,
+                part: Some(part)
+            },
+            StartState::Reading
+        )));
     }
 
     #[test]

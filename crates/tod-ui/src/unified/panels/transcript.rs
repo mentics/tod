@@ -35,6 +35,7 @@ fn entry_of(turn: &Turn) -> Entry {
         parts: turn.parts.clone(),
         label: None,
         summary: None,
+        live: false,
     }
 }
 

@@ -594,6 +594,13 @@ impl AgentProvider for CursorAcpProvider {
             .conversations
             .entry(key.clone())
             .or_insert_with(|| LiveConversation::spawn(spec.clone(), resume_session_id.clone()));
+        // The worker clears them when it starts the turn; until then a poll
+        // would report the previous turn's parts as this one's.
+        conversation
+            .reply_parts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         if let Err(mpsc::SendError(command)) = conversation.cmd_tx.send(command) {
             // The worker is gone: start another, resuming the session it reached.
             let resume = conversation.session_id().or(resume_session_id);

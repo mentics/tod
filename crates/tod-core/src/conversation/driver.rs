@@ -91,6 +91,9 @@ pub struct ConversationStatus {
     pub running: bool,
     /// What the agent is doing right now, when the provider reports it.
     pub activity: Option<String>,
+    /// The turn in flight so far, part by part (text, thoughts, tool calls),
+    /// when the provider streams them. Empty when no turn is in flight.
+    pub parts: Vec<ReplyPart>,
     /// The agent is blocked on a permission decision; answer it through the
     /// provider (`respond_to_permission`) with this request's run.
     pub permission: Option<PermissionRequest>,
@@ -151,6 +154,7 @@ pub struct ConversationDriver {
     session_tokens: Option<i64>,
     reported_stale: ReportedStale,
     activity: Option<String>,
+    parts: Vec<ReplyPart>,
     permission: Option<PermissionRequest>,
     last_error: Option<String>,
     live_usage: Option<TokenUsage>,
@@ -171,6 +175,7 @@ impl ConversationDriver {
             session_tokens: None,
             reported_stale: ReportedStale::new(),
             activity: None,
+            parts: Vec::new(),
             permission: None,
             last_error: None,
             live_usage: None,
@@ -230,6 +235,7 @@ impl ConversationDriver {
         ConversationStatus {
             running: self.run.is_some(),
             activity: self.activity.clone(),
+            parts: self.parts.clone(),
             permission: self.permission.clone(),
             last_error: self.last_error.clone(),
             live_usage: self.live_usage.clone(),
@@ -258,6 +264,7 @@ impl ConversationDriver {
         };
         let _ = agent.with(|a| a.cancel_run(run.id));
         self.activity = None;
+        self.parts.clear();
         self.permission = None;
         let id = self
             .conversation_id
@@ -411,11 +418,17 @@ impl ConversationDriver {
         };
         let outcome = match agent.with(|a| a.poll_run(run.id)) {
             Some(AgentRunState::InFlight(activity)) => {
+                self.parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 self.activity = activity;
                 self.permission = None;
                 return self.save_session_id(fleet, agent);
             }
             Some(AgentRunState::NeedsPermission(request)) => {
+                self.parts = agent
+                    .with(|a| a.session_reply_parts(&run.key))
+                    .unwrap_or_default();
                 // Otherwise the view keeps showing the tool that asked, as
                 // if it were still running.
                 self.activity = Some(format!(
@@ -431,6 +444,7 @@ impl ConversationDriver {
         };
         let run = self.run.take().expect("checked above");
         self.activity = None;
+        self.parts.clear();
         self.permission = None;
         let id = self
             .conversation_id

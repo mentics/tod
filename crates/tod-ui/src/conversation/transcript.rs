@@ -33,6 +33,7 @@ pub(super) fn entry_of(turn: &Turn) -> Entry {
         parts: turn.parts.clone(),
         label: None,
         summary: None,
+        live: false,
     }
 }
 
@@ -162,7 +163,7 @@ impl ConversationView {
         let active =
             self.pane == Pane::Transcript && self.stop == Stop::Transcript && self.picker.is_none();
         let gate_check = self.data.protocol == ProtocolKind::GateCheck;
-        let entries = self
+        let mut entries: Vec<_> = self
             .data
             .turns
             .iter()
@@ -184,6 +185,10 @@ impl ConversationView {
                 entry
             })
             .collect();
+        // The turn in flight, one line per step so far.
+        if self.status.running && !self.status.parts.is_empty() {
+            entries.push(Entry::live_reply(self.status.parts.clone()));
+        }
         let empty = format!(
             "No conversation about {} yet. Give direction below.",
             self.data.title

@@ -78,6 +78,7 @@ fn entry_of(turn: &Turn) -> Entry {
         parts: turn.parts.clone(),
         label: None,
         summary: None,
+        live: false,
     }
 }
 
@@ -425,7 +426,11 @@ impl ChatDrawer {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
-        let entries: Vec<Entry> = turns.iter().map(entry_of).collect();
+        let mut entries: Vec<Entry> = turns.iter().map(entry_of).collect();
+        // The turn in flight, one line per step so far.
+        if self.status.running && !self.status.parts.is_empty() {
+            entries.push(Entry::live_reply(self.status.parts.clone()));
+        }
         self.has_session = self.conversation_id.is_some_and(|id| {
             self.fleet
                 .read(|conn| ConversationRepo::new(conn).get(id))
