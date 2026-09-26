@@ -34,6 +34,7 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::status::{self, StatusSource};
 use crate::ui::toast::{error_toast, info_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
+use crate::views::pull_requests::{PullRequestsEvent, PullRequestsView};
 use crate::views::database::DatabaseView;
 use crate::views::incoming_check::{IncomingCheck, IncomingCheckEvent};
 use crate::views::lifecycle_control::LifecycleController;
@@ -162,6 +163,7 @@ pub struct Shell {
     _lifecycle_panel_subscription: Subscription,
     _visual_design_panel_subscription: Subscription,
     _action_panel_subscription: Subscription,
+    _pull_requests_subscription: Subscription,
     _sessions_subscription: Subscription,
     _conversation_subscription: Subscription,
     _settings_subscription: Subscription,
@@ -594,6 +596,15 @@ impl Shell {
                 if !self.drawer.action.read(cx).is_open() {
                     self.task_list.update(cx, |list, cx| {
                         list.show_error("Could not open the Action panel", window, cx);
+                    });
+                }
+            }
+            DrawerRequest::OpenPullRequests { task_id, title } => {
+                if let Ok(node_id) = Uuid::parse_str(&task_id) {
+                    self.drawer
+                        .close_except(Some(DrawerKind::PullRequests), window, cx);
+                    self.drawer.pull_requests.update(cx, |panel, cx| {
+                        panel.open(node_id, &title, window, cx);
                     });
                 }
             }
@@ -1960,6 +1971,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 interactive_agent_window.clone(),
                             )
                         });
+                        let pull_requests_panel = cx.new(|cx| {
+                            PullRequestsView::new(cx, fleet.clone(), paths.data_root().to_path_buf())
+                        });
                         let agent_for_sessions = agent.clone();
                         let sessions = cx.new(|cx| {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
@@ -2040,6 +2054,15 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         TaskListEvent::OpenPlan { task_id, title } => {
                                             this.queue_drawer(
                                                 DrawerRequest::OpenPlan {
+                                                    task_id: task_id.clone(),
+                                                    title: title.clone(),
+                                                },
+                                                cx,
+                                            );
+                                        }
+                                        TaskListEvent::OpenPullRequests { task_id, title } => {
+                                            this.queue_drawer(
+                                                DrawerRequest::OpenPullRequests {
                                                     task_id: task_id.clone(),
                                                     title: title.clone(),
                                                 },
@@ -2248,6 +2271,18 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
+                            let _pull_requests_subscription = cx.subscribe(
+                                &pull_requests_panel,
+                                |this: &mut Shell, _, event, cx| match event {
+                                    PullRequestsEvent::Close => {
+                                        this.on_drawer_panel_closed(cx);
+                                    }
+                                    PullRequestsEvent::FocusTaskList => {
+                                        this.pending_refocus_task_list = true;
+                                        cx.notify();
+                                    }
+                                },
+                            );
                             let _sessions_subscription = cx.subscribe(
                                 &sessions,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -2337,6 +2372,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     lifecycle: lifecycle_panel,
                                     visual_design: visual_design_panel,
                                     action: action_panel,
+                                    pull_requests: pull_requests_panel,
                                 },
                                 sessions,
                                 conversation,
@@ -2379,6 +2415,7 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _lifecycle_panel_subscription,
                                 _visual_design_panel_subscription,
                                 _action_panel_subscription,
+                                _pull_requests_subscription,
                                 _sessions_subscription,
                                 _conversation_subscription,
                                 _settings_subscription,

@@ -18,6 +18,7 @@ use crate::views::action_panel::ActionPanelView;
 use crate::views::lifecycle_panel::LifecyclePanelView;
 use crate::views::obligations::ObligationsView;
 use crate::views::plan_steps::PlanStepsView;
+use crate::views::pull_requests::PullRequestsView;
 use crate::views::task_edit::TaskEditView;
 use crate::views::visual_design_panel::VisualDesignPanelView;
 use gpui::{AnyElement, App, Entity, Focusable, IntoElement, Window};
@@ -32,15 +33,17 @@ pub(crate) enum DrawerKind {
     Lifecycle,
     VisualDesign,
     Action,
+    PullRequests,
 }
 
-const ALL_KINDS: [DrawerKind; 6] = [
+const ALL_KINDS: [DrawerKind; 7] = [
     DrawerKind::TaskEdit,
     DrawerKind::Obligations,
     DrawerKind::Plan,
     DrawerKind::Lifecycle,
     DrawerKind::VisualDesign,
     DrawerKind::Action,
+    DrawerKind::PullRequests,
 ];
 
 /// A change to the drawer, queued from event handlers (which have no
@@ -68,6 +71,10 @@ pub(crate) enum DrawerRequest {
     OpenActionPanel {
         task_id: String,
     },
+    OpenPullRequests {
+        task_id: String,
+        title: String,
+    },
     /// The tree selection changed.
     Follow {
         task_id: Option<String>,
@@ -83,6 +90,7 @@ pub(crate) struct RightDrawer {
     pub lifecycle: Entity<LifecyclePanelView>,
     pub visual_design: Entity<VisualDesignPanelView>,
     pub action: Entity<ActionPanelView>,
+    pub pull_requests: Entity<PullRequestsView>,
 }
 
 impl RightDrawer {
@@ -94,6 +102,7 @@ impl RightDrawer {
             DrawerKind::Lifecycle => self.lifecycle.read(cx).is_open(),
             DrawerKind::VisualDesign => self.visual_design.read(cx).is_open(),
             DrawerKind::Action => self.action.read(cx).is_open(),
+            DrawerKind::PullRequests => self.pull_requests.read(cx).is_open(),
         }
     }
 
@@ -126,6 +135,9 @@ impl RightDrawer {
                     self.visual_design.update(cx, |panel, cx| panel.close(cx))
                 }
                 DrawerKind::Action => self.action.update(cx, |panel, cx| panel.close(cx)),
+                DrawerKind::PullRequests => {
+                    self.pull_requests.update(cx, |panel, cx| panel.close(cx))
+                }
             }
         }
     }
@@ -171,6 +183,13 @@ impl RightDrawer {
                 self.action
                     .update(cx, |panel, cx| panel.retarget(task_id, cx));
             }
+            DrawerKind::PullRequests => {
+                if let Ok(node_id) = Uuid::parse_str(task_id) {
+                    let title = node_title(task_id, fleet);
+                    self.pull_requests
+                        .update(cx, |panel, cx| panel.retarget(node_id, &title, cx));
+                }
+            }
         }
     }
 
@@ -208,6 +227,11 @@ impl RightDrawer {
                 .focus_handle(cx)
                 .focus(window, cx),
             Some(DrawerKind::Action) => self.action.read(cx).focus_handle(cx).focus(window, cx),
+            Some(DrawerKind::PullRequests) => self
+                .pull_requests
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx),
             None => {}
         }
     }
@@ -220,6 +244,7 @@ impl RightDrawer {
             DrawerKind::Lifecycle => self.lifecycle.clone().into_any_element(),
             DrawerKind::VisualDesign => self.visual_design.clone().into_any_element(),
             DrawerKind::Action => self.action.clone().into_any_element(),
+            DrawerKind::PullRequests => self.pull_requests.clone().into_any_element(),
         })
     }
 }

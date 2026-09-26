@@ -228,6 +228,14 @@ fn switch_to_branch(repo: &Workdir, branch: &str) -> Result<bool> {
 /// Initialized submodules of `repo`, recursively, parents before children.
 /// Empty for a repository without submodules.
 pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
+    Ok(submodule_paths(repo)?
+        .iter()
+        .map(|rel| repo.join(rel))
+        .collect())
+}
+
+/// [`submodule_dirs`], as paths relative to `repo` (`lib/a`, `lib/a/b`).
+pub fn submodule_paths(repo: &Workdir) -> Result<Vec<String>> {
     // `git submodule status --recursive` takes most of a second even with
     // nothing to report, and every run start and commit asks.
     if !has_gitmodules(repo) {
@@ -236,8 +244,8 @@ pub fn submodule_dirs(repo: &Workdir) -> Result<Vec<Workdir>> {
     let output = run_git(repo, &["submodule", "status", "--recursive"])?;
     Ok(output
         .lines()
-        .filter_map(|line| parse_submodule_status(line))
-        .map(|rel| repo.join(rel))
+        .filter_map(parse_submodule_status)
+        .map(str::to_string)
         .collect())
 }
 
