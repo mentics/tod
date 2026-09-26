@@ -756,6 +756,12 @@ fn sync_branch(env: &ProtocolEnv<'_>, node: Uuid, cwd: &Workdir) -> Option<RunNo
 /// plan, so the app's loop is what carries it to the end — which is the point
 /// of running it under the mock at all. Like a real agent, it has nothing to
 /// say while the work goes to plan.
+///
+/// A step whose text starts `wait <duration>` (`wait 3m: …`, a
+/// `tod_store::waits::parse_duration`) makes it record a timed wait instead,
+/// as `tod-cli wait --until +<duration>` would, the first time only (while
+/// the node has no wait yet): so a cloud node can be taken through a sleep
+/// and a wake with the mock.
 pub fn mock_turn(
     access: &impl super::mock::Access,
     node_id: Uuid,
@@ -764,6 +770,22 @@ pub fn mock_turn(
     let steps = access.read(|conn| {
         Ok(tod_store::outline::repos::PlanStepRepo::new(conn).list_for_node(node_id)?)
     })?;
+    if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status))
+        && let Some(secs) = mock_wait_secs(&step.body)
+    {
+        let waited = access.read(|conn| Ok(!tod_store::waits::WaitRepo::new(conn).list_for_node(node_id)?.is_empty()))?;
+        if !waited {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            access.interview(tod_store::interview::InterviewCommand::RecordWait {
+                node_id,
+                wait: tod_store::waits::NewWait::until(now + secs * 1000),
+            })?;
+            return Ok(String::new());
+        }
+    }
     if let Some(step) = steps.iter().find(|step| !step_is_done(&step.status)) {
         access.interview(tod_store::interview::InterviewCommand::Outline {
             mutation: tod_store::outline::OutlineMutation::UpdatePlanStepStatus {
@@ -790,6 +812,13 @@ pub fn mock_turn(
     Ok(String::new())
 }
 
+/// `wait 3m: …` → 180 (see [`mock_turn`]).
+fn mock_wait_secs(body: &str) -> Option<i64> {
+    let rest = body.trim().strip_prefix("wait ")?;
+    let word = rest.split(|c: char| c.is_whitespace() || c == ':').next()?;
+    tod_store::waits::parse_duration(word).ok()
+}
+
 #[cfg(test)]
 mod commit_tests {
     use super::*;
@@ -804,6 +833,14 @@ mod commit_tests {
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn mock_wait_steps_name_a_duration() {
+        assert_eq!(mock_wait_secs("wait 3m: then carry on"), Some(180));
+        assert_eq!(mock_wait_secs("wait 90s"), Some(90));
+        assert_eq!(mock_wait_secs("Write the parser"), None);
+        assert_eq!(mock_wait_secs("wait for CI"), None);
     }
 
     #[test]

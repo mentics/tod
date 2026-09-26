@@ -6,7 +6,7 @@ design is in [autonomous-nodes.md](autonomous-nodes.md); this is how it runs.
 
 ## Server (`crates/tod-orchestrator`)
 
-`tod-orchestrator [--port 8080] [--bind 0.0.0.0] [--base /data] [--tod-cli PATH]`
+`tod-orchestrator [--port 8090] [--bind 0.0.0.0] [--base /data] [--tod-cli PATH]`
 
 - `--base` (or `TOD_ORCHESTRATOR_BASE`): each user's data root is
   `<base>/users/<user>/`, created and opened as a `FleetStore` on first use,
@@ -65,12 +65,12 @@ tod-sandbox --data-root <root> orchestrator [--image IMAGE] [--bin PATH] [--tod-
 ```
 
 This creates `tod-orchestrator` if it does not exist (labelled
-`tod-role=orchestrator`, declaring the relay's port and 8080), uploads the
+`tod-role=orchestrator`, declaring the relay's port and 8090; not 8080, where the sandbox's own API listens), uploads the
 two binaries to `/opt/tod-orchestrator/` in 4 MB parts, (re)starts the
 server as a sandbox process that restarts on failure, asks for a public
-preview on 8080 (named `webhooks`, for later; a failure there is only
+preview on 8090 (named `webhooks`, for later; a failure there is only
 reported), and waits for `/health`. The server's URL is
-`<sandbox url>/port/8080`. Run it again to update the binaries.
+`<sandbox url>/port/8090`. Run it again to update the binaries.
 
 On the dev account its data lives on the sandbox's own disk, `/data`: it
 goes with the sandbox. The image needs `curl` (for the health check).
@@ -129,7 +129,7 @@ Running it:
 - `tod-sandbox watchdog run-once [--orchestrator-url URL]` runs one pass
   from this machine with the account in `sandboxes.toml`. Without
   `--orchestrator-url` it uses the `tod-orchestrator` sandbox's
-  `<url>/port/8080`.
+  `<url>/port/8090`.
 - `tod-sandbox watchdog deploy --image IMAGE` creates (or replaces) the job
   `tod-watchdog`, cron `0 * * * *`. IMAGE must have the Linux `tod-watchdog`
   (`scripts/build-sandbox-binaries.sh` builds it into `target/sandbox/`) at

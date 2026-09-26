@@ -96,14 +96,22 @@ struct TopicFile {
     secret: String,
 }
 
+/// Hex digits of the secret in a topic: 160 bits. ntfy takes topics of at
+/// most 64 characters, and the alerts topic adds `-alerts` to `tod-<secret>`.
+const SECRET_LEN: usize = 40;
+
 /// The user's topic, made (and saved in `root`) on first use.
 pub fn topic(root: &Path) -> Result<String> {
     let path = root.join(TOPIC_FILE);
     if let Some(f) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<TopicFile>(&b).ok()) {
-        return Ok(format!("tod-{}", f.secret));
+        // A secret saved before the limit was known is longer; ntfy refused
+        // it (404), so cutting it breaks no subscription that worked.
+        let secret = f.secret.get(..SECRET_LEN).unwrap_or(&f.secret);
+        return Ok(format!("tod-{secret}"));
     }
     std::fs::create_dir_all(root)?;
-    let secret = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let full = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    let secret = full[..SECRET_LEN].to_string();
     std::fs::write(&path, serde_json::to_vec(&TopicFile { secret: secret.clone() })?)
         .with_context(|| format!("write {}", path.display()))?;
     Ok(format!("tod-{secret}"))
@@ -373,7 +381,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tod-notify-topic-{}", uuid::Uuid::new_v4()));
         let a = topic(&dir).unwrap();
         assert_eq!(a, topic(&dir).unwrap());
-        assert!(a.len() > 60, "{a}");
+        assert!(a.len() > 40, "{a}");
+        assert!(alerts_topic(&a).len() <= 64, "ntfy takes topics of at most 64 characters: {a}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

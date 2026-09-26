@@ -37,13 +37,18 @@ use tod_store::sync::{self, ApplyReport, Change};
 /// The app's cloud-sync record, under the data root.
 pub const STATE_FILE: &str = "cloud-sync.json";
 
-/// Overrides the orchestrator's URL (e.g. `http://127.0.0.1:8080` in tests).
+/// Overrides the orchestrator's URL (e.g. `http://127.0.0.1:8090` in tests).
 pub const ORCHESTRATOR_URL_ENV: &str = "TOD_ORCHESTRATOR_URL";
+
+/// The agent a node's supervisor runs (`claude`, the default, or `mock`),
+/// for sandboxes created from here on: testing a node end to end in the
+/// cloud without a Claude subscription.
+pub const CLOUD_AGENT_ENV: &str = "TOD_CLOUD_AGENT";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudSyncState {
     /// The orchestrator's base URL; else [`ORCHESTRATOR_URL_ENV`], else the
-    /// `tod-orchestrator` sandbox's `/port/8080`.
+    /// `tod-orchestrator` sandbox's `/port/8090`.
     #[serde(default)]
     pub orchestrator_url: Option<String>,
     /// The user name on the orchestrator; else the Blaxel account's owner,
@@ -559,6 +564,7 @@ pub fn ensure_node_sandbox(
     }
 
     let name = node_sandbox_name(&task.slug);
+    let agent = std::env::var(CLOUD_AGENT_ENV).ok().filter(|a| !a.trim().is_empty());
     let spec = node::NodeSandboxSpec {
         name: &name,
         image: &account.default_image,
@@ -568,6 +574,7 @@ pub fn ensure_node_sandbox(
         node: node_id,
         orchestrator_host: &orchestrator_host,
         orchestrator_cli_url: &cli_url,
+        agent: agent.as_deref(),
     };
     let existing = bx.get(&name)?;
     if let Some(info) = &existing
@@ -591,12 +598,24 @@ pub fn ensure_node_sandbox(
     let relay_path = tod_store::fleet::sandbox::relay_path()?;
     let relay = std::fs::read(&relay_path).with_context(|| format!("read {}", relay_path.display()))?;
     let supervisor = relay_path.parent().and_then(node::supervisor_from);
+    // The supervisor builds the agent's context from the same process and
+    // media bundles as this app, installed beside it.
+    let mut bundles = node::bundle_files(crate::process_bundle::TodInstallPaths::discover()?.process_root(), "process")
+        .context("read the process bundle")?;
+    bundles.extend(
+        node::bundle_files(
+            crate::media::MediaPaths::discover().map_err(|e| anyhow!("media bundle: {e}"))?.media_root(),
+            "media",
+        )
+        .context("read the media bundle")?,
+    );
     let payload = node::NodePayload {
         relay: &relay,
         shim: tod_store::fleet::cli_relay::HTTP_SHIM_SCRIPT.as_bytes(),
         supervisor: supervisor.as_deref(),
         repo_url: &repo_url,
         branch: &branch,
+        bundles: &bundles,
     };
     progress("installing the relay and supervisor…");
     node::provision(&bx, &url, &payload, progress)?;

@@ -34,60 +34,45 @@ skips all of this.
 
 ## Building sandbox binaries (`scripts/build-sandbox-binaries.sh`)
 
-Everything that runs inside a sandbox — `tod-relay` today, `tod-supervisor`
-and `tod-orchestrator` once those crates exist (autonomous nodes, waves 2–3)
-— is a Linux binary for `x86_64-unknown-linux-musl`, built from whatever OS
-you develop on (Windows, macOS, or Linux) rather than requiring a Linux
-machine for day-to-day work.
+Everything that runs inside a sandbox (`tod-relay`, `tod-supervisor`,
+`tod-orchestrator`, the Linux `tod-cli`, and `tod-watchdog`) is a static
+Linux binary for `x86_64-unknown-linux-musl`, built from whatever OS you
+develop on, into `target/sandbox/`. Provisioning looks there first
+(`relay_path()` in `crates/tod-store/src/fleet/sandbox.rs`, and
+`tod-sandbox orchestrator`).
 
 ```sh
 scripts/build-sandbox-binaries.sh              # release build (default)
 scripts/build-sandbox-binaries.sh --debug
+scripts/build-sandbox-binaries.sh --docker-test -p tod-relay   # Linux-only tests
 ```
 
-On Windows, run it under Git Bash (`sh scripts/build-sandbox-binaries.sh` or
-`bash scripts/build-sandbox-binaries.sh`) — there is no PowerShell twin; the
-script is POSIX shell like `scripts/dev.sh` and `scripts/install.sh`, and
-Git Bash is already assumed to be present for those.
+On Windows, run it under Git Bash (`bash scripts/build-sandbox-binaries.sh`);
+there is no PowerShell twin.
 
-It builds each sandbox binary that exists in the workspace today into
-`target/sandbox/` (skipping the ones later waves add, so it keeps working as
-`tod-supervisor` and `tod-orchestrator` land), and `tod-store`'s sandbox
-provisioning (`relay_path()` in `crates/tod-store/src/fleet/sandbox.rs`)
-looks there first, ahead of the raw per-target cargo output and the
-installed `sandbox/tod-relay`.
+Everything but the relay links C: bundled SQLite (through `tod-store`),
+OpenSSL (reqwest's native-tls, through `tod-integration`), zstd, and ring.
+So the script picks, in order:
 
-Two cases:
-
-- **No C dependencies** (`tod-relay` today): a plain `cargo build --target
-  x86_64-unknown-linux-musl`. `rust-lld` (`.cargo/config.toml`) links it with
-  no Linux toolchain needed, on any host.
-- **Depends on `tod-store`** (`tod-supervisor`, `tod-orchestrator`, once they
-  exist): pulls in bundled SQLite, which is C, so cross-linking needs a
-  Linux C toolchain for the musl target. The script tries
-  [`cargo zigbuild`](https://github.com/rust-cross/cargo-zigbuild), which
-  uses `zig` as that cross C compiler/linker from any host. Neither is
-  installed by this script — install them yourself once:
-
-  ```sh
-  cargo install cargo-zigbuild
-  # zig: https://ziglang.org/download/, or a package manager:
-  #   brew install zig            (macOS)
-  #   choco install zig           (Windows)
-  #   apt/dnf/pacman install zig  (Linux)
-  #   pip install ziglang         (any OS, via PyPI)
-  ```
-
-  Without them, the script leaves that binary out and prints where to build
-  it instead: inside a Linux sandbox or container (`tod-sandbox exec <name>
-  -- cargo build --release -p <crate>`), copying the result into
-  `target/sandbox/<name>` by hand. `tod-relay` itself never needs this path.
-
-  As of this writing, `zig` and `cargo-zigbuild` are not installed in this
-  repository's dev environment, so the `tod-store`-dependent path above is
-  documented but not yet verified end to end here; `tod-relay`'s plain
-  cross-build is verified by this script (it is what `scripts/install.sh`
-  already does for the installed relay).
+- **Docker** (used whenever `docker` answers, unless `--no-docker`; Docker
+  Desktop on Windows and macOS). One container run of `rust:1-alpine`
+  (override with `TOD_SANDBOX_BUILD_IMAGE`), where musl is the native
+  target and OpenSSL is linked statically, builds all five. The repository
+  is mounted read-only; cargo's target directory, registry, and git
+  checkouts live in Docker volumes (`tod-sandbox-target`,
+  `tod-sandbox-cargo`, `tod-sandbox-cargo-git`), so the host's `target/` is
+  untouched but for the binaries copied to `target/sandbox/`, and later
+  builds are incremental. The first build takes about 15 minutes (it
+  fetches the workspace's git dependencies, gpui's included, to resolve it);
+  a rebuild after a change, a minute or two. `--docker-test <args>` runs
+  `cargo test <args>` in the same container, for code only Linux compiles
+  (`tod-relay`'s tests).
+- **`cargo zigbuild`**, when `zig` and `cargo-zigbuild` are installed and
+  Docker is not (or `--no-docker`). Not verified here, and OpenSSL would
+  still need a musl build of its own.
+- Otherwise only `tod-relay` is built: it has no C dependencies, so a plain
+  `cargo build --target x86_64-unknown-linux-musl` links it with `rust-lld`
+  (`.cargo/config.toml`) on any host. The script says what it skipped.
 
 ## The Blaxel account
 
@@ -246,3 +231,25 @@ says to quit Zed and try again.
 The sandbox that holds each user's database for autonomous nodes and runs
 their `tod-cli` commands: `tod-sandbox orchestrator` sets it up. See
 [orchestrator.md](orchestrator.md).
+
+## Running a node in the cloud without the window
+
+`cargo run -p tod-core --example cloud_dev -- <data_root> run <node>` does
+what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
+orchestrator, create the node's sandbox with its proxy rules, install the
+relay, the `tod-cli` shim, the supervisor, and the process and media
+bundles, check out the node's branch, and poke it. `... sync` sends the
+outbox and pulls the node's progress back; `... init` makes a list `cloud` in
+a fresh data root to create a test node in with `tod-cli`. Build the sandbox
+binaries first, and never point it at a data root the app has open.
+
+The node's supervisor runs Claude unless `TOD_CLOUD_AGENT=mock` is set when
+the sandbox is created (it becomes the sandbox's `TOD_SUPERVISOR_AGENT`). In a
+mock run, a plan step whose body starts `wait 3m: …` records a wait of that
+long, so the orchestrator's timer wakes the node. The relay's log
+(`GET <sandbox-url>/process/tod-relay/logs`) holds the supervisor's too.
+
+For Claude, the supervisor needs Claude Code logged in inside the node's
+sandbox: set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the
+sandbox's environment, or run `claude /login` in `tod-sandbox shell
+<sandbox>` as the user the supervisor runs as (root).

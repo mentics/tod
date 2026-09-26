@@ -17,13 +17,18 @@ use tod_supervisor::{Config, Woke, wake};
 
 const USAGE: &str = "usage: tod-supervisor wake [--workspace DIR] [--agent claude|mock] [--state-dir DIR]
                           [--relay URL] [--media-root DIR] [--no-push] [--no-transcripts]
-environment: TOD_USER, TOD_NODE, TOD_SANDBOX, TOD_ORCHESTRATOR_CLI_URL (or TOD_ORCHESTRATOR_URL)";
+environment: TOD_USER, TOD_NODE, TOD_SANDBOX, TOD_ORCHESTRATOR_CLI_URL (or TOD_ORCHESTRATOR_URL),
+             TOD_SUPERVISOR_AGENT (the default for --agent; claude when unset)";
 
 fn env(name: &str) -> Result<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty()).with_context(|| format!("{name} is not set"))
 }
 
 fn main() {
+    // First, before anything slow: the relay signals a supervisor it has
+    // started when the next poke comes, which may be right away, and
+    // SIGUSR1's default action ends the process.
+    tod_supervisor::signal::install();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -51,7 +56,12 @@ fn run(args: &[String]) -> Result<()> {
         _ => bail!("{USAGE}"),
     }
     let mut workspace = PathBuf::from("/workspace/repo");
-    let mut agent = AgentKind::Claude;
+    // The sandbox's environment picks the agent (`tod_sandbox::node::node_env`),
+    // since the relay starts `wake` with no options.
+    let mut agent = match env("TOD_SUPERVISOR_AGENT") {
+        Ok(raw) => AgentKind::parse(&raw)?,
+        Err(_) => AgentKind::Claude,
+    };
     let mut state_dir: Option<PathBuf> = None;
     let mut relay = "http://127.0.0.1:2222".to_string();
     let mut media_root: Option<PathBuf> = None;

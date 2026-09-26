@@ -4,12 +4,14 @@
 //! sandbox's own disk (`/data`). See `doc/cloud-sandboxes/orchestrator.md`.
 
 use crate::blaxel::{Blaxel, RELAY_PORT};
+use crate::provision::{RELAY_PATH, RELAY_PROCESS};
 use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Duration;
 
 pub const NAME: &str = "tod-orchestrator";
-pub const PORT: u16 = 8080;
+/// Not 8080: every Blaxel sandbox's own API (the process API) listens there.
+pub const PORT: u16 = 8090;
 pub const DATA_DIR: &str = "/data";
 const DIR: &str = "/opt/tod-orchestrator";
 const PROCESS: &str = "tod-orchestrator";
@@ -23,6 +25,9 @@ pub struct Spec<'a> {
     pub orchestrator: &'a [u8],
     /// The Linux `tod-cli` it runs commands with.
     pub tod_cli: &'a [u8],
+    /// The Linux `tod-relay`: the orchestrator holds its own sandbox awake
+    /// through it while a wake is pending (`tod-orchestrator`'s `wakes.rs`).
+    pub relay: &'a [u8],
     /// The caller's Blaxel account, which the orchestrator uses to poke node
     /// sandboxes when their wakes are due (`TOD_ORCHESTRATOR_BLAXEL_*`).
     pub blaxel_workspace: &'a str,
@@ -39,9 +44,25 @@ fn process_env<'a>(spec: &Spec<'a>) -> [(&'static str, &'a str); 2] {
 
 /// Creates the orchestrator's sandbox if it does not exist, installs the
 /// binaries, and (re)starts the server. Returns the sandbox's URL; the
-/// server is at `<url>/port/8080`.
+/// server is at `<url>/port/8090`.
 pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Result<String> {
-    if bx.get(NAME)?.is_none() {
+    let existing = bx.get(NAME)?;
+    if let Some(info) = &existing
+        && is_dead(&info.status)
+    {
+        // Deleted, it lingers as TERMINATED for a while; the name is taken
+        // until it is gone.
+        progress(&format!("removing the dead sandbox {NAME} ({})…", info.status));
+        bx.delete(NAME)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        while bx.get(NAME)?.is_some() {
+            if std::time::Instant::now() > deadline {
+                bail!("{NAME} is still being removed; try again in a few minutes");
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    }
+    if existing.as_ref().is_none_or(|i| is_dead(&i.status)) {
         progress(&format!("creating sandbox {NAME}…"));
         bx.create_from_body(&create_body(spec))?;
     }
@@ -49,50 +70,45 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
     let Some(url) = info.url else { bail!("{NAME} has no URL") };
     progress("installing tod-orchestrator and tod-cli…");
     bx.run(&url, &format!("mkdir -p {DIR} {DATA_DIR}"), 30)?;
-    upload_large(bx, &url, &format!("{DIR}/tod-orchestrator.new"), spec.orchestrator)?;
+    bx.upload_large(&url, &format!("{DIR}/tod-orchestrator.new"), spec.orchestrator, "0755")?;
     bx.kill(&url, PROCESS)?;
-    upload_large(bx, &url, &format!("{DIR}/tod-cli"), spec.tod_cli)?;
+    bx.upload_large(&url, &format!("{DIR}/tod-cli"), spec.tod_cli, "0755")?;
     let res = bx.run(&url, &format!("mv {DIR}/tod-orchestrator.new {DIR}/tod-orchestrator"), 30)?;
     if res.exit_code != 0 {
         bail!("installing tod-orchestrator failed: {}", res.output());
     }
+    progress("installing and starting tod-relay…");
+    bx.kill(&url, RELAY_PROCESS)?;
+    bx.run(&url, "mkdir -p /opt/tod", 30)?;
+    bx.upload(&url, RELAY_PATH, spec.relay, "0755")?;
+    bx.start(&url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true)?;
     progress("starting tod-orchestrator…");
     bx.start_with_env(&url, PROCESS, &start_command(), true, &process_env(spec))?;
     // A preview that already exists is fine; any other failure only costs
     // webhooks, which nothing uses yet.
-    if let Err(err) = bx.post_json(&format!("/sandboxes/{NAME}/previews"), &preview_body(), "create the preview") {
+    if let Err(err) = bx.post_json(&format!("/sandboxes/{NAME}/previews"), &preview_body(), "create the preview")
+        && !format!("{err:#}").contains("409")
+    {
         progress(&format!("public preview not created ({err:#}); webhooks will need it"));
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    // Through the sandbox's URL, the way the app and the node sandboxes
+    // reach it (and with no dependency on the image having curl).
+    let health = format!("{}/port/{PORT}/health", url.trim_end_matches('/'));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let res = bx.run(&url, &format!("curl -fsS http://127.0.0.1:{PORT}/health"), 15)?;
-        if res.exit_code == 0 {
+        let (status, body) = bx.get_url(&health)?;
+        if status == 200 && body.trim() == "ok" {
             return Ok(url);
         }
         if std::time::Instant::now() > deadline {
-            bail!("tod-orchestrator did not answer /health within 20s: {}", res.output());
+            bail!("tod-orchestrator did not answer {health} within 30s: {status} {}", body.trim());
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
 
-/// Uploads in parts (the sandbox API takes at most 5 MB a call) and joins them.
-fn upload_large(bx: &Blaxel, url: &str, path: &str, bytes: &[u8]) -> Result<()> {
-    const PART: usize = 4 * 1024 * 1024;
-    let mut parts = Vec::new();
-    for (i, chunk) in bytes.chunks(PART).enumerate() {
-        let part = format!("{path}.part{i:04}");
-        bx.upload(url, &part, chunk, "0644")?;
-        parts.push(part);
-    }
-    let q = crate::relay::shell_quote;
-    let joined: Vec<String> = parts.iter().map(|p| q(p)).collect();
-    let joined = joined.join(" ");
-    let res = bx.run(url, &format!("cat {joined} > {0} && chmod 0755 {0} && rm -f {joined}", q(path)), 120)?;
-    if res.exit_code != 0 {
-        bail!("writing {path} failed: {}", res.output());
-    }
-    Ok(())
+fn is_dead(status: &str) -> bool {
+    matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
 }
 
 pub fn start_command() -> String {
@@ -109,7 +125,8 @@ fn create_body(spec: &Spec) -> serde_json::Value {
                 "memory": spec.memory_mb,
                 "ports": [
                     { "name": "tod-relay", "target": RELAY_PORT, "protocol": "HTTP" },
-                    { "name": "tod-orchestrator", "target": PORT, "protocol": "HTTP" },
+                    // Blaxel allows port names of at most 15 characters.
+                    { "name": "tod-orch", "target": PORT, "protocol": "HTTP" },
                 ],
             },
         },
@@ -135,6 +152,7 @@ mod tests {
             memory_mb: 2048,
             orchestrator: b"",
             tod_cli: b"",
+            relay: b"",
             blaxel_workspace: "ws",
             blaxel_token: "tok",
         };

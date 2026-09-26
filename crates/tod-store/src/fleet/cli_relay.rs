@@ -97,7 +97,7 @@ exit "$code"
 "#;
 
 /// The orchestrator's `/cli` URL, for [`HTTP_SHIM_SCRIPT`] (e.g.
-/// `https://<orchestrator>.bl.run/port/8080/cli`).
+/// `https://<orchestrator>.bl.run/port/8090/cli`).
 pub const ORCHESTRATOR_CLI_URL_ENV: &str = "TOD_ORCHESTRATOR_CLI_URL";
 /// The user whose database the orchestrator uses (`X-Tod-User`).
 pub const USER_ENV: &str = "TOD_USER";

@@ -40,6 +40,12 @@ fn handle_turn(data_root: &Path, turn: &MockInterviewTurn) -> Result<MockReply> 
         return crate::conversation::gate_check::mock_turn(&client, node, &text)
             .map(MockReply::from);
     }
+    // A state's on-entry turn (`OnEntryProtocol`) carries neither a node nor
+    // an actor. The mock has no on-entry work: what a state sets up on entry
+    // (plan steps, for one), a mock run's outline already has.
+    if text.contains("phase_purpose:** on_entry") {
+        return Ok(MockReply::from("Nothing was needed on entry.".to_string()));
+    }
     if let (Some(node), Some(conversation)) =
         (env_uuid(IMPLEMENT_NODE_ENV), env_uuid(IMPLEMENT_CONVERSATION_ENV))
     {

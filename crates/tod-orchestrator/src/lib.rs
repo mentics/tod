@@ -52,7 +52,8 @@ fn client(request: &Request) -> Option<&str> {
         .or_else(|| request.query_param("client"))
         .filter(|c| !c.is_empty())
 }
-pub const DEFAULT_PORT: u16 = 8080;
+/// Not 8080: every Blaxel sandbox's own API listens there.
+pub const DEFAULT_PORT: u16 = 8090;
 pub const DEFAULT_BASE: &str = "/data";
 
 pub struct Config {
