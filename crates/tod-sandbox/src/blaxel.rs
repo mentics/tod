@@ -117,6 +117,10 @@ impl Blaxel {
         &self.token
     }
 
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
     fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         req.header("Authorization", &format!("Bearer {}", self.token))
             .header("X-Blaxel-Workspace", &self.workspace)
@@ -258,7 +262,25 @@ impl Blaxel {
 
     /// Starts a background process by name. It does not hold the sandbox awake.
     pub fn start(&self, url: &str, name: &str, command: &str, restart_on_failure: bool) -> Result<()> {
+        self.start_with_env(url, name, command, restart_on_failure, &[])
+    }
+
+    /// [`Self::start`] with environment variables set for the process only
+    /// (the process API's `env`), so secrets stay off its command line.
+    pub fn start_with_env(
+        &self,
+        url: &str,
+        name: &str,
+        command: &str,
+        restart_on_failure: bool,
+        env: &[(&str, &str)],
+    ) -> Result<()> {
         let mut body = json!({ "command": command, "name": name, "timeout": 0 });
+        if !env.is_empty() {
+            let env: serde_json::Map<String, Value> =
+                env.iter().map(|(k, v)| (k.to_string(), Value::String(v.to_string()))).collect();
+            body["env"] = Value::Object(env);
+        }
         if restart_on_failure {
             body["restartOnFailure"] = json!(true);
             body["maxRestarts"] = json!(100);

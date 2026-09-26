@@ -60,6 +60,10 @@ pub struct Config {
     pub poll: Duration,
     /// Push the branch after each step and at the end.
     pub push_branch: bool,
+    /// Wakes the sandbox when a wait is due (`tod_core::scheduler`).
+    pub scheduler: Option<Arc<dyn tod_core::scheduler::Scheduler>>,
+    /// This sandbox's name, for the scheduler.
+    pub sandbox: String,
 }
 
 /// How a wake ended.
@@ -94,11 +98,22 @@ impl StepHook for Hook<'_> {
                 tracing::warn!("pushing the branch: {err:#}");
             }
         }
-        Ok(match waits::check(fleet, self.node)? {
+        Ok(match waits::check(fleet, self.node, self.workspace)? {
             waits::WaitStatus::Clear => None,
             waits::WaitStatus::Waiting { reason } => Some(format!("waiting: {reason}")),
         })
     }
+}
+
+/// Schedules the wake the node's waits need, if it has a scheduler.
+fn schedule(store: &FleetStore, config: &Config) -> Result<()> {
+    match &config.scheduler {
+        Some(scheduler) => {
+            waits::schedule_wake(store, config.node, scheduler.as_ref(), &config.sandbox)?;
+        }
+        None => tracing::warn!("no scheduler: nothing will wake this node but a poke"),
+    }
+    Ok(())
 }
 
 /// One wake. See the module docs.
@@ -109,8 +124,11 @@ pub fn wake(config: Config) -> Result<Woke> {
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
     replica.lock().unwrap_or_else(|e| e.into_inner()).pull()?;
 
-    if let waits::WaitStatus::Waiting { reason } = waits::check(&store, config.node)? {
-        waits::schedule_wake(&store, config.node)?;
+    let status = waits::check(&store, config.node, &config.workspace)?;
+    // What `check` settled or moved goes up before anything else.
+    replica.lock().unwrap_or_else(|e| e.into_inner()).push()?;
+    if let waits::WaitStatus::Waiting { reason } = status {
+        schedule(&store, &config)?;
         tracing::info!(%reason, "still waiting; going back to sleep");
         return Ok(Woke::StillWaiting(reason));
     }
@@ -162,7 +180,7 @@ pub fn wake(config: Config) -> Result<Woke> {
     pushed?;
     tracing::info!(?outcome, "autopilot stopped");
     if matches!(outcome, Outcome::Stopped { .. }) {
-        waits::schedule_wake(&store, config.node)?;
+        schedule(&store, &config)?;
     }
     drop(agent);
     drop(hold);

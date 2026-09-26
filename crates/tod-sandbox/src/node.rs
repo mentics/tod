@@ -118,11 +118,12 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
 }
 
 /// The environment of every process in a node's sandbox. No secrets.
-pub fn node_env(user: &str, node: &str, orchestrator_cli_url: &str) -> Vec<(&'static str, String)> {
+pub fn node_env(sandbox: &str, user: &str, node: &str, orchestrator_cli_url: &str) -> Vec<(&'static str, String)> {
     vec![
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
         // Node's fetch ignores HTTP(S)_PROXY without it, and so gets nothing injected.
         ("NODE_USE_ENV_PROXY", "1".to_string()),
+        ("TOD_SANDBOX", sandbox.to_string()),
         ("TOD_USER", user.to_string()),
         ("TOD_NODE", node.to_string()),
         ("TOD_ORCHESTRATOR_CLI_URL", orchestrator_cli_url.to_string()),
@@ -145,7 +146,7 @@ pub struct NodeSandboxSpec<'a> {
 
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
-    let envs: Vec<Value> = node_env(spec.user, spec.node, spec.orchestrator_cli_url)
+    let envs: Vec<Value> = node_env(spec.name, spec.user, spec.node, spec.orchestrator_cli_url)
         .into_iter()
         .map(|(name, value)| json!({ "name": name, "value": value }))
         .collect();

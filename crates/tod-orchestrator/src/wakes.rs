@@ -14,12 +14,9 @@
 //!   and drops the row. A failed poke is retried a minute later. A wake is
 //!   only a poke, so a late or duplicate one is harmless.
 //! - While any wake is pending the orchestrator holds its own sandbox awake
-//!   ([`KeepAwake`]); [`LocalRelayAwake`] does it by poking its own relay
-//!   (`127.0.0.1:2222/poke`) every 45 s, each poke taking the relay's 60 s
-//!   leased hold. The relay has no lease call of its own yet, so this is the
-//!   way available; a side effect is that each such poke also runs the
-//!   relay's `--supervisor-cmd`, which on the orchestrator's sandbox should
-//!   be a no-op (e.g. `--supervisor-cmd true`).
+//!   ([`KeepAwake`]); [`LocalRelayAwake`] does it by renewing a lease on
+//!   its own relay's hold (`POST 127.0.0.1:2222/hold?reason=wakes&secs=120`)
+//!   on every tick, and `/release?reason=wakes` once nothing is pending.
 //!
 //! Poking needs Blaxel credentials to reach other sandboxes: [`RelayPoker`]
 //! reads `TOD_ORCHESTRATOR_BLAXEL_WORKSPACE` and `TOD_ORCHESTRATOR_BLAXEL_TOKEN`.
@@ -267,14 +264,16 @@ impl Default for LocalRelayAwake {
 
 impl KeepAwake for LocalRelayAwake {
     fn tick(&self, pending: bool) {
-        if !pending {
-            return; // the last poke's 60 s lease lapses on its own
-        }
+        // A lease on the relay's hold, renewed every tick and released as
+        // soon as nothing is pending (it would lapse on its own anyway).
+        let path = if pending { "/hold?reason=wakes&secs=120" } else { "/release?reason=wakes" };
         let result = std::net::TcpStream::connect(&self.addr).and_then(|mut s| {
             s.set_write_timeout(Some(Duration::from_secs(5)))?;
-            write!(s, "POST /poke HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            write!(s, "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         });
-        if let Err(err) = result {
+        if let Err(err) = result
+            && pending
+        {
             eprintln!("tod-orchestrator: cannot hold awake through {}: {err}", self.addr);
         }
     }

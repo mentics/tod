@@ -13,6 +13,7 @@ use std::time::Duration;
 use tod_core::autopilot::Budget;
 use tod_store::fleet::FleetStore;
 use tod_store::outline::{Capability, CreatePosition, OutlineMutation};
+use tod_store::waits::{NewWait, WaitRepo};
 use tod_supervisor::agent::AgentKind;
 use tod_supervisor::hold::RelayHolder;
 use tod_supervisor::orchestrator::Orchestrator;
@@ -169,6 +170,8 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
         budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
         poll: Duration::from_millis(20),
         push_branch: true,
+        scheduler: None,
+        sandbox: "node-test".into(),
     })
     .unwrap();
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
@@ -217,7 +220,66 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
         budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
         poll: Duration::from_millis(20),
         push_branch: false,
+        scheduler: None,
+        sandbox: "node-test".into(),
     })
     .unwrap();
     assert!(matches!(woke, Woke::Ran(_)), "{woke:?}");
+
+    // Waits recorded on the orchestrator (as `tod-cli wait` there would): a
+    // timer a minute out, and a check that is due and fails.
+    let remote_db = base.join("orchestrator").join("users").join("alice").join("tod.db");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let (timer, poll) = {
+        let conn = rusqlite::Connection::open(&remote_db).unwrap();
+        conn.busy_timeout(Duration::from_secs(10)).unwrap();
+        let repo = WaitRepo::new(&conn);
+        let timer = repo.create(node, &NewWait::until(now + 60_000)).unwrap();
+        let mut check = NewWait::check("exit 1", 3600, now);
+        check.due_at = now - 1;
+        let poll = repo.create(node, &check).unwrap();
+        (timer, poll)
+    };
+    let scheduler = Arc::new(FakeScheduler::default());
+    let (relay_url, relay_seen) = fake_relay();
+    let woke = wake(Config {
+        orchestrator: orchestrator.clone(),
+        node,
+        workspace: workspace.clone(),
+        state_dir: base.join("supervisor"),
+        agent: AgentKind::Mock,
+        holder: Arc::new(RelayHolder::new(relay_url)),
+        transcripts: None,
+        media: media(),
+        budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        poll: Duration::from_millis(20),
+        push_branch: false,
+        scheduler: Some(scheduler.clone()),
+        sandbox: "node-test".into(),
+    })
+    .unwrap();
+    assert!(matches!(woke, Woke::StillWaiting(_)), "{woke:?}");
+    assert!(relay_seen.lock().unwrap().is_empty(), "no hold while only waiting");
+    // Woken for the soonest: the timer, not the check pushed an hour out.
+    assert_eq!(*scheduler.calls.lock().unwrap(), vec![(timer.id, "node-test".to_string(), timer.due_at)]);
+    // The failed check moved on, and that reached the orchestrator.
+    let conn = rusqlite::Connection::open(&remote_db).unwrap();
+    let moved = WaitRepo::new(&conn).get(poll.id).unwrap().unwrap();
+    assert_eq!(moved.state, "pending");
+    assert!(moved.due_at >= now + 3_600_000, "{moved:?}");
+}
+
+#[derive(Default)]
+struct FakeScheduler {
+    calls: Mutex<Vec<(Uuid, String, i64)>>,
+}
+
+impl tod_core::scheduler::Scheduler for FakeScheduler {
+    fn schedule(&self, id: Uuid, sandbox: &str, at_ms: i64) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push((id, sandbox.to_string(), at_ms));
+        Ok(())
+    }
+    fn cancel(&self, _id: Uuid) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

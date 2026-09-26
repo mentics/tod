@@ -17,7 +17,7 @@ use tod_supervisor::{Config, Woke, wake};
 
 const USAGE: &str = "usage: tod-supervisor wake [--workspace DIR] [--agent claude|mock] [--state-dir DIR]
                           [--relay URL] [--media-root DIR] [--no-push] [--no-transcripts]
-environment: TOD_USER, TOD_NODE, TOD_ORCHESTRATOR_CLI_URL (or TOD_ORCHESTRATOR_URL)";
+environment: TOD_USER, TOD_NODE, TOD_SANDBOX, TOD_ORCHESTRATOR_CLI_URL (or TOD_ORCHESTRATOR_URL)";
 
 fn env(name: &str) -> Result<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty()).with_context(|| format!("{name} is not set"))
@@ -100,6 +100,16 @@ fn run(args: &[String]) -> Result<()> {
         budget: Budget::default(),
         poll: Duration::from_millis(500),
         push_branch,
+        // The development account's timer. A Blaxel schedule would need
+        // Blaxel credentials, which a node's sandbox does not hold.
+        scheduler: match tod_core::scheduler::OrchestratorScheduler::from_env() {
+            Ok(s) => Some(Arc::new(s)),
+            Err(err) => {
+                tracing::warn!("no wake scheduler: {err:#}");
+                None
+            }
+        },
+        sandbox: env("TOD_SANDBOX").unwrap_or_else(|_| format!("node-{node}")),
     };
     match wake(config)? {
         Woke::StillWaiting(reason) => eprintln!("tod-supervisor: still waiting ({reason})"),

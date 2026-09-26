@@ -378,14 +378,18 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
     };
     let orchestrator = read(bin, "tod-orchestrator")?;
     let tod_cli = read(cli, "tod-cli")?;
+    let bx = ctx.blaxel()?;
     let spec = orch::Spec {
         image: image.as_deref().unwrap_or(&acct.default_image),
         region: &acct.region,
         memory_mb: acct.memory_mb,
         orchestrator: &orchestrator,
         tod_cli: &tod_cli,
+        // The caller's own account, for poking node sandboxes.
+        blaxel_workspace: bx.workspace(),
+        blaxel_token: bx.token(),
     };
-    let url = orch::provision(&ctx.blaxel()?, &spec, &mut |m| eprintln!("{m}"))?;
+    let url = orch::provision(&bx, &spec, &mut |m| eprintln!("{m}"))?;
     println!("{}: running at {url}/port/{}", orch::NAME, orch::PORT);
     Ok(0)
 }

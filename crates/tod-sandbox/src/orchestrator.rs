@@ -23,6 +23,18 @@ pub struct Spec<'a> {
     pub orchestrator: &'a [u8],
     /// The Linux `tod-cli` it runs commands with.
     pub tod_cli: &'a [u8],
+    /// The caller's Blaxel account, which the orchestrator uses to poke node
+    /// sandboxes when their wakes are due (`TOD_ORCHESTRATOR_BLAXEL_*`).
+    pub blaxel_workspace: &'a str,
+    pub blaxel_token: &'a str,
+}
+
+/// The orchestrator process's environment.
+fn process_env<'a>(spec: &Spec<'a>) -> [(&'static str, &'a str); 2] {
+    [
+        ("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE", spec.blaxel_workspace),
+        ("TOD_ORCHESTRATOR_BLAXEL_TOKEN", spec.blaxel_token),
+    ]
 }
 
 /// Creates the orchestrator's sandbox if it does not exist, installs the
@@ -45,7 +57,7 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
         bail!("installing tod-orchestrator failed: {}", res.output());
     }
     progress("starting tod-orchestrator…");
-    bx.start(&url, PROCESS, &start_command(), true)?;
+    bx.start_with_env(&url, PROCESS, &start_command(), true, &process_env(spec))?;
     // A preview that already exists is fine; any other failure only costs
     // webhooks, which nothing uses yet.
     if let Err(err) = bx.post_json(&format!("/sandboxes/{NAME}/previews"), &preview_body(), "create the preview") {
@@ -117,7 +129,19 @@ mod tests {
 
     #[test]
     fn the_sandbox_declares_both_ports() {
-        let spec = Spec { image: "img", region: "r", memory_mb: 2048, orchestrator: b"", tod_cli: b"" };
+        let spec = Spec {
+            image: "img",
+            region: "r",
+            memory_mb: 2048,
+            orchestrator: b"",
+            tod_cli: b"",
+            blaxel_workspace: "ws",
+            blaxel_token: "tok",
+        };
+        let env = process_env(&spec);
+        assert_eq!(env[0], ("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE", "ws"));
+        assert_eq!(env[1], ("TOD_ORCHESTRATOR_BLAXEL_TOKEN", "tok"));
+        assert!(!start_command().contains("tok"), "the token stays off the command line");
         let body = create_body(&spec);
         let ports = body["spec"]["runtime"]["ports"].as_array().unwrap();
         assert_eq!(ports.len(), 2);
