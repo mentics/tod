@@ -6,12 +6,15 @@ resolver = "2"
 # - local crate stays unoptimized (opt-level 0, default)
 # - dependencies compile once with light optimization (gpui stack is heavy)
 # - line-table debug info keeps binaries smaller and links faster
+# - dependencies carry no debug info, to keep target/ small (every worktree
+#   has its own)
 [profile.dev]
 debug = 1
 incremental = true
 
 [profile.dev.package."*"]
 opt-level = 1
+debug = 0
 
 [profile.dev.build-override]
 opt-level = 3
