@@ -163,6 +163,13 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// Creates a sandbox from a full request body (see `node::create_body`).
+    pub fn create_from_body(&self, body: &Value) -> Result<()> {
+        let mut resp =
+            self.auth(self.agent.post(&format!("{API}/sandboxes"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, "create sandbox")
+    }
+
     /// Creates `target` as a copy of `source`'s current state (Blaxel's
     /// fork; not every workspace has it). Returns once the control plane
     /// accepted it; see [`Blaxel::wait_deployed`].
