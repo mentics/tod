@@ -1,5 +1,6 @@
 pub mod action_panel;
 pub mod agent_transcripts;
+pub mod cloud_node;
 pub mod command_history;
 pub mod database;
 pub mod interactive_agent;

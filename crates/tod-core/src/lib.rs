@@ -21,6 +21,7 @@ pub const GIT_DIRTY: &str = env!("TOD_GIT_DIRTY");
 pub mod agent_context;
 pub mod attention;
 pub mod autopilot;
+pub mod cloud_sync;
 pub mod codebase_rules;
 pub mod context_recipes;
 pub mod conversation;
