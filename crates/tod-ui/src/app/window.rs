@@ -995,20 +995,31 @@ impl Shell {
             self.queue_error_toast(format!("Unknown code editor: {editor_id}"), cx);
             return;
         };
-        match open_code_editor_for_node(&self.fleet, editor, &task_id) {
-            Ok(cwd) => {
-                self.task_list.update(cx, |list, cx| {
-                    list.set_status_message(
-                        format!("Opened {} in {}", editor.label(), cwd.display()),
-                        cx,
-                    );
-                });
-            }
-            Err(err) => {
-                self.queue_error_toast(format!("Open code failed: {err:#}"), cx);
-            }
-        }
-        cx.notify();
+        // A dev container is prepared through Docker first: off the UI thread.
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { open_code_editor_for_node(&fleet, editor, &task_id) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(cwd) => {
+                        this.task_list.update(cx, |list, cx| {
+                            list.set_status_message(
+                                format!("Opened {} in {}", editor.label(), cwd.display()),
+                                cx,
+                            );
+                        });
+                    }
+                    Err(err) => {
+                        this.queue_error_toast(format!("Open code failed: {err:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn undo_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {

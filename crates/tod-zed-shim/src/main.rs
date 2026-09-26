@@ -13,7 +13,9 @@
 //! - Zed's connection "master" is answered locally.
 //!
 //! `scp` and `sftp` run the real OpenSSH programs with this `ssh` as their
-//! transport. Every other host goes to the real `ssh` untouched.
+//! transport. A host named `<container>.docker.tod` is a dev container: the
+//! real `ssh` reaches it through `docker exec ... sshd -i`. Every other host
+//! goes to the real `ssh` untouched.
 //!
 //! Design: `doc/cloud-sandboxes/blaxel-remote.md`.
 
@@ -155,6 +157,49 @@ fn parse_args(args: &[String]) -> SshArgs {
 }
 
 // ---------------------------------------------------------------------------
+// Reaching a dev container
+
+/// Hosts named `<container>.docker.tod` are dev containers (see
+/// `tod_store::fleet::code_editor::zed::CONTAINER_HOST_SUFFIX`).
+const CONTAINER_HOST_SUFFIX: &str = ".docker.tod";
+/// tod's key pair for them, beside this shim (`zed::CONTAINER_KEY_FILE`).
+const CONTAINER_KEY_FILE: &str = "docker_ed25519";
+
+/// The container for an ssh destination (`[user@]<container>.docker.tod`),
+/// when it is one and a usable Docker name.
+fn container_for_host(dest: &str) -> Option<&str> {
+    let host = dest.rsplit('@').next().unwrap_or(dest);
+    let name = host.strip_suffix(CONTAINER_HOST_SUFFIX)?;
+    let mut chars = name.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+    valid.then_some(name)
+}
+
+/// Options put ahead of Zed's own (ssh keeps the first value it gets for
+/// each): the transport is `sshd -i` in the container over `docker exec`,
+/// so there is no port, and tod prepared the container to accept its key
+/// (`tod_agent::devcontainer::prepare_sshd`). Host keys are not checked:
+/// the connection never leaves this machine, and a rebuilt container gets
+/// new ones.
+fn container_ssh_options(container: &str, key: &Path) -> Vec<String> {
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    [
+        format!("ProxyCommand=docker exec -i -u root {container} /usr/sbin/sshd -i"),
+        "IdentitiesOnly=yes".to_string(),
+        "PreferredAuthentications=publickey".to_string(),
+        "BatchMode=yes".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        format!("UserKnownHostsFile={null}"),
+        "LogLevel=ERROR".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .chain(["-i".to_string(), key.display().to_string()])
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Reaching the sandbox
 
 struct Target {
@@ -209,6 +254,10 @@ fn main() {
     }
 
     let parsed = parse_args(&args);
+    if let Some(container) = parsed.dest.as_deref().and_then(container_for_host) {
+        log(&format!("{container}: ssh through docker exec sshd -i"));
+        run_real("ssh", &args, &container_ssh_options(container, &exe_dir().join(CONTAINER_KEY_FILE)));
+    }
     let Some(name) = parsed.dest.as_deref().and_then(config::name_for_host).map(str::to_string) else {
         run_real("ssh", &args, &[]);
     };
@@ -450,6 +499,26 @@ mod tests {
         let p = parse_args(&args("-O exit -S /tmp/x.sock dev.tod"));
         assert_eq!(p.control.as_deref(), Some("exit"));
         assert_eq!(p.control_path.as_deref(), Some("/tmp/x.sock"));
+    }
+
+    #[test]
+    fn routes_container_hosts_before_sandboxes() {
+        assert_eq!(container_for_host("vscode@my-dev.docker.tod"), Some("my-dev"));
+        assert_eq!(container_for_host("a.b_c.docker.tod"), Some("a.b_c"));
+        assert_eq!(container_for_host("root@.docker.tod"), None);
+        assert_eq!(container_for_host("root@x y.docker.tod"), None);
+        assert_eq!(container_for_host("root@dev.tod"), None);
+        assert_eq!(container_for_host("example.com"), None);
+        let p = parse_args(&args("-q -T vscode@my-dev.docker.tod uname -sm"));
+        assert_eq!(p.dest.as_deref().and_then(container_for_host), Some("my-dev"));
+    }
+
+    #[test]
+    fn container_options_proxy_through_sshd() {
+        let opts = container_ssh_options("my-dev", Path::new("/data/zed-shim/docker_ed25519"));
+        assert!(opts.chunks(2).all(|pair| pair[0] == "-o" || pair[0] == "-i"));
+        assert!(opts.contains(&"ProxyCommand=docker exec -i -u root my-dev /usr/sbin/sshd -i".to_string()));
+        assert!(opts.ends_with(&["-i".to_string(), "/data/zed-shim/docker_ed25519".to_string()]));
     }
 
     #[test]

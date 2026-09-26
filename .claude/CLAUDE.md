@@ -397,6 +397,18 @@ Nothing starts or builds a container; tod only uses a running one.
   `docker exec -it [-u user] <id> sh /tmp/tod-cli-relay/launch-<id>.sh`; the
   script sets the directory, `PATH`, and relay env, so the token never goes on
   a command line.
+- Code editors: a repository in the container opens only in Zed, as
+  `ssh://<remoteUser>@<container>.docker.tod/<dir>`
+  (`code_editor::zed::open_in_container`; a file opens in a second call,
+  since Zed takes one `ssh://` URL per call). `tod-zed-shim` routes
+  `.docker.tod` hosts (before sandboxes' `.tod`) to the real `ssh` with a
+  ProxyCommand of `docker exec -i -u root <c> /usr/sbin/sshd -i` and tod's own
+  key (`<data root>/zed-shim/docker_ed25519`). Beforehand,
+  `devcontainer::prepare_sshd` (off the UI thread) runs `ssh-keygen -A`,
+  makes `/run/sshd`, maps `UNKNOWN` to 127.0.0.1 in `/etc/hosts` (PAM's
+  ~13s DNS wait), and authorizes the key; it installs nothing, and a
+  container without `sshd` gets an error saying to install it. A mounted
+  repository opens on this machine.
 - Tests that need a real container are skipped unless `TOD_TEST_DEV_CONTAINER`
   (a running container with git; some also need
   `TOD_TEST_DEV_CONTAINER_HOST_DIR` or `TOD_TEST_TOD_CLI`) is set; the
