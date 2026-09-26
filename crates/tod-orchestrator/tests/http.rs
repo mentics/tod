@@ -100,6 +100,44 @@ fn requests_must_name_a_valid_user() {
     assert!(!h.base.join("users").exists(), "no data root is made for a refused request");
 }
 
+fn json(body: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(body).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(body)))
+}
+
+#[test]
+fn seed_then_sync_changes_both_ways() {
+    let h = start("sync");
+    // The app's database, snapshotted.
+    let app = h.base.join("app");
+    drop(tod_store::fleet::FleetStore::open(&app).unwrap());
+    let snap = h.base.join("snap.db");
+    tod_store::sync::snapshot(&app.join("tod.db"), &snap).unwrap();
+    let app_seq = {
+        let conn = rusqlite::Connection::open(app.join("tod.db")).unwrap();
+        tod_store::sync::last_seq(&conn).unwrap()
+    };
+
+    // Open the user's store first, so the seed must close it.
+    let (status, body) = send(h.port, "GET", "/users/carol/changes", &[], b"");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let (status, body) = send(h.port, "POST", "/users/carol/seed", &[], &std::fs::read(&snap).unwrap());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let seeded = json(&body)["last_seq"].as_i64().unwrap();
+    assert!(seeded >= app_seq);
+
+    // The feed never replays the snapshot's own log.
+    let (status, body) = send(h.port, "GET", "/users/carol/changes?after=0", &[], b"");
+    assert_eq!(status, 200);
+    let feed = json(&body);
+    assert_eq!(feed["changes"].as_array().unwrap().len(), 0, "{feed}");
+    assert_eq!(feed["last_seq"].as_i64().unwrap(), seeded);
+
+    let (status, body) = send(h.port, "POST", "/users/carol/changes", &[], b"[]");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(json(&body)["applied"], 0);
+    assert_eq!(send(h.port, "POST", "/users/carol/changes", &[], b"not json").0, 500);
+}
+
 #[test]
 fn routing() {
     let h = start("routes");
@@ -107,10 +145,6 @@ fn routing() {
     assert_eq!(send(h.port, "GET", "/cli", &[("X-Tod-User", "a")], b"").0, 405);
     assert_eq!(send(h.port, "POST", "/cli", &[("X-Tod-User", "a")], b"garbage").0, 400);
     assert_eq!(send(h.port, "GET", "/nope", &[], b"").0, 404);
-    // Sync waits on tod_store::sync (W2).
-    assert_eq!(send(h.port, "POST", "/users/a/seed", &[], b"x").0, 501);
-    assert_eq!(send(h.port, "POST", "/users/a/changes", &[], b"x").0, 501);
-    assert_eq!(send(h.port, "GET", "/users/a/changes?after=4", &[], b"").0, 501);
     assert_eq!(send(h.port, "GET", "/users/a/changes?after=x", &[], b"").0, 400);
     assert_eq!(send(h.port, "DELETE", "/users/a/seed", &[], b"").0, 405);
 }

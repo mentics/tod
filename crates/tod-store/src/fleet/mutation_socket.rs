@@ -23,10 +23,12 @@ use std::time::Duration;
 /// instance for longer than necessary. A file left behind by a hard crash is
 /// still possible and is handled by the client side (connect failure -> fall
 /// back to direct-open), not by anything here.
-pub struct PortFileGuard(std::path::PathBuf);
+/// Dropping it also stops the listener, which then releases its store.
+pub struct PortFileGuard(std::path::PathBuf, Arc<AtomicBool>);
 
 impl Drop for PortFileGuard {
     fn drop(&mut self) {
+        self.1.store(true, Ordering::Relaxed);
         let _ = std::fs::remove_file(&self.0);
     }
 }
@@ -42,10 +44,10 @@ pub fn start(store: Arc<FleetStore>, root: &std::path::Path) -> anyhow::Result<P
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     std::fs::write(paths.mutation_port(), port.to_string())?;
-    let guard = PortFileGuard(paths.mutation_port().to_path_buf());
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let accept_shutdown = shutdown.clone();
+    let guard = PortFileGuard(paths.mutation_port().to_path_buf(), shutdown.clone());
     std::thread::Builder::new()
         .name("tod-mutation-socket".into())
         .spawn(move || listen_loop(listener, store, accept_shutdown))
