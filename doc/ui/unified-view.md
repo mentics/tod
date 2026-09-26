@@ -32,7 +32,7 @@ view is meant to end both.
 | **Column** | A vertical slot, numbered from the left: "the second column". |
 | **Top region** | The header across the whole application. |
 | **Bottom region** | The status bar. |
-| **Panel** | One piece of content placed in a slot: the node tree panel, the details panel, the decisions panel, the obligations panel, the settings panel. |
+| **Panel** | One piece of content placed in a slot: the node tree panel, the task panel, the details panel, the obligations panel, the settings panel. |
 | **Pane** | A subsection of a panel. |
 | **Drawer** | A panel that slides out from an edge and collapses back on its own. It pushes what is above it up rather than covering it. The chat drawer is the only one so far. |
 
@@ -70,7 +70,7 @@ view is meant to end both.
   `doc/ui-style-guide.yaml`). Column 1's header is the node tree's own
   toolbar, on one fixed-height row.
 - When the app opens, only the tree is shown. Selecting a node opens its
-  details panel in column 2.
+  default panel in column 2: its own (task, generator, managed), else details.
 
 ### Where a panel opens
 
@@ -83,7 +83,7 @@ view is meant to end both.
 - **Ctrl+click**: the new panel opens in the first unpinned column *after* the
   clicked one, even if the clicked column is unpinned. This is how to keep what
   you are looking at and open something beside it.
-- The node tree counts as pinned, so selecting a node opens its details panel
+- The node tree counts as pinned, so selecting a node opens its default panel
   in the first unpinned column from column 2.
 - Replacing a column's panel leaves the columns to its right alone, even ones
   that were opened from the panel it replaced.
@@ -99,10 +99,9 @@ Some panels exist at most once. Opening one that is already shown does not
 open a second copy: focus moves to the existing one, which switches to what
 was asked for. The column rule applies only when it is not shown anywhere.
 
-The decisions panel is a singleton. That is what makes **Alt+Q** repeatable:
-each press moves the one decisions panel to the next waiting node, wherever the
-panel is and whether or not it is pinned. Other panels may turn out to want
-the same treatment.
+No panel needs this today: the decisions panel was the one singleton, and the
+task panel replaced it (`doc/ui/task-panel.md`). Panels may turn out to want
+the treatment later.
 
 ### Pinning
 
@@ -157,46 +156,29 @@ column 1, under the node tree.
   finds what needs attention (e.g. "needs you" and "running" chips, sort by
   time waiting). There is no separate attention column.
 - Each node shows whether an agent is running on it or waiting on the user,
-  with a count badge for pending decisions. Clicking the badge opens the
-  node's decisions panel.
+  with a count badge for pending requests. Clicking the badge opens the
+  node's task panel.
 - **Right-click** on a node opens a menu of everything valid on it. Mostly
-  navigation: open details, open decisions (with the count, only when some are
-  pending), open obligations, plan, settings. Then node actions such as rename,
-  move, and launch agent.
+  navigation: open the task panel (or details), obligations, plan,
+  settings. Then node actions such as rename, move, and launch agent.
+
+### Task panel
+
+The default panel for a task node: its identity, artifacts, runner, and
+requests, with past answers in a drawer. See `doc/ui/task-panel.md`. It
+replaces the decisions panel that used to hold requests.
 
 ### Details
 
-What a user expects to see when they click a node. It holds:
+What a user sees when they click a node with no default panel of its own. It holds:
 
 - The node's title and its lifecycle status label (below).
 - The details field: one block of content, not a list.
-- Links to the node's other panels (obligations, plan, decisions waiting,
+- Links to the node's other panels (obligations, plan,
   settings).
 
 Obligations and plan steps are *not* laid out inside the details panel. A node
 can have 20 or 30 obligations, so they get panels of their own.
-
-### Decisions
-
-What the user answers. Its own panel, not a pane of the details panel.
-
-- **Pending decisions** are at the top, one pane each, oldest first. More than
-  one agent may be working on a node, so there can be several; the user
-  answers them one after another.
-- Each decision comes from a structured agent reply: the question, its
-  options with quick keys (**1**, **2**, **3** …), and links to its evidence
-  (the obligation, the plan step, the test run, the transcript). Evidence opens
-  by the column rule above, so the decision stays put while the user checks.
-- Below them, **the answer log**: every answer the user gave on this node, and
-  which agent asked. The panel scrolls when it gets long.
-
-The answer log is **append-only**. **Change** on an entry asks the question
-again, and the new answer is sent to the agent as a new action and logged as a
-new entry. The old entry stays, so it is plain that the user changed their
-mind. Changing an answer does not reverse anything: the agent may have done
-other work based on the first answer, so the agent is told about the change
-and decides how to adjust. Each entry links to the agent transcript for that
-action.
 
 ### Obligations, plan, findings, transcripts
 
@@ -223,7 +205,7 @@ label wherever the node is shown:
 | `→ verifying` | Running the on-entry agent for this state. |
 
 Decisions the lifecycle panel used to hold (gate verdicts, waives, what to do
-next) move to the decisions panel.
+next) move to the task panel's requests.
 
 ### Structured agents
 
@@ -240,7 +222,7 @@ visibly distinct from structured work.
 
 | Key | Action |
 |---|---|
-| **Alt+Q** | Show the next node waiting on the user in the decisions panel (a singleton), opening and pinning it if it is not shown. |
+| **Alt+Q** | Select the next task with a request, longest waiting first, which shows its task panel. |
 | **Alt+Shift+Q** | The same, going back. |
 | **Alt+W** | Pin or unpin the focused column. |
 | **Enter** / **Ctrl+Enter** | Click / Ctrl+click the focused link. |
@@ -248,7 +230,7 @@ visibly distinct from structured work.
 | **E** on an item | Open its panel. |
 | **Ctrl+E** on an item | Open its panel as a Ctrl+click would: after the current column. |
 | **Ctrl+W** | Close the focused column (never column 1). |
-| **1**, **2**, **3** … | Answer the top pending decision with that option. |
+| **1**, **2**, **3** … | Answer the top request with that option (task panel). |
 | **Ctrl+J** | Expand or collapse the chat drawer. |
 | **Ctrl+N** | Start a new conversation in the chat drawer. |
 | **Ctrl+Left / Ctrl+Right** | Move focus between columns (`ui/pane_nav.rs`). |
@@ -275,6 +257,6 @@ session.
   case). It may help clean up what the conversation view shows today, but
   whether users need it is unproven.
 - **Relations between nodes.** Beyond parent and children, which relations
-  matter will be worked out as needed. Evidence links from a decision are the
+  matter will be worked out as needed. Evidence links from a request are the
   first real use.
 - **Dockable chat**, under a particular column or dragged between them.
