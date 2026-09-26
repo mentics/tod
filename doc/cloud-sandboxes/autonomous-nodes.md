@@ -2,7 +2,8 @@
 
 Status: design (September 2026). Nothing here is built. It builds on the
 sandbox transport in [blaxel-remote.md](blaxel-remote.md) and the relay in
-[relay-protocol.md](relay-protocol.md).
+[relay-protocol.md](relay-protocol.md). The work items are in
+[autonomous-nodes-plan.md](autonomous-nodes-plan.md).
 
 ## Goal
 
