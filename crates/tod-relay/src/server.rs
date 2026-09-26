@@ -30,6 +30,10 @@ pub type WsIn = SplitStream<WebSocketStream<TcpStream>>;
 /// process is ended and the client sees it exit.
 const MAX_HELD_BYTES: usize = 32 << 20;
 const LOG_DIR: &str = "/opt/tod/logs";
+/// How long a poke's own bridging lease (`Hold::lease("poke", ..)`) holds the
+/// sandbox awake by itself, giving the supervisor time to decide whether to
+/// take its own hold.
+const POKE_BRIDGE_SECS: u64 = 60;
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
@@ -39,18 +43,30 @@ struct Relay {
     tunnel: Arc<Tunnel>,
     hold: Hold,
     home: String,
+    /// The command a poke starts when no supervisor is running
+    /// (`--supervisor-cmd`, e.g. `tod-supervisor wake`). The binary does not
+    /// exist yet; this just needs to be a valid shell command line once it
+    /// does.
+    supervisor_cmd: String,
+    /// The pid of a supervisor this relay started, while it is still
+    /// running. `None` both before one has been started and once it exits.
+    supervisor: Mutex<Option<u32>>,
 }
 
 pub fn main(args: &[String]) {
     let mut port = 2222u16;
     let mut max_hold = 4 * 3600u64;
     let mut tunnel_port = crate::tunnel::DEFAULT_PORT;
+    let mut supervisor_cmd = "tod-supervisor wake".to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--max-hold-secs" => max_hold = it.next().and_then(|v| v.parse().ok()).unwrap_or(max_hold),
             "--tunnel-port" => tunnel_port = it.next().and_then(|v| v.parse().ok()).unwrap_or(tunnel_port),
+            "--supervisor-cmd" => {
+                supervisor_cmd = it.next().cloned().unwrap_or(supervisor_cmd);
+            }
             _ => {}
         }
     }
@@ -61,6 +77,8 @@ pub fn main(args: &[String]) {
         tunnel: Arc::new(Tunnel::default()),
         hold: Hold::new(max_hold),
         home: home_dir(),
+        supervisor_cmd,
+        supervisor: Mutex::new(None),
     });
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     rt.block_on(async move {
@@ -91,8 +109,114 @@ fn close(code: u16, reason: &str) -> Message {
     Message::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.to_string().into() }))
 }
 
+// ---------------------------------------------------------------------------
+// POST /poke: wakes the node's supervisor, starting it if it is not running.
+
+/// Peeks the request line without consuming it. A `POST .../poke` is handled
+/// here, outside the WebSocket upgrade, and `None` is returned since the
+/// connection is done; anything else is handed back untouched so the caller
+/// can still try the WebSocket handshake on it.
+async fn try_poke(relay: &Arc<Relay>, stream: TcpStream) -> Option<TcpStream> {
+    let mut buf = [0u8; 512];
+    let n = match stream.peek(&mut buf).await {
+        Ok(n) => n,
+        Err(_) => return Some(stream),
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let Some(line) = head.lines().next() else { return Some(stream) };
+    let mut parts = line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else { return Some(stream) };
+    if method != "POST" {
+        return Some(stream);
+    }
+    // The proxy may or may not strip its `/port/<n>` prefix, so match segments.
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if !segs.contains(&"poke") {
+        return Some(stream);
+    }
+    handle_poke(relay, stream).await;
+    None
+}
+
+async fn handle_poke(relay: &Arc<Relay>, mut stream: TcpStream) {
+    // Drain enough of the request to be a well-behaved HTTP peer; nothing in
+    // it (headers or body) matters to a poke.
+    let mut buf = vec![0u8; 4096];
+    let mut total = Vec::new();
+    while total.len() < 65536 {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                total.extend_from_slice(&buf[..n]);
+                if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    poke(relay);
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+}
+
+/// Returns true if a process with this pid is (still) around. Used to decide
+/// whether a poke should signal the supervisor we started before, or start a
+/// fresh one because it is gone.
+fn alive(pid: u32) -> bool {
+    // SAFETY: signal 0 only checks for existence/permission, sends nothing.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Wakes the node's supervisor: if one we started is still running, signal it
+/// (`SIGUSR1`) to look again now rather than at its next schedule; otherwise
+/// start it fresh with `supervisor_cmd` (`keepAlive: false` — it takes its
+/// own hold once it has decided there is work, see `doc/cloud-sandboxes/
+/// autonomous-nodes.md`).
+///
+/// Either way, a poke takes a short leased hold of its own first: the
+/// supervisor needs a moment after waking to look and decide whether to take
+/// its own hold, and this bridges that gap without granting an indefinite
+/// one — it lapses on its own (`POKE_BRIDGE_SECS`) unless another poke
+/// arrives to renew it.
+fn poke(relay: &Arc<Relay>) {
+    relay.hold.lease("poke", POKE_BRIDGE_SECS);
+    {
+        let mut sup = relay.supervisor.lock().unwrap();
+        if let Some(pid) = *sup {
+            if alive(pid) {
+                // SAFETY: signalling a process we started ourselves.
+                unsafe { libc::kill(pid as i32, libc::SIGUSR1) };
+                eprintln!("poke: signalled supervisor pid {pid}");
+                return;
+            }
+            *sup = None;
+        }
+    }
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(&relay.supervisor_cmd);
+    cmd.env("HOME", &relay.home);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id().unwrap_or(0);
+            *relay.supervisor.lock().unwrap() = Some(pid);
+            eprintln!("poke: started supervisor pid {pid}: {}", relay.supervisor_cmd);
+            let relay = relay.clone();
+            tokio::spawn(async move {
+                let code = child.wait().await.map(exit_code).unwrap_or(255);
+                eprintln!("poke: supervisor pid {pid} exited {code}");
+                let mut sup = relay.supervisor.lock().unwrap();
+                if *sup == Some(pid) {
+                    *sup = None;
+                }
+            });
+        }
+        Err(e) => eprintln!("poke: could not start supervisor: {e}"),
+    }
+}
+
 async fn handle(relay: Arc<Relay>, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
+    let Some(stream) = try_poke(&relay, stream).await else { return };
     let mut path = String::new();
     let callback = |req: &Request, resp: Response| {
         path = req.uri().path().to_string();
