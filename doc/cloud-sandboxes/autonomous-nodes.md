@@ -249,7 +249,8 @@ then:
    deadline for an event wait (give up or check directly if the webhook never
    comes), the next check for a poll, the time for a timer. Its command is
    `tod-supervisor wake`, with `keepAlive: false`: the supervisor takes its own
-   hold once it has decided there is work.
+   hold once it has decided there is work. (On the development account the
+   orchestrator keeps the timer instead; see Development account.)
 2. Releases its hold. The sandbox is in standby about 15 s later.
 
 **A wake is a poke, never an instruction.** Whether it comes from a schedule,
@@ -484,17 +485,49 @@ The plan:
   of the agent's process.
 - **The watchdog** holds a Blaxel key as a job secret.
 
+## Development account
+
+The account tod is developed on has no sandbox schedules, volumes, or
+forking; the account it is deployed on has all three. Each gap has a
+stand-in, chosen per account in `sandboxes.toml`, so the same code runs on
+both and only the stand-ins are dev-only.
+
+- **Schedules → the orchestrator's timer** (`scheduler = "orchestrator"`;
+  the default, `"blaxel"`, is the design above). An agent sandbox still
+  schedules its own wakes; the one call that creates or deletes a wake goes
+  to the orchestrator (`POST /wakes` with the id, sandbox, and time;
+  `DELETE /wakes/<id>`) instead of to Blaxel. The orchestrator keeps each
+  wake as a row in the user's database, runs a timer in its own process, and
+  pokes the sandbox when one is due, the same poke a webhook sends. A
+  sandbox's timers stop in standby, so while any wake is pending the
+  orchestrator holds itself awake with the same `keepAlive` lease the agent
+  sandboxes use, and lets itself sleep when none is left; after a restart it
+  reloads the pending wakes. Everything else is real: agent sandboxes sleep
+  while they wait, waits and deadlines behave the same, and it runs with the
+  app closed. The cost is an orchestrator that is awake while anything waits
+  on a timer, which at development scale is a few dollars a month. The timer
+  is deleted once development moves to an account with schedules.
+- **Volumes → the orchestrator's own disk.** The per-user databases go in
+  the same directory on the sandbox's ordinary filesystem. They survive
+  standby but not the sandbox, so on this account a lost orchestrator loses
+  them; that is acceptable for development data.
+- **Forking → creating from the image.** A node's sandbox (and a replacement
+  for one) is always created from the image and checks out the node's
+  branch, which the design needs anyway. Forking would only make that
+  faster.
+
 ## To verify
 
-1. **Sandbox schedules.** Not available on our current plan (403); access has
-   been requested. Verify that a schedule wakes a sandbox in standby, that a
-   sandbox can schedule itself, and that deleting a schedule by id works.
-   Script: `.local/agent/scratchpad/sched-spike/spike.py` (git-ignored).
+1. **Sandbox schedules.** Not available on our development account (403).
+   On the deployment account, verify that a schedule wakes a sandbox in
+   standby, that a sandbox can schedule itself, and that deleting a schedule
+   by id works. Script: `.local/agent/scratchpad/sched-spike/spike.py`
+   (git-ignored).
 2. **Agent Drive.** Private preview, and only in `us-was-1`, which is also
    the region the team will use (tod's default region is now `us-was-1`).
    Check that a mount survives standby, and how it behaves with a line
    appended per transcript write.
-3. **Volumes.** Assumed available on the tier we deploy on (not on our current
+3. **Volumes.** Available on the deployment account (not the development
    one). Check reattaching one to a replacement orchestrator sandbox.
 4. **The proxy.** Claude Code's own traffic through it (subscription auth,
    streaming); whether a rule's secrets can be rotated on a running sandbox
