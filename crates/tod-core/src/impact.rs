@@ -27,6 +27,7 @@ use uuid::Uuid;
 pub const IGNORED_TABLES: &[&str] = &[
     "cloud_nodes",
     "waits",
+    "node_events",
     "decisions",
     "decision_answers",
     "conversations",

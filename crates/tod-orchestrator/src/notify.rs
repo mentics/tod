@@ -246,7 +246,18 @@ impl Notifier {
 
     /// The sink from the environment: ntfy at [`NTFY_URL_ENV`] (else
     /// ntfy.sh), or none when it is `off`.
+    /// Publishes only when `TOD_NTFY_URL` is set (and not `off`): what
+    /// [`crate::Server::new`] uses, so tests and embedders never reach the
+    /// network unasked. The binary uses [`Self::default_sink`].
     pub fn sink_from_env() -> Box<dyn Sink> {
+        match std::env::var(NTFY_URL_ENV) {
+            Ok(v) if !v.is_empty() => Self::default_sink(),
+            _ => Box::new(NoSink),
+        }
+    }
+
+    /// [`server_from_env`]: `TOD_NTFY_URL`, else ntfy.sh; `off` is none.
+    pub fn default_sink() -> Box<dyn Sink> {
         match server_from_env() {
             Some(server) => Box::new(NtfySink::new(server)),
             None => Box::new(NoSink),

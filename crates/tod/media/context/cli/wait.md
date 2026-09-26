@@ -24,7 +24,12 @@ as the 8-character prefix listings show.
   (`+2h` or `2h`); `<DURATION>` is `30s`, `5m`, `2h`, `1d`, or plain seconds.
 - `--until`: a timer, e.g. until a usage limit resets.
 - `--event`: a webhook, e.g. `github:pr 123 checks`. `--deadline` (default
-  24h) is when to give up on the webhook and check directly.
+  24h) is when to give up on the webhook and check directly. The match is a
+  prefix of the event's key, words split by `:` or spaces:
+  `github:pr <N> checks` (then `:success`/`:failure`), `github:pr <N> review`,
+  `github:pr <N> comment`, `github:pr <N> merged`,
+  `github:branch <BRANCH> checks`, `github:branch <BRANCH> push`,
+  `linear:issue <ID>`.
 - `--check`: a shell command polled every `<DURATION>` until it exits 0, for
   something that sends no webhook. Quote it.
 
