@@ -32,6 +32,63 @@ data root the same way tod does (`--data-root`, `TOD_DATA_ROOT`, then
 install.toml) and never writes install.toml. `-NoSandbox` / `--no-sandbox`
 skips all of this.
 
+## Building sandbox binaries (`scripts/build-sandbox-binaries.sh`)
+
+Everything that runs inside a sandbox — `tod-relay` today, `tod-supervisor`
+and `tod-orchestrator` once those crates exist (autonomous nodes, waves 2–3)
+— is a Linux binary for `x86_64-unknown-linux-musl`, built from whatever OS
+you develop on (Windows, macOS, or Linux) rather than requiring a Linux
+machine for day-to-day work.
+
+```sh
+scripts/build-sandbox-binaries.sh              # release build (default)
+scripts/build-sandbox-binaries.sh --debug
+```
+
+On Windows, run it under Git Bash (`sh scripts/build-sandbox-binaries.sh` or
+`bash scripts/build-sandbox-binaries.sh`) — there is no PowerShell twin; the
+script is POSIX shell like `scripts/dev.sh` and `scripts/install.sh`, and
+Git Bash is already assumed to be present for those.
+
+It builds each sandbox binary that exists in the workspace today into
+`target/sandbox/` (skipping the ones later waves add, so it keeps working as
+`tod-supervisor` and `tod-orchestrator` land), and `tod-store`'s sandbox
+provisioning (`relay_path()` in `crates/tod-store/src/fleet/sandbox.rs`)
+looks there first, ahead of the raw per-target cargo output and the
+installed `sandbox/tod-relay`.
+
+Two cases:
+
+- **No C dependencies** (`tod-relay` today): a plain `cargo build --target
+  x86_64-unknown-linux-musl`. `rust-lld` (`.cargo/config.toml`) links it with
+  no Linux toolchain needed, on any host.
+- **Depends on `tod-store`** (`tod-supervisor`, `tod-orchestrator`, once they
+  exist): pulls in bundled SQLite, which is C, so cross-linking needs a
+  Linux C toolchain for the musl target. The script tries
+  [`cargo zigbuild`](https://github.com/rust-cross/cargo-zigbuild), which
+  uses `zig` as that cross C compiler/linker from any host. Neither is
+  installed by this script — install them yourself once:
+
+  ```sh
+  cargo install cargo-zigbuild
+  # zig: https://ziglang.org/download/, or a package manager:
+  #   brew install zig            (macOS)
+  #   choco install zig           (Windows)
+  #   apt/dnf/pacman install zig  (Linux)
+  #   pip install ziglang         (any OS, via PyPI)
+  ```
+
+  Without them, the script leaves that binary out and prints where to build
+  it instead: inside a Linux sandbox or container (`tod-sandbox exec <name>
+  -- cargo build --release -p <crate>`), copying the result into
+  `target/sandbox/<name>` by hand. `tod-relay` itself never needs this path.
+
+  As of this writing, `zig` and `cargo-zigbuild` are not installed in this
+  repository's dev environment, so the `tod-store`-dependent path above is
+  documented but not yet verified end to end here; `tod-relay`'s plain
+  cross-build is verified by this script (it is what `scripts/install.sh`
+  already does for the installed relay).
+
 ## The Blaxel account
 
 The workspace, and how to sign in to it, are recorded in
