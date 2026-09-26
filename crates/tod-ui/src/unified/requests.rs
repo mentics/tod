@@ -379,7 +379,6 @@ impl Requests {
         &self.loaded.items
     }
 
-    #[allow(dead_code)] // for T5.
     pub fn log(&self) -> &[LogEntry] {
         &self.loaded.log
     }
@@ -1104,18 +1103,25 @@ impl Requests {
             .into_any_element()
     }
 
-    /// The append-only decision answer log, newest first, each entry with
-    /// **Change** and a link to the conversation that asked. T5 moves this
-    /// into the task panel's Answered drawer.
-    pub fn render_log(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
+    /// The log's entries alone, newest first: the task panel's Answered
+    /// drawer, which has its own header.
+    pub fn render_log_entries(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let entries: Vec<AnyElement> =
             self.loaded.log.iter().rev().map(|entry| self.render_log_entry(entry, window, cx)).collect();
+        div().flex().flex_col().children(entries).into_any_element()
+    }
+
+    /// The append-only decision answer log, newest first, each entry with
+    /// **Change** and a link to the conversation that asked (the decisions
+    /// panel's; the task panel shows it in its Answered drawer).
+    pub fn render_log(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let entries = self.render_log_entries(window, cx);
         div()
             .flex()
             .flex_col()
             .child(div().text_xs().text_color(muted).child("Answer log"))
-            .children(entries)
+            .child(entries)
             .when(self.loaded.log.is_empty(), |el| {
                 el.child(div().text_xs().text_color(muted).child("No answers yet."))
             })

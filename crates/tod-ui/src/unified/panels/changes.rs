@@ -77,14 +77,27 @@ impl ChangesWatch {
         let weak = cx.weak_entity();
         let fleet_rx = fleet.clone();
         // A store change is when a turn may have ended: each is checked with
-        // a cheap count, and only a changed count recomputes.
+        // a cheap count, and only a changed count recomputes. The channel is
+        // drained on a timer (as the task panel's own poll does) rather than
+        // awaited, so a store write never wakes this task from the store's
+        // thread.
         let watch = cx.spawn(async move |_, cx: &mut AsyncApp| {
+            use tokio::sync::broadcast::error::TryRecvError;
             let mut rx = fleet_rx.subscribe_changes();
             loop {
-                match rx.recv().await {
-                    Ok(()) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                let mut changed = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(()) | Err(TryRecvError::Lagged(_)) => changed = true,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Closed) => return,
+                    }
+                }
+                if !changed {
+                    continue;
                 }
                 let Ok(()) = weak.update(cx, |view: &mut V, cx| {
                     let watch = view.changes_watch();
