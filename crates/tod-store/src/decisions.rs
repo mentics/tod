@@ -129,7 +129,7 @@ pub const CREATE_TABLE: &str = "
         status          TEXT NOT NULL DEFAULT 'pending'
                             CHECK (status IN ('pending','answered','withdrawn')),
         created_at      INTEGER NOT NULL
-        -- `reason` is added by a later migration (schema v68),
+        -- `reason` is added by a later migration (schema v71),
         -- which runs after this on every install, fresh or upgraded.
     );
     CREATE INDEX IF NOT EXISTS idx_decisions_node ON decisions(node_id, created_at);

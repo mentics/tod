@@ -13,19 +13,51 @@ pub enum CloudUpdate {
     Progress(String),
     Accepted(CloudNode),
     Synced(String),
+    /// The node no longer runs in the cloud.
+    Left(String),
     Failed(String),
 }
 
 /// The line shown instead of a cloud node's lifecycle buttons: where it
 /// runs and what the supervisor last did, as far as the synced data says.
 pub fn status_line(cloud: &CloudNode, lifecycle: &str) -> String {
-    format!(
+    status_line_with(cloud, lifecycle, None)
+}
+
+/// [`status_line`], saying when the sandbox was found gone and what the
+/// app's lost-sandbox check (`cloud_sync::lost`) did about it (`note`).
+pub fn status_line_with(cloud: &CloudNode, lifecycle: &str, note: Option<&str>) -> String {
+    let mut line = format!(
         "Runs in the cloud (sandbox {}, as {}); its supervisor moves it along. \
          Last synced state: {}.",
         cloud.sandbox,
         cloud.user,
         if lifecycle.is_empty() { "unknown" } else { lifecycle }
-    )
+    );
+    match note {
+        Some(note) => line = format!("{line} {note}"),
+        None if cloud.lost_at.is_some() => {
+            line.push_str(" Its sandbox is gone; the app replaces it on its next sync.")
+        }
+        None => {}
+    }
+    line
+}
+
+/// Take `node_id` out of the cloud off the UI thread (`cloud_sync::lost::stop_running_in_cloud`).
+pub fn stop_running<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node_id: String,
+    delete_sandbox: bool,
+    cx: &mut Context<T>,
+    on_update: impl Fn(&mut T, CloudUpdate, &mut Context<T>) + 'static,
+) {
+    spawn(cx, on_update, move |tx| {
+        let _ = tx.send_blocking(match cloud_sync::lost::stop_running_in_cloud(&fleet, &node_id, delete_sandbox) {
+            Ok(msg) => CloudUpdate::Left(msg),
+            Err(err) => CloudUpdate::Failed(format!("Stop running in the cloud failed: {err:#}")),
+        });
+    });
 }
 
 /// Run `node_id` in the cloud off the UI thread; `on_update` hears each step
@@ -87,9 +119,12 @@ mod tests {
 
     #[test]
     fn status_line_names_the_sandbox_and_state() {
-        let cloud = CloudNode { sandbox: "node-x".into(), user: "joel".into(), accepted_at_ms: 0 };
+        let mut cloud = CloudNode { sandbox: "node-x".into(), user: "joel".into(), accepted_at_ms: 0, lost_at: None };
         let line = status_line(&cloud, "active");
         assert!(line.contains("node-x") && line.contains("joel") && line.contains("active"), "{line}");
         assert!(status_line(&cloud, "").contains("unknown"));
+        cloud.lost_at = Some(1);
+        assert!(status_line(&cloud, "active").contains("gone"));
+        assert!(status_line_with(&cloud, "active", Some("Replaced it.")).ends_with("Replaced it."));
     }
 }

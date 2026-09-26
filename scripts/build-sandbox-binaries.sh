@@ -52,6 +52,8 @@ CANDIDATES=(
     "tod-supervisor:tod-supervisor:true"
     "tod-orchestrator:tod-orchestrator:true"
     "tod-cli:tod-cli:true"
+    # The hourly watchdog job (a bin of tod-sandbox); rustls pulls in ring (C).
+    "tod-watchdog:tod-sandbox:true"
 )
 
 install_bin() {

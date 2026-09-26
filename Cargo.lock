@@ -9119,12 +9119,16 @@ name = "tod-orchestrator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tod-core",
  "tod-sandbox",
  "tod-store",
  "ureq",
+ "uuid",
 ]
 
 [[package]]
@@ -9205,6 +9209,7 @@ name = "tod-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "libc",
  "rusqlite",
  "serde",

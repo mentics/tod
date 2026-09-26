@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 69;
+pub const CURRENT_USER_VERSION: i32 = 72;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -417,30 +417,69 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 67)?;
     }
     if version < 68 {
-        // Checked first: a store wound back below 68 still has the column.
-        let has_reason: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'reason'",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_reason {
-            conn.execute_batch(
-                "ALTER TABLE decisions ADD COLUMN reason TEXT NOT NULL DEFAULT 'other';",
-            )?;
-        }
+        // Which nodes run in the cloud and when their context changed
+        // (`crate::cloud_nodes`); synced.
+        conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
         conn.pragma_update(None, "user_version", 68)?;
     }
     if version < 69 {
-        conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
-        conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
+        // Webhook events routed to a node (`crate::node_events`); synced.
+        conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
         conn.pragma_update(None, "user_version", 69)?;
     }
+    if version < 70 {
+        // When the orchestrator found a cloud node's sandbox gone
+        // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
+        crate::cloud_nodes::add_lost_at(conn)?;
+        conn.pragma_update(None, "user_version", 70)?;
+    }
+    if version < 71 {
+        // The task panel's request reasons.
+        ensure_decisions_reason(conn)?;
+        conn.pragma_update(None, "user_version", 71)?;
+    }
+    if version < 72 {
+        // The task panel's "Shouldn't have asked" (`crate::request_feedback`).
+        conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 72)?;
+    }
+    // Other branches (the task panel) numbered their own steps 66–67 at the
+    // same time as 66–70 above, so a store may be past a version without
+    // having these. Every one is idempotent: make sure of them all.
+    conn.execute_batch(crate::waits::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
+    conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
+    conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
+    crate::cloud_nodes::add_lost_at(conn)?;
+    // The task panel's own steps, first numbered 66–69 on its branch.
+    ensure_decisions_reason(conn)?;
+    conn.execute_batch(crate::request_feedback::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::request_feedback_triggers_sql())?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels
     // on an install that already ran that migration long ago).
     crate::outline::gate_criteria_seed::seed_gate_criteria(conn)?;
+    Ok(())
+}
+
+/// `decisions.reason` (the task panel's request reasons); a no-op when the
+/// column is already there.
+fn ensure_decisions_reason(conn: &Connection) -> Result<()> {
+    let has_reason: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'reason'",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_reason {
+        conn.execute_batch("ALTER TABLE decisions ADD COLUMN reason TEXT NOT NULL DEFAULT 'other';")?;
+    }
     Ok(())
 }
 

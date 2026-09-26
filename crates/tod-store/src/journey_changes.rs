@@ -38,9 +38,11 @@
 //!   that creates the tables.
 //! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
 //!   v67 migration for the same reason.
+//! - `cloud_nodes` (`tod_store::cloud_nodes`), created by
+//!   [`cloud_nodes_triggers_sql`] in the v68 migration.
 //! - `request_feedback` (`tod_store::request_feedback`; `doc/ui/task-panel.md`
 //!   "Shouldn't have asked") — same story: added after the epoch, so its
-//!   trigger is created by [`request_feedback_triggers_sql`] in the v69
+//!   trigger is created by [`request_feedback_triggers_sql`] in the v72
 //!   migration step that creates the table.
 //!
 //! Deliberately excluded, with reasons:
@@ -273,6 +275,16 @@ pub fn decisions_triggers_sql() -> String {
 /// are updated).
 pub fn waits_triggers_sql() -> String {
     simple_id_triggers("waits")
+}
+
+/// Triggers for `node_events` (webhook events routed to a node).
+pub fn node_events_triggers_sql() -> String {
+    simple_id_triggers("node_events")
+}
+
+/// Triggers for `cloud_nodes` (one row per node, keyed by `node_id`).
+pub fn cloud_nodes_triggers_sql() -> String {
+    node_keyed_triggers("cloud_nodes")
 }
 
 /// Triggers for `request_feedback` (simple `(id, node_id)` shape, can be

@@ -15,8 +15,9 @@ use tod_store::fleet::cli_relay::{self, RelayReply, RelayRequest};
 
 pub fn parse(mut body: &[u8]) -> Result<RelayRequest> {
     let mut request = cli_relay::decode_request(&mut body, None)?;
-    // The data root is the user's, whatever the sandbox says.
-    request.env.retain(|(k, _)| k != "TOD_DATA_ROOT");
+    // The data root is the user's, whatever the sandbox says, and only the
+    // orchestrator files stop questions (`tod_core::stop_questions`).
+    request.env.retain(|(k, _)| k != "TOD_DATA_ROOT" && k != tod_core::stop_questions::KIND_ENV);
     Ok(request)
 }
 

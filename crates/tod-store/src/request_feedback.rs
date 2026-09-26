@@ -331,8 +331,8 @@ mod tests {
         let db_path = dir.join("tod.db");
         {
             let conn = schema::open_writer_connection(&db_path).unwrap();
-            // v69 added it.
-            conn.pragma_update(None, "user_version", 68).unwrap();
+            // v72 added it.
+            conn.pragma_update(None, "user_version", 71).unwrap();
             conn.execute_batch("DROP TABLE IF EXISTS request_feedback;")
                 .unwrap();
         }

@@ -13,17 +13,27 @@
 //!   Clients name themselves with `X-Tod-Client` (`app-<id>`,
 //!   `supervisor-<node>`): what one sends reaches every other client's pulls
 //!   and never comes back to it (see [`sync_backend`]).
+//! - `GET /users/<u>/notify` — the ntfy server and topics the app subscribes
+//!   to (see [`notify`]).
 //! - `GET /users/<u>/snapshot` — the whole database, for a supervisor's copy.
 //! - `GET /users/<u>/nodes/<n>/transcripts` — the node's mirrored agent
 //!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
 //!   (see [`transcripts`]).
+//! - `POST /users/<u>/nodes/<n>/flags` — the watchdog flags a node (see [`flags`]).
+//! - `POST /webhooks/github`, `POST /webhooks/linear` — no user: signed, and
+//!   routed to nodes by branch or open waits (see [`webhooks`]).
 
+pub mod answers;
 pub mod cli;
+pub mod flags;
 pub mod http;
+pub mod impact_handler;
+pub mod notify;
 pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
 pub mod wakes;
+pub mod webhooks;
 
 use anyhow::{Context, Result};
 use http::{Request, Response};
@@ -56,8 +66,10 @@ pub struct Config {
 
 pub struct Server {
     config: Config,
-    users: Users,
+    users: Arc<Users>,
     wakes: Arc<wakes::Wakes>,
+    notifier: Arc<notify::Notifier>,
+    webhook_secrets: webhooks::Secrets,
 }
 
 impl Server {
@@ -68,9 +80,17 @@ impl Server {
     }
 
     pub fn with_poker(config: Config, poker: Box<dyn wakes::Poker>) -> Result<Arc<Self>> {
-        let users = Users::new(config.base.clone());
+        Self::with_sink(config, poker, notify::Notifier::sink_from_env())
+    }
+
+    /// [`Self::with_poker`], publishing change notices to `sink` (see [`notify`]).
+    pub fn with_sink(config: Config, poker: Box<dyn wakes::Poker>, sink: Box<dyn notify::Sink>) -> Result<Arc<Self>> {
+        let users = Arc::new(Users::new(config.base.clone()));
         let wakes = wakes::Wakes::load(&config.base, poker)?;
-        Ok(Arc::new(Self { config, users, wakes }))
+        wakes.set_lost_handler(impact_handler::lost_handler(users.clone()));
+        let notifier = notify::Notifier::start(Box::new(notify::StoreProbe(users.clone())), sink);
+        let webhook_secrets = webhooks::Secrets::load(&config.base)?;
+        Ok(Arc::new(Self { config, users, wakes, notifier, webhook_secrets }))
     }
 
     pub fn wakes(&self) -> &Arc<wakes::Wakes> {
@@ -109,11 +129,32 @@ impl Server {
         }
     }
 
+    /// [`Self::route`], then a change notice for the user after any POST that succeeded
+    /// (the notifier skips it when nothing was committed).
     pub fn handle(&self, request: &Request) -> Response {
+        let response = self.route(request);
+        if request.method == "POST" && response.status == 200 {
+            let path_user = request.path.trim_matches('/').strip_prefix("users/").and_then(|r| r.split('/').next());
+            if let Some(user) = path_user.or_else(|| request.header(USER_HEADER)) {
+                self.notifier.poke(user);
+            }
+        }
+        response
+    }
+
+    fn route(&self, request: &Request) -> Response {
         let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
         let method = request.method.as_str();
         match segments.as_slice() {
             ["health"] => Response::text(200, "ok"),
+            ["webhooks", source] => {
+                let (response, touched) =
+                    webhooks::handle(&self.users, &self.wakes, &self.webhook_secrets, source, request);
+                for user in touched {
+                    self.notifier.poke(&user);
+                }
+                response
+            }
             ["cli"] => {
                 if method != "POST" {
                     return Response::text(405, "POST /cli");
@@ -143,6 +184,7 @@ impl Server {
                             &data,
                             &request.body,
                             client(request).unwrap_or("unknown"),
+                            Some((&user, &self.wakes)),
                         ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
@@ -156,8 +198,19 @@ impl Server {
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }
+                    ("GET", ["notify"]) => self.notify_topics(&user),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {
                         Ok(data) => sync_backend::snapshot(&data),
+                        Err(err) => Response::text(500, format!("{err:#}")),
+                    },
+                    ("POST", ["nodes", node, "flags"]) => match self.users.get(&user) {
+                        Ok(data) => flags::handle(
+                            &self.config.tod_cli,
+                            &self.config.tod_cli_prefix,
+                            &data.root,
+                            node,
+                            &request.body,
+                        ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
                     (_, ["nodes", node, "transcripts", rest @ ..]) => match self.users.root_of(&user) {
@@ -185,6 +238,23 @@ impl Server {
         };
         users::validate(user).map_err(|e| Response::text(400, format!("{e:#}")))?;
         Ok(user.to_string())
+    }
+
+    /// `GET /users/<u>/notify`: the ntfy server and the user's topics.
+    fn notify_topics(&self, user: &str) -> Response {
+        let Some(server) = notify::server_from_env() else {
+            return Response::text(404, "notifications are off on this orchestrator");
+        };
+        let topic = match self.users.root_of(user).and_then(|root| notify::topic(&root)) {
+            Ok(t) => t,
+            Err(err) => return Response::text(500, format!("{err:#}")),
+        };
+        let topics = notify::Topics { server, alerts_topic: notify::alerts_topic(&topic), topic };
+        Response {
+            status: 200,
+            content_type: "application/json",
+            body: serde_json::to_vec(&topics).unwrap_or_default(),
+        }
     }
 
     fn cli(&self, user: &str, body: &[u8]) -> Response {

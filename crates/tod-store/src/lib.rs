@@ -1,5 +1,6 @@
 //! Durable persistence for fleet tasks, outline trees, and related storage.
 
+pub mod cloud_nodes;
 pub mod conversation;
 pub mod credentials;
 pub mod decisions;
@@ -23,6 +24,7 @@ pub mod review;
 pub mod settings;
 pub mod sync;
 pub mod verification;
+pub mod node_events;
 pub mod waits;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they
