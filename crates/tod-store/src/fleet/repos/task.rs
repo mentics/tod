@@ -465,4 +465,72 @@ mod tests {
         assert_eq!(loaded.slug, "plain-node");
         cleanup_test_dir(&dir);
     }
+
+    /// A node with Files but not Agent keeps its directory and branch: every
+    /// Files reader sees what `SetNodeFiles` wrote, and undoing a change to
+    /// either restores the old value rather than clearing it.
+    #[test]
+    fn files_fields_are_read_without_agent_capability() {
+        use crate::conversation::{Entity, EntitySnapshot, snapshot};
+        use crate::fleet::node_actions::resolve_files_for_node;
+        use crate::fleet::undo::capture_inverse_before;
+        use crate::fleet::writer::FleetMutation;
+        use crate::outline::mutations::OutlineMutation;
+        use crate::outline::repos::node::NodeRepo;
+
+        let (dir, conn) = test_writer_conn();
+        let nodes = NodeRepo::new(&conn);
+        let node = nodes.create_normal("files-only", "Files only").unwrap();
+        nodes.enable_capability(node.id, Capability::Files).unwrap();
+        OutlineMutation::SetNodeFiles {
+            node_id: node.id,
+            repo: Some("/w/p".into()),
+            branch: Some("feature".into()),
+            use_worktree: false,
+            dev_container: None,
+        }
+        .execute(&conn, &dir)
+        .unwrap();
+        let id = node.id.to_string();
+
+        let Some(EntitySnapshot::Capabilities { settings, .. }) =
+            snapshot(&conn, Entity::Capabilities, node.id).unwrap()
+        else {
+            panic!("expected a capabilities snapshot");
+        };
+        assert_eq!(settings.repo.as_deref(), Some("/w/p"));
+        assert_eq!(settings.branch.as_deref(), Some("feature"));
+
+        let files = resolve_files_for_node(&conn, &id).unwrap().expect("files resolve");
+        assert_eq!(files.repo.as_deref(), Some("/w/p"));
+        assert_eq!(files.branch.as_deref(), Some("feature"));
+
+        let entry = capture_inverse_before(
+            &conn,
+            &FleetMutation::UpdateTaskRepo {
+                id: id.clone(),
+                repo: Some("/w/q".into()),
+            },
+        )
+        .unwrap()
+        .expect("repo change is undoable");
+        assert!(matches!(
+            entry.inverses.as_slice(),
+            [FleetMutation::UpdateTaskRepo { repo: Some(old), .. }] if old == "/w/p"
+        ));
+        let entry = capture_inverse_before(
+            &conn,
+            &FleetMutation::UpdateTaskBranch {
+                id: id.clone(),
+                branch: None,
+            },
+        )
+        .unwrap()
+        .expect("branch change is undoable");
+        assert!(matches!(
+            entry.inverses.as_slice(),
+            [FleetMutation::UpdateTaskBranch { branch: Some(old), .. }] if old == "feature"
+        ));
+        cleanup_test_dir(&dir);
+    }
 }
