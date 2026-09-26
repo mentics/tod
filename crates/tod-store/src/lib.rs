@@ -18,6 +18,7 @@ pub mod log_level;
 pub mod outline;
 pub mod path_util;
 pub mod paths;
+pub mod request_feedback;
 pub mod review;
 pub mod settings;
 pub mod verification;
