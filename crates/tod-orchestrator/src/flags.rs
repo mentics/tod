@@ -4,7 +4,10 @@
 //! A flag is a pending decision on the node (`tod-cli decisions ask`), so it
 //! reaches the user through the decisions panel and the attention queue like
 //! any other question, with no schema of its own. It syncs to the app as an
-//! ordinary change.
+//! ordinary change. It is filed as a `watchdog` question
+//! (`tod_core::stop_questions`), so its answer takes effect: the orchestrator
+//! pokes the node when it arrives ([`crate::answers`]), and the supervisor
+//! wakes or stays asleep by it.
 
 use crate::cli;
 use crate::http::Response;
@@ -13,7 +16,7 @@ use tod_sandbox::watchdog::Flag;
 use tod_store::fleet::cli_relay::{self, RelayRequest};
 
 /// The options offered with a flag, in order.
-pub const OPTIONS: [&str; 2] = ["Wake it again", "Leave it asleep"];
+pub const OPTIONS: [&str; 2] = tod_core::stop_questions::WATCHDOG_OPTIONS;
 
 /// The `tod-cli` arguments that record `flag` on `node`.
 pub fn ask_args(node: &str, flag: &Flag) -> Vec<String> {
@@ -31,12 +34,17 @@ pub fn ask_args(node: &str, flag: &Flag) -> Vec<String> {
     args
 }
 
+/// Files the decision as a watchdog question.
+pub fn kind_env() -> Vec<(String, String)> {
+    vec![(tod_core::stop_questions::KIND_ENV.to_string(), tod_core::stop_questions::WATCHDOG.to_string())]
+}
+
 pub fn handle(tod_cli: &Path, prefix: &[String], data_root: &Path, node: &str, body: &[u8]) -> Response {
     let flag: Flag = match serde_json::from_slice(body) {
         Ok(f) => f,
         Err(err) => return Response::text(400, format!("flag: {err}")),
     };
-    let request = RelayRequest { env: Vec::new(), args: ask_args(node, &flag), stdin: Vec::new() };
+    let request = RelayRequest { env: kind_env(), args: ask_args(node, &flag), stdin: Vec::new() };
     let reply = cli::run(tod_cli, prefix, data_root, request);
     match cli_relay::decode_reply(&reply) {
         Ok(r) if r.code == 0 => Response::text(200, String::from_utf8_lossy(&r.stdout).into_owned()),
@@ -61,6 +69,7 @@ mod tests {
         assert_eq!(&args[..4], ["decisions", "ask", "--node", "n1"]);
         assert!(args[4].starts_with("The watchdog let sb sleep."));
         assert_eq!(&args[5..], ["--option", "Wake it again", "--option", "Leave it asleep"]);
+        assert_eq!(kind_env(), [("TOD_DECISION_KIND".to_string(), "watchdog".to_string())]);
     }
 
     #[test]

@@ -120,6 +120,7 @@ fn run(args: &[String]) -> Result<()> {
     };
     match wake(config)? {
         Woke::StillWaiting(reason) => eprintln!("tod-supervisor: still waiting ({reason})"),
+        Woke::LeftStopped(reason) => eprintln!("tod-supervisor: left stopped ({reason})"),
         Woke::Ran(outcome) => eprintln!("tod-supervisor: stopped: {}", serde_json::to_string(&outcome)?),
     }
     Ok(())

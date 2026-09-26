@@ -60,7 +60,8 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
 /// them through the feed and `client` does not get them back.
 ///
 /// With `impact` (the user's name and the wakes), the running cloud nodes
-/// the changes affect are marked and poked ([`crate::impact_handler`]).
+/// the changes affect are marked and poked ([`crate::impact_handler`]), and
+/// so are those whose stop questions they answer ([`crate::answers`]).
 pub fn apply_changes(
     user: &UserData,
     body: &[u8],
@@ -68,6 +69,7 @@ pub fn apply_changes(
     impact: Option<(&str, &crate::wakes::Wakes)>,
 ) -> Response {
     let mut affected = Vec::new();
+    let mut answered = Vec::new();
     let response = reply((|| {
         let changes: Vec<Change> = serde_json::from_slice(body).context("changes: a JSON array of Change")?;
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -80,6 +82,10 @@ pub fn apply_changes(
                     eprintln!("tod-orchestrator: impact: {err:#}");
                     Vec::new()
                 });
+            answered = crate::answers::record(&conn, &changes).unwrap_or_else(|err| {
+                eprintln!("tod-orchestrator: answers: {err:#}");
+                Vec::new()
+            });
         }
         let last = sync::last_seq(&conn)?;
         drop(conn);
@@ -90,6 +96,7 @@ pub fn apply_changes(
     })());
     if let Some((name, wakes)) = impact {
         crate::impact_handler::poke(wakes, name, &affected);
+        crate::answers::poke(wakes, name, &answered);
     }
     response
 }
