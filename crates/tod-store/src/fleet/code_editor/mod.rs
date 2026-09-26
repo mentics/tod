@@ -70,8 +70,8 @@ pub fn open_code_editor_for_node(
 }
 
 /// Open one file, `rel` (relative to `dir`, a node's Files directory), in
-/// the first available code editor. A file in a sandbox opens in Zed over
-/// the sandbox; one in a dev container cannot be opened from here.
+/// the first available code editor. A file in a sandbox or a dev container
+/// opens in Zed over it.
 pub fn open_file_in_code_editor(
     fleet: &FleetStore,
     dir: &crate::fleet::Workdir,
@@ -86,9 +86,18 @@ pub fn open_file_in_code_editor(
         crate::fleet::Workdir::Host(path) => editor
             .open(&path)
             .with_context(|| format!("open {} in {}", path.display(), editor.label())),
-        crate::fleet::Workdir::Container { container, path } => anyhow::bail!(
-            "{path} is inside dev container {container}; open it from an editor attached to the container"
-        ),
+        crate::fleet::Workdir::Container { container, path } => {
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in dev container {container}; only Zed opens a dev container");
+            }
+            // The Files directory first, so the file lands in that window.
+            let folder = match dir {
+                crate::fleet::Workdir::Container { path: folder, .. } => folder.as_str(),
+                _ => path.as_str(),
+            };
+            zed::open_in_container(fleet.paths().root(), &container, folder, Some((&path, None)))
+                .with_context(|| format!("open {path} in dev container {container} in Zed"))
+        }
         crate::fleet::Workdir::Sandbox { sandbox, path } => {
             if editor.id() != zed::ZedEditor.id() {
                 anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");
