@@ -435,6 +435,16 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         crate::cloud_nodes::add_lost_at(conn)?;
         conn.pragma_update(None, "user_version", 70)?;
     }
+    // Other branches (the task panel) numbered their own steps 66–67 at the
+    // same time as 66–70 above, so a store may be past a version without
+    // having these. Every one is idempotent: make sure of them all.
+    conn.execute_batch(crate::waits::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
+    conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
+    conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
+    crate::cloud_nodes::add_lost_at(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
