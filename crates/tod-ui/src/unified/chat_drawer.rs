@@ -42,7 +42,7 @@ use crate::ui::agent_conversation::{AgentConversationEvent, AgentConversationPan
 use crate::ui::agent_runs::AgentRuns;
 use crate::ui::key_context;
 use crate::ui::style;
-use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
 use crate::unified::resize::{CHAT_START_HEIGHT, ChatDrawerEdge, DIVIDER_WIDTH, DividerDrag};
 use uuid::Uuid;
 
@@ -269,6 +269,9 @@ impl ChatDrawer {
                     cx,
                 )
             }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
+                terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
+            }
             AgentConversationEvent::Action(..) => {}
         }
     }
@@ -433,7 +436,8 @@ impl ChatDrawer {
                 .flatten()
                 .is_some_and(|c| c.agent_session_id.is_some())
         });
-        let tools = vec![terminal_handoff::tool(self.has_session, self.status.running)];
+        let tools =
+            terminal_handoff::tools(self.focus.node_id(), self.has_session, self.status.running);
         let running = self.status.running;
         let activity = self.status.activity.clone();
         let about = self.about.clone();

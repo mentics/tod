@@ -6,7 +6,7 @@ use crate::ui::token_usage;
 use crate::ui::agent_conversation::{
     AgentConversationEvent, AgentConversationPanel, Entry, EntryKind, PanelAction,
 };
-use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL};
+use crate::ui::terminal_handoff::{self, CONTINUE_IN_TERMINAL, OPEN_SHELL};
 use gpui::{
     AnyElement, AppContext, ClipboardItem, Context, Entity, IntoElement, Subscription, Window,
 };
@@ -94,6 +94,9 @@ impl ConversationView {
                     window,
                     cx,
                 )
+            }
+            AgentConversationEvent::Action(id, _) if id.as_ref() == OPEN_SHELL => {
+                terminal_handoff::open_shell(self.fleet.clone(), self.focus.node_id(), window, cx)
             }
             AgentConversationEvent::Action(id, _) if id.as_ref() == REPORT_PROBLEM => {
                 self.on_report_problem(&crate::ui::report_problem::ReportProblem, window, cx);
@@ -223,10 +226,11 @@ impl ConversationView {
         if crate::ui::report_problem::is_available(cx) {
             header_actions.push(PanelAction::new(REPORT_PROBLEM, "Report a problem"));
         }
-        let tools = vec![terminal_handoff::tool(
+        let tools = terminal_handoff::tools(
+            self.focus.node_id(),
             self.agent_session().is_some(),
             self.status.running,
-        )];
+        );
         self.transcript.update(cx, |panel, cx| {
             panel.set_title(title, cx);
             panel.set_header_actions(header_actions, cx);
