@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 65;
+pub const CURRENT_USER_VERSION: i32 = 66;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -403,6 +403,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         migrate_v64_to_v65(conn)?;
         conn.pragma_update(None, "user_version", 65)?;
     }
+    if version < 66 {
+        // The sync change log (`crate::sync`); its triggers are recreated
+        // on every open below, from the live schema.
+        crate::sync::install(conn)?;
+        conn.pragma_update(None, "user_version", 66)?;
+    }
+    crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that
     // first seeded it (`INSERT OR IGNORE` alone would never update labels

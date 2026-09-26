@@ -54,6 +54,8 @@
 //!   drafting flow this replaced (CLAUDE.md: "Drafting ... is gone").
 //! - every `conversation_*` table — conversations are recorded through the
 //!   driver instead (step 3 of the plan).
+//! - `sync_changes`, `sync_state` (`crate::sync`) — a log about other
+//!   tables' rows (with its own triggers), not data the user changed.
 //! - fleet run-tracking tables (`agent_configs`, `agent_runs`,
 //!   `shell_sessions`, `notifications`, `notification_agents`,
 //!   `transcript_turns`, `tasks`) — the fleet concept is being deprecated
