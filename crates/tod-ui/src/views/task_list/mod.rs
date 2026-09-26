@@ -71,7 +71,6 @@ actions!(
         TaskListOpenEditPanelCtrl,
         TaskListOpenObligations,
         TaskListOpenPlan,
-        TaskListOpenPullRequests,
         TaskListTag1,
         TaskListTag2,
         TaskListTag3,
@@ -133,7 +132,6 @@ pub fn register_task_list_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("x", TaskListOpenExternal, context),
         KeyBinding::new("o", TaskListOpenObligations, context),
         KeyBinding::new("p", TaskListOpenPlan, context),
-        KeyBinding::new("g", TaskListOpenPullRequests, context),
         KeyBinding::new("e", TaskListOpenEditPanel, context),
         // Unified view only: Ctrl+E opens the item's panel as a Ctrl+click
         // would, beside the current column rather than replacing it
@@ -229,11 +227,6 @@ pub enum TaskListEvent {
         title: String,
     },
     OpenPlan {
-        task_id: String,
-        title: String,
-    },
-    /// G — the pull requests of the node's repository and its submodules.
-    OpenPullRequests {
         task_id: String,
         title: String,
     },
@@ -1587,25 +1580,6 @@ impl TaskListView {
         cx.notify();
     }
 
-    pub fn open_pull_requests_panel(
-        &mut self,
-        task_id: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id).cloned() else {
-            return;
-        };
-        self.close_chrome_overlays(cx);
-        cx.emit(TaskListEvent::OpenPullRequests {
-            task_id: task_id.to_string(),
-            title: task.title.clone(),
-        });
-        self.set_status_line(format!("Pull requests: {}", task.title), cx);
-        self.bump_interaction(task_id, window, cx);
-        cx.notify();
-    }
-
     /// Kept in sync by the shell, so Escape in the tree knows to close the drawer.
     pub fn set_drawer_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.drawer_open == open {
@@ -1625,6 +1599,14 @@ impl TaskListView {
     }
 
     /// The selected node, when a saved (not draft) row is selected.
+    /// [`Self::selected_node_id`] with the node's title.
+    pub fn selected_node_with_title(&self) -> Option<(uuid::Uuid, String)> {
+        let id = self.selected_node_id()?;
+        let key = id.to_string();
+        let title = self.all_tasks.iter().find(|t| t.id == key)?.title.clone();
+        Some((id, title))
+    }
+
     pub fn selected_node_id(&self) -> Option<uuid::Uuid> {
         let id = self.working_set.selected_id.as_deref()?;
         if self.is_draft_id(id) {
@@ -2954,23 +2936,6 @@ impl TaskListView {
         self.open_plan_panel(&task_id, window, cx);
     }
 
-    fn on_open_pull_requests(
-        &mut self,
-        _: &TaskListOpenPullRequests,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(task_id) = self
-            .working_set
-            .selected_id
-            .clone()
-            .or_else(|| self.selected_task(cx).map(|t| t.id))
-        else {
-            return;
-        };
-        self.open_pull_requests_panel(&task_id, window, cx);
-    }
-
     fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         use gpui::IntoElement as _;
         if self.marks_focused_column {
@@ -3686,7 +3651,6 @@ impl Render for TaskListView {
             .on_action(cx.listener(Self::on_open_edit_panel_ctrl))
             .on_action(cx.listener(Self::on_open_obligations))
             .on_action(cx.listener(Self::on_open_plan))
-            .on_action(cx.listener(Self::on_open_pull_requests))
             .on_action(cx.listener(Self::on_tag1))
             .on_action(cx.listener(Self::on_tag2))
             .on_action(cx.listener(Self::on_tag3))

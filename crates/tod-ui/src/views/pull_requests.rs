@@ -1,5 +1,5 @@
-//! Right-drawer Pull requests panel: the pull requests of the node's work, one
-//! group per repository it spans — the superproject its Files capability
+//! The Pull requests view (the app menu's "Pull requests"): the pull requests
+//! of the node selected in Tasks, one group per repository its work spans — the superproject its Files capability
 //! names, then each submodule, which is its own GitHub repository with its
 //! own pull requests.
 //!
@@ -9,11 +9,11 @@
 //! edited, created, reordered or marked: it lives on GitHub, and this panel
 //! is a window onto it. What it affords is opening it there.
 //!
-//! Loading runs git and calls GitHub, so it happens off the UI thread: on
-//! open, on following the tree to another node, and on Refresh — never on a
-//! timer. The last result stays on screen while the next one loads.
+//! Loading runs git and calls GitHub, so it happens off the UI thread: when
+//! the view is shown, and on Refresh — never on a timer. The last result
+//! stays on screen while the next one loads.
 
-use crate::ui::actionable::chrome_control_with_shortcut;
+use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav};
 use crate::ui::item_list::keyboard::{
     ItemListCollapse, ItemListDown, ItemListEnd, ItemListExpand, ItemListHome, ItemListPageDown,
     ItemListPageUp, ItemListUp,
@@ -23,7 +23,6 @@ use crate::ui::item_list::{
     bind_item_list_keys,
 };
 use crate::ui::key_context;
-use crate::ui::pane_nav::{PaneFocusLeft, bind_modified_pane_nav};
 use crate::ui::selectable_text::selectable_text;
 use crate::ui::status_filter::{StatusFilter, render_status_filter, status_counts};
 use crate::ui::style;
@@ -31,52 +30,49 @@ use crate::views::rows::pull_request_row::{pull_request_columns, pull_request_ro
 use crate::views::rows::{RowAction, RowHost};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable,
+    AnyElement, App, AppContext, ClipboardItem, Context, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Styled, Window, actions,
     div,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{ActiveTheme, Disableable, StyledExt, h_flex, v_flex};
+use gpui_component::{ActiveTheme, Disableable, Selectable, StyledExt, h_flex, v_flex};
 use gpui_kit_assets::IconName;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tod_core::pull_requests::{NodePulls, RepoPulls, RepoSection, load_node_pulls};
+use tod_core::pull_requests::{
+    NodePulls, PullScope, RepoPulls, RepoSection, load_node_pulls, read_target,
+};
 use tod_store::fleet::FleetStore;
 use tod_store::github::{PullState, PullSummary};
 use uuid::Uuid;
 
 const PULL_REQUESTS_CONTEXT: &str = "PullRequests";
 
-/// How long to wait before loading, so arrowing through the tree with the
-/// panel open asks GitHub about the node the user stops on, not every one
-/// passed on the way.
+/// How long to wait before loading, so switching views back and forth asks
+/// GitHub once, about where the user stops.
 const SETTLE: Duration = Duration::from_millis(250);
 
 actions!(
     pull_requests,
-    [PullRequestsClose, PullRequestsRefresh, PullRequestsOpen]
+    [
+        PullRequestsRefresh,
+        PullRequestsOpen,
+        PullRequestsToggleScope
+    ]
 );
 
 pub fn register_pull_requests_keyboard_bindings(cx: &mut App) {
     // A pull request lives on GitHub: navigation, and the two things this
-    // panel does with one — open it, and ask again.
+    // view does with one — open it, and ask again. Left/Right collapse and
+    // expand the repositories.
     bind_item_list_keys(cx, PULL_REQUESTS_CONTEXT, ItemListKeys::default());
     let context = Some(key_context::excluding_input(PULL_REQUESTS_CONTEXT));
     cx.bind_keys([
         KeyBinding::new("enter", PullRequestsOpen, context),
         KeyBinding::new("r", PullRequestsRefresh, context),
+        KeyBinding::new("a", PullRequestsToggleScope, context),
     ]);
-    key_context::bind_panel_escape(cx, PullRequestsClose, PULL_REQUESTS_CONTEXT);
-    // Left/Right collapse and expand the repositories.
-    bind_modified_pane_nav(cx, PULL_REQUESTS_CONTEXT);
-}
-
-#[derive(Debug, Clone)]
-pub enum PullRequestsEvent {
-    Close,
-    /// Ctrl+Left — move keyboard focus back to the task tree, leaving the panel open.
-    FocusTaskList,
 }
 
 /// One row under a repository's heading: a pull request, or what there is to
@@ -143,18 +139,21 @@ fn section_label(section: &RepoSection) -> String {
 
 /// What to say under a repository with no pull request to list, or `None`
 /// when its rows say it.
-fn section_note(section: &RepoSection, branch: Option<&str>) -> Option<PullRow> {
+fn section_note(section: &RepoSection, scope: PullScope, branch: Option<&str>) -> Option<PullRow> {
     let (text, error) = match &section.pulls {
         RepoPulls::Listed(pulls) if !pulls.is_empty() => return None,
         RepoPulls::Listed(_) => (
-            match branch {
-                Some(branch) => format!("No pull request from {branch}"),
-                None => "No pull request".to_string(),
+            match (scope, branch) {
+                (PullScope::AllOpen, _) => "No open pull request".to_string(),
+                (PullScope::Branch, Some(branch)) => format!("No pull request from {branch}"),
+                (PullScope::Branch, None) => "No pull request".to_string(),
             },
             false,
         ),
         RepoPulls::NotGithub { remote: Some(url) } => (format!("Not on GitHub: {url}"), false),
-        RepoPulls::NotGithub { remote: None } => ("No remote to open pull requests on".into(), false),
+        RepoPulls::NotGithub { remote: None } => {
+            ("No remote to open pull requests on".into(), false)
+        }
         RepoPulls::NoBranch => ("Not on a branch".into(), false),
         RepoPulls::Failed(err) => (err.clone(), true),
     };
@@ -189,9 +188,12 @@ fn build_rows(
             continue;
         }
         rows.extend(visible.into_iter().map(|pull| {
-            ItemListRow::item(format!("{key}#{}", pull.number), PullRow::Pull(pull.clone()))
+            ItemListRow::item(
+                format!("{key}#{}", pull.number),
+                PullRow::Pull(pull.clone()),
+            )
         }));
-        if let Some(note) = section_note(section, pulls.branch.as_deref()) {
+        if let Some(note) = section_note(section, pulls.scope, pulls.branch.as_deref()) {
             rows.push(ItemListRow::item(format!("{key}:note"), note));
         }
     }
@@ -232,11 +234,12 @@ pub struct PullRequestsView {
     /// dropped when it lands.
     generation: u64,
     filter: StatusFilter,
+    /// The node's branch, or every open one.
+    scope: PullScope,
     list: ItemList<PullRow>,
     host: RowHost<PullAction>,
+    app_nav: AppNavMenu,
 }
-
-impl EventEmitter<PullRequestsEvent> for PullRequestsView {}
 
 impl PullRequestsView {
     pub fn new(cx: &mut Context<Self>, fleet: Arc<FleetStore>, data_root: PathBuf) -> Self {
@@ -250,27 +253,31 @@ impl PullRequestsView {
             loading: false,
             generation: 0,
             filter: StatusFilter::default(),
+            scope: PullScope::default(),
             list: ItemList::new()
                 .with_columns(pull_request_columns())
                 .with_row_actions(pull_actions)
                 .with_row_text(row_text),
             host: RowHost::for_entity(cx.weak_entity()),
+            app_nav: AppNavMenu::default(),
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        self.node_id.is_some()
-    }
-
-    pub fn open(&mut self, node_id: Uuid, title: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.retarget(node_id, title, cx);
-        self.focus_handle.focus(window, cx);
-    }
-
-    /// Point the panel at `node_id` without moving focus. The same node is
-    /// asked about again: the user may have pushed since.
-    pub fn retarget(&mut self, node_id: Uuid, title: &str, cx: &mut Context<Self>) {
-        self.title = title.to_string();
+    /// Show the pull requests of `node` (its id and title), or say to select
+    /// one when there is none. The same node is asked about again: the user
+    /// may have pushed since.
+    pub fn show(&mut self, node: Option<(Uuid, String)>, cx: &mut Context<Self>) {
+        let Some((node_id, title)) = node else {
+            self.node_id = None;
+            self.title.clear();
+            self.load = Load::Idle;
+            self.loading = false;
+            self.generation += 1;
+            self.rebuild_rows();
+            cx.notify();
+            return;
+        };
+        self.title = title;
         if self.node_id != Some(node_id) {
             self.node_id = Some(node_id);
             self.load = Load::Idle;
@@ -279,20 +286,6 @@ impl PullRequestsView {
             self.rebuild_rows();
         }
         self.reload(cx);
-    }
-
-    pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.node_id.is_none() {
-            return;
-        }
-        self.node_id = None;
-        self.title.clear();
-        self.load = Load::Idle;
-        self.loading = false;
-        self.generation += 1;
-        self.rebuild_rows();
-        cx.emit(PullRequestsEvent::Close);
-        cx.notify();
     }
 
     /// Ask again, off the UI thread, once the selection has settled.
@@ -305,6 +298,7 @@ impl PullRequestsView {
         self.loading = true;
         let fleet = self.fleet.clone();
         let data_root = self.data_root.clone();
+        let scope = self.scope;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
             let current = this
@@ -314,7 +308,12 @@ impl PullRequestsView {
                 return;
             }
             let result = cx
-                .background_spawn(async move { load_node_pulls(&fleet, &data_root, node_id) })
+                .background_spawn(async move {
+                    let target = fleet
+                        .read(|conn| read_target(conn, node_id))
+                        .map_err(|err| format!("{err:#}"))?;
+                    load_node_pulls(target, scope, &data_root)
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
@@ -335,7 +334,9 @@ impl PullRequestsView {
 
     fn rebuild_rows(&mut self) {
         let rows = match &self.load {
-            Load::Loaded(pulls) => build_rows(pulls, &self.filter, |key| self.list.is_collapsed(key)),
+            Load::Loaded(pulls) => {
+                build_rows(pulls, &self.filter, |key| self.list.is_collapsed(key))
+            }
             Load::Idle | Load::Failed(_) => Vec::new(),
         };
         self.list.set_rows(rows);
@@ -370,12 +371,31 @@ impl PullRequestsView {
         }
     }
 
-    fn on_close(&mut self, _: &PullRequestsClose, _: &mut Window, cx: &mut Context<Self>) {
-        self.close(cx);
-    }
-
     fn on_refresh(&mut self, _: &PullRequestsRefresh, _: &mut Window, cx: &mut Context<Self>) {
         self.reload(cx);
+    }
+
+    fn set_scope(&mut self, scope: PullScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.list.set_cursor_key(None);
+        self.reload(cx);
+        cx.notify();
+    }
+
+    fn on_toggle_scope(
+        &mut self,
+        _: &PullRequestsToggleScope,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = match self.scope {
+            PullScope::Branch => PullScope::AllOpen,
+            PullScope::AllOpen => PullScope::Branch,
+        };
+        self.set_scope(next, cx);
     }
 
     /// Enter: open the pull request under the cursor on GitHub; on a heading,
@@ -385,7 +405,12 @@ impl PullRequestsView {
             cx.open_url(&pull.url);
             return;
         }
-        if let Some(key) = self.list.cursor_row().and_then(|row| row.as_group()).map(|g| g.key.clone()) {
+        if let Some(key) = self
+            .list
+            .cursor_row()
+            .and_then(|row| row.as_group())
+            .map(|g| g.key.clone())
+        {
             self.list.toggle_collapsed(&key);
             self.rebuild_rows();
             cx.notify();
@@ -457,7 +482,12 @@ impl PullRequestsView {
     ) -> AnyElement {
         let row_ix = state.row_ix;
         let select_host = host.clone();
-        let body = selectable_text(format!("pull-note-{}", state.key), text.to_string(), window, cx);
+        let body = selectable_text(
+            format!("pull-note-{}", state.key),
+            text.to_string(),
+            window,
+            cx,
+        );
         style::row(h_flex())
             .w_full()
             .items_center()
@@ -476,7 +506,7 @@ impl PullRequestsView {
             .into_any_element()
     }
 
-    fn render_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let branch = match &self.load {
             Load::Loaded(pulls) => pulls.branch.clone(),
             _ => None,
@@ -486,12 +516,17 @@ impl PullRequestsView {
             None => self.title.clone(),
         };
         let muted = cx.theme().muted_foreground;
+        let app_nav = self
+            .render_app_nav_without_badge(window, cx)
+            .into_any_element();
         style::panel_header(h_flex())
             .flex_shrink_0()
             .w_full()
             .min_w_0()
             .items_center()
+            .gap(style::space::RELATED)
             .bg(cx.theme().secondary)
+            .child(app_nav)
             .child(
                 v_flex()
                     .min_w_0()
@@ -505,24 +540,33 @@ impl PullRequestsView {
                     ),
             )
             .child(
-                Button::new("pull-requests-refresh")
-                    .label(if self.loading { "Loading…" } else { "Refresh" })
+                Button::new("pull-requests-scope-branch")
+                    .label("This branch")
                     .ghost()
                     .compact()
-                    .disabled(self.loading)
+                    .selected(self.scope == PullScope::Branch)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_scope(PullScope::Branch, cx))),
+            )
+            .child(
+                Button::new("pull-requests-scope-open")
+                    .label("All open")
+                    .ghost()
+                    .compact()
+                    .selected(self.scope == PullScope::AllOpen)
+                    .on_click(cx.listener(|this, _, _, cx| this.set_scope(PullScope::AllOpen, cx))),
+            )
+            .child(
+                Button::new("pull-requests-refresh")
+                    .label(if self.loading {
+                        "Loading…"
+                    } else {
+                        "Refresh"
+                    })
+                    .ghost()
+                    .compact()
+                    .disabled(self.loading || self.node_id.is_none())
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
-            .child(chrome_control_with_shortcut(
-                Button::new("pull-requests-close")
-                    .label("Close")
-                    .ghost()
-                    .compact()
-                    .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
-                window,
-                &PullRequestsClose,
-                PULL_REQUESTS_CONTEXT,
-                cx,
-            ))
     }
 
     fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -532,11 +576,19 @@ impl PullRequestsView {
                 .child(text)
                 .into_any_element()
         };
+        if self.node_id.is_none() {
+            return message("Select a node in Tasks to see the pull requests of its work".into());
+        }
         match &self.load {
             Load::Idle => message("Loading pull requests…".into()),
             Load::Failed(reason) => style::text_error(div())
                 .p(style::space::INSET)
-                .child(selectable_text("pull-requests-error", reason.clone(), window, cx))
+                .child(selectable_text(
+                    "pull-requests-error",
+                    reason.clone(),
+                    window,
+                    cx,
+                ))
                 .into_any_element(),
             Load::Loaded(pulls) if pulls.sections.is_empty() => {
                 message("No repositories to look in".into())
@@ -569,10 +621,7 @@ impl Focusable for PullRequestsView {
 impl Render for PullRequestsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.drain_row_actions(cx);
-        if !self.is_open() {
-            return div().size_full().into_any_element();
-        }
-        let theme = cx.theme();
+        let background = cx.theme().background;
         let counts = match &self.load {
             Load::Loaded(pulls) => {
                 status_counts(&STATE_ORDER, all_pulls(pulls).map(|p| p.state.as_str()))
@@ -583,19 +632,13 @@ impl Render for PullRequestsView {
             Load::Loaded(pulls) => pulls.warnings.join("\n"),
             _ => String::new(),
         };
-        v_flex()
+        let root = v_flex()
             .key_context(PULL_REQUESTS_CONTEXT)
             .track_focus(&self.focus_handle)
             .size_full()
-            .bg(theme.background)
-            .border_l_2()
-            .border_color(theme.primary)
-            .on_action(cx.listener(|_, _: &PaneFocusLeft, _, cx| {
-                cx.emit(PullRequestsEvent::FocusTaskList);
-                cx.stop_propagation();
-            }))
-            .on_action(cx.listener(Self::on_close))
+            .bg(background)
             .on_action(cx.listener(Self::on_refresh))
+            .on_action(cx.listener(Self::on_toggle_scope))
             .on_action(cx.listener(Self::on_open))
             .on_action(cx.listener(Self::on_arrow_up))
             .on_action(cx.listener(Self::on_arrow_down))
@@ -613,7 +656,7 @@ impl Render for PullRequestsView {
                 |this: &mut Self, state, _, cx| this.set_filter(state, cx),
                 cx,
             ))
-            .child(div().flex_1().min_h_0().child(self.render_body(window, cx)))
+            .child(v_flex().flex_1().min_h_0().child(self.render_body(window, cx)))
             .when(!warnings.is_empty(), |el| {
                 el.child(
                     style::panel_footer(div()).flex_shrink_0().child(
@@ -630,10 +673,24 @@ impl Render for PullRequestsView {
                 style::panel_footer(div())
                     .flex_shrink_0()
                     .child(style::text_dense_muted(div()).child(
-                        "↑/↓ navigate · Enter opens on GitHub · ←/→ collapse/expand · R refreshes · Esc closes",
+                        "↑/↓ navigate · Enter opens on GitHub · ←/→ collapse/expand · A this branch / all open · R refreshes",
                     )),
-            )
-            .into_any_element()
+            );
+        self.bind_app_nav_toggle(root, cx)
+    }
+}
+
+impl HasAppNav for PullRequestsView {
+    fn app_nav_mut(&mut self) -> &mut AppNavMenu {
+        &mut self.app_nav
+    }
+
+    fn app_nav_current(&self) -> Option<AppDestination> {
+        Some(AppDestination::PullRequests)
+    }
+
+    fn app_nav_fallback_focus(&self) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -668,6 +725,7 @@ mod tests {
 
     fn node_pulls() -> NodePulls {
         NodePulls {
+            scope: PullScope::Branch,
             branch: Some("tod/x".into()),
             sections: vec![
                 section(
@@ -675,7 +733,11 @@ mod tests {
                     Some(("acme", "app")),
                     RepoPulls::Listed(vec![pull(1, PullState::Open), pull(2, PullState::Merged)]),
                 ),
-                section("vendor/lib", Some(("acme", "lib")), RepoPulls::Listed(Vec::new())),
+                section(
+                    "vendor/lib",
+                    Some(("acme", "lib")),
+                    RepoPulls::Listed(Vec::new()),
+                ),
                 section(
                     "vendor/gl",
                     None,
@@ -683,7 +745,11 @@ mod tests {
                         remote: Some("https://gitlab.com/x/gl.git".into()),
                     },
                 ),
-                section("vendor/err", Some(("acme", "err")), RepoPulls::Failed("GitHub: boom".into())),
+                section(
+                    "vendor/err",
+                    Some(("acme", "err")),
+                    RepoPulls::Failed("GitHub: boom".into()),
+                ),
             ],
             warnings: Vec::new(),
         }
@@ -695,7 +761,10 @@ mod tests {
                 ItemListRow::Group { spec, .. } => {
                     format!("## {} ({})", spec.label, spec.count.unwrap_or(0))
                 }
-                ItemListRow::Item { item: PullRow::Pull(p), .. } => {
+                ItemListRow::Item {
+                    item: PullRow::Pull(p),
+                    ..
+                } => {
                     format!("#{} {}", p.number, p.state.as_str())
                 }
                 ItemListRow::Item {
@@ -736,6 +805,7 @@ mod tests {
         // A repository whose pull requests are all filtered out shows no
         // note: it has pull requests, just none in this state.
         let pulls = NodePulls {
+            scope: PullScope::Branch,
             branch: Some("b".into()),
             sections: vec![section(
                 "",
@@ -744,21 +814,44 @@ mod tests {
             )],
             warnings: Vec::new(),
         };
-        assert_eq!(describe(&build_rows(&pulls, &filter, |_| false)), vec!["## acme/app (0)"]);
+        assert_eq!(
+            describe(&build_rows(&pulls, &filter, |_| false)),
+            vec!["## acme/app (0)"]
+        );
+    }
+
+    #[test]
+    fn listing_every_open_one_an_empty_repository_says_so_not_the_branch() {
+        let mut pulls = node_pulls();
+        pulls.scope = PullScope::AllOpen;
+        let rows = build_rows(&pulls, &StatusFilter::default(), |_| false);
+        let described = describe(&rows);
+        assert!(
+            described.contains(&"- No open pull request".to_string()),
+            "{described:?}"
+        );
     }
 
     #[test]
     fn a_collapsed_repository_is_its_heading_alone() {
-        let rows = build_rows(&node_pulls(), &StatusFilter::default(), |key| key == "repo:acme/app");
+        let rows = build_rows(&node_pulls(), &StatusFilter::default(), |key| {
+            key == "repo:acme/app"
+        });
         let described = describe(&rows);
-        assert_eq!(&described[..2], &["## acme/app (2)", "## vendor/lib · acme/lib (0)"]);
+        assert_eq!(
+            &described[..2],
+            &["## acme/app (2)", "## vendor/lib · acme/lib (0)"]
+        );
     }
 
     #[test]
     fn keys_are_stable_per_repository_and_number() {
         let rows = build_rows(&node_pulls(), &StatusFilter::default(), |_| false);
         let keys: Vec<&str> = rows.iter().take(3).map(|r| r.key()).collect();
-        assert_eq!(keys, vec!["repo:acme/app", "repo:acme/app#1", "repo:acme/app#2"]);
+        assert_eq!(
+            keys,
+            vec!["repo:acme/app", "repo:acme/app#1", "repo:acme/app#2"]
+        );
     }
 
     #[test]

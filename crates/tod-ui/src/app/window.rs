@@ -25,8 +25,8 @@ use crate::ui::report_problem::{
     self, OpenReportDialog, REPORT_DIALOG_CONTEXT, ReportDialogSubmit, ReportProblem,
 };
 use crate::ui::app_nav::{
-    HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoSettings, ShellGoTasks,
-    ShellGoWorkbench, register_app_nav_keyboard_bindings,
+    HasAppNav, ShellGoConversation, ShellGoDatabase, ShellGoPullRequests, ShellGoSettings,
+    ShellGoTasks, ShellGoWorkbench, register_app_nav_keyboard_bindings,
 };
 use crate::ui::key_context::NOT_INPUT;
 use crate::ui::panel_split::{PanelSplitState, h_panel_split};
@@ -34,8 +34,8 @@ use crate::ui::selectable_text::selectable_text;
 use crate::ui::status::{self, StatusSource};
 use crate::ui::toast::{error_toast, info_toast, notification_overlay, warning_toast};
 use crate::views::action_panel::{ActionPanelEvent, ActionPanelView};
-use crate::views::pull_requests::{PullRequestsEvent, PullRequestsView};
 use crate::views::database::DatabaseView;
+use crate::views::pull_requests::PullRequestsView;
 use crate::views::incoming_check::{IncomingCheck, IncomingCheckEvent};
 use crate::views::lifecycle_control::LifecycleController;
 use crate::views::lifecycle_panel::{LifecyclePanelEvent, LifecyclePanelView};
@@ -87,6 +87,8 @@ enum ShellView {
     Conversation,
     Settings,
     Database,
+    /// The pull requests of the node selected in Tasks.
+    PullRequests,
     /// The unified view ("Workbench") — `doc/ui/unified-view.md`.
     Unified,
 }
@@ -114,6 +116,7 @@ pub struct Shell {
     view_before_conversation: ShellView,
     settings: Entity<SettingsView>,
     database: Entity<DatabaseView>,
+    pull_requests: Entity<PullRequestsView>,
     unified: Entity<UnifiedView>,
     fleet: Arc<FleetStore>,
     _mutation_socket: Option<tod_store::fleet::mutation_socket::PortFileGuard>,
@@ -163,7 +166,6 @@ pub struct Shell {
     _lifecycle_panel_subscription: Subscription,
     _visual_design_panel_subscription: Subscription,
     _action_panel_subscription: Subscription,
-    _pull_requests_subscription: Subscription,
     _sessions_subscription: Subscription,
     _conversation_subscription: Subscription,
     _settings_subscription: Subscription,
@@ -230,6 +232,8 @@ impl Shell {
             .update(cx, |settings, _| settings.app_nav_mut().close());
         self.database
             .update(cx, |database, _| database.app_nav_mut().close());
+        self.pull_requests
+            .update(cx, |pull_requests, _| pull_requests.app_nav_mut().close());
         self.unified
             .update(cx, |unified, cx| unified.close_app_nav(cx));
         if self.active_view == view {
@@ -243,6 +247,7 @@ impl Shell {
         if view == ShellView::Conversation {
             self.view_before_conversation = self.active_view;
         }
+        let previous = self.active_view;
         self.active_view = view;
         crate::ui::journey::record_nav(
             cx,
@@ -273,6 +278,18 @@ impl Shell {
             }
             ShellView::Database => {
                 let focus = self.database.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            }
+            ShellView::PullRequests => {
+                // The node selected in the tree the user came from.
+                let node = if previous == ShellView::Unified {
+                    self.unified.read(cx).selected_node_with_title(cx)
+                } else {
+                    self.task_list.read(cx).selected_node_with_title()
+                };
+                self.pull_requests
+                    .update(cx, |pull_requests, cx| pull_requests.show(node, cx));
+                let focus = self.pull_requests.read(cx).focus_handle(cx);
                 focus.focus(window, cx);
             }
             ShellView::Unified => {
@@ -596,15 +613,6 @@ impl Shell {
                 if !self.drawer.action.read(cx).is_open() {
                     self.task_list.update(cx, |list, cx| {
                         list.show_error("Could not open the Action panel", window, cx);
-                    });
-                }
-            }
-            DrawerRequest::OpenPullRequests { task_id, title } => {
-                if let Ok(node_id) = Uuid::parse_str(&task_id) {
-                    self.drawer
-                        .close_except(Some(DrawerKind::PullRequests), window, cx);
-                    self.drawer.pull_requests.update(cx, |panel, cx| {
-                        panel.open(node_id, &title, window, cx);
                     });
                 }
             }
@@ -1050,6 +1058,7 @@ impl Shell {
             ShellView::Interview
             | ShellView::Settings
             | ShellView::Database
+            | ShellView::PullRequests
             | ShellView::Unified => {
                 return SharedString::default();
             }
@@ -1239,6 +1248,9 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ShellGoDatabase, window, cx| {
                 this.select_view(ShellView::Database, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ShellGoPullRequests, window, cx| {
+                this.select_view(ShellView::PullRequests, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ShellGoWorkbench, window, cx| {
                 this.select_view(ShellView::Unified, window, cx);
             }))
@@ -1307,6 +1319,7 @@ impl Shell {
             ShellView::Conversation => self.conversation.clone().into_any_element(),
             ShellView::Settings => self.settings.clone().into_any_element(),
             ShellView::Database => self.database.clone().into_any_element(),
+            ShellView::PullRequests => self.pull_requests.clone().into_any_element(),
             ShellView::Unified => self.unified.clone().into_any_element(),
         }
     }
@@ -1971,9 +1984,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 interactive_agent_window.clone(),
                             )
                         });
-                        let pull_requests_panel = cx.new(|cx| {
-                            PullRequestsView::new(cx, fleet.clone(), paths.data_root().to_path_buf())
-                        });
                         let agent_for_sessions = agent.clone();
                         let sessions = cx.new(|cx| {
                             SessionsView::new(window, cx, agent_for_sessions, fleet.clone())
@@ -1995,6 +2005,9 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                         });
                         let settings = cx.new(|cx| SettingsView::new(window, cx));
                         let database = cx.new(|cx| DatabaseView::new(window, cx, fleet.clone()));
+                        let pull_requests = cx.new(|cx| {
+                            PullRequestsView::new(cx, fleet.clone(), paths.data_root().to_path_buf())
+                        });
                         let unified = cx.new(|cx| {
                             UnifiedView::new(
                                 window,
@@ -2054,15 +2067,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         TaskListEvent::OpenPlan { task_id, title } => {
                                             this.queue_drawer(
                                                 DrawerRequest::OpenPlan {
-                                                    task_id: task_id.clone(),
-                                                    title: title.clone(),
-                                                },
-                                                cx,
-                                            );
-                                        }
-                                        TaskListEvent::OpenPullRequests { task_id, title } => {
-                                            this.queue_drawer(
-                                                DrawerRequest::OpenPullRequests {
                                                     task_id: task_id.clone(),
                                                     title: title.clone(),
                                                 },
@@ -2271,18 +2275,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                         }
                                     }
                                 });
-                            let _pull_requests_subscription = cx.subscribe(
-                                &pull_requests_panel,
-                                |this: &mut Shell, _, event, cx| match event {
-                                    PullRequestsEvent::Close => {
-                                        this.on_drawer_panel_closed(cx);
-                                    }
-                                    PullRequestsEvent::FocusTaskList => {
-                                        this.pending_refocus_task_list = true;
-                                        cx.notify();
-                                    }
-                                },
-                            );
                             let _sessions_subscription = cx.subscribe(
                                 &sessions,
                                 |this: &mut Shell, _, event, cx| match event {
@@ -2372,13 +2364,13 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                     lifecycle: lifecycle_panel,
                                     visual_design: visual_design_panel,
                                     action: action_panel,
-                                    pull_requests: pull_requests_panel,
                                 },
                                 sessions,
                                 conversation,
                                 view_before_conversation: ShellView::Unified,
                                 settings,
                                 database,
+                                pull_requests,
                                 unified,
                                 fleet: fleet.clone(),
                                 _mutation_socket: mutation_socket,
@@ -2415,7 +2407,6 @@ pub fn open(cx: &mut AsyncApp, opts: LaunchOptions) -> Result<()> {
                                 _lifecycle_panel_subscription,
                                 _visual_design_panel_subscription,
                                 _action_panel_subscription,
-                                _pull_requests_subscription,
                                 _sessions_subscription,
                                 _conversation_subscription,
                                 _settings_subscription,

@@ -202,7 +202,21 @@ pub fn list_branch_prs(
         repo.repo,
         query_encode(&format!("{}:{branch}", repo.owner)),
     );
-    let mut response = ureq::get(&url)
+    list_pulls(token, &url)
+}
+
+/// Every open pull request in `repo`, whichever branch it is from, most
+/// recently updated first (the first 100).
+pub fn list_open_prs(token: &str, repo: &GithubRepo) -> Result<Vec<PullSummary>, GithubError> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100",
+        repo.owner, repo.repo,
+    );
+    list_pulls(token, &url)
+}
+
+fn list_pulls(token: &str, url: &str) -> Result<Vec<PullSummary>, GithubError> {
+    let mut response = ureq::get(url)
         .header("Authorization", &auth_header(token))
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "tod")

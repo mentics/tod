@@ -11,10 +11,12 @@
 //!
 //! Everything here runs git and calls GitHub: call it off the UI thread.
 
+use rusqlite::Connection;
 use std::collections::HashSet;
 use std::path::Path;
 use tod_store::credentials::{CredentialStore, resolve_github_token};
-use tod_store::fleet::FleetStore;
+use tod_store::fleet::ResolvedFiles;
+use tod_store::fleet::node_actions::resolve_files_for_node;
 use tod_store::fleet::repositories::{NodeRepositories, node_repositories};
 use tod_store::github::{self, GithubError, GithubRepo, NodePr, NodePrRepo, PullSummary};
 use uuid::Uuid;
@@ -51,9 +53,21 @@ impl RepoSection {
     }
 }
 
+/// Which pull requests to list in each repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PullScope {
+    /// Every one from the node's branch, in any state, and the one the `pr`
+    /// state recorded.
+    #[default]
+    Branch,
+    /// Every open one, whichever branch it is from.
+    AllOpen,
+}
+
 /// Every repository of a node's work and the pull requests in each.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NodePulls {
+    pub scope: PullScope,
     pub branch: Option<String>,
     pub sections: Vec<RepoSection>,
     /// What could not be read, for the user.
@@ -63,6 +77,7 @@ pub struct NodePulls {
 /// Where pull requests come from: GitHub, or a stand-in under test.
 pub trait PullSource: Sync {
     fn branch_pulls(&self, repo: &GithubRepo, branch: &str) -> Result<Vec<PullSummary>, String>;
+    fn open_pulls(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, String>;
     fn pull(&self, repo: &GithubRepo, number: i64) -> Result<PullSummary, String>;
 }
 
@@ -88,6 +103,10 @@ impl PullSource for GithubPulls {
         github::list_branch_prs(&self.token, repo, branch).map_err(github_error)
     }
 
+    fn open_pulls(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, String> {
+        github::list_open_prs(&self.token, repo).map_err(github_error)
+    }
+
     fn pull(&self, repo: &GithubRepo, number: i64) -> Result<PullSummary, String> {
         github::get_pull(&self.token, repo, number).map_err(github_error)
     }
@@ -98,45 +117,62 @@ pub const NO_FILES: &str =
     "Enable Files on this node (or an ancestor) to see the pull requests of its repository";
 pub const NO_TOKEN: &str = "No GitHub token is configured — add one in Settings";
 
-/// Load `node_id`'s pull requests from GitHub, with the configured token.
+/// Where to look for a node's pull requests, as the database has it: the
+/// Files capability it resolves to, and the pull request the `pr` state
+/// recorded. Reading it is quick; loading from it is not.
+#[derive(Debug, Clone)]
+pub struct PullsTarget {
+    pub files: Option<ResolvedFiles>,
+    pub recorded: Option<NodePr>,
+}
+
+/// Read `node_id`'s [`PullsTarget`].
+pub fn read_target(conn: &Connection, node_id: Uuid) -> anyhow::Result<PullsTarget> {
+    Ok(PullsTarget {
+        files: resolve_files_for_node(conn, &node_id.to_string())?,
+        recorded: NodePrRepo::new(conn).get(node_id)?,
+    })
+}
+
+/// Load the pull requests `target` names from GitHub, with the token
+/// configured for `data_root`.
 pub fn load_node_pulls(
-    fleet: &FleetStore,
+    target: PullsTarget,
+    scope: PullScope,
     data_root: &Path,
-    node_id: Uuid,
 ) -> Result<NodePulls, String> {
     let source = GithubPulls::from_data_root(data_root).ok_or_else(|| NO_TOKEN.to_string())?;
-    load_with(fleet, node_id, &source)
+    load_with(target, scope, &source)
 }
 
 /// [`load_node_pulls`] with pull requests from `source`.
 pub fn load_with(
-    fleet: &FleetStore,
-    node_id: Uuid,
+    target: PullsTarget,
+    scope: PullScope,
     source: &dyn PullSource,
 ) -> Result<NodePulls, String> {
-    let recorded = fleet
-        .read(|conn| NodePrRepo::new(conn).get(node_id))
-        .map_err(|err| format!("{err:#}"))?;
-    let files = fleet
-        .resolve_files_for_node(&node_id.to_string())
-        .map_err(|err| format!("{err:#}"))?;
-    let repos = match files {
+    let repos = match target.files {
         Some(files) => node_repositories(&files)?,
         // No repository to look in, but the `pr` state may have recorded one.
-        None if recorded.is_some() => NodeRepositories {
+        None if target.recorded.is_some() => NodeRepositories {
             branch: None,
             repos: Vec::new(),
             warnings: Vec::new(),
         },
         None => return Err(NO_FILES.to_string()),
     };
-    Ok(collect(repos, recorded.as_ref(), source))
+    Ok(collect(repos, target.recorded.as_ref(), scope, source))
 }
 
 /// Ask `source` about every GitHub repository in `repos` at once (one
 /// request each, in parallel: a superproject with several submodules would
 /// otherwise wait on them one after another), then fold in `recorded`.
-fn collect(repos: NodeRepositories, recorded: Option<&NodePr>, source: &dyn PullSource) -> NodePulls {
+fn collect(
+    repos: NodeRepositories,
+    recorded: Option<&NodePr>,
+    scope: PullScope,
+    source: &dyn PullSource,
+) -> NodePulls {
     let branch = repos.branch.clone();
     // Two submodules can be clones of one repository; it is one section.
     let mut seen = HashSet::new();
@@ -148,20 +184,28 @@ fn collect(repos: NodeRepositories, recorded: Option<&NodePr>, source: &dyn Pull
             None => true,
         })
         .collect();
-    let mut sections: Vec<RepoSection> = std::thread::scope(|scope| {
+    let mut sections: Vec<RepoSection> = std::thread::scope(|threads| {
         let handles: Vec<_> = unique
             .iter()
             .map(|repo| {
                 let branch = branch.as_deref();
-                scope.spawn(move || match (&repo.github, branch) {
-                    (None, _) => RepoPulls::NotGithub {
-                        remote: repo.remote_url.clone(),
-                    },
-                    (Some(_), None) => RepoPulls::NoBranch,
-                    (Some(github), Some(branch)) => match source.branch_pulls(github, branch) {
+                threads.spawn(move || {
+                    let listed = match (&repo.github, scope, branch) {
+                        (None, _, _) => {
+                            return RepoPulls::NotGithub {
+                                remote: repo.remote_url.clone(),
+                            };
+                        }
+                        (Some(github), PullScope::AllOpen, _) => source.open_pulls(github),
+                        (Some(_), PullScope::Branch, None) => return RepoPulls::NoBranch,
+                        (Some(github), PullScope::Branch, Some(branch)) => {
+                            source.branch_pulls(github, branch)
+                        }
+                    };
+                    match listed {
                         Ok(pulls) => RepoPulls::Listed(pulls),
                         Err(err) => RepoPulls::Failed(err),
-                    },
+                    }
                 })
             })
             .collect();
@@ -178,10 +222,12 @@ fn collect(repos: NodeRepositories, recorded: Option<&NodePr>, source: &dyn Pull
             .collect()
     });
     let mut warnings = repos.warnings;
-    if let Some(recorded) = recorded {
+    // Listing every open one, the recorded one is shown if it is open.
+    if let (PullScope::Branch, Some(recorded)) = (scope, recorded) {
         fold_in_recorded(&mut sections, &mut warnings, recorded, source);
     }
     NodePulls {
+        scope,
         branch,
         sections,
         warnings,
@@ -201,7 +247,9 @@ fn fold_in_recorded(
         owner: recorded.owner.clone(),
         repo: recorded.repo.clone(),
     };
-    let section = sections.iter_mut().find(|s| s.github.as_ref() == Some(&repo));
+    let section = sections
+        .iter_mut()
+        .find(|s| s.github.as_ref() == Some(&repo));
     let listed = |pulls: &[PullSummary]| pulls.iter().any(|p| p.number == recorded.pr_number);
     if let Some(RepoSection {
         pulls: RepoPulls::Listed(pulls),
@@ -269,7 +317,20 @@ mod tests {
     }
 
     impl PullSource for Fake {
-        fn branch_pulls(&self, repo: &GithubRepo, branch: &str) -> Result<Vec<PullSummary>, String> {
+        fn open_pulls(&self, repo: &GithubRepo) -> Result<Vec<PullSummary>, String> {
+            self.asked.lock().unwrap().push(format!("{repo} open"));
+            self.by_repo
+                .iter()
+                .find(|(r, _)| r == repo)
+                .map(|(_, pulls)| pulls.clone())
+                .unwrap_or(Ok(Vec::new()))
+        }
+
+        fn branch_pulls(
+            &self,
+            repo: &GithubRepo,
+            branch: &str,
+        ) -> Result<Vec<PullSummary>, String> {
             self.asked.lock().unwrap().push(format!("{repo}@{branch}"));
             self.by_repo
                 .iter()
@@ -337,16 +398,26 @@ mod tests {
                 ],
             ),
             None,
+            PullScope::Branch,
             &fake,
         );
         let mut asked = fake.asked.lock().unwrap().clone();
         asked.sort();
         assert_eq!(asked, vec!["acme/app@tod/x", "acme/lib@tod/x"]);
         assert_eq!(found.sections.len(), 3);
-        assert_eq!(found.sections[0].pulls, RepoPulls::Listed(vec![pull(1, "tod/x")]));
+        assert_eq!(
+            found.sections[0].pulls,
+            RepoPulls::Listed(vec![pull(1, "tod/x")])
+        );
         assert_eq!(found.sections[1].path, "vendor/lib");
-        assert_eq!(found.sections[1].pulls, RepoPulls::Listed(vec![pull(9, "tod/x")]));
-        assert!(matches!(found.sections[2].pulls, RepoPulls::NotGithub { .. }));
+        assert_eq!(
+            found.sections[1].pulls,
+            RepoPulls::Listed(vec![pull(9, "tod/x")])
+        );
+        assert!(matches!(
+            found.sections[2].pulls,
+            RepoPulls::NotGithub { .. }
+        ));
     }
 
     #[test]
@@ -361,6 +432,7 @@ mod tests {
                 ],
             ),
             None,
+            PullScope::Branch,
             &Fake::default(),
         );
         let paths: Vec<&str> = found.sections.iter().map(|s| s.path.as_str()).collect();
@@ -382,10 +454,45 @@ mod tests {
                 ],
             ),
             None,
+            PullScope::Branch,
             &fake,
         );
         assert_eq!(found.sections[0].pulls, RepoPulls::Listed(Vec::new()));
-        assert_eq!(found.sections[1].pulls, RepoPulls::Failed("GitHub: 404".into()));
+        assert_eq!(
+            found.sections[1].pulls,
+            RepoPulls::Failed("GitHub: 404".into())
+        );
+    }
+
+    #[test]
+    fn all_open_asks_every_repository_whatever_the_branch() {
+        let fake = Fake {
+            by_repo: vec![(repo("acme", "lib"), Ok(vec![pull(4, "someone/else")]))],
+            single: vec![(repo("acme", "app"), pull(7, "old"))],
+            ..Fake::default()
+        };
+        let found = collect(
+            repos(
+                None,
+                vec![
+                    node_repo("", Some(repo("acme", "app"))),
+                    node_repo("lib", Some(repo("acme", "lib"))),
+                ],
+            ),
+            Some(&recorded("acme", "app", 7)),
+            PullScope::AllOpen,
+            &fake,
+        );
+        let mut asked = fake.asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["acme/app open", "acme/lib open"]);
+        // The recorded pull request is not open, so it is not listed.
+        assert_eq!(found.sections[0].pulls, RepoPulls::Listed(Vec::new()));
+        assert_eq!(
+            found.sections[1].pulls,
+            RepoPulls::Listed(vec![pull(4, "someone/else")])
+        );
+        assert_eq!(found.scope, PullScope::AllOpen);
     }
 
     #[test]
@@ -394,6 +501,7 @@ mod tests {
         let found = collect(
             repos(None, vec![node_repo("", Some(repo("acme", "app")))]),
             None,
+            PullScope::Branch,
             &fake,
         );
         assert!(fake.asked.lock().unwrap().is_empty());
@@ -409,11 +517,18 @@ mod tests {
             ..Fake::default()
         };
         let found = collect(
-            repos(Some("tod/x"), vec![node_repo("", Some(repo("acme", "app")))]),
+            repos(
+                Some("tod/x"),
+                vec![node_repo("", Some(repo("acme", "app")))],
+            ),
             Some(&recorded("acme", "app", 4)),
+            PullScope::Branch,
             &fake,
         );
-        assert_eq!(found.sections[0].pulls, RepoPulls::Listed(vec![pull(4, "tod/x")]));
+        assert_eq!(
+            found.sections[0].pulls,
+            RepoPulls::Listed(vec![pull(4, "tod/x")])
+        );
 
         // From an older branch: first in its repository's section.
         let fake = Fake {
@@ -422,8 +537,12 @@ mod tests {
             ..Fake::default()
         };
         let found = collect(
-            repos(Some("tod/y"), vec![node_repo("", Some(repo("acme", "app")))]),
+            repos(
+                Some("tod/y"),
+                vec![node_repo("", Some(repo("acme", "app")))],
+            ),
             Some(&recorded("acme", "app", 4)),
+            PullScope::Branch,
             &fake,
         );
         assert_eq!(
@@ -438,13 +557,26 @@ mod tests {
             single: vec![(repo("else", "where"), pull(2, "b"))],
             ..Fake::default()
         };
-        let found = collect(repos(None, Vec::new()), Some(&recorded("else", "where", 2)), &fake);
+        let found = collect(
+            repos(None, Vec::new()),
+            Some(&recorded("else", "where", 2)),
+            PullScope::Branch,
+            &fake,
+        );
         assert_eq!(found.sections.len(), 1);
         assert_eq!(found.sections[0].github, Some(repo("else", "where")));
-        assert_eq!(found.sections[0].pulls, RepoPulls::Listed(vec![pull(2, "b")]));
+        assert_eq!(
+            found.sections[0].pulls,
+            RepoPulls::Listed(vec![pull(2, "b")])
+        );
 
         // One it cannot read is a warning, not a section.
-        let found = collect(repos(None, Vec::new()), Some(&recorded("gone", "x", 2)), &Fake::default());
+        let found = collect(
+            repos(None, Vec::new()),
+            Some(&recorded("gone", "x", 2)),
+            PullScope::Branch,
+            &Fake::default(),
+        );
         assert!(found.sections.is_empty());
         assert_eq!(found.warnings.len(), 1);
     }
