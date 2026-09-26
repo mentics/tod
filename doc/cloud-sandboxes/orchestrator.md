@@ -80,3 +80,48 @@ the server in `TOD_NTFY_URL`; `off` turns it off). Messages carry no data.
   on a background thread (renewed every 10 minutes, resuming with `since=`;
   reconnects with backoff), and runs one cloud sync per message, never two
   at once.
+
+## The watchdog (`tod_sandbox::watchdog`, `tod-watchdog`)
+
+A Blaxel job that runs hourly, so a node's sandbox is never kept awake (and
+billed) longer than its lease allows because something kept renewing a hold.
+Each pass:
+
+1. Lists the workspace's sandboxes and keeps the node ones (`tod-kind=node`)
+   Blaxel reports as running. One in standby, or with no state reported, is
+   never contacted, since anything sent to its URL wakes it.
+2. Asks each one's relay what holds it (`GET /holds`, see
+   `relay-protocol.md`).
+3. Judges it over its lease when it has been held continuously for more
+   than `max_awake_secs` (default 6 h; the relay's own `--max-hold-secs` is
+   4 h, so past that something keeps renewing), or holds a lease with more
+   than `max_lease_secs` left (default 1 h; the supervisor renews 120 s at a
+   time).
+4. For each one over: `POST /release-all` on its relay, then
+   `POST /users/<u>/nodes/<n>/flags` on the orchestrator (`flags.rs`), which
+   records a pending decision on the node (`tod-cli decisions ask`, options
+   "Wake it again" / "Leave it asleep"), so the user sees it in the
+   decisions panel and the attention queue. It needs no schema of its own.
+
+A failure on one sandbox is reported and the rest go on; the pass exits 1
+if anything failed.
+
+Running it:
+
+- `tod-sandbox watchdog run-once [--orchestrator-url URL]` runs one pass
+  from this machine with the account in `sandboxes.toml`. Without
+  `--orchestrator-url` it uses the `tod-orchestrator` sandbox's
+  `<url>/port/8080`.
+- `tod-sandbox watchdog deploy --image IMAGE` creates (or replaces) the job
+  `tod-watchdog`, cron `0 * * * *`. IMAGE must have the Linux `tod-watchdog`
+  (`scripts/build-sandbox-binaries.sh` builds it into `target/sandbox/`) at
+  `/opt/tod/tod-watchdog`. It needs an API-key sign-in (`tod-sandbox setup
+  --auth api-key`), since a `bl login` token expires.
+- The job runs `tod-watchdog`, which reads everything from its environment:
+  `TOD_WATCHDOG_BLAXEL_WORKSPACE`, `TOD_WATCHDOG_BLAXEL_TOKEN` (a job secret,
+  never a plain env value in the spec), `TOD_WATCHDOG_ORCHESTRATOR_URL`, and
+  optionally `TOD_WATCHDOG_MAX_AWAKE_SECS` / `TOD_WATCHDOG_MAX_LEASE_SECS`.
+
+The job's request body (`watchdog::job_body`) is a best reading of Blaxel's
+jobs API, which is not documented here: verify it against a live workspace
+and adjust only there and in `watchdog::deploy`.

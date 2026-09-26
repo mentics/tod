@@ -6,6 +6,7 @@
 //! - [`terminal`]: interactive terminals that let the sandbox sleep when idle.
 //! - [`agent`]: an agent in a sandbox bridged to local stdio, detaching when idle.
 //! - [`tunnel`]: `tod-cli` in a sandbox reaching the app on this machine.
+//! - [`watchdog`]: the hourly job that ends holds kept past their lease.
 //! - [`config`]: `sandboxes.toml`.
 //!
 //! Design: `doc/cloud-sandboxes/blaxel-remote.md`.
@@ -19,3 +20,4 @@ pub mod provision;
 pub mod relay;
 pub mod terminal;
 pub mod tunnel;
+pub mod watchdog;

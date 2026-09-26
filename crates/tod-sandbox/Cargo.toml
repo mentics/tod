@@ -8,6 +8,12 @@ description = "Cloud sandboxes for tod: the provider's API, the relay client, pr
 # A leaf crate, like tod-agent: nothing here knows about tod's data root,
 # settings, or credentials. Callers pass the token and the files to install.
 
+# The hourly Blaxel job's entry point (see `watchdog`): no tod-store, so its
+# image stays small.
+[[bin]]
+name = "tod-watchdog"
+path = "src/bin/tod-watchdog.rs"
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"

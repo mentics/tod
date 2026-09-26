@@ -11,8 +11,10 @@ The relay routes by the path's segments, since the proxy may or may not keep
 its `/port/2222` prefix: a path with an `agent` segment goes to
 [`/agent/<name>`](#agentname), one with an `exec` segment goes to
 [`/exec`](#exec), one with a `tunnel` segment goes to [`/tunnel`](#tunnel),
-and a `POST` whose last segment is `poke`, `hold`, or `release` goes to
-[`POST /poke`](#post-poke) or [`POST /hold`, `POST /release`](#post-hold-post-release)
+a `POST` whose last segment is `poke`, `hold`, `release`, or `release-all`
+goes to [`POST /poke`](#post-poke) or
+[`POST /hold`, `POST /release`](#post-hold-post-release), and a `GET` whose
+last segment is `holds` goes to [`GET /holds`](#get-holds-post-release-all),
 instead of the WebSocket upgrade every other path expects.
 
 ## `/exec`
@@ -174,6 +176,27 @@ only owner of the `keepAlive` process:
 Both answer `200` with an empty body, or `400` when a parameter is missing.
 `reason` keeps only `[A-Za-z0-9._:-]` and is namespaced (`ext:<r>`), so it
 never names one of the relay's own reasons.
+
+## `GET /holds`, `POST /release-all`
+
+For the watchdog (`tod_sandbox::watchdog`; see `orchestrator.md`), which
+checks hourly that no sandbox is held longer than its lease allows.
+
+- `GET /holds` returns what holds the sandbox now, as JSON:
+
+  ```json
+  {"held_for_secs": 5400,
+   "reasons": [{"reason": "busy:abc", "lease_secs_left": null},
+               {"reason": "ext:supervisor", "lease_secs_left": 97}]}
+  ```
+
+  `held_for_secs` is how long ago the current stretch of holding began (the
+  first reason opened with none open before); `null` when nothing holds it.
+  A reason's `lease_secs_left` is `null` when it is lease-less. Times are
+  relative because the relay's clock is monotonic.
+- `POST /release-all` ends every hold now, leased or lease-less (the
+  relay's own `busy:`/`awake:`/`agent:` reasons too; those are set again the
+  next time their work changes state), and the `keepAlive` process with them.
 
 ## Running it
 
