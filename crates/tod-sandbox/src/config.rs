@@ -53,6 +53,10 @@ pub struct Account {
 /// names an image.
 pub const DEFAULT_IMAGE: &str = "blaxel/base-image:latest";
 
+/// Where new sandboxes are created unless the account says otherwise. Agent
+/// Drive is only available here.
+pub const DEFAULT_REGION: &str = "us-was-1";
+
 impl Account {
     /// An account signed in with `bl login`, with the defaults.
     pub fn new(workspace: impl Into<String>) -> Self {
@@ -68,7 +72,7 @@ impl Account {
 }
 
 fn default_region() -> String {
-    "us-pdx-1".into()
+    DEFAULT_REGION.into()
 }
 fn default_image() -> String {
     DEFAULT_IMAGE.into()

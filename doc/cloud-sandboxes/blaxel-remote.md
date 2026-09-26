@@ -3,7 +3,9 @@
 Status: design, backed by a working prototype (September 2026). Nothing here is
 in tod yet. The prototype lives in the git-ignored
 `.local/agent/scratchpad/blaxel-spike/` of the `journeys-functionality-12b84f`
-worktree; see [Prototype](#prototype).
+worktree; see [Prototype](#prototype). Running a node's whole lifecycle in a
+sandbox with the app closed is designed in
+[autonomous-nodes.md](autonomous-nodes.md).
 
 ## Goal and constraints
 

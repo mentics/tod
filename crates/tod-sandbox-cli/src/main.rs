@@ -239,7 +239,7 @@ fn setup(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
     let key_from_stdin = args.flag("--api-key-stdin");
     let defaults = Account {
         workspace: workspace.clone(),
-        region: "us-pdx-1".into(),
+        region: config::DEFAULT_REGION.into(),
         auth,
         default_image: "blaxel/base-image:latest".into(),
         memory_mb: 4096,
