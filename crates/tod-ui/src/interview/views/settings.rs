@@ -160,7 +160,15 @@ impl SettingsSection {
                 TreehouseWorktreesRoot,
                 TerminalProgram,
             ],
-            Self::CloudSandboxes => &[SandboxWorkspace, SandboxSignIn, SandboxApiKey, SandboxDefaultImage],
+            Self::CloudSandboxes => &[
+                SandboxWorkspace,
+                SandboxSignIn,
+                SandboxApiKey,
+                SandboxDefaultImage,
+                SandboxClaudeToken,
+                SandboxClaudeGetToken,
+                SandboxClaudeClear,
+            ],
             Self::Logging => &[LogLevel, LogMaxSize],
             Self::Journeys => &[
                 JourneysSend,
@@ -194,6 +202,13 @@ enum SettingField {
     SandboxApiKey,
     /// The image a new sandbox starts from unless one is given.
     SandboxDefaultImage,
+    /// The Claude subscription token for autonomous nodes, kept in the
+    /// credential store (never shown).
+    SandboxClaudeToken,
+    /// Opens a terminal running `claude setup-token`.
+    SandboxClaudeGetToken,
+    /// Forgets the stored Claude subscription token.
+    SandboxClaudeClear,
     LogLevel,
     LogMaxSize,
     ChatLaunchMode,
@@ -224,6 +239,9 @@ impl SettingField {
             Self::SandboxSignIn => "sandbox-sign-in",
             Self::SandboxApiKey => "sandbox-api-key",
             Self::SandboxDefaultImage => "sandbox-default-image",
+            Self::SandboxClaudeToken => "sandbox-claude-token",
+            Self::SandboxClaudeGetToken => "sandbox-claude-get-token",
+            Self::SandboxClaudeClear => "sandbox-claude-clear",
             Self::LogLevel => "log-level",
             Self::LogMaxSize => "log-max-size",
             Self::ChatLaunchMode => "chat-launch-mode",
@@ -351,6 +369,13 @@ pub struct SettingsView {
     sandbox_check_generation: u64,
     sandbox_editing: Option<SettingField>,
     sandbox_status: Option<Result<SharedString, SharedString>>,
+    /// The Claude subscription token for autonomous nodes' sandboxes: pasted
+    /// here, stored in the credential store, never shown.
+    claude_token_input: Entity<InputState>,
+    /// Where a Claude token is kept; `Some(None)` when there is none, `None`
+    /// until the keyring has been read (off the UI thread).
+    claude_token_backend: Option<Option<tod_store::credentials::CredentialBackend>>,
+    claude_status: Option<Result<SharedString, SharedString>>,
     agent_selects: Vec<AgentRoleSelects>,
     focus_handle: FocusHandle,
     app_nav: AppNavMenu,
@@ -420,16 +445,27 @@ impl SettingsView {
         {
             let root = paths.data_root().to_path_buf();
             cx.spawn(async move |this, cx| {
-                let has_key = cx
-                    .background_spawn(async move { tod_store::fleet::sandbox::has_api_key(&root) })
+                let (has_key, claude) = cx
+                    .background_spawn(async move {
+                        (
+                            tod_store::fleet::sandbox::has_api_key(&root),
+                            tod_store::fleet::sandbox::claude_token_backend(&root),
+                        )
+                    })
                     .await;
                 let _ = this.update(cx, |this, cx| {
                     this.sandbox_has_key = Some(has_key);
+                    this.claude_token_backend = Some(claude);
                     cx.notify();
                 });
             })
             .detach();
         }
+        let claude_token_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder("Enter to edit · Paste the token `claude setup-token` printed")
+        });
         let treehouse_executable_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(format!(
@@ -544,6 +580,9 @@ impl SettingsView {
             sandbox_check_generation: 0,
             sandbox_editing: None,
             sandbox_status: None,
+            claude_token_input,
+            claude_token_backend: None,
+            claude_status: None,
             relay_code_input,
             milestone_states_input,
             agent_selects,
@@ -666,6 +705,7 @@ impl SettingsView {
             SettingField::SandboxWorkspace => self.sandbox_workspace_input.clone(),
             SettingField::SandboxApiKey => self.sandbox_key_input.clone(),
             SettingField::SandboxDefaultImage => self.sandbox_image_input.clone(),
+            SettingField::SandboxClaudeToken => self.claude_token_input.clone(),
             _ => return,
         };
         if self.selected_field() != field {
@@ -691,6 +731,7 @@ impl SettingsView {
     ) {
         match field {
             SettingField::SandboxApiKey => self.save_sandbox_key(window, cx),
+            SettingField::SandboxClaudeToken => self.save_claude_token(window, cx),
             _ => self.save_sandbox_account(cx),
         }
     }
@@ -706,6 +747,107 @@ impl SettingsView {
         self.sandbox_auth = tod_store::fleet::sandbox::AuthMode::ApiKey;
         self.sandbox_has_key = Some(true);
         self.apply_sandbox_sign_in(Some(key), cx);
+    }
+
+    /// Store a pasted Claude token, off the UI thread (the keyring). The
+    /// field is cleared: the token is never shown again.
+    fn save_claude_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let token: String = self.claude_token_input.read(cx).text().to_string();
+        let token: String = token.trim().chars().filter(|c| !c.is_control()).collect();
+        if token.is_empty() {
+            return;
+        }
+        self.claude_token_input.update(cx, |input, cx| input.set_value("", window, cx));
+        record_claude_action(cx, "claude_token_save", ClaudeRow::Token, self.claude_token_is_set());
+        self.claude_status = Some(Ok("Saving…".into()));
+        cx.notify();
+        let root = self.paths.data_root().to_path_buf();
+        let looks_right = token.starts_with("sk-ant-");
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { tod_store::fleet::sandbox::set_claude_token(&root, &token) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.claude_status = Some(match result {
+                    Ok(backend) => {
+                        this.claude_token_backend = Some(Some(backend));
+                        if looks_right {
+                            Ok("Saved. Autonomous nodes' sandboxes created from now on use it.".into())
+                        } else {
+                            Err("Saved, but it does not look like a token from `claude setup-token` (those start with sk-ant-).".into())
+                        }
+                    }
+                    Err(err) => Err(format!("{err:#}").into()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn claude_token_is_set(&self) -> bool {
+        matches!(self.claude_token_backend, Some(Some(_)))
+    }
+
+    /// Open a terminal on this machine running `claude setup-token`, which
+    /// signs in in the browser and prints a long-lived token to paste above.
+    fn get_claude_token(&mut self, source: crate::ui::journey::Source, cx: &mut Context<Self>) {
+        record_claude_action_from(cx, "claude_token_get", ClaudeRow::GetToken, self.claude_token_is_set(), source);
+        self.claude_status = Some(Ok("Opening a terminal…".into()));
+        cx.notify();
+        let paths = self.paths.clone();
+        let settings = self.settings.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    tod_store::fleet::open_host_terminal_command(
+                        &paths,
+                        &settings,
+                        paths.data_root(),
+                        &[],
+                        CLAUDE_SETUP_TOKEN_COMMAND,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.claude_status = Some(match result {
+                    Ok(()) => Ok("A terminal is running `claude setup-token`. Sign in in the browser it opens, then copy the token it prints and paste it above.".into()),
+                    Err(err) => Err(format!("Could not open a terminal: {err:#}").into()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Forget the stored Claude token, off the UI thread (the keyring).
+    fn clear_claude_token(&mut self, source: crate::ui::journey::Source, cx: &mut Context<Self>) {
+        // The button is disabled then; Enter on its row does nothing either.
+        if !self.claude_token_is_set() {
+            return;
+        }
+        record_claude_action_from(cx, "claude_token_clear", ClaudeRow::Clear, self.claude_token_is_set(), source);
+        let root = self.paths.data_root().to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { tod_store::fleet::sandbox::clear_claude_token(&root) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.claude_status = Some(match result {
+                    Ok(None) => {
+                        this.claude_token_backend = Some(None);
+                        Ok("Cleared.".into())
+                    }
+                    Ok(Some(backend)) => {
+                        this.claude_token_backend = Some(Some(backend));
+                        Err("Cleared the stored token, but CLAUDE_CODE_OAUTH_TOKEN is set in the environment tod was started from, and is used instead.".into())
+                    }
+                    Err(err) => Err(format!("{err:#}").into()),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn cycle_sandbox_sign_in(&mut self, cx: &mut Context<Self>) {
@@ -937,7 +1079,10 @@ impl SettingsView {
             | SettingField::TerminalProgram
             | SettingField::SandboxWorkspace
             | SettingField::SandboxApiKey
-            | SettingField::SandboxDefaultImage => {}
+            | SettingField::SandboxDefaultImage
+            | SettingField::SandboxClaudeToken
+            | SettingField::SandboxClaudeGetToken
+            | SettingField::SandboxClaudeClear => {}
             SettingField::SandboxSignIn => self.cycle_sandbox_sign_in(cx),
             SettingField::LogLevel => self.step_log_level(delta, cx),
             SettingField::LogMaxSize => {
@@ -974,7 +1119,14 @@ impl SettingsView {
             SettingField::TreehouseExecutable => self.enter_treehouse_executable_edit(window, cx),
             field @ (SettingField::SandboxWorkspace
             | SettingField::SandboxApiKey
-            | SettingField::SandboxDefaultImage) => self.enter_sandbox_edit(field, window, cx),
+            | SettingField::SandboxDefaultImage
+            | SettingField::SandboxClaudeToken) => self.enter_sandbox_edit(field, window, cx),
+            SettingField::SandboxClaudeGetToken => {
+                self.get_claude_token(crate::ui::journey::Source::Keyboard, cx)
+            }
+            SettingField::SandboxClaudeClear => {
+                self.clear_claude_token(crate::ui::journey::Source::Keyboard, cx)
+            }
             SettingField::Agent(role) => self.focus_agent_select(role, window, cx),
             SettingField::JourneysRelayCode => self.enter_relay_code_edit(window, cx),
             SettingField::JourneysMilestoneStates => self.enter_milestone_states_edit(window, cx),
@@ -1464,6 +1616,128 @@ impl SettingsView {
 
 /// Sign in to the workspace and say what came back. Network, and maybe
 /// `bl`: never on the UI thread.
+/// What "Get a token" runs: a line saying what to do with the output, then
+/// `claude setup-token`. Valid in PowerShell and a POSIX shell alike.
+const CLAUDE_SETUP_TOKEN_COMMAND: &str = "echo 'tod: sign in in the browser that opens. Then copy the token printed below (sk-ant-oat01-...) and paste it in tod: Settings, Cloud sandboxes, Claude subscription.'; claude setup-token";
+
+/// The Claude subscription row's help: whether a token is kept, and where.
+/// Never the token itself.
+fn claude_token_help(
+    backend: Option<Option<tod_store::credentials::CredentialBackend>>,
+) -> &'static str {
+    use tod_store::credentials::CredentialBackend;
+    match backend {
+        None => "The token autonomous nodes' sandboxes run Claude Code with, from `claude setup-token`. Kept in the OS keyring (else an encrypted file), where agents cannot read it.",
+        Some(None) => "Not set. Nodes that run in the cloud need it: get one below, then paste it here. It is kept in the OS keyring (else an encrypted file), where agents cannot read it.",
+        Some(Some(CredentialBackend::Environment)) => "Set, from CLAUDE_CODE_OAUTH_TOKEN in the environment tod was started from. Paste a token to store one instead.",
+        Some(Some(_)) => "Set, in the OS keyring (else an encrypted file), where agents cannot read it. Paste a new one to replace it. Existing node sandboxes keep the one they were created with.",
+    }
+}
+
+/// The Claude subscription rows, for the journey's `Presented` snapshot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaudeRow {
+    Token,
+    GetToken,
+    Clear,
+}
+
+fn record_claude_action(cx: &mut App, action: &str, row: ClaudeRow, token_set: bool) {
+    record_claude_action_from(cx, action, row, token_set, crate::ui::journey::Source::Keyboard);
+}
+
+/// A `UserAction` for the Claude subscription rows, with what was on screen:
+/// the token field and both buttons, "Get a token" primary while no token is
+/// set, Clear disabled then.
+fn record_claude_action_from(
+    cx: &mut App,
+    action: &str,
+    row: ClaudeRow,
+    token_set: bool,
+    source: crate::ui::journey::Source,
+) {
+    let entry = |id: &str, label: &str, primary: bool, disabled: bool| tod_journey::PresentedAction {
+        id: id.to_string(),
+        label: label.to_string(),
+        primary,
+        disabled,
+    };
+    let focused = match row {
+        ClaudeRow::Token => "claude_token_save",
+        ClaudeRow::GetToken => "claude_token_get",
+        ClaudeRow::Clear => "claude_token_clear",
+    };
+    let presented = tod_journey::Presented {
+        actions: vec![
+            entry("claude_token_save", "Claude subscription", false, false),
+            entry("claude_token_get", "Get a token", !token_set, false),
+            entry("claude_token_clear", "Clear", false, !token_set),
+        ],
+        focused: Some(focused.to_string()),
+        notices: Vec::new(),
+    };
+    crate::ui::journey::record_action(
+        cx,
+        tod_store::conversation::Focus::Project,
+        action,
+        source,
+        "settings_cloud_sandboxes",
+        presented,
+    );
+}
+
+/// A row with one button (the Claude subscription's "Get a token" and
+/// "Clear"): Enter on the row, or a click on the button, runs `on_click`.
+#[allow(clippy::too_many_arguments)]
+fn claude_button_row(
+    cx: &mut Context<SettingsView>,
+    view: &SettingsView,
+    field: SettingField,
+    label: &'static str,
+    help: &'static str,
+    primary: bool,
+    disabled: bool,
+    theme: &gpui_component::Theme,
+    on_click: impl Fn(&mut SettingsView, &mut Context<SettingsView>) + 'static,
+) -> impl IntoElement {
+    let selected = view.field_selected(field);
+    let button = Button::new(SharedString::from(format!("{}-button", field.id())))
+        .label(label)
+        .disabled(disabled)
+        .tab_stop(false)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.focus_region = SettingsFocus::Panel;
+            this.focus_handle.focus(window, cx);
+            on_click(this, cx);
+        }));
+    h_flex()
+        .w_full()
+        .gap_4()
+        .px_3()
+        .py_3()
+        .rounded_md()
+        .items_center()
+        .when(selected, |el| {
+            el.bg(theme.list_active)
+                .border_1()
+                .border_color(theme.list_active_border)
+        })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(select_field_listener(field)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .whitespace_normal()
+                .child(help),
+        )
+        .child(if primary { button.primary() } else { button })
+}
+
 fn check_sandbox_sign_in(root: &std::path::Path) -> Result<SharedString, SharedString> {
     let (workspace, _) = tod_store::fleet::sandbox::account_settings(root);
     if workspace.trim().is_empty() {
@@ -1568,6 +1842,7 @@ impl Render for SettingsView {
             (SettingField::SandboxWorkspace, self.sandbox_workspace_input.clone()),
             (SettingField::SandboxApiKey, self.sandbox_key_input.clone()),
             (SettingField::SandboxDefaultImage, self.sandbox_image_input.clone()),
+            (SettingField::SandboxClaudeToken, self.claude_token_input.clone()),
         ] {
             let editing = self.sandbox_editing == Some(field);
             key_context::set_input_tab_stop(&input, editing, cx);
@@ -1997,6 +2272,56 @@ impl SettingsView {
                             )),
                     )
                 })
+                .child(text_input_row(
+                    cx,
+                    self,
+                    SettingField::SandboxClaudeToken,
+                    "Claude subscription",
+                    claude_token_help(self.claude_token_backend),
+                    &self.claude_token_input,
+                    self.sandbox_editing == Some(SettingField::SandboxClaudeToken),
+                    theme,
+                ))
+                .child(claude_button_row(
+                    cx,
+                    self,
+                    SettingField::SandboxClaudeGetToken,
+                    "Get a token",
+                    "Opens a terminal running `claude setup-token` (Claude Code must be installed here). Sign in in the browser it opens; it prints a long-lived token (sk-ant-oat01-…). Paste that above. Once per machine, not per sandbox.",
+                    !self.claude_token_is_set(),
+                    false,
+                    theme,
+                    |this, cx| this.get_claude_token(crate::ui::journey::Source::Click, cx),
+                ))
+                .child(claude_button_row(
+                    cx,
+                    self,
+                    SettingField::SandboxClaudeClear,
+                    "Clear",
+                    "Forgets the stored token. Nodes already running keep the one their sandbox was created with.",
+                    false,
+                    !self.claude_token_is_set(),
+                    theme,
+                    |this, cx| this.clear_claude_token(crate::ui::journey::Source::Click, cx),
+                ))
+                .when_some(self.claude_status.clone(), |el, status| {
+                    let (color, text) = match status {
+                        Ok(text) => (theme.muted_foreground, text),
+                        Err(text) => (theme.danger, text),
+                    };
+                    el.child(
+                        div()
+                            .px_3()
+                            .text_sm()
+                            .text_color(color)
+                            .child(crate::ui::selectable_text::selectable_text(
+                                "settings-claude-status",
+                                text,
+                                window,
+                                cx,
+                            )),
+                    )
+                })
                 .into_any_element(),
             SettingsSection::Logging => v_flex()
                 .gap_1()
@@ -2360,7 +2685,8 @@ fn text_input_row(
                     }
                     SettingField::SandboxWorkspace
                     | SettingField::SandboxApiKey
-                    | SettingField::SandboxDefaultImage => {
+                    | SettingField::SandboxDefaultImage
+                    | SettingField::SandboxClaudeToken => {
                         if this.sandbox_editing != Some(field) {
                             this.enter_sandbox_edit(field, window, cx);
                         }

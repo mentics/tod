@@ -513,6 +513,37 @@ fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::F
     Ok((task, repo_url, branch))
 }
 
+/// The agent a node's supervisor will run ([`CLOUD_AGENT_ENV`]), if set.
+fn cloud_agent() -> Option<String> {
+    std::env::var(CLOUD_AGENT_ENV).ok().map(|a| a.trim().to_string()).filter(|a| !a.is_empty())
+}
+
+/// What to tell the user when a node that runs Claude has no subscription
+/// token to run it with.
+pub const MISSING_CLAUDE_TOKEN: &str = "the node's sandbox runs Claude Code, which needs your Claude \
+     subscription token: set it once in Settings → Cloud sandboxes → Claude subscription \
+     (Get a token runs `claude setup-token`)";
+
+/// The Claude subscription token for a node's sandbox: required unless its
+/// supervisor runs the mock (`agent`), so a sandbox that could not work is
+/// never created. A mock node still gets the token when there is one.
+fn require_claude_token(agent: Option<&str>, token: Option<String>) -> Result<Option<String>> {
+    let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    if token.is_none() && agent != Some("mock") {
+        bail!("{MISSING_CLAUDE_TOKEN}");
+    }
+    Ok(token)
+}
+
+/// [`require_claude_token`] from the credential store. Reads the OS keyring:
+/// never on the UI thread.
+fn claude_token_for_node(root: &Path) -> Result<Option<String>> {
+    require_claude_token(
+        cloud_agent().as_deref(),
+        CredentialStore::from_data_root(root).get(CredentialKind::ClaudeOauthToken),
+    )
+}
+
 /// Whether Blaxel's record of a sandbox says it can no longer run.
 pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
     matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
@@ -534,6 +565,8 @@ pub fn ensure_node_sandbox(
     use tod_sandbox::node;
 
     let (task, repo_url, branch) = node_source(fleet, node_id)?;
+    // Before any network call: without it the sandbox could not run Claude.
+    let claude_oauth_token = claude_token_for_node(root)?;
     let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let account = sandboxes.account()?.clone();
     let bx = sandboxes.blaxel()?;
@@ -558,13 +591,14 @@ pub fn ensure_node_sandbox(
         github_token: creds.get(CredentialKind::GithubToken),
         linear_api_key: creds.get(CredentialKind::LinearApiKey),
         blaxel_token: bx.token().to_string(),
+        claude_oauth_token,
     };
     if credentials.github_token.is_none() {
         progress("warning: no GitHub token stored; the node cannot push or open a pull request");
     }
 
     let name = node_sandbox_name(&task.slug);
-    let agent = std::env::var(CLOUD_AGENT_ENV).ok().filter(|a| !a.trim().is_empty());
+    let agent = cloud_agent();
     let spec = node::NodeSandboxSpec {
         name: &name,
         image: &account.default_image,
@@ -575,6 +609,7 @@ pub fn ensure_node_sandbox(
         orchestrator_host: &orchestrator_host,
         orchestrator_cli_url: &cli_url,
         agent: agent.as_deref(),
+        claude_via: account.claude_token_via,
     };
     let existing = bx.get(&name)?;
     if let Some(info) = &existing
@@ -616,6 +651,9 @@ pub fn ensure_node_sandbox(
         repo_url: &repo_url,
         branch: &branch,
         bundles: &bundles,
+        // At every provisioning, so the supervisor's next start has the
+        // token as it is now (with `claude_token_via = "env"`).
+        supervisor_env: &node::supervisor_env(&credentials, account.claude_token_via),
     };
     progress("installing the relay and supervisor…");
     node::provision(&bx, &url, &payload, progress)?;
@@ -671,8 +709,10 @@ pub fn run_in_cloud(
     node_id: &str,
     progress: &mut dyn FnMut(&str),
 ) -> Result<CloudNode> {
-    // Fails early, before any network call, on a node with no repository.
+    // Fails early, before any network call, on a node with no repository or
+    // no Claude token to run it with.
     node_source(fleet, node_id)?;
+    claude_token_for_node(root)?;
     progress("syncing with the orchestrator…");
     let (orch, user) = resolve(root)?;
     sync(fleet, root, &orch, &user)?;
