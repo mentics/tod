@@ -203,6 +203,15 @@ impl Blaxel {
         }
     }
 
+    /// `DELETE {API}{path}`; a 404 (already gone) is not an error.
+    pub fn delete_path(&self, path: &str, what: &str) -> Result<()> {
+        let mut resp = self.auth(self.agent.delete(&format!("{API}{path}"))).call().context("Blaxel API")?;
+        if resp.status().as_u16() == 404 {
+            return Ok(());
+        }
+        check(&mut resp, what)
+    }
+
     pub fn delete(&self, name: &str) -> Result<()> {
         let mut resp =
             self.auth(self.agent.delete(&format!("{API}/sandboxes/{name}"))).call().context("Blaxel API")?;

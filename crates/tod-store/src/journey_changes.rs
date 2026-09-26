@@ -36,6 +36,8 @@
 //!   `create_triggers_sql` above is seeded at, so their triggers are created
 //!   by [`decisions_triggers_sql`] instead, run by the same migration step
 //!   that creates the tables.
+//! - `waits` (`tod_store::waits`), created by [`waits_triggers_sql`] in the
+//!   v67 migration for the same reason.
 //!
 //! Deliberately excluded, with reasons:
 //! - `node_plan_step_deps`, `node_plan_step_obligations`, `node_plan_step_notes`
@@ -261,6 +263,12 @@ pub fn decisions_triggers_sql() -> String {
         "
     ));
     sql
+}
+
+/// Triggers for `waits` (simple `(id, node_id)` shape; state and due time
+/// are updated).
+pub fn waits_triggers_sql() -> String {
+    simple_id_triggers("waits")
 }
 
 /// Triggers for a table shaped `(id BLOB PRIMARY KEY, node_id BLOB, ...)`.
