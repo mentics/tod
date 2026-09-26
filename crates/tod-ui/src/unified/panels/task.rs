@@ -11,8 +11,8 @@
 //! 3. **Runner line** (T2) — `render_runner_line`, a placeholder for now.
 //! 4. **Requests** (T4) — the only part that scrolls: the shared
 //!    [`crate::unified::requests::Requests`], oldest first, no heading.
-//! 5. **Answered drawer** (T5) — anchored to the bottom;
-//!    `render_answered_drawer`, a placeholder for now.
+//! 5. **Answered drawer** (T5) — anchored to the bottom, collapsed by
+//!    default; the shared [`crate::unified::requests::Requests`] answer log.
 //!
 //! The first three are fixed. Everything reloads on store change, as the
 //! details panel does.
@@ -158,6 +158,8 @@ pub struct TaskPanel {
     /// T4: what the task is waiting on the user for.
     pub(crate) requests: Entity<Requests>,
     _requests_subs: Vec<Subscription>,
+    /// T5: whether the Answered drawer is open; kept for the session only.
+    pub(crate) answered_open: bool,
 }
 
 impl HasChangesWatch for TaskPanel {
@@ -235,6 +237,7 @@ impl TaskPanel {
             focus_handle,
             requests,
             _requests_subs,
+            answered_open: false,
             header,
             pending_refresh: false,
             changes,
@@ -505,10 +508,60 @@ impl TaskPanel {
         Some(div().px_3().pb_3().child(self.requests.clone()).into_any_element())
     }
 
-    /// T5: the Answered drawer, anchored to the bottom of the column.
-    /// Not implemented yet.
-    fn render_answered_drawer(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+    /// T5: the Answered drawer, anchored to the bottom of the column:
+    /// collapsed to "Answered (n)", opened it lists the node's decision
+    /// answers newest first, each with **Change** and the asking
+    /// conversation — the shared [`Requests`] log. Click-only: the header
+    /// is not one of the requests' keyboard stops.
+    fn render_answered_drawer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use gpui_component::ActiveTheme as _;
+        let count = self.requests.read(cx).log().len();
+        let open = self.answered_open;
+        let border = cx.theme().border;
+        let muted = cx.theme().muted_foreground;
+        let entries = open.then(|| {
+            self.requests
+                .update(cx, |requests, cx| requests.render_log_entries(window, cx))
+        });
+        Some(
+            div()
+                .id("unified-task-answered")
+                .flex_none()
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .id("unified-task-answered-header")
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .cursor_pointer()
+                        .child(format!("{} Answered ({count})", if open { "▾" } else { "▸" }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_answered(cx))),
+                )
+                .when_some(entries, |el, entries| {
+                    el.child(
+                        div()
+                            .id("unified-task-answered-list")
+                            .max_h(gpui::px(320.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .child(entries)
+                            .when(count == 0, |el| {
+                                el.child(div().text_xs().text_color(muted).pb_2().child("No answers yet."))
+                            }),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// Open or close the Answered drawer.
+    pub(crate) fn toggle_answered(&mut self, cx: &mut Context<Self>) {
+        self.answered_open = !self.answered_open;
+        cx.notify();
     }
 }
 
@@ -540,7 +593,7 @@ impl Render for TaskPanel {
         let artifacts = self.render_artifacts(cx);
         let runner = self.render_runner_line(window, cx);
         let requests = self.render_requests(cx);
-        let drawer = self.render_answered_drawer(cx);
+        let drawer = self.render_answered_drawer(window, cx);
 
         bind_request_actions(div().id("unified-task-panel"), &self.requests)
             .track_focus(&self.focus_handle)
@@ -714,15 +767,13 @@ mod tests {
             assert_eq!(requests.items()[0].id, decision_id);
         });
 
-        // Answer with the panel gone: T8's `ChangesWatch` awaits store
-        // changes directly, which the test scheduler rejects as a wake from
-        // the store's own thread. The answer path is the shared module's.
-        drop(view);
-        cx.update(|window, _| window.remove_window());
-        cx.run_until_parked();
+        // Answer with the panel open.
         let decision = requests.read_with(cx, |requests, _| requests.loaded.pending[0].clone());
         requests.update(cx, |requests, cx| requests.click_option(decision, 2, cx));
         cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
 
         let answers = fixture
             .store
@@ -733,5 +784,34 @@ mod tests {
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].option, Some(2));
         requests.read_with(cx, |requests, _| assert!(requests.items().is_empty()));
+
+        // T5: the drawer starts closed and counts the answer; opened, Change
+        // on its entry records a second answer beside the first.
+        view.read_with(cx, |view, _| assert!(!view.answered_open));
+        view.update(cx, |view, cx| view.toggle_answered(cx));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        requests.update(cx, |requests, cx| {
+            assert_eq!(requests.log().len(), 1);
+            let decision = requests.log()[0].decision.clone();
+            requests.start_change(decision_id, cx);
+            requests.click_option(decision, 1, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let answers = fixture
+            .store
+            .read(|conn| DecisionRepo::new(conn).get_with_answers(decision_id))
+            .unwrap()
+            .unwrap()
+            .answers;
+        assert_eq!(answers.len(), 2, "the first answer is never overwritten");
+        assert_eq!(answers[0].option, Some(2));
+        assert_eq!(answers[1].option, Some(1));
+        requests.read_with(cx, |requests, _| assert_eq!(requests.log().len(), 2));
+        view.read_with(cx, |view, _| assert!(view.answered_open));
     }
 }
