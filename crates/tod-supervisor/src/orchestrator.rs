@@ -33,31 +33,9 @@ pub fn base_from_cli_url(cli_url: &str) -> String {
     url.strip_suffix("/cli").unwrap_or(url).to_string()
 }
 
+/// Through the sandbox's proxy, trusting its CA (`SSL_CERT_FILE`).
 fn agent() -> ureq::Agent {
-    let mut config = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(300)));
-    // The sandbox's proxy terminates TLS with its own CA, which is in the
-    // system bundle `SSL_CERT_FILE` names.
-    if let Some(certs) = std::env::var_os("SSL_CERT_FILE")
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|pem| {
-            ureq::tls::parse_pem(&pem)
-                .filter_map(|item| match item {
-                    Ok(ureq::tls::PemItem::Certificate(cert)) => Some(cert),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .filter(|certs| !certs.is_empty())
-    {
-        config = config.tls_config(
-            ureq::tls::TlsConfig::builder()
-                .root_certs(ureq::tls::RootCerts::Specific(std::sync::Arc::new(certs)))
-                .build(),
-        );
-    }
-    config.build().into()
+    tod_core::scheduler::sandbox_agent(Duration::from_secs(300))
 }
 
 impl Orchestrator {

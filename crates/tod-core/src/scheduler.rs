@@ -43,6 +43,59 @@ pub fn schedule_name(id: Uuid) -> String {
     format!("wait-{id}")
 }
 
+/// An HTTP agent for a node sandbox's calls through its proxy (from
+/// `HTTPS_PROXY`), which terminates TLS with its own CA: that CA is in the
+/// bundle `SSL_CERT_FILE` names, so it is trusted when set. Elsewhere, the
+/// default roots.
+pub fn sandbox_agent(timeout: Duration) -> ureq::Agent {
+    let mut config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .proxy(sandbox_proxy());
+    if let Some(certs) = std::env::var_os("SSL_CERT_FILE")
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|pem| {
+            ureq::tls::parse_pem(&pem)
+                .filter_map(|item| match item {
+                    Ok(ureq::tls::PemItem::Certificate(cert)) => Some(cert),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|certs| !certs.is_empty())
+    {
+        config = config.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::Specific(std::sync::Arc::new(certs)))
+                .build(),
+        );
+    }
+    config.build().into()
+}
+
+/// The proxy from the environment (`HTTPS_PROXY` and the rest, with
+/// `NO_PROXY`), with a `localhost` host replaced by `127.0.0.1`: a node
+/// sandbox's proxy is `http://localhost:49152`, and its image may have no
+/// `/etc/hosts`, where musl (unlike glibc) then cannot resolve `localhost`.
+fn sandbox_proxy() -> Option<ureq::Proxy> {
+    let proxy = ureq::Proxy::try_from_env()?;
+    if !proxy.host().eq_ignore_ascii_case("localhost") {
+        return Some(proxy);
+    }
+    let mut builder = ureq::Proxy::builder(proxy.protocol()).host("127.0.0.1").port(proxy.port());
+    if let Some(user) = proxy.username() {
+        builder = builder.username(user);
+    }
+    if let Some(password) = proxy.password() {
+        builder = builder.password(password);
+    }
+    let no_proxy = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")).unwrap_or_default();
+    for entry in no_proxy.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        builder = builder.no_proxy(entry);
+    }
+    builder.build().ok().or(Some(proxy))
+}
+
 /// Calls the orchestrator's dev timer.
 pub struct OrchestratorScheduler {
     /// The orchestrator's base URL (no trailing `/`), e.g. `https://…/port/8090`.
@@ -54,11 +107,8 @@ pub struct OrchestratorScheduler {
 
 impl OrchestratorScheduler {
     pub fn new(base_url: impl Into<String>, user: impl Into<String>, node: Uuid) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build()
-            .into();
+        // Called from a node sandbox, through its proxy.
+        let agent = sandbox_agent(Duration::from_secs(30));
         Self { base_url: base_url.into().trim_end_matches('/').to_string(), user: user.into(), node, agent }
     }
 

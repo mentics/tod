@@ -231,3 +231,25 @@ says to quit Zed and try again.
 The sandbox that holds each user's database for autonomous nodes and runs
 their `tod-cli` commands: `tod-sandbox orchestrator` sets it up. See
 [orchestrator.md](orchestrator.md).
+
+## Running a node in the cloud without the window
+
+`cargo run -p tod-core --example cloud_dev -- <data_root> run <node>` does
+what the app's "Run in the cloud" does (`cloud_sync::run_in_cloud`): seed the
+orchestrator, create the node's sandbox with its proxy rules, install the
+relay, the `tod-cli` shim, the supervisor, and the process and media
+bundles, check out the node's branch, and poke it. `... sync` sends the
+outbox and pulls the node's progress back; `... init` makes a list `cloud` in
+a fresh data root to create a test node in with `tod-cli`. Build the sandbox
+binaries first, and never point it at a data root the app has open.
+
+The node's supervisor runs Claude unless `TOD_CLOUD_AGENT=mock` is set when
+the sandbox is created (it becomes the sandbox's `TOD_SUPERVISOR_AGENT`). In a
+mock run, a plan step whose body starts `wait 3m: …` records a wait of that
+long, so the orchestrator's timer wakes the node. The relay's log
+(`GET <sandbox-url>/process/tod-relay/logs`) holds the supervisor's too.
+
+For Claude, the supervisor needs Claude Code logged in inside the node's
+sandbox: set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the
+sandbox's environment, or run `claude /login` in `tod-sandbox shell
+<sandbox>` as the user the supervisor runs as (root).

@@ -118,8 +118,16 @@ pub fn proxy_spec(rules: &[ProxyRule]) -> Value {
 }
 
 /// The environment of every process in a node's sandbox. No secrets.
-pub fn node_env(sandbox: &str, user: &str, node: &str, orchestrator_cli_url: &str) -> Vec<(&'static str, String)> {
-    vec![
+/// `agent` (`claude` or `mock`) becomes the supervisor's `TOD_SUPERVISOR_AGENT`;
+/// `None` leaves it to the supervisor's default, Claude.
+pub fn node_env(
+    sandbox: &str,
+    user: &str,
+    node: &str,
+    orchestrator_cli_url: &str,
+    agent: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut env = vec![
         ("GH_TOKEN", GH_TOKEN_PLACEHOLDER.to_string()),
         // Node's fetch ignores HTTP(S)_PROXY without it, and so gets nothing injected.
         ("NODE_USE_ENV_PROXY", "1".to_string()),
@@ -127,7 +135,11 @@ pub fn node_env(sandbox: &str, user: &str, node: &str, orchestrator_cli_url: &st
         ("TOD_USER", user.to_string()),
         ("TOD_NODE", node.to_string()),
         ("TOD_ORCHESTRATOR_CLI_URL", orchestrator_cli_url.to_string()),
-    ]
+    ];
+    if let Some(agent) = agent.filter(|a| !a.is_empty()) {
+        env.push(("TOD_SUPERVISOR_AGENT", agent.to_string()));
+    }
+    env
 }
 
 /// What a node's sandbox is created as.
@@ -142,11 +154,13 @@ pub struct NodeSandboxSpec<'a> {
     pub orchestrator_host: &'a str,
     /// The orchestrator's full `/cli` URL.
     pub orchestrator_cli_url: &'a str,
+    /// The supervisor's agent (`claude`, `mock`); `None` for its default.
+    pub agent: Option<&'a str>,
 }
 
 /// The `POST /sandboxes` body for a node's sandbox.
 pub fn create_body(spec: &NodeSandboxSpec, creds: &NodeCredentials) -> Value {
-    let envs: Vec<Value> = node_env(spec.name, spec.user, spec.node, spec.orchestrator_cli_url)
+    let envs: Vec<Value> = node_env(spec.name, spec.user, spec.node, spec.orchestrator_cli_url, spec.agent)
         .into_iter()
         .map(|(name, value)| json!({ "name": name, "value": value }))
         .collect();
@@ -184,6 +198,32 @@ pub struct NodePayload<'a> {
     /// The repository's HTTPS URL (git goes through the proxy).
     pub repo_url: &'a str,
     pub branch: &'a str,
+    /// The supervisor's bundles, as `(path relative to /opt/tod, contents)`:
+    /// `process/...` and `media/...`, found beside its executable (it builds
+    /// the agent's context from them). See [`bundle_files`].
+    pub bundles: &'a [(String, Vec<u8>)],
+}
+
+/// Every file under `dir`, as `(prefix/relative/path, contents)`, for
+/// [`NodePayload::bundles`].
+pub fn bundle_files(dir: &Path, prefix: &str) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = format!("{rel}/{name}");
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), &rel, out)?;
+            } else {
+                out.push((rel, std::fs::read(entry.path())?));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, prefix.trim_end_matches('/'), &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
 }
 
 /// Reads the supervisor from `target/sandbox/` (built by
@@ -212,15 +252,29 @@ pub fn checkout_script(repo_url: &str, branch: &str) -> String {
 /// at `url`, checks out the branch, and starts the relay and supervisor.
 /// `progress` hears each slow step and any warning.
 pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut dyn FnMut(&str)) -> Result<()> {
-    bx.upload(url, RELAY_PATH, payload.relay, "0755")?;
+    bx.upload_large(url, RELAY_PATH, payload.relay, "0755")?;
     bx.upload(url, TOD_CLI_PATH, payload.shim, "0755")?;
     match payload.supervisor {
-        Some(bytes) => bx.upload(url, SUPERVISOR_PATH, bytes, "0755")?,
+        Some(bytes) => bx.upload_large(url, SUPERVISOR_PATH, bytes, "0755")?,
         None => progress("warning: tod-supervisor is not built (target/sandbox/); the node will not run on its own"),
     }
-    let res = bx.run(url, &format!("mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli"), 30)?;
+    let res = bx.run(
+        url,
+        &format!("mkdir -p {TOD_DIR}/bin && ln -sf {TOD_CLI_PATH} /usr/local/bin/tod-cli && {LOOPBACK_HOSTS}"),
+        30,
+    )?;
     if res.exit_code != 0 {
         bail!("installing tod-cli failed: {}", res.output());
+    }
+    if !payload.bundles.is_empty() {
+        progress(&format!("installing {} bundle files…", payload.bundles.len()));
+        let res = bx.run(url, &format!("rm -rf {TOD_DIR}/process {TOD_DIR}/media"), 30)?;
+        if res.exit_code != 0 {
+            bail!("clearing the old bundles failed: {}", res.output());
+        }
+        for (rel, bytes) in payload.bundles {
+            bx.upload(url, &format!("{TOD_DIR}/{rel}"), bytes, "0644")?;
+        }
     }
 
     progress(&format!("checking out {}…", payload.branch));
@@ -229,9 +283,9 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
         bail!("checking out {} failed (exit {}): {}", payload.branch, res.exit_code, res.output());
     }
 
-    if bx.process_status(url, RELAY_PROCESS)?.as_deref() != Some("running") {
-        bx.start(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true)?;
-    }
+    // Restarted, so it runs the binary just installed.
+    bx.kill(url, RELAY_PROCESS)?;
+    bx.start(url, RELAY_PROCESS, &format!("{RELAY_PATH} --port {RELAY_PORT}"), true)?;
     if payload.supervisor.is_some() {
         // Through the relay's poke, like every later wake: the relay starts
         // `tod-supervisor wake` (its default `--supervisor-cmd`, the same
@@ -244,6 +298,12 @@ pub fn provision(bx: &Blaxel, url: &str, payload: &NodePayload, progress: &mut d
     }
     Ok(())
 }
+
+/// Names `localhost` in `/etc/hosts` when the image left it out (Blaxel's
+/// images ship it empty). curl resolves `localhost` by itself; most programs
+/// do not, and the sandbox's proxy is `http://localhost:49152`.
+const LOOPBACK_HOSTS: &str = "{ grep -qw localhost /etc/hosts 2>/dev/null || \
+     printf '127.0.0.1 localhost\\n::1 localhost ip6-localhost ip6-loopback\\n' >> /etc/hosts; }";
 
 /// The command the relay runs to start the supervisor (its default
 /// `--supervisor-cmd`).
@@ -300,13 +360,15 @@ mod tests {
             user: "u1",
             node: "n1",
             orchestrator_host: "orch.bl.run",
-            orchestrator_cli_url: "https://orch.bl.run/port/8080/cli",
+            orchestrator_cli_url: "https://orch.bl.run/port/8090/cli",
+            agent: Some("mock"),
         };
         let body = create_body(&spec, &creds());
         let runtime = body["spec"]["runtime"].to_string();
         assert!(!runtime.contains("ghp_x") && !runtime.contains("lin_y") && !runtime.contains("bl_z"));
         assert!(runtime.contains("NODE_USE_ENV_PROXY"));
         assert!(runtime.contains(GH_TOKEN_PLACEHOLDER));
+        assert!(runtime.contains("TOD_SUPERVISOR_AGENT"));
         let proxy = body["spec"]["network"]["proxy"].to_string();
         assert!(proxy.contains("ghp_x") && proxy.contains("{{SECRET:github}}"));
         assert!(!format!("{:?}", creds()).contains("ghp_x"));

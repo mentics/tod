@@ -274,7 +274,10 @@ fn poke(relay: &Arc<Relay>) {
         }
     }
     let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c").arg(&relay.supervisor_cmd);
+    // `exec`, so the pid is the supervisor's own and the next poke's
+    // SIGUSR1 reaches it: a shell in between would die of the signal and
+    // leave the supervisor running untracked.
+    cmd.arg("-c").arg(format!("exec {}", relay.supervisor_cmd));
     cmd.env("HOME", &relay.home);
     match cmd.spawn() {
         Ok(mut child) => {

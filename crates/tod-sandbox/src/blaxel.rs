@@ -321,6 +321,38 @@ impl Blaxel {
         Ok((status, resp.body_mut().read_to_string().unwrap_or_default()))
     }
 
+    /// Writes a file of any size: in parts of at most 4 MB (the filesystem
+    /// API takes at most 5 MB per call), joined into `<path>.new`, which is
+    /// then renamed over `path`, so a binary that is running can be replaced.
+    pub fn upload_large(&self, url: &str, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
+        const PART: usize = 4 * 1024 * 1024;
+        let q = crate::relay::shell_quote;
+        let staged = format!("{path}.new");
+        let mut parts = Vec::new();
+        let chunks: Vec<&[u8]> = if bytes.is_empty() { vec![&[]] } else { bytes.chunks(PART).collect() };
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let part = format!("{path}.part{i:04}");
+            self.upload(url, &part, chunk, "0644")?;
+            parts.push(part);
+        }
+        let joined: Vec<String> = parts.iter().map(|p| q(p)).collect();
+        let joined = joined.join(" ");
+        let res = self.run(
+            url,
+            &format!(
+                "cat {joined} > {1} && chmod {2} {1} && mv -f {1} {0} && rm -f {joined}",
+                q(path),
+                q(&staged),
+                q(mode)
+            ),
+            120,
+        )?;
+        if res.exit_code != 0 {
+            bail!("writing {path} failed: {}", res.output());
+        }
+        Ok(())
+    }
+
     /// Writes a file into the sandbox (at most 5 MB per call).
     pub fn upload(&self, url: &str, path: &str, bytes: &[u8], mode: &str) -> Result<()> {
         const BOUNDARY: &str = "tod-sandbox-7d1f0c2e";

@@ -70,9 +70,9 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
     let Some(url) = info.url else { bail!("{NAME} has no URL") };
     progress("installing tod-orchestrator and tod-cli…");
     bx.run(&url, &format!("mkdir -p {DIR} {DATA_DIR}"), 30)?;
-    upload_large(bx, &url, &format!("{DIR}/tod-orchestrator.new"), spec.orchestrator)?;
+    bx.upload_large(&url, &format!("{DIR}/tod-orchestrator.new"), spec.orchestrator, "0755")?;
     bx.kill(&url, PROCESS)?;
-    upload_large(bx, &url, &format!("{DIR}/tod-cli"), spec.tod_cli)?;
+    bx.upload_large(&url, &format!("{DIR}/tod-cli"), spec.tod_cli, "0755")?;
     let res = bx.run(&url, &format!("mv {DIR}/tod-orchestrator.new {DIR}/tod-orchestrator"), 30)?;
     if res.exit_code != 0 {
         bail!("installing tod-orchestrator failed: {}", res.output());
@@ -109,25 +109,6 @@ pub fn provision(bx: &Blaxel, spec: &Spec, progress: &mut dyn FnMut(&str)) -> Re
 
 fn is_dead(status: &str) -> bool {
     matches!(status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
-}
-
-/// Uploads in parts (the sandbox API takes at most 5 MB a call) and joins them.
-fn upload_large(bx: &Blaxel, url: &str, path: &str, bytes: &[u8]) -> Result<()> {
-    const PART: usize = 4 * 1024 * 1024;
-    let mut parts = Vec::new();
-    for (i, chunk) in bytes.chunks(PART).enumerate() {
-        let part = format!("{path}.part{i:04}");
-        bx.upload(url, &part, chunk, "0644")?;
-        parts.push(part);
-    }
-    let q = crate::relay::shell_quote;
-    let joined: Vec<String> = parts.iter().map(|p| q(p)).collect();
-    let joined = joined.join(" ");
-    let res = bx.run(url, &format!("cat {joined} > {0} && chmod 0755 {0} && rm -f {joined}", q(path)), 120)?;
-    if res.exit_code != 0 {
-        bail!("writing {path} failed: {}", res.output());
-    }
-    Ok(())
 }
 
 pub fn start_command() -> String {
