@@ -26,6 +26,4 @@ tod-core = { path = "../tod-core" }
 tod-sandbox = { path = "../tod-sandbox" }
 ureq = "3"
 tod-store = { path = "../tod-store" }
-
-[dev-dependencies]
 uuid = { version = "1.0", features = ["v4"] }
