@@ -454,7 +454,7 @@ impl UnifiedView {
             }
             PanelKind::Task(node_id) => {
                 let panel =
-                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), window, cx));
+                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), self.agent_runs.clone(), window, cx));
                 let panel_id = panel.entity_id();
                 let subscription =
                     cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
