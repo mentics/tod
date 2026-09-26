@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 68;
+pub const CURRENT_USER_VERSION: i32 = 70;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -422,6 +422,13 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
         conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
         conn.pragma_update(None, "user_version", 68)?;
+    }
+    // v69 is W12's migration; it merges before this one.
+    if version < 70 {
+        // When the orchestrator found a cloud node's sandbox gone
+        // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
+        crate::cloud_nodes::add_lost_at(conn)?;
+        conn.pragma_update(None, "user_version", 70)?;
     }
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in

@@ -19,7 +19,11 @@
 //! The cursors and the orchestrator's URL and user override are kept in
 //! [`STATE_FILE`] under the data root. Which nodes run in the cloud is in
 //! the synced `cloud_nodes` table (`tod_store::cloud_nodes`); older builds
-//! kept it in the state file, which [`cloud_node`] still reads.
+//! kept it in the state file, which the start-up check ([`lost`]) moves into
+//! the table.
+//!
+//! - [`lost`]: on start, and after a sync that brings a lost mark, replace
+//!   node sandboxes that are gone; leaving the cloud; retiring done nodes.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -84,6 +88,15 @@ pub struct CloudNode {
     pub sandbox: String,
     pub user: String,
     pub accepted_at_ms: i64,
+    /// When the orchestrator found its sandbox gone, until the app replaces it.
+    #[serde(default)]
+    pub lost_at: Option<i64>,
+}
+
+impl From<tod_store::cloud_nodes::CloudNodeRow> for CloudNode {
+    fn from(row: tod_store::cloud_nodes::CloudNodeRow) -> Self {
+        Self { sandbox: row.sandbox, user: row.user, accepted_at_ms: row.accepted_at, lost_at: row.lost_at }
+    }
 }
 
 impl CloudSyncState {
@@ -108,23 +121,14 @@ impl CloudSyncState {
     }
 }
 
-/// Where the node runs in the cloud, if it does: its `cloud_nodes` row in
-/// the database (synced, so every copy of the app sees it), else the record
-/// older builds kept in [`STATE_FILE`]. One indexed read: fine on the UI
-/// thread.
-pub fn cloud_node(root: &Path, node_id: &str) -> Option<CloudNode> {
-    let from_db = (|| {
-        let node = uuid::Uuid::parse_str(node_id).ok()?;
-        let db = tod_store::fleet::FleetPaths::new(root).ok()?.db().to_path_buf();
-        if !db.is_file() {
-            return None;
-        }
-        let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-        let _ = conn.busy_timeout(Duration::from_millis(200));
-        let row = tod_store::cloud_nodes::get(&conn, node).ok()??;
-        Some(CloudNode { sandbox: row.sandbox, user: row.user, accepted_at_ms: row.accepted_at })
-    })();
-    from_db.or_else(|| CloudSyncState::load(root).ok()?.nodes.get(node_id).cloned())
+/// Where the node runs in the cloud, if it does: its `cloud_nodes` row
+/// (synced, so every copy of the app sees it), read through the store's
+/// already-open read connection, so fine on the UI thread (no database is
+/// opened). Records older builds kept in [`STATE_FILE`] are moved into the
+/// table by the start-up check ([`lost::adopt_legacy_records`]).
+pub fn cloud_node(fleet: &FleetStore, node_id: &str) -> Option<CloudNode> {
+    let node = uuid::Uuid::parse_str(node_id).ok()?;
+    fleet.read(|conn| tod_store::cloud_nodes::get(conn, node)).ok()?.map(CloudNode::from)
 }
 
 /// Held by every [`sync`] in this process. Background syncs (the outbox
@@ -367,6 +371,10 @@ pub fn sync(fleet: &FleetStore, root: &Path, orch: &dyn Orchestrator, user: &str
     }
     state.feed_after = last;
     state.save(root)?;
+    drop(_guard);
+    if let Err(err) = lost::retire_done(fleet) {
+        tracing::warn!("cloud sync: retiring done nodes: {err:#}");
+    }
     Ok(report)
 }
 
@@ -473,44 +481,54 @@ pub fn sync_on_start(fleet: std::sync::Arc<FleetStore>) {
     if !CloudSyncState::load(&root).is_ok_and(|s| s.seeded) {
         return;
     }
-    crate::cloud_notify::runner(&fleet).request();
+    // Sync, then check every cloud node's sandbox against Blaxel and
+    // replace any that is gone.
+    lost::spawn_check(fleet, lost::Check::Full);
 }
 
-/// Run `node_id` in the cloud: sync (seeding first), create the node's
-/// sandbox with the user's credentials in its proxy, provision it, poke it,
-/// and record it. `progress` hears each step.
-pub fn run_in_cloud(
-    fleet: &FleetStore,
-    root: &Path,
-    node_id: &str,
-    progress: &mut dyn FnMut(&str),
-) -> Result<CloudNode> {
-    use tod_sandbox::node;
-
+/// Where a node's code comes from: its repository as an HTTPS URL, and branch.
+fn node_source(fleet: &FleetStore, node_id: &str) -> Result<(tod_store::fleet::FleetTask, String, String)> {
     let task = fleet.get_node(node_id)?.ok_or_else(|| anyhow!("no node {node_id}"))?;
     let repo = task.repo.clone().filter(|r| !r.trim().is_empty()).ok_or_else(|| {
         anyhow!("the node has no repository (set its workspace directory in the Files section)")
     })?;
-    let repo_url = if https_repo_url(&repo).is_some() {
-        https_repo_url(&repo).unwrap()
-    } else {
-        let out = std::process::Command::new("git")
-            .args(["-C", &repo, "remote", "get-url", "origin"])
-            .output()
-            .context("run git")?;
-        let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        https_repo_url(&remote).ok_or_else(|| anyhow!("{repo}: no HTTPS-reachable origin remote ({remote:?})"))?
+    let repo_url = match https_repo_url(&repo) {
+        Some(url) => url,
+        None => {
+            let out = std::process::Command::new("git")
+                .args(["-C", &repo, "remote", "get-url", "origin"])
+                .output()
+                .context("run git")?;
+            let remote = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            https_repo_url(&remote)
+                .ok_or_else(|| anyhow!("{repo}: no HTTPS-reachable origin remote ({remote:?})"))?
+        }
     };
-    let branch = task
-        .branch
-        .clone()
-        .filter(|b| !b.trim().is_empty())
-        .unwrap_or_else(|| task.slug.clone());
+    let branch = task.branch.clone().filter(|b| !b.trim().is_empty()).unwrap_or_else(|| task.slug.clone());
+    Ok((task, repo_url, branch))
+}
 
-    progress("syncing with the orchestrator…");
-    let (orch, user) = resolve(root)?;
-    sync(fleet, root, &orch, &user)?;
+/// Whether Blaxel's record of a sandbox says it can no longer run.
+pub fn sandbox_is_dead(info: &tod_sandbox::blaxel::SandboxInfo) -> bool {
+    matches!(info.status.to_ascii_uppercase().as_str(), "FAILED" | "TERMINATED" | "DELETING" | "DELETED")
+}
 
+/// Make sure `node_id` has a working sandbox: create it (with the user's
+/// credentials in its proxy) if Blaxel has none by its name, or replace one
+/// that can no longer run; wait for it, provision the relay and supervisor,
+/// and poke it. Returns the sandbox's name. The one path both
+/// [`run_in_cloud`] and replacing a lost sandbox ([`lost`]) take. Blocks on
+/// the network.
+pub fn ensure_node_sandbox(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    user: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<String> {
+    use tod_sandbox::node;
+
+    let (task, repo_url, branch) = node_source(fleet, node_id)?;
     let mut sandboxes = tod_store::fleet::sandbox::Sandboxes::load(root)?;
     let account = sandboxes.account()?.clone();
     let bx = sandboxes.blaxel()?;
@@ -546,12 +564,23 @@ pub fn run_in_cloud(
         image: &account.default_image,
         region: &account.region,
         memory_mb: account.memory_mb,
-        user: &user,
+        user,
         node: node_id,
         orchestrator_host: &orchestrator_host,
         orchestrator_cli_url: &cli_url,
     };
-    if bx.get(&name)?.is_none() {
+    let existing = bx.get(&name)?;
+    if let Some(info) = &existing
+        && sandbox_is_dead(info)
+    {
+        progress(&format!("removing the dead sandbox {name} ({})…", info.status));
+        bx.delete(&name)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while bx.get(&name)?.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    if existing.as_ref().is_none_or(sandbox_is_dead) {
         progress(&format!("creating sandbox {name}…"));
         node::create(&bx, &spec, &credentials)?;
     }
@@ -584,18 +613,24 @@ pub fn run_in_cloud(
     if !resp.status().is_success() {
         progress(&format!("warning: the poke got {}", resp.status()));
     }
+    let _ = sandboxes.save();
+    Ok(name)
+}
 
+/// Records that `node_id` runs in `sandbox` (clearing any lost mark) in the
+/// database, which is synced: the orchestrator needs to know the node is
+/// active (`tod_core::impact`), and its supervisor reads its context mark
+/// there.
+fn record_cloud_node(fleet: &FleetStore, node_id: &str, sandbox: String, user: &str) -> Result<CloudNode> {
     let record = CloudNode {
-        sandbox: name,
-        user: user.clone(),
+        sandbox,
+        user: user.to_string(),
         accepted_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0),
+        lost_at: None,
     };
-    // Recorded in the database, which is synced: the orchestrator needs to
-    // know the node is active (`tod_core::impact`), and its supervisor reads
-    // its context mark there.
     let node_uuid = uuid::Uuid::parse_str(node_id).with_context(|| format!("node id {node_id}"))?;
     let _ = fleet.flush_on_quit();
     tod_store::cloud_nodes::upsert(
@@ -606,12 +641,31 @@ pub fn run_in_cloud(
         record.accepted_at_ms,
     )?;
     let _ = fleet.reload_if_stale();
-    let _ = sandboxes.save();
+    Ok(record)
+}
+
+/// Run `node_id` in the cloud: sync (seeding first), make its sandbox
+/// ([`ensure_node_sandbox`]), and record it. `progress` hears each step.
+pub fn run_in_cloud(
+    fleet: &FleetStore,
+    root: &Path,
+    node_id: &str,
+    progress: &mut dyn FnMut(&str),
+) -> Result<CloudNode> {
+    // Fails early, before any network call, on a node with no repository.
+    node_source(fleet, node_id)?;
+    progress("syncing with the orchestrator…");
+    let (orch, user) = resolve(root)?;
+    sync(fleet, root, &orch, &user)?;
+    let name = ensure_node_sandbox(fleet, root, node_id, &user, progress)?;
+    let record = record_cloud_node(fleet, node_id, name, &user)?;
     if let Err(err) = sync(fleet, root, &orch, &user) {
         progress(&format!("warning: could not send the record to the orchestrator yet: {err:#}"));
     }
     Ok(record)
 }
+
+pub mod lost;
 
 #[cfg(test)]
 mod tests;
