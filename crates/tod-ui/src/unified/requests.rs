@@ -19,15 +19,16 @@
 //! and forwards the actions with [`bind_request_actions`].
 //!
 //! Each request ends with one footer line: its evidence links (each item's
-//! name), the reason ([`reason_label`]), and at the right the slot set with
-//! [`Requests::set_footer_extra`] (T6's "Shouldn't have asked").
+//! name), the reason ([`reason_label`]), and at the right **Shouldn't have
+//! asked** (`doc/ui/task-panel.md`): one click records `should_not_ask`
+//! feedback (`tod_store::request_feedback`) without answering or dismissing
+//! the request, then offers a note and a switch to "bad question".
 //!
 //! The decision answer log with **Change** is here too
 //! ([`Requests::render_log`]), shown only when the host asks for it
 //! ([`Requests::set_show_log`]).
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
@@ -44,10 +45,14 @@ use tod_core::conversation::implement::HandoffAnswer;
 use tod_journey::{Presented, PresentedAction};
 use tod_store::decisions::{DECISION_PENDING, Decision, DecisionAnswer, DecisionRepo, EvidenceRef};
 use tod_store::fleet::FleetStore;
-use tod_store::interview::short_id;
+use tod_store::interview::{ACTOR_USER, InterviewCommand, short_id};
 use tod_store::outline::PlanStep;
 use tod_store::outline::repos::plan_steps::HandoffReason;
 use tod_store::outline::repos::{ObligationRepo, PlanStepRepo};
+use tod_store::request_feedback::{
+    KIND_DECISION, KIND_GATE_BLOCKER, KIND_PLAN_STEP_HANDOFF, KIND_REVIEW_FINDING, NewRequestFeedback,
+    VERDICT_BAD_QUESTION, VERDICT_SHOULD_NOT_ASK,
+};
 use tod_store::review::{FINDING_DECLINED, FINDING_FIXED, FINDING_OUT_OF_SCOPE, ReviewFinding, ReviewRepo};
 use uuid::Uuid;
 
@@ -66,6 +71,8 @@ pub const REQUESTS_CONTEXT: &str = "UnifiedRequests";
 /// Key-context tag for whichever freeform answer field is in edit mode, so
 /// Escape only fires for that one field (`key_context::including_tag`).
 const FREEFORM_TAG: &str = "RequestsFreeform";
+/// Key-context tag for the feedback note field while it is in edit mode.
+const FEEDBACK_NOTE_TAG: &str = "RequestsFeedbackNote";
 /// The journey surface every answer is recorded under — the same whether it
 /// came from the task panel or the decisions panel.
 const JOURNEY_SURFACE: &str = "decisions";
@@ -97,6 +104,11 @@ pub fn register_request_keyboard_bindings(cx: &mut App) {
         KeyBinding::new("enter", DecisionsActivate, outside_input),
         KeyBinding::new("ctrl-enter", DecisionsCtrlActivate, outside_input),
         KeyBinding::new("escape", DecisionsFreeformEscape, with_input),
+        KeyBinding::new(
+            "escape",
+            DecisionsFreeformEscape,
+            Some(key_context::including_tag(REQUESTS_CONTEXT, FEEDBACK_NOTE_TAG)),
+        ),
         KeyBinding::new("up", DecisionsLinkPrev, outside_input),
         KeyBinding::new("down", DecisionsLinkNext, outside_input),
     ]);
@@ -273,9 +285,14 @@ fn evidence_links(node_id: Uuid, evidence: &[EvidenceRef], names: &HashMap<Uuid,
         .collect()
 }
 
-/// A hook for extra controls at the right of each request's footer line
-/// (T6's "Shouldn't have asked").
-pub type FooterExtra = Rc<dyn Fn(&AttentionItem, &mut Window, &mut App) -> Option<AnyElement>>;
+/// "Shouldn't have asked" feedback given on one request in this session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackState {
+    /// The `request_feedback` row, once the first write has landed.
+    pub id: Option<Uuid>,
+    pub verdict: &'static str,
+    pub note: Option<String>,
+}
 
 pub struct Requests {
     pub(crate) node_id: Option<Uuid>,
@@ -299,7 +316,11 @@ pub struct Requests {
     selected_link: usize,
     pub(crate) last_error: Option<String>,
     show_log: bool,
-    footer_extra: Option<FooterExtra>,
+    /// Feedback given per request id.
+    feedback: HashMap<Uuid, FeedbackState>,
+    /// The request whose feedback note field is in edit mode.
+    feedback_note_editing: Option<Uuid>,
+    feedback_note_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     _poll: gpui::Task<()>,
 }
@@ -321,6 +342,14 @@ impl Requests {
         let freeform_sub = cx.subscribe(&freeform_input, |this, _, event, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.submit_freeform(cx);
+            }
+        });
+        let feedback_note_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Why? (Enter to save)"));
+        let note_sub = cx.subscribe_in(&feedback_note_input, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.commit_feedback_note(cx);
+                this.host_focus.focus(window, cx);
             }
         });
         // A gate criterion waived elsewhere shows here too: one controller.
@@ -353,8 +382,10 @@ impl Requests {
             selected_link: 0,
             last_error: None,
             show_log: false,
-            footer_extra: None,
-            _subscriptions: vec![freeform_sub, lifecycle_sub],
+            feedback: HashMap::new(),
+            feedback_note_editing: None,
+            feedback_note_input,
+            _subscriptions: vec![freeform_sub, lifecycle_sub, note_sub],
             _poll,
         };
         this.reload(cx);
@@ -364,13 +395,6 @@ impl Requests {
     /// Show the decision answer log with **Change** below the requests.
     pub fn set_show_log(&mut self, show: bool, cx: &mut Context<Self>) {
         self.show_log = show;
-        cx.notify();
-    }
-
-    /// T6: set the control rendered at the right of each footer line.
-    #[allow(dead_code)] // T6 is its first caller.
-    pub fn set_footer_extra(&mut self, extra: Option<FooterExtra>, cx: &mut Context<Self>) {
-        self.footer_extra = extra;
         cx.notify();
     }
 
@@ -390,6 +414,7 @@ impl Requests {
         }
         self.node_id = node_id;
         self.freeform_editing = None;
+        self.feedback_note_editing = None;
         self.changing = None;
         self.selected_link = 0;
         self.loaded = Loaded::default();
@@ -630,6 +655,215 @@ impl Requests {
         self.reload(cx);
     }
 
+    /// The feedback given on request `id` in this session, if any.
+    #[allow(dead_code)] // for tests.
+    pub fn feedback_for(&self, id: Uuid) -> Option<&FeedbackState> {
+        self.feedback.get(&id)
+    }
+
+    /// What a feedback row records about `item`: its kind, and the
+    /// conversation and protocol that asked when the request has them.
+    fn new_feedback(&self, item: &AttentionItem) -> NewRequestFeedback {
+        let (kind, conversation_id, protocol) = match item.kind {
+            AttentionKind::Decision => {
+                let decision = self.loaded.pending.iter().find(|d| d.id == item.id);
+                (KIND_DECISION, decision.and_then(|d| d.conversation_id), decision.and_then(|d| d.protocol.clone()))
+            }
+            AttentionKind::PlanStep => (KIND_PLAN_STEP_HANDOFF, None, None),
+            AttentionKind::Finding => (
+                KIND_REVIEW_FINDING,
+                self.loaded.findings.iter().find(|f| f.id == item.id).and_then(|f| f.conversation_id),
+                None,
+            ),
+            // A gate request's id is the gate-check conversation.
+            AttentionKind::Gate => (KIND_GATE_BLOCKER, Some(item.id), None),
+        };
+        NewRequestFeedback {
+            node_id: item.node_id,
+            request_kind: kind.to_string(),
+            request_id: item.id,
+            reason: item.reason.as_str().to_string(),
+            conversation_id,
+            protocol,
+            verdict: VERDICT_SHOULD_NOT_ASK.to_string(),
+            note: None,
+        }
+    }
+
+    /// Run one feedback write on the fleet writer off the UI thread; `done`
+    /// gets its result back on it.
+    fn write_feedback(
+        &self,
+        command: InterviewCommand,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, anyhow::Result<serde_json::Value>, &mut Context<Self>) + 'static,
+    ) {
+        let fleet = self.fleet.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { fleet.interview(ACTOR_USER, command).map_err(anyhow::Error::from) })
+                .await;
+            let _ = this.update(cx, |this: &mut Requests, cx| {
+                done(this, result, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// **Shouldn't have asked**: record `should_not_ask` feedback on `item`.
+    /// The request itself stays pending.
+    pub(crate) fn should_not_have_asked(&mut self, item: &AttentionItem, source: Source, cx: &mut Context<Self>) {
+        if self.feedback.contains_key(&item.id) {
+            return;
+        }
+        record_action(
+            cx,
+            tod_store::conversation::Focus::Node(item.node_id),
+            VERDICT_SHOULD_NOT_ASK.to_string(),
+            source,
+            JOURNEY_SURFACE,
+            Presented {
+                actions: vec![PresentedAction {
+                    id: VERDICT_SHOULD_NOT_ASK.to_string(),
+                    label: "Shouldn't have asked".to_string(),
+                    primary: false,
+                    disabled: false,
+                }],
+                focused: None,
+                notices: vec![item.summary.clone()],
+            },
+        );
+        let request_id = item.id;
+        self.feedback.insert(request_id, FeedbackState { id: None, verdict: VERDICT_SHOULD_NOT_ASK, note: None });
+        let feedback = self.new_feedback(item);
+        cx.notify();
+        self.write_feedback(InterviewCommand::RecordRequestFeedback(feedback), cx, move |this, result, cx| {
+            let id = result
+                .as_ref()
+                .ok()
+                .and_then(|v| v.get("id")?.as_str().and_then(|raw| Uuid::parse_str(raw).ok()));
+            let Some(id) = id else {
+                this.feedback.remove(&request_id);
+                this.set_error("record feedback", result.map(|_| ()));
+                return;
+            };
+            let Some(state) = this.feedback.get_mut(&request_id) else { return };
+            state.id = Some(id);
+            // A switch or note made while the first write was in flight.
+            if state.verdict != VERDICT_SHOULD_NOT_ASK || state.note.is_some() {
+                this.save_feedback(request_id, cx);
+            }
+        });
+    }
+
+    /// Write the feedback on `request_id` as it now stands. Before its row
+    /// exists, the first write saves it when it lands.
+    fn save_feedback(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
+        cx.notify();
+        let Some(FeedbackState { id: Some(id), verdict, note }) = self.feedback.get(&request_id).cloned() else {
+            return;
+        };
+        let command = InterviewCommand::UpdateRequestFeedback { id, verdict: verdict.to_string(), note };
+        self.write_feedback(command, cx, |this, result, _| this.set_error("update feedback", result.map(|_| ())));
+    }
+
+    /// Switch the feedback on `request_id` between "shouldn't have asked"
+    /// and "bad question".
+    pub(crate) fn toggle_bad_question(&mut self, request_id: Uuid, cx: &mut Context<Self>) {
+        let Some(state) = self.feedback.get_mut(&request_id) else { return };
+        state.verdict =
+            if state.verdict == VERDICT_BAD_QUESTION { VERDICT_SHOULD_NOT_ASK } else { VERDICT_BAD_QUESTION };
+        self.save_feedback(request_id, cx);
+    }
+
+    fn begin_feedback_note_edit(&mut self, request_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let note = self.feedback.get(&request_id).and_then(|s| s.note.clone()).unwrap_or_default();
+        self.feedback_note_editing = Some(request_id);
+        self.freeform_editing = None;
+        self.feedback_note_input.update(cx, |input, cx| input.set_value(note, window, cx));
+        cx.notify();
+        let input = self.feedback_note_input.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            input.update(cx, |input, cx| input.focus(window, cx));
+        });
+    }
+
+    /// Enter in the note field: save its text on the request being edited.
+    fn commit_feedback_note(&mut self, cx: &mut Context<Self>) {
+        let Some(request_id) = self.feedback_note_editing.take() else { return };
+        let text = self.feedback_note_input.read(cx).text().to_string().trim().to_string();
+        self.set_feedback_note(request_id, (!text.is_empty()).then_some(text), cx);
+    }
+
+    pub(crate) fn set_feedback_note(&mut self, request_id: Uuid, note: Option<String>, cx: &mut Context<Self>) {
+        let Some(state) = self.feedback.get_mut(&request_id) else { return };
+        state.note = note;
+        self.save_feedback(request_id, cx);
+    }
+
+    /// The control at the right of a request's footer line.
+    fn render_feedback(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let request_id = item.id;
+        let Some(state) = self.feedback.get(&request_id).cloned() else {
+            let item = item.clone();
+            return Button::new(SharedString::from(format!("unified-requests-should-not-ask-{request_id}")))
+                .label("Shouldn't have asked")
+                .xsmall()
+                .on_click(cx.listener(move |this, _, _, cx| this.should_not_have_asked(&item, Source::Click, cx)))
+                .into_any_element();
+        };
+        let editing = self.feedback_note_editing == Some(request_id);
+        key_context::set_input_tab_stop(&self.feedback_note_input, editing, cx);
+        let bad = state.verdict == VERDICT_BAD_QUESTION;
+        let recorded = if state.id.is_some() { "Feedback recorded" } else { "Recording feedback…" };
+        let note: AnyElement = if editing {
+            div()
+                .id(SharedString::from(format!("unified-requests-feedback-note-{request_id}")))
+                .key_context(FEEDBACK_NOTE_TAG)
+                .w_48()
+                .child(Input::new(&self.feedback_note_input).xsmall())
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(state.note.clone().map(|note| {
+                    style::text_muted(div().text_xs()).child(selectable_text(
+                        SharedString::from(format!("unified-requests-feedback-note-text-{request_id}")),
+                        note,
+                        window,
+                        cx,
+                    ))
+                }))
+                .child(
+                    Button::new(SharedString::from(format!("unified-requests-feedback-note-edit-{request_id}")))
+                        .label(if state.note.is_some() { "Edit note" } else { "Add note" })
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.begin_feedback_note_edit(request_id, window, cx)
+                        })),
+                )
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(style::text_muted(div().text_xs()).child(recorded))
+            .child(
+                Button::new(SharedString::from(format!("unified-requests-feedback-bad-question-{request_id}")))
+                    .label(if bad { "Bad question ✓" } else { "Bad question" })
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_bad_question(request_id, cx))),
+            )
+            .child(note)
+            .into_any_element()
+    }
+
     fn begin_freeform_edit(&mut self, decision_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = Some(decision_id);
         self.freeform_input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
@@ -668,6 +902,7 @@ impl Requests {
 
     pub(crate) fn exit_freeform_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.freeform_editing = None;
+        self.feedback_note_editing = None;
         self.host_focus.focus(window, cx);
         cx.notify();
     }
@@ -800,14 +1035,14 @@ impl Requests {
         }
     }
 
-    /// The one footer line: evidence links, the reason, and the T6 slot.
+    /// The one footer line: evidence links, the reason, and "Shouldn't have asked".
     fn render_footer(&self, item: &AttentionItem, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let stops = item.kind == AttentionKind::Decision
             && self.changing.is_none()
             && self.loaded.pending.first().map(|d| d.id) == Some(item.id);
         let evidence = self.item_evidence(item);
         let links = self.render_evidence_links(item.id, item.node_id, &evidence, stops, cx);
-        let extra = self.footer_extra.clone().and_then(|f| f(item, window, cx));
+        let feedback = self.render_feedback(item, window, cx);
         div()
             .id(SharedString::from(format!("unified-requests-footer-{}", item.id)))
             .flex()
@@ -817,7 +1052,7 @@ impl Requests {
             .children(links)
             .child(style::text_muted(div().text_xs().flex_none()).child(reason_label(item.reason)))
             .child(div().flex_1())
-            .children(extra)
+            .child(feedback)
             .into_any_element()
     }
 
@@ -1209,5 +1444,81 @@ mod tests {
         assert!(evidence_label(&evidence, &names).starts_with("obligation "));
         names.insert(id, "Rounds per line".to_string());
         assert_eq!(evidence_label(&evidence, &names), "Rounds per line");
+    }
+
+    #[gpui::test]
+    fn should_not_have_asked_records_feedback_and_leaves_the_request_pending(cx: &mut gpui::TestAppContext) {
+        use crate::views::rows::fixture::Fixture;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use tod_store::request_feedback::RequestFeedbackRepo;
+
+        let fixture = Fixture::new();
+        let decision_id = fixture
+            .store
+            .interview(
+                ACTOR_USER,
+                InterviewCommand::AskDecision {
+                    node_id: fixture.node_id,
+                    conversation_id: None,
+                    protocol: Some("implement".to_string()),
+                    decision: tod_store::decisions::NewDecision {
+                        question: "Round per line or per invoice?".to_string(),
+                        options: vec!["per line".to_string(), "per invoice".to_string()],
+                        reason: "risk".to_string(),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap()
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .unwrap();
+
+        cx.update(gpui_component::init);
+        let agent: crate::interview::agent::SharedAgent =
+            Arc::new(std::sync::Mutex::new(Box::new(tod_agent::MockAgentProvider::new())));
+        let agent_runs = cx.new(|_| AgentRuns::new(fixture.store.clone(), agent));
+        let lifecycle = cx.new(|_| LifecycleController::new(fixture.store.clone()));
+        let (node, fleet) = (fixture.node_id, fixture.store.clone());
+        let slot = Rc::new(RefCell::new(None));
+        let slot_in = slot.clone();
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let focus = cx.focus_handle();
+            let view = cx.new(|cx| Requests::new(Some(node), fleet, agent_runs, lifecycle, focus, window, cx));
+            *slot_in.borrow_mut() = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let requests: Entity<Requests> = slot.borrow_mut().take().unwrap();
+        cx.run_until_parked();
+
+        let item = requests.read_with(cx, |r, _| r.items()[0].clone());
+        assert_eq!(item.id, decision_id);
+        requests.update(cx, |r, cx| r.should_not_have_asked(&item, Source::Click, cx));
+        cx.run_until_parked();
+
+        let feedback_id = requests.read_with(cx, |r, _| r.feedback_for(decision_id).and_then(|s| s.id)).unwrap();
+        let row = fixture.store.read(|conn| RequestFeedbackRepo::new(conn).get(feedback_id)).unwrap().unwrap();
+        assert_eq!(row.verdict, VERDICT_SHOULD_NOT_ASK);
+        assert_eq!(row.request_kind, KIND_DECISION);
+        assert_eq!(row.request_id, decision_id);
+        assert_eq!(row.reason, "risk");
+        assert_eq!(row.protocol.as_deref(), Some("implement"));
+        assert_eq!(row.conversation_id, None);
+
+        requests.update(cx, |r, cx| {
+            r.toggle_bad_question(decision_id, cx);
+            r.set_feedback_note(decision_id, Some("It was in the spec".to_string()), cx);
+        });
+        cx.run_until_parked();
+        let row = fixture.store.read(|conn| RequestFeedbackRepo::new(conn).get(feedback_id)).unwrap().unwrap();
+        assert_eq!(row.verdict, VERDICT_BAD_QUESTION);
+        assert_eq!(row.note.as_deref(), Some("It was in the spec"));
+
+        requests.read_with(cx, |r, _| {
+            assert_eq!(r.items().len(), 1);
+            assert_eq!(r.loaded.pending.len(), 1);
+        });
     }
 }

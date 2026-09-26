@@ -232,6 +232,16 @@ pub enum InterviewCommand {
         #[serde(default)]
         text: Option<String>,
     },
+    /// The user's "Shouldn't have asked" on a request
+    /// (`crate::request_feedback`). Not offered by `tod-cli`.
+    RecordRequestFeedback(crate::request_feedback::NewRequestFeedback),
+    /// Change a request feedback row's verdict and note.
+    UpdateRequestFeedback {
+        id: Uuid,
+        verdict: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Record an open code review finding on a node (`crate::review`).
     AddReviewFinding {
         node_id: Uuid,
@@ -912,6 +922,14 @@ pub fn execute(
                 author,
             )?;
             Ok(json!({ "id": answer.id }))
+        }
+        InterviewCommand::RecordRequestFeedback(feedback) => {
+            let id = crate::request_feedback::RequestFeedbackRepo::new(conn).record(feedback)?;
+            Ok(json!({ "id": id.to_string() }))
+        }
+        InterviewCommand::UpdateRequestFeedback { id, verdict, note } => {
+            crate::request_feedback::RequestFeedbackRepo::new(conn).update(*id, verdict, note.as_deref())?;
+            Ok(json!({}))
         }
         InterviewCommand::AddReviewFinding {
             node_id,

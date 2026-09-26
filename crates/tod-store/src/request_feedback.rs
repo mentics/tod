@@ -62,7 +62,7 @@ pub struct RequestFeedback {
 }
 
 /// What the UI submits to record feedback on a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NewRequestFeedback {
     pub node_id: Uuid,
     pub request_kind: String,
