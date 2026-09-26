@@ -113,6 +113,7 @@ pub const SYNCED_TABLES: &[&str] = &[
     "conversation_actions",
     "conversation_flags",
     "conversation_reports",
+    "waits",
 ];
 
 pub const CREATE_SYNC_TABLES: &str = "

@@ -305,6 +305,15 @@ pub enum InterviewCommand {
         #[serde(default)]
         force: bool,
     },
+    /// Record what a node now waits on (`crate::waits`).
+    RecordWait {
+        node_id: Uuid,
+        wait: crate::waits::NewWait,
+    },
+    /// Move a wait to another state (`satisfied`, `cancelled`, `expired`).
+    SetWaitState { wait_id: Uuid, state: String },
+    /// Set a pending wait's next time (a poll's next check).
+    RescheduleWait { wait_id: Uuid, due_at: i64 },
 }
 
 /// Execute `command` as `actor` (`user`, or an interview agent session id).
@@ -1049,6 +1058,18 @@ pub fn execute(
             }
             let note = crate::fleet::repos::task::TaskRepo::new(conn).append_note(*node_id, text)?;
             Ok(json!({ "id": note.id.to_string() }))
+        }
+        InterviewCommand::RecordWait { node_id, wait } => {
+            let wait = crate::waits::WaitRepo::new(conn).create(*node_id, wait)?;
+            Ok(json!({ "id": wait.id.to_string(), "due_at": wait.due_at }))
+        }
+        InterviewCommand::SetWaitState { wait_id, state } => {
+            crate::waits::WaitRepo::new(conn).set_state(*wait_id, state)?;
+            Ok(json!({}))
+        }
+        InterviewCommand::RescheduleWait { wait_id, due_at } => {
+            crate::waits::WaitRepo::new(conn).reschedule(*wait_id, *due_at)?;
+            Ok(json!({}))
         }
     }
 }

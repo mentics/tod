@@ -26,6 +26,7 @@ mod secrets;
 mod test_runs;
 mod verdicts;
 mod visual_design;
+mod wait;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -61,6 +62,7 @@ NOUNS:
     learn                  A node's retrospective, stored once per pass
     secrets                Run a command with stored secrets, without seeing them
     decisions              What the user answers: ask, list, show
+    wait                   What a node waits on between sessions: a time, an event, a check
 
 Run `tod-cli <NOUN> --help` for that noun's commands, or
 `tod-cli help <WORDS>` to find the commands that mention them
@@ -87,6 +89,7 @@ const NOUNS: &[(&str, &str)] = &[
     ("learn", crate::learn::USAGE),
     ("secrets", crate::secrets::USAGE),
     ("decisions", crate::decisions::USAGE),
+    ("wait", crate::wait::USAGE),
 ];
 
 fn main() -> ExitCode {
@@ -207,8 +210,9 @@ fn run(args: &[String]) -> anyhow::Result<String> {
         "learn" => learn::run(invocation),
         "secrets" => secrets::run(invocation),
         "decisions" => decisions::run(invocation),
+        "wait" => wait::run(invocation),
         other => anyhow::bail!(
-            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions)"
+            "unknown noun `{other}` (expected: node, obligations, content, plan, questions, memory, interview, visual-design, capabilities, changeset, tests, review, pr, verdicts, incoming, learn, secrets, decisions, wait)"
         ),
     }
 }
@@ -818,6 +822,30 @@ Second."), "{listed}");
         );
         assert!(listed.contains("tags: ui"), "{listed}");
         assert!(listed.contains("ticket: tickets ABC-1;"), "{listed}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wait_round_trip_add_list_and_close() {
+        let (root, node, _) = data_root();
+        let node = node.to_string();
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node]).unwrap(), "(no pending waits)");
+        let err = cli(&root, &["wait", "--node", &node, "--until", "2h", "--check", "true"]).unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
+
+        let a = cli(&root, &["wait", "--node", &node, "--until", "2h"]).unwrap();
+        let a = a.strip_prefix("ok ").unwrap().to_string();
+        cli(&root, &["wait", "add", "--node", &node, "--event", "github:pr 12 checks"]).unwrap();
+        cli(&root, &["wait", "add", "--node", &node, "--check", "test -f x", "--every", "5m"]).unwrap();
+        let listed = cli(&root, &["wait", "list", "--node", &node]).unwrap();
+        assert_eq!(listed.lines().count(), 3, "{listed}");
+        assert!(listed.contains("check `test -f x` every 300s"), "{listed}");
+
+        assert_eq!(cli(&root, &["wait", "satisfy", &a]).unwrap(), "ok");
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node]).unwrap().lines().count(), 2);
+        assert!(cli(&root, &["wait", "show", &a]).unwrap().contains("satisfied"));
+        assert!(cli(&root, &["wait", "reschedule", &a, "--at", "1h"]).is_err());
+        assert_eq!(cli(&root, &["wait", "list", "--node", &node, "--all"]).unwrap().lines().count(), 3);
         let _ = std::fs::remove_dir_all(root);
     }
 

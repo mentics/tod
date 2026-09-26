@@ -23,7 +23,9 @@ toml = "0.8"
 tod-agent = { path = "../tod-agent" }
 tod-integration = { path = "../tod-integration" }
 tod-journey = { path = "../tod-journey" }
+tod-sandbox = { path = "../tod-sandbox" }
 tod-store = { path = "../tod-store" }
+ureq = "3"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-appender = "0.2"

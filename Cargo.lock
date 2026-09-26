@@ -9057,6 +9057,7 @@ dependencies = [
  "tod-agent",
  "tod-integration",
  "tod-journey",
+ "tod-sandbox",
  "tod-store",
  "tokio",
  "toml 0.8.23",
@@ -9064,6 +9065,7 @@ dependencies = [
  "tracing-appender",
  "tracing-rolling-file",
  "tracing-subscriber",
+ "ureq",
  "uuid",
 ]
 
@@ -9117,8 +9119,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde",
  "serde_json",
+ "tod-sandbox",
  "tod-store",
+ "ureq",
 ]
 
 [[package]]

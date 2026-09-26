@@ -47,7 +47,7 @@ fn run() -> Result<()> {
     std::fs::create_dir_all(&base).with_context(|| format!("create {}", base.display()))?;
     let listener = TcpListener::bind((bind.as_str(), port)).with_context(|| format!("bind {bind}:{port}"))?;
     eprintln!("tod-orchestrator: listening on {bind}:{port}, data in {}, tod-cli {}", base.display(), tod_cli.display());
-    Server::new(Config { base, tod_cli, tod_cli_prefix: Vec::new() }).serve(listener)
+    Server::new(Config { base, tod_cli, tod_cli_prefix: Vec::new() })?.serve(listener)
 }
 
 fn echo(args: Vec<String>) -> Result<()> {

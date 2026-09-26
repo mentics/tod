@@ -43,6 +43,7 @@ pub mod process;
 pub mod process_bundle;
 pub mod pull_requests;
 pub mod run_transcript;
+pub mod scheduler;
 pub mod session_name;
 pub mod task;
 pub mod workbench_layout;
