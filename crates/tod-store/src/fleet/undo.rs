@@ -38,7 +38,7 @@ pub fn capture_inverse_before(
         }
         FleetMutation::UpdateTaskNotes { id, notes } => {
             let old = TaskRepo::new(conn)
-                .get(id)?
+                .get_node(id)?
                 .map(|t| t.notes)
                 .unwrap_or_default();
             if old == *notes {
@@ -56,7 +56,7 @@ pub fn capture_inverse_before(
             }))
         }
         FleetMutation::UpdateTaskRepo { id, repo } => {
-            let old = TaskRepo::new(conn).get(id)?.and_then(|t| t.repo);
+            let old = TaskRepo::new(conn).get_node(id)?.and_then(|t| t.repo);
             if old == *repo {
                 return Ok(None);
             }
@@ -72,7 +72,7 @@ pub fn capture_inverse_before(
             }))
         }
         FleetMutation::UpdateTaskBranch { id, branch } => {
-            let old = TaskRepo::new(conn).get(id)?.and_then(|t| t.branch);
+            let old = TaskRepo::new(conn).get_node(id)?.and_then(|t| t.branch);
             if old == *branch {
                 return Ok(None);
             }
@@ -456,7 +456,7 @@ fn task_field<T, F>(conn: &Connection, id: &str, f: F) -> Result<Option<T>>
 where
     F: FnOnce(&crate::fleet::repos::task::FleetTask) -> T,
 {
-    Ok(TaskRepo::new(conn).get(id)?.map(|t| f(&t)))
+    Ok(TaskRepo::new(conn).get_node(id)?.map(|t| f(&t)))
 }
 
 /// Label for restore undo (re-delete on undo of a delete).
