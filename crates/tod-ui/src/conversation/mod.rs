@@ -60,6 +60,7 @@ use crate::ui::agent_chat::OpenAgentChat;
 use crate::ui::agent_conversation::{AgentConversationPanel, PanelStop};
 use crate::ui::agent_permission::queue_permission_request;
 use crate::ui::app_nav::{AppDestination, AppNavMenu, HasAppNav, on_app_nav_toggle};
+use crate::ui::code_links::{OpenCodeRef, open_code_ref};
 use crate::ui::item_list::{ItemList, ItemListEvent, ItemListRow};
 use crate::ui::key_context::set_input_tab_stop;
 use crate::ui::pane_nav::{PaneFocusLeft, PaneFocusRight};
@@ -1757,6 +1758,15 @@ impl Render for ConversationView {
             .flex_col()
             .on_action(cx.listener(on_app_nav_toggle::<Self>))
             .on_action(cx.listener(Self::on_open_agent_chat))
+            .on_action(cx.listener(|this, action: &OpenCodeRef, window, cx| {
+                open_code_ref(
+                    this.fleet.clone(),
+                    this.focus.node_id(),
+                    &action.target,
+                    window,
+                    cx,
+                );
+            }))
             .on_action(
                 cx.listener(|this, _: &ConversationSubmit, window, cx| this.submit(window, cx)),
             )

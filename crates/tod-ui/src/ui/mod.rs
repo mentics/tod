@@ -3,6 +3,7 @@ pub mod agent_chat;
 pub mod agent_conversation;
 pub mod agent_permission;
 pub mod app_nav;
+pub mod code_links;
 pub mod item_list;
 pub mod key_context;
 pub mod list;
