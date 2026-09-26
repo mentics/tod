@@ -59,6 +59,9 @@ pub struct CloudSyncState {
     /// made on first use by [`client_id`].
     #[serde(default)]
     pub client_id: Option<String>,
+    /// Where the orchestrator announces changes ([`crate::cloud_notify`]).
+    #[serde(default)]
+    pub notify: Option<crate::cloud_notify::NotifyTopics>,
 }
 
 /// This data root's sync client id, made and saved on first use.
@@ -189,6 +192,12 @@ impl HttpOrchestrator {
     pub fn with_client(mut self, client: impl Into<String>) -> Self {
         self.client = client.into();
         self
+    }
+
+    /// `GET /users/<user>/<rest>` as JSON.
+    pub fn get_json(&self, user: &str, rest: &str) -> Result<serde_json::Value> {
+        let resp = self.auth(self.agent.get(&self.url(user, rest))).call().with_context(|| format!("orchestrator {rest}"))?;
+        Self::finish(resp, rest)
     }
 
     fn url(&self, user: &str, rest: &str) -> String {

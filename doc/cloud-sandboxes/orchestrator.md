@@ -59,3 +59,24 @@ reported), and waits for `/health`. The server's URL is
 
 On the dev account its data lives on the sandbox's own disk, `/data`: it
 goes with the sandbox. The image needs `curl` (for the health check).
+
+## Telling the app (`notify.rs`)
+
+The orchestrator announces changes through **ntfy** (`https://ntfy.sh`, or
+the server in `TOD_NTFY_URL`; `off` turns it off). Messages carry no data.
+
+- Each user has a random secret, made once in `<root>/notify.json`; their
+  topic is `tod-<secret>`, and `tod-<secret>-alerts` is for the phone.
+  `GET /users/<u>/notify` returns `{"server", "topic", "alerts_topic"}`.
+- After any POST that succeeded, the request thread pokes the notifier; its
+  own thread checks the user's `last_seq` and publishes `changed` to the
+  topic if it moved, at most once a second per user, trailing edge included
+  (the last change is always announced).
+- When a new pending decision or blocked plan step appears, it also
+  publishes "A node needs you" (priority high) to the alerts topic. Subscribe
+  the ntfy phone app to that topic to get pushes.
+- The app (`tod_core::cloud_notify`), once its data root is seeded, fetches
+  the topics into `cloud-sync.json` (`notify`), holds `GET <server>/<topic>/json`
+  on a background thread (renewed every 10 minutes, resuming with `since=`;
+  reconnects with backoff), and runs one cloud sync per message, never two
+  at once.

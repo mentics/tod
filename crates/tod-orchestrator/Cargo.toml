@@ -25,3 +25,4 @@ serde_json = "1.0"
 tod-sandbox = { path = "../tod-sandbox" }
 ureq = "3"
 tod-store = { path = "../tod-store" }
+uuid = { version = "1.0", features = ["v4"] }
