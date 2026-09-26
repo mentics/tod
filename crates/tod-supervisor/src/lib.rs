@@ -18,10 +18,15 @@
 //! state no longer holds, the conversation's session is ended so the next
 //! turn gets the new context, and the autopilot continues.
 //!
+//! When it stops for repeated failures or a spent budget it asks the user
+//! (`tod_core::stop_questions`); each wake first reads the answer to the
+//! latest such question, or the watchdog's ([`answers`]).
+//!
 //! Design: `doc/cloud-sandboxes/autonomous-nodes.md` ("The supervisor and
 //! waiting", "Holding the sandbox awake", "Transcripts").
 
 pub mod agent;
+pub mod answers;
 pub mod context;
 pub mod git;
 pub mod guard;
@@ -80,6 +85,9 @@ pub struct Config {
 pub enum Woke {
     /// It was still waiting; nothing ran.
     StillWaiting(String),
+    /// The user answered its latest stop question to leave it stopped;
+    /// nothing ran, and no wake is scheduled.
+    LeftStopped(String),
     /// The autopilot ran and stopped.
     Ran(Outcome),
 }
@@ -154,8 +162,13 @@ fn budget_question(limit: &BudgetLimit) -> String {
 }
 
 /// Asks the user through a pending decision on the node, as an agent's
-/// `ask` would; the next wake stops on it until it is answered.
-fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, question: String) -> Result<()> {
+/// `ask` would; the next wake stops on it until it is answered. Not again
+/// while an earlier one is unanswered.
+fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, kind: &str, question: String) -> Result<()> {
+    if answers::still_asking(store, node)? {
+        tracing::info!(%question, "already asked; still waiting on the answer");
+        return Ok(());
+    }
     tracing::info!(%question, "asking the user");
     store
         .interview(
@@ -163,10 +176,10 @@ fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, question: Str
             tod_store::interview::InterviewCommand::AskDecision {
                 node_id: node,
                 conversation_id: conversation,
-                protocol: None,
+                protocol: Some(kind.to_string()),
                 decision: tod_store::decisions::NewDecision {
                     question,
-                    options: vec!["Keep going".into(), "Leave it stopped".into()],
+                    options: tod_core::stop_questions::SUPERVISOR_OPTIONS.iter().map(|o| o.to_string()).collect(),
                     evidence: Vec::new(),
                 },
             },
@@ -182,6 +195,14 @@ pub fn wake(config: Config) -> Result<Woke> {
     let replica = Arc::new(Mutex::new(replica));
     let store = replica.lock().unwrap_or_else(|e| e.into_inner()).store().clone();
     replica.lock().unwrap_or_else(|e| e.into_inner()).pull()?;
+
+    let budget = match answers::before_wake(&store, config.node, &config.state_dir, config.budget)? {
+        answers::Before::LeaveStopped(reason) => {
+            tracing::info!(%reason, "left stopped; going back to sleep");
+            return Ok(Woke::LeftStopped(reason));
+        }
+        answers::Before::Go(budget) => budget,
+    };
 
     let status = waits::check(&store, config.node, &config.workspace)?;
     // What `check` settled or moved goes up before anything else.
@@ -231,7 +252,7 @@ pub fn wake(config: Config) -> Result<Woke> {
         context_seen: context::load_seen(&config.state_dir),
         context_pending: None,
     };
-    let run = Autopilot::new(conversation, config.node, config.budget)
+    let run = Autopilot::new(conversation, config.node, budget)
         .map(|pilot| pilot.with_poll_interval(config.poll))
         .and_then(|mut pilot| loop {
             let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
@@ -260,8 +281,9 @@ pub fn wake(config: Config) -> Result<Woke> {
                                     &store,
                                     config.node,
                                     current,
+                                    tod_core::stop_questions::FAILURES,
                                     format!(
-                                        "The agent failed {failures} times in a row, most recently: {error}.                                          Try again?"
+                                        "The agent failed {failures} times in a row, most recently: {error}. Keep going?"
                                     ),
                                 )?;
                                 break Ok(outcome);
@@ -269,7 +291,7 @@ pub fn wake(config: Config) -> Result<Woke> {
                         }
                     }
                     Outcome::BudgetExhausted { limit } => {
-                        ask(&store, config.node, current, budget_question(limit))?;
+                        ask(&store, config.node, current, tod_core::stop_questions::BUDGET, budget_question(limit))?;
                         break Ok(outcome);
                     }
                     _ => break Ok(outcome),

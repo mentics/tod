@@ -42,6 +42,21 @@ changes` never returns the app's own log back to it, whatever `after` says.
 The app pulls again with `after` set to the `last_seq` it was given. Changes
 from the app are applied without being logged again, so they are not echoed.
 
+After an apply, two handlers look at what arrived. `impact_handler.rs` marks
+the running cloud nodes whose context the changes affect and pokes them.
+`answers.rs` pokes a cloud node when the changes answer one of its **stop
+questions** (`tod_core::stop_questions`): the decisions the node's
+supervisor asks after repeated agent failures (`supervisor:failures`) or a
+spent budget (`supervisor:budget`), and the watchdog's flag (`watchdog`),
+each marked by the decision's `protocol` column. Decisions are otherwise not
+context (`tod_core::impact::IGNORED_TABLES`), so an answer to any other
+decision pokes nothing. On waking, the supervisor reads the node's latest
+stop question: "Keep going" / "Wake it again" carries on (after a spent
+budget, with another budget of the same size); "Leave it stopped" / "Leave
+it asleep" leaves it stopped, asking nothing and scheduling no wake, until
+the user answers again (the last answer counts). While one is unanswered the
+supervisor does not ask again.
+
 ## Provisioning
 
 ```sh
@@ -101,7 +116,10 @@ Each pass:
    `POST /users/<u>/nodes/<n>/flags` on the orchestrator (`flags.rs`), which
    records a pending decision on the node (`tod-cli decisions ask`, options
    "Wake it again" / "Leave it asleep"), so the user sees it in the
-   decisions panel and the attention queue. It needs no schema of its own.
+   decisions panel and the attention queue. It needs no schema of its own:
+   it is filed as a `watchdog` stop question (the orchestrator sets
+   `TOD_DECISION_KIND` on that `tod-cli` run, and strips it from `/cli`
+   requests), so its answer pokes the node (see Server).
 
 A failure on one sandbox is reported and the rest go on; the pass exits 1
 if anything failed.

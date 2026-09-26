@@ -111,7 +111,13 @@ fn ask(inv: &Invocation, args: &Args) -> anyhow::Result<String> {
         .iter()
         .map(|raw| parse_evidence(raw))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let (conversation_id, protocol) = asking_conversation(inv)?;
+    let (conversation_id, mut protocol) = asking_conversation(inv)?;
+    // The orchestrator filing one of the app's own stop questions.
+    if let Ok(kind) = std::env::var(tod_core::stop_questions::KIND_ENV)
+        && tod_core::stop_questions::is_kind(Some(&kind))
+    {
+        protocol = Some(kind);
+    }
     let result = inv.client().interview(InterviewCommand::AskDecision {
         node_id: node,
         conversation_id,
