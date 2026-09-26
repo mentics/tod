@@ -1320,6 +1320,7 @@ mod tests {
                         question: question.to_string(),
                         options: options.iter().map(|o| o.to_string()).collect(),
                         evidence: Vec::new(),
+                        ..Default::default()
                     },
                 },
             )
@@ -1458,6 +1459,7 @@ mod tests {
                         question: "won't be created: node missing".to_string(),
                         options: vec!["a".to_string()],
                         evidence: Vec::new(),
+                        ..Default::default()
                     },
                 },
             )

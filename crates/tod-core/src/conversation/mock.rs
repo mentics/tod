@@ -235,6 +235,7 @@ fn directive(client: &impl Access, conversation: Uuid, line: &str) -> Result<Opt
                     question: question.to_string(),
                     options,
                     evidence: Vec::new(),
+                    ..Default::default()
                 },
             })?;
             return Ok(Some(question.to_string()));

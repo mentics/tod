@@ -31,6 +31,31 @@ pub const EVIDENCE_KINDS: [&str; 6] = [
     "node",
 ];
 
+/// No obligation, plan step, or process doc settles it.
+pub const REASON_MISSING_RULE: &str = "missing_rule";
+/// Obligations or other requirements that cannot all hold.
+pub const REASON_CONFLICT: &str = "conflict";
+/// A secret, account, or permission the agent does not have.
+pub const REASON_ACCESS: &str = "access";
+/// A judgment call worth a human's sign-off.
+pub const REASON_RISK: &str = "risk";
+/// About a capability's own configuration.
+pub const REASON_CAPABILITY: &str = "capability";
+/// Does not fit the other reasons.
+pub const REASON_OTHER: &str = "other";
+
+/// Every reason a decision can be asked with (`doc/ui/task-panel.md`
+/// "Requests"); mirrored by `tod_core::attention::RequestReason`, which this
+/// crate cannot depend on (policy depends on transport, never the reverse).
+pub const DECISION_REASONS: [&str; 6] = [
+    REASON_MISSING_RULE,
+    REASON_CONFLICT,
+    REASON_ACCESS,
+    REASON_RISK,
+    REASON_CAPABILITY,
+    REASON_OTHER,
+];
+
 /// A typed pointer to whatever backs up a decision's question: an
 /// obligation, a plan step, a test run, a conversation, a review finding, or
 /// another node.
@@ -53,6 +78,9 @@ pub struct Decision {
     pub evidence: Vec<EvidenceRef>,
     pub status: String,
     pub created_at: i64,
+    /// Why the agent could not settle this itself, one of
+    /// [`DECISION_REASONS`].
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +112,9 @@ pub struct NewDecision {
     pub options: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<EvidenceRef>,
+    /// One of [`DECISION_REASONS`]; empty defaults to `other`.
+    #[serde(default)]
+    pub reason: String,
 }
 
 pub const CREATE_TABLE: &str = "
@@ -98,6 +129,8 @@ pub const CREATE_TABLE: &str = "
         status          TEXT NOT NULL DEFAULT 'pending'
                             CHECK (status IN ('pending','answered','withdrawn')),
         created_at      INTEGER NOT NULL
+        -- `reason` is added by a later migration (`migrate_v65_to_v66`),
+        -- which runs after this on every install, fresh or upgraded.
     );
     CREATE INDEX IF NOT EXISTS idx_decisions_node ON decisions(node_id, created_at);
 
@@ -113,7 +146,7 @@ pub const CREATE_TABLE: &str = "
 ";
 
 const DECISION_COLUMNS: &str =
-    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at";
+    "id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason";
 
 const ANSWER_COLUMNS: &str = "id, decision_id, option_index, text, actor, answered_at";
 
@@ -153,12 +186,21 @@ impl<'a> DecisionRepo<'a> {
                 );
             }
         }
+        let reason = decision.reason.trim();
+        let reason = if reason.is_empty() { REASON_OTHER } else { reason };
+        if !DECISION_REASONS.contains(&reason) {
+            bail!(
+                "unknown reason `{}` (expected {})",
+                reason,
+                DECISION_REASONS.join("|")
+            );
+        }
         let id = Uuid::new_v4();
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO decisions
-             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+             (id, node_id, conversation_id, protocol, question, options, evidence, status, created_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
             params![
                 uuid_to_blob(id),
                 uuid_to_blob(node_id),
@@ -168,6 +210,7 @@ impl<'a> DecisionRepo<'a> {
                 serde_json::to_string(&options)?,
                 serde_json::to_string(&decision.evidence)?,
                 now,
+                reason,
             ],
         )?;
         self.get(id)?.context("decision vanished after insert")
@@ -351,6 +394,7 @@ fn map_decision(row: &rusqlite::Row<'_>) -> rusqlite::Result<Decision> {
         evidence: serde_json::from_str(&evidence).unwrap_or_default(),
         status: row.get(7)?,
         created_at: row.get(8)?,
+        reason: row.get(9)?,
     })
 }
 
@@ -403,6 +447,7 @@ mod tests {
                 kind: "obligation".into(),
                 id: Uuid::new_v4(),
             }],
+            ..Default::default()
         }
     }
 
@@ -423,8 +468,23 @@ mod tests {
         assert_eq!(d.evidence.len(), 1);
         assert_eq!(d.evidence[0].kind, "obligation");
         assert_eq!(d.protocol.as_deref(), Some("implement"));
+        assert_eq!(d.reason, REASON_OTHER);
         let got = repo.get(d.id).unwrap().unwrap();
         assert_eq!(got, d);
+    }
+
+    #[test]
+    fn create_round_trips_an_explicit_reason_and_rejects_an_unknown_one() {
+        let fx = setup();
+        let repo = DecisionRepo::new(&fx.conn);
+        let mut with_reason = decision("Missing a secret?", &["ok"]);
+        with_reason.reason = REASON_ACCESS.to_string();
+        let d = repo.create(fx.node, None, None, &with_reason).unwrap();
+        assert_eq!(d.reason, REASON_ACCESS);
+
+        let mut bad_reason = decision("x?", &["ok"]);
+        bad_reason.reason = "spaceship".to_string();
+        assert!(repo.create(fx.node, None, None, &bad_reason).is_err());
     }
 
     #[test]

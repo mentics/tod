@@ -771,6 +771,7 @@ mod tests {
                         question: "Round per line or per invoice?".to_string(),
                         options: vec!["per line".to_string(), "per invoice".to_string()],
                         evidence: Vec::new(),
+                        ..Default::default()
                     },
                 },
             )

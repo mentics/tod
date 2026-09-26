@@ -67,7 +67,7 @@ pub(super) fn waiting_order(map: &HashMap<Uuid, NodeAttention>) -> Vec<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tod_core::attention::AttentionKind;
+    use tod_core::attention::{AttentionKind, RequestReason};
 
     fn attention(node_id: Uuid, count: usize, waiting_since: Option<i64>) -> NodeAttention {
         let items = (0..count)
@@ -78,6 +78,7 @@ mod tests {
                 summary: String::new(),
                 options: Vec::new(),
                 since: waiting_since.unwrap_or(0) + ix as i64,
+                reason: RequestReason::Other,
             })
             .collect::<Vec<_>>();
         NodeAttention {

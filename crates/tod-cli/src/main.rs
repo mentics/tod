@@ -864,6 +864,30 @@ Second."), "{listed}");
         .unwrap_err();
         assert!(err.to_string().contains("evidence kind"), "{err}");
 
+        // No --reason defaults to `other`; an unknown one is refused.
+        assert!(shown.contains(" · other"), "{shown}");
+        let err = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Bad reason?",
+                "--option", "a", "--reason", "spaceship",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--reason"), "{err}");
+
+        let with_reason = cli(
+            &root,
+            &[
+                "decisions", "ask", "--node", &node, "Missing a permission?",
+                "--option", "a", "--reason", "access",
+            ],
+        )
+        .unwrap();
+        let short = with_reason.strip_prefix("ok ").expect("one-line ack");
+        let shown = cli(&root, &["decisions", "show", short]).unwrap();
+        assert!(shown.contains(" · access"), "{shown}");
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

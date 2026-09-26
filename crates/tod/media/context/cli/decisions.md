@@ -5,7 +5,7 @@ more it is reduced, the faster the user gets through the queue. You only
 ask; answering is the user's.
 
 ```
-tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)]
+tod-cli --data-root <DATA_ROOT> decisions ask  [--node <NODE_UUID>] <QUESTION> --option <TEXT> (repeatable) [--evidence <KIND>:<ID> (repeatable)] [--reason <KIND>]
 tod-cli --data-root <DATA_ROOT> decisions list [--node <NODE_UUID>] [--all]
 tod-cli --data-root <DATA_ROOT> decisions show <DECISION_ID>
 ```
@@ -22,6 +22,9 @@ in full or as the 8-character prefix listings show.
 - `--evidence`: repeatable `kind:id` links the user can open while
   answering, kind one of `obligation`, `plan_step`, `test_run`,
   `conversation`, `finding`, `node`.
+- `--reason`: one of `missing_rule`, `conflict`, `access`, `risk`,
+  `capability`, `other` — defaults to `other` when omitted. See "Asking the
+  user" for what each means.
 
 `list` shows a node's pending decisions, oldest first; `--all` also lists
 answered and withdrawn ones. `show` prints one decision and its full answer
