@@ -19,8 +19,10 @@
 //! - `GET /users/<u>/nodes/<n>/transcripts` — the node's mirrored agent
 //!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
 //!   (see [`transcripts`]).
+//! - `POST /users/<u>/nodes/<n>/flags` — the watchdog flags a node (see [`flags`]).
 
 pub mod cli;
+pub mod flags;
 pub mod http;
 pub mod impact_handler;
 pub mod notify;
@@ -184,6 +186,16 @@ impl Server {
                     ("GET", ["notify"]) => self.notify_topics(&user),
                     ("GET", ["snapshot"]) => match self.users.get(&user) {
                         Ok(data) => sync_backend::snapshot(&data),
+                        Err(err) => Response::text(500, format!("{err:#}")),
+                    },
+                    ("POST", ["nodes", node, "flags"]) => match self.users.get(&user) {
+                        Ok(data) => flags::handle(
+                            &self.config.tod_cli,
+                            &self.config.tod_cli_prefix,
+                            &data.root,
+                            node,
+                            &request.body,
+                        ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
                     (_, ["nodes", node, "transcripts", rest @ ..]) => match self.users.root_of(&user) {
