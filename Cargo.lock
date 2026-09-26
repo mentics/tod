@@ -9112,6 +9112,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tod-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tod-store",
+]
+
+[[package]]
 name = "tod-relay"
 version = "0.1.0"
 dependencies = [

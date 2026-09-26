@@ -1,0 +1,22 @@
+[package]
+name = "tod-orchestrator"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The team's orchestrator: one sandbox holding each user's tod database, serving tod-cli for agent sandboxes"
+
+# Runs on Linux in a sandbox (cross-built by scripts/build-sandbox-binaries.sh,
+# which needs zigbuild: tod-store bundles SQLite). Builds and tests anywhere.
+# The HTTP server is a small std one (no new dependencies): requests are few,
+# short, and come only from tod's own sandboxes and apps.
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tod-orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+tod-store = { path = "../tod-store" }

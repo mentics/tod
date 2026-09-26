@@ -51,6 +51,7 @@ CANDIDATES=(
     "tod-relay:tod-relay:false"
     "tod-supervisor:tod-supervisor:true"
     "tod-orchestrator:tod-orchestrator:true"
+    "tod-cli:tod-cli:true"
 )
 
 install_bin() {

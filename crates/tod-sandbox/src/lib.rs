@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod blaxel;
 pub mod config;
+pub mod orchestrator;
 pub mod provision;
 pub mod relay;
 pub mod terminal;

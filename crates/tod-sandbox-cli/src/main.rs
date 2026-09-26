@@ -59,6 +59,11 @@ agent <name> --name AGENT [--cwd DIR] [--idle SECS] [--cli-relay] [--env NAME]..
                          --env NAME passes this process's NAME (or NAME=VALUE).
 zed <name> [PATH]        Open PATH (default /root) in Zed on the sandbox.
 delete <name>            Delete a sandbox.
+orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH]
+                         Create (if needed) the team's orchestrator sandbox,
+                         install tod-orchestrator and tod-cli (Linux builds;
+                         default target/sandbox/, from
+                         scripts/build-sandbox-binaries.sh), and start it.
 doctor                   Check the setup.
 connect-info <name>      (internal) The relay URL and token, as JSON.
 ";
@@ -204,6 +209,7 @@ fn run() -> Result<i32> {
             println!("{name}: deleted");
             Ok(0)
         }
+        "orchestrator" => orchestrator(&ctx, args),
         "doctor" => doctor(&mut ctx),
         "connect-info" => {
             let target = args.positional("sandbox name")?;
@@ -354,6 +360,47 @@ fn bake(ctx: &mut Ctx, mut args: Args) -> Result<i32> {
          Rebake after updating tod, or the first connect updates it in place."
     );
     Ok(0)
+}
+
+fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
+    use tod_sandbox::orchestrator as orch;
+    let image = args.opt("--image");
+    let bin = args.opt("--bin").map(PathBuf::from);
+    let cli = args.opt("--tod-cli").map(PathBuf::from);
+    args.done()?;
+    let acct = ctx.account()?.clone();
+    let read = |given: Option<PathBuf>, name: &str| -> Result<Vec<u8>> {
+        let path = match given {
+            Some(p) => p,
+            None => sandbox_binary(name)?,
+        };
+        std::fs::read(&path).with_context(|| format!("read {}", path.display()))
+    };
+    let orchestrator = read(bin, "tod-orchestrator")?;
+    let tod_cli = read(cli, "tod-cli")?;
+    let spec = orch::Spec {
+        image: image.as_deref().unwrap_or(&acct.default_image),
+        region: &acct.region,
+        memory_mb: acct.memory_mb,
+        orchestrator: &orchestrator,
+        tod_cli: &tod_cli,
+    };
+    let url = orch::provision(&ctx.blaxel()?, &spec, &mut |m| eprintln!("{m}"))?;
+    println!("{}: running at {url}/port/{}", orch::NAME, orch::PORT);
+    Ok(0)
+}
+
+/// `target/sandbox/<name>` (or `sandbox/<name>` beside an install), found
+/// from this executable's directory up.
+fn sandbox_binary(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    for dir in exe.ancestors().skip(1) {
+        let p = dir.join("sandbox").join(name);
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    bail!("{name} (Linux) not found under sandbox/; build it with scripts/build-sandbox-binaries.sh or pass its path")
 }
 
 fn list(ctx: &Ctx) -> Result<i32> {

@@ -163,6 +163,12 @@ impl Blaxel {
         check(&mut resp, "create sandbox")
     }
 
+    /// `POST {API}{path}` with a JSON body, for calls this type has no method for.
+    pub fn post_json(&self, path: &str, body: &Value, what: &str) -> Result<()> {
+        let mut resp = self.auth(self.agent.post(&format!("{API}{path}"))).send_json(body).context("Blaxel API")?;
+        check(&mut resp, what)
+    }
+
     /// Creates `target` as a copy of `source`'s current state (Blaxel's
     /// fork; not every workspace has it). Returns once the control plane
     /// accepted it; see [`Blaxel::wait_deployed`].
