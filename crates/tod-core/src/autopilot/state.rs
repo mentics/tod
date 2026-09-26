@@ -23,9 +23,16 @@ pub fn state_path(data_root: &Path, node: Uuid) -> PathBuf {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutopilotState {
-    /// When the run started (ms since the epoch): the time budget counts
-    /// from here.
+    /// When the run started (ms since the epoch).
     pub started_at_ms: i64,
+    /// Time spent working (ms), summed over every stretch the autopilot ran:
+    /// the time budget counts this, not time asleep between wakes.
+    #[serde(default)]
+    pub active_ms: u64,
+    /// When the stretch running now began; not saved (a restart begins a
+    /// new one).
+    #[serde(skip)]
+    pub active_since_ms: Option<i64>,
     /// Conversations started or reopened.
     pub sessions: u32,
     /// The conversation in progress, reopened by a restart.
@@ -61,6 +68,8 @@ impl AutopilotState {
     pub fn fresh() -> Self {
         Self {
             started_at_ms: now_ms(),
+            active_ms: 0,
+            active_since_ms: None,
             sessions: 0,
             current: None,
             steps: Vec::new(),
@@ -90,8 +99,51 @@ impl AutopilotState {
         Ok(())
     }
 
-    /// Time since the run started.
+    /// Time spent working: every finished stretch plus the one running.
     pub fn elapsed(&self) -> Duration {
-        Duration::from_millis(now_ms().saturating_sub(self.started_at_ms).max(0) as u64)
+        let running = self.active_since_ms.map_or(0, |since| now_ms().saturating_sub(since).max(0) as u64);
+        Duration::from_millis(self.active_ms + running)
+    }
+
+    /// A working stretch begins (ending any still open).
+    pub fn begin_active(&mut self) {
+        self.end_active();
+        self.active_since_ms = Some(now_ms());
+    }
+
+    /// The working stretch ends: its time is added to `active_ms`.
+    pub fn end_active(&mut self) {
+        if let Some(since) = self.active_since_ms.take() {
+            self.active_ms += now_ms().saturating_sub(since).max(0) as u64;
+        }
+    }
+
+    /// Adds the running stretch's time so far to `active_ms` and keeps it
+    /// running, so a save holds it.
+    pub fn checkpoint_active(&mut self) {
+        if self.active_since_ms.is_some() {
+            self.begin_active();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_asleep_does_not_count() {
+        let mut state = AutopilotState::fresh();
+        // Started a day ago, worked ten minutes.
+        state.started_at_ms -= 24 * 60 * 60 * 1000;
+        state.active_ms = 10 * 60 * 1000;
+        assert!(state.elapsed() < Duration::from_secs(11 * 60));
+        state.active_since_ms = Some(now_ms() - 60_000);
+        state.end_active();
+        let elapsed = state.elapsed();
+        assert!(elapsed >= Duration::from_secs(11 * 60) && elapsed < Duration::from_secs(12 * 60), "{elapsed:?}");
+        // The sum is saved; a stretch in progress is not.
+        let saved: AutopilotState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(saved.active_ms, state.active_ms);
     }
 }

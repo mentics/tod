@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Current fleet schema epoch stored in `PRAGMA user_version`.
-pub const CURRENT_USER_VERSION: i32 = 67;
+pub const CURRENT_USER_VERSION: i32 = 70;
 
 const BUSY_TIMEOUT_MS: i64 = 5000;
 
@@ -416,6 +416,35 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
         conn.pragma_update(None, "user_version", 67)?;
     }
+    if version < 68 {
+        // Which nodes run in the cloud and when their context changed
+        // (`crate::cloud_nodes`); synced.
+        conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 68)?;
+    }
+    if version < 69 {
+        // Webhook events routed to a node (`crate::node_events`); synced.
+        conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+        conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
+        conn.pragma_update(None, "user_version", 69)?;
+    }
+    if version < 70 {
+        // When the orchestrator found a cloud node's sandbox gone
+        // (`crate::cloud_nodes::mark_lost`); synced with the rest of the row.
+        crate::cloud_nodes::add_lost_at(conn)?;
+        conn.pragma_update(None, "user_version", 70)?;
+    }
+    // Other branches (the task panel) numbered their own steps 66–67 at the
+    // same time as 66–70 above, so a store may be past a version without
+    // having these. Every one is idempotent: make sure of them all.
+    conn.execute_batch(crate::waits::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::waits_triggers_sql())?;
+    conn.execute_batch(crate::cloud_nodes::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::cloud_nodes_triggers_sql())?;
+    conn.execute_batch(crate::node_events::CREATE_TABLE)?;
+    conn.execute_batch(&crate::journey_changes::node_events_triggers_sql())?;
+    crate::cloud_nodes::add_lost_at(conn)?;
     crate::sync::install(conn)?;
     // Idempotent and cheap — keeps the gate criteria catalog's wording in
     // sync with the source on every startup, not just the migration that

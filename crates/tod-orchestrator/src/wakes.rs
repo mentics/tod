@@ -18,6 +18,12 @@
 //!   its own relay's hold (`POST 127.0.0.1:2222/hold?reason=wakes&secs=120`)
 //!   on every tick, and `/release?reason=wakes` once nothing is pending.
 //!
+//! A poke that finds the sandbox gone ([`SandboxGone`]: Blaxel has no such
+//! sandbox, or its relay answers 404) is not retried: the wake is dropped and
+//! the lost handler ([`Wakes::set_lost_handler`]; the server marks the node's
+//! `cloud_nodes.lost_at`) is told, so the app replaces the sandbox on its
+//! next sync. Only the app can: the user's tokens are only on their machine.
+//!
 //! Poking needs Blaxel credentials to reach other sandboxes: [`RelayPoker`]
 //! reads `TOD_ORCHESTRATOR_BLAXEL_WORKSPACE` and `TOD_ORCHESTRATOR_BLAXEL_TOKEN`.
 //! Without them a poke fails (and is retried) with a message saying so.
@@ -45,6 +51,26 @@ pub struct Wake {
     /// When, in ms since the epoch.
     pub at: i64,
 }
+
+/// A poke's error when the sandbox no longer exists.
+#[derive(Debug)]
+pub struct SandboxGone(pub String);
+
+impl std::fmt::Display for SandboxGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sandbox {} is gone", self.0)
+    }
+}
+
+impl std::error::Error for SandboxGone {}
+
+/// Whether a poke failed because the sandbox is gone.
+pub fn is_gone(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.downcast_ref::<SandboxGone>().is_some())
+}
+
+/// Told about a wake whose sandbox is gone.
+pub type LostHandler = Box<dyn Fn(&Wake) + Send + Sync>;
 
 /// Wakes a sandbox.
 pub trait Poker: Send + Sync {
@@ -75,6 +101,7 @@ pub struct Wakes {
     rows: Mutex<Vec<Wake>>,
     changed: Condvar,
     poker: Box<dyn Poker>,
+    lost: std::sync::OnceLock<LostHandler>,
 }
 
 impl Wakes {
@@ -86,7 +113,19 @@ impl Wakes {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker }))
+        Ok(Arc::new(Self { path, rows: Mutex::new(rows), changed: Condvar::new(), poker, lost: std::sync::OnceLock::new() }))
+    }
+
+    /// Who hears of a sandbox found gone (set once; later calls are ignored).
+    pub fn set_lost_handler(&self, handler: LostHandler) {
+        let _ = self.lost.set(handler);
+    }
+
+    fn report_lost(&self, wake: &Wake) {
+        eprintln!("tod-orchestrator: node {} lost its sandbox {}", wake.node, wake.sandbox);
+        if let Some(handler) = self.lost.get() {
+            handler(wake);
+        }
     }
 
     pub fn list(&self) -> Vec<Wake> {
@@ -136,6 +175,12 @@ impl Wakes {
                     let _ = self.save(&rows).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
                     fired.push(wake.id);
                 }
+                Err(err) if is_gone(&err) => {
+                    self.report_lost(&wake);
+                    let mut rows = self.rows.lock().unwrap();
+                    rows.retain(|w| w != &wake);
+                    let _ = self.save(&rows).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
+                }
                 Err(err) => {
                     eprintln!("tod-orchestrator: poke {} for wake {}: {err:#}", wake.sandbox, wake.id);
                     let mut rows = self.rows.lock().unwrap();
@@ -147,6 +192,20 @@ impl Wakes {
             }
         }
         fired
+    }
+
+    /// Pokes `wake`'s sandbox now; if that fails, records it to be retried
+    /// [`RETRY_MS`] later by the timer.
+    pub fn poke_now(&self, mut wake: Wake) {
+        if let Err(err) = self.poker.poke(&wake) {
+            if is_gone(&err) {
+                self.report_lost(&wake);
+                return;
+            }
+            eprintln!("tod-orchestrator: poke {} ({}): {err:#}; retrying later", wake.sandbox, wake.id);
+            wake.at = now_ms() + RETRY_MS;
+            let _ = self.put(wake).map_err(|e| eprintln!("tod-orchestrator: wakes: {e:#}"));
+        }
     }
 
     /// Runs the timer forever: fires due wakes, ticks `awake`, and sleeps
@@ -230,7 +289,12 @@ impl Poker for RelayPoker {
         let Some(bx) = &self.blaxel else {
             bail!("TOD_ORCHESTRATOR_BLAXEL_WORKSPACE and TOD_ORCHESTRATOR_BLAXEL_TOKEN are not set");
         };
-        let info = bx.get(&wake.sandbox)?.with_context(|| format!("no sandbox named {}", wake.sandbox))?;
+        let Some(info) = bx.get(&wake.sandbox)? else {
+            return Err(SandboxGone(wake.sandbox.clone()).into());
+        };
+        if matches!(info.status.as_str(), "FAILED" | "TERMINATED" | "DELETING") {
+            return Err(SandboxGone(wake.sandbox.clone()).into());
+        }
         let url = info.url.with_context(|| format!("{} has no URL", wake.sandbox))?;
         let url = format!("{}/port/{}/poke", url.trim_end_matches('/'), tod_sandbox::blaxel::RELAY_PORT);
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -244,6 +308,9 @@ impl Poker for RelayPoker {
             .send_empty()
             .context("poke")?;
         let status = resp.status().as_u16();
+        if status == 404 {
+            return Err(anyhow::Error::new(SandboxGone(wake.sandbox.clone())).context(format!("poke {url}: 404")));
+        }
         if !(200..300).contains(&status) {
             bail!("poke {url}: {status}");
         }
@@ -288,9 +355,13 @@ mod tests {
     struct FakePoker {
         poked: Mutex<Vec<String>>,
         fail: AtomicBool,
+        gone: AtomicBool,
     }
     impl Poker for Arc<FakePoker> {
         fn poke(&self, wake: &Wake) -> Result<()> {
+            if self.gone.load(Ordering::SeqCst) {
+                return Err(SandboxGone(wake.sandbox.clone()).into());
+            }
             if self.fail.load(Ordering::SeqCst) {
                 bail!("down");
             }
@@ -304,7 +375,9 @@ mod tests {
     }
 
     fn base() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-orch-wakes-{}", now_ms() ^ std::process::id() as i64));
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("tod-orch-wakes-{}-{}-{n}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -333,6 +406,25 @@ mod tests {
         assert!(!again.remove("bob", "b").unwrap(), "another user's wake is not theirs to drop");
         assert!(again.remove("alice", "b").unwrap());
         assert!(Wakes::load(&dir, Box::new(poker)).unwrap().list().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_gone_sandbox_is_reported_lost_and_not_retried() {
+        let dir = base();
+        let poker = Arc::new(FakePoker::default());
+        poker.gone.store(true, Ordering::SeqCst);
+        let wakes = Wakes::load(&dir, Box::new(poker.clone())).unwrap();
+        let lost = Arc::new(Mutex::new(Vec::new()));
+        let seen = lost.clone();
+        wakes.set_lost_handler(Box::new(move |w: &Wake| seen.lock().unwrap().push(w.sandbox.clone())));
+
+        wakes.poke_now(wake("now", 0));
+        assert!(wakes.list().is_empty(), "a poke of a gone sandbox is not retried");
+        wakes.put(wake("due", 100)).unwrap();
+        assert!(wakes.fire_due(200).is_empty());
+        assert!(wakes.list().is_empty());
+        assert_eq!(*lost.lock().unwrap(), ["sb-now", "sb-due"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

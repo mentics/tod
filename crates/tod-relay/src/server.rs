@@ -126,14 +126,23 @@ async fn try_poke(relay: &Arc<Relay>, stream: TcpStream) -> Option<TcpStream> {
     let Some(line) = head.lines().next() else { return Some(stream) };
     let mut parts = line.split_whitespace();
     let (Some(method), Some(path)) = (parts.next(), parts.next()) else { return Some(stream) };
-    if method != "POST" {
+    if method != "POST" && method != "GET" {
         return Some(stream);
     }
     // The proxy may or may not strip its `/port/<n>` prefix, so match segments.
     let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if method == "GET" {
+        // Only `GET /holds` is plain HTTP; every other GET is a WebSocket upgrade.
+        if segs.last() != Some(&"holds") {
+            return Some(stream);
+        }
+        handle_http(relay, stream, HttpAction::Holds).await;
+        return None;
+    }
     let action = match segs.last() {
         Some(&"poke") => HttpAction::Poke,
+        Some(&"release-all") => HttpAction::ReleaseAll,
         Some(&"hold") => {
             let reason = query_param(query, "reason").unwrap_or_default();
             let secs = query_param(query, "secs").and_then(|s| s.parse::<u64>().ok());
@@ -159,6 +168,10 @@ enum HttpAction {
     Hold(String, u64),
     /// `POST /release?reason=<r>`: end it now.
     Release(String),
+    /// `POST /release-all`: end every hold now (the watchdog's).
+    ReleaseAll,
+    /// `GET /holds`: what holds the sandbox, as JSON (`hold::HoldsReport`).
+    Holds,
     Bad(&'static str),
 }
 
@@ -192,7 +205,21 @@ async fn handle_http(relay: &Arc<Relay>, mut stream: TcpStream, action: HttpActi
             Err(_) => break,
         }
     }
+    let json_reply;
     let reply: &[u8] = match action {
+        HttpAction::Holds => {
+            let body = serde_json::to_string(&relay.hold.report()).unwrap_or_else(|_| "{}".into());
+            json_reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            json_reply.as_bytes()
+        }
+        HttpAction::ReleaseAll => {
+            eprintln!("relay: release-all");
+            relay.hold.release_all();
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        }
         HttpAction::Poke => {
             poke(relay);
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

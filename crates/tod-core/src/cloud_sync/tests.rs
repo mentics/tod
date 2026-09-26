@@ -31,10 +31,9 @@ fn state_round_trips_and_defaults_when_missing() {
     let root = temp_root("state");
     assert_eq!(CloudSyncState::load(&root).unwrap(), CloudSyncState::default());
     let mut s = CloudSyncState { seeded: true, sent_after: 3, feed_after: 9, ..Default::default() };
-    s.nodes.insert("n".into(), CloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1 });
+    s.nodes.insert("n".into(), CloudNode { sandbox: "node-n".into(), user: "u".into(), accepted_at_ms: 1, lost_at: None });
     s.save(&root).unwrap();
     assert_eq!(CloudSyncState::load(&root).unwrap(), s);
-    assert_eq!(cloud_node(&root, "n").unwrap().sandbox, "node-n");
     let _ = std::fs::remove_dir_all(&root);
 }
 

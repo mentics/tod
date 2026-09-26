@@ -383,6 +383,12 @@ writes them.
   ends the session and retries. After K failures it asks the user.
 - **A runaway loop**: each node has a budget (sessions, awake hours).
   Reaching it asks the user; it never just keeps going.
+- **The user's answer takes effect.** These questions, and the watchdog's
+  flag, are decisions marked as stop questions (`tod_core::stop_questions`);
+  an answer syncs to the orchestrator, which pokes the node. "Keep going"
+  resets the failure count or grants another budget of the same size;
+  "Leave it stopped" / "Leave it asleep" keeps the node stopped with no
+  wake scheduled until the user answers again. See `orchestrator.md`.
 - **The watchdog.** Hourly, it lists the workspace's sandboxes through the
   control plane (which does not wake them). A sandbox that has been awake
   longer than its lease allows gets its hold cleared (the process API: kill

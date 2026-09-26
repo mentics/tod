@@ -18,16 +18,24 @@ impl Drop for Harness {
 }
 
 fn start(name: &str) -> Harness {
+    start_with_sink(name, Box::new(tod_orchestrator::notify::NoSink))
+}
+
+fn start_with_sink(name: &str, sink: Box<dyn tod_orchestrator::notify::Sink>) -> Harness {
     let base = std::env::temp_dir().join(format!("tod-orch-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = Server::new(Config {
+    let server = Server::with_sink(
+        Config {
         base: base.clone(),
         tod_cli: env!("CARGO_BIN_EXE_tod-orchestrator").into(),
         tod_cli_prefix: vec!["--test-echo-cli".into()],
-    })
+        },
+        Box::new(tod_orchestrator::wakes::RelayPoker::from_env()),
+        sink,
+    )
     .unwrap();
     std::thread::spawn(move || server.serve(listener));
     Harness { port, base }
@@ -195,4 +203,39 @@ fn wakes_are_recorded_listed_on_disk_and_deleted() {
     let (status, _) = send(h.port, "DELETE", "/wakes/w1", &[("X-Tod-User", "alice")], b"");
     assert_eq!(status, 200, "deleting a wake already gone is fine");
     assert!(!std::fs::read_to_string(h.base.join("wakes.json")).unwrap().contains("w1"));
+}
+
+#[derive(Default, Clone)]
+struct FakeSink(std::sync::Arc<std::sync::Mutex<Vec<(String, tod_orchestrator::notify::Kind)>>>);
+
+impl tod_orchestrator::notify::Sink for FakeSink {
+    fn publish(&self, topic: &str, kind: tod_orchestrator::notify::Kind) -> anyhow::Result<()> {
+        self.0.lock().unwrap().push((topic.to_string(), kind));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_changes_post_is_announced_on_the_users_topic() {
+    use tod_orchestrator::notify::Kind;
+    let sink = FakeSink::default();
+    let h = start_with_sink("notify", Box::new(sink.clone()));
+    let (status, body) = send(h.port, "POST", "/users/dave/changes", &[], b"[]");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while sink.0.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (status, body) = send(h.port, "GET", "/users/dave/notify", &[], b"");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let topics = json(&body);
+    let topic = topics["topic"].as_str().unwrap().to_string();
+    assert!(topic.starts_with("tod-") && topic.len() > 60, "{topics}");
+    assert_eq!(topics["alerts_topic"].as_str().unwrap(), format!("{topic}-alerts"));
+    assert_eq!(*sink.0.lock().unwrap(), vec![(topic.clone(), Kind::Changed)]);
+
+    // Nothing committed: no second notice.
+    assert_eq!(send(h.port, "POST", "/users/dave/changes", &[], b"[]").0, 200);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(sink.0.lock().unwrap().len(), 1);
 }

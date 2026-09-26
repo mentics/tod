@@ -123,6 +123,8 @@ pub const SYNCED_TABLES: &[&str] = &[
     "conversation_flags",
     "conversation_reports",
     "waits",
+    "cloud_nodes",
+    "node_events",
 ];
 
 /// The HTTP header a client names itself by to the orchestrator
@@ -377,6 +379,21 @@ fn node_from_value(v: Value) -> Option<Uuid> {
 }
 
 /// The row with `key` in `table`, as it is now.
+/// Whether two versions of a row hold the same content. `updated_at` is left
+/// out: a write that only touched the row (a renumber, a save with no edit)
+/// is not an edit the other side could have lost.
+fn same_content(a: &Option<Row>, b: &Option<Row>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            fn content(row: &Row) -> impl Iterator<Item = (&String, &SqlValue)> {
+                row.iter().filter(|(k, _)| k.as_str() != "updated_at")
+            }
+            content(a).eq(content(b))
+        }
+        (a, b) => a == b,
+    }
+}
+
 fn current_row(conn: &Connection, table: &str, info: &TableInfo, key: &Row) -> Result<Option<Row>> {
     let (clause, values) = key_clause(key)?;
     let sql = format!(
@@ -507,7 +524,7 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<
         }
         let info = &infos[&change.table];
         let found = current_row(&tx, &change.table, info, &change.key)?;
-        if found != change.before && found != change.after {
+        if !same_content(&found, &change.before) && !same_content(&found, &change.after) {
             report.conflicts.push(Conflict {
                 node_id: change.node_id,
                 table: change.table.clone(),

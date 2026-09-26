@@ -38,6 +38,28 @@ const RENEW_MARGIN: Duration = Duration::from_secs(20);
 struct HoldState {
     /// reason -> lease deadline, or `None` for a lease-less hold.
     reasons: HashMap<String, Option<Instant>>,
+    /// When the current stretch of holding began: set when the first reason
+    /// opens, cleared when the last one ends. `GET /holds` reports it, so the
+    /// watchdog can tell how long the sandbox has been kept awake.
+    since: Option<Instant>,
+}
+
+/// One open reason, as `GET /holds` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReasonReport {
+    pub reason: String,
+    /// Seconds left on its lease; `None` for a lease-less reason.
+    pub lease_secs_left: Option<u64>,
+}
+
+/// What `GET /holds` returns. Times are relative (seconds before or after
+/// the moment of the request), since the relay's clock is monotonic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HoldsReport {
+    /// How long ago the current stretch of holding began; `None` when
+    /// nothing holds the sandbox.
+    pub held_for_secs: Option<u64>,
+    pub reasons: Vec<ReasonReport>,
 }
 
 impl HoldState {
@@ -65,6 +87,33 @@ impl HoldState {
 
     fn is_empty(&self) -> bool {
         self.reasons.is_empty()
+    }
+
+    /// Starts or ends the holding stretch to match the reasons open now.
+    fn touch(&mut self, now: Instant) {
+        if self.reasons.is_empty() {
+            self.since = None;
+        } else if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.reasons.clear();
+        self.since = None;
+    }
+
+    fn report(&self, now: Instant) -> HoldsReport {
+        let mut reasons: Vec<ReasonReport> = self
+            .reasons
+            .iter()
+            .map(|(r, d)| ReasonReport {
+                reason: r.clone(),
+                lease_secs_left: d.map(|d| d.saturating_duration_since(now).as_secs()),
+            })
+            .collect();
+        reasons.sort_by(|a, b| a.reason.cmp(&b.reason));
+        HoldsReport { held_for_secs: self.since.map(|s| now.saturating_duration_since(s).as_secs()), reasons }
     }
 
     /// The `keepAlive` process's `timeout`, in seconds, for the reasons open
@@ -109,21 +158,46 @@ impl Hold {
     /// Sets or clears a lease-less hold (the existing `busy:` / `awake:` /
     /// `agent:` reasons).
     pub fn set(&self, reason: &str, on: bool) {
-        self.state.lock().unwrap().set(reason, on);
+        {
+            let mut s = self.state.lock().unwrap();
+            s.set(reason, on);
+            s.touch(Instant::now());
+        }
         let _ = self.worker.send(());
     }
 
     /// Sets or renews a leased hold for `secs` from now. Not calling this
     /// again before it elapses ends the hold.
     pub fn lease(&self, reason: &str, secs: u64) {
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        self.state.lock().unwrap().lease(reason, deadline);
+        let now = Instant::now();
+        {
+            let mut s = self.state.lock().unwrap();
+            s.lease(reason, now + Duration::from_secs(secs));
+            s.touch(now);
+        }
         let _ = self.worker.send(());
     }
 
     /// Ends a hold (leased or not) now.
     pub fn release(&self, reason: &str) {
         self.set(reason, false);
+    }
+
+    /// Ends every hold now, leased or not (the watchdog's `POST
+    /// /release-all`). A lease-less reason whose work is still running is
+    /// set again the next time that work changes state.
+    pub fn release_all(&self) {
+        self.state.lock().unwrap().clear();
+        let _ = self.worker.send(());
+    }
+
+    /// What is holding the sandbox, and since when (`GET /holds`).
+    pub fn report(&self) -> HoldsReport {
+        let now = Instant::now();
+        let mut s = self.state.lock().unwrap();
+        s.expire(now);
+        s.touch(now);
+        s.report(now)
     }
 }
 
@@ -136,6 +210,7 @@ fn reconcile(state: &Mutex<HoldState>, current: &mut Option<(String, Instant)>, 
     let (empty, desired_secs) = {
         let mut s = state.lock().unwrap();
         s.expire(now);
+        s.touch(now);
         (s.is_empty(), s.timeout_secs(now, max_secs))
     };
     if empty {
@@ -262,6 +337,36 @@ mod tests {
         s.set("busy:1", false);
         s.set("busy:1", true);
         assert_eq!(s.timeout_secs(now, 3600), 30);
+    }
+
+    #[test]
+    fn report_tracks_the_holding_stretch() {
+        let now = Instant::now();
+        let mut s = HoldState::default();
+        assert_eq!(s.report(now).held_for_secs, None);
+        s.set("busy:1", true);
+        s.touch(now);
+        s.lease("ext:supervisor", now + secs(120));
+        s.touch(now + secs(10));
+        let r = s.report(now + secs(30));
+        assert_eq!(r.held_for_secs, Some(30));
+        assert_eq!(
+            r.reasons,
+            vec![
+                ReasonReport { reason: "busy:1".into(), lease_secs_left: None },
+                ReasonReport { reason: "ext:supervisor".into(), lease_secs_left: Some(90) },
+            ]
+        );
+        s.set("busy:1", false);
+        s.expire(now + secs(200));
+        s.touch(now + secs(200));
+        assert_eq!(s.report(now + secs(200)).held_for_secs, None);
+        s.set("a", true);
+        s.touch(now + secs(300));
+        assert_eq!(s.report(now + secs(301)).held_for_secs, Some(1));
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.report(now + secs(302)).held_for_secs, None);
     }
 
     #[test]

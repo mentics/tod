@@ -59,6 +59,12 @@ agent <name> --name AGENT [--cwd DIR] [--idle SECS] [--cli-relay] [--env NAME]..
                          --env NAME passes this process's NAME (or NAME=VALUE).
 zed <name> [PATH]        Open PATH (default /root) in Zed on the sandbox.
 delete <name>            Delete a sandbox.
+watchdog run-once [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
+                         One watchdog pass: release the holds on any running
+                         node sandbox held past its lease, and flag its node.
+watchdog deploy --image IMAGE [--orchestrator-url URL] [--max-awake-secs N] [--max-lease-secs N]
+                         Create (or replace) the hourly Blaxel job that runs
+                         tod-watchdog from IMAGE. Needs an API-key sign-in.
 orchestrator [--image IMAGE] [--bin PATH] [--tod-cli PATH]
                          Create (if needed) the team's orchestrator sandbox,
                          install tod-orchestrator and tod-cli (Linux builds;
@@ -210,6 +216,7 @@ fn run() -> Result<i32> {
             Ok(0)
         }
         "orchestrator" => orchestrator(&ctx, args),
+        "watchdog" => watchdog(&ctx, args),
         "doctor" => doctor(&mut ctx),
         "connect-info" => {
             let target = args.positional("sandbox name")?;
@@ -392,6 +399,51 @@ fn orchestrator(ctx: &Ctx, mut args: Args) -> Result<i32> {
     let url = orch::provision(&bx, &spec, &mut |m| eprintln!("{m}"))?;
     println!("{}: running at {url}/port/{}", orch::NAME, orch::PORT);
     Ok(0)
+}
+
+/// `tod-sandbox watchdog run-once|deploy` (see `tod_sandbox::watchdog`).
+fn watchdog(ctx: &Ctx, mut args: Args) -> Result<i32> {
+    use tod_sandbox::watchdog as wd;
+    let sub = args.positional("run-once or deploy")?;
+    let given_url = args.opt("--orchestrator-url");
+    let image = args.opt("--image");
+    let mut policy = wd::Policy::default();
+    if let Some(v) = args.opt("--max-awake-secs") {
+        policy.max_awake_secs = v.parse().context("--max-awake-secs")?;
+    }
+    if let Some(v) = args.opt("--max-lease-secs") {
+        policy.max_lease_secs = v.parse().context("--max-lease-secs")?;
+    }
+    args.done()?;
+    let bx = ctx.blaxel()?;
+    let orchestrator_url = match given_url {
+        Some(u) => u,
+        None => {
+            use tod_sandbox::orchestrator as orch;
+            let info = bx.get(orch::NAME)?.with_context(|| format!("no {} sandbox; pass --orchestrator-url", orch::NAME))?;
+            let url = info.url.with_context(|| format!("{} has no URL", orch::NAME))?;
+            format!("{}/port/{}", url.trim_end_matches('/'), orch::PORT)
+        }
+    };
+    match sub.as_str() {
+        "run-once" => {
+            let env = wd::BlaxelEnv::new(bx, orchestrator_url);
+            let out = wd::run_once(&env, &policy, std::time::SystemTime::now())?;
+            Ok(wd::report(&out))
+        }
+        "deploy" => {
+            let acct = ctx.account()?;
+            if acct.auth == AuthMode::Bl {
+                bail!("the watchdog job needs a workspace API key (a `bl login` token expires): run `tod-sandbox setup --auth api-key` first");
+            }
+            let image = image.context("deploy needs --image (an image with /opt/tod/tod-watchdog)")?;
+            let spec = wd::JobSpec { image: &image, region: &acct.region, orchestrator_url: &orchestrator_url, policy };
+            wd::deploy(&bx, &spec)?;
+            println!("{}: hourly ({}), from {image}", wd::JOB_NAME, wd::SCHEDULE);
+            Ok(0)
+        }
+        other => bail!("unknown watchdog command {other:?}\n\n{USAGE}"),
+    }
 }
 
 /// `target/sandbox/<name>` (or `sandbox/<name>` beside an install), found
