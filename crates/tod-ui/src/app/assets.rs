@@ -17,7 +17,8 @@ gpui_kit_assets::icon_assets!(
         Layers,
         ListChecks,
         Brain,
-        Wrench
+        Wrench,
+        Terminal
     ]
 );
 
@@ -59,5 +60,10 @@ mod tests {
     fn continue_in_terminal_icon_is_bundled() {
         use gpui_component::{IconName, IconNamed};
         assert!(serves(&IconName::SquareTerminal.path()));
+    }
+
+    #[test]
+    fn open_shell_icon_is_bundled() {
+        assert!(serves(&gpui_kit_assets::IconName::Terminal.path()));
     }
 }

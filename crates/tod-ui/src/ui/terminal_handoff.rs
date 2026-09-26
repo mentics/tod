@@ -3,6 +3,9 @@
 //! machine, the node's dev container, or its cloud sandbox — and resumes the
 //! conversation's agent session there in the agent's own CLI
 //! (`tod_core::conversation::handoff`).
+//!
+//! Beside it, "Open a shell": a plain shell in the focus's node's Files
+//! directory, as the node's own "Open shell" opens (`open_shell_for_node`).
 
 use crate::interview::agent::SharedAgent;
 use crate::interview::{TodPaths, TodSettings};
@@ -13,11 +16,62 @@ use gpui_component::IconName;
 use std::sync::Arc;
 use tod_core::conversation::handoff::{release_session, terminal_handoff};
 use tod_core::conversation::{ConversationConfig, SharedAgentAccess};
-use tod_store::fleet::{FleetStore, open_terminal_command};
+use tod_store::fleet::{FleetStore, open_shell_for_node, open_terminal_command};
 use uuid::Uuid;
 
 /// The tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
 pub const CONTINUE_IN_TERMINAL: &str = "continue-in-terminal";
+
+/// The shell tool's id in [`crate::ui::agent_conversation::AgentConversationEvent::Action`].
+pub const OPEN_SHELL: &str = "open-shell";
+
+/// Both icons left of Send, the shell first: the one for the conversation's
+/// node (`None` for the project, which has no Files directory).
+pub fn tools(node: Option<Uuid>, has_session: bool, running: bool) -> Vec<PanelTool> {
+    vec![shell_tool(node), tool(has_session, running)]
+}
+
+/// The shell icon, enabled when the conversation is about a node.
+pub fn shell_tool(node: Option<Uuid>) -> PanelTool {
+    let tooltip = if node.is_some() {
+        "Open a shell in this node's files"
+    } else {
+        "Open a shell (on a node, not the project)"
+    };
+    PanelTool::new(OPEN_SHELL, gpui_kit_assets::IconName::Terminal, tooltip)
+        .disabled(node.is_none())
+}
+
+/// Open a shell for `node` off the UI thread (it waits for the terminal's
+/// shell to start, and for Docker when the node runs in a dev container),
+/// and say how it went in a toast.
+pub fn open_shell<T: 'static>(
+    fleet: Arc<FleetStore>,
+    node: Option<Uuid>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    let Some(node) = node else {
+        return;
+    };
+    cx.spawn_in(window, async move |_, cx| {
+        let opened = cx
+            .background_executor()
+            .spawn(async move {
+                let paths = TodPaths::discover()?;
+                let settings = TodSettings::load(&paths).unwrap_or_default();
+                let (_, cwd) =
+                    open_shell_for_node(&fleet, &paths, &settings, &node.to_string(), None)?;
+                anyhow::Ok(cwd)
+            })
+            .await;
+        let _ = cx.update(|window, cx| match opened {
+            Ok(cwd) => info_toast(window, cx, format!("Opened a shell in {cwd}")),
+            Err(err) => error_toast(window, cx, format!("Could not open a shell: {err:#}")),
+        });
+    })
+    .detach();
+}
 
 /// The icon, enabled once the conversation has an agent session and no turn
 /// is using it.
