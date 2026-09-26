@@ -9207,6 +9207,7 @@ name = "tod-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "libc",
  "rusqlite",
  "serde",

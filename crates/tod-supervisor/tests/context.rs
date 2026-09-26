@@ -99,6 +99,7 @@ fn config(orchestrator: &Orchestrator, node: Uuid, base: &Path) -> Config {
         transcripts: None,
         media: media(),
         budget: Budget { max_sessions: 1, max_duration: Duration::from_secs(600) },
+        guards: Default::default(),
         poll: Duration::from_millis(20),
         push_branch: false,
         scheduler: None,

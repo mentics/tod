@@ -24,11 +24,13 @@
 pub mod agent;
 pub mod context;
 pub mod git;
+pub mod guard;
 pub mod hold;
 pub mod orchestrator;
 pub mod replica;
 pub mod signal;
 pub mod transcripts;
+pub mod usage_limit;
 pub mod waits;
 
 use agent::{AgentKind, Syncing};
@@ -39,7 +41,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tod_agent::{AgentLaunchOptions, AgentPlatform};
-use tod_core::autopilot::{Autopilot, Boundary, Budget, Outcome, StepHook};
+use guard::{Guarded, Guards, OnFailure};
+use tod_core::autopilot::{Autopilot, Boundary, Budget, BudgetLimit, NeedsHuman, Outcome, StepHook};
 use tod_core::conversation::driver::ConversationConfig;
 use tod_core::media::MediaPaths;
 use tod_store::fleet::FleetStore;
@@ -60,6 +63,8 @@ pub struct Config {
     pub transcripts: Option<(PathBuf, Arc<dyn TranscriptStore>)>,
     pub media: MediaPaths,
     pub budget: Budget,
+    /// Hung agents and repeated failures (design: "Crash guards").
+    pub guards: Guards,
     /// Between polls of a turn in flight.
     pub poll: Duration,
     /// Push the branch after each step and at the end.
@@ -128,6 +133,48 @@ fn schedule(store: &FleetStore, config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The reason a run stopped for a usage limit (distinct from a failure).
+pub fn usage_limit_reason(limit: &usage_limit::UsageLimit) -> String {
+    format!("usage limit: waiting until {}", limit.reset_at_ms)
+}
+
+fn waits_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn budget_question(limit: &BudgetLimit) -> String {
+    let spent = match limit {
+        BudgetLimit::Sessions { used } => format!("{used} agent sessions"),
+        BudgetLimit::Time { elapsed_secs } => format!("{:.1} hours of work", *elapsed_secs as f64 / 3600.0),
+    };
+    format!("This node has spent its budget ({spent}) without finishing. Keep going?")
+}
+
+/// Asks the user through a pending decision on the node, as an agent's
+/// `ask` would; the next wake stops on it until it is answered.
+fn ask(store: &FleetStore, node: Uuid, conversation: Option<Uuid>, question: String) -> Result<()> {
+    tracing::info!(%question, "asking the user");
+    store
+        .interview(
+            waits::ACTOR,
+            tod_store::interview::InterviewCommand::AskDecision {
+                node_id: node,
+                conversation_id: conversation,
+                protocol: None,
+                decision: tod_store::decisions::NewDecision {
+                    question,
+                    options: vec!["Keep going".into(), "Leave it stopped".into()],
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// One wake. See the module docs.
 pub fn wake(config: Config) -> Result<Woke> {
     signal::install();
@@ -167,7 +214,15 @@ pub fn wake(config: Config) -> Result<Woke> {
         launch: AgentLaunchOptions::for_platform(AgentPlatform::Claude),
         context: InterviewContextSettings::default(),
     };
-    let mut agent = Syncing::new(config.agent.provider(&data_root), replica.clone());
+    let mut agent = Guarded::new(
+        Syncing::new(config.agent.provider(&data_root), replica.clone()),
+        config.guards.hang_after,
+        Arc::new(guard::SystemClock),
+    );
+    // Consecutive failed runs, and the steps finished at the last one: a
+    // step finished since then means the failures were not in a row.
+    let mut failures = 0u32;
+    let mut steps_at_failure = 0usize;
     let mut hook = Hook {
         replica: &replica,
         node: config.node,
@@ -181,7 +236,44 @@ pub fn wake(config: Config) -> Result<Woke> {
         .and_then(|mut pilot| loop {
             let outcome = pilot.run_with(&store, &mut agent, &mut hook)?;
             let Some(at) = hook.context_pending.take() else {
-                break Ok(outcome);
+                let current = pilot.state().current.as_ref().map(|c| c.conversation_id);
+                match &outcome {
+                    Outcome::NeedsHuman { reason: NeedsHuman::AgentFailed { error } } => {
+                        let done = pilot.state().steps.len();
+                        if done > steps_at_failure {
+                            failures = 0;
+                        }
+                        failures += 1;
+                        steps_at_failure = done;
+                        match guard::on_failure(error, failures, &config.guards, waits_now_ms()) {
+                            OnFailure::UsageLimit(limit) => {
+                                usage_limit::record(&store, config.node, &limit)?;
+                                tracing::info!(reset_at = limit.reset_at_ms, parsed = limit.parsed, "usage limit reached");
+                                break Ok(Outcome::Stopped { reason: usage_limit_reason(&limit) });
+                            }
+                            OnFailure::Retry => {
+                                tracing::warn!(failures, %error, "the agent failed; running the step again");
+                                continue;
+                            }
+                            OnFailure::Ask => {
+                                ask(
+                                    &store,
+                                    config.node,
+                                    current,
+                                    format!(
+                                        "The agent failed {failures} times in a row, most recently: {error}.                                          Try again?"
+                                    ),
+                                )?;
+                                break Ok(outcome);
+                            }
+                        }
+                    }
+                    Outcome::BudgetExhausted { limit } => {
+                        ask(&store, config.node, current, budget_question(limit))?;
+                        break Ok(outcome);
+                    }
+                    _ => break Ok(outcome),
+                }
             };
             // Stopped to take a context change: take it and go on.
             let current = pilot.state().current.as_ref().map(|c| c.conversation_id);

@@ -11,7 +11,7 @@
 //! suggests. It stops when the node is `done`, when a human is needed (a
 //! pending decision, a `blocked` plan step, a failing criterion nothing
 //! earlier can fix, a step that changed nothing), or when its budget
-//! (sessions started, wall-clock time) runs out.
+//! (sessions started, time spent working) runs out.
 //!
 //! It has no GPUI and blocks while it drives the agent, so it can run in a
 //! headless supervisor. What it decides from is all in the store (lifecycle,
@@ -51,7 +51,7 @@ pub const RESUME_MESSAGE: &str = "Continue where you left off.";
 pub struct Budget {
     /// Conversations started (or reopened after a restart).
     pub max_sessions: u32,
-    /// Wall-clock time since the run started.
+    /// Time spent working, summed over the run's wakes (not time asleep).
     pub max_duration: Duration,
 }
 
@@ -216,7 +216,8 @@ impl Autopilot {
         self.save()
     }
 
-    fn save(&self) -> Result<()> {
+    fn save(&mut self) -> Result<()> {
+        self.state.checkpoint_active();
         self.state.save(&self.config.data_root, self.node)
     }
 
@@ -224,6 +225,7 @@ impl Autopilot {
     fn finish(&mut self, outcome: Outcome) -> Result<Outcome> {
         tracing::info!(node = %self.node, ?outcome, "autopilot stopped");
         self.state.outcome = Some(outcome.clone());
+        self.state.end_active();
         self.save()?;
         Ok(outcome)
     }
@@ -261,6 +263,7 @@ impl Autopilot {
         // Called again after it stopped: the user has presumably dealt with
         // what it stopped for.
         self.state.outcome = None;
+        self.state.begin_active();
         self.save()?;
         let mut last: Option<(Standing, NextStep)> = None;
         loop {

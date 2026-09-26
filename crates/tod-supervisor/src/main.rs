@@ -98,6 +98,13 @@ fn run(args: &[String]) -> Result<()> {
         transcripts,
         media,
         budget: Budget::default(),
+        guards: tod_supervisor::guard::Guards {
+            hang_after: env("TOD_HANG_MINUTES")
+                .ok()
+                .and_then(|m| m.parse::<u64>().ok())
+                .map_or(tod_supervisor::guard::Guards::default().hang_after, |m| Duration::from_secs(m * 60)),
+            ..Default::default()
+        },
         poll: Duration::from_millis(500),
         push_branch,
         // The development account's timer. A Blaxel schedule would need
