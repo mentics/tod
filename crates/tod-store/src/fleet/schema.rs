@@ -404,9 +404,17 @@ pub fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 65)?;
     }
     if version < 66 {
-        conn.execute_batch(
-            "ALTER TABLE decisions ADD COLUMN reason TEXT NOT NULL DEFAULT 'other';",
+        // Checked first: a store wound back below 66 still has the column.
+        let has_reason: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('decisions') WHERE name = 'reason'",
+            [],
+            |row| row.get(0),
         )?;
+        if !has_reason {
+            conn.execute_batch(
+                "ALTER TABLE decisions ADD COLUMN reason TEXT NOT NULL DEFAULT 'other';",
+            )?;
+        }
         conn.pragma_update(None, "user_version", 66)?;
     }
     if version < 67 {
