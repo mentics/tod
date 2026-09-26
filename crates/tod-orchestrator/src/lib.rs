@@ -23,6 +23,7 @@ pub mod http;
 pub mod sync_backend;
 pub mod transcripts;
 pub mod users;
+pub mod wakes;
 
 use anyhow::{Context, Result};
 use http::{Request, Response};
@@ -56,16 +57,30 @@ pub struct Config {
 pub struct Server {
     config: Config,
     users: Users,
+    wakes: Arc<wakes::Wakes>,
 }
 
 impl Server {
-    pub fn new(config: Config) -> Arc<Self> {
-        let users = Users::new(config.base.clone());
-        Arc::new(Self { config, users })
+    /// Loads the pending wakes from `<base>/wakes.json`; pokes go through
+    /// [`wakes::RelayPoker`].
+    pub fn new(config: Config) -> Result<Arc<Self>> {
+        Self::with_poker(config, Box::new(wakes::RelayPoker::from_env()))
     }
 
-    /// Accepts connections until the listener fails; one thread each.
+    pub fn with_poker(config: Config, poker: Box<dyn wakes::Poker>) -> Result<Arc<Self>> {
+        let users = Users::new(config.base.clone());
+        let wakes = wakes::Wakes::load(&config.base, poker)?;
+        Ok(Arc::new(Self { config, users, wakes }))
+    }
+
+    pub fn wakes(&self) -> &Arc<wakes::Wakes> {
+        &self.wakes
+    }
+
+    /// Starts the wake timer, then accepts connections until the listener
+    /// fails; one thread each.
     pub fn serve(self: &Arc<Self>, listener: TcpListener) -> Result<()> {
+        self.wakes.spawn_timer(Box::new(wakes::LocalRelayAwake::default()))?;
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -108,6 +123,13 @@ impl Server {
                     Err(r) => return r,
                 };
                 self.cli(&user, &request.body)
+            }
+            ["wakes", rest @ ..] if rest.len() <= 1 => {
+                let user = match self.user(request, None) {
+                    Ok(u) => u,
+                    Err(r) => return r,
+                };
+                self.wakes.handle(request, &user, rest.first().copied())
             }
             ["users", user, rest @ ..] => {
                 let user = match self.user(request, Some(user)) {

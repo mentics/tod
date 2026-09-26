@@ -125,7 +125,7 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
         base: base.join("orchestrator"),
         tod_cli: "tod-cli-not-used".into(),
         tod_cli_prefix: Vec::new(),
-    });
+    }).unwrap();
     std::thread::spawn(move || server.serve(listener));
     let app = base.join("app");
     let node = app_database(&app);

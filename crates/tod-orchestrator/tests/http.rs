@@ -27,7 +27,8 @@ fn start(name: &str) -> Harness {
         base: base.clone(),
         tod_cli: env!("CARGO_BIN_EXE_tod-orchestrator").into(),
         tod_cli_prefix: vec!["--test-echo-cli".into()],
-    });
+    })
+    .unwrap();
     std::thread::spawn(move || server.serve(listener));
     Harness { port, base }
 }
@@ -175,4 +176,23 @@ fn a_snapshot_is_the_users_database() {
     let (status, body) = send(h.port, "GET", "/users/erin/snapshot", &[], b"");
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     assert!(body.starts_with(b"SQLite format 3\0"));
+}
+
+#[test]
+fn wakes_are_recorded_listed_on_disk_and_deleted() {
+    let h = start("wakes");
+    let body = br#"{"id":"w1","user":"alice","node":"n1","sandbox":"sb","at":4102444800000}"#;
+    let (status, _) = send(h.port, "POST", "/wakes", &[("X-Tod-User", "alice")], body);
+    assert_eq!(status, 200);
+    let (status, _) = send(h.port, "POST", "/wakes", &[("X-Tod-User", "bob")], body);
+    assert_eq!(status, 400, "a wake belongs to the user who sends it");
+    let (status, _) = send(h.port, "POST", "/wakes", &[], body);
+    assert_eq!(status, 400);
+    let saved = std::fs::read_to_string(h.base.join("wakes.json")).unwrap();
+    assert!(saved.contains("\"w1\""), "{saved}");
+    let (status, _) = send(h.port, "DELETE", "/wakes/w1", &[("X-Tod-User", "alice")], b"");
+    assert_eq!(status, 200);
+    let (status, _) = send(h.port, "DELETE", "/wakes/w1", &[("X-Tod-User", "alice")], b"");
+    assert_eq!(status, 200, "deleting a wake already gone is fine");
+    assert!(!std::fs::read_to_string(h.base.join("wakes.json")).unwrap().contains("w1"));
 }

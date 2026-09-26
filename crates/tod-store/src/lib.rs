@@ -22,6 +22,7 @@ pub mod review;
 pub mod settings;
 pub mod sync;
 pub mod verification;
+pub mod waits;
 
 /// Agent launch options and live traffic counters live in `tod-agent` (they
 /// describe how a session is started and how it is doing, not how it is
