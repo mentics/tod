@@ -232,8 +232,9 @@ T1 and T3 can start together; T2 and T8 follow T1 in parallel with T4.
 
 ## Left for later
 
-- **Journey** on the artifact strip: shown once there is a journey viewer to
-  open. A link that goes nowhere is not shown.
+- **Journey** on the artifact strip: a muted "Journey (not built yet)"
+  placeholder holds its place at the right end of the strip, so it is not
+  forgotten; it becomes a link once there is a journey viewer to open.
 - **Pause and resume, and stuck requests:** they belong to the runner.
 - **Generator and managed nodes' default panels** in the unified view; until
   then they open details.

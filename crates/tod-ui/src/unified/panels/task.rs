@@ -355,6 +355,10 @@ impl TaskPanel {
             .children(self.changes.state.label().map(|label| {
                 self.artifact_link("unified-task-changes", label, PanelKind::Changes(node_id), cx)
             }))
+            // Placeholder until there is a journey viewer to open
+            // (`doc/ui/task-panel-plan.md`, "Left for later"); then it
+            // becomes an `artifact_link` like the others.
+            .child(style::text_muted(div().id("unified-task-journey").ml_auto()).child("Journey (not built yet)"))
             .into_any_element()
     }
 
