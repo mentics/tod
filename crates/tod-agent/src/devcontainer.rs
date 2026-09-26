@@ -669,10 +669,94 @@ pub fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Where a container's OpenSSH server must be for Zed to reach it: the
+/// shim's ProxyCommand runs `docker exec -i -u root <c> /usr/sbin/sshd -i`.
+pub const SSHD_PATH: &str = "/usr/sbin/sshd";
+
+/// Exit code of [`SSHD_PREP_SCRIPT`] when the container has no `sshd`.
+const NO_SSHD: i32 = 3;
+/// Exit code of [`SSHD_PREP_SCRIPT`] when the user is not in `/etc/passwd`.
+const NO_USER: i32 = 4;
+
+/// Makes `sshd -i` over a pipe usable, as root: host keys, its privilege
+/// separation directory, a hosts entry for `UNKNOWN` (PAM otherwise waits
+/// ~13s on Docker Desktop's DNS resolving it for every connection), and the
+/// public key `$2` in user `$1`'s `authorized_keys`. Idempotent.
+const SSHD_PREP_SCRIPT: &str = r#"
+[ -x /usr/sbin/sshd ] || exit 3
+ssh-keygen -A >/dev/null || exit 1
+mkdir -p /run/sshd
+grep -qx '127.0.0.1 UNKNOWN' /etc/hosts || echo '127.0.0.1 UNKNOWN' >> /etc/hosts
+home=$(grep "^$1:" /etc/passwd | cut -d: -f6)
+[ -n "$home" ] || exit 4
+mkdir -p "$home/.ssh"
+touch "$home/.ssh/authorized_keys"
+grep -qxF "$2" "$home/.ssh/authorized_keys" || echo "$2" >> "$home/.ssh/authorized_keys"
+chown "$1" "$home/.ssh" "$home/.ssh/authorized_keys"
+chmod 700 "$home/.ssh"
+chmod 600 "$home/.ssh/authorized_keys"
+"#;
+
+/// Prepare `container` so an `ssh` whose ProxyCommand is `sshd -i` in it can
+/// log in as `user` with `public_key` (one `authorized_keys` line). Runs as
+/// root and installs nothing: a container without an OpenSSH server gets an
+/// error saying so. Talks to Docker: never call it on the UI thread.
+pub fn prepare_sshd(container: &str, user: &str, public_key: &str) -> Result<()> {
+    validate_container_ref(container)?;
+    let public_key = public_key.trim();
+    if public_key.is_empty() || public_key.contains('\n') {
+        bail!("not a public key line");
+    }
+    if user.is_empty() || user.contains([':', '/', '\n']) {
+        bail!("`{user}` is not a user name");
+    }
+    let out = output(docker_command()?.args([
+        "exec", "-u", "0", container, "sh", "-c", SSHD_PREP_SCRIPT, "sh", user, public_key,
+    ]))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(NO_SSHD) => bail!(
+            "Dev container `{container}` has no OpenSSH server ({SSHD_PATH}), which Zed reaches it through. \
+             Install it in the container's image (e.g. `openssh-server` on Debian/Ubuntu, `openssh` on Alpine), then try again"
+        ),
+        Some(NO_USER) => bail!("Dev container `{container}` has no user `{user}` in /etc/passwd"),
+        _ => bail!(
+            "prepare sshd in dev container `{container}`: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prepare_sshd_rejects_bad_input_before_docker() {
+        assert!(prepare_sshd("bad name", "root", "ssh-ed25519 AAAA").is_err());
+        assert!(prepare_sshd("c", "root", "").is_err());
+        assert!(prepare_sshd("c", "root", "a\nb").is_err());
+        assert!(prepare_sshd("c", "a:b", "ssh-ed25519 AAAA").is_err());
+    }
+
+    /// Needs `TOD_TEST_DEV_CONTAINER`: a running container with `sshd`.
+    #[test]
+    fn prepare_sshd_in_a_real_container_is_idempotent() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            return;
+        };
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItodtestkey tod-test";
+        prepare_sshd(&container, "root", key).unwrap();
+        prepare_sshd(&container, "root", key).unwrap();
+        let out = output(docker_command().unwrap().args([
+            "exec", "-u", "0", &container, "sh", "-c",
+            "grep -cxF \"$1\" /root/.ssh/authorized_keys; grep -c '^127.0.0.1 UNKNOWN$' /etc/hosts; test -d /run/sshd && echo dir",
+            "sh", key,
+        ]))
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1\n1\ndir");
+    }
 
     fn info(mounts: &[(&str, &str)]) -> ContainerInfo {
         ContainerInfo {

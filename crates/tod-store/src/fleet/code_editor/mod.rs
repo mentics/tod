@@ -43,9 +43,16 @@ pub fn open_code_editor_for_node(
 ) -> Result<PathBuf> {
     let cwd = match resolve_launch_cwd(fleet, node_id)? {
         crate::fleet::Workdir::Host(cwd) => cwd,
-        crate::fleet::Workdir::Container { container, path } => anyhow::bail!(
-            "{path} is inside dev container {container}; open it from an editor attached to the container"
-        ),
+        crate::fleet::Workdir::Container { container, path } => {
+            // Mounted repositories resolve to `Host` above and open on this
+            // machine; this is a repository that lives in the container.
+            if editor.id() != zed::ZedEditor.id() {
+                anyhow::bail!("{path} is in dev container {container}; only Zed opens a dev container");
+            }
+            zed::open_in_container(fleet.paths().root(), &container, &path, None)
+                .with_context(|| format!("open {path} in dev container {container} in Zed"))?;
+            return Ok(PathBuf::from(path));
+        }
         crate::fleet::Workdir::Sandbox { sandbox, path } => {
             if editor.id() != zed::ZedEditor.id() {
                 anyhow::bail!("{path} is in sandbox {sandbox}; only Zed opens a sandbox");

@@ -739,13 +739,17 @@ impl ActionPanelView {
         let (Some(task_id), Some(editor)) = (self.task_id.clone(), code_editor(editor_id)) else {
             return;
         };
-        match open_code_editor_for_node(&self.fleet, editor, &task_id) {
-            Ok(cwd) => {
-                self.status_message = format!("Opened {} in {}", editor.label(), cwd.display());
-                cx.notify();
-            }
-            Err(err) => error_toast(window, cx, format!("Open code editor failed: {err:#}")),
-        }
+        // A dev container is prepared through Docker first: off the UI thread.
+        self.run_terminal_job(
+            &format!("Opening {}…", editor.label()),
+            "Open code editor failed",
+            move |fleet, _, _| {
+                let cwd = open_code_editor_for_node(fleet, editor, &task_id)?;
+                Ok(format!("Opened {} in {}", editor.label(), cwd.display()))
+            },
+            window,
+            cx,
+        );
     }
 
     fn on_close(&mut self, _: &ActionPanelClose, _: &mut Window, cx: &mut Context<Self>) {

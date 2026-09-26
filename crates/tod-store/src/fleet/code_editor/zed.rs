@@ -91,12 +91,135 @@ pub fn sandbox_url(sandbox: &str, path: &str) -> String {
     )
 }
 
+/// Hosts ending in this are dev containers (`ssh://<user>@<container>.docker.tod/...`);
+/// `tod-zed-shim` reaches them through `docker exec ... sshd -i`. Checked
+/// there before the sandbox suffix (`.tod`), which it also ends in.
+pub const CONTAINER_HOST_SUFFIX: &str = ".docker.tod";
+
+/// The key pair Zed logs in to dev containers with, in [`SHIM_DIR`] (the
+/// shim looks for it beside itself).
+pub const CONTAINER_KEY_FILE: &str = "docker_ed25519";
+
+/// The Zed URL for `path` (absolute) in dev container `container` as `user`,
+/// at `line[:column]` when given.
+pub fn container_url(user: &str, container: &str, path: &str, position: Option<(u32, Option<u32>)>) -> String {
+    let mut url = format!(
+        "ssh://{user}@{container}{CONTAINER_HOST_SUFFIX}/{}",
+        path.trim_start_matches('/')
+    );
+    if let Some((line, column)) = position {
+        url.push_str(&format!(":{line}"));
+        if let Some(column) = column {
+            url.push_str(&format!(":{column}"));
+        }
+    }
+    url
+}
+
+/// No console window for a helper the app runs (Windows).
+fn no_window(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// The public key line of tod's container key pair, generating the pair
+/// with the host's `ssh-keygen` the first time.
+pub fn ensure_container_key(data_root: &Path) -> Result<String> {
+    let dir = data_root.join(SHIM_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let key = dir.join(CONTAINER_KEY_FILE);
+    let public = dir.join(format!("{CONTAINER_KEY_FILE}.pub"));
+    if !key.is_file() || !public.is_file() {
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(&public);
+        let out = no_window(&mut Command::new("ssh-keygen"))
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "tod-zed", "-f"])
+            .arg(&key)
+            .stdin(Stdio::null())
+            .output()
+            .context("run ssh-keygen (is OpenSSH installed?)")?;
+        if !out.status.success() {
+            bail!("ssh-keygen: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        // Windows' ssh ignores a private key others can read, and the file
+        // inherits the data root's permissions: keep only this user's.
+        #[cfg(windows)]
+        {
+            let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+                (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
+                (_, Ok(name)) => name,
+                _ => bail!("USERNAME is not set; cannot protect {}", key.display()),
+            };
+            let out = no_window(&mut Command::new("icacls"))
+                .arg(&key)
+                .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+                .stdin(Stdio::null())
+                .output()
+                .context("run icacls")?;
+            if !out.status.success() {
+                let _ = std::fs::remove_file(&key);
+                bail!(
+                    "restrict {} to {user}: {}",
+                    key.display(),
+                    String::from_utf8_lossy(&out.stdout).trim()
+                );
+            }
+        }
+    }
+    let line = std::fs::read_to_string(&public).with_context(|| format!("read {}", public.display()))?;
+    Ok(line.trim().to_string())
+}
+
+/// Open `folder` in dev container `container` in Zed, then `file` (with its
+/// position) when given: Zed takes one `ssh://` URL per call, and the file
+/// then opens in the folder's window. Prepares the container's `sshd` first.
+/// Talks to Docker: never call it on the UI thread.
+pub fn open_in_container(
+    data_root: &Path,
+    container: &str,
+    folder: &str,
+    file: Option<(&str, Option<(u32, Option<u32>)>)>,
+) -> Result<()> {
+    let exec = tod_agent::devcontainer::ContainerExec::connect(container)?;
+    let user = exec.user.clone().unwrap_or_else(|| "root".to_string());
+    let key = ensure_container_key(data_root)?;
+    tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key)?;
+    // The name the user gave, so Zed's window titles and recent projects
+    // stay stable across container ids.
+    let host = if tod_agent::devcontainer::validate_container_ref(container).is_ok() {
+        container
+    } else {
+        &exec.id
+    };
+    let folder_url = container_url(&user, host, folder, None);
+    let Some((path, position)) = file else {
+        return spawn_zed_url(&folder_url, data_root);
+    };
+    // The file goes to a window whose remote project holds it, so the
+    // folder's call has to have handed off to Zed first.
+    let mut child = spawn_zed_child(&[folder_url], &zed_env(data_root)?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while child.try_wait()?.is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    spawn_zed_url(&container_url(&user, host, path, position), data_root)
+}
+
 pub fn spawn_zed_url(url: &str, data_root: &Path) -> Result<()> {
     let env = zed_env(data_root)?;
     spawn_zed_with(&[url.to_string()], &env)
 }
 
 fn spawn_zed_with(args: &[String], env: &[(String, OsString)]) -> Result<()> {
+    spawn_zed_child(args, env).map(|_| ())
+}
+
+fn spawn_zed_child(args: &[String], env: &[(String, OsString)]) -> Result<std::process::Child> {
     let bin = resolve_zed_bin().ok_or_else(|| {
         anyhow::anyhow!(
             "Zed CLI not found. Install Zed and ensure `zed` is on PATH \
@@ -112,7 +235,6 @@ fn spawn_zed_with(args: &[String], env: &[(String, OsString)]) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("spawn `{} {}`", bin.display(), args.join(" ")))
-        .map(|_| ())
 }
 
 /// Where Zed's `ssh`, `scp`, and `sftp` stand-ins live, under the data root.
@@ -209,6 +331,68 @@ mod tests {
             zed_open_args(&cwd),
             vec!["--classic".to_string(), "/tmp/workspace".to_string()]
         );
+    }
+
+    #[test]
+    fn container_urls_name_the_container_host_and_position() {
+        assert_eq!(
+            container_url("vscode", "my-dev", "/workspaces/app", None),
+            "ssh://vscode@my-dev.docker.tod/workspaces/app"
+        );
+        assert_eq!(
+            container_url("root", "c1", "/w/src/main.rs", Some((12, Some(4)))),
+            "ssh://root@c1.docker.tod/w/src/main.rs:12:4"
+        );
+        assert_eq!(
+            container_url("root", "c1", "/w/a.rs", Some((7, None))),
+            "ssh://root@c1.docker.tod/w/a.rs:7"
+        );
+        // The sandbox suffix also matches; the shim checks this one first.
+        assert!(CONTAINER_HOST_SUFFIX.ends_with(tod_sandbox::config::HOST_SUFFIX));
+    }
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("tod-zed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Scratch(dir)
+    }
+
+    /// Needs `ssh-keygen` on PATH; skipped without it.
+    #[test]
+    fn container_key_is_generated_once() {
+        if Command::new("ssh-keygen").arg("-?").output().is_err() {
+            return;
+        }
+        let root = scratch("key");
+        let first = ensure_container_key(root.path()).unwrap();
+        assert!(first.starts_with("ssh-ed25519 "), "{first}");
+        assert_eq!(ensure_container_key(root.path()).unwrap(), first);
+        assert!(root.path().join(SHIM_DIR).join(CONTAINER_KEY_FILE).is_file());
+    }
+
+    /// Needs `TOD_TEST_DEV_CONTAINER`: a running container with `sshd`.
+    /// Prepares it the way opening it in Zed does (without opening Zed).
+    #[test]
+    fn prepares_a_real_container_for_zed() {
+        let Ok(container) = std::env::var("TOD_TEST_DEV_CONTAINER") else {
+            return;
+        };
+        let root = scratch("prep");
+        let key = ensure_container_key(root.path()).unwrap();
+        let exec = tod_agent::devcontainer::ContainerExec::connect(&container).unwrap();
+        let user = exec.user.clone().unwrap_or_else(|| "root".into());
+        tod_agent::devcontainer::prepare_sshd(&exec.id, &user, &key).unwrap();
     }
 
     #[test]
