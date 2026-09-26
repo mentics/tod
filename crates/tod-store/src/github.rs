@@ -98,6 +98,178 @@ pub fn find_open_pr(
     }))
 }
 
+/// A repository on github.com, as named in its remote URL.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GithubRepo {
+    pub owner: String,
+    pub repo: String,
+}
+
+impl std::fmt::Display for GithubRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
+    }
+}
+
+/// The github.com repository a git remote URL points at, or `None` for a
+/// remote anywhere else. Takes every form git accepts for one:
+/// `https://github.com/o/r(.git)`, with or without credentials,
+/// `git@github.com:o/r.git`, and `ssh://git@github.com/o/r.git`.
+pub fn parse_remote_url(url: &str) -> Option<GithubRepo> {
+    let url = url.trim();
+    let rest = if let Some((scheme, rest)) = url.split_once("://") {
+        if !matches!(scheme, "https" | "http" | "ssh" | "git") {
+            return None;
+        }
+        // Drop credentials, then require the host.
+        let rest = rest.rsplit_once('@').map_or(rest, |(_, host_path)| host_path);
+        let (host, path) = rest.split_once('/')?;
+        let host = host.split_once(':').map_or(host, |(host, _port)| host);
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    } else {
+        // scp-like: `[user@]github.com:owner/repo`.
+        let (host, path) = url.split_once(':')?;
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    };
+    let mut parts = rest.trim_matches('/').split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if repo.is_empty() {
+        return None;
+    }
+    Some(GithubRepo {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+    })
+}
+
+/// Where a pull request stands. GitHub's own `state` is only open or closed;
+/// merged and draft are read off the rest of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PullState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PullState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Draft => "draft",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// One pull request, as a list of them shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSummary {
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+    pub state: PullState,
+    pub author: Option<String>,
+    pub head: String,
+    pub base: String,
+    /// ISO 8601, as GitHub sends it.
+    pub updated_at: String,
+}
+
+/// Every pull request, in any state, from `branch` of `repo` itself (not a
+/// fork) into it, most recently updated first.
+pub fn list_branch_prs(
+    token: &str,
+    repo: &GithubRepo,
+    branch: &str,
+) -> Result<Vec<PullSummary>, GithubError> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{}/{}/pulls?head={}&state=all&sort=updated&direction=desc&per_page=50",
+        repo.owner,
+        repo.repo,
+        query_encode(&format!("{}:{branch}", repo.owner)),
+    );
+    list_pulls(token, &url)
+}
+
+/// Every open pull request in `repo`, whichever branch it is from, most
+/// recently updated first (the first 100).
+pub fn list_open_prs(token: &str, repo: &GithubRepo) -> Result<Vec<PullSummary>, GithubError> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{}/{}/pulls?state=open&sort=updated&direction=desc&per_page=100",
+        repo.owner, repo.repo,
+    );
+    list_pulls(token, &url)
+}
+
+fn list_pulls(token: &str, url: &str) -> Result<Vec<PullSummary>, GithubError> {
+    let mut response = ureq::get(url)
+        .header("Authorization", &auth_header(token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "tod")
+        .call()
+        .map_err(request_error)?;
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        return Err(api_error(status.as_u16(), &mut response));
+    }
+    let raw: Vec<PullListRaw> = response
+        .body_mut()
+        .read_json()
+        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
+    Ok(raw.into_iter().map(PullListRaw::into_summary).collect())
+}
+
+/// One pull request by number, as [`list_branch_prs`] lists it.
+pub fn get_pull(token: &str, repo: &GithubRepo, number: i64) -> Result<PullSummary, GithubError> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{}/{}/pulls/{number}",
+        repo.owner, repo.repo
+    );
+    let mut response = ureq::get(&url)
+        .header("Authorization", &auth_header(token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "tod")
+        .call()
+        .map_err(request_error)?;
+    let status = response.status();
+    if status.as_u16() >= 400 {
+        return Err(api_error(status.as_u16(), &mut response));
+    }
+    let raw: PullListRaw = response
+        .body_mut()
+        .read_json()
+        .map_err(|err| GithubError::Http(format!("invalid JSON (HTTP {status}): {err}")))?;
+    Ok(raw.into_summary())
+}
+
+/// Percent-encode a query value. A branch name may hold `&`, `#` or `+`.
+fn query_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Open a pull request `head` -> `base` in `owner/repo`. Callers should check
 /// `find_open_pr` first — this always creates a new one.
 pub fn create_pr(
@@ -304,6 +476,52 @@ struct PrRaw {
 }
 
 #[derive(Debug, Deserialize)]
+struct PullListRaw {
+    number: i64,
+    title: String,
+    html_url: String,
+    state: String,
+    #[serde(default)]
+    draft: bool,
+    merged_at: Option<String>,
+    user: Option<UserRaw>,
+    head: RefRaw,
+    base: RefRaw,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefRaw {
+    #[serde(rename = "ref")]
+    name: String,
+}
+
+impl PullListRaw {
+    fn into_summary(self) -> PullSummary {
+        let state = if self.merged_at.is_some() {
+            PullState::Merged
+        } else if self.state == "closed" {
+            PullState::Closed
+        } else if self.draft {
+            PullState::Draft
+        } else {
+            PullState::Open
+        };
+        PullSummary {
+            number: self.number,
+            title: self.title,
+            url: self.html_url,
+            state,
+            author: self.user.map(|u| u.login),
+            head: self.head.name,
+            base: self.base.name,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct PrDetailRaw {
     mergeable: Option<bool>,
     mergeable_state: Option<String>,
@@ -390,5 +608,79 @@ impl<'a> NodePrRepo<'a> {
             params![uuid_to_blob(node_id), owner, repo, pr_number, url, now_ms()],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(owner: &str, name: &str) -> Option<GithubRepo> {
+        Some(GithubRepo {
+            owner: owner.into(),
+            repo: name.into(),
+        })
+    }
+
+    #[test]
+    fn reads_every_form_of_a_github_remote() {
+        for url in [
+            "https://github.com/acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://user:secret@github.com/acme/app.git",
+            "git@github.com:acme/app.git",
+            "github.com:acme/app",
+            "ssh://git@github.com/acme/app.git",
+            "ssh://git@github.com:22/acme/app.git",
+            "  https://GitHub.com/acme/app.git\n",
+        ] {
+            assert_eq!(parse_remote_url(url), repo("acme", "app"), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_remote_anywhere_else_is_not_github() {
+        for url in [
+            "https://gitlab.com/acme/app.git",
+            "git@bitbucket.org:acme/app.git",
+            "https://github.example.com/acme/app.git",
+            "/home/me/repos/app",
+            "../app.git",
+            r"C:\repos\app",
+            "https://github.com/acme",
+            "https://github.com/acme/app/tree/main",
+        ] {
+            assert_eq!(parse_remote_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_branch_name_is_encoded_for_the_query() {
+        assert_eq!(query_encode("acme:tod/fix-1"), "acme:tod/fix-1");
+        assert_eq!(query_encode("acme:a&b#c+d e"), "acme:a%26b%23c%2Bd%20e");
+    }
+
+    fn raw(state: &str, draft: bool, merged: bool) -> PullListRaw {
+        PullListRaw {
+            number: 7,
+            title: "Fix it".into(),
+            html_url: "https://github.com/acme/app/pull/7".into(),
+            state: state.into(),
+            draft,
+            merged_at: merged.then(|| "2026-01-01T00:00:00Z".to_string()),
+            user: None,
+            head: RefRaw { name: "tod/x".into() },
+            base: RefRaw { name: "main".into() },
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn merged_and_draft_are_read_off_the_record() {
+        assert_eq!(raw("open", false, false).into_summary().state, PullState::Open);
+        assert_eq!(raw("open", true, false).into_summary().state, PullState::Draft);
+        assert_eq!(raw("closed", false, true).into_summary().state, PullState::Merged);
+        assert_eq!(raw("closed", false, false).into_summary().state, PullState::Closed);
     }
 }

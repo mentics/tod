@@ -16,6 +16,7 @@ pub mod projection;
 pub mod provision;
 pub mod reattach;
 pub mod reconnect_identity;
+pub mod repositories;
 pub mod repos;
 pub mod runtime;
 pub mod sandbox;

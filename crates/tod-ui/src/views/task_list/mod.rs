@@ -1599,6 +1599,14 @@ impl TaskListView {
     }
 
     /// The selected node, when a saved (not draft) row is selected.
+    /// [`Self::selected_node_id`] with the node's title.
+    pub fn selected_node_with_title(&self) -> Option<(uuid::Uuid, String)> {
+        let id = self.selected_node_id()?;
+        let key = id.to_string();
+        let title = self.all_tasks.iter().find(|t| t.id == key)?.title.clone();
+        Some((id, title))
+    }
+
     pub fn selected_node_id(&self) -> Option<uuid::Uuid> {
         let id = self.working_set.selected_id.as_deref()?;
         if self.is_draft_id(id) {

@@ -682,6 +682,11 @@ impl UnifiedView {
     /// `SortKey::WaitingLongest`) and the node adjacent to the current
     /// selection in it, wrapping around
     /// (`doc/ui/unified-view.md` "Alt+Q").
+    /// The node selected in this view's tree, with its title.
+    pub fn selected_node_with_title(&self, cx: &App) -> Option<(Uuid, String)> {
+        self.task_list.read(cx).selected_node_with_title()
+    }
+
     fn next_waiting_node(&self, forward: bool, cx: &Context<Self>) -> Option<Uuid> {
         let order = attention_feed::waiting_order(&self.attention);
         if order.is_empty() {
