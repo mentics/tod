@@ -5,17 +5,17 @@
 //!   snapshot's `last_seq` is recorded as the feed's start, since the
 //!   snapshot carries the app's own log, which the app must not get back.
 //!   Reply: `{"last_seq": n}`.
-//! - `POST /users/<u>/changes`: the body is the app's changes, a JSON array
-//!   of `tod_store::sync::Change`. Applied without being logged again, so
-//!   they are not echoed down. Reply: the `ApplyReport` and `last_seq`.
+//! - `POST /users/<u>/changes`: the body is a client's changes (the app's,
+//!   or a node supervisor's), a JSON array of `tod_store::sync::Change`.
+//!   Logged, tagged with the client (`X-Tod-Client`, else `?client=`, else
+//!   `unknown`), so every other client gets them. Reply: the `ApplyReport`
+//!   and `last_seq`.
 //! - `GET /users/<u>/changes?after=<n>`: the changes after `n` (never from
-//!   before the seed). Reply: `{"last_seq": n, "changes": [...]}`; the app
-//!   pulls again with `after` = `last_seq`.
-//!
+//!   before the seed), without the requesting client's own. Reply:
+//!   `{"last_seq": n, "changes": [...]}`; the client pulls again with
+//!   `after` = `last_seq`.
 //! - `GET /users/<u>/snapshot`: the whole database, for a node supervisor's
 //!   local copy (its `last_seq` is where that copy pulls from).
-//! - `POST /users/<u>/changes?from=supervisor`: a supervisor's changes,
-//!   logged so the app gets them.
 //!
 //! Each runs on its own SQLite connection, under the user's sync lock, after
 //! flushing the store's pending writes; the store reloads its read view
@@ -56,20 +56,15 @@ fn seed_inner(users: &Users, user: &str, snapshot: &[u8]) -> Result<Response> {
     Ok(json(&serde_json::json!({ "last_seq": last })))
 }
 
-/// `logged`: the changes come from a node's supervisor, not the app, so they
-/// are logged here and reach the app through the feed (the supervisor gets
-/// them back too, which it applies as a no-op).
-pub fn apply_changes(user: &UserData, body: &[u8], logged: bool) -> Response {
+/// Logged, tagged with the sending `client`, so every other client gets
+/// them through the feed and `client` does not get them back.
+pub fn apply_changes(user: &UserData, body: &[u8], client: &str) -> Response {
     reply((|| {
         let changes: Vec<Change> = serde_json::from_slice(body).context("changes: a JSON array of Change")?;
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let mut conn = connect(user)?;
-        let report = if logged {
-            sync::apply_changes_logged(&mut conn, &changes)?
-        } else {
-            sync::apply_changes(&mut conn, &changes)?
-        };
+        let report = sync::apply_changes_from(&mut conn, &changes, client)?;
         let last = sync::last_seq(&conn)?;
         drop(conn);
         let _ = user.store.reload_if_stale();
@@ -79,14 +74,15 @@ pub fn apply_changes(user: &UserData, body: &[u8], logged: bool) -> Response {
     })())
 }
 
-pub fn export_changes(user: &UserData, after: i64) -> Response {
+/// `client`'s own changes are left out.
+pub fn export_changes(user: &UserData, after: i64, client: Option<&str>) -> Response {
     reply((|| {
         let _guard = user.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = user.store.flush_on_quit();
         let after = after.max(seed_seq(&user.root));
         let conn = connect(user)?;
         let last = sync::last_seq(&conn)?;
-        let changes = sync::export_changes(&conn, after)?;
+        let changes = sync::export_changes_for(&conn, after, client)?;
         Ok(json(&serde_json::json!({ "last_seq": last, "changes": changes })))
     })())
 }

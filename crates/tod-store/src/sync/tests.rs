@@ -215,6 +215,32 @@ fn applied_changes_are_not_logged() {
 }
 
 #[test]
+fn changes_applied_from_a_client_reach_the_others_but_not_it() {
+    let (a, b) = pair();
+    let list_id = a.fleet.list_outline_lists().unwrap()[0].id;
+    a.apply(OutlineMutation::CreateNode {
+        node_id: None,
+        list_id,
+        parent_id: None,
+        anchor_id: None,
+        position: CreatePosition::Below,
+        title: "from a".into(),
+    });
+    let changes = export_changes(&a.conn(), a.cursor).unwrap();
+    assert!(!changes.is_empty());
+    // `b` is the hub; `a` is client "one".
+    let hub_before = last_seq(&b.conn()).unwrap();
+    apply_changes_from(&mut b.conn(), &changes, "one").unwrap();
+    assert!(last_seq(&b.conn()).unwrap() > hub_before, "logged at the hub");
+    assert!(export_changes_for(&b.conn(), hub_before, Some("one")).unwrap().is_empty(), "no echo");
+    let others = export_changes_for(&b.conn(), hub_before, Some("two")).unwrap();
+    assert_eq!(others.len(), changes.len());
+    assert_eq!(export_changes(&b.conn(), hub_before).unwrap().len(), changes.len());
+    let _ = std::fs::remove_dir_all(&a.root);
+    let _ = std::fs::remove_dir_all(&b.root);
+}
+
+#[test]
 fn a_row_changed_on_both_sides_is_a_conflict_and_the_sender_wins() {
     let (mut a, mut b) = pair();
     let list_id = a.fleet.list_outline_lists().unwrap()[0].id;

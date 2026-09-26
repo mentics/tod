@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::time::Duration;
 use tod_store::fleet::cli_relay::{NODE_HEADER, USER_HEADER};
-use tod_store::sync::Change;
+use tod_store::sync::{CLIENT_HEADER, Change};
 
 #[derive(Clone)]
 pub struct Orchestrator {
@@ -74,6 +74,12 @@ impl Orchestrator {
         &self.user
     }
 
+    /// This supervisor as a sync client (`X-Tod-Client`): its pushes reach
+    /// the app and never come back to it.
+    pub fn client(&self) -> String {
+        format!("supervisor-{}", self.node)
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/users/{}{path}", self.base, self.user)
     }
@@ -90,18 +96,21 @@ impl Orchestrator {
                     .post(url)
                     .header(USER_HEADER, &self.user)
                     .header(NODE_HEADER, &self.node)
+                    .header(CLIENT_HEADER, &self.client())
                     .send(body),
                 None if method == "GET" => self
                     .agent
                     .get(url)
                     .header(USER_HEADER, &self.user)
                     .header(NODE_HEADER, &self.node)
+                    .header(CLIENT_HEADER, &self.client())
                     .call(),
                 None => self
                     .agent
                     .post(url)
                     .header(USER_HEADER, &self.user)
                     .header(NODE_HEADER, &self.node)
+                    .header(CLIENT_HEADER, &self.client())
                     .send_empty(),
             };
             let retry = match result {
@@ -147,10 +156,10 @@ impl Orchestrator {
         serde_json::from_slice(&bytes).context("the orchestrator's change feed")
     }
 
-    /// Sends this copy's own changes (logged there, so the app gets them).
+    /// Sends this copy's own changes (tagged with [`Self::client`] there).
     pub fn push_changes(&self, changes: &[Change]) -> Result<()> {
         let body = serde_json::to_vec(changes)?;
-        self.ok("POST", "/changes?from=supervisor", Some(&body))?;
+        self.ok("POST", "/changes", Some(&body))?;
         Ok(())
     }
 

@@ -176,8 +176,16 @@ fn a_wake_runs_the_node_and_its_work_reaches_the_orchestrator() {
     // The supervisor's own writes (the implementation conversation, its
     // turns) and the mock agent's (plan steps) are on the orchestrator, in
     // the feed the app pulls.
-    let feed = orchestrator.changes_after(seed_seq).unwrap();
+    let feed: tod_supervisor::orchestrator::Feed = ureq::get(format!("{orch_url}/users/alice/changes?after={seed_seq}"))
+        .header(tod_store::sync::CLIENT_HEADER, "app-test")
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_json()
+        .unwrap();
     let tables: Vec<&str> = feed.changes.iter().map(|c| c.table.as_str()).collect();
+    // The supervisor never gets its own changes back.
+    assert!(orchestrator.changes_after(seed_seq).unwrap().changes.is_empty());
     assert!(tables.contains(&"conversations"), "{tables:?}");
     assert!(tables.contains(&"conversation_turns"), "{tables:?}");
     assert!(tables.contains(&"node_plan_steps"), "{tables:?}");

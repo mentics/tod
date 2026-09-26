@@ -55,6 +55,22 @@ pub struct CloudSyncState {
     /// Nodes running in the cloud, by node id.
     #[serde(default)]
     pub nodes: BTreeMap<String, CloudNode>,
+    /// This data root's sync client id on the orchestrator (`app-<id>`),
+    /// made on first use by [`client_id`].
+    #[serde(default)]
+    pub client_id: Option<String>,
+}
+
+/// This data root's sync client id, made and saved on first use.
+pub fn client_id(root: &Path) -> Result<String> {
+    let mut state = CloudSyncState::load(root)?;
+    if let Some(id) = state.client_id.clone() {
+        return Ok(id);
+    }
+    let id = format!("app-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    state.client_id = Some(id.clone());
+    state.save(root)?;
+    Ok(id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +168,9 @@ pub trait Orchestrator {
 pub struct HttpOrchestrator {
     base: String,
     token: Option<String>,
+    /// This app as a sync client (`X-Tod-Client`): what it sends reaches the
+    /// node supervisors and never comes back to it.
+    client: String,
     agent: ureq::Agent,
 }
 
@@ -163,7 +182,13 @@ impl HttpOrchestrator {
             .timeout_global(Some(Duration::from_secs(300)))
             .build()
             .into();
-        Self { base: base.into().trim_end_matches('/').to_string(), token, agent }
+        Self { base: base.into().trim_end_matches('/').to_string(), token, client: "app".into(), agent }
+    }
+
+    /// Names this app as the sync client `client` ([`client_id`]).
+    pub fn with_client(mut self, client: impl Into<String>) -> Self {
+        self.client = client.into();
+        self
     }
 
     fn url(&self, user: &str, rest: &str) -> String {
@@ -171,6 +196,7 @@ impl HttpOrchestrator {
     }
 
     fn auth<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        let req = req.header(sync::CLIENT_HEADER, &self.client);
         match &self.token {
             Some(t) => req.header("Authorization", &format!("Bearer {t}")),
             None => req,
@@ -329,7 +355,7 @@ pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
         } else {
             None
         };
-        return Ok((HttpOrchestrator::new(url, token), user));
+        return Ok((HttpOrchestrator::new(url, token).with_client(client_id(root)?), user));
     }
     let mut sandboxes = sandboxes?;
     let bx = sandboxes.blaxel()?;
@@ -337,7 +363,7 @@ pub fn resolve(root: &Path) -> Result<(HttpOrchestrator, String)> {
         .url(&bx, tod_sandbox::orchestrator::NAME)
         .context("find the orchestrator (run `tod-sandbox orchestrator` first)")?;
     let base = format!("{}/port/{}", url.trim_end_matches('/'), tod_sandbox::orchestrator::PORT);
-    Ok((HttpOrchestrator::new(base, Some(bx.token().to_string())), user))
+    Ok((HttpOrchestrator::new(base, Some(bx.token().to_string())).with_client(client_id(root)?), user))
 }
 
 /// [`sync`] with the resolved orchestrator: the "Sync with the cloud" action.

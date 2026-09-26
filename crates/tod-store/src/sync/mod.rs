@@ -55,6 +55,15 @@
 //! `temp` objects.) Local triggers that derive data (staleness, references)
 //! still run on the receiver; their own logged effect on the sender arrives
 //! as a change too, so the receiver converges.
+//!
+//! # Several clients
+//!
+//! The orchestrator's copy has several clients (the app, each node's
+//! supervisor), and what one sends the others must get. So it applies with
+//! [`apply_changes_from`], which logs what it applies and tags those entries
+//! with the sender's client id (`sync_changes.origin`, `NULL` for a local
+//! write); [`export_changes_for`] leaves a requester's own entries out, so
+//! nothing is echoed. The clients themselves apply the feed suppressed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -114,6 +123,11 @@ pub const SYNCED_TABLES: &[&str] = &[
     "conversation_flags",
     "conversation_reports",
 ];
+
+/// The HTTP header a client names itself by to the orchestrator
+/// (`app-<id>`, `supervisor-<node>`): the origin its changes are tagged with,
+/// and whose changes its pulls leave out.
+pub const CLIENT_HEADER: &str = "X-Tod-Client";
 
 pub const CREATE_SYNC_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS sync_changes (
@@ -252,6 +266,15 @@ fn node_expr(table: &str, columns: &[String], prefix: &str) -> String {
 /// schema. Idempotent; run by the migration and on every open.
 pub fn install(conn: &Connection) -> Result<()> {
     conn.execute_batch(CREATE_SYNC_TABLES)?;
+    // Which client a change came from (see [`apply_changes_from`]); `NULL`
+    // for a write made here. Added here rather than by a numbered migration,
+    // since this runs on every open.
+    let has_origin = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sync_changes') WHERE name = 'origin'")?
+        .exists([])?;
+    if !has_origin {
+        conn.execute_batch("ALTER TABLE sync_changes ADD COLUMN origin TEXT;")?;
+    }
     let mut sql = String::new();
     for table in SYNCED_TABLES {
         for op in ["insert", "update", "delete"] {
@@ -387,18 +410,29 @@ pub fn last_seq(conn: &Connection) -> Result<i64> {
 /// Every row changed after `after`, one [`Change`] per row with its current
 /// contents, ordered by the last change to each row.
 pub fn export_changes(conn: &Connection, after: i64) -> Result<Vec<Change>> {
+    export_changes_for(conn, after, None)
+}
+
+/// [`export_changes`] for the client `requester`: log entries that came from
+/// it ([`apply_changes_from`]) are left out, so a client never gets its own
+/// changes back. A row it changed and another client changed after is still
+/// sent, with `before` taken from the other client's first entry.
+pub fn export_changes_for(conn: &Connection, after: i64, requester: Option<&str>) -> Result<Vec<Change>> {
     let mut stmt = conn.prepare(
         "SELECT tbl, row_key, MAX(seq),
                 (SELECT op FROM sync_changes f WHERE f.tbl = s.tbl AND f.row_key = s.row_key
-                   AND f.seq > ?1 ORDER BY f.seq LIMIT 1),
+                   AND f.seq > ?1 AND (?2 IS NULL OR f.origin IS NULL OR f.origin <> ?2)
+                   ORDER BY f.seq LIMIT 1),
                 (SELECT old_row FROM sync_changes f WHERE f.tbl = s.tbl AND f.row_key = s.row_key
-                   AND f.seq > ?1 ORDER BY f.seq LIMIT 1),
+                   AND f.seq > ?1 AND (?2 IS NULL OR f.origin IS NULL OR f.origin <> ?2)
+                   ORDER BY f.seq LIMIT 1),
                 (SELECT node_id FROM sync_changes l WHERE l.tbl = s.tbl AND l.row_key = s.row_key
                    ORDER BY l.seq DESC LIMIT 1)
-         FROM sync_changes s WHERE seq > ?1 GROUP BY tbl, row_key ORDER BY MAX(seq)",
+         FROM sync_changes s WHERE seq > ?1 AND (?2 IS NULL OR origin IS NULL OR origin <> ?2)
+         GROUP BY tbl, row_key ORDER BY MAX(seq)",
     )?;
     let entries: Vec<(String, String, i64, String, Option<String>, Value)> = stmt
-        .query_map([after], |r| {
+        .query_map(rusqlite::params![after, requester], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -438,20 +472,24 @@ pub fn export_changes(conn: &Connection, after: i64) -> Result<Vec<Change>> {
 /// contents here are neither the sender's `before` nor its `after` is
 /// reported as a conflict, and the sender's version applied anyway.
 pub fn apply_changes(conn: &mut Connection, changes: &[Change]) -> Result<ApplyReport> {
-    apply_changes_with(conn, changes, false)
+    apply_changes_with(conn, changes, None)
 }
 
-/// [`apply_changes`], but logging what it applies, so the changes appear in
-/// this side's feed ([`export_changes`]) for other copies: the orchestrator
-/// takes a node supervisor's changes this way, since the app has to get them.
-pub fn apply_changes_logged(conn: &mut Connection, changes: &[Change]) -> Result<ApplyReport> {
-    apply_changes_with(conn, changes, true)
+/// [`apply_changes`], but logging what it applies, tagged as coming from the
+/// client `origin`, so the changes reach every other client through this
+/// side's feed ([`export_changes_for`]) but not `origin` itself. The
+/// orchestrator takes every client's changes (the app's, each node
+/// supervisor's) this way; the clients apply the feed with [`apply_changes`].
+pub fn apply_changes_from(conn: &mut Connection, changes: &[Change], origin: &str) -> Result<ApplyReport> {
+    apply_changes_with(conn, changes, Some(origin))
 }
 
-fn apply_changes_with(conn: &mut Connection, changes: &[Change], log: bool) -> Result<ApplyReport> {
+fn apply_changes_with(conn: &mut Connection, changes: &[Change], origin: Option<&str>) -> Result<ApplyReport> {
     let tx = conn.transaction()?;
     tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
-    if !log {
+    // Everything logged after this inside the transaction is the apply's own.
+    let logged_after = last_seq(&tx)?;
+    if origin.is_none() {
         tx.execute_batch("UPDATE sync_state SET suppress = 1 WHERE id = 1;")?;
     }
     let mut report = ApplyReport::default();
@@ -513,6 +551,12 @@ fn apply_changes_with(conn: &mut Connection, changes: &[Change], log: bool) -> R
     }
     drop_orphans(&tx, &mut report)?;
     tx.execute_batch("UPDATE sync_state SET suppress = 0 WHERE id = 1;")?;
+    if let Some(origin) = origin {
+        tx.execute(
+            "UPDATE sync_changes SET origin = ?1 WHERE seq > ?2",
+            rusqlite::params![origin, logged_after],
+        )?;
+    }
     tx.commit()?;
     Ok(report)
 }

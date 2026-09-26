@@ -10,8 +10,9 @@
 //! - `POST /users/<u>/seed` — a snapshot of the user's database.
 //! - `POST /users/<u>/changes` — the app's changes.
 //! - `GET /users/<u>/changes?after=<n>` — the changes after number `n`.
-//! - `POST /users/<u>/changes?from=supervisor` — a node supervisor's changes
-//!   (logged, so the app gets them).
+//!   Clients name themselves with `X-Tod-Client` (`app-<id>`,
+//!   `supervisor-<node>`): what one sends reaches every other client's pulls
+//!   and never comes back to it (see [`sync_backend`]).
 //! - `GET /users/<u>/snapshot` — the whole database, for a supervisor's copy.
 //! - `GET /users/<u>/nodes/<n>/transcripts` — the node's mirrored agent
 //!   transcripts; `GET`/`POST .../transcripts/<name>` reads or appends one
@@ -32,6 +33,14 @@ use std::time::Duration;
 use users::Users;
 
 pub const USER_HEADER: &str = tod_store::fleet::cli_relay::USER_HEADER;
+
+/// The sync client a request is from (`X-Tod-Client`, else `?client=`).
+fn client(request: &Request) -> Option<&str> {
+    request
+        .header(tod_store::sync::CLIENT_HEADER)
+        .or_else(|| request.query_param("client"))
+        .filter(|c| !c.is_empty())
+}
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_BASE: &str = "/data";
 
@@ -111,7 +120,7 @@ impl Server {
                         Ok(data) => sync_backend::apply_changes(
                             &data,
                             &request.body,
-                            request.query_param("from") == Some("supervisor"),
+                            client(request).unwrap_or("unknown"),
                         ),
                         Err(err) => Response::text(500, format!("{err:#}")),
                     },
@@ -121,7 +130,7 @@ impl Server {
                             Err(_) => return Response::text(400, "after must be a number"),
                         };
                         match self.users.get(&user) {
-                            Ok(data) => sync_backend::export_changes(&data, after),
+                            Ok(data) => sync_backend::export_changes(&data, after, client(request)),
                             Err(err) => Response::text(500, format!("{err:#}")),
                         }
                     }

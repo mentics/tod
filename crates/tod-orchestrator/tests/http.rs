@@ -148,3 +148,31 @@ fn routing() {
     assert_eq!(send(h.port, "GET", "/users/a/changes?after=x", &[], b"").0, 400);
     assert_eq!(send(h.port, "DELETE", "/users/a/seed", &[], b"").0, 405);
 }
+
+#[test]
+fn transcripts_append_at_an_offset_and_list() {
+    let h = start("transcripts");
+    let path = "/users/dan/nodes/n1/transcripts/-proj__s1";
+    assert_eq!(send(h.port, "GET", path, &[], b"").0, 404);
+    let (status, body) = send(h.port, "POST", &format!("{path}?offset=0"), &[], b"a\n");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(json(&body)["size"], 2);
+    // A retried append at a stale offset is refused with the real size.
+    let (status, body) = send(h.port, "POST", &format!("{path}?offset=0"), &[], b"a\n");
+    assert_eq!(status, 409);
+    assert_eq!(json(&body)["size"], 2);
+    assert_eq!(send(h.port, "POST", &format!("{path}?offset=2"), &[], b"b\n").0, 200);
+    assert_eq!(send(h.port, "GET", path, &[], b""), (200, b"a\nb\n".to_vec()));
+    let (_, body) = send(h.port, "GET", "/users/dan/nodes/n1/transcripts", &[], b"");
+    assert_eq!(json(&body)["transcripts"][0]["name"], "-proj__s1");
+    assert_eq!(send(h.port, "POST", "/users/dan/nodes/n1/transcripts/.x", &[], b"").0, 400);
+    assert_eq!(send(h.port, "POST", "/users/dan/nodes/.n/transcripts/a", &[], b"").0, 400);
+}
+
+#[test]
+fn a_snapshot_is_the_users_database() {
+    let h = start("snapshot");
+    let (status, body) = send(h.port, "GET", "/users/erin/snapshot", &[], b"");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(body.starts_with(b"SQLite format 3\0"));
+}
