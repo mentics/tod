@@ -304,7 +304,9 @@ mod tests {
     }
 
     fn base() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tod-orch-wakes-{}", now_ms() ^ std::process::id() as i64));
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("tod-orch-wakes-{}-{}-{n}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
