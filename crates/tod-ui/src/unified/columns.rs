@@ -13,6 +13,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelKind {
     Details(uuid::Uuid),
+    /// The task panel (`doc/ui/task-panel.md`): a task node's default panel.
+    Task(uuid::Uuid),
     Decisions,
     Obligations(uuid::Uuid),
     Plan(uuid::Uuid),
@@ -29,6 +31,7 @@ impl PanelKind {
     pub fn node(&self) -> Option<uuid::Uuid> {
         match self {
             PanelKind::Details(id)
+            | PanelKind::Task(id)
             | PanelKind::Obligations(id)
             | PanelKind::Plan(id)
             | PanelKind::Findings(id)
@@ -257,6 +260,39 @@ mod tests {
         let mut bytes = [0u8; 16];
         bytes[15] = n;
         PanelKind::Obligations(Uuid::from_bytes(bytes))
+    }
+
+    fn task(n: u8) -> PanelKind {
+        let mut bytes = [0u8; 16];
+        bytes[15] = n;
+        PanelKind::Task(Uuid::from_bytes(bytes))
+    }
+
+    #[test]
+    fn task_panel_targets_its_node_and_is_not_a_singleton() {
+        let t = task(1);
+        assert_eq!(t.node(), details(1).node());
+        assert!(!t.is_singleton());
+    }
+
+    #[test]
+    fn task_panel_follows_the_column_rule() {
+        let mut m = ColumnModel::new();
+        m.open(task(1), 0, false); // col 2
+        // Selecting another node replaces the unpinned task column, whatever
+        // that node's default panel is.
+        assert_eq!(m.open(details(2), 0, false), 0);
+        assert_eq!(m.open(task(3), 0, false), 0);
+        assert_eq!(m.columns()[0].panel, task(3));
+        // A Ctrl+click on one of its artifact links opens to its right.
+        assert_eq!(m.open(obligations(3), 0, true), 1);
+        assert_eq!(m.columns()[0].panel, task(3));
+        // Pinned, a task column stays; the next task goes elsewhere.
+        m.toggle_pin(0);
+        let ix = m.open(task(4), 0, false);
+        assert_ne!(ix, 0);
+        assert_eq!(m.columns()[0].panel, task(3));
+        assert_eq!(m.columns()[ix].panel, task(4));
     }
 
     #[test]

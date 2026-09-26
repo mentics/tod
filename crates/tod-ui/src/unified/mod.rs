@@ -59,6 +59,7 @@ use crate::views::task_list::{TaskListEvent, TaskListView};
 /// `conversation/context_panel.rs` already does.
 enum HostedPanel {
     Details(Entity<DetailsPanel>),
+    Task(Entity<panels::task::TaskPanel>),
     Decisions(Entity<panels::decisions::DecisionsPanel>),
     Obligations(Entity<panels::obligations::ObligationsPanel>),
     Plan(Entity<panels::plan::PlanPanel>),
@@ -71,6 +72,7 @@ impl HostedPanel {
     fn title(&self, cx: &App) -> SharedString {
         match self {
             Self::Details(e) => e.read(cx).title(cx),
+            Self::Task(e) => e.read(cx).title(cx),
             Self::Decisions(e) => e.read(cx).title(cx),
             Self::Obligations(e) => e.read(cx).title(cx),
             Self::Plan(e) => e.read(cx).title(cx),
@@ -83,6 +85,7 @@ impl HostedPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self {
             Self::Details(e) => e.read(cx).focus_handle(cx),
+            Self::Task(e) => e.read(cx).focus_handle(cx),
             Self::Decisions(e) => e.read(cx).focus_handle(cx),
             Self::Obligations(e) => e.read(cx).focus_handle(cx),
             Self::Plan(e) => e.read(cx).focus_handle(cx),
@@ -95,6 +98,7 @@ impl HostedPanel {
     fn entity_id(&self) -> EntityId {
         match self {
             Self::Details(e) => e.entity_id(),
+            Self::Task(e) => e.entity_id(),
             Self::Decisions(e) => e.entity_id(),
             Self::Obligations(e) => e.entity_id(),
             Self::Plan(e) => e.entity_id(),
@@ -107,6 +111,7 @@ impl HostedPanel {
     fn render(&self) -> AnyElement {
         match self {
             Self::Details(e) => e.clone().into_any_element(),
+            Self::Task(e) => e.clone().into_any_element(),
             Self::Decisions(e) => e.clone().into_any_element(),
             Self::Obligations(e) => e.clone().into_any_element(),
             Self::Plan(e) => e.clone().into_any_element(),
@@ -338,9 +343,10 @@ impl UnifiedView {
                 let node_id = task_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
                 if let Some(id) = node_id {
                     // The node tree (column 1) always counts as pinned, so a
-                    // selection opens Details in the first unpinned column
-                    // starting at column 2 (index 0), as a plain (non-ctrl) open.
-                    self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+                    // selection opens the node's default panel in the first
+                    // unpinned column starting at column 2 (index 0), as a
+                    // plain (non-ctrl) open.
+                    self.open_panel(self.default_panel(id), 0, false, window, cx);
                     self.set_chat_focus(Focus::Node(id), cx);
                 }
                 // The decisions panel is a singleton with no target of its own:
@@ -355,12 +361,12 @@ impl UnifiedView {
             // right-click menu to columns").
             TaskListEvent::OpenTaskEdit { task_id } | TaskListEvent::OpenActionPanel { task_id } => {
                 if let Ok(id) = Uuid::parse_str(task_id) {
-                    self.open_panel(PanelKind::Details(id), 0, false, window, cx);
+                    self.open_panel(self.default_panel(id), 0, false, window, cx);
                 }
             }
             TaskListEvent::OpenTaskEditCtrl { task_id } => {
                 if let Ok(id) = Uuid::parse_str(task_id) {
-                    self.open_panel(PanelKind::Details(id), 0, true, window, cx);
+                    self.open_panel(self.default_panel(id), 0, true, window, cx);
                 }
             }
             TaskListEvent::OpenObligations { task_id, .. } => {
@@ -395,6 +401,24 @@ impl UnifiedView {
         }
     }
 
+    /// The panel a node opens by default: the task panel for a task node
+    /// (`tod_store::fleet::node_actions::is_task_node`), else Details.
+    /// Generator and managed nodes get their own arms later.
+    ///
+    /// One short `fleet.read` (capability lookups and an ancestor walk), the
+    /// same kind of read `DetailsPanel`'s load does on this thread.
+    fn default_panel(&self, node_id: Uuid) -> PanelKind {
+        let is_task = self
+            .fleet
+            .read(|conn| tod_store::fleet::node_actions::is_task_node(conn, node_id))
+            .unwrap_or(false);
+        if is_task {
+            PanelKind::Task(node_id)
+        } else {
+            PanelKind::Details(node_id)
+        }
+    }
+
     fn sync_decisions_node(&mut self, node_id: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
         for hosted in &self.hosted {
             if let HostedPanel::Decisions(panel) = &hosted.panel {
@@ -425,6 +449,19 @@ impl UnifiedView {
                     });
                 HostedColumn {
                     panel: HostedPanel::Details(panel),
+                    _subscriptions: vec![subscription],
+                }
+            }
+            PanelKind::Task(node_id) => {
+                let panel =
+                    cx.new(|cx| panels::task::TaskPanel::new(node_id, self.fleet.clone(), window, cx));
+                let panel_id = panel.entity_id();
+                let subscription =
+                    cx.subscribe_in(&panel, window, move |this, _, event: &PanelOpenRequest, window, cx| {
+                        this.route_open_request(panel_id, event, window, cx);
+                    });
+                HostedColumn {
+                    panel: HostedPanel::Task(panel),
                     _subscriptions: vec![subscription],
                 }
             }
@@ -591,7 +628,7 @@ impl UnifiedView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let PanelKind::Details(node_id) = target {
+        if let PanelKind::Details(node_id) | PanelKind::Task(node_id) = target {
             self.set_chat_focus(Focus::Node(node_id), cx);
         }
         let before = self.columns.len();
@@ -607,6 +644,12 @@ impl UnifiedView {
             {
                 let panel = panel.clone();
                 panel.update(cx, |panel, cx| panel.set_node(node_id, window, cx));
+            } else if let (HostedPanel::Task(panel), PanelKind::Task(node_id)) =
+                (&self.hosted[ix].panel, target)
+            {
+                // A task column retargeted to another task keeps its entity.
+                let panel = panel.clone();
+                panel.update(cx, |panel, cx| panel.set_node(node_id, cx));
             } else if !matches!(
                 (&self.hosted[ix].panel, target),
                 (HostedPanel::Decisions(_), PanelKind::Decisions)
@@ -1199,6 +1242,57 @@ mod tests {
             assert_eq!(view.columns.columns()[0].panel, PanelKind::Details(node_id));
             // Keys stay in the tree, so its column is still the focused one.
             assert_eq!(view.columns.focused_index(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn a_task_node_opens_the_task_panel(cx: &mut TestAppContext) {
+        use tod_store::outline::{Capability, OutlineMutation};
+        let fixture = Fixture::new();
+        let plain = fixture.node_id;
+        // A second node, made a task before the view opens (store writes
+        // while the view runs wake it from another thread).
+        let task_id = Uuid::new_v4();
+        let list_id = fixture.store.list_outline_lists().unwrap()[0].id;
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::CreateNode {
+                node_id: Some(task_id),
+                list_id,
+                parent_id: None,
+                anchor_id: Some(plain),
+                position: tod_store::outline::CreatePosition::Below,
+                title: "A task".into(),
+            })
+            .unwrap();
+        fixture
+            .store
+            .enqueue_outline(OutlineMutation::EnableCapabilities {
+                node_id: task_id,
+                capabilities: vec![Capability::Lifecycle, Capability::Agent],
+            })
+            .unwrap();
+        fixture.store.writer().flush().unwrap();
+        fixture.store.reload_if_stale().ok();
+
+        let (view, cx) = open_view(&fixture, cx);
+        // The fixture node has only Spec: not a task.
+        assert_eq!(
+            view.read_with(cx, |view, _| view.default_panel(plain)),
+            PanelKind::Details(plain)
+        );
+        let target = view.read_with(cx, |view, _| view.default_panel(task_id));
+        assert_eq!(target, PanelKind::Task(task_id));
+        view.update_in(cx, |view, window, cx| {
+            view.open_panel(target, 0, false, window, cx);
+        });
+        draw(cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.columns.columns()[0].panel, PanelKind::Task(task_id));
+            let HostedPanel::Task(panel) = &view.hosted[0].panel else {
+                panic!("expected a task panel");
+            };
+            assert_eq!(panel.read(cx).node_id(), task_id);
         });
     }
 
